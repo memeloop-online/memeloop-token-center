@@ -445,6 +445,63 @@ async fn sqlite_global_model_history_indexes_drive_both_top_n_sources() {
 }
 
 #[tokio::test]
+async fn sqlite_control_list_projection_indexes_are_covering() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("control-list-covering.db").display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    database.migrate().await.unwrap();
+
+    for index in [
+        "conversation_observations_request_list_cover_idx",
+        "model_prices_currency_model_idx",
+    ] {
+        let installed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = $1",
+        )
+        .bind(index)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(installed, 1, "missing v73 control-list index {index}");
+    }
+
+    let observation_plan: Vec<String> = sqlx::query(
+        "EXPLAIN QUERY PLAN SELECT session_name, task_kind, agent_id, metadata_source FROM conversation_observations INDEXED BY conversation_observations_request_list_cover_idx WHERE request_id = 'request-a' AND key_id = 'key-a' AND cluster_id = 'cluster-a'",
+    )
+    .fetch_all(&database.pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.try_get("detail").unwrap())
+    .collect();
+    assert!(
+        observation_plan.iter().any(|detail| {
+            detail.contains("COVERING INDEX conversation_observations_request_list_cover_idx")
+        }),
+        "request-list metadata must be served from the narrow covering index: {observation_plan:?}"
+    );
+
+    let price_plan: Vec<String> = sqlx::query(
+        "EXPLAIN QUERY PLAN SELECT model FROM model_prices WHERE currency = 'USD' AND model > 'gpt-5' ORDER BY model LIMIT 200",
+    )
+    .fetch_all(&database.pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.try_get("detail").unwrap())
+    .collect();
+    assert!(
+        price_plan
+            .iter()
+            .any(|detail| detail.contains("model_prices_currency_model_idx")),
+        "model-price keyset pages must use the currency/model index: {price_plan:?}"
+    );
+}
+
+#[tokio::test]
 async fn durable_oauth_migration_retires_bridge_routes_without_deleting_history() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(

@@ -2610,10 +2610,26 @@ paths:
       tags: [Routes and pricing]
       operationId: listTokenModelPrices
       summary: List configured token prices
-      description: Returns every service tier with uncached input, cached input, cache-write and output dimensions plus source/estimated metadata.
+      description: |
+        Returns service tiers with uncached input, cached input, cache-write and
+        output dimensions plus source/estimated metadata. Use `limit` and
+        `after_model` for stable keyset pagination. `offset` remains available
+        for existing clients and is ignored when `after_model` is supplied.
       security: [{ serviceBearer: [] }]
       x-required-scope: requests:read
-      parameters: [{ $ref: '#/components/parameters/Currency' }]
+      parameters:
+        - $ref: '#/components/parameters/Currency'
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 1000 }
+        - name: offset
+          in: query
+          deprecated: true
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: after_model
+          in: query
+          description: Exclusive model-name cursor from the preceding page.
+          schema: { type: string }
       responses:
         '200':
           description: Prices for the requested currency.

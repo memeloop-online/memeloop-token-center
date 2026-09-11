@@ -29,6 +29,7 @@ import { UpstreamAvailability } from '../UpstreamAvailability';
 import { UpstreamQuota } from '../UpstreamQuota';
 import { upstreamAvailabilityPath, type UpstreamAvailabilityWindow } from '../upstreamAvailabilityWindow';
 import { useOperatorResource, type ResourceState } from '../hooks/useOperatorResource';
+import { loadModelPricePages } from '../pricingLoading';
 import { enumLabel, messageOf, OneTimeSecret, queryForTenant, WriteScopeNotice } from '../scope/operatorShared';
 
 function Form(props: FormProps) {
@@ -325,7 +326,14 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
   </div>;
 }
 
-function Pricing({ token, tenant, writeTenant = tenant, schemas }: { token: string; tenant: string; writeTenant?: string; schemas?: ConfigurationSchemas }) {
+function Pricing({ token, tenant, writeTenant = tenant, schemas, schemasLoading = false, onRequestSchemas }: {
+  token: string;
+  tenant: string;
+  writeTenant?: string;
+  schemas?: ConfigurationSchemas;
+  schemasLoading?: boolean;
+  onRequestSchemas?: () => void;
+}) {
   const { locale, t } = useI18n();
   const [prices, setPrices] = useState<ModelPriceView[]>([]);
   const [generationPrices, setGenerationPrices] = useState<GenerationPriceView[]>([]);
@@ -340,6 +348,8 @@ function Pricing({ token, tenant, writeTenant = tenant, schemas }: { token: stri
   const [loadedCurrency, setLoadedCurrency] = useState('');
   const [pricingLoading, setPricingLoading] = useState(false);
   const [usageFailed, setUsageFailed] = useState(false);
+  const [usageLoading, setUsageLoading] = useState(false);
+  const [basePricingScope, setBasePricingScope] = useState('');
   const [message, setMessage] = useState('');
   const loadSequence = useRef(0);
   const priceRequest = useRef<AbortController | undefined>(undefined);
@@ -349,21 +359,29 @@ function Pricing({ token, tenant, writeTenant = tenant, schemas }: { token: stri
   const load = async (requestedCurrency = displayCurrency) => {
     const sequence = ++loadSequence.current;
     const loadToken = token; const loadTenant = tenant;
+    const loadScope = `${loadToken}\0${loadTenant}`;
     if (!loadToken) return;
     priceRequest.current?.abort();
     const controller = new AbortController();
     priceRequest.current = controller;
-    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]);
     const current = () => !controller.signal.aborted && sequence === loadSequence.current
       && scopeRef.current.token === loadToken && scopeRef.current.tenant === loadTenant
       && scopeRef.current.displayCurrency === requestedCurrency;
+    // Usage is invariant for a tenant/token scope. Start its independent read
+    // with the first price page rather than holding it behind a long catalog
+    // walk (or re-reading it for every currency switch).
+    setBasePricingScope(loadScope);
     setPricingLoading(true); setPrices([]); setGenerationPrices([]);
     // Publish each independent price table as soon as it arrives. Usage does
     // not vary by currency and must never gate price rendering.
     const results = await Promise.allSettled([
-      api<ModelPriceView[]>(`/internal/v1/model-prices?currency=${encodeURIComponent(requestedCurrency)}`, loadToken, { signal })
-        .then((value) => { if (current()) { setPrices(value); setLoadedCurrency(requestedCurrency); } }),
-      api<GenerationPriceView[]>(`/internal/v1/generation-prices?currency=${encodeURIComponent(requestedCurrency)}`, loadToken, { signal })
+      loadModelPricePages(
+        requestedCurrency,
+        controller.signal,
+        (path, pageSignal) => api<ModelPriceView[]>(path, loadToken, { signal: AbortSignal.any([pageSignal, AbortSignal.timeout(10_000)]) }),
+        (value) => { if (current()) { setPrices(value); setLoadedCurrency(requestedCurrency); } },
+      ),
+      api<GenerationPriceView[]>(`/internal/v1/generation-prices?currency=${encodeURIComponent(requestedCurrency)}`, loadToken, { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]) })
         .then((value) => { if (current()) setGenerationPrices(value); }),
     ]);
     if (!current()) return;
@@ -376,6 +394,7 @@ function Pricing({ token, tenant, writeTenant = tenant, schemas }: { token: stri
     syncSequence.current += 1;
     setPrices([]); setGenerationPrices([]); setSyncResult(undefined); setLoadedCurrency('');
     setPricingLoading(false); setSyncing(false); setError(''); setMessage(''); setKind('token'); setModel('');
+    setUsageLoading(false); setBasePricingScope('');
   }, [token, tenant, writeTenant]);
   useEffect(() => {
     void load(displayCurrency);
@@ -383,12 +402,17 @@ function Pricing({ token, tenant, writeTenant = tenant, schemas }: { token: stri
   }, [token, tenant, writeTenant, displayCurrency]);
   useEffect(() => {
     const controller = new AbortController();
-    setUsage({ models: [] }); setUsageFailed(false);
-    if (token) void api<ModelPriceUsageSummary>(`/internal/v1/model-prices/usage-summary${queryForTenant(tenant)}`, token, { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]) })
+    const scope = `${token}\0${tenant}`;
+    setUsage({ models: [] }); setUsageFailed(false); setUsageLoading(false);
+    if (token && basePricingScope === scope) {
+      setUsageLoading(true);
+      void api<ModelPriceUsageSummary>(`/internal/v1/model-prices/usage-summary${queryForTenant(tenant)}`, token, { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]) })
       .then((value) => { if (!controller.signal.aborted) setUsage(value); })
-      .catch(() => { if (!controller.signal.aborted) setUsageFailed(true); });
+      .catch(() => { if (!controller.signal.aborted) setUsageFailed(true); })
+      .finally(() => { if (!controller.signal.aborted) setUsageLoading(false); });
+    }
     return () => controller.abort();
-  }, [token, tenant]);
+  }, [token, tenant, basePricingScope]);
   const renderCurrency = loadedCurrency || displayCurrency;
   const rows = useMemo(() => {
     const usageByModel = new Map(usage.models.map((value) => [value.model, value]));
@@ -426,7 +450,7 @@ function Pricing({ token, tenant, writeTenant = tenant, schemas }: { token: stri
   return <div className="pricing-page"><WriteScopeNotice tenant={writeTenant} />
     {usageFailed && <div className="notice error" role="alert">{t('pricing.partialLoad')}</div>}
     <article className="panel pricing-overview"><div className="panel-title"><div><h2>{t('pricing.title')}</h2><p className="muted">{t('pricing.description')}</p></div><div className="pricing-heading-actions"><label>{t('pricing.viewCurrency')}<select aria-label={t('pricing.viewCurrency')} value={displayCurrency} onChange={(event) => { const next = event.target.value; syncSequence.current += 1; setSyncing(false); setSyncResult(undefined); setMessage(''); setDisplayCurrency(next); setCurrency(next); }}><option value="USD">USD</option><option value="CNY">CNY</option></select></label><div className="disabled-action"><button type="button" onClick={() => void sync()} disabled={!writeTenant || syncing}>{syncing ? t('pricing.syncing') : t('pricing.sync')}</button></div></div></div>
-      <div className="pricing-summary"><span>{t('pricing.usedModels', { count: formatNumber(usage.models.length, locale) })}</span><span>{t('pricing.saved', { count: formatNumber(prices.length, locale) })}</span><span>{t('pricing.sourceOrder')}: models.dev → LiteLLM → OpenRouter</span></div>
+      <div className="pricing-summary"><span>{usageLoading ? t('common.loading') : t('pricing.usedModels', { count: formatNumber(usage.models.length, locale) })}</span><span>{t('pricing.saved', { count: formatNumber(prices.length, locale) })}</span><span>{t('pricing.sourceOrder')}: models.dev → LiteLLM → OpenRouter</span></div>
       {error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice success" role="status">{message}</div>}
       {syncResult && <><div className="source-status">{syncResult.sourceResults.map((source) => <div className={`source-card ${source.error ? 'failed' : 'healthy'}`} key={source.source}><b>{source.source}</b><span>{source.error ? t('pricing.sourceFailed') : t('pricing.sourceHealthy', { count: formatNumber(source.models, locale) })}</span>{source.error && <small>{source.error}</small>}</div>)}</div><div className="notice success"><b>{t('pricing.result')}</b> · {t('pricing.imported', { count: formatNumber(syncResult.imported, locale) })} · {t('pricing.candidates', { count: formatNumber(syncResult.candidates.length, locale) })} · {t('pricing.unmatched', { count: formatNumber(syncResult.unmatched.length, locale) })} · {t('pricing.preserved', { count: formatNumber(syncResult.preserved.length, locale) })}</div>
         {(syncResult.candidates.length > 0 || syncResult.unmatched.length > 0) && <div className="sync-details"><h3>{t('pricing.candidateDetails')}</h3>{syncResult.candidates.map((candidate) => <details key={candidate.model}><summary><code>{candidate.model}</code><span>{t('pricing.candidateCount', { count: formatNumber(candidate.candidates.length, locale) })}</span></summary><div className="candidate-list">{candidate.candidates.map((match) => <div key={`${match.source}-${match.sourceModelId}-${match.serviceTier}`}><b>{match.sourceModelId}</b><span>{match.source} · {match.serviceTier} · {match.reason}</span><code>{t('pricing.input')}: {formatCurrency(match.inputPerMillion, renderCurrency, locale)} · {t('pricing.output')}: {formatCurrency(match.outputPerMillion, renderCurrency, locale)}</code></div>)}</div></details>)}{syncResult.unmatched.length > 0 && <details><summary>{t('pricing.unmatchedModels')}</summary><div className="model-name-list">{syncResult.unmatched.map((name) => <code key={name}>{name}</code>)}</div></details>}</div>}
@@ -434,7 +458,7 @@ function Pricing({ token, tenant, writeTenant = tenant, schemas }: { token: stri
       <div className="table-scroll"><table><thead><tr><th>{t('pricing.model')}</th><th>{t('pricing.calls')}</th><th>{t('pricing.serviceTier')}</th><th>{t('pricing.input')}</th><th>{t('pricing.cachedInput')}</th><th>{t('pricing.cacheWrite')}</th><th>{t('pricing.output')}</th><th>{t('pricing.source')}</th><th>{t('pricing.updated')}</th></tr></thead><tbody>{rows.map((row) => <tr key={`${row.model}-${row.tier?.service_tier ?? 'missing'}`}><td><code>{row.model}</code></td><td>{row.usage ? formatNumber(row.usage.calls, locale) : ''}</td><td>{row.tier?.service_tier ?? '—'}</td><td>{row.tier ? formatCurrency(row.tier.input_per_million, renderCurrency, locale) : '—'}</td><td>{row.tier ? <>{formatCurrency(row.tier.cached_input_per_million, renderCurrency, locale)}{row.tier.cache_price_estimated && <small className="muted"> {t('pricing.estimated')}</small>}</> : '—'}</td><td>{row.tier ? <>{formatCurrency(row.tier.cache_write_per_million, renderCurrency, locale)}{row.tier.cache_price_estimated && <small className="muted"> {t('pricing.estimated')}</small>}</> : '—'}</td><td>{row.tier ? formatCurrency(row.tier.output_per_million, renderCurrency, locale) : '—'}</td><td>{row.tier ? <span className={`pill source-${row.tier.source.replace('.', '-')}`}>{row.tier.source}</span> : <span className="status pending">{t('pricing.missing')}</span>}</td><td>{row.tier ? new Date(row.tier.updated_at).toLocaleString(locale) : '—'}</td></tr>)}</tbody></table>{rows.length === 0 && <div className="empty">{pricingLoading ? t('common.loading') : t('pricing.noPricesForCurrency', { currency: renderCurrency })}</div>}</div>
     </article>
     <article className="panel"><div className="panel-title"><h2>{t('pricing.generationPrices')}</h2><span>{formatNumber(generationPrices.length, locale)}</span></div><div className="table-scroll"><table><thead><tr><th>{t('pricing.model')}</th><th>{t('pricing.currency')}</th><th>{t('self.units')}</th><th>{t('pricing.unitPrice')}</th></tr></thead><tbody>{generationPrices.map((price) => <tr key={`${price.currency}-${price.model}`}><td><code>{price.model}</code></td><td>{price.currency}</td><td>{enumLabel(t, 'billingUnit', price.billing_unit)}</td><td>{formatCurrency(price.price_per_unit, price.currency, locale)}</td></tr>)}</tbody></table>{generationPrices.length === 0 && <div className="empty">{t('pricing.noGenerationPrices')}</div>}</div></article>
-    <details className="panel manual-pricing"><summary><span><b>{t('pricing.manual')}</b><small>{t('pricing.manualHint')}</small></span><span>＋</span></summary><div className="manual-pricing-body form-panel"><label>{t('pricing.type')}<select value={kind} onChange={(event) => setKind(event.target.value as typeof kind)}><option value="token">{t('pricing.tokenModel')}</option><option value="generation">{t('pricing.generationModel')}</option></select></label><ModelPicker label={t('pricing.model')} value={model} onChange={setModel} options={modelOptions} editable /><label>{t('pricing.currency')}<select value={currency} onChange={(event) => setCurrency(event.target.value)}><option value="USD">USD</option><option value="CNY">CNY</option></select></label>{schema ? <Form key={`${kind}-${locale}`} schema={localizeSchema(schema as RJSFSchema, locale)} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!writeTenant) return; try { const prefix = kind === 'generation' ? 'generation-prices' : 'prices'; await api(`/internal/v1/${prefix}/${encodeURIComponent(currency)}/${encodeURIComponent(model)}`, token, { method: 'POST', body: JSON.stringify(formData) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setMessage(t('pricing.savedMessage')); if (currency === displayCurrency) await load(currency); else setDisplayCurrency(currency); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!writeTenant || !model.trim()}>{t('pricing.save')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}</div></details>
+    <details className="panel manual-pricing" onToggle={(event) => { if (event.currentTarget.open) onRequestSchemas?.(); }}><summary><span><b>{t('pricing.manual')}</b><small>{t('pricing.manualHint')}</small></span><span>＋</span></summary><div className="manual-pricing-body form-panel"><label>{t('pricing.type')}<select value={kind} onChange={(event) => setKind(event.target.value as typeof kind)}><option value="token">{t('pricing.tokenModel')}</option><option value="generation">{t('pricing.generationModel')}</option></select></label><ModelPicker label={t('pricing.model')} value={model} onChange={setModel} options={modelOptions} editable /><label>{t('pricing.currency')}<select value={currency} onChange={(event) => setCurrency(event.target.value)}><option value="USD">USD</option><option value="CNY">CNY</option></select></label>{schema ? <Form key={`${kind}-${locale}`} schema={localizeSchema(schema as RJSFSchema, locale)} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!writeTenant) return; try { const prefix = kind === 'generation' ? 'generation-prices' : 'prices'; await api(`/internal/v1/${prefix}/${encodeURIComponent(currency)}/${encodeURIComponent(model)}`, token, { method: 'POST', body: JSON.stringify(formData) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setMessage(t('pricing.savedMessage')); if (currency === displayCurrency) await load(currency); else setDisplayCurrency(currency); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!writeTenant || !model.trim()}>{t('pricing.save')}</button></Form> : <div className="empty">{schemasLoading ? t('common.loading') : t('providers.schemaMissing')}</div>}</div></details>
   </div>;
 }
 
@@ -520,6 +544,8 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   const { confirm, confirmationDialog } = useConfirmDialog([token, tenant, writeTenant]);
   const [routes, setRoutes] = useState<ModelRouteView[]>([]);
   const [credentials, setCredentials] = useState<KeyView[]>([]);
+  const [credentialsRequested, setCredentialsRequested] = useState(false);
+  const [credentialError, setCredentialError] = useState('');
   const providerGroups = useGroups('provider', token, writeTenant);
   const routeGroups = useGroups('route', token, writeTenant);
   const [form, setForm] = useState<RouteDraft>(emptyRouteDraft);
@@ -532,6 +558,8 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   const [error, setError] = useState('');
   const loadSequence = useRef(0);
   const loadAbort = useRef<AbortController | undefined>(undefined);
+  const credentialLoadSequence = useRef(0);
+  const credentialLoadAbort = useRef<AbortController | undefined>(undefined);
   const credentialSearchAbort = useRef<AbortController | undefined>(undefined);
   const scopeRef = useRef({ token, tenant, writeTenant });
   scopeRef.current = { token, tenant, writeTenant };
@@ -543,12 +571,12 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
     const loadToken = token; const loadTenant = tenant;
     if (!loadToken) { setRoutes([]); setCredentials([]); return; }
     try {
-      const [nextRoutes, nextCredentials] = await Promise.all([
-        apiRead<ModelRouteView[]>(`/internal/v1/model-routes${queryForTenant(loadTenant)}`, loadToken, { signal: controller.signal }),
-        apiRead<KeyView[]>(`/internal/v1/keys${queryForTenant(loadTenant)}`, loadToken, { signal: controller.signal }),
-      ]);
+      // The table is the route page's primary content. Credential choices are
+      // only used by an opened create/edit form, so never put their paged
+      // read on this critical path.
+      const nextRoutes = await apiRead<ModelRouteView[]>(`/internal/v1/model-routes${queryForTenant(loadTenant)}`, loadToken, { signal: controller.signal });
       if (sequence !== loadSequence.current || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant) return;
-      setRoutes(nextRoutes); setCredentials(nextCredentials); setError('');
+      setRoutes(nextRoutes); setError('');
     }
     catch (reason) { if (!controller.signal.aborted && sequence === loadSequence.current && scopeRef.current.token === loadToken && scopeRef.current.tenant === loadTenant) setError(messageOf(reason, t('common.requestFailed'))); }
   };
@@ -569,10 +597,32 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
     });
   };
   useEffect(() => {
-    loadSequence.current += 1; setRoutes([]); setCredentials([]); setForm(emptyRouteDraft); setFormCatalog({ valid: false, allowCustom: false });
+    credentialLoadAbort.current?.abort();
+    if (!credentialsRequested || !token || !writeTenant) {
+      setCredentials([]); setCredentialError('');
+      return;
+    }
+    const controller = new AbortController();
+    credentialLoadAbort.current = controller;
+    const sequence = ++credentialLoadSequence.current;
+    const loadToken = token; const loadTenant = tenant; const loadWriteTenant = writeTenant;
+    setCredentialError('');
+    void apiRead<KeyView[]>(`/internal/v1/keys${queryForTenant(loadWriteTenant)}`, loadToken, { signal: controller.signal })
+      .then((nextCredentials) => {
+        if (controller.signal.aborted || sequence !== credentialLoadSequence.current || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant || scopeRef.current.writeTenant !== loadWriteTenant) return;
+        setCredentials(nextCredentials);
+      })
+      .catch((reason) => {
+        if (controller.signal.aborted || sequence !== credentialLoadSequence.current || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant || scopeRef.current.writeTenant !== loadWriteTenant) return;
+        setCredentialError(messageOf(reason, t('common.requestFailed')));
+      });
+    return () => controller.abort();
+  }, [credentialsRequested, token, tenant, writeTenant, t]);
+  useEffect(() => {
+    loadSequence.current += 1; credentialLoadSequence.current += 1; setRoutes([]); setCredentials([]); setCredentialsRequested(false); setCredentialError(''); setForm(emptyRouteDraft); setFormCatalog({ valid: false, allowCustom: false });
     setEditing(undefined); setEditForm(emptyRouteDraft); setEditCatalog({ valid: false, allowCustom: false });
     setBusy(''); setMessage(''); setError(''); void load();
-    return () => { loadAbort.current?.abort(); credentialSearchAbort.current?.abort(); };
+    return () => { loadAbort.current?.abort(); credentialLoadAbort.current?.abort(); credentialSearchAbort.current?.abort(); };
   }, [token, tenant, writeTenant]);
   const statusFilter = useResourceListStatusFilter('model-routes', tenant, routes, (route) => route.enabled);
   const scopedUpstreams = upstreams.filter((value) => !value.tenant_external_id || value.tenant_external_id === writeTenant);
@@ -580,6 +630,7 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   const canSubmit = (draft: RouteDraft, catalogValid: boolean) => Boolean(writeTenant && catalogValid && draft.public_model.trim() && draft.upstream_model.trim()
     && (draft.upstream_account_ids.length > 0 || draft.included_provider_group_ids.length > 0));
   const beginEdit = (route: ModelRouteView) => {
+    setCredentialsRequested(true);
     setEditing(route);
     setEditCatalog({ valid: false, allowCustom: false });
     setEditForm({
@@ -630,10 +681,10 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
     finally { setBusy(''); }
   };
   return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} /><section className="management-layout">
-    <article className="panel"><div className="panel-title"><div><h2>{t('routes.title')}</h2><p className="muted">{t('routes.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>{error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="table-scroll"><table><thead><tr>{!tenant && <th>{t('credentials.tenant')}</th>}<th>{t('routes.publicModel')}</th><th>{t('routes.upstream')}</th><th>{t('routes.groups')}</th><th>{t('routes.upstreamModel')}</th><th>{t('routes.protocol')}</th><th>{t('routes.priority')}</th><th>{t('request.status')}</th><th>{t('routes.actions')}</th></tr></thead><tbody>{statusFilter.values.map((route) => <tr key={route.id}>{!tenant && <td><code>{route.tenant_external_id ?? '—'}</code></td>}<td><code>{route.public_model}</code></td><td><div className="table-chip-list">{(route.upstream_account_ids ?? (route.upstream_account_id ? [route.upstream_account_id] : [])).map((id) => <span key={id}>{upstreams.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><div className="table-chip-list">{(route.route_group_ids ?? []).map((id) => <span key={id}>{routeGroups.groups.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><code>{route.upstream_model}</code></td><td>{route.protocol}</td><td>{formatNumber(route.priority, locale)}</td><td><span className={`status ${route.enabled ? 'ok' : 'pending'}`}>{route.enabled ? t('common.enabled') : t('common.disabled')}</span></td><td><div className="row-actions"><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => beginEdit(route)}>{t('routes.edit')}</button><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => void setEnabled(route, !route.enabled)}>{route.enabled ? t('routes.disable') : t('routes.enable')}</button><button type="button" className="danger" title={route.enabled ? t('routes.disableBeforeDelete') : undefined} disabled={busy === route.id || !canManage(route) || route.enabled} onClick={() => void remove(route)}>{t('common.remove')}</button></div></td></tr>)}</tbody></table>{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('common.enabled')} empty={t('routes.empty')} />}</div>
+    <article className="panel"><div className="panel-title"><div><h2>{t('routes.title')}</h2><p className="muted">{t('routes.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>{error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{credentialError && <div className="notice error" role="alert">{credentialError}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="table-scroll"><table><thead><tr>{!tenant && <th>{t('credentials.tenant')}</th>}<th>{t('routes.publicModel')}</th><th>{t('routes.upstream')}</th><th>{t('routes.groups')}</th><th>{t('routes.upstreamModel')}</th><th>{t('routes.protocol')}</th><th>{t('routes.priority')}</th><th>{t('request.status')}</th><th>{t('routes.actions')}</th></tr></thead><tbody>{statusFilter.values.map((route) => <tr key={route.id}>{!tenant && <td><code>{route.tenant_external_id ?? '—'}</code></td>}<td><code>{route.public_model}</code></td><td><div className="table-chip-list">{(route.upstream_account_ids ?? (route.upstream_account_id ? [route.upstream_account_id] : [])).map((id) => <span key={id}>{upstreams.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><div className="table-chip-list">{(route.route_group_ids ?? []).map((id) => <span key={id}>{routeGroups.groups.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><code>{route.upstream_model}</code></td><td>{route.protocol}</td><td>{formatNumber(route.priority, locale)}</td><td><span className={`status ${route.enabled ? 'ok' : 'pending'}`}>{route.enabled ? t('common.enabled') : t('common.disabled')}</span></td><td><div className="row-actions"><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => beginEdit(route)}>{t('routes.edit')}</button><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => void setEnabled(route, !route.enabled)}>{route.enabled ? t('routes.disable') : t('routes.enable')}</button><button type="button" className="danger" title={route.enabled ? t('routes.disableBeforeDelete') : undefined} disabled={busy === route.id || !canManage(route) || route.enabled} onClick={() => void remove(route)}>{t('common.remove')}</button></div></td></tr>)}</tbody></table>{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('common.enabled')} empty={t('routes.empty')} />}</div>
       {editing && <div className="inline-editor form-panel"><div className="panel-title"><h3>{t('routes.editTitle', { model: editing.public_model })}</h3><button type="button" className="secondary" onClick={() => setEditing(undefined)}>{t('common.cancel')}</button></div><RouteFields token={token} tenant={writeTenant} draft={editForm} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setEditForm} onCatalogValidity={(valid, allowCustom) => setEditCatalog({ valid, allowCustom })} onCredentialQuery={searchCredential} /><button type="button" disabled={busy === editing.id || !canSubmit(editForm, editCatalog.valid)} onClick={() => void saveEdit()}>{t('common.save')}</button></div>}
     </article>
-    <details className="panel create-resource"><summary><span><b>{t('routes.createTitle')}</b><small>{t('routes.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel"><RouteFields token={token} tenant={writeTenant} draft={form} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setForm} onCatalogValidity={(valid, allowCustom) => setFormCatalog({ valid, allowCustom })} onCredentialQuery={searchCredential} /><button type="button" disabled={busy === 'create' || !canSubmit(form, formCatalog.valid)} onClick={async () => { setBusy('create'); setMessage(''); setError(''); try { await api('/internal/v1/model-routes', token, { method: 'POST', body: JSON.stringify({ ...routeRequest(form, formCatalog.allowCustom), tenant_external_id: writeTenant }) }); setForm(emptyRouteDraft); setFormCatalog({ valid: false, allowCustom: false }); setMessage(t('routes.created')); await Promise.all([load(), routeGroups.load]); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}>{t('routes.create')}</button></div></details>
+    <details className="panel create-resource" onToggle={(event) => { if (event.currentTarget.open) setCredentialsRequested(true); }}><summary><span><b>{t('routes.createTitle')}</b><small>{t('routes.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel"><RouteFields token={token} tenant={writeTenant} draft={form} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setForm} onCatalogValidity={(valid, allowCustom) => setFormCatalog({ valid, allowCustom })} onCredentialQuery={searchCredential} /><button type="button" disabled={busy === 'create' || !canSubmit(form, formCatalog.valid)} onClick={async () => { setBusy('create'); setMessage(''); setError(''); try { await api('/internal/v1/model-routes', token, { method: 'POST', body: JSON.stringify({ ...routeRequest(form, formCatalog.allowCustom), tenant_external_id: writeTenant }) }); setForm(emptyRouteDraft); setFormCatalog({ valid: false, allowCustom: false }); setMessage(t('routes.created')); await Promise.all([load(), routeGroups.load]); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}>{t('routes.create')}</button></div></details>
   </section><section className="routing-group-managers">
     <GroupManager kind="provider" token={token} tenant={writeTenant} groups={providerGroups.groups} resources={scopedUpstreams.map((value) => ({ value: value.id, label: value.name, description: value.driver }))} onChanged={providerGroups.load} />
     <GroupManager kind="route" token={token} tenant={writeTenant} groups={routeGroups.groups} resources={routes.filter(canManage).map((route) => ({ value: route.id, label: route.public_model, description: route.protocol }))} onChanged={async () => { await Promise.all([routeGroups.load(), load()]); }} />
@@ -980,16 +1031,17 @@ export function ProvidersPage({ token, tenant, writeTenant, onOpenRequest }: Ope
 
 export function PricingPage({ token, tenant, writeTenant }: OperatorPageProps) {
   const { t } = useI18n();
+  const [schemasRequested, setSchemasRequested] = useState(false);
   const resource = useOperatorResource(
-    Boolean(token), token,
-    () => api<ConfigurationSchemas>('/internal/v1/schemas', token, { signal: AbortSignal.timeout(10_000) }),
+    Boolean(token) && schemasRequested, token,
+    (signal) => api<ConfigurationSchemas>('/internal/v1/schemas', token, { signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]) }),
     t('common.requestFailed'),
   );
   // Schemas are only needed by the manual editor, not the price tables.
   // Keep it mounted while schema discovery completes or fails.
   return <>
     {resource.state.kind === 'failed' && <div className="notice error" role="alert">{resource.state.message}</div>}
-    <Pricing key={`${token}\0${tenant}`} token={token} tenant={tenant} writeTenant={writeTenant} schemas={resource.state.kind === 'ready' ? resource.state.value : undefined} />
+    <Pricing key={`${token}\0${tenant}`} token={token} tenant={tenant} writeTenant={writeTenant} schemas={resource.state.kind === 'ready' ? resource.state.value : undefined} schemasLoading={schemasRequested && (resource.state.kind === 'idle' || resource.state.kind === 'loading')} onRequestSchemas={() => setSchemasRequested(true)} />
   </>;
 }
 
