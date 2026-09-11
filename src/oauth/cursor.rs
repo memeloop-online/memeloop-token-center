@@ -350,7 +350,8 @@ pub async fn poll_cursor_login(
             lease_owner,
             ready_ciphertext,
         } => {
-            let login = open_private_json(&ready_ciphertext, key_material, CURSOR_READY_AAD)?;
+            let login: ReadyCursorLogin =
+                open_private_json(&ready_ciphertext, key_material, CURSOR_READY_AAD)?;
             if !providers.is_public(&login.provider_driver) {
                 let _ = db
                     .release_oauth_login_poll(session.session_id, lease_owner, now)
