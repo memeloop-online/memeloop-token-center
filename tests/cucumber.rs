@@ -1,5 +1,6 @@
 use std::{
     fmt,
+    panic::AssertUnwindSafe,
     str::FromStr,
     time::{Duration, Instant},
 };
@@ -187,6 +188,40 @@ async fn finish_scenario(world: Option<&mut TokenCenterWorld>) {
     // Stop and join it before inspecting mock expectations, so any failure belongs to this hook.
     stop_test_worker(world).await;
     verify_test_mocks(world).await;
+}
+
+async fn assert_lifecycle_contract() {
+    let (shutdown, mut receiver) = watch::channel(false);
+    let worker = tokio::spawn(async move {
+        receiver.changed().await.expect("worker shutdown signal");
+        assert!(*receiver.borrow(), "worker received shutdown");
+    });
+    let mock = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let mut world = TokenCenterWorld::default();
+    world.worker_shutdown = Some(shutdown);
+    world.worker_task = Some(worker);
+    world.mock = Some(mock);
+    let failure = AssertUnwindSafe(finish_scenario(Some(&mut world)))
+        .catch_unwind()
+        .await
+        .expect_err("unsatisfied mock expectation must fail in the scenario after hook");
+    assert!(world.worker_shutdown.is_none());
+    assert!(world.worker_task.is_none());
+    assert!(world.mock.is_none());
+
+    let message = failure
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| failure.downcast_ref::<&str>().copied())
+        .expect("wiremock verification panic contains a message");
+    assert!(message.contains("Verifications failed"), "{message}");
+    assert!(message.contains("expected exactly 1"), "{message}");
 }
 
 #[given("a token center backed by SQLite and memory object storage")]
@@ -7877,6 +7912,7 @@ async fn rotated_group_routing_is_stable(world: &mut TokenCenterWorld) {
 
 #[tokio::main]
 async fn main() {
+    assert_lifecycle_contract().await;
     let postgres_enabled = std::env::var_os("MTC_TEST_POSTGRES_URL").is_some();
     TokenCenterWorld::cucumber()
         // Every scenario boots an isolated application, database and plugin runtime. Cucumber's
@@ -7888,48 +7924,4 @@ async fn main() {
             postgres_enabled || !scenario.tags.iter().any(|tag| tag == "postgres")
         })
         .await;
-}
-
-#[cfg(test)]
-mod lifecycle_contract_tests {
-    use std::panic::AssertUnwindSafe;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn mock_expectation_failure_is_readable_after_the_worker_exits() {
-        let (shutdown, mut receiver) = watch::channel(false);
-        let worker = tokio::spawn(async move {
-            receiver.changed().await.expect("worker shutdown signal");
-            assert!(*receiver.borrow(), "worker received shutdown");
-        });
-        let mut world = TokenCenterWorld::default();
-        world.worker_shutdown = Some(shutdown);
-        world.worker_task = Some(worker);
-
-        stop_test_worker(&mut world).await;
-        assert!(world.worker_shutdown.is_none());
-        assert!(world.worker_task.is_none());
-
-        let mock = MockServer::start().await;
-        Mock::given(method("DELETE"))
-            .respond_with(ResponseTemplate::new(204))
-            .expect(1)
-            .mount(&mock)
-            .await;
-        world.mock = Some(mock);
-        let failure = AssertUnwindSafe(verify_test_mocks(&mut world))
-            .catch_unwind()
-            .await
-            .expect_err("unsatisfied mock expectation must fail explicitly");
-        assert!(world.mock.is_none());
-
-        let message = failure
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| failure.downcast_ref::<&str>().copied())
-            .expect("wiremock verification panic contains a message");
-        assert!(message.contains("Verifications failed"), "{message}");
-        assert!(message.contains("expected exactly 1"), "{message}");
-    }
 }
