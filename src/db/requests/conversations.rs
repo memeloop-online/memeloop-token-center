@@ -249,6 +249,13 @@ impl Database {
                 "conversation projection lease ownership changed".into(),
             ));
         }
+        emit_conversation_projected_event_in_transaction(
+            &mut transaction,
+            request_id,
+            tenant_id,
+            key_id,
+        )
+        .await?;
         transaction.commit().await?;
         Ok(true)
     }
@@ -827,6 +834,49 @@ impl Database {
             edges_truncated,
         })
     }
+}
+
+async fn emit_conversation_projected_event_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    request_id: Uuid,
+    tenant_id: Uuid,
+    key_id: Uuid,
+) -> Result<(), AppError> {
+    // Take the cursor timestamp only after semantic materialization and the
+    // outbox acknowledgement have succeeded. Reusing the projector's lease
+    // timestamp would let a live cursor advance past this still-uncommitted
+    // event while the more expensive projection writes are running.
+    let event_at = unix_millis();
+    let event_id = Uuid::now_v7().to_string();
+    let request_id = request_id.to_string();
+    let tenant_id = tenant_id.to_string();
+    let key_id = key_id.to_string();
+    if !claim_request_event_locator(
+        transaction,
+        &event_id,
+        event_at,
+        &tenant_id,
+        &key_id,
+        &request_id,
+    )
+    .await?
+    {
+        return Err(AppError::Internal);
+    }
+    let inserted = sqlx::query(
+        "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT $1, tenant_id, key_id, id, $2, 'projected', protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_records WHERE id = $3 AND tenant_id = $4 AND key_id = $5 AND completed_at IS NOT NULL",
+    )
+    .bind(event_id)
+    .bind(event_at)
+    .bind(request_id)
+    .bind(tenant_id)
+    .bind(key_id)
+    .execute(&mut **transaction)
+    .await?;
+    if inserted.rows_affected() != 1 {
+        return Err(AppError::Internal);
+    }
+    Ok(())
 }
 
 pub(crate) async fn attach_conversation_upstream_response_in_transaction(
