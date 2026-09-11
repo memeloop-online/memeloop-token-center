@@ -9,6 +9,9 @@ type WorkflowJob = { if?: string; needs?: string | string[]; steps?: WorkflowSte
 
 test('release contains only runtime images and no retired migration delivery surface', () => {
   const dockerfile = read('Dockerfile');
+  const compose = read('compose.yaml');
+  const minioImage = 'quay.io/minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e';
+  const minioClientImage = 'quay.io/minio/mc@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3';
   assert.ok(!dockerfile.includes('import-cpa-session-archive'));
   assert.ok(!dockerfile.includes('memeloop-token-center-importer'));
   contains('Dockerfile.plugin-installer', 'FROM ${RUNTIME_IMAGE}');
@@ -20,6 +23,14 @@ test('release contains only runtime images and no retired migration delivery sur
   assert.ok(!workflow.includes('test-cpa-upstream-import'));
   assert.ok(!workflow.includes('legacy_credentials_bulk_postgres'));
   assert.ok(!workflow.includes('test-session-archive-delta-export'));
+  assert.equal(occurrences(workflow, minioImage), 1);
+  assert.equal(occurrences(compose, minioImage), 1);
+  assert.equal(occurrences(workflow, minioClientImage), 1);
+  assert.equal(occurrences(compose, minioClientImage), 1);
+  assert.ok(!workflow.includes('minio/minio:'));
+  assert.ok(!compose.includes('minio/minio:'));
+  assert.ok(!workflow.includes('minio/mc:'));
+  assert.ok(!compose.includes('minio/mc:'));
 
   const workflowFiles = readdirSync(new URL('../../.github/workflows/', import.meta.url)).filter((name) => /\.ya?ml$/.test(name));
   const workflows = workflowFiles.map((name) => read(`.github/workflows/${name}`)).join('\n');
