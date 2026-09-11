@@ -46,9 +46,23 @@ impl RoutingAttemptPolicy {
 
 /// The database may inspect a larger defensive set, while component hooks and
 /// outbound sends remain bounded by the much smaller attempt budget. Only
-/// validated, sendable candidates count against the resolver side of this
-/// policy; request-local compatibility filters run before attempt accounting.
+/// authorized candidate handles count against the resolver side of this
+/// policy; transport materialization and request-local compatibility filters
+/// run lazily before attempt accounting.
 pub(crate) const PROXY_ROUTING_POLICY: RoutingAttemptPolicy = RoutingAttemptPolicy::new(3, 1_000);
+
+/// A non-sensitive authorization and ordering handle for one proxy candidate.
+///
+/// Transport configuration and encrypted credentials are deliberately absent:
+/// the proxy materializes only the candidate it is about to admit.  This keeps
+/// a malformed standby from affecting a healthy preferred route.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizedUpstreamCandidate {
+    pub route_id: Uuid,
+    pub account_id: Uuid,
+    pub(crate) transport_revision: i64,
+    pub(crate) credential_generation: i64,
+}
 
 /// Account and credential fields read by one send-time database statement.
 /// Route-specific fields are intentionally absent because they were already

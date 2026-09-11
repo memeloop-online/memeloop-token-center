@@ -142,7 +142,7 @@ pub use requests::{
     normalize_proxy_usage,
 };
 pub(crate) use requests::{
-    ConversationObservationInput, MAX_STATS_RANGE_MILLIS,
+    ConversationObservationInput, MAX_STATS_RANGE_MILLIS, SwitchProxyCandidateInput,
     attach_conversation_upstream_response_in_transaction, claim_request_event_locator,
     price_token_usage, proxy_contract_ceiling_micros, record_request_finished_in_transaction,
     record_request_started_in_transaction, reserve_usage_in_transaction, search_prefix,

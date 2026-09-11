@@ -266,14 +266,33 @@ async fn hint_routing_fixture(
     standby_uri: String,
     hint_unauthorized_account: bool,
 ) -> HintRoutingFixture {
+    hint_routing_fixture_with_database(
+        label,
+        preferred_uri,
+        standby_uri,
+        hint_unauthorized_account,
+        None,
+    )
+    .await
+}
+
+async fn hint_routing_fixture_with_database(
+    label: &str,
+    preferred_uri: String,
+    standby_uri: String,
+    hint_unauthorized_account: bool,
+    database_url: Option<String>,
+) -> HintRoutingFixture {
     let directory = tempfile::tempdir().unwrap();
-    let database_url = format!(
-        "sqlite://{}?mode=rwc",
-        directory
-            .path()
-            .join(format!("hint-routing-{label}.db"))
-            .display()
-    );
+    let database_url = database_url.unwrap_or_else(|| {
+        format!(
+            "sqlite://{}?mode=rwc",
+            directory
+                .path()
+                .join(format!("hint-routing-{label}.db"))
+                .display()
+        )
+    });
     let initial_state = AppState::initialize(Config::for_test(database_url.clone()))
         .await
         .unwrap();
@@ -297,7 +316,11 @@ async fn hint_routing_fixture(
                     tenant_external_id: tenant.clone(),
                     name: format!("{label}-{name}"),
                     driver: "http-json".to_owned(),
-                    config: json!({"base_url": uri, "network_scope": "public"}),
+                    config: json!({
+                        "base_url": uri,
+                        "network_scope": "public",
+                        "input_token_overhead_ceiling": if name == "standby" { 4096 } else { 0 }
+                    }),
                     credential: UpstreamCredential::None,
                     oauth_session_id: None,
                     oauth_driver: None,
@@ -406,6 +429,19 @@ async fn put_accounts_in_cooldown(fixture: &HintRoutingFixture, account_ids: &[u
     pool.close().await;
 }
 
+async fn corrupt_upstream_credential(fixture: &HintRoutingFixture, account_id: uuid::Uuid) {
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query(
+        "UPDATE upstream_credentials SET credential_ciphertext = 'malformed-selected-candidate'
+         WHERE upstream_account_id = $1",
+    )
+    .bind(account_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+}
+
 async fn call_hint_routing_fixture(fixture: &HintRoutingFixture) -> (StatusCode, Value) {
     call(
         &fixture.state,
@@ -453,8 +489,129 @@ async fn authorized_traffic_hint_is_preferred_ahead_of_route_priority() {
     standby.verify().await;
 }
 
+async fn assert_malformed_standby_is_lazy(database_url: Option<String>, label: &str) {
+    let preferred = MockServer::start().await;
+    let standby = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(successful_hint_response("preferred"))
+        .expect(1)
+        .mount(&preferred)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(successful_hint_response("unexpected-standby"))
+        .expect(0)
+        .mount(&standby)
+        .await;
+    let fixture = hint_routing_fixture_with_database(
+        label,
+        preferred.uri(),
+        standby.uri(),
+        false,
+        database_url,
+    )
+    .await;
+    corrupt_upstream_credential(&fixture, fixture.standby_account_id).await;
+
+    let (status, body) = call_hint_routing_fixture(&fixture).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["choices"][0]["message"]["content"], "preferred");
+    preferred.verify().await;
+    standby.verify().await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let reservation_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM usage_reservations WHERE key_id = $1")
+            .bind(fixture.issued.key_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    pool.close().await;
+    assert_eq!(reservation_count, 1, "standby must not reserve capacity");
+}
+
+async fn assert_selected_malformed_candidate_fails_closed(
+    database_url: Option<String>,
+    label: &str,
+) {
+    let preferred = MockServer::start().await;
+    let standby = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(successful_hint_response("unexpected-preferred"))
+        .expect(0)
+        .mount(&preferred)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(successful_hint_response("unexpected-standby"))
+        .expect(0)
+        .mount(&standby)
+        .await;
+    let fixture = hint_routing_fixture_with_database(
+        label,
+        preferred.uri(),
+        standby.uri(),
+        false,
+        database_url,
+    )
+    .await;
+    put_accounts_in_cooldown(&fixture, &[fixture.preferred_account_id]).await;
+    corrupt_upstream_credential(&fixture, fixture.standby_account_id).await;
+
+    let (status, _) = call_hint_routing_fixture(&fixture).await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    preferred.verify().await;
+    standby.verify().await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let terminal: (i64, String, i64) = sqlx::query_as(
+        "SELECT request.status_code, request.error_code,
+                (SELECT COUNT(*) FROM usage_reservations reservation
+                 WHERE reservation.key_id = request.key_id)
+         FROM request_records request
+         WHERE request.key_id = $1 ORDER BY request.created_at DESC LIMIT 1",
+    )
+    .bind(fixture.issued.key_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    assert_eq!(terminal, (502, "upstream_candidate_invalid".to_owned(), 1));
+}
+
+#[tokio::test]
+async fn sqlite_malformed_standby_does_not_poison_a_healthy_hinted_primary() {
+    assert_malformed_standby_is_lazy(None, "sqlite-lazy-malformed-standby").await;
+}
+
+#[tokio::test]
+async fn sqlite_selected_malformed_candidate_fails_closed() {
+    assert_selected_malformed_candidate_fails_closed(None, "sqlite-selected-malformed").await;
+}
+
+#[tokio::test]
+async fn postgres_malformed_standby_does_not_poison_a_healthy_hinted_primary() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let label = format!("postgres-lazy-malformed-{}", uuid::Uuid::now_v7());
+    assert_malformed_standby_is_lazy(Some(database_url), &label).await;
+}
+
+#[tokio::test]
+async fn postgres_selected_malformed_candidate_fails_closed() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let label = format!("postgres-selected-malformed-{}", uuid::Uuid::now_v7());
+    assert_selected_malformed_candidate_fails_closed(Some(database_url), &label).await;
+}
+
 #[tokio::test]
 async fn cooled_down_traffic_hint_fails_over_to_healthy_authorized_candidate() {
+    assert_cooldown_failover_keeps_one_reservation(None, "cooldown").await;
+}
+
+async fn assert_cooldown_failover_keeps_one_reservation(database_url: Option<String>, label: &str) {
     let preferred = MockServer::start().await;
     let standby = MockServer::start().await;
     Mock::given(method("POST"))
@@ -468,7 +625,14 @@ async fn cooled_down_traffic_hint_fails_over_to_healthy_authorized_candidate() {
         .expect(1)
         .mount(&standby)
         .await;
-    let fixture = hint_routing_fixture("cooldown", preferred.uri(), standby.uri(), false).await;
+    let fixture = hint_routing_fixture_with_database(
+        label,
+        preferred.uri(),
+        standby.uri(),
+        false,
+        database_url,
+    )
+    .await;
     put_accounts_in_cooldown(&fixture, &[fixture.preferred_account_id]).await;
 
     let (status, body) = call_hint_routing_fixture(&fixture).await;
@@ -477,6 +641,38 @@ async fn cooled_down_traffic_hint_fails_over_to_healthy_authorized_candidate() {
     assert_eq!(body["choices"][0]["message"]["content"], "standby");
     preferred.verify().await;
     standby.verify().await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let persisted: (String, i64, i64, i64) = sqlx::query_as(
+        "SELECT request.upstream_account_id, reservation.reserved_tokens, window.tokens,
+                (SELECT COUNT(*) FROM usage_reservations reservation
+                 WHERE reservation.key_id = request.key_id)
+         FROM request_records request
+         JOIN usage_reservations reservation ON reservation.id = request.reservation_id
+         JOIN rate_limit_windows window ON window.key_id = reservation.key_id
+              AND window.window_start = reservation.rate_window_start
+         WHERE request.key_id = $1 ORDER BY request.created_at DESC LIMIT 1",
+    )
+    .bind(fixture.issued.key_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    assert_eq!(persisted.0, fixture.standby_account_id.to_string());
+    assert!(
+        persisted.1 > 8_000,
+        "standby-specific overhead must replace the primary reservation bound"
+    );
+    assert_eq!(persisted.2, persisted.1);
+    assert_eq!(persisted.3, 1);
+}
+
+#[tokio::test]
+async fn postgres_cooldown_failover_resizes_the_same_reservation() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let label = format!("postgres-cooldown-resize-{}", uuid::Uuid::now_v7());
+    assert_cooldown_failover_keeps_one_reservation(Some(database_url), &label).await;
 }
 
 #[tokio::test]

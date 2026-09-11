@@ -6,8 +6,8 @@ use uuid::Uuid;
 
 use super::super::{AppError, Database, parse_uuid, unix_millis};
 use crate::provider::{
-    PROXY_ROUTING_POLICY, ResolvedUpstream, UpstreamTransportSnapshot, open_credential,
-    validate_config,
+    AuthorizedUpstreamCandidate, PROXY_ROUTING_POLICY, ResolvedUpstream, UpstreamTransportSnapshot,
+    open_credential, validate_config,
 };
 
 use super::types::{GrantedModelCapabilitySource, RouteSelectionOptions};
@@ -162,20 +162,49 @@ impl Database {
         selection: RouteSelectionOptions,
         key_material: &[u8],
     ) -> Result<Vec<ResolvedUpstream>, AppError> {
+        let candidates = self
+            .list_authorized_upstream_candidates_with_hint(
+                key_id,
+                tenant_id,
+                public_model,
+                protocol,
+                selection,
+            )
+            .await?;
+        let mut resolved = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if let Some(candidate) = self
+                .materialize_authorized_upstream_candidate(&candidate, key_material)
+                .await?
+            {
+                resolved.push(candidate);
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// Lists authorized candidates in deterministic preference order without
+    /// reading their transport configuration or encrypted credentials.
+    pub async fn list_authorized_upstream_candidates_with_hint(
+        &self,
+        key_id: Uuid,
+        tenant_id: Uuid,
+        public_model: &str,
+        protocol: &str,
+        selection: RouteSelectionOptions,
+    ) -> Result<Vec<AuthorizedUpstreamCandidate>, AppError> {
         let RouteSelectionOptions {
             upstream_account_hint,
             selection_seed,
         } = selection;
         let rows = sqlx::query(
-             "SELECT r.id AS route_id, r.priority, candidates.upstream_model,
-                     candidates.scheduling_weight, a.id AS account_id,
-                     a.updated_at AS transport_revision, a.credential_generation,
-                     a.driver, a.config_json, c.credential_ciphertext
+             "SELECT r.id AS route_id, r.priority, candidates.scheduling_weight,
+                     a.id AS account_id, a.updated_at AS transport_revision,
+                     a.credential_generation
              FROM model_routes r
              JOIN model_route_eligible_upstream_accounts candidates
                ON candidates.tenant_id = r.tenant_id AND candidates.model_route_id = r.id
              JOIN upstream_accounts a ON a.id = candidates.upstream_account_id AND a.tenant_id = r.tenant_id
-             JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at > $5)
              WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3
                AND r.enabled = 1 AND a.status = 'active'
                AND (
@@ -189,13 +218,12 @@ impl Database {
                  )
                )
              ORDER BY r.priority ASC, r.id ASC, a.id ASC
-             LIMIT $6",
+             LIMIT $5",
         )
         .bind(tenant_id.to_string())
         .bind(public_model)
         .bind(protocol)
         .bind(key_id.to_string())
-        .bind(unix_millis())
         .bind(PROXY_ROUTING_POLICY.candidate_query_limit())
         .fetch_all(&self.pool)
         .await?;
@@ -227,43 +255,89 @@ impl Database {
                 .then_with(|| left.route_id.cmp(&right.route_id))
                 .then_with(|| left.account_id.cmp(&right.account_id))
         });
-        let mut resolved = Vec::with_capacity(
+        let mut ordered = Vec::with_capacity(
             candidates
                 .len()
                 .min(PROXY_ROUTING_POLICY.max_resolved_candidates()),
         );
         for candidate in candidates {
-            let config: serde_json::Value =
-                serde_json::from_str(&candidate.config_json).map_err(|_| AppError::Internal)?;
-            let base_url = validate_config(&config)?;
-            let credential = open_credential(&candidate.credential_ciphertext, key_material)?;
-            let now = unix_millis();
-            if credential
-                .expires_at()
-                .is_some_and(|expires_at| expires_at <= now)
-            {
-                continue;
-            }
-            credential.validate(now)?;
-            // Corrupt encrypted material or route configuration is not a
-            // normal health/readiness transition. Do not silently change
-            // providers when an authorized candidate is malformed.
-            resolved.push(ResolvedUpstream {
+            ordered.push(AuthorizedUpstreamCandidate {
                 route_id: candidate.route_id,
                 account_id: candidate.account_id,
                 transport_revision: candidate.transport_revision,
                 credential_generation: candidate.credential_generation,
-                driver: candidate.driver,
-                base_url,
-                config,
-                upstream_model: candidate.upstream_model,
-                credential,
             });
-            if resolved.len() == PROXY_ROUTING_POLICY.max_resolved_candidates() {
+            if ordered.len() == PROXY_ROUTING_POLICY.max_resolved_candidates() {
                 break;
             }
         }
-        Ok(resolved)
+        Ok(ordered)
+    }
+
+    /// Reads and validates one candidate immediately before request planning.
+    /// A disappeared or rotated tuple is ordinary unavailability; malformed
+    /// selected material remains an explicit fail-closed error.
+    pub(crate) async fn materialize_authorized_upstream_candidate(
+        &self,
+        candidate: &AuthorizedUpstreamCandidate,
+        key_material: &[u8],
+    ) -> Result<Option<ResolvedUpstream>, AppError> {
+        let row = sqlx::query(
+            "SELECT route_candidate.upstream_model, account.driver,
+                    account.config_json, credential.credential_ciphertext
+             FROM model_routes route
+             JOIN model_route_eligible_upstream_accounts route_candidate
+               ON route_candidate.tenant_id = route.tenant_id
+              AND route_candidate.model_route_id = route.id
+              AND route_candidate.upstream_account_id = $2
+             JOIN upstream_accounts account
+               ON account.tenant_id = route.tenant_id
+              AND account.id = route_candidate.upstream_account_id
+              AND account.status = 'active'
+              AND account.updated_at = $3
+              AND account.credential_generation = $4
+             JOIN upstream_credentials credential
+               ON credential.upstream_account_id = account.id
+              AND credential.generation = account.credential_generation
+              AND credential.revoked_at IS NULL
+              AND (credential.expires_at IS NULL OR credential.expires_at > $5)
+             WHERE route.id = $1 AND route.enabled = 1",
+        )
+        .bind(candidate.route_id.to_string())
+        .bind(candidate.account_id.to_string())
+        .bind(candidate.transport_revision)
+        .bind(candidate.credential_generation)
+        .bind(unix_millis())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let config_json: String = row.try_get("config_json")?;
+        let config: serde_json::Value =
+            serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?;
+        let base_url = validate_config(&config)?;
+        let ciphertext: String = row.try_get("credential_ciphertext")?;
+        let credential = open_credential(&ciphertext, key_material)?;
+        let now = unix_millis();
+        if credential
+            .expires_at()
+            .is_some_and(|expires_at| expires_at <= now)
+        {
+            return Ok(None);
+        }
+        credential.validate(now)?;
+        Ok(Some(ResolvedUpstream {
+            route_id: candidate.route_id,
+            account_id: candidate.account_id,
+            transport_revision: candidate.transport_revision,
+            credential_generation: candidate.credential_generation,
+            driver: row.try_get("driver")?,
+            base_url,
+            config,
+            upstream_model: row.try_get("upstream_model")?,
+            credential,
+        }))
     }
 
     pub async fn granted_available_models(
@@ -403,10 +477,6 @@ struct RoutingCandidate {
     credential_generation: i64,
     priority: i64,
     scheduling_weight: i64,
-    upstream_model: String,
-    driver: String,
-    config_json: String,
-    credential_ciphertext: String,
 }
 
 impl RoutingCandidate {
@@ -422,10 +492,6 @@ impl RoutingCandidate {
             credential_generation: row.try_get("credential_generation")?,
             priority: row.try_get("priority")?,
             scheduling_weight,
-            upstream_model: row.try_get("upstream_model")?,
-            driver: row.try_get("driver")?,
-            config_json: row.try_get("config_json")?,
-            credential_ciphertext: row.try_get("credential_ciphertext")?,
         })
     }
 }
