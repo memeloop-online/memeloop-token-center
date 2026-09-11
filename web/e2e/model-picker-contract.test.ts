@@ -20,12 +20,17 @@ test('model hierarchy uses actual account membership, excludes removed accounts,
   assert.equal(unknown.disabled, true);
 });
 
-test('all maintained model selectors share the same picker without replacing catalog coverage validation', async () => {
+test('all maintained model selectors share the same picker and stale catalogs remain safely restricted', async () => {
   for (const path of ['operator/TypedFilterBuilder.tsx', 'operator/UpstreamModelCombobox.tsx', 'operator/pages/SystemSettingsPage.tsx', 'self/GeneratePage.tsx']) {
     assert.match(await readFile(new URL(`../src/${path}`, import.meta.url), 'utf8'), /<ModelPicker/);
   }
   const upstream = await readFile(new URL('../src/operator/UpstreamModelCombobox.tsx', import.meta.url), 'utf8');
   assert.match(upstream, /modelConfirmationValidity\(/);
+  assert.match(upstream, /routes\.catalogLastVerified/);
+  assert.doesNotMatch(upstream, /confirmPartialCoverage|catalogNotReady|partialConfirmed/);
+  const messages = await readFile(new URL('../src/i18n.tsx', import.meta.url), 'utf8');
+  assert.match(messages, /'routes\.catalogReady': '模型目录已加载。'/);
+  assert.match(messages, /'routes\.catalogReady': 'Model catalogs loaded\.'/);
   assert.match(upstream, /Math\.min\(4, ids\.length\)/);
   const picker = await readFile(new URL('../src/ModelPicker.tsx', import.meta.url), 'utf8');
   assert.match(picker, /popover="auto"/);

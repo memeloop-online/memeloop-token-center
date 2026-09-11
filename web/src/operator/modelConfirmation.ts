@@ -5,16 +5,13 @@ export function confirmationForScope(state: ModelConfirmation, scope: string): M
   return state.scope === scope ? state : { scope, confirmed: false };
 }
 
-export function modelConfirmationValidity({ hasValue, selected, catalogFresh, partialConfirmed, customAllowed, customConfirmed }: {
+export function modelConfirmationValidity({ hasValue, catalogListed, customAllowed, customConfirmed }: {
   hasValue: boolean;
-  selected: { complete_coverage: boolean } | undefined;
-  catalogFresh: boolean;
-  partialConfirmed: boolean;
+  catalogListed: boolean;
   customAllowed: boolean;
   customConfirmed: boolean;
 }) {
-  const selectedValid = Boolean(selected && catalogFresh && (selected.complete_coverage || partialConfirmed));
-  const needsCustomConfirmation = hasValue && (!selected || !catalogFresh);
+  const needsCustomConfirmation = hasValue && !catalogListed;
   const allowCustom = Boolean(needsCustomConfirmation && customAllowed && customConfirmed);
-  return { needsCustomConfirmation, allowCustom, valid: selectedValid || allowCustom };
+  return { needsCustomConfirmation, allowCustom, valid: catalogListed || allowCustom };
 }
