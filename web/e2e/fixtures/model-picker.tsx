@@ -9,16 +9,19 @@ import '../../src/theme.css';
 import '../../src/operator/operator.css';
 
 const accounts = [
+  { id: 'd', name: 'Archived account', driver: 'provider-0', status: 'disabled' },
   { id: 'a', name: 'Research account', driver: 'provider-a', status: 'active' },
   { id: 'b', name: 'Production account', driver: 'provider-b', status: 'active' },
   { id: 'c', name: 'Retired account', driver: 'provider-c', status: 'disabled' },
 ] as UpstreamAccount[];
 const routes = [
+  { id: 'route-d', public_model: 'archived-model', upstream_model: 'native-d', protocol: 'openai', upstream_account_ids: ['d'], enabled: true },
   { id: 'route-a', public_model: 'research-model', upstream_model: 'native-a', protocol: 'openai', upstream_account_ids: ['a'], enabled: true },
   { id: 'route-b', public_model: 'production-model', upstream_model: 'native-b', protocol: 'anthropic', upstream_account_ids: ['b'], enabled: true },
   { id: 'route-c', public_model: 'retired-model', upstream_model: 'native-c', protocol: 'openai', upstream_account_ids: ['c'], enabled: true },
 ] as ModelRouteView[];
 const groups = [
+  { id: 'group-d', name: 'Archive pool', member_ids: ['d'] },
   { id: 'group-a', name: 'Research pool', member_ids: ['a'] },
   { id: 'group-b', name: 'Production pool', member_ids: ['b'] },
   { id: 'group-c', name: 'Retired pool', member_ids: ['c'] },

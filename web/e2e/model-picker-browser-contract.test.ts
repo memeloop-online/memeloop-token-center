@@ -40,6 +40,7 @@ test('filters are non-modal themed popovers and model selection is searchable by
         assert.equal(color, theme === 'light' ? 'rgb(255, 255, 255)' : 'rgb(13, 28, 32)');
         await page.keyboard.press('Escape');
         await filter.waitFor({ state: 'hidden' });
+        assert.equal(await page.evaluate(() => document.activeElement === document.querySelector('.typed-filter-actions button')), true, 'Escape restores focus to the non-modal popover trigger');
         await trigger.click();
         await page.locator('[data-outside]').click();
         await filter.waitFor({ state: 'hidden' });
@@ -81,6 +82,11 @@ test('filters are non-modal themed popovers and model selection is searchable by
     const unavailable = settingsCatalog.getByRole('option', { name: /retired-model/i });
     assert.equal(await unavailable.getAttribute('aria-disabled'), 'true');
     assert.equal(await unavailable.isDisabled(), true);
+    await settingsCatalog.getByRole('combobox').fill('model');
+    assert.equal(await settingsCatalog.getByRole('option').first().isDisabled(), true, 'the first visual result exercises disabled-result keyboard handling');
+    await settingsCatalog.getByRole('combobox').press('Enter');
+    await settingsCatalog.waitFor({ state: 'hidden' });
+    assert.match(await page.locator('.system-settings .model-picker-trigger').textContent() ?? '', /production-model/, 'Enter skips an unavailable first result and chooses the first available route');
     assert.deepEqual(pageErrors, [], 'model picker interactions must not produce page errors');
   } finally {
     await browser.close();

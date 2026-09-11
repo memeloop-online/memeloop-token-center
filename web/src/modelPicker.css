@@ -24,6 +24,10 @@
 .model-picker-metadata .model-picker-availability.unavailable, .model-picker-metadata .model-picker-health.unhealthy { border-color: #a35757; color: #ef9292; }
 .model-picker-metadata .model-picker-health.degraded { border-color: #a98744; color: #e3bd72; }
 .shared-model-picker :focus-visible, .shared-model-popover :focus-visible { outline: 2px solid var(--picker-border); outline-offset: 2px; }
+:root[data-theme='light'] .model-picker-metadata .model-picker-availability.available { border-color: #287553; color: #176543; }
+:root[data-theme='light'] .model-picker-metadata .model-picker-availability.unavailable,
+:root[data-theme='light'] .model-picker-metadata .model-picker-health.unhealthy { border-color: #a64b4b; color: #922f2f; }
+:root[data-theme='light'] .model-picker-metadata .model-picker-health.degraded { border-color: #916b27; color: #765114; }
 :root[data-theme='light'] .typed-filter-builder .filter-chip,
 :root[data-theme='light'] .typed-filter-dialog .filter-chip { background: var(--picker-hover); border-color: var(--picker-border); color: var(--picker-text); }
 :root[data-theme='light'] .model-combobox .custom-model-confirm { background: #fff8e5; border-color: #c7ac63; color: #685014; }
