@@ -33,6 +33,7 @@ const SUPPORTED_SERVICE_SCOPES: &[&str] = &[
     "service_tokens:write",
     "tenants:read",
     "tenants:write",
+    "upstreams:import:write",
 ];
 
 #[derive(Serialize, Deserialize)]

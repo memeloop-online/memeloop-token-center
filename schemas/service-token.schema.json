@@ -42,7 +42,8 @@
           "schemas:read",
           "metrics:read",
           "entitlements:read",
-          "entitlements:write"
+          "entitlements:write",
+          "upstreams:import:write"
         ]
       }
     }

@@ -21,6 +21,7 @@ routes.
 - [Architecture](architecture.md)
 - [Development handoff](development-handoff.md)
 - [HTTP API contract](../openapi/openapi.yaml)
+- [Native OAuth cohort imports](native-oauth-imports.md)
 - [Deployment readiness](deployment-readiness.md)
 - [Acceptance matrix](acceptance-matrix.md)
 - [Semantic execution metadata](semantic-execution-metadata.md)

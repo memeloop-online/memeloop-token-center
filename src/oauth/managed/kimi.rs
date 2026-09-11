@@ -13,6 +13,26 @@ const CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const SCHEMA: &str = "kimi-oauth-v1";
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeImportDocument {
+    #[serde(rename = "type")]
+    kind: String,
+    access_token: String,
+    refresh_token: String,
+    token_type: String,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    device_id: Option<String>,
+    #[serde(default)]
+    expired: Option<String>,
+    #[serde(default)]
+    last_refresh: Option<String>,
+    #[serde(default)]
+    disabled: bool,
+}
+
 fn invalid() -> AppError {
     AppError::BadRequest("Kimi OAuth credential is invalid".into())
 }
@@ -26,6 +46,65 @@ fn optional_text(value: Option<&str>) -> Result<(), AppError> {
         super::controlled_text(value, 2048, true, "Kimi")?;
     }
     Ok(())
+}
+
+/// Parse the fixed native Kimi import document without constructing a network
+/// client, resolving DNS, refreshing, or contacting the provider.
+pub(crate) fn credential_from_native_import(
+    payload: &Value,
+) -> Result<UpstreamCredential, AppError> {
+    let source: NativeImportDocument =
+        serde_json::from_value(payload.clone()).map_err(|_| invalid())?;
+    if source.kind != "kimi"
+        || source.disabled
+        || !source.token_type.eq_ignore_ascii_case("bearer")
+    {
+        return Err(invalid());
+    }
+    super::bearer_token(&source.access_token, "Kimi")?;
+    super::required_secret(&source.refresh_token, "Kimi")?;
+    optional_text(source.scope.as_deref())?;
+    optional_text(source.device_id.as_deref())?;
+    if let Some(last_refresh) = source.last_refresh.as_deref().filter(|value| !value.is_empty()) {
+        rfc3339_millis(last_refresh)?;
+    }
+    let expires_at = source
+        .expired
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(rfc3339_millis)
+        .transpose()?;
+    let credential = UpstreamCredential::OAuth {
+        access_token: source.access_token,
+        refresh_token: Some(source.refresh_token),
+        expires_at,
+        header: "authorization".to_owned(),
+        prefix: "Bearer ".to_owned(),
+        adapter_state: Some(json!({
+            "schema": SCHEMA,
+            "device_id": source.device_id,
+            "scope": source.scope,
+            "token_type": source.token_type,
+        })),
+        proxy_url: None,
+        proxy_network_scope: None,
+    };
+    validate_credential(&credential)?;
+    Ok(credential)
+}
+
+pub(crate) fn native_import_config() -> Value {
+    json!({
+        "base_url": BASE_URL,
+        "network_scope": "public",
+        "reservation_token_bounds": {},
+    })
+}
+
+fn rfc3339_millis(value: &str) -> Result<i64, AppError> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.timestamp_millis())
+        .map_err(|_| invalid())
 }
 
 pub(crate) fn validate_credential(credential: &UpstreamCredential) -> Result<(), AppError> {
@@ -218,6 +297,46 @@ mod tests {
             proxy_url: None,
             proxy_network_scope: None,
         }
+    }
+
+    fn native_document(expired: &str) -> Value {
+        json!({
+            "type": "kimi",
+            "access_token": "native-fixture-access",
+            "refresh_token": "native-fixture-refresh",
+            "token_type": "Bearer",
+            "scope": "coding",
+            "device_id": "native-fixture-device",
+            "expired": expired,
+            "last_refresh": "2026-09-01T00:00:00Z",
+            "disabled": false
+        })
+    }
+
+    #[test]
+    fn native_import_parsing_is_local_strict_and_preserves_expiry() {
+        let document = native_document("2099-01-01T00:00:00Z");
+        let credential = credential_from_native_import(&document).unwrap();
+        assert_eq!(
+            credential.adapter_state().unwrap()["device_id"],
+            "native-fixture-device"
+        );
+        assert_eq!(
+            credential.expires_at(),
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
+                    .unwrap()
+                    .timestamp_millis()
+            )
+        );
+        assert_eq!(native_import_config()["base_url"], BASE_URL);
+
+        let mut disabled = document.clone();
+        disabled["disabled"] = json!(true);
+        assert!(credential_from_native_import(&disabled).is_err());
+        let mut unknown = document;
+        unknown["unexpected"] = json!("rejected");
+        assert!(credential_from_native_import(&unknown).is_err());
     }
 
     #[test]

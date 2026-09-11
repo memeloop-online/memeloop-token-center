@@ -1978,6 +1978,60 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
+  /internal/v1/native-oauth-imports/capabilities:
+    get:
+      tags: [Upstream providers]
+      operationId: getNativeOAuthImportCapabilities
+      summary: Read the fail-closed native OAuth import contract
+      description: Global operator-only capability discovery. The response contains no source identity, path, credential, or tenant data and performs no provider or DNS operation.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: upstreams:import:write
+      x-global-service-only: true
+      responses:
+        '200':
+          description: Exact contracts supported by this target.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NativeOAuthImportCapabilities' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/native-oauth-imports/kimi-cohort:
+    post:
+      tags: [Upstream providers]
+      operationId: importNativeKimiOAuthCohort
+      summary: Atomically create, converge, replay, or rotate one approved Kimi OAuth cohort
+      description: |
+        Global operator-only, exactly-two import. The server validates both documents
+        locally before taking a tenant-scoped import lock and applying one transaction.
+        Existing Kimi inventory must be the exact 0/1/2 subset named by the request.
+        Rotation requires both accounts, the account-id/document/generation CAS triples,
+        and the old/new cohort approval digests; mixed rotation is rejected and rolled back.
+        No provider request, refresh, or DNS resolution occurs during import.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: upstreams:import:write
+      x-global-service-only: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NativeKimiOAuthCohortRequest' }
+      responses:
+        '200':
+          description: Exact replay, safe one-account convergence, or atomic two-account rotation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NativeKimiOAuthCohortResponse' }
+        '201':
+          description: Both stable Kimi OAuth upstream accounts were created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NativeKimiOAuthCohortResponse' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
   /internal/v1/imports/session-archive/quarantine:
     get:
       tags: [Session archive quarantine]
@@ -5239,6 +5293,7 @@ components:
         - plugins:read
         - plugins:write
         - oauth:write
+        - upstreams:import:write
         - imports:session_archive:quarantine:read
         - imports:session_archive:quarantine:resolve
         - routes:read
@@ -5401,6 +5456,107 @@ components:
           api_key: '#/components/schemas/ApiKeyCredential'
           api_key_proxy: '#/components/schemas/ProxiedApiKeyCredential'
           oauth: '#/components/schemas/OAuthCredential'
+    NativeOAuthImportCapabilities:
+      type: object
+      additionalProperties: false
+      required: [contract_version, source_types, source_identity_contract, account_name_policies, atomic_cohort_contracts, credential_envelope_contract]
+      properties:
+        contract_version: { type: integer, const: 2 }
+        source_types:
+          type: array
+          prefixItems: [{ const: kimi }]
+          minItems: 1
+          maxItems: 1
+        source_identity_contract: { const: operator-hmac-sha256-v1 }
+        account_name_policies:
+          type: object
+          additionalProperties: false
+          required: [kimi]
+          properties:
+            kimi: { const: neutral-server-keyed-source-suffix-v1 }
+        atomic_cohort_contracts:
+          type: array
+          prefixItems: [{ const: atomic_kimi_cohort_v2 }]
+          minItems: 1
+          maxItems: 1
+        credential_envelope_contract: { const: chacha20poly1305-hkdf-sha256-v2-aad-v1 }
+    NativeOAuthImportSource:
+      type: object
+      additionalProperties: false
+      required: [kind, relative_path]
+      properties:
+        kind: { const: auth_file }
+        relative_path: { type: string, minLength: 1, maxLength: 512, pattern: '^(?!/)(?!.*(?:^|/)\.\.?/)(?!.*\\)[^\x00-\x1f\x7f]+$' }
+    NativeKimiOAuthDocument:
+      type: object
+      additionalProperties: false
+      required: [type, access_token, refresh_token, token_type]
+      properties:
+        type: { const: kimi }
+        access_token: { type: string, minLength: 1, writeOnly: true }
+        refresh_token: { type: string, minLength: 1, writeOnly: true }
+        token_type: { type: string, pattern: '^[Bb][Ee][Aa][Rr][Ee][Rr]$' }
+        scope: { type: [string, 'null'], maxLength: 2048 }
+        device_id: { type: [string, 'null'], maxLength: 2048 }
+        expired: { type: [string, 'null'], format: date-time }
+        last_refresh: { type: [string, 'null'], format: date-time }
+        disabled: { type: boolean, default: false }
+    NativeKimiOAuthCohortAccount:
+      type: object
+      additionalProperties: false
+      required: [source, source_type, source_identity_hash, source_document_sha256, expected_current_account_id, expected_current_document_sha256, expected_current_credential_generation, document]
+      properties:
+        source: { $ref: '#/components/schemas/NativeOAuthImportSource' }
+        source_type: { const: kimi }
+        source_identity_hash: { type: string, pattern: '^[0-9a-f]{64}$' }
+        source_document_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+        expected_current_account_id: { type: [string, 'null'], format: uuid }
+        expected_current_document_sha256: { type: [string, 'null'], pattern: '^[0-9a-f]{64}$' }
+        expected_current_credential_generation: { type: [integer, 'null'], format: int64, minimum: 1 }
+        document: { $ref: '#/components/schemas/NativeKimiOAuthDocument' }
+      allOf:
+        - oneOf:
+            - properties:
+                expected_current_account_id: { type: 'null' }
+                expected_current_document_sha256: { type: 'null' }
+                expected_current_credential_generation: { type: 'null' }
+            - properties:
+                expected_current_account_id: { type: string, format: uuid }
+                expected_current_document_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+                expected_current_credential_generation: { type: integer, format: int64, minimum: 1 }
+    NativeKimiOAuthCohortApproval:
+      type: object
+      additionalProperties: false
+      required: [contract, expected_current_cohort_sha256, new_cohort_sha256]
+      properties:
+        contract: { const: kimi-cohort-digest-pair-v1 }
+        expected_current_cohort_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+        new_cohort_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+    NativeKimiOAuthCohortRequest:
+      type: object
+      additionalProperties: false
+      required: [contract_version, tenant_external_id, cohort_contract, approval, accounts]
+      properties:
+        contract_version: { type: integer, const: 2 }
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+        cohort_contract: { const: atomic_kimi_cohort_v2 }
+        approval: { $ref: '#/components/schemas/NativeKimiOAuthCohortApproval' }
+        accounts:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items: { $ref: '#/components/schemas/NativeKimiOAuthCohortAccount' }
+    NativeKimiOAuthCohortResponse:
+      type: object
+      additionalProperties: false
+      required: [disposition, accounts]
+      properties:
+        disposition: { type: string, enum: [created, converged, replayed, rotated] }
+        accounts:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items: { $ref: '#/components/schemas/UpstreamProvider' }
     CreateUpstreamProviderRequest:
       type: object
       additionalProperties: false
@@ -5454,7 +5610,7 @@ components:
     UpstreamProvider:
       type: object
       additionalProperties: false
-      required: [id, tenant_id, tenant_external_id, name, driver, auth_kind, connection_method, credential_generation, status, config, credential_expires_at, has_proxy, proxy_scheme, proxy_remote_dns, proxy_label, proxy_fingerprint, can_update_transport_proxy, can_refresh, can_rotate, can_reauthorize, route_count, created_at, updated_at]
+      required: [id, tenant_id, tenant_external_id, name, driver, auth_kind, connection_method, credential_generation, status, config, credential_expires_at, has_proxy, proxy_scheme, proxy_remote_dns, proxy_label, proxy_fingerprint, can_update_transport_proxy, import_source_identity_hash, import_source_document_sha256, can_refresh, can_rotate, can_reauthorize, route_count, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
         tenant_id: { type: string, format: uuid }
@@ -5476,6 +5632,8 @@ components:
         proxy_label: { type: [string, 'null'], description: Server-generated generic label without host, port, username, or password. }
         proxy_fingerprint: { type: [string, 'null'], pattern: '^proxy_[0-9a-f]{16}$', description: Pepper-keyed non-reversible comparison fingerprint. }
         can_update_transport_proxy: { type: boolean, description: True only for a global operator viewing an OpenAI Codex OAuth account supported by the explicit transport operation. }
+        import_source_identity_hash: { type: [string, 'null'], pattern: '^[0-9a-f]{64}$', description: Opaque operator-HMAC provenance for a native OAuth import; null for other accounts. }
+        import_source_document_sha256: { type: [string, 'null'], pattern: '^[0-9a-f]{64}$', description: Canonical source-document digest for a native OAuth import; null for other accounts. }
         can_refresh: { type: boolean, description: Managed OAuth refresh is available for the active generation. }
         can_rotate: { type: boolean, description: The credential may be replaced without changing the stable account identity. }
         can_reauthorize: { type: boolean, description: An interactive reauthorization endpoint is available. }

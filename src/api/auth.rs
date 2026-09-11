@@ -53,10 +53,16 @@ pub(super) async fn authenticate_control_before_body(
                 ));
             }
         };
+        let maximum = match request.uri().path() {
+            "/internal/v1/native-oauth-imports/kimi-cohort" => {
+                super::MAX_NATIVE_KIMI_COHORT_REQUEST
+            }
+            _ => super::MAX_DEFAULT_REQUEST_BODY,
+        };
         request = match crate::gateway_body::admit_request_body(
             request,
             CONTROL_BODY_READ_DEADLINE,
-            super::MAX_DEFAULT_REQUEST_BODY,
+            maximum,
         )
         .await
         {

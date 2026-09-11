@@ -1018,6 +1018,8 @@ impl Database {
             proxy_label: None,
             proxy_fingerprint: None,
             can_update_transport_proxy,
+            import_source_identity_hash: None,
+            import_source_document_sha256: None,
             can_refresh: auth_kind == "oauth"
                 && row
                     .try_get::<Option<String>, _>("oauth_session_id")?

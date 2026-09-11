@@ -536,6 +536,8 @@ mod tests {
             proxy_label: None,
             proxy_fingerprint: None,
             can_update_transport_proxy: true,
+            import_source_identity_hash: None,
+            import_source_document_sha256: None,
             can_refresh: true,
             can_rotate: false,
             can_reauthorize: true,

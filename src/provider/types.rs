@@ -107,6 +107,12 @@ pub struct UpstreamAccountView {
     pub proxy_fingerprint: Option<String>,
     #[serde(default)]
     pub can_update_transport_proxy: bool,
+    /// Opaque operator-derived provenance for native OAuth imports. Directly
+    /// configured and historical accounts return null.
+    #[serde(default)]
+    pub import_source_identity_hash: Option<String>,
+    #[serde(default)]
+    pub import_source_document_sha256: Option<String>,
     /// Server-derived lifecycle capabilities. Clients must use these instead
     /// of inferring actions from `auth_kind` or `connection_method`.
     pub can_refresh: bool,
