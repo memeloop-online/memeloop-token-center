@@ -230,7 +230,7 @@ pub(crate) async fn confirm(
         .upstream_quota
         .permits
         .try_acquire()
-        .map_err(|_| blocked())?;
+        .map_err(|_| temporarily_unavailable())?;
     let http = tokio::time::timeout(
         Duration::from_secs(5),
         crate::network::client_for_config_url_without_retries(
@@ -242,8 +242,8 @@ pub(crate) async fn confirm(
         ),
     )
     .await
-    .map_err(|_| blocked())?
-    .map_err(|_| blocked())?;
+    .map_err(|_| temporarily_unavailable())?
+    .map_err(|_| temporarily_unavailable())?;
     let claim = state
         .db
         .claim_quota_reset(

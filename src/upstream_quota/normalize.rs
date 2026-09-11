@@ -323,7 +323,11 @@ mod tests {
             !result.conclusively_allows_codex(),
             "explicit exhaustion wins over the allowed flag"
         );
-        result.windows[0].limit_reached = Some(false);
+        result.windows[0].limit_reached = None;
+        assert!(
+            result.conclusively_allows_codex(),
+            "explicit allowed evidence is conclusive when exhaustion is not explicitly reported"
+        );
         result.stale = true;
         assert!(
             !result.conclusively_allows_codex(),

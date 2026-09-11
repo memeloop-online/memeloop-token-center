@@ -1163,6 +1163,8 @@ paths:
         Snapshots are cached for 30 seconds with bounded singleflight/concurrency;
         stale observations may be retained for five minutes after a read error.
         Unsupported means no quota adapter, not zero quota or unlimited usage.
+        A fresh observation may clear a quota-exhausted routing row only when the
+        main code limit reports allowed=true and does not report limit_reached=true.
       parameters:
         - $ref: '#/components/parameters/AccountId'
         - name: tenant_external_id
@@ -1270,6 +1272,10 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { description: Missing fresh applicable credits or an unresolved operation. }
+        '503':
+          description: Transient fresh-read or local-capacity failure; retrying the same Idempotency-Key is safe.
+          headers:
+            Retry-After: { schema: { type: integer, minimum: 1 } }
 
   /internal/v1/upstreams/{account_id}/quota-reset/{operation_id}:
     get:
@@ -1314,6 +1320,8 @@ paths:
         Accepted means HTTP 2xx only, not proven consumption or window recovery.
         Submitted, accepted and unknown all block another operation pending
         separately reviewed manual handling. No automated unlock is provided.
+        Transient local capacity, DNS, proxy, or client-construction failures
+        before the durable claim return 503 and are safe to retry with the same key.
       parameters:
         - $ref: '#/components/parameters/AccountId'
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
@@ -1346,6 +1354,10 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { description: 'Stale, expired, mismatched or already dispatched confirmation.' }
+        '503':
+          description: Transient pre-claim failure; the operation remains prepared and the same Idempotency-Key is safe to retry.
+          headers:
+            Retry-After: { schema: { type: integer, minimum: 1 } }
 
   /internal/v1/upstreams/{account_id}/quota-reset/{operation_id}/reconcile:
     post:
@@ -1378,6 +1390,10 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { description: Prepared operation or unavailable fresh supplier evidence. }
+        '503':
+          description: Transient fresh-read or local-capacity failure; reconciliation remains read-only and retryable.
+          headers:
+            Retry-After: { schema: { type: integer, minimum: 1 } }
 
   /internal/v1/upstreams/{account_id}/health:
     post:

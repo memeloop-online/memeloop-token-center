@@ -52,7 +52,7 @@ attribution does not change when routes are disabled or replaced.
 ### Upstream account availability
 
 Quota reset writes require `providers:write`, explicit tenant/account authorization
-and schema 73. `POST /internal/v1/upstreams/{account_id}/quota-reset/prepare`
+and schema 74. `POST /internal/v1/upstreams/{account_id}/quota-reset/prepare`
 performs fresh supplier GETs and returns `{operation, confirmation_token}`.
 The 120-second token binds actor, account, credential generation/transport revision
 and the exact prepared credit counts. Prepare requires one `Idempotency-Key`; an
@@ -67,7 +67,9 @@ selection is supported by the supplier wire contract.
 rechecks fresh credit counts and credential generation before an atomic dispatch claim.
 An exact confirmation replay returns durable state and never dispatches again;
 another key returns 409, while a missing or different explicit confirmation
-literal is rejected before any claim.
+literal is rejected before any claim. Transient refresh, local capacity, DNS, proxy,
+or client-construction failures before that claim return 503 with `Retry-After` and
+remain safe to retry using the same confirmation key.
 One fixed-host POST follows the committed `submitted` state with retries and
 redirects disabled. HTTP 2xx yields `accepted` (not proven quota recovery);
 ambiguous outcomes are `unknown`. Both, and interrupted `submitted`, permanently
@@ -116,7 +118,9 @@ use `Cache-Control: no-store`. Request quota only on explicit account inspection
 not one automatic request per row on page load.
 
 A successful fresh Codex usage read may clear `quota_exhausted` only when the
-supplier explicitly reports the code limit as allowed and not reached. The delete
+supplier explicitly reports `allowed=true` for the code limit and does not
+explicitly report `limit_reached=true`; an omitted `limit_reached` does not override
+that affirmative allowed signal. The delete
 is fenced by account credential generation, account status, the observation start
 time, health update time, and any half-open lease. Cached/stale/failed/ambiguous
 reads and newer 429 evidence never clear routing health.
