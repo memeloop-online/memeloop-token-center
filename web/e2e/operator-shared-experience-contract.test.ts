@@ -19,13 +19,13 @@ test('operator tenant and settings writes retain native form submission', () => 
   assert.match(tenants, /id="tenant-external-id" name="tenant_external_id" autoComplete="off"/);
   assert.match(tenants, /<button type="submit" disabled=\{loading \|\| busy === 'create' \|\| !name\.trim\(\)\}/);
   assert.match(settings, /<form className="system-settings-form" onSubmit=/);
-  assert.match(settings, /<button type="submit" disabled=\{saving \|\| !selectedRouteId\}/);
+  assert.match(settings, /<button type="submit" disabled=\{saving \|\| !selectedRouteId \|\| !selectedRouteHasAvailableCandidate\}/);
 });
 
 test('system-settings load failure cannot be rendered as the no-enabled-route empty state', () => {
   assert.match(settings, /const \[loadError, setLoadError\] = useState\(''\)/);
   assert.match(settings, /messageOf\(reason, t\('common\.requestFailed'\)\)/);
   assert.match(settings, /loading \? <div className="empty" role="status">/);
-  assert.match(settings, /loadError \? <div className="settings-empty"><button type="button" className="secondary" onClick=\{\(\) => void load\(\)\}>\{t\('common\.retry'\)\}/);
+  assert.match(settings, /loadError \? <div className="settings-empty" role="alert"><b>\{t\('settings\.filterAssistantLoadFailed'\)\}<\/b><span>\{loadError\}<\/span><button type="button" className="secondary" onClick=\{\(\) => void load\(\)\}>\{t\('common\.retry'\)\}/);
   assert.match(settings, /routes\.length === 0 \? <div className="settings-empty"><b>\{t\('settings\.noEnabledRoute'\)\}/);
 });
