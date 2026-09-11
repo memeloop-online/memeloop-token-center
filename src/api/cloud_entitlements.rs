@@ -149,6 +149,34 @@ fn digest(parts: &[&[u8]]) -> String {
     format!("{:x}", digest.finalize())
 }
 
+pub(in crate::api) fn cloud_principal_provisioning_key(
+    tenant_external_id: &str,
+    principal_external_id: &str,
+) -> String {
+    format!(
+        "memeloop-cloud-principal:{}",
+        digest(&[
+            tenant_external_id.as_bytes(),
+            principal_external_id.as_bytes(),
+        ])
+    )
+}
+
+pub(in crate::api) fn validate_cloud_principal_identity(
+    tenant_external_id: &str,
+    principal_external_id: &str,
+) -> Result<(), AppError> {
+    if tenant_external_id != tenant_external_id.trim()
+        || principal_external_id != principal_external_id.trim()
+    {
+        return Err(AppError::BadRequest(
+            "tenant_external_id and principal_external_id must not have surrounding whitespace"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn entitlement_operation(
     body: &CloudSubscriptionWebhook,
     account_id: Uuid,
@@ -230,6 +258,7 @@ pub(in crate::api) async fn sync_memeloop_cloud_subscription(
     let event_id = required_event_id(&headers)?;
     let payload: CloudSubscriptionWebhook = serde_json::from_slice(&body)
         .map_err(|_| AppError::BadRequest("request body must match the webhook schema".into()))?;
+    validate_cloud_principal_identity(&payload.tenant_external_id, &payload.principal_external_id)?;
     let canonical = serde_json::to_vec(&payload).map_err(|_| AppError::Internal)?;
     let event_digest = digest(&[canonical.as_slice()]);
     let policy: KeyPolicy = payload.policy.clone().into();
@@ -239,12 +268,9 @@ pub(in crate::api) async fn sync_memeloop_cloud_subscription(
     // been resolved.
     let operation = entitlement_operation(&payload, Uuid::nil(), &event_digest)?;
     crate::db::validate_entitlement_operation(&operation)?;
-    let provisioning_key = format!(
-        "memeloop-cloud-principal:{}",
-        digest(&[
-            payload.tenant_external_id.as_bytes(),
-            payload.principal_external_id.as_bytes(),
-        ])
+    let provisioning_key = cloud_principal_provisioning_key(
+        &payload.tenant_external_id,
+        &payload.principal_external_id,
     );
     // A bounded digest is used as the durable event namespace; the raw event
     // identifier may contain provider punctuation and is never persisted or

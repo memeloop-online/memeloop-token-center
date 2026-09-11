@@ -11,6 +11,7 @@ use crate::db::routing::{
 
 const KEY_PROVISIONING_AAD: &[u8] = b"memeloop-token-center/key-provisioning-response/v1";
 const KEY_ROTATION_RESOURCE: &str = "key";
+const CLOUD_PRINCIPAL_PROVISIONING_PREFIX: &str = "memeloop-cloud-principal:";
 
 pub struct CreateKeyInput {
     pub tenant_external_id: String,
@@ -46,6 +47,36 @@ pub(crate) struct CloudCredentialProvisioningInput<'a> {
 }
 
 impl Database {
+    /// Ensures the stable MemeLoop Cloud credential identity exists without
+    /// changing its policy, routing, entitlement, or credit balance.
+    pub async fn ensure_cloud_credential(
+        &self,
+        tenant_external_id: &str,
+        principal_external_id: &str,
+        currency: &str,
+        provisioning_idempotency_key: &str,
+        pepper: &[u8],
+    ) -> Result<ProvisionedCloudCredential, AppError> {
+        let now = unix_millis();
+        let mut tx = self.begin_write_transaction().await?;
+        let (_, credential) = self
+            .provision_or_load_cloud_credential_in_transaction(
+                &mut tx,
+                CloudCredentialProvisioningInput {
+                    tenant_external_id,
+                    principal_external_id,
+                    currency,
+                    provisioning_idempotency_key,
+                    create_if_missing: true,
+                    pepper,
+                    now,
+                },
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(credential)
+    }
+
     pub(crate) async fn provision_or_load_cloud_credential_in_transaction(
         &self,
         tx: &mut Transaction<'_, Any>,
@@ -62,6 +93,11 @@ impl Database {
         } = input;
         validate_currency(currency)?;
         validate_idempotency_key(provisioning_idempotency_key, "provisioning identity")?;
+        if !provisioning_idempotency_key.starts_with(CLOUD_PRINCIPAL_PROVISIONING_PREFIX) {
+            return Err(AppError::BadRequest(
+                "MemeLoop Cloud provisioning identity must use its reserved namespace".into(),
+            ));
+        }
         let bootstrap = CreateKeyInput {
             tenant_external_id: tenant_external_id.to_owned(),
             principal_external_id: principal_external_id.to_owned(),
@@ -72,6 +108,11 @@ impl Database {
             idempotency_key: Some(provisioning_idempotency_key.to_owned()),
         };
         validate_key_input(&bootstrap)?;
+        let provisioning_request_hash = cloud_credential_provisioning_request_hash(
+            tenant_external_id,
+            principal_external_id,
+            currency,
+        )?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
             sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 734627102948312))")
                 .bind(format!(
@@ -100,7 +141,7 @@ impl Database {
             .try_get("id")?;
 
         let existing = sqlx::query(
-            "SELECT k.id, k.account_id, k.alias, k.currency, k.status, k.credential_generation, k.issued_key_ciphertext, p.external_id AS principal_external_id, (SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation ORDER BY (c.revoked_at IS NULL) DESC, c.id LIMIT 1) AS fingerprint, CASE WHEN EXISTS (SELECT 1 FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL) THEN 1 ELSE 0 END AS generation_active FROM key_records k JOIN principals p ON p.id = k.principal_id WHERE k.tenant_id = $1 AND k.provisioning_idempotency_key = $2",
+            "SELECT k.id, k.account_id, k.alias, k.currency, k.status, k.credential_generation, k.provisioning_request_hash, k.issued_key_ciphertext, p.external_id AS principal_external_id, (SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation ORDER BY (c.revoked_at IS NULL) DESC, c.id LIMIT 1) AS fingerprint, CASE WHEN EXISTS (SELECT 1 FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL) THEN 1 ELSE 0 END AS generation_active FROM key_records k JOIN principals p ON p.id = k.principal_id WHERE k.tenant_id = $1 AND k.provisioning_idempotency_key = $2",
         )
         .bind(&tenant_id)
         .bind(provisioning_idempotency_key)
@@ -113,6 +154,7 @@ impl Database {
                     row,
                     principal_external_id.trim(),
                     currency,
+                    &provisioning_request_hash,
                     pepper,
                 )?,
             ));
@@ -150,18 +192,6 @@ impl Database {
             fingerprint: issued.fingerprint.clone(),
         };
         let issued_key_ciphertext = seal_private_json(&issued_key, pepper, KEY_PROVISIONING_AAD)?;
-        let provisioning_request_hash = format!(
-            "{:x}",
-            Sha256::digest(
-                serde_json::to_vec(&serde_json::json!({
-                    "contract": "memeloop-cloud-stable-credential-v1",
-                    "tenant_external_id": tenant_external_id.trim(),
-                    "principal_external_id": principal_external_id.trim(),
-                    "currency": currency.to_uppercase(),
-                }))
-                .map_err(|_| AppError::Internal)?
-            )
-        );
         sqlx::query(
             "INSERT INTO credit_accounts (id, tenant_id, principal_id, currency, available_micros, reserved_micros, created_at, updated_at) VALUES ($1, $2, $3, $4, 0, 0, $5, $6)",
         )
@@ -340,6 +370,13 @@ impl Database {
         }) {
             return Err(AppError::BadRequest(
                 "Idempotency-Key must be at most 200 visible ASCII characters".into(),
+            ));
+        }
+        if idempotency_key
+            .is_some_and(|value| value.starts_with(CLOUD_PRINCIPAL_PROVISIONING_PREFIX))
+        {
+            return Err(AppError::BadRequest(
+                "Idempotency-Key uses a reserved provisioning namespace".into(),
             ));
         }
         let provisioning_request_hash = idempotency_key.map(|_| {
@@ -1043,20 +1080,25 @@ fn provisioned_cloud_credential_from_stable_row(
     row: AnyRow,
     expected_principal: &str,
     expected_currency: &str,
+    expected_request_hash: &str,
     pepper: &[u8],
 ) -> Result<ProvisionedCloudCredential, AppError> {
     let principal: String = row.try_get("principal_external_id")?;
     let alias: String = row.try_get("alias")?;
     let currency: String = row.try_get("currency")?;
+    let provisioning_request_hash: Option<String> = row.try_get("provisioning_request_hash")?;
     if principal != expected_principal
         || alias != "MemeLoop Cloud"
         || !currency.eq_ignore_ascii_case(expected_currency)
+        || provisioning_request_hash.as_deref() != Some(expected_request_hash)
     {
         return Err(AppError::Conflict(
-            "MemeLoop Cloud principal identity or currency does not match its stable credential"
+            "MemeLoop Cloud principal identity does not match its stable provisioning contract"
                 .into(),
         ));
     }
+    let key_id = parse_uuid(row.try_get("id")?)?;
+    let account_id = parse_uuid(row.try_get("account_id")?)?;
     let fingerprint: Option<String> = row.try_get("fingerprint")?;
     let fingerprint = fingerprint.ok_or(AppError::Internal)?;
     let status: String = row.try_get("status")?;
@@ -1070,22 +1112,49 @@ fn provisioned_cloud_credential_from_stable_row(
         ciphertext
             .as_deref()
             .map(|ciphertext| {
-                open_private_json::<IssuedKey>(ciphertext, pepper, KEY_PROVISIONING_AAD)
-                    .map(|issued| issued.key)
+                let issued =
+                    open_private_json::<IssuedKey>(ciphertext, pepper, KEY_PROVISIONING_AAD)?;
+                let (_, secret_fingerprint) = crypto::hash_credential(&issued.key, pepper);
+                if issued.key_id != key_id
+                    || issued.account_id != account_id
+                    || issued.alias != alias
+                    || issued.currency != currency
+                    || issued.credential_generation != generation
+                    || issued.fingerprint != fingerprint
+                    || secret_fingerprint != fingerprint
+                {
+                    return Err(AppError::Internal);
+                }
+                Ok(issued.key)
             })
             .transpose()?
     } else {
         None
     };
     Ok(ProvisionedCloudCredential {
-        key_id: parse_uuid(row.try_get("id")?)?,
-        account_id: parse_uuid(row.try_get("account_id")?)?,
+        key_id,
+        account_id,
         alias,
         currency,
         credential_generation: generation,
         fingerprint,
         key,
     })
+}
+
+fn cloud_credential_provisioning_request_hash(
+    tenant_external_id: &str,
+    principal_external_id: &str,
+    currency: &str,
+) -> Result<String, AppError> {
+    let canonical = serde_json::to_vec(&serde_json::json!({
+        "contract": "memeloop-cloud-stable-credential-v1",
+        "tenant_external_id": tenant_external_id.trim(),
+        "principal_external_id": principal_external_id.trim(),
+        "currency": currency.to_uppercase(),
+    }))
+    .map_err(|_| AppError::Internal)?;
+    Ok(format!("{:x}", Sha256::digest(canonical)))
 }
 
 async fn insert_credential(

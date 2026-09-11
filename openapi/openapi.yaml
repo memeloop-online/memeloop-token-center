@@ -214,7 +214,9 @@ paths:
         Creates or reuses the tenant and principal, creates a credit account and stable
         `key_id`, then returns the one-time `mtc_…` secret. When `Idempotency-Key` is
         supplied, an identical request may replay the same response for 24 hours; use
-        of the same key with a different normalized request is rejected.
+        of the same key with a different normalized request is rejected. The
+        `memeloop-cloud-principal:` namespace is reserved for the Cloud integration
+        and cannot be claimed through this generic endpoint.
       security: [{ serviceBearer: [] }]
       x-required-scope: keys:write
       parameters:
@@ -2920,6 +2922,39 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/EntitlementResult' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/integrations/memeloop-cloud/principals/ensure:
+    post:
+      tags: [Credentials]
+      operationId: ensureMemeLoopCloudPrincipal
+      summary: Ensure a stable MemeLoop Cloud principal credential
+      description: |
+        Ensures the same stable credit account and downstream credential used by
+        MemeLoop Cloud subscription snapshots for this tenant/principal pair.
+        This does not create an entitlement, change credential policy or routing,
+        or post any ledger credit. A tenant-scoped service token can only ensure
+        its own tenant. Replays retain the IDs and return the one-time credential
+        secret only while its encrypted provisioning response remains available.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MemeLoopCloudPrincipalEnsureRequest' }
+      responses:
+        '200':
+          description: Stable credential ensured or replayed.
+          headers:
+            Cache-Control: { schema: { const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProvisionedCloudCredential' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -6533,6 +6568,14 @@ components:
               type: [string, 'null']
               format: uuid
               description: Old stable subscription identity, populated only by replace.
+    MemeLoopCloudPrincipalEnsureRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_external_id, principal_external_id, currency]
+      properties:
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200, pattern: '^[^\x00-\x1F\x7F]+$' }
+        principal_external_id: { type: string, minLength: 1, maxLength: 200, pattern: '^[^\x00-\x1F\x7F]+$' }
+        currency: { $ref: '#/components/schemas/Currency' }
     MemeLoopCloudSubscriptionSnapshot:
       type: object
       additionalProperties: false

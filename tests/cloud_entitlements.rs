@@ -17,6 +17,13 @@ use tempfile::TempDir;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+#[path = "cloud_entitlements/principal_ensure.rs"]
+mod principal_ensure;
+#[path = "cloud_entitlements/principal_ensure_concurrency.rs"]
+mod principal_ensure_concurrency;
+#[path = "cloud_entitlements/principal_ensure_order.rs"]
+mod principal_ensure_order;
+
 const WEBHOOK_SECRET: &str = "test-memeloop-cloud-webhook-secret-long-enough";
 static FIXTURE_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 

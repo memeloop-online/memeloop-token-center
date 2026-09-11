@@ -34,6 +34,7 @@ mod archive_quarantine;
 mod auth;
 mod billing;
 mod cloud_entitlements;
+mod cloud_principals;
 mod control_requests;
 mod credentials;
 mod diagnostics;
@@ -72,6 +73,7 @@ use cloud_entitlements::{
     list_memeloop_cloud_subscription_events, self_memeloop_cloud_entitlements,
     sync_memeloop_cloud_subscription,
 };
+use cloud_principals::ensure_memeloop_cloud_principal;
 use control_requests::{
     ManagementTenantQuery, cancel_internal_generation, configuration_schemas,
     get_filter_assistant_settings, get_filter_presets, internal_generation,
