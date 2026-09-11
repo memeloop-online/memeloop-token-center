@@ -102,8 +102,20 @@ impl Database {
         let current = sqlx::query(select)
             .bind(key_id.to_string())
             .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(AppError::NotFound)?;
+            .await?;
+        let Some(current) = current else {
+            // A tenant-bound or insufficiently scoped actor must not learn
+            // whether a UUID belongs to another tenant. There is no target
+            // tenant for a durable audit/rate bucket when the UUID is truly
+            // absent, so return the same generic denial without writing.
+            return Err(
+                if actor_tenant_external_id.is_some() || !actor_allows_recovery {
+                    AppError::Forbidden
+                } else {
+                    AppError::NotFound
+                },
+            );
+        };
         let tenant_id: String = current.try_get("tenant_id")?;
         let tenant_external_id: String = current.try_get("tenant_external_id")?;
         let generation: i64 = current.try_get("credential_generation")?;
@@ -111,6 +123,39 @@ impl Database {
             .map(|service_id| service_id.to_string())
             .unwrap_or_else(|| KEY_CREDENTIAL_RECOVERY_BOOTSTRAP_ACTOR.to_owned());
         let now = unix_millis();
+        if !actor_allows_recovery {
+            record_key_credential_recovery_access_audit(
+                &mut tx,
+                &tenant_id,
+                key_id,
+                generation,
+                actor_service_id,
+                "scope_denied",
+                now,
+            )
+            .await?;
+            tx.commit().await?;
+            return Err(AppError::Forbidden);
+        }
+        if actor_tenant_external_id
+            .is_some_and(|actor_tenant| actor_tenant != tenant_external_id.as_str())
+        {
+            record_key_credential_recovery_access_audit(
+                &mut tx,
+                &tenant_id,
+                key_id,
+                generation,
+                actor_service_id,
+                "tenant_denied",
+                now,
+            )
+            .await?;
+            tx.commit().await?;
+            return Err(AppError::Forbidden);
+        }
+        // Apply recovery quotas only after authorization. Otherwise a
+        // tenant-bound actor could distinguish a foreign key from an unknown
+        // UUID when repeated foreign probes eventually changed 403 to 429.
         let tenant_attempts = consume_key_credential_recovery_rate_limit(
             &mut tx,
             &tenant_id,
@@ -151,36 +196,6 @@ impl Database {
             }
             tx.commit().await?;
             return Err(AppError::RateLimited);
-        }
-        if !actor_allows_recovery {
-            record_key_credential_recovery_access_audit(
-                &mut tx,
-                &tenant_id,
-                key_id,
-                generation,
-                actor_service_id,
-                "scope_denied",
-                now,
-            )
-            .await?;
-            tx.commit().await?;
-            return Err(AppError::Forbidden);
-        }
-        if actor_tenant_external_id
-            .is_some_and(|actor_tenant| actor_tenant != tenant_external_id.as_str())
-        {
-            record_key_credential_recovery_access_audit(
-                &mut tx,
-                &tenant_id,
-                key_id,
-                generation,
-                actor_service_id,
-                "tenant_denied",
-                now,
-            )
-            .await?;
-            tx.commit().await?;
-            return Err(AppError::Forbidden);
         }
         if current.try_get::<String, _>("status")? != "active" {
             record_key_credential_recovery_access_audit(

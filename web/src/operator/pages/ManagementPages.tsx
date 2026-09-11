@@ -824,6 +824,11 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   secretRef.current = visibleSecret;
   const scopeRef = useRef({ token, tenant, writeTenant });
   scopeRef.current = { token, tenant, writeTenant };
+  const ownsSecretScope = (operationToken: string, operationTenant: string, operationWriteTenant: string, operationScopeGeneration: number) =>
+    renderScope.current.generation === operationScopeGeneration
+    && scopeRef.current.token === operationToken
+    && scopeRef.current.tenant === operationTenant
+    && scopeRef.current.writeTenant === operationWriteTenant;
   const credentialGroups = useGroups('credential', token, writeTenant);
   const routeGroups = useGroups('route', token, writeTenant);
   const createFormSchema = createSchema;
@@ -962,7 +967,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
     if (!canManage(value) || value.status === 'revoked') return;
     const operation = beginSecretOperation();
     if (!operation) return;
-    const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant;
+    const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant; const operationScopeGeneration = renderScope.current.generation;
     setBusy(`rotate-${value.key_id}`); setError(''); setMessage('');
     const controller = new AbortController();
     secretRequest.current?.abort();
@@ -970,20 +975,20 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
     try {
       if (!await confirm(`${t('credentials.rotate')} · ${value.alias}\n${value.key_id}`)) return;
       const result = await api<{ key: string }>(`/internal/v1/keys/${value.key_id}/rotate`, operationToken, { ...secretResponseRequestPolicy, method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() }, signal: controller.signal });
-      if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || scopeRef.current.writeTenant !== operationWriteTenant) return;
+      if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
       showSecret({ value: result.key, recovered: false, displayId: crypto.randomUUID() }); setMessage(t('credentials.rotated', { alias: value.alias })); await load();
     } catch (reason) {
-      if (scopeRef.current.token === operationToken && scopeRef.current.tenant === operationTenant && scopeRef.current.writeTenant === operationWriteTenant) setError(messageOf(reason, t('common.requestFailed')));
+      if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setError(messageOf(reason, t('common.requestFailed')));
     } finally {
       if (secretRequest.current === controller) secretRequest.current = undefined;
-      if (scopeRef.current.token === operationToken && scopeRef.current.tenant === operationTenant && scopeRef.current.writeTenant === operationWriteTenant) finishSecretOperation(operation);
+      if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) finishSecretOperation(operation);
     }
   };
   const recoverCredential = async (value: KeyView) => {
     if (!canManage(value) || value.status !== 'active' || !value.credential_recovery_available) return;
     const operation = beginSecretOperation();
     if (!operation) return;
-    const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant;
+    const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant; const operationScopeGeneration = renderScope.current.generation;
     setBusy(`recover-${value.key_id}`); setError(''); setMessage('');
     const controller = new AbortController();
     secretRequest.current?.abort();
@@ -995,15 +1000,15 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
       const result = await api<{ key_id: string; credential_generation: number; key: string }>(`/internal/v1/keys/${value.key_id}/credential-recovery/copy`, operationToken, {
         ...secretResponseRequestPolicy, method: 'POST', signal: controller.signal,
       });
-      if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || scopeRef.current.writeTenant !== operationWriteTenant) return;
+      if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
       if (result.key_id !== value.key_id || result.credential_generation !== value.credential_generation) throw new Error(t('common.requestFailed'));
       showSecret({ value: result.key, recovered: true, displayId: crypto.randomUUID() });
       setMessage(t('credentials.recovered', { alias: value.alias }));
     } catch (reason) {
-      if (!controller.signal.aborted && scopeRef.current.token === operationToken && scopeRef.current.tenant === operationTenant && scopeRef.current.writeTenant === operationWriteTenant) setError(messageOf(reason, t('common.requestFailed')));
+      if (!controller.signal.aborted && ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setError(messageOf(reason, t('common.requestFailed')));
     } finally {
       if (secretRequest.current === controller) secretRequest.current = undefined;
-      if (scopeRef.current.token === operationToken && scopeRef.current.tenant === operationTenant && scopeRef.current.writeTenant === operationWriteTenant) finishSecretOperation(operation);
+      if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) finishSecretOperation(operation);
     }
   };
   const routeOptions = routes.filter((route) => route.tenant_external_id === writeTenant).map((route) => ({ value: route.id, label: route.public_model, description: route.protocol }));
@@ -1069,20 +1074,20 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
         if (!writeTenant) return;
         const operation = beginSecretOperation();
         if (!operation) return;
-        const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant;
+        const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant; const operationScopeGeneration = renderScope.current.generation;
         setBusy('create-credential'); setError(''); setMessage('');
         const controller = new AbortController();
         secretRequest.current?.abort();
         secretRequest.current = controller;
         try {
           const created = await api<{ key: string; key_id: string }>('/internal/v1/keys', operationToken, { ...secretResponseRequestPolicy, method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: operationWriteTenant, route_ids: newRouteIds, route_group_ids: newRouteGroupIds }), signal: controller.signal });
-          if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || scopeRef.current.writeTenant !== operationWriteTenant) return;
+          if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
           setNewRouteIds([]); setNewRouteGroupIds([]); showSecret({ value: created.key, recovered: false, displayId: crypto.randomUUID() }); setMessage(t(newRouteIds.length || newRouteGroupIds.length ? 'credentials.created' : 'credentials.createdNoRoutes')); await load();
         } catch (reason) {
-          if (scopeRef.current.token === operationToken && scopeRef.current.tenant === operationTenant && scopeRef.current.writeTenant === operationWriteTenant) setError(messageOf(reason, t('common.requestFailed')));
+          if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setError(messageOf(reason, t('common.requestFailed')));
         } finally {
           if (secretRequest.current === controller) secretRequest.current = undefined;
-          if (scopeRef.current.token === operationToken && scopeRef.current.tenant === operationTenant && scopeRef.current.writeTenant === operationWriteTenant) finishSecretOperation(operation);
+          if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) finishSecretOperation(operation);
         }
       }}><button type="submit" disabled={!canWrite || Boolean(busy) || Boolean(visibleSecret)}>{busy === 'create-credential' ? t('common.loading') : t('credentials.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
     </div></details>
@@ -1092,14 +1097,28 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
 function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schema }: { token: string; tenant: string; writeTenant?: string; schema?: Record<string, unknown> }) {
   const { locale, t } = useI18n();
   const { confirm, confirmationDialog } = useConfirmDialog([token, tenant, writeTenant]);
+  const renderScope = useRef({ token, tenant, writeTenant, generation: 0 });
+  if (renderScope.current.token !== token || renderScope.current.tenant !== tenant || renderScope.current.writeTenant !== writeTenant) {
+    renderScope.current = { token, tenant, writeTenant, generation: renderScope.current.generation + 1 };
+  }
   const [values, setValues] = useState<ServiceTokenView[]>([]);
-  const [secret, setSecret] = useState('');
+  const [secret, setSecret] = useState<{ value: string; displayId: string; scopeGeneration: number }>();
   const [busy, setBusy] = useState('');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const loadSequence = useRef(0);
+  const secretRequest = useRef<AbortController | undefined>(undefined);
+  const secretOperation = useRef<symbol | undefined>(undefined);
+  const visibleSecret = secret?.scopeGeneration === renderScope.current.generation ? secret : undefined;
+  const secretRef = useRef(visibleSecret);
+  secretRef.current = visibleSecret;
   const scopeRef = useRef({ token, tenant, writeTenant });
   scopeRef.current = { token, tenant, writeTenant };
+  const ownsSecretScope = (operationToken: string, operationTenant: string, operationWriteTenant: string, operationScopeGeneration: number) =>
+    renderScope.current.generation === operationScopeGeneration
+    && scopeRef.current.token === operationToken
+    && scopeRef.current.tenant === operationTenant
+    && scopeRef.current.writeTenant === operationWriteTenant;
   const load = async () => {
     const sequence = ++loadSequence.current;
     const loadToken = token; const loadTenant = tenant;
@@ -1111,13 +1130,75 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schem
     } catch (reason) { if (sequence === loadSequence.current && scopeRef.current.token === loadToken && scopeRef.current.tenant === loadTenant) setError(messageOf(reason, t('common.requestFailed'))); }
   };
   useEffect(() => {
-    loadSequence.current += 1; setValues([]); setSecret(''); setBusy(''); setMessage(''); setError(''); void load();
+    secretRequest.current?.abort(); secretRequest.current = undefined; secretOperation.current = undefined; secretRef.current = undefined;
+    loadSequence.current += 1; setValues([]); setSecret(undefined); setBusy(''); setMessage(''); setError(''); void load();
+    return () => { secretRequest.current?.abort(); };
   }, [token, tenant, writeTenant]);
   const statusFilter = useResourceListStatusFilter('service-credentials', tenant, values, (value) => (value.status ?? 'active') === 'active');
   const canManage = (value: ServiceTokenView) => Boolean(writeTenant) && (!value.tenant_external_id || value.tenant_external_id === writeTenant);
-  return <>{confirmationDialog}{secret && <OneTimeSecret value={secret} message={t('services.oneTimeSecret')} />}<section className="management-layout">
-    <article className="panel"><div className="panel-title"><div><h2>{t('services.title')}</h2><p className="muted">{t('services.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>{error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="account-list">{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('status.active')} empty={t('services.empty')} />}{statusFilter.values.map((value) => <div className="managed-resource" key={value.service_id}><div className="managed-resource-header"><div><b>{value.name}</b><small>{value.service_id}</small><span>{value.tenant_external_id ?? t('services.globalScope')} · {value.scopes.join(' · ')}</span></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div><div className="row-actions"><button type="button" className="secondary" disabled={!canManage(value) || value.status === 'revoked' || Boolean(busy)} onClick={async () => { if (!await confirm(`${t('services.rotate')} · ${value.name}\n${value.service_id}`)) return; setBusy(`rotate-${value.service_id}`); try { const result = await api<{ token: string }>(`/internal/v1/service-tokens/${value.service_id}/rotate`, token, { ...secretResponseRequestPolicy, method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() } }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setSecret(result.token); setMessage(t('services.rotated', { name: value.name })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); } }}>{t('services.rotate')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" disabled={!canManage(value) || Boolean(busy)} onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; setBusy(`status-${value.service_id}`); try { await api(`/internal/v1/service-tokens/${value.service_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setMessage(t(nextStatus === 'active' ? 'services.resumed' : 'services.suspended', { name: value.name })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); } } }>{value.status === 'active' ? t('services.suspend') : t('services.resume')}</button>}</div></div>)}</div></article>
-    <details className="panel create-resource"><summary><span><b>{t('services.createTitle')}</b><small>{t('services.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">{schema ? <Form key={`${tenant}-${writeTenant}-${locale}`} schema={localizeSchema(schema as RJSFSchema, locale)} uiSchema={{ tenant_external_id: { 'ui:widget': 'hidden' } }} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!writeTenant) return; try { const created = await api<{ token: string }>('/internal/v1/service-tokens', token, { ...secretResponseRequestPolicy, method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant }) }); setSecret(created.token); setMessage(t('services.created')); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!writeTenant}>{t('services.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}</div></details>
+  const beginSecretOperation = () => {
+    if (secretOperation.current || secretRef.current) return undefined;
+    const operation = Symbol('service-credential-secret-operation');
+    secretOperation.current = operation;
+    return operation;
+  };
+  const finishSecretOperation = (operation: symbol) => {
+    if (secretOperation.current !== operation) return;
+    secretOperation.current = undefined;
+    setBusy('');
+  };
+  const showSecret = (value: string) => {
+    const next = { value, displayId: crypto.randomUUID(), scopeGeneration: renderScope.current.generation };
+    secretRef.current = next;
+    setSecret(next);
+  };
+  const dismissSecret = () => {
+    secretRef.current = undefined;
+    setSecret(undefined);
+  };
+  const rotateServiceCredential = async (value: ServiceTokenView) => {
+    if (!canManage(value) || value.status === 'revoked') return;
+    const operation = beginSecretOperation();
+    if (!operation) return;
+    const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant; const operationScopeGeneration = renderScope.current.generation;
+    const controller = new AbortController();
+    secretRequest.current?.abort(); secretRequest.current = controller;
+    setBusy(`rotate-${value.service_id}`); setError(''); setMessage('');
+    try {
+      if (!await confirm(`${t('services.rotate')} · ${value.name}\n${value.service_id}`)) return;
+      const result = await api<{ token: string }>(`/internal/v1/service-tokens/${value.service_id}/rotate`, operationToken, { ...secretResponseRequestPolicy, method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() }, signal: controller.signal });
+      if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
+      showSecret(result.token); setMessage(t('services.rotated', { name: value.name })); await load();
+    } catch (reason) {
+      if (!controller.signal.aborted && ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setError(messageOf(reason, t('common.requestFailed')));
+    } finally {
+      if (secretRequest.current === controller) secretRequest.current = undefined;
+      if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) finishSecretOperation(operation);
+    }
+  };
+  const createServiceCredential = async (formData: unknown) => {
+    if (!writeTenant) return;
+    const operation = beginSecretOperation();
+    if (!operation) return;
+    const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant; const operationScopeGeneration = renderScope.current.generation;
+    const controller = new AbortController();
+    secretRequest.current?.abort(); secretRequest.current = controller;
+    setBusy('create-service-credential'); setError(''); setMessage('');
+    const fields = formData && typeof formData === 'object' ? formData : {};
+    try {
+      const created = await api<{ token: string }>('/internal/v1/service-tokens', operationToken, { ...secretResponseRequestPolicy, method: 'POST', body: JSON.stringify({ ...fields, tenant_external_id: operationWriteTenant }), signal: controller.signal });
+      if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
+      showSecret(created.token); setMessage(t('services.created')); await load();
+    } catch (reason) {
+      if (!controller.signal.aborted && ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setError(messageOf(reason, t('common.requestFailed')));
+    } finally {
+      if (secretRequest.current === controller) secretRequest.current = undefined;
+      if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) finishSecretOperation(operation);
+    }
+  };
+  return <>{confirmationDialog}{visibleSecret && <OneTimeSecret key={visibleSecret.displayId} value={visibleSecret.value} filename="service-credential.txt" onDismiss={dismissSecret} message={t('services.oneTimeSecret')} />}<section className="management-layout">
+    <article className="panel"><div className="panel-title"><div><h2>{t('services.title')}</h2><p className="muted">{t('services.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>{error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="account-list">{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('status.active')} empty={t('services.empty')} />}{statusFilter.values.map((value) => <div className="managed-resource" key={value.service_id}><div className="managed-resource-header"><div><b>{value.name}</b><small>{value.service_id}</small><span>{value.tenant_external_id ?? t('services.globalScope')} · {value.scopes.join(' · ')}</span></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div><div className="row-actions"><button type="button" className="secondary" disabled={!canManage(value) || value.status === 'revoked' || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void rotateServiceCredential(value)}>{t('services.rotate')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" disabled={!canManage(value) || Boolean(busy)} onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; setBusy(`status-${value.service_id}`); try { await api(`/internal/v1/service-tokens/${value.service_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setMessage(t(nextStatus === 'active' ? 'services.resumed' : 'services.suspended', { name: value.name })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); } } }>{value.status === 'active' ? t('services.suspend') : t('services.resume')}</button>}</div></div>)}</div></article>
+    <details className="panel create-resource"><summary><span><b>{t('services.createTitle')}</b><small>{t('services.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">{schema ? <Form key={`${tenant}-${writeTenant}-${locale}`} schema={localizeSchema(schema as RJSFSchema, locale)} uiSchema={{ tenant_external_id: { 'ui:widget': 'hidden' } }} validator={validator} templates={schemaFormTemplates} onSubmit={({ formData }) => { void createServiceCredential(formData); }}><button type="submit" disabled={!writeTenant || Boolean(busy) || Boolean(visibleSecret)}>{busy === 'create-service-credential' ? t('common.loading') : t('services.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}</div></details>
   </section></>;
 }
 

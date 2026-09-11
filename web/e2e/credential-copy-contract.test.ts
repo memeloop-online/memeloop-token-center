@@ -9,6 +9,10 @@ const [copyButton, oneTimeSecret, managementPages, portal, settings] = await Pro
   readFile(new URL('../src/self/SelfPortal.tsx', import.meta.url), 'utf8'),
   readFile(new URL('../src/operator/pages/SystemSettingsPage.tsx', import.meta.url), 'utf8'),
 ]);
+const serviceWorkspace = managementPages.slice(
+  managementPages.indexOf('function ServiceCredentialWorkspace'),
+  managementPages.indexOf('interface OperatorPageProps'),
+);
 
 test('credential copying shares clipboard handling with accessible failure feedback', () => {
   assert.match(copyButton, /navigator\.clipboard\?\.writeText/);
@@ -18,7 +22,9 @@ test('credential copying shares clipboard handling with accessible failure feedb
   assert.match(copyButton, /common\.requestFailed/);
   assert.match(oneTimeSecret, /navigator\.clipboard\?\.writeText/);
   assert.match(oneTimeSecret, /document\.execCommand\('copy'\)/);
-  assert.match(oneTimeSecret, /role="status" aria-live="polite"/);
+  assert.match(oneTimeSecret, /role="alert"/);
+  assert.match(oneTimeSecret, /role="status"/);
+  assert.doesNotMatch(oneTimeSecret, /<aside className="one-time" role=/, 'the secret container itself must never be a live region');
 });
 
 test('only current plaintext credential sources are offered for copying', () => {
@@ -28,9 +34,9 @@ test('only current plaintext credential sources are offered for copying', () => 
   assert.match(managementPages, /api<\{ key: string \}>\(`\/internal\/v1\/keys\/\$\{value\.key_id\}\/rotate`/);
   assert.match(managementPages, /showSecret\(\{ value: result\.key, recovered: false, displayId: crypto\.randomUUID\(\) \}\)/);
   assert.match(managementPages, /api<\{ token: string \}>\('\/internal\/v1\/service-tokens'/);
-  assert.match(managementPages, /setSecret\(created\.token\)/);
+  assert.match(managementPages, /showSecret\(created\.token\)/);
   assert.match(managementPages, /api<\{ token: string \}>\(`\/internal\/v1\/service-tokens\/\$\{value\.service_id\}\/rotate`/);
-  assert.match(managementPages, /setSecret\(result\.token\)/);
+  assert.match(managementPages, /showSecret\(result\.token\)/);
   assert.match(portal, /<CopyButton value=\{credentialInput\}/);
   assert.match(portal, /<CopyButton value=\{credential\}/);
   assert.match(settings, /<CopyButton value=\{credentialInput\}/);
@@ -38,4 +44,18 @@ test('only current plaintext credential sources are offered for copying', () => 
   assert.doesNotMatch(portal, /<CopyButton value=\{credentialView\.key_id\}/);
   assert.doesNotMatch(managementPages, /<OneTimeSecret value=\{value\.key_id\}/);
   assert.doesNotMatch(managementPages, /<OneTimeSecret value=\{value\.service_id\}/);
+});
+
+test('service credentials cannot be double-issued or overwrite visible plaintext', () => {
+  assert.match(serviceWorkspace, /Symbol\('service-credential-secret-operation'\)/);
+  assert.match(serviceWorkspace, /if \(secretOperation\.current \|\| secretRef\.current\) return undefined/);
+  assert.match(serviceWorkspace, /secretRef\.current = next;\s*setSecret\(next\)/);
+  assert.match(serviceWorkspace, /secret\?\.scopeGeneration === renderScope\.current\.generation/);
+  assert.match(serviceWorkspace, /renderScope\.current\.generation === operationScopeGeneration/);
+  assert.match(serviceWorkspace, /filename="service-credential\.txt" onDismiss=\{dismissSecret\}/);
+  assert.match(serviceWorkspace, /onClick=\{\(\) => void rotateServiceCredential\(value\)\}/);
+  assert.match(serviceWorkspace, /onSubmit=\{\(\{ formData \}\) => \{ void createServiceCredential\(formData\); \}\}/);
+  assert.match(serviceWorkspace, /disabled=\{!canManage\(value\) \|\| value\.status === 'revoked' \|\| Boolean\(busy\) \|\| Boolean\(visibleSecret\)\}/);
+  assert.match(serviceWorkspace, /disabled=\{!writeTenant \|\| Boolean\(busy\) \|\| Boolean\(visibleSecret\)\}/);
+  assert.doesNotMatch(serviceWorkspace, /setSecret\((created|result)\.token\)/);
 });
