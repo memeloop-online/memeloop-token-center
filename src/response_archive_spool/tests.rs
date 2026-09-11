@@ -88,14 +88,16 @@ async fn finish(pool: &sqlx::AnyPool, identity: ArchiveSpoolIdentity) {
 #[tokio::test]
 async fn nine_burst_frames_are_durable_before_any_object_store_consumer() {
     let (_dir, state, pool, identity) = fixture().await;
-    let mut producer = ResponseArchiveProducer::begin(&state, identity)
+    // This regression covers durable burst buffering without a consumer. The
+    // production ACK deadline has its own paused-time contract in producer.rs.
+    let mut producer = ResponseArchiveProducer::begin_for_test(&state, identity)
         .await
         .unwrap();
     let frames: Vec<Bytes> = (0..9)
         .map(|i| Bytes::from(format!("data: {{\"n\":{i}}}\n\n")))
         .collect();
-    assert!(producer.append(frames.clone()).await);
-    assert!(producer.seal().await);
+    producer.append_for_test(frames.clone()).await.unwrap();
+    producer.seal_for_test().await.unwrap();
     finish(&pool, identity).await;
     let row =
         sqlx::query("SELECT state,chunk_count FROM response_archive_spools WHERE request_id=$1")
@@ -132,14 +134,17 @@ async fn nine_burst_frames_are_durable_before_any_object_store_consumer() {
 #[tokio::test]
 async fn crlf_boundaries_and_multiple_frames_replay_exact_bytes() {
     let (_dir, state, pool, identity) = fixture().await;
-    let mut producer = ResponseArchiveProducer::begin(&state, identity)
+    let mut producer = ResponseArchiveProducer::begin_for_test(&state, identity)
         .await
         .unwrap();
     let first = Bytes::from_static(b"data: [DONE]\r\n\r");
     let second = Bytes::from_static(b"\n: heartbeat\n\n");
-    assert!(producer.append(vec![first.clone()]).await);
-    assert!(producer.append(vec![second.clone()]).await);
-    assert!(producer.seal().await);
+    producer.append_for_test(vec![first.clone()]).await.unwrap();
+    producer
+        .append_for_test(vec![second.clone()])
+        .await
+        .unwrap();
+    producer.seal_for_test().await.unwrap();
     finish(&pool, identity).await;
     upload::process_one(&state, Uuid::new_v4()).await;
     let locator: String =
@@ -157,13 +162,23 @@ async fn crlf_boundaries_and_multiple_frames_replay_exact_bytes() {
 #[tokio::test]
 async fn rejected_capture_never_publishes_a_complete_prefix() {
     let (_dir, state, pool, identity) = fixture().await;
-    let mut producer = ResponseArchiveProducer::begin(&state, identity)
+    let mut producer = ResponseArchiveProducer::begin_for_test(&state, identity)
         .await
         .unwrap();
-    assert!(producer.append(vec![Bytes::from_static(b"prefix")]).await);
-    mark_gap(&state, identity, "capture_failed").await;
-    assert!(!producer.append(vec![Bytes::from_static(b"suffix")]).await);
-    assert!(!producer.seal().await);
+    producer
+        .append_for_test(vec![Bytes::from_static(b"prefix")])
+        .await
+        .unwrap();
+    producer::mark_gap_for_test(&state, identity, "capture_failed")
+        .await
+        .unwrap();
+    assert!(
+        producer
+            .append_for_test(vec![Bytes::from_static(b"suffix")])
+            .await
+            .is_err()
+    );
+    assert!(producer.seal_for_test().await.is_err());
     finish(&pool, identity).await;
     upload::process_one(&state, Uuid::new_v4()).await;
     let locator: String =
