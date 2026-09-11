@@ -14,8 +14,19 @@ declare global {
   interface Window {
     credentialFixture: {
       calls: string[];
-      requests: Array<{ method: string; path: string }>;
+      requests: Array<{
+        method: string;
+        path: string;
+        cache?: RequestCache;
+        credentials?: RequestCredentials;
+        referrerPolicy?: ReferrerPolicy;
+        hasSignal: boolean;
+      }>;
       releaseIssue: (token: string) => void;
+      releaseCredentialScopeA: () => void;
+      releaseCredentialCursor: () => void;
+      createdObjectUrls: string[];
+      revokedObjectUrls: string[];
     };
   }
 }
@@ -73,13 +84,31 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     await routeFailure.getByRole('alert').getByText('route catalog unavailable', { exact: true }).waitFor();
     assert.equal(await routeFailure.getByText('Route failure client', { exact: true }).count(), 1, 'a route error cannot hide a successfully loaded key page');
 
+    const recovery = await browser.newPage();
+    await recovery.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await recovery.goto(fixture('client-recovery'));
+    await recovery.getByText('Recoverable client', { exact: true }).waitFor();
+    await recovery.getByRole('button', { name: 'Recover and copy credential', exact: true }).click();
+    await recovery.getByRole('button', { name: 'Confirm and continue', exact: true }).click();
+    await recovery.getByText('mts_client_recovered', { exact: true }).waitFor();
+    const recoveryRequest = await recovery.evaluate(() => window.credentialFixture.requests.find((request) => request.path.endsWith('/credential-recovery/copy')));
+    assert.deepEqual(recoveryRequest, {
+      method: 'POST',
+      path: '/internal/v1/keys/key-recovery/credential-recovery/copy',
+      cache: 'no-store',
+      credentials: 'omit',
+      referrerPolicy: 'no-referrer',
+      hasSignal: true,
+    });
+
     const race = await browser.newPage();
     await race.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await race.goto(fixture('scope-race'));
     await race.waitForFunction(() => window.credentialFixture.calls.some((call) => call.includes('tenant_external_id=tenant-a')));
     await race.getByRole('button', { name: 'Switch tenant', exact: true }).click();
     await race.getByText('Scope B client', { exact: true }).waitFor();
-    await race.waitForTimeout(260);
+    await race.evaluate(() => window.credentialFixture.releaseCredentialScopeA());
+    await nextPaint(race);
     assert.equal(await race.getByText('Scope A client', { exact: true }).count(), 0, 'a late aborted scope cannot overwrite the replacement scope or release its request identity');
 
     const lock = await browser.newPage();
@@ -88,12 +117,18 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     await lock.waitForFunction(() => window.credentialFixture.calls.some((call) => call.includes('tenant_external_id=tenant-a')));
     await lock.getByRole('button', { name: 'Switch tenant', exact: true }).click();
     await lock.getByText('Scope B 101', { exact: true }).waitFor();
-    await lock.getByRole('button', { name: 'Load more credentials', exact: true }).click();
+    const loadMore = lock.locator('.load-more button');
+    await loadMore.click();
+    await lock.waitForFunction(() => window.credentialFixture.calls.some((call) => call.startsWith('/internal/v1/keys?') && call.includes('before_id=')));
+    await lock.evaluate(() => window.credentialFixture.releaseCredentialScopeA());
+    await nextPaint(lock);
+    assert.equal(await loadMore.isDisabled(), true, 'the stale scope cannot release the active cursor request identity');
+    assert.equal(await lock.getByText('Scope A client', { exact: true }).count(), 0, 'the old scope remains invisible while a replacement cursor page is pending');
+    await lock.evaluate(() => window.credentialFixture.releaseCredentialCursor());
     await lock.getByText('Scope B older client', { exact: true }).waitFor();
     const cursorCalls = (await calls(lock)).filter((call) => call.startsWith('/internal/v1/keys?') && call.includes('before_id='));
     assert.equal(cursorCalls.length, 1, 'the stale scope cannot release the active cursor request for a second load');
-    assert.equal(await lock.getByText('Scope A client', { exact: true }).count(), 0, 'the old scope remains invisible while a replacement cursor page is pending');
-    await Promise.all([allTenants.close(), routeFailure.close(), race.close(), lock.close()]);
+    await Promise.all([allTenants.close(), routeFailure.close(), recovery.close(), race.close(), lock.close()]);
 
     const plaintext = await browser.newPage();
     plaintext.setDefaultTimeout(10_000);
@@ -109,6 +144,14 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     await plaintext.waitForFunction(() => window.credentialFixture.requests.filter((request) => request.method === 'POST' && request.path === '/internal/v1/service-tokens').length === 1);
     await plaintext.evaluate(() => window.credentialFixture.releaseIssue('mts_service_secret_first'));
     await plaintext.getByText('mts_service_secret_first', { exact: true }).waitFor();
+    const oneTimePanel = plaintext.locator('aside.one-time');
+    assert.equal(await oneTimePanel.getAttribute('role'), null, 'rendering plaintext must not announce it as a live region');
+    assert.equal(await oneTimePanel.locator('code').evaluate((element) => element.closest('[role="status"], [aria-live]') === null), true);
+    await plaintext.getByRole('button', { name: 'Copy credential', exact: true }).click();
+    await plaintext.getByRole('alert').getByText('Copy failed. Use download or select the credential above manually.', { exact: true }).waitFor();
+    assert.equal(await plaintext.locator('textarea').count(), 0, 'a throwing clipboard fallback clears and removes its plaintext node');
+    await plaintext.getByRole('button', { name: 'Download credential', exact: true }).click();
+    await plaintext.waitForFunction(() => window.credentialFixture.createdObjectUrls.length === 1 && window.credentialFixture.revokedObjectUrls[0] === window.credentialFixture.createdObjectUrls[0]);
     assert.equal(await create.isDisabled(), true, 'visible plaintext blocks another service credential issuance');
     assert.equal(await plaintext.getByRole('button', { name: 'Rotate service credential', exact: true }).isDisabled(), true, 'visible plaintext blocks rotation from replacing it');
     plaintext.once('dialog', (dialog) => void dialog.accept());
