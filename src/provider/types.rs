@@ -124,7 +124,11 @@ impl UpstreamAccountView {
         credential: &UpstreamCredential,
         key_material: &[u8],
     ) -> Result<(), crate::error::AppError> {
-        let metadata = credential.proxy_metadata(key_material)?;
+        let metadata = if self.driver == crate::oauth::codex_device::PROVIDER_DRIVER {
+            credential.codex_proxy_metadata(key_material)?
+        } else {
+            credential.proxy_metadata(key_material)?
+        };
         self.has_proxy = metadata.has_proxy;
         self.proxy_scheme = metadata.scheme;
         self.proxy_remote_dns = metadata.remote_dns;

@@ -175,7 +175,15 @@ impl Database {
         &self,
         account_id: Uuid,
         key_material: &[u8],
-    ) -> Result<(UpstreamAccountView, UpstreamCredential, bool), AppError> {
+    ) -> Result<
+        (
+            UpstreamAccountView,
+            UpstreamCredential,
+            bool,
+            Option<String>,
+        ),
+        AppError,
+    > {
         let row = sqlx::query(
             "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, c.revoked_at, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation WHERE a.id = $1",
         )
@@ -185,10 +193,11 @@ impl Database {
         .ok_or(AppError::NotFound)?;
         let ciphertext: String = row.try_get("credential_ciphertext")?;
         let active = row.try_get::<Option<i64>, _>("revoked_at")?.is_none();
+        let oauth_driver = row.try_get::<Option<String>, _>("oauth_driver")?;
         let credential = open_credential(&ciphertext, key_material)?;
         let mut view = upstream_account_view(row)?;
         view.can_update_transport_proxy &= active;
-        Ok((view, credential, active))
+        Ok((view, credential, active, oauth_driver))
     }
 
     /// Reads the encrypted identity-bearing OAuth credential for a

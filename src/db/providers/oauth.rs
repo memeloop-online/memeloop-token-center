@@ -5,6 +5,7 @@ use super::*;
 pub struct ReauthorizeUpstreamAccountInput {
     pub tenant_external_id: String,
     pub expected_updated_at: i64,
+    pub expected_credential_generation: i64,
     pub driver: String,
     pub oauth_session_id: Uuid,
     pub oauth_driver: String,
@@ -100,8 +101,8 @@ impl Database {
         let replacement = current_credential
             .clone()
             .with_oauth_proxy(proxy_url.clone())?;
-        let old_metadata = current_credential.proxy_metadata(key_material)?;
-        let new_metadata = replacement.proxy_metadata(key_material)?;
+        let old_metadata = current_credential.codex_proxy_metadata(key_material)?;
+        let new_metadata = replacement.codex_proxy_metadata(key_material)?;
         let mut view = upstream_account_view(row)?;
 
         if current_proxy.as_deref() != Some(proxy_url.as_str()) {
@@ -352,7 +353,10 @@ impl Database {
         ) {
             return Err(AppError::Forbidden);
         }
-        if row.try_get::<i64, _>("updated_at")? != input.expected_updated_at {
+        if row.try_get::<i64, _>("updated_at")? != input.expected_updated_at
+            || row.try_get::<i64, _>("credential_generation")?
+                != input.expected_credential_generation
+        {
             return Err(AppError::Conflict(
                 "reload the upstream provider before authorizing it again".into(),
             ));
@@ -398,7 +402,7 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         let changed = sqlx::query(
-            "UPDATE upstream_accounts SET auth_kind = 'oauth', credential_generation = $1, oauth_session_id = $2, oauth_driver = $3, oauth_refresh_url = $4, config_json = COALESCE($5, config_json), updated_at = $6 WHERE id = $7 AND updated_at = $8",
+            "UPDATE upstream_accounts SET auth_kind = 'oauth', credential_generation = $1, oauth_session_id = $2, oauth_driver = $3, oauth_refresh_url = $4, config_json = COALESCE($5, config_json), updated_at = $6 WHERE id = $7 AND updated_at = $8 AND credential_generation = $9",
         )
         .bind(generation)
         .bind(input.oauth_session_id.to_string())
@@ -408,6 +412,7 @@ impl Database {
         .bind(updated_at)
         .bind(account_id.to_string())
         .bind(input.expected_updated_at)
+        .bind(input.expected_credential_generation)
         .execute(&mut *tx)
         .await?;
         if changed.rows_affected() != 1 {
@@ -435,6 +440,7 @@ impl Database {
                 account_id,
                 credential,
                 idempotency_key,
+                None,
                 key_material,
             )
             .await?;
@@ -449,6 +455,7 @@ impl Database {
         account_id: Uuid,
         credential: UpstreamCredential,
         idempotency_key: &str,
+        expected_generation: Option<i64>,
         key_material: &[u8],
     ) -> Result<(UpstreamAccountView, bool), AppError> {
         validate_idempotency_key(idempotency_key, "Idempotency-Key")?;
@@ -489,7 +496,7 @@ impl Database {
                 UPSTREAM_CREDENTIAL_ROTATION_RESOURCE,
                 &request_hash,
                 expires_at,
-                None,
+                expected_generation,
                 None,
                 key_material,
             )

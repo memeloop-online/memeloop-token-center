@@ -67,14 +67,13 @@ pub fn normalize(payload: &Value) -> Result<ManagedOAuthNormalizedAccount, AppEr
     if document.provider_type != "codex" {
         return Err(invalid_document());
     }
-    super::bearer_token(&document.access_token, "CPA Codex")?;
-    super::required_secret(&document.refresh_token, "CPA Codex")?;
-    super::optional_secret(document.id_token.as_deref(), "CPA Codex")?;
-    super::account_id(&document.account_id, "CPA Codex")?;
-    let account_name =
-        super::account_name(document.email.as_deref(), "Codex account", "CPA Codex")?;
-    let _ = super::timestamp_millis(&document.last_refresh, "CPA Codex")?;
-    let expires_at = super::timestamp_millis(&document.expired, "CPA Codex")?;
+    super::bearer_token(&document.access_token, "Codex")?;
+    super::required_secret(&document.refresh_token, "Codex")?;
+    super::optional_secret(document.id_token.as_deref(), "Codex")?;
+    super::account_id(&document.account_id, "Codex")?;
+    let account_name = super::account_name(document.email.as_deref(), "Codex account", "Codex")?;
+    let _ = super::timestamp_millis(&document.last_refresh, "Codex")?;
+    let expires_at = super::timestamp_millis(&document.expired, "Codex")?;
     let proxy_url = document
         .proxy_url
         .as_deref()
@@ -499,7 +498,7 @@ async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, AppError> 
 }
 
 fn invalid_document() -> AppError {
-    super::invalid_document("CPA Codex")
+    super::invalid_document("Codex")
 }
 
 fn refresh_failed() -> AppError {
@@ -641,7 +640,7 @@ mod tests {
             let rendered = format!("{error:?} {error}");
             assert_eq!(
                 error.to_string(),
-                "invalid request: CPA Codex OAuth document is invalid",
+                "invalid request: Codex OAuth document is invalid",
                 "{value}"
             );
             assert!(!rendered.contains(value));
@@ -840,7 +839,7 @@ mod tests {
             let rendered = format!("{error:?} {error}");
             assert_eq!(
                 error.to_string(),
-                "invalid request: CPA Codex OAuth document is invalid"
+                "invalid request: Codex OAuth document is invalid"
             );
             for secret in secrets {
                 assert!(!rendered.contains(secret));

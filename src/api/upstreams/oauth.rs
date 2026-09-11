@@ -38,6 +38,7 @@ pub(super) async fn reauthorization_target(
     Ok(Some(OAuthReauthorizationTarget {
         account_id,
         expected_updated_at: account.updated_at,
+        expected_credential_generation: account.credential_generation,
     }))
 }
 
@@ -66,23 +67,29 @@ pub(in crate::api) async fn start_codex_oauth(
                 .into(),
         ));
     }
-    let (provider_config, session_proxy_url) = if let Some(account_id) = body.upstream_account_id {
-        let account = state
-            .db
-            .upstream_account_for_reauthorization(account_id, &body.tenant_external_id)
-            .await?;
-        if account.driver != CODEX_PROVIDER_DRIVER || account.name != body.account_name.trim() {
-            return Err(AppError::Conflict(
-                "reauthorization must use the existing OpenAI Codex upstream".into(),
-            ));
-        }
-        let (_, credential, _) = state
+    let (provider_config, session_proxy_url, reauthorize) = if let Some(account_id) =
+        body.upstream_account_id
+    {
+        let (account, credential, _, oauth_driver) = state
             .db
             .upstream_account_with_current_credential(
                 account_id,
                 state.config.key_pepper.as_bytes(),
             )
             .await?;
+        if account.tenant_external_id.as_deref() != Some(body.tenant_external_id.as_str()) {
+            return Err(AppError::Forbidden);
+        }
+        if !account.can_reauthorize
+            || account.driver != CODEX_PROVIDER_DRIVER
+            || account.name != body.account_name.trim()
+            || oauth_driver.as_deref() != Some(CODEX_OAUTH_DRIVER)
+        {
+            return Err(AppError::Conflict(
+                "reauthorization must use the existing OpenAI Codex upstream and OAuth lifecycle"
+                    .into(),
+            ));
+        }
         let (proxy_url, proxy_scope) = credential.proxy().ok_or_else(|| {
             AppError::BadRequest(
                 "OpenAI Codex authorization requires an approved remote-DNS proxy".into(),
@@ -93,7 +100,12 @@ pub(in crate::api) async fn start_codex_oauth(
                 "OpenAI Codex authorization proxy is outside the approved private network".into(),
             ));
         }
-        (account.config, proxy_url.to_owned())
+        let target = OAuthReauthorizationTarget {
+            account_id,
+            expected_updated_at: account.updated_at,
+            expected_credential_generation: account.credential_generation,
+        };
+        (account.config, proxy_url.to_owned(), Some(target))
     } else {
         require_global_service(&service)?;
         let proxy_url = body.proxy_url.clone().ok_or_else(|| {
@@ -108,6 +120,7 @@ pub(in crate::api) async fn start_codex_oauth(
                 "reservation_token_bounds": {},
             }),
             proxy_url,
+            None,
         )
     };
     validate_provider_config_schema(&state, CODEX_PROVIDER_DRIVER, &provider_config)?;
@@ -117,16 +130,6 @@ pub(in crate::api) async fn start_codex_oauth(
         &provider_config,
         Some((&session_proxy_url, OutboundScope::Private)),
         false,
-    )
-    .await?;
-    let reauthorize = reauthorization_target(
-        &state,
-        body.upstream_account_id,
-        &body.tenant_external_id,
-        &body.account_name,
-        CODEX_PROVIDER_DRIVER,
-        &provider_config,
-        CODEX_OAUTH_DRIVER,
     )
     .await?;
     validate_upstream_destination(CODEX_PROVIDER_DRIVER, &provider_config, &service, &state)
@@ -186,7 +189,7 @@ pub(in crate::api) async fn poll_codex_oauth(
             tenant_external_id,
         } => {
             require_service_tenant(&service, &tenant_external_id)?;
-            let (mut account, credential, credential_active) = state
+            let (mut account, credential, credential_active, _) = state
                 .db
                 .upstream_account_with_current_credential(
                     account_id,
@@ -239,6 +242,8 @@ pub(in crate::api) async fn poll_codex_oauth(
                             ReauthorizeUpstreamAccountInput {
                                 tenant_external_id: ready.tenant_external_id,
                                 expected_updated_at: target.expected_updated_at,
+                                expected_credential_generation: target
+                                    .expected_credential_generation,
                                 driver: CODEX_PROVIDER_DRIVER.to_owned(),
                                 oauth_session_id: ready.session_id,
                                 oauth_driver: CODEX_OAUTH_DRIVER.to_owned(),
@@ -553,6 +558,8 @@ pub(in crate::api) async fn poll_cursor_oauth(
                             ReauthorizeUpstreamAccountInput {
                                 tenant_external_id: ready.tenant_external_id,
                                 expected_updated_at: target.expected_updated_at,
+                                expected_credential_generation: target
+                                    .expected_credential_generation,
                                 driver: ready.provider_driver,
                                 oauth_session_id: ready.session_id,
                                 oauth_driver: ready.oauth_driver,

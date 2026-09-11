@@ -275,13 +275,36 @@ impl UpstreamCredential {
         &self,
         key_material: &[u8],
     ) -> Result<UpstreamProxyMetadata, AppError> {
+        self.proxy_metadata_for_driver(key_material, false)
+    }
+
+    pub(crate) fn codex_proxy_metadata(
+        &self,
+        key_material: &[u8],
+    ) -> Result<UpstreamProxyMetadata, AppError> {
+        self.proxy_metadata_for_driver(key_material, true)
+    }
+
+    fn proxy_metadata_for_driver(
+        &self,
+        key_material: &[u8],
+        codex: bool,
+    ) -> Result<UpstreamProxyMetadata, AppError> {
         let Some((proxy_url, _)) = self.proxy() else {
             return Ok(UpstreamProxyMetadata::default());
         };
-        validate_proxy_url(proxy_url)?;
-        let parsed = url::Url::parse(proxy_url).map_err(|_| AppError::Internal)?;
-        let scheme = parsed.scheme().to_owned();
-        let remote_dns = scheme == "socks5h";
+        let parsed = url::Url::parse(proxy_url).ok();
+        let valid = if codex {
+            validate_codex_proxy_url(proxy_url).is_ok()
+        } else {
+            validate_proxy_url(proxy_url).is_ok()
+        };
+        let scheme = parsed
+            .as_ref()
+            .map(url::Url::scheme)
+            .filter(|scheme| matches!(*scheme, "socks5" | "socks5h"))
+            .map(str::to_owned);
+        let remote_dns = valid && scheme.as_deref() == Some("socks5h");
         let mut hasher = Sha256::new();
         hasher.update(PROXY_FINGERPRINT_DOMAIN);
         hasher.update([0]);
@@ -291,9 +314,11 @@ impl UpstreamCredential {
         let digest = format!("{:x}", hasher.finalize());
         Ok(UpstreamProxyMetadata {
             has_proxy: true,
-            scheme: Some(scheme.clone()),
+            scheme: valid.then_some(scheme).flatten(),
             remote_dns,
-            label: Some(if remote_dns {
+            label: Some(if !valid {
+                "Configured proxy requires update".to_owned()
+            } else if remote_dns {
                 "SOCKS5H private proxy".to_owned()
             } else {
                 "SOCKS5 private proxy".to_owned()
@@ -413,9 +438,6 @@ pub(crate) fn validate_proxy_url(value: &str) -> Result<(), AppError> {
         || parsed.query().is_some()
         || parsed.fragment().is_some()
     {
-        return Err(AppError::BadRequest("upstream proxy URL is invalid".into()));
-    }
-    if parsed.scheme() == "socks5h" && !has_safe_private_ip_literal_host(&parsed) {
         return Err(AppError::BadRequest("upstream proxy URL is invalid".into()));
     }
     Ok(())
@@ -689,8 +711,6 @@ mod proxy_tests {
         );
         for proxy_url in [
             "https://10.20.30.40:8443",
-            "socks5h://proxy.internal:1080",
-            "socks5h://8.8.8.8:1080",
             "socks5://10.20.30.40:1080/path",
             "socks5://10.20.30.40:1080?secret=value",
             "socks5://10.20.30.40:0",
@@ -704,6 +724,19 @@ mod proxy_tests {
                 *value = proxy_url.into();
             }
             assert!(credential.validate(0).is_err(), "{proxy_url}");
+        }
+        for proxy_url in [
+            "socks5h://proxy.example.test:1080",
+            "socks5h://8.8.8.8:1080",
+        ] {
+            let mut credential = proxied();
+            if let UpstreamCredential::ProxiedApiKey {
+                proxy_url: value, ..
+            } = &mut credential
+            {
+                *value = proxy_url.into();
+            }
+            credential.validate(0).unwrap();
         }
         let mut remote_dns = proxied();
         if let UpstreamCredential::ProxiedApiKey {

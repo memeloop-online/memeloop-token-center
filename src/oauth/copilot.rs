@@ -1278,6 +1278,7 @@ mod tests {
             reauthorize: Some(OAuthReauthorizationTarget {
                 account_id: Uuid::nil(),
                 expected_updated_at: 42,
+                expected_credential_generation: 7,
             }),
         }
     }

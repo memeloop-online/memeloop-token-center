@@ -677,6 +677,7 @@ mod tests {
                 ReauthorizeUpstreamAccountInput {
                     tenant_external_id: "oauth-reauthorize-test".to_owned(),
                     expected_updated_at: account.updated_at,
+                    expected_credential_generation: account.credential_generation,
                     driver: "openai-codex".to_owned(),
                     oauth_session_id: second_session,
                     oauth_driver: "openai_codex_device".to_owned(),
@@ -696,6 +697,7 @@ mod tests {
                 ReauthorizeUpstreamAccountInput {
                     tenant_external_id: "oauth-reauthorize-test".to_owned(),
                     expected_updated_at: account.updated_at,
+                    expected_credential_generation: account.credential_generation,
                     driver: "openai-codex".to_owned(),
                     oauth_session_id: second_session,
                     oauth_driver: "openai_codex_device".to_owned(),

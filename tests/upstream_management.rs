@@ -246,6 +246,30 @@ async fn codex_transport_proxy_rotation_is_sanitized_fenced_and_audited() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{bypass_rejection}");
     assert!(!bypass_rejection.to_string().contains("other-secret"));
 
+    let (status, token_rotated_json) = json_request(
+        &state,
+        "PUT",
+        &format!("/internal/v1/upstreams/{}/credential", upstream.id),
+        &operator.token,
+        Some("codex-token-rotation-without-proxy"),
+        Some(json!({
+            "credential": {
+                "type": "oauth",
+                "access_token": "rotated-access-secret",
+                "refresh_token": "rotated-refresh-secret",
+                "expires_at": memeloop_token_center::db::unix_millis() + 3_600_000,
+                "adapter_state": {
+                    "schema": "openai-codex-oauth-v1",
+                    "account_id": "codex-account"
+                }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{token_rotated_json}");
+    let token_rotated = account(token_rotated_json);
+    assert_eq!(token_rotated.proxy_fingerprint, rotated.proxy_fingerprint);
+
     let (status, replay_json) = json_request(
         &state,
         "PUT",
@@ -360,6 +384,344 @@ async fn codex_transport_proxy_rotation_is_sanitized_fenced_and_audited() {
     assert!(!credential_ciphertext.contains("100.64.0.16"));
 }
 
+#[tokio::test]
+async fn legacy_invalid_codex_proxy_remains_listable_and_can_be_repaired() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("codex-proxy-repair.db").display()
+    );
+    let state = AppState::initialize(Config::for_test(database_url.clone()))
+        .await
+        .unwrap();
+    let pepper = state.config.key_pepper.as_bytes();
+    let credential = |proxy_url: &str| UpstreamCredential::OAuth {
+        access_token: "repair-access-secret".into(),
+        refresh_token: Some("repair-refresh-secret".into()),
+        expires_at: Some(memeloop_token_center::db::unix_millis() + 3_600_000),
+        header: "authorization".into(),
+        prefix: "Bearer ".into(),
+        adapter_state: Some(json!({
+            "schema": "openai-codex-oauth-v1",
+            "account_id": "repair-account"
+        })),
+        proxy_url: Some(proxy_url.into()),
+        proxy_network_scope: Some(memeloop_token_center::network::OutboundScope::Private),
+    };
+    let legacy_proxy = "socks5h://legacy-user:legacy-secret@proxy.example.test:1080";
+    let legacy = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "codex-proxy-repair-tenant".into(),
+                name: "Legacy proxy".into(),
+                driver: "http-json".into(),
+                config: json!({"base_url": "https://api.example.test"}),
+                credential: credential(legacy_proxy),
+                oauth_session_id: Some(Uuid::now_v7()),
+                oauth_driver: Some("openai_codex_device".into()),
+                oauth_refresh_url: Some("https://auth.openai.com/oauth/token".into()),
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let valid = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "codex-proxy-repair-tenant".into(),
+                name: "Valid proxy".into(),
+                driver: "openai-codex".into(),
+                config: json!({
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "network_scope": "public",
+                    "reservation_token_bounds": {}
+                }),
+                credential: credential("socks5h://100.64.0.20:1080"),
+                oauth_session_id: Some(Uuid::now_v7()),
+                oauth_driver: Some("openai_codex_device".into()),
+                oauth_refresh_url: Some("https://auth.openai.com/oauth/token".into()),
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let audit_pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+    sqlx::query(
+        "UPDATE upstream_accounts SET driver = 'openai-codex', config_json = $1 WHERE id = $2",
+    )
+    .bind(
+        json!({
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "network_scope": "public",
+            "reservation_token_bounds": {}
+        })
+        .to_string(),
+    )
+    .bind(legacy.id.to_string())
+    .execute(&audit_pool)
+    .await
+    .unwrap();
+
+    let listed = state
+        .db
+        .list_upstream_accounts_page_with_transport(
+            Some("codex-proxy-repair-tenant"),
+            None,
+            None,
+            100,
+            pepper,
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 2);
+    let legacy_view = listed.iter().find(|view| view.id == legacy.id).unwrap();
+    assert!(legacy_view.has_proxy);
+    assert_eq!(legacy_view.proxy_scheme, None);
+    assert!(!legacy_view.proxy_remote_dns);
+    assert_eq!(
+        legacy_view.proxy_label.as_deref(),
+        Some("Configured proxy requires update")
+    );
+    assert!(legacy_view.proxy_fingerprint.is_some());
+    assert!(legacy_view.can_update_transport_proxy);
+    let valid_view = listed.iter().find(|view| view.id == valid.id).unwrap();
+    assert_eq!(valid_view.proxy_scheme.as_deref(), Some("socks5h"));
+    assert!(valid_view.proxy_remote_dns);
+
+    let (repaired, changed) = state
+        .db
+        .rotate_codex_transport_proxy(
+            legacy.id,
+            "codex-proxy-repair-tenant",
+            "socks5h://100.64.0.21:1080".into(),
+            legacy.updated_at,
+            legacy.credential_generation,
+            "repair-legacy-proxy",
+            None,
+            pepper,
+        )
+        .await
+        .unwrap();
+    assert!(changed);
+    assert_eq!(repaired.proxy_scheme.as_deref(), Some("socks5h"));
+    assert!(repaired.proxy_remote_dns);
+    assert!(
+        !serde_json::to_string(&repaired)
+            .unwrap()
+            .contains(legacy_proxy)
+    );
+    let audit = sqlx::query(
+        "SELECT previous_fingerprint, previous_scheme, new_fingerprint, new_scheme FROM upstream_transport_proxy_audit WHERE upstream_account_id = $1",
+    )
+    .bind(legacy.id.to_string())
+    .fetch_one(&audit_pool)
+    .await
+    .unwrap();
+    assert!(
+        audit
+            .try_get::<Option<String>, _>("previous_fingerprint")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        audit
+            .try_get::<Option<String>, _>("previous_scheme")
+            .unwrap()
+            .is_none()
+    );
+    for column in ["new_fingerprint", "new_scheme"] {
+        let value: String = audit.try_get(column).unwrap();
+        assert!(!value.contains("legacy-secret"));
+        assert!(!value.contains("proxy.example.test"));
+    }
+}
+
+#[tokio::test]
+async fn codex_proxy_rotation_fences_stale_reauthorization_and_token_rotation() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("codex-proxy-fences.db").display()
+    );
+    let state = AppState::initialize(Config::for_test(database_url.clone()))
+        .await
+        .unwrap();
+    let pepper = state.config.key_pepper.as_bytes();
+    let credential = |access_token: &str, proxy_url: Option<&str>| UpstreamCredential::OAuth {
+        access_token: access_token.into(),
+        refresh_token: Some("fenced-refresh-secret".into()),
+        expires_at: Some(memeloop_token_center::db::unix_millis() + 3_600_000),
+        header: "authorization".into(),
+        prefix: "Bearer ".into(),
+        adapter_state: Some(json!({
+            "schema": "openai-codex-oauth-v1",
+            "account_id": "fenced-account"
+        })),
+        proxy_url: proxy_url.map(str::to_owned),
+        proxy_network_scope: proxy_url
+            .map(|_| memeloop_token_center::network::OutboundScope::Private),
+    };
+    let account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "codex-proxy-fence-tenant".into(),
+                name: "Fenced Codex".into(),
+                driver: "openai-codex".into(),
+                config: json!({
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "network_scope": "public",
+                    "reservation_token_bounds": {}
+                }),
+                credential: credential("access-v1", Some("socks5h://100.64.0.30:1080")),
+                oauth_session_id: Some(Uuid::now_v7()),
+                oauth_driver: Some("openai_codex_device".into()),
+                oauth_refresh_url: Some("https://auth.openai.com/oauth/token".into()),
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let (reauth_snapshot, _, _, oauth_driver) = state
+        .db
+        .upstream_account_with_current_credential(account.id, pepper)
+        .await
+        .unwrap();
+    assert_eq!(oauth_driver.as_deref(), Some("openai_codex_device"));
+
+    let start_rotation = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let rotation_finished = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let rotation = {
+        let database = state.db.clone();
+        let key_material = pepper.to_vec();
+        let start_rotation = start_rotation.clone();
+        let rotation_finished = rotation_finished.clone();
+        tokio::spawn(async move {
+            start_rotation.wait().await;
+            let result = database
+                .rotate_codex_transport_proxy(
+                    account.id,
+                    "codex-proxy-fence-tenant",
+                    "socks5h://100.64.0.31:1080".into(),
+                    reauth_snapshot.updated_at,
+                    reauth_snapshot.credential_generation,
+                    "reauth-interleaved-proxy-rotation",
+                    None,
+                    &key_material,
+                )
+                .await;
+            rotation_finished.wait().await;
+            result
+        })
+    };
+    start_rotation.wait().await;
+    rotation_finished.wait().await;
+    let (rotated, changed) = rotation.await.unwrap().unwrap();
+    assert!(changed);
+    let stale_reauthorization = state
+        .db
+        .reauthorize_upstream_account(
+            account.id,
+            ReauthorizeUpstreamAccountInput {
+                tenant_external_id: "codex-proxy-fence-tenant".into(),
+                expected_updated_at: reauth_snapshot.updated_at,
+                expected_credential_generation: reauth_snapshot.credential_generation,
+                driver: "openai-codex".into(),
+                oauth_session_id: Uuid::now_v7(),
+                oauth_driver: "openai_codex_device".into(),
+                oauth_refresh_url: Some("https://auth.openai.com/oauth/token".into()),
+                provider_config: None,
+                credential: credential("reauthorized-access", None),
+            },
+            pepper,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale_reauthorization,
+        memeloop_token_center::error::AppError::Conflict(_)
+    ));
+
+    let (token_snapshot, current_credential, _, _) = state
+        .db
+        .upstream_account_with_current_credential(account.id, pepper)
+        .await
+        .unwrap();
+    let stale_token_rotation =
+        credential("token-v2", None).preserve_proxy_from(&current_credential);
+    let start_rotation = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let rotation_finished = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let rotation = {
+        let database = state.db.clone();
+        let key_material = pepper.to_vec();
+        let start_rotation = start_rotation.clone();
+        let rotation_finished = rotation_finished.clone();
+        tokio::spawn(async move {
+            start_rotation.wait().await;
+            let result = database
+                .rotate_codex_transport_proxy(
+                    account.id,
+                    "codex-proxy-fence-tenant",
+                    "socks5h://100.64.0.32:1080".into(),
+                    token_snapshot.updated_at,
+                    token_snapshot.credential_generation,
+                    "token-interleaved-proxy-rotation",
+                    None,
+                    &key_material,
+                )
+                .await;
+            rotation_finished.wait().await;
+            result
+        })
+    };
+    start_rotation.wait().await;
+    rotation_finished.wait().await;
+    let (latest_proxy, changed) = rotation.await.unwrap().unwrap();
+    assert!(changed);
+    let stale_rotation = state
+        .db
+        .rotate_upstream_credential_with_outcome(
+            account.id,
+            stale_token_rotation,
+            "stale-token-rotation",
+            Some(token_snapshot.credential_generation),
+            pepper,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale_rotation,
+        memeloop_token_center::error::AppError::Conflict(_)
+    ));
+    let (latest_account, latest_credential, _, _) = state
+        .db
+        .upstream_account_with_current_credential(account.id, pepper)
+        .await
+        .unwrap();
+    assert_eq!(
+        latest_account.credential_generation,
+        latest_proxy.credential_generation
+    );
+    assert_eq!(
+        latest_credential.proxy(),
+        Some((
+            "socks5h://100.64.0.32:1080",
+            memeloop_token_center::network::OutboundScope::Private
+        ))
+    );
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_transport_proxy_audit WHERE upstream_account_id = $1",
+    )
+    .bind(account.id.to_string())
+    .fetch_one(&sqlx::AnyPool::connect(&database_url).await.unwrap())
+    .await
+    .unwrap();
+    assert_eq!(audit_count, 2);
+    assert_eq!(rotated.proxy_scheme.as_deref(), Some("socks5h"));
+}
+
 fn account(value: Value) -> UpstreamAccountView {
     serde_json::from_value(value).unwrap()
 }
@@ -459,6 +821,7 @@ async fn interactive_reauthorization_preserves_stable_identity_routes_and_replay
             ReauthorizeUpstreamAccountInput {
                 tenant_external_id: "reauthorize-tenant".into(),
                 expected_updated_at: original.updated_at,
+                expected_credential_generation: original.credential_generation,
                 driver: "http-json".into(),
                 oauth_session_id: completed_session,
                 oauth_driver: "cursor".into(),
@@ -496,6 +859,7 @@ async fn interactive_reauthorization_preserves_stable_identity_routes_and_replay
             ReauthorizeUpstreamAccountInput {
                 tenant_external_id: "reauthorize-tenant".into(),
                 expected_updated_at: original.updated_at,
+                expected_credential_generation: original.credential_generation,
                 driver: "http-json".into(),
                 oauth_session_id: completed_session,
                 oauth_driver: "cursor".into(),
@@ -539,6 +903,7 @@ async fn interactive_reauthorization_preserves_stable_identity_routes_and_replay
             ReauthorizeUpstreamAccountInput {
                 tenant_external_id: "reauthorize-tenant".into(),
                 expected_updated_at: original.updated_at,
+                expected_credential_generation: original.credential_generation,
                 driver: "http-json".into(),
                 oauth_session_id: Uuid::now_v7(),
                 oauth_driver: "cursor".into(),
@@ -562,6 +927,7 @@ async fn interactive_reauthorization_preserves_stable_identity_routes_and_replay
             ReauthorizeUpstreamAccountInput {
                 tenant_external_id: "other-tenant".into(),
                 expected_updated_at: reauthorized.updated_at,
+                expected_credential_generation: reauthorized.credential_generation,
                 driver: "http-json".into(),
                 oauth_session_id: Uuid::now_v7(),
                 oauth_driver: "cursor".into(),
@@ -704,6 +1070,7 @@ async fn retired_provider_rows_cannot_be_reactivated_through_the_api() {
                 ReauthorizeUpstreamAccountInput {
                     tenant_external_id: "subscription-tenant".into(),
                     expected_updated_at: account.updated_at,
+                    expected_credential_generation: account.credential_generation,
                     driver: "retired-historical".into(),
                     oauth_session_id: Uuid::now_v7(),
                     oauth_driver: "provider_adapter".into(),

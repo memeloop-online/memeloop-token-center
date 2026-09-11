@@ -363,7 +363,7 @@ pub(in crate::api) async fn update_upstream(
         .require_upstream_tenant(account_id, &body.tenant_external_id)
         .await?;
     let driver = state.db.upstream_driver(account_id).await?;
-    let (current, current_credential, credential_active) = state
+    let (current, current_credential, credential_active, _) = state
         .db
         .upstream_account_with_current_credential(account_id, state.config.key_pepper.as_bytes())
         .await?;
@@ -420,7 +420,7 @@ pub(in crate::api) async fn set_upstream_status(
         .db
         .require_upstream_tenant(account_id, &body.tenant_external_id)
         .await?;
-    let (account_before_status, credential, credential_active) = state
+    let (account_before_status, credential, credential_active, _) = state
         .db
         .upstream_account_with_current_credential(account_id, state.config.key_pepper.as_bytes())
         .await?;
@@ -530,12 +530,14 @@ pub(in crate::api) async fn rotate_upstream_credential(
     let credential: UpstreamCredential = serde_json::from_value(body.credential)
         .map_err(|error| AppError::BadRequest(format!("invalid upstream credential: {error}")))?;
     let changes_proxy = credential.proxy().is_some();
-    let (account_before_rotation, current_credential) = state
+    let (account_before_rotation, current_credential, _, _) = state
         .db
-        .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
+        .upstream_account_with_current_credential(account_id, state.config.key_pepper.as_bytes())
         .await?;
     if driver == crate::oauth::codex_device::PROVIDER_DRIVER
-        && credential.proxy() != current_credential.proxy()
+        && credential
+            .proxy()
+            .is_some_and(|proxy| Some(proxy) != current_credential.proxy())
     {
         return Err(AppError::BadRequest(
             "use the transport-proxy endpoint to change an OpenAI Codex proxy".into(),
@@ -560,6 +562,7 @@ pub(in crate::api) async fn rotate_upstream_credential(
             account_id,
             credential,
             idempotency_key,
+            Some(account_before_rotation.credential_generation),
             state.config.key_pepper.as_bytes(),
         )
         .await?;

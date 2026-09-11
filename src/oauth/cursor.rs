@@ -109,6 +109,8 @@ pub struct StartCursorLogin {
 pub struct OAuthReauthorizationTarget {
     pub account_id: Uuid,
     pub expected_updated_at: i64,
+    #[serde(default)]
+    pub expected_credential_generation: i64,
 }
 
 #[derive(Clone, Debug, Serialize)]
