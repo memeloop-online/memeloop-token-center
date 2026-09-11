@@ -46,6 +46,275 @@ struct SessionAccumulator {
     archived_only_duration_sum_ms: i64,
 }
 
+// The default first page is the latency-sensitive Sessions entry point.  Each
+// source below first produces one row per logical session, then contributes at
+// most one page to the global candidate set.  A session in the global top N
+// must be in the top N of at least one source that supplies its maximum
+// activity time, so the second LIMIT does not change first-page membership.
+// Metrics and presentation metadata are deliberately joined only after this
+// bounded identity set has been selected.
+//
+// Filtered and cursor requests cannot use this shortcut: applying a global
+// predicate after any source LIMIT can hide an arbitrary number of matching
+// sessions.  They continue to use the reference query in `recent_sessions`.
+pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candidates AS MATERIALIZED (
+           SELECT totals.tenant_id, totals.key_id, totals.session_id,
+                  MAX(totals.last_activity_at) AS last_activity_at
+             FROM session_usage_totals totals
+            WHERE totals.tenant_id = $1
+              AND ($2 = '' OR totals.key_id = $2)
+            GROUP BY totals.tenant_id, totals.key_id, totals.session_id
+            ORDER BY MAX(totals.last_activity_at) DESC, totals.session_id DESC
+            LIMIT $3
+       ), active_candidates AS MATERIALIZED (
+           SELECT request.tenant_id, request.key_id,
+                  COALESCE(request.conversation_cluster_id,
+                      'unlinked:' || request.key_id) AS session_id,
+                  MAX(request.created_at) AS last_activity_at
+             FROM request_records request
+            WHERE request.tenant_id = $1
+              AND ($2 = '' OR request.key_id = $2)
+              AND request.status_code IS NULL
+            GROUP BY request.tenant_id, request.key_id,
+                     COALESCE(request.conversation_cluster_id,
+                         'unlinked:' || request.key_id)
+            ORDER BY MAX(request.created_at) DESC,
+                     COALESCE(request.conversation_cluster_id,
+                         'unlinked:' || request.key_id) DESC
+            LIMIT $3
+       ), projected_candidates AS MATERIALIZED (
+           SELECT key_record.tenant_id, projection.key_id,
+                  projection.cluster_id AS session_id,
+                  projection.updated_at AS last_activity_at
+             FROM conversation_key_clusters projection
+             JOIN key_records key_record ON key_record.id = projection.key_id
+            WHERE key_record.tenant_id = $1
+              AND ($2 = '' OR projection.key_id = $2)
+            ORDER BY projection.updated_at DESC, projection.cluster_id DESC
+            LIMIT $3
+       ), archived_candidates AS MATERIALIZED (
+           SELECT tenant_id, key_id, session_id, last_activity_at
+             FROM session_archive_totals
+            WHERE tenant_id = $1 AND ($2 = '' OR key_id = $2)
+            ORDER BY last_activity_at DESC, session_id DESC
+            LIMIT $3
+       ), candidate_activity AS (
+           SELECT * FROM completed_candidates
+           UNION ALL SELECT * FROM active_candidates
+           UNION ALL SELECT * FROM projected_candidates
+           UNION ALL SELECT * FROM archived_candidates
+       ), recent AS MATERIALIZED (
+           SELECT tenant_id, key_id, session_id,
+                  MAX(last_activity_at) AS last_activity_at
+             FROM candidate_activity
+            GROUP BY tenant_id, key_id, session_id
+            ORDER BY MAX(last_activity_at) DESC, session_id DESC
+            LIMIT $3
+       ), completed AS (
+           SELECT totals.tenant_id, totals.key_id, totals.session_id,
+                  MAX(totals.last_activity_at) AS last_activity_at,
+                  CAST(SUM(totals.requests) AS BIGINT) AS requests,
+                  CAST(SUM(totals.errors) AS BIGINT) AS errors,
+                  CAST(SUM(totals.input_tokens) AS BIGINT) AS input_tokens,
+                  CAST(SUM(totals.output_tokens) AS BIGINT) AS output_tokens,
+                  CAST(SUM(totals.duration_count) AS BIGINT) AS duration_count,
+                  CAST(SUM(totals.duration_sum_ms) AS BIGINT) AS duration_sum_ms
+             FROM recent
+             JOIN session_usage_totals totals
+               ON totals.tenant_id = recent.tenant_id
+              AND totals.key_id = recent.key_id
+              AND totals.session_id = recent.session_id
+            GROUP BY totals.tenant_id, totals.key_id, totals.session_id
+       ), active AS (
+           SELECT request.tenant_id, request.key_id,
+                  COALESCE(request.conversation_cluster_id,
+                      'unlinked:' || request.key_id) AS session_id,
+                  MAX(request.created_at) AS last_activity_at,
+                  COUNT(*) AS active_requests
+             FROM recent
+             JOIN request_records request
+               ON request.tenant_id = recent.tenant_id
+              AND request.key_id = recent.key_id
+              AND COALESCE(request.conversation_cluster_id,
+                      'unlinked:' || request.key_id) = recent.session_id
+              AND request.status_code IS NULL
+            GROUP BY request.tenant_id, request.key_id,
+                     COALESCE(request.conversation_cluster_id,
+                         'unlinked:' || request.key_id)
+       ), projected AS (
+           SELECT key_record.tenant_id, projection.key_id,
+                  projection.cluster_id AS session_id,
+                  projection.updated_at AS last_activity_at,
+                  projection.request_count
+             FROM recent
+             JOIN conversation_key_clusters projection
+               ON projection.key_id = recent.key_id
+              AND projection.cluster_id = recent.session_id
+             JOIN key_records key_record
+               ON key_record.id = projection.key_id
+              AND key_record.tenant_id = recent.tenant_id
+       ), archived AS (
+           SELECT archive.tenant_id, archive.key_id, archive.session_id,
+                  archive.last_activity_at, archive.requests, archive.errors,
+                  archive.input_tokens, archive.output_tokens,
+                  archive.duration_count, archive.duration_sum_ms
+             FROM recent
+             JOIN session_archive_totals archive
+               ON archive.tenant_id = recent.tenant_id
+              AND archive.key_id = recent.key_id
+              AND archive.session_id = recent.session_id
+       ), latest_ids AS MATERIALIZED (
+           SELECT recent.key_id, recent.session_id,
+                  (SELECT latest.id FROM request_records latest
+                    WHERE latest.key_id = recent.key_id
+                      AND latest.conversation_cluster_id = recent.session_id
+                    ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1) AS request_id,
+                  (SELECT latest.archive_request_id FROM session_archive_unlinked_requests latest
+                    WHERE latest.key_id = recent.key_id
+                      AND latest.conversation_cluster_id = recent.session_id
+                    ORDER BY latest.source_started_at DESC, latest.archive_request_id DESC LIMIT 1) AS archive_id
+             FROM recent
+            WHERE recent.session_id <> 'unlinked:' || recent.key_id
+           UNION ALL
+           SELECT recent.key_id, recent.session_id,
+                  (SELECT latest.id FROM request_records latest
+                    WHERE latest.key_id = recent.key_id
+                      AND latest.conversation_cluster_id IS NULL
+                    ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1),
+                  (SELECT latest.archive_request_id FROM session_archive_unlinked_requests latest
+                    WHERE latest.key_id = recent.key_id
+                      AND latest.conversation_cluster_id IS NULL
+                    ORDER BY latest.source_started_at DESC, latest.archive_request_id DESC LIMIT 1)
+             FROM recent
+            WHERE recent.session_id = 'unlinked:' || recent.key_id
+       ), recent_activity AS (
+           SELECT recent.key_id, recent.session_id, request.model,
+                  request.protocol, request.status_code, request.created_at,
+                  request.id, 1 AS live, observation.session_name,
+                  observation.task_kind
+             FROM latest_ids recent
+             JOIN request_records request
+               ON request.key_id = recent.key_id
+              AND request.conversation_cluster_id = recent.session_id
+              AND request.id = recent.request_id
+             LEFT JOIN conversation_observations observation
+               ON observation.request_id = request.id
+              AND observation.key_id = request.key_id
+           UNION ALL
+           SELECT recent.key_id, recent.session_id, request.model,
+                  request.protocol, request.status_code, request.created_at,
+                  request.id, 1, observation.session_name,
+                  observation.task_kind
+             FROM latest_ids recent
+             JOIN request_records request
+               ON request.key_id = recent.key_id
+              AND request.conversation_cluster_id IS NULL
+              AND recent.session_id = 'unlinked:' || recent.key_id
+              AND request.id = recent.request_id
+             LEFT JOIN conversation_observations observation
+               ON observation.request_id = request.id
+              AND observation.key_id = request.key_id
+           UNION ALL
+           SELECT recent.key_id, recent.session_id, archive.model,
+                  archive.protocol, archive.status_code,
+                  archive.source_started_at, archive.archive_request_id, 0,
+                  observation.session_name, observation.task_kind
+             FROM latest_ids recent
+             JOIN session_archive_unlinked_requests archive
+               ON archive.key_id = recent.key_id
+              AND archive.conversation_cluster_id = recent.session_id
+              AND archive.archive_request_id = recent.archive_id
+             LEFT JOIN conversation_observations observation
+               ON observation.request_id = archive.archive_request_id
+              AND observation.key_id = archive.key_id
+           UNION ALL
+           SELECT recent.key_id, recent.session_id, archive.model,
+                  archive.protocol, archive.status_code,
+                  archive.source_started_at, archive.archive_request_id, 0,
+                  observation.session_name, observation.task_kind
+             FROM latest_ids recent
+             JOIN session_archive_unlinked_requests archive
+               ON archive.key_id = recent.key_id
+              AND archive.conversation_cluster_id IS NULL
+              AND recent.session_id = 'unlinked:' || recent.key_id
+              AND archive.archive_request_id = recent.archive_id
+             LEFT JOIN conversation_observations observation
+               ON observation.request_id = archive.archive_request_id
+              AND observation.key_id = archive.key_id
+       ), latest_activity AS (
+           SELECT recent_activity.*,
+                  ROW_NUMBER() OVER (
+                      PARTITION BY key_id, session_id
+                      ORDER BY created_at DESC, id DESC
+                  ) AS activity_rank
+             FROM recent_activity
+       )
+       SELECT recent.*, key_record.alias AS key_alias,
+              COALESCE(totals.currency, '') AS currency,
+              COALESCE(totals.cost_micros, 0) AS cost_micros,
+              COALESCE(completed.requests, 0) AS requests,
+              COALESCE(completed.errors, 0) AS errors,
+              COALESCE(completed.input_tokens, 0) AS input_tokens,
+              COALESCE(completed.output_tokens, 0) AS output_tokens,
+              COALESCE(completed.duration_count, 0) AS duration_count,
+              COALESCE(completed.duration_sum_ms, 0) AS duration_sum_ms,
+              COALESCE(archived.requests, 0) AS archived_only_requests,
+              COALESCE(archived.errors, 0) AS archived_only_errors,
+              COALESCE(archived.input_tokens, 0) AS archived_only_input_tokens,
+              COALESCE(archived.output_tokens, 0) AS archived_only_output_tokens,
+              COALESCE(archived.duration_count, 0) AS archived_only_duration_count,
+              COALESCE(archived.duration_sum_ms, 0) AS archived_only_duration_sum_ms,
+              COALESCE(active.active_requests, 0) AS active_requests,
+              COALESCE(latest_activity.model, '') AS model,
+              COALESCE(latest_activity.protocol, '') AS protocol,
+              latest_activity.session_name,
+              latest_activity.task_kind,
+              CASE WHEN latest_activity.status_code IS NULL AND
+                             latest_activity.live = 1 THEN 'active'
+                   WHEN latest_activity.status_code IS NULL THEN 'unknown'
+                   WHEN latest_activity.status_code BETWEEN 200 AND 399 THEN 'success'
+                   ELSE 'error' END AS last_status
+         FROM recent
+         JOIN key_records key_record
+           ON key_record.id = recent.key_id
+          AND key_record.tenant_id = recent.tenant_id
+         LEFT JOIN completed
+           ON completed.tenant_id = recent.tenant_id
+          AND completed.key_id = recent.key_id
+          AND completed.session_id = recent.session_id
+         LEFT JOIN active
+           ON active.tenant_id = recent.tenant_id
+          AND active.key_id = recent.key_id
+          AND active.session_id = recent.session_id
+         LEFT JOIN projected
+           ON projected.tenant_id = recent.tenant_id
+          AND projected.key_id = recent.key_id
+          AND projected.session_id = recent.session_id
+         LEFT JOIN archived
+           ON archived.tenant_id = recent.tenant_id
+          AND archived.key_id = recent.key_id
+          AND archived.session_id = recent.session_id
+         LEFT JOIN session_usage_totals totals
+           ON totals.tenant_id = recent.tenant_id
+          AND totals.key_id = recent.key_id
+          AND totals.session_id = recent.session_id
+         LEFT JOIN latest_activity
+           ON latest_activity.key_id = recent.key_id
+          AND latest_activity.session_id = recent.session_id
+          AND latest_activity.activity_rank = 1
+        ORDER BY recent.last_activity_at DESC, recent.session_id DESC,
+                 recent.key_id DESC, totals.currency ASC"#;
+
+pub(super) fn should_use_candidate_first_page(
+    allow_candidate_first: bool,
+    has_cursor: bool,
+    state: &str,
+    model: &str,
+    query: &str,
+) -> bool {
+    allow_candidate_first && !has_cursor && state == "all" && model.is_empty() && query.is_empty()
+}
+
 impl Database {
     pub async fn operator_recent_sessions(
         &self,
@@ -135,19 +404,44 @@ impl Database {
         tenant_id: &str,
         filter: LogicalSessionListFilter,
     ) -> Result<Vec<LogicalSessionSummary>, AppError> {
+        self.recent_sessions_with_candidate_first(tenant_id, filter, true)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn recent_sessions_reference_for_test(
+        &self,
+        tenant_id: &str,
+        filter: LogicalSessionListFilter,
+    ) -> Result<Vec<LogicalSessionSummary>, AppError> {
+        self.recent_sessions_with_candidate_first(tenant_id, filter, false)
+            .await
+    }
+
+    async fn recent_sessions_with_candidate_first(
+        &self,
+        tenant_id: &str,
+        filter: LogicalSessionListFilter,
+        allow_candidate_first: bool,
+    ) -> Result<Vec<LogicalSessionSummary>, AppError> {
         let limit = filter.limit.clamp(1, 100) + 1;
         let key_id = filter.key_id.map(|id| id.to_string()).unwrap_or_default();
+        let has_cursor = filter.cursor.is_some();
         let (before_last_activity_at, before_session_id) =
             filter.cursor.unwrap_or((-1, String::new()));
         let model = filter.model.unwrap_or_default();
         let query = search_prefix(filter.query.as_deref());
-        // Only the latest activity supplies presentation metadata. Select the
-        // newest live/archive row per returned session through the existing
-        // cursor indexes before joining observations or ranking sources. Joining
-        // every historical request here made an unlinked session sort its entire
-        // history for a single label. Aggregate totals and filters stay complete.
-        let rows = sqlx::query(
-            r#"WITH completed AS (
+        let use_candidate_first_page = should_use_candidate_first_page(
+            allow_candidate_first,
+            has_cursor,
+            &filter.state,
+            &model,
+            &query,
+        );
+        // Any global filter or cursor stays on the reference path. In those
+        // cases source-local truncation would be incorrect because an arbitrary
+        // number of newer non-matching sessions may precede the first match.
+        let reference_query = r#"WITH completed AS (
                    SELECT totals.tenant_id, totals.key_id, totals.session_id,
                           MAX(totals.last_activity_at) AS last_activity_at,
                           CAST(SUM(totals.requests) AS BIGINT) AS requests,
@@ -396,18 +690,25 @@ impl Database {
                   AND latest_activity.session_id = recent.session_id
                   AND latest_activity.activity_rank = 1
                 ORDER BY recent.last_activity_at DESC, recent.session_id DESC,
-                         recent.key_id DESC, totals.currency ASC"#,
-        )
-        .bind(tenant_id)
-        .bind(&key_id)
-        .bind(limit)
-        .bind(before_last_activity_at)
-        .bind(&before_session_id)
-        .bind(&filter.state)
-        .bind(&model)
-        .bind(&query)
-        .fetch_all(&self.pool)
-        .await?;
+                         recent.key_id DESC, totals.currency ASC"#;
+        let session_query = if use_candidate_first_page {
+            RECENT_SESSIONS_FIRST_PAGE_SQL
+        } else {
+            reference_query
+        };
+        let mut session_query = sqlx::query(session_query)
+            .bind(tenant_id)
+            .bind(&key_id)
+            .bind(limit);
+        if !use_candidate_first_page {
+            session_query = session_query
+                .bind(before_last_activity_at)
+                .bind(&before_session_id)
+                .bind(&filter.state)
+                .bind(&model)
+                .bind(&query);
+        }
+        let rows = session_query.fetch_all(&self.pool).await?;
         let mut sessions = BTreeMap::<(String, String), SessionAccumulator>::new();
         for row in rows {
             let session_id: String = row.try_get("session_id")?;
