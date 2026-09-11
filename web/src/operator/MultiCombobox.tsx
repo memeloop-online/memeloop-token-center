@@ -20,6 +20,11 @@ interface MultiComboboxProps {
   disabled?: boolean;
   hint?: string;
   onQueryChange?: (query: string) => void;
+  loading?: boolean;
+  loadingText?: string;
+  error?: string;
+  retryLabel?: string;
+  onRetry?: () => void;
 }
 
 function normalized(value: string) {
@@ -40,7 +45,8 @@ function rowsForQuery(options: ComboboxOption[], value: ComboboxOption[], query:
 
 export function MultiCombobox({
   label, options, value, onChange, placeholder, emptyText, removeLabel, allowCreate = false,
-  createLabel, disabled = false, hint, onQueryChange,
+  createLabel, disabled = false, hint, onQueryChange, loading = false, loadingText, error = '',
+  retryLabel, onRetry,
 }: MultiComboboxProps) {
   const id = useId();
   const inputRef = useRef<HTMLInputElement>(null);
@@ -106,19 +112,23 @@ export function MultiCombobox({
         onKeyDown={onKeyDown}
       />
     </div>
-    {open && !disabled && <div className="combobox-popover" id={`${id}-listbox`} role="listbox" aria-labelledby={`${id}-label`}>
-      {rows.map((item, index) => <button
-        type="button"
-        role="option"
-        aria-selected={index === activeIndex}
-        className={index === activeIndex ? 'active' : ''}
-        id={`${id}-option-${index}`}
-        key={item.value}
-        onMouseDown={(event) => event.preventDefault()}
-        onMouseEnter={() => setActiveIndex(index)}
-        onClick={() => choose(item)}
-      ><span>{item.created ? createLabel?.(item.label) ?? item.label : item.label}</span>{item.description && <small>{item.description}</small>}</button>)}
-      {rows.length === 0 && <div className="combobox-empty">{emptyText}</div>}
+    {open && !disabled && <div className="combobox-popover">
+      <div className="combobox-options" id={`${id}-listbox`} role="listbox" aria-labelledby={`${id}-label`} aria-busy={loading}>
+        {rows.map((item, index) => <button
+          type="button"
+          role="option"
+          aria-selected={index === activeIndex}
+          className={index === activeIndex ? 'active' : ''}
+          id={`${id}-option-${index}`}
+          key={item.value}
+          onMouseDown={(event) => event.preventDefault()}
+          onMouseEnter={() => setActiveIndex(index)}
+          onClick={() => choose(item)}
+        ><span>{item.created ? createLabel?.(item.label) ?? item.label : item.label}</span>{item.description && <small>{item.description}</small>}</button>)}
+      </div>
+      {loading && <div className="combobox-state" role="status">{loadingText}</div>}
+      {!loading && error && <div className="combobox-state error" role="alert"><span>{error}</span>{onRetry && <button type="button" className="secondary" onMouseDown={(event) => event.preventDefault()} onClick={onRetry}>{retryLabel}</button>}</div>}
+      {!loading && !error && rows.length === 0 && <div className="combobox-empty">{emptyText}</div>}
     </div>}
   </div>;
 }
