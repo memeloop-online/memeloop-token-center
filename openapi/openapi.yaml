@@ -295,7 +295,10 @@ paths:
         Returns plaintext only for an explicit, authorized copy action and only while the
         matching key generation remains active. Credential lists and self-service APIs never
         contain the secret. A key created before recovery envelopes were enabled returns 404
-        until an authorized importer stores its still-valid source credential.
+        until an authorized importer stores its still-valid source credential. Retrieval
+        attempts are durably audited without credential material and limited in a short window
+        by target tenant, authenticated actor, and key; the actor also has a tenant-wide cap to
+        prevent bulk plaintext recovery across keys.
       security: [{ serviceBearer: [] }]
       x-required-scope: keys:write
       parameters: [{ $ref: '#/components/parameters/KeyId' }]
@@ -310,6 +313,11 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '429':
+          description: The authenticated actor exceeded a credential-recovery access limit.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
 
   /internal/v1/keys/{key_id}/alias:
     patch:

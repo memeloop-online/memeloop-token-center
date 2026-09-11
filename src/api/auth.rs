@@ -391,7 +391,7 @@ pub(super) async fn require_service_any(
     Ok(service)
 }
 
-async fn authenticated_service(
+pub(super) async fn authenticated_service(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Result<AuthenticatedService, AppError> {

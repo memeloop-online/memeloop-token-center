@@ -16,15 +16,17 @@ test('credential copying shares clipboard handling with accessible failure feedb
   assert.match(copyButton, /catch \{\s*setState\('failed'\);/s);
   assert.match(copyButton, /role="status" aria-live="polite"/);
   assert.match(copyButton, /common\.requestFailed/);
-  assert.match(oneTimeSecret, /<CopyButton value=\{value\}/);
+  assert.match(oneTimeSecret, /navigator\.clipboard\?\.writeText/);
+  assert.match(oneTimeSecret, /document\.execCommand\('copy'\)/);
+  assert.match(oneTimeSecret, /role="status" aria-live="polite"/);
 });
 
 test('only current plaintext credential sources are offered for copying', () => {
-  assert.match(managementPages, /<OneTimeSecret value=\{secret\}/);
+  assert.match(managementPages, /<OneTimeSecret key=\{visibleSecret\.displayId\} value=\{visibleSecret\.value\}/);
   assert.match(managementPages, /api<\{ key: string; key_id: string \}>\('\/internal\/v1\/keys'/);
-  assert.match(managementPages, /setSecret\(created\.key\)/);
+  assert.match(managementPages, /showSecret\(\{ value: created\.key, recovered: false, displayId: crypto\.randomUUID\(\) \}\)/);
   assert.match(managementPages, /api<\{ key: string \}>\(`\/internal\/v1\/keys\/\$\{value\.key_id\}\/rotate`/);
-  assert.match(managementPages, /setSecret\(result\.key\)/);
+  assert.match(managementPages, /showSecret\(\{ value: result\.key, recovered: false, displayId: crypto\.randomUUID\(\) \}\)/);
   assert.match(managementPages, /api<\{ token: string \}>\('\/internal\/v1\/service-tokens'/);
   assert.match(managementPages, /setSecret\(created\.token\)/);
   assert.match(managementPages, /api<\{ token: string \}>\(`\/internal\/v1\/service-tokens\/\$\{value\.service_id\}\/rotate`/);

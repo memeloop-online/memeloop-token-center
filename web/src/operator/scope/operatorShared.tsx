@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useI18n } from '../../i18n';
 
 export type Translate = (key: string, variables?: Record<string, string | number>) => string;
@@ -39,6 +39,12 @@ export function OneTimeSecret({ value, message, filename = 'token-center-credent
   const { t } = useI18n();
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
   const [saved, setSaved] = useState(false);
+  const objectUrls = useRef(new Set<string>());
+
+  useEffect(() => () => {
+    for (const url of objectUrls.current) URL.revokeObjectURL(url);
+    objectUrls.current.clear();
+  }, []);
 
   async function copySecret() {
     try {
@@ -54,9 +60,16 @@ export function OneTimeSecret({ value, message, filename = 'token-center-credent
         textarea.style.position = 'fixed';
         textarea.style.opacity = '0';
         document.body.appendChild(textarea);
-        textarea.select();
-        const copied = document.execCommand('copy');
-        textarea.remove();
+        let copied = false;
+        try {
+          textarea.select();
+          copied = document.execCommand('copy');
+        } finally {
+          // execCommand may throw in locked-down or embedded browsers. Never
+          // leave the secret-bearing fallback node behind in the document.
+          textarea.value = '';
+          textarea.remove();
+        }
         if (!copied) throw new Error('clipboard unavailable');
       }
       setCopyState('copied');
@@ -68,16 +81,26 @@ export function OneTimeSecret({ value, message, filename = 'token-center-credent
   function downloadSecret() {
     const blob = new Blob([`${value}\n`], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
+    objectUrls.current.add(url);
     const link = document.createElement('a');
     link.href = url;
     link.download = filename;
-    link.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    try {
+      link.click();
+    } finally {
+      window.setTimeout(() => {
+        URL.revokeObjectURL(url);
+        objectUrls.current.delete(url);
+      }, 0);
+    }
     setSaved(true);
   }
 
   function dismiss() {
-    if (onDismiss && window.confirm(t('common.confirmDismissSecret'))) onDismiss();
+    const prompt = recovered
+      ? 'common.confirmDismissRecoveredSecret'
+      : recoveryAvailable ? 'common.confirmDismissRecoverableSecret' : 'common.confirmDismissSecret';
+    if (onDismiss && window.confirm(t(prompt))) onDismiss();
   }
 
   // Do not make this container a live region: assistive technology must not
@@ -87,7 +110,7 @@ export function OneTimeSecret({ value, message, filename = 'token-center-credent
       <div><b>{message}</b><p>{t(recovered ? 'common.recoveredSecretHint' : 'common.secretShownOnce')}</p></div>
       {onDismiss && <button type="button" className="secondary one-time-close" aria-label={t('common.close')} onClick={dismiss}>×</button>}
     </div>
-    <code aria-label={t('common.secretValue')}>{value}</code>
+    <code aria-label={t(recovered ? 'common.recoveredSecretValue' : 'common.secretValue')}>{value}</code>
     <div className="button-row">
       <button type="button" onClick={() => void copySecret()}>
         {copyState === 'copied' ? t('common.copied') : t('common.copySecret')}

@@ -1436,8 +1436,9 @@ async fn credential_copy_is_explicit_authorized_and_never_part_of_the_key_list()
     assert_eq!(listed[0]["credential_recovery_available"], true);
 
     let copied = control
+        .clone()
         .oneshot(
-            Request::post(copy_path)
+            Request::post(&copy_path)
                 .header(header::AUTHORIZATION, format!("Bearer {service_token}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -1457,6 +1458,34 @@ async fn credential_copy_is_explicit_authorized_and_never_part_of_the_key_list()
     .unwrap();
     assert_eq!(copied["key"], issued.key);
     assert_eq!(copied["credential_generation"], 1);
+
+    for _ in 0..2 {
+        let repeated = control
+            .clone()
+            .oneshot(
+                Request::post(&copy_path)
+                    .header(header::AUTHORIZATION, format!("Bearer {service_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeated.status(), StatusCode::OK);
+    }
+    let limited = control
+        .oneshot(
+            Request::post(copy_path)
+                .header(header::AUTHORIZATION, format!("Bearer {service_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        limited.headers().get(header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static("no-store"))
+    );
 }
 
 #[tokio::test]
