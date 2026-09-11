@@ -17,5 +17,7 @@ test('route credentials remain fresh but load only for an opened editor', () => 
   assert.match(workspace, /setCredentialsRequested\(true\);\s*setEditing\(route\)/);
   assert.match(workspace, /onToggle=\{\(event\) => \{ if \(event\.currentTarget\.open\) setCredentialsRequested\(true\); \}\}/);
   assert.match(workspace, /credentialLoadAbort\.current\?\.abort\(\)/);
-  assert.match(workspace, /apiRead<KeyView\[\]>\(`\/internal\/v1\/keys/);
+  assert.match(workspace, /!credentialsRequested \|\| !token \|\| !writeTenant/);
+  assert.match(workspace, /apiRead<KeyView\[\]>\(`\/internal\/v1\/keys\$\{queryForTenant\(loadWriteTenant\)\}/);
+  assert.match(workspace, /scopeRef\.current\.writeTenant !== loadWriteTenant/);
 });

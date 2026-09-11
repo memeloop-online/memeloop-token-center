@@ -364,7 +364,6 @@ function Pricing({ token, tenant, writeTenant = tenant, schemas, schemasLoading 
     priceRequest.current?.abort();
     const controller = new AbortController();
     priceRequest.current = controller;
-    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]);
     const current = () => !controller.signal.aborted && sequence === loadSequence.current
       && scopeRef.current.token === loadToken && scopeRef.current.tenant === loadTenant
       && scopeRef.current.displayCurrency === requestedCurrency;
@@ -378,11 +377,11 @@ function Pricing({ token, tenant, writeTenant = tenant, schemas, schemasLoading 
     const results = await Promise.allSettled([
       loadModelPricePages(
         requestedCurrency,
-        signal,
-        (path, pageSignal) => api<ModelPriceView[]>(path, loadToken, { signal: pageSignal }),
+        controller.signal,
+        (path, pageSignal) => api<ModelPriceView[]>(path, loadToken, { signal: AbortSignal.any([pageSignal, AbortSignal.timeout(10_000)]) }),
         (value) => { if (current()) { setPrices(value); setLoadedCurrency(requestedCurrency); } },
       ),
-      api<GenerationPriceView[]>(`/internal/v1/generation-prices?currency=${encodeURIComponent(requestedCurrency)}`, loadToken, { signal })
+      api<GenerationPriceView[]>(`/internal/v1/generation-prices?currency=${encodeURIComponent(requestedCurrency)}`, loadToken, { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]) })
         .then((value) => { if (current()) setGenerationPrices(value); }),
     ]);
     if (!current()) return;
@@ -599,22 +598,22 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   };
   useEffect(() => {
     credentialLoadAbort.current?.abort();
-    if (!credentialsRequested || !token || !tenant) {
+    if (!credentialsRequested || !token || !writeTenant) {
       setCredentials([]); setCredentialError('');
       return;
     }
     const controller = new AbortController();
     credentialLoadAbort.current = controller;
     const sequence = ++credentialLoadSequence.current;
-    const loadToken = token; const loadTenant = tenant;
+    const loadToken = token; const loadTenant = tenant; const loadWriteTenant = writeTenant;
     setCredentialError('');
-    void apiRead<KeyView[]>(`/internal/v1/keys${queryForTenant(loadTenant)}`, loadToken, { signal: controller.signal })
+    void apiRead<KeyView[]>(`/internal/v1/keys${queryForTenant(loadWriteTenant)}`, loadToken, { signal: controller.signal })
       .then((nextCredentials) => {
-        if (controller.signal.aborted || sequence !== credentialLoadSequence.current || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant) return;
+        if (controller.signal.aborted || sequence !== credentialLoadSequence.current || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant || scopeRef.current.writeTenant !== loadWriteTenant) return;
         setCredentials(nextCredentials);
       })
       .catch((reason) => {
-        if (controller.signal.aborted || sequence !== credentialLoadSequence.current || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant) return;
+        if (controller.signal.aborted || sequence !== credentialLoadSequence.current || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant || scopeRef.current.writeTenant !== loadWriteTenant) return;
         setCredentialError(messageOf(reason, t('common.requestFailed')));
       });
     return () => controller.abort();

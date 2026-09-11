@@ -20,6 +20,8 @@ test('pricing usage is scope-only and independent from currency price requests',
   assert.match(pricing, /token && basePricingScope === scope/);
   assert.match(pricing, /usage-summary[\s\S]*?return \(\) => controller\.abort\(\);\s*\}, \[token, tenant, basePricingScope\]\)/);
   assert.match(priceLoad, /loadModelPricePages\(/);
+  assert.match(priceLoad, /requestedCurrency,\s*controller\.signal,/);
+  assert.match(priceLoad, /AbortSignal\.any\(\[pageSignal, AbortSignal\.timeout\(10_000\)\]\)/);
   assert.match(priceLoad, /\(value\) => \{ if \(current\(\)\) \{ setPrices\(value\)/);
   assert.match(priceLoad, /\.then\(\(value\) => \{ if \(current\(\)\) setGenerationPrices\(value\)/);
 });
