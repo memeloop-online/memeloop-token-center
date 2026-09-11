@@ -77,6 +77,32 @@ pub enum AppError {
     Internal,
 }
 
+impl AppError {
+    /// Low-cardinality diagnostic label safe for structured logs.
+    ///
+    /// Several variants intentionally carry operator-, provider-, or
+    /// guest-controlled detail for local control flow.  Their `Display`
+    /// representation must not be copied into logs because it can contain
+    /// configuration fragments, URLs, or plugin failure text.
+    pub(crate) const fn diagnostic_category(&self) -> &'static str {
+        match self {
+            Self::Unauthorized => "unauthorized",
+            Self::Forbidden => "forbidden",
+            Self::UnpricedModel => "unpriced_model",
+            Self::QuotaExceeded => "quota_exceeded",
+            Self::RateLimited => "rate_limited",
+            Self::LimitExceeded { .. } => "limit_exceeded",
+            Self::NotFound => "not_found",
+            Self::Conflict(_) => "conflict",
+            Self::BadRequest(_) => "invalid_request",
+            Self::Upstream(_) => "upstream",
+            Self::Overloaded => "overloaded",
+            Self::Storage(_) => "storage",
+            Self::Internal => "internal",
+        }
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         let (status, code, message) = match &self {
@@ -233,6 +259,21 @@ mod tests {
     use axum::body::to_bytes;
 
     use super::*;
+
+    #[test]
+    fn diagnostic_categories_do_not_echo_error_payloads() {
+        const CANARY: &str = "panic: config_secret=should-never-enter-a-log";
+        for (error, expected) in [
+            (AppError::Conflict(CANARY.to_owned()), "conflict"),
+            (AppError::BadRequest(CANARY.to_owned()), "invalid_request"),
+            (AppError::Upstream(CANARY.to_owned()), "upstream"),
+            (AppError::Storage(CANARY.to_owned()), "storage"),
+        ] {
+            let category = error.diagnostic_category();
+            assert_eq!(category, expected);
+            assert!(!category.contains(CANARY));
+        }
+    }
 
     #[tokio::test]
     async fn retryable_limit_response_has_fixed_reason_and_retry_after() {

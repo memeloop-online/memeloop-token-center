@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use serde_json::Value;
 use sqlx::{Any, Row, Transaction};
 use uuid::Uuid;
 
@@ -7,6 +8,7 @@ use super::super::{AppError, DatabaseBackend, unix_millis};
 use super::grant_revisions::bump_credential_grant_revisions;
 
 const ASSOCIATION_CHUNK_SIZE: usize = 64;
+const CONSERVATIVE_CUSTOM_MODEL_RESERVATION_BOUND: i64 = 1_000_000_000;
 
 pub(super) struct RouteRelationSnapshot {
     pub(super) credential_ids: Vec<Uuid>,
@@ -153,6 +155,10 @@ pub(super) async fn replace_route_associations(
         credential_ids,
         custom_model_confirmed,
     } = replacement;
+    if custom_model_confirmed {
+        ensure_explicit_custom_reservation_bounds(tx, tenant_id, upstream_model, upstream_ids)
+            .await?;
+    }
     for table in [
         "model_route_upstream_accounts",
         "model_route_included_provider_groups",
@@ -211,6 +217,85 @@ pub(super) async fn replace_route_associations(
         .await?;
     }
     insert_credential_grants(tx, tenant_id, route_id, credential_ids, now).await?;
+    Ok(())
+}
+
+/// Establish the transport-side half of an explicit custom Codex route.
+///
+/// Callers already hold the tenant routing-relation write lock. Keeping this
+/// config update in the association transaction gives catalog replacement and
+/// association replacement one serialization boundary. If catalog pruning is
+/// ordered first, the route recreates a conservative bound; if the route is
+/// ordered first, catalog replacement observes the committed association and
+/// preserves its bound.
+pub(in crate::db) async fn ensure_explicit_custom_reservation_bounds(
+    tx: &mut Transaction<'_, Any>,
+    tenant_id: &str,
+    upstream_model: &str,
+    account_ids: &[Uuid],
+) -> Result<(), AppError> {
+    for account_id in account_ids {
+        let account = sqlx::query(
+            "SELECT driver, config_json, updated_at FROM upstream_accounts WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(account_id.to_string())
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(AppError::NotFound)?;
+        let driver: String = account.try_get("driver")?;
+        if driver != "openai-codex" {
+            continue;
+        }
+        let config_json: String = account.try_get("config_json")?;
+        let previous_updated_at: i64 = account.try_get("updated_at")?;
+        let mut config: Value =
+            serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?;
+        let object = config.as_object_mut().ok_or(AppError::Internal)?;
+        let current = object.get("reservation_token_bounds");
+        let legacy = object.get("output_token_limits");
+        let (mut bounds, needs_normalization) = match (current, legacy) {
+            (Some(Value::Object(bounds)), None) => (bounds.clone(), false),
+            (None, Some(Value::Object(bounds))) => (bounds.clone(), true),
+            (None, None) => (serde_json::Map::new(), true),
+            _ => return Err(AppError::Internal),
+        };
+        let has_valid_bound = bounds.get(upstream_model).is_some_and(|bound| {
+            bound.as_i64().is_some_and(|bound| {
+                (1..=CONSERVATIVE_CUSTOM_MODEL_RESERVATION_BOUND).contains(&bound)
+            })
+        });
+        if !has_valid_bound {
+            if bounds.contains_key(upstream_model) {
+                return Err(AppError::Internal);
+            }
+            bounds.insert(
+                upstream_model.to_owned(),
+                Value::from(CONSERVATIVE_CUSTOM_MODEL_RESERVATION_BOUND),
+            );
+        } else if !needs_normalization {
+            continue;
+        }
+        object.remove("output_token_limits");
+        object.insert("reservation_token_bounds".to_owned(), Value::Object(bounds));
+        let next_config = serde_json::to_string(&config).map_err(|_| AppError::Internal)?;
+        let next_updated_at = unix_millis().max(previous_updated_at.saturating_add(1));
+        let updated = sqlx::query(
+            "UPDATE upstream_accounts SET config_json = $1, updated_at = $2 WHERE tenant_id = $3 AND id = $4 AND updated_at = $5",
+        )
+        .bind(next_config)
+        .bind(next_updated_at)
+        .bind(tenant_id)
+        .bind(account_id.to_string())
+        .bind(previous_updated_at)
+        .execute(&mut **tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(AppError::Conflict(
+                "upstream account changed while saving the route".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
