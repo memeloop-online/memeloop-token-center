@@ -788,10 +788,7 @@ mod tests {
     #[tokio::test]
     async fn mocked_device_protocol_creates_a_verified_ready_result() {
         let server = MockServer::start().await;
-        let target_origin = format!(
-            "http://codex-oauth.test:{}",
-            server.address().port()
-        );
+        let target_origin = format!("http://codex-oauth.test:{}", server.address().port());
         let (proxy_url, proxy) =
             spawn_remote_dns_proxy(*server.address(), b"codex-oauth.test", 4).await;
         let verifier = "verified-pkce-secret";

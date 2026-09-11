@@ -971,10 +971,7 @@ mod tests {
             None,
             Some(("socks5://10.20.30.40:1080", OutboundScope::Private)),
             Some(("socks5h://10.20.30.40:1080", OutboundScope::Public)),
-            Some((
-                "socks5h://proxy.internal:1080",
-                OutboundScope::Private,
-            )),
+            Some(("socks5h://proxy.internal:1080", OutboundScope::Private)),
             Some(("socks5h://8.8.8.8:1080", OutboundScope::Private)),
         ] {
             assert!(
