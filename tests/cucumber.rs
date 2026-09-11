@@ -22,7 +22,7 @@ use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
 use sqlx::{AnyPool, Row};
 use tempfile::TempDir;
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
 use uuid::Uuid;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -45,6 +45,7 @@ struct TokenCenterWorld {
     asset_mock: Option<MockServer>,
     temp_dir: Option<TempDir>,
     server_task: Option<JoinHandle<()>>,
+    worker_shutdown: Option<watch::Sender<bool>>,
     worker_task: Option<JoinHandle<()>>,
     current_key: String,
     old_key: String,
@@ -88,6 +89,7 @@ impl Default for TokenCenterWorld {
             asset_mock: None,
             temp_dir: None,
             server_task: None,
+            worker_shutdown: None,
             worker_task: None,
             current_key: String::new(),
             old_key: String::new(),
@@ -140,10 +142,29 @@ impl Drop for TokenCenterWorld {
         if let Some(task) = self.server_task.take() {
             task.abort();
         }
+        if let Some(shutdown) = self.worker_shutdown.take() {
+            let _ = shutdown.send(true);
+        }
         if let Some(task) = self.worker_task.take() {
             task.abort();
         }
     }
+}
+
+fn spawn_test_worker(state: AppState) -> (watch::Sender<bool>, JoinHandle<()>) {
+    let (shutdown, receiver) = watch::channel(false);
+    let task = tokio::spawn(worker::run_until_shutdown(state, receiver));
+    (shutdown, task)
+}
+
+async fn stop_test_worker(world: &mut TokenCenterWorld) {
+    let shutdown = world
+        .worker_shutdown
+        .take()
+        .expect("generation worker shutdown signal");
+    let task = world.worker_task.take().expect("generation worker task");
+    shutdown.send(true).expect("generation worker is running");
+    task.await.expect("generation worker shuts down cleanly");
 }
 
 #[given("a token center backed by SQLite and memory object storage")]
@@ -159,7 +180,7 @@ async fn start_test_service(world: &mut TokenCenterWorld) {
         .await
         .expect("initialize test service");
     let test_state = state.clone();
-    let worker_task = tokio::spawn(worker::run(state.clone()));
+    let (worker_shutdown, worker_task) = spawn_test_worker(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind test server");
@@ -175,6 +196,7 @@ async fn start_test_service(world: &mut TokenCenterWorld) {
     world.mock = Some(mock);
     world.temp_dir = Some(temp_dir);
     world.server_task = Some(server_task);
+    world.worker_shutdown = Some(worker_shutdown);
     world.worker_task = Some(worker_task);
 }
 
@@ -1641,10 +1663,7 @@ async fn assert_generation_admission_matrix(
     billing_unit: &str,
     input: Value,
 ) {
-    if let Some(worker) = world.worker_task.take() {
-        worker.abort();
-        let _ = worker.await;
-    }
+    stop_test_worker(world).await;
     let mock_url = world.mock.as_ref().expect("mock server").uri();
     let endpoint = if driver == "comfyui" {
         "/v1/images/generations"
@@ -1832,9 +1851,7 @@ async fn seedance_video_admission_matrix(world: &mut TokenCenterWorld) {
 
 #[when("the generation worker is stopped before it can submit upstream")]
 async fn stop_generation_worker(world: &mut TokenCenterWorld) {
-    let worker = world.worker_task.take().expect("generation worker task");
-    worker.abort();
-    let _ = worker.await;
+    stop_test_worker(world).await;
 }
 
 #[when("a durable ComfyUI manifest is persisted before terminal settlement")]
@@ -1866,7 +1883,20 @@ async fn persist_comfyui_manifest_before_terminal_settlement(world: &mut TokenCe
         .await
         .expect("mark manifest job submitted");
 
-    tokio::time::sleep(std::time::Duration::from_millis(2_050)).await;
+    // Advance this isolated fixture to its persisted retry deadline instead of
+    // relying on a wall-clock sleep with a narrow scheduling margin.
+    let inspection = AnyPool::connect(&state.config.database_url)
+        .await
+        .expect("connect generation retry clock inspector");
+    let advanced = sqlx::query(
+        "UPDATE generation_jobs SET next_attempt_at = 0 WHERE id = $1 AND status = 'running' AND lease_owner IS NULL",
+    )
+    .bind(job_id.to_string())
+    .execute(&inspection)
+    .await
+    .expect("advance durable manifest retry clock");
+    assert_eq!(advanced.rows_affected(), 1);
+    inspection.close().await;
     let settlement_worker = "manifest-settlement-worker";
     let running = state
         .db
@@ -1938,7 +1968,9 @@ async fn persist_comfyui_manifest_before_terminal_settlement(world: &mut TokenCe
 #[then("the restarted worker settles the durable manifest without contacting ComfyUI")]
 async fn restarted_worker_recovers_comfyui_manifest(world: &mut TokenCenterWorld) {
     let state = world.state.clone().expect("test state");
-    world.worker_task = Some(tokio::spawn(worker::run(state)));
+    let (worker_shutdown, worker_task) = spawn_test_worker(state);
+    world.worker_shutdown = Some(worker_shutdown);
+    world.worker_task = Some(worker_task);
     let job_id = world.generation_job_id.expect("ComfyUI generation job id");
     for _ in 0..30 {
         let detail = world
