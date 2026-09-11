@@ -117,7 +117,7 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
           if (current) setAccountCatalogs((catalogs) => new Map(catalogs).set(accountId, next));
         } catch {
           // Missing account provenance stays explicitly unknown. Aggregate
-          // coverage remains authoritative for validation.
+          // catalog listing remains authoritative for validation.
         }
       }
     };
@@ -135,7 +135,7 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
   // that safe restriction here. A stale or partial snapshot must not turn a
   // discovered model into an explicit_custom bypass.
   const { needsCustomConfirmation, allowCustom, valid } = modelConfirmationValidity({
-    hasValue: Boolean(value.trim()), selected, customAllowed, customConfirmed,
+    hasValue: Boolean(value.trim()), catalogListed: Boolean(selected), customAllowed, customConfirmed,
   });
   useLayoutEffect(() => validityCallback.current(valid, allowCustom), [valid, allowCustom]);
 

@@ -3,10 +3,9 @@ import test from 'node:test';
 import { confirmationForScope, modelConfirmationValidity } from '../src/operator/modelConfirmation.js';
 
 test('catalog evidence selects one confirmation path and groups cannot bypass missing coverage', () => {
-  const defaults = { hasValue: true, selected: undefined, customAllowed: true, customConfirmed: false };
+  const defaults = { hasValue: true, catalogListed: false, customAllowed: true, customConfirmed: false };
   for (const [name, input, expected] of [
-    ['complete catalog entry', { selected: { complete_coverage: true } }, [false, false, true]],
-    ['partial catalog entry', { selected: { complete_coverage: false } }, [false, false, true]],
+    ['catalog-listed model', { catalogListed: true }, [false, false, true]],
     ['unknown', {}, [true, false, false]],
     ['confirmed unknown', { customConfirmed: true }, [true, true, true]],
     ['group unknown', { customAllowed: false, customConfirmed: true }, [true, false, false]],
