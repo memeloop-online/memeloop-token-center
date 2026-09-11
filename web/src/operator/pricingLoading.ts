@@ -1,4 +1,4 @@
-import type { ModelPriceView } from '../types';
+import type { ModelPriceView } from '../types.js';
 
 export const MODEL_PRICE_PAGE_SIZE = 200;
 
