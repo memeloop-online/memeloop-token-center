@@ -6874,7 +6874,21 @@ async fn own_conversation_detail(world: &TokenCenterWorld) -> Value {
 
 #[then("the two Responses requests have a direct continuation edge")]
 async fn responses_requests_have_direct_parent_edge(world: &mut TokenCenterWorld) {
-    let detail = own_conversation_detail(world).await;
+    // EOF precedes asynchronous terminal/projection work. Wait only for both
+    // requests to be visible; the assertions below still reject a wrong
+    // cluster shape or lineage edge.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let detail = loop {
+        let snapshot = own_conversation_detail(world).await;
+        if snapshot["cluster"]["request_count"].as_u64().is_some_and(|count| count >= 2) {
+            break snapshot;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "both terminal requests must reach the conversation projection: {snapshot}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     assert_eq!(detail["cluster"]["request_count"], 2, "{detail}");
     assert_eq!(
         detail["edges"].as_array().map(Vec::len),
