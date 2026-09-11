@@ -817,8 +817,8 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const routeRequestGeneration = useRef(0);
   const keyRequest = useRef<{ identity: KeyListRequestIdentity; controller: AbortController } | undefined>(undefined);
   const routeRequest = useRef<{ generation: number; scopeGeneration: number; controller: AbortController } | undefined>(undefined);
-  const secretRequest = useRef<AbortController>();
-  const secretOperation = useRef<symbol>();
+  const secretRequest = useRef<AbortController | undefined>(undefined);
+  const secretOperation = useRef<symbol | undefined>(undefined);
   const visibleSecret = secret?.scopeGeneration === renderScope.current.generation ? secret : undefined;
   const secretRef = useRef(visibleSecret);
   secretRef.current = visibleSecret;
