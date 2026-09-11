@@ -62,10 +62,6 @@ fn created(
 #[tokio::test]
 async fn fresh_sqlite_migrates_latest_schema_and_rejects_untyped_rows() {
     let (_directory, _url, database, pool) = sqlite_fixture().await;
-    database
-        .ensure_session_archive_import_schema()
-        .await
-        .unwrap();
     database.readiness_check().await.unwrap();
     sqlx::query(
         "SELECT r.enforcement_mode, o.projected_at FROM usage_reservations r CROSS JOIN metered_usage_projection_outbox o WHERE 1 = 0",

@@ -48,52 +48,6 @@ pub(crate) fn validate_oauth_adapter_endpoint(value: &str, field: &str) -> Resul
     Ok(url)
 }
 
-#[cfg(test)]
-pub(crate) fn validate_managed_oauth_adapter_endpoint(
-    value: &str,
-    field: &str,
-) -> Result<Url, AppError> {
-    validate_managed_oauth_adapter_endpoint_inner(value, field, false)
-}
-
-pub(crate) fn validate_managed_oauth_adapter_endpoint_with_policy(
-    value: &str,
-    field: &str,
-    allow_test_loopback: bool,
-) -> Result<Url, AppError> {
-    validate_managed_oauth_adapter_endpoint_inner(value, field, allow_test_loopback)
-}
-
-fn validate_managed_oauth_adapter_endpoint_inner(
-    value: &str,
-    field: &str,
-    allow_test_loopback: bool,
-) -> Result<Url, AppError> {
-    let url = validate_oauth_endpoint_with_scope(value, field, OutboundScope::Private)?;
-    if url.query().is_some() {
-        return Err(AppError::BadRequest(format!(
-            "OAuth {field} cannot contain a query"
-        )));
-    }
-    classify_oauth_endpoint(&url, field, allow_test_loopback, OutboundScope::Private)?;
-    Ok(url)
-}
-
-pub(super) fn managed_oauth_endpoint_scope(
-    value: &str,
-    allow_test_loopback: bool,
-) -> Result<(Url, OutboundScope), AppError> {
-    let url =
-        validate_managed_oauth_adapter_endpoint_inner(value, "adapter_url", allow_test_loopback)?;
-    let scope = classify_oauth_endpoint(
-        &url,
-        "adapter_url",
-        allow_test_loopback,
-        OutboundScope::Private,
-    )?;
-    Ok((url, scope))
-}
-
 pub(crate) fn oauth_adapter_endpoint_scope(
     value: &str,
     field: &str,

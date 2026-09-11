@@ -67,6 +67,16 @@ pub(in crate::api::proxy) async fn next_planned_proxy_candidate(
     summary: &mut CandidatePreparationSummary,
 ) -> Result<Option<PlannedProxyRoute>, AppError> {
     for candidate in candidates.by_ref() {
+        if !request.state.providers.is_public(&candidate.driver) {
+            tracing::warn!(
+                %request.request_id,
+                route_id = %candidate.route_id,
+                upstream_account_id = %candidate.account_id,
+                stage = "candidate_retired_provider",
+                "proxy skipped a candidate whose provider is not public"
+            );
+            continue;
+        }
         let route = match request
             .state
             .db

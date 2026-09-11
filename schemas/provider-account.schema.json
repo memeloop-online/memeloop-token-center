@@ -72,7 +72,7 @@
             "header": { "type": "string", "default": "authorization" },
             "prefix": { "type": "string", "default": "Bearer " },
             "adapter_state": {
-              "description": "Opaque encrypted state for a server-installed managed OAuth adapter.",
+              "description": "Opaque encrypted state for a server-owned OAuth driver.",
               "writeOnly": true
             }
           }

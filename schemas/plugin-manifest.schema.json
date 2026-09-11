@@ -138,28 +138,6 @@
                   "refresh_url": { "type": "string", "format": "uri" }
                 }
               },
-              "managed_oauth_adapter": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["api_version", "source_types", "normalize_url", "refresh_url"],
-                "properties": {
-                  "api_version": { "const": "cpa-managed-oauth-adapter-v1" },
-                  "source_types": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 64,
-                    "uniqueItems": true,
-                    "items": {
-                      "type": "string",
-                      "minLength": 1,
-                      "maxLength": 64,
-                      "pattern": "^[a-z0-9._-]+$"
-                    }
-                  },
-                  "normalize_url": { "type": "string", "format": "uri" },
-                  "refresh_url": { "type": "string", "format": "uri" }
-                }
-              },
               "component_adapter": {
                 "type": "object",
                 "additionalProperties": false,

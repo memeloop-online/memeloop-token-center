@@ -127,8 +127,8 @@ result-origin allowlist before streaming into the job-scoped CAS staging area.
 Ambiguous submission never causes a second POST; normal polling uses bounded
 backoff, and the short-lived provider URL is never stored in job metadata.
 
-Direct accounts and reviewed managed OAuth documents converge into the unified
-account model. Opaque authorization handles cannot become credentials and
+OAuth accounts converge into the unified account model after server-owned
+authorization. Opaque authorization handles cannot become credentials and
 require native reauthorization. Historical inactive connection rows may remain
 readable for attribution, but are never routable or refreshable.
 

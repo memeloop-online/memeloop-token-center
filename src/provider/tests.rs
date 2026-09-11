@@ -216,7 +216,7 @@ fn oauth_adapter_state_is_bounded_redacted_and_backward_compatible() {
     );
 }
 
-fn managed_provider(id: &str, source_types: Vec<&str>) -> ProviderType {
+fn test_provider(id: &str) -> ProviderType {
     ProviderType {
         id: id.into(),
         display_name: id.into(),
@@ -225,12 +225,6 @@ fn managed_provider(id: &str, source_types: Vec<&str>) -> ProviderType {
         config_schema: json!({"type": "object"}),
         credential_schema: json!({"type": "object"}),
         oauth_adapter: None,
-        managed_oauth_adapter: Some(ManagedOAuthAdapterContribution {
-            api_version: MANAGED_OAUTH_ADAPTER_API_VERSION.into(),
-            source_types: source_types.into_iter().map(str::to_owned).collect(),
-            normalize_url: "https://adapter.example.test/normalize".into(),
-            refresh_url: "https://adapter.example.test/refresh".into(),
-        }),
         component_adapter: None,
         source: "test".into(),
     }
@@ -248,17 +242,14 @@ fn cloned_provider_catalog_shares_frozen_schemas_and_extends_copy_on_write() {
     ));
 
     catalog
-        .extend([managed_provider(
-            "managed-copy-on-write",
-            vec!["copy-on-write"],
-        )])
+        .extend([test_provider("copy-on-write")])
         .expect("extend cloned catalog");
 
     assert!(!Arc::ptr_eq(&catalog.types, &cloned.types));
     assert_eq!(catalog.list().len(), builtin_count + 1);
     assert_eq!(cloned.list().len(), builtin_count);
-    assert!(catalog.contains("managed-copy-on-write"));
-    assert!(!cloned.contains("managed-copy-on-write"));
+    assert!(catalog.contains("copy-on-write"));
+    assert!(!cloned.contains("copy-on-write"));
 }
 
 #[test]
@@ -317,39 +308,6 @@ fn builtin_cbcnx_exposes_only_verified_openai_text_embedding_and_image_contracts
 }
 
 #[test]
-fn managed_oauth_source_types_are_extensible_but_unique_and_controlled() {
-    let mut catalog = ProviderCatalog::builtins();
-    catalog
-        .extend([managed_provider("managed-one", vec!["gemini-custom"])])
-        .unwrap();
-    assert_eq!(
-        catalog
-            .managed_oauth_adapter_for_source("gemini-custom")
-            .unwrap()
-            .provider_driver(),
-        "managed-one"
-    );
-    assert!(
-        catalog
-            .extend([managed_provider("managed-two", vec!["codex"])])
-            .is_err()
-    );
-    assert!(
-        ProviderCatalog::builtins()
-            .extend([managed_provider(
-                "managed-duplicate",
-                vec!["other-custom", "other-custom"],
-            )])
-            .is_err()
-    );
-    assert!(
-        ProviderCatalog::builtins()
-            .extend([managed_provider("managed-bad", vec!["Codex/../../secret"])])
-            .is_err()
-    );
-}
-
-#[test]
 fn builtin_codex_routes_openai_with_required_trusted_limits_only() {
     let catalog = ProviderCatalog::builtins();
     let codex = catalog.get("openai-codex").unwrap();
@@ -399,15 +357,6 @@ fn builtin_codex_routes_openai_with_required_trusted_limits_only() {
             .is_none()
     );
 
-    let gemini = catalog.get("cpa-gemini-oauth-legacy").unwrap();
-    assert!(gemini.protocols.is_empty());
-    assert!(
-        gemini
-            .config_schema
-            .pointer("/properties/transport_policy")
-            .is_none()
-    );
-
     let public_ids = catalog
         .list()
         .iter()
@@ -417,6 +366,7 @@ fn builtin_codex_routes_openai_with_required_trusted_limits_only() {
     assert!(!public_ids.iter().any(|driver| driver.starts_with("cpa-")));
     assert!(catalog.get("cpa-codex-oauth").is_none());
     assert!(catalog.get("cpa-subscription-bridge").is_none());
+    assert!(catalog.get("cpa-gemini-oauth-legacy").is_none());
     assert!(!catalog.supports_direct_credential("openai-codex", "oauth"));
     // The schema remains authoritative and rejects unsupported API-key shapes
     // before the authorization-flow guard is consulted.
@@ -425,14 +375,7 @@ fn builtin_codex_routes_openai_with_required_trusted_limits_only() {
     assert!(
         catalog
             .managed_oauth_adapter_for_driver("openai-codex")
-            .unwrap()
-            .can_refresh()
-    );
-    assert!(
-        !catalog
-            .managed_oauth_adapter_for_driver("cpa-gemini-oauth-legacy")
-            .unwrap()
-            .can_refresh()
+            .is_ok()
     );
 }
 

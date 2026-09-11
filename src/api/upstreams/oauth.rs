@@ -341,7 +341,7 @@ pub(in crate::api) async fn start_cursor_oauth(
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
-    if !state.providers.contains(&body.provider_driver) {
+    if !state.providers.is_public(&body.provider_driver) {
         return Err(AppError::BadRequest(format!(
             "unknown provider driver: {}",
             body.provider_driver
@@ -483,6 +483,7 @@ pub(in crate::api) async fn poll_cursor_oauth(
     let service = require_service(&headers, &state, "oauth:write").await?;
     match poll_cursor_login(
         &state.db,
+        &state.providers,
         &state.http,
         &body.session_token,
         state.config.key_pepper.as_bytes(),

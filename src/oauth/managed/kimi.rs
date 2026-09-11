@@ -1,16 +1,10 @@
-//! Native CPA Kimi token import. Wire contract: CLIProxyAPI
-//! v7.2.128-onetwo.1 internal/auth/kimi/{token,kimi}.go.
+//! Native Kimi OAuth refresh and request identity handling.
 use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{
-    error::AppError,
-    network::{self, OutboundScope},
-    oauth::ManagedOAuthNormalizedAccount,
-    provider::UpstreamCredential,
-};
+use crate::{error::AppError, network, provider::UpstreamCredential};
 
 pub const PROVIDER_DRIVER: &str = "kimi-oauth";
 pub const BASE_URL: &str = "https://api.kimi.com/coding";
@@ -19,30 +13,8 @@ const CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const SCHEMA: &str = "kimi-oauth-v1";
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Document {
-    #[serde(rename = "type")]
-    kind: String,
-    access_token: String,
-    refresh_token: String,
-    token_type: String,
-    #[serde(default)]
-    scope: Option<String>,
-    #[serde(default)]
-    device_id: Option<String>,
-    #[serde(default)]
-    expired: Option<String>,
-    #[serde(default)]
-    last_refresh: Option<String>,
-    #[serde(default)]
-    disabled: bool,
-    #[serde(default)]
-    proxy_url: Option<String>,
-}
-
 fn invalid() -> AppError {
-    AppError::BadRequest("CPA Kimi OAuth document is invalid".into())
+    AppError::BadRequest("Kimi OAuth credential is invalid".into())
 }
 
 fn failed() -> AppError {
@@ -51,52 +23,9 @@ fn failed() -> AppError {
 
 fn optional_text(value: Option<&str>) -> Result<(), AppError> {
     if let Some(value) = value {
-        super::controlled_text(value, 2048, true, "CPA Kimi")?;
+        super::controlled_text(value, 2048, true, "Kimi")?;
     }
     Ok(())
-}
-
-pub fn normalize(payload: &Value) -> Result<ManagedOAuthNormalizedAccount, AppError> {
-    let source: Document = serde_json::from_value(payload.clone()).map_err(|_| invalid())?;
-    if source.kind != "kimi" || !source.token_type.eq_ignore_ascii_case("bearer") {
-        return Err(invalid());
-    }
-    super::bearer_token(&source.access_token, "CPA Kimi")?;
-    super::required_secret(&source.refresh_token, "CPA Kimi")?;
-    optional_text(source.scope.as_deref())?;
-    optional_text(source.device_id.as_deref())?;
-    if let Some(last_refresh) = source.last_refresh.as_deref().filter(|v| !v.is_empty()) {
-        super::timestamp_millis(last_refresh, "CPA Kimi")?;
-    }
-    let expires_at = source
-        .expired
-        .as_deref()
-        .filter(|v| !v.is_empty())
-        .map(|v| super::timestamp_millis(v, "CPA Kimi"))
-        .transpose()?;
-    let proxy_url = source
-        .proxy_url
-        .map(|v| super::codex::normalize_private_proxy_url(&v).map_err(|_| invalid()))
-        .transpose()?;
-    let proxy_network_scope = proxy_url.as_ref().map(|_| OutboundScope::Private);
-    Ok(ManagedOAuthNormalizedAccount {
-        account_name: "Kimi account".to_owned(),
-        config: json!({"base_url": BASE_URL, "network_scope": "public", "reservation_token_bounds": {}}),
-        enabled: !source.disabled,
-        credential: UpstreamCredential::OAuth {
-            access_token: source.access_token,
-            refresh_token: Some(source.refresh_token),
-            expires_at,
-            header: "authorization".to_owned(),
-            prefix: "Bearer ".to_owned(),
-            adapter_state: Some(json!({
-                "schema": SCHEMA, "device_id": source.device_id,
-                "scope": source.scope, "token_type": source.token_type,
-            })),
-            proxy_url,
-            proxy_network_scope,
-        },
-    })
 }
 
 pub(crate) fn validate_credential(credential: &UpstreamCredential) -> Result<(), AppError> {
@@ -112,8 +41,8 @@ pub(crate) fn validate_credential(credential: &UpstreamCredential) -> Result<(),
         return Err(invalid());
     };
     credential.validate(i64::MIN).map_err(|_| invalid())?;
-    super::bearer_token(access_token, "CPA Kimi")?;
-    super::required_secret(refresh_token, "CPA Kimi")?;
+    super::bearer_token(access_token, "Kimi")?;
+    super::required_secret(refresh_token, "Kimi")?;
     let object = state.as_object().ok_or_else(invalid)?;
     if header != "authorization"
         || prefix != "Bearer "
@@ -230,9 +159,9 @@ async fn refresh_at(
         .await
         .map_err(|_| failed())??;
     let response: TokenResponse = serde_json::from_slice(&bytes).map_err(|_| failed())?;
-    super::bearer_token(&response.access_token, "CPA Kimi").map_err(|_| failed())?;
+    super::bearer_token(&response.access_token, "Kimi").map_err(|_| failed())?;
     let refreshed_token = response.refresh_token.filter(|v| !v.is_empty());
-    super::optional_secret(refreshed_token.as_deref(), "CPA Kimi").map_err(|_| failed())?;
+    super::optional_secret(refreshed_token.as_deref(), "Kimi").map_err(|_| failed())?;
     let expiry = match response.expires_in {
         None | Some(0.0) => *expires_at,
         Some(seconds) if seconds.is_finite() && seconds > 0.0 && seconds <= 31_536_000.0 => Some(
@@ -273,81 +202,35 @@ mod tests {
         matchers::{body_string_contains, header, method, path},
     };
 
-    fn document() -> Value {
-        json!({
-            "type": "kimi", "access_token": "fixture-access",
-            "refresh_token": "fixture-refresh", "token_type": "Bearer",
-            "device_id": "fixture-device", "scope": "coding",
-            "expired": "2099-01-01T00:00:00Z",
-        })
-    }
-
-    #[test]
-    fn import_preserves_oauth_identity_and_unknown_expiry() {
-        let source = document();
-        let account = normalize(&source).unwrap();
-        validate_credential(&account.credential).unwrap();
-        let value = serde_json::to_value(&account.credential).unwrap();
-        assert_eq!(value["access_token"], source["access_token"]);
-        assert_eq!(value["refresh_token"], source["refresh_token"]);
-        assert_eq!(value["adapter_state"]["device_id"], source["device_id"]);
-        assert_eq!(value["adapter_state"]["scope"], source["scope"]);
-        assert_eq!(account.config["base_url"], BASE_URL);
-        assert!(account.enabled);
-        let mut no_expiry = source.clone();
-        no_expiry.as_object_mut().unwrap().remove("expired");
-        assert_eq!(
-            serde_json::to_value(normalize(&no_expiry).unwrap().credential).unwrap()["expires_at"],
-            Value::Null
-        );
-        no_expiry["disabled"] = json!(true);
-        assert!(!normalize(&no_expiry).unwrap().enabled);
-        let debug = format!("{:?}", account.credential);
-        assert!(!debug.contains("fixture-access"));
-        assert!(!debug.contains("fixture-refresh"));
-        assert!(!debug.contains("fixture-device"));
-    }
-
-    #[test]
-    fn import_rejects_unsupported_or_injected_state() {
-        for (name, value) in [
-            ("type", json!("codex")),
-            ("token_type", json!("Basic")),
-            ("device_id", json!("device\r\nAuthorization: injected")),
-            ("expired", json!("not-a-date")),
-            ("access_token", json!("a\nb")),
-            ("base_url", json!("https://attacker.example")),
-            ("proxy_url", json!("socks5h://attacker.example:1080")),
-        ] {
-            let mut source = document();
-            source[name] = value;
-            let error = normalize(&source).unwrap_err().to_string();
-            assert!(!error.contains("fixture-access"));
-            assert!(!error.contains("attacker"));
+    fn credential(device_id: &str) -> UpstreamCredential {
+        UpstreamCredential::OAuth {
+            access_token: "fixture-access".to_owned(),
+            refresh_token: Some("fixture-refresh".to_owned()),
+            expires_at: None,
+            header: "authorization".to_owned(),
+            prefix: "Bearer ".to_owned(),
+            adapter_state: Some(json!({
+                "schema": SCHEMA,
+                "device_id": device_id,
+                "scope": "coding",
+                "token_type": "Bearer"
+            })),
+            proxy_url: None,
+            proxy_network_scope: None,
         }
-        let mut source = document();
-        source["proxy_url"] = json!("socks5h://user:pass@10.2.3.4:1080");
-        let credential = normalize(&source).unwrap().credential;
-        assert_eq!(
-            credential.proxy(),
-            Some(("socks5h://user:pass@10.2.3.4:1080", OutboundScope::Private))
-        );
     }
 
     #[test]
     fn catalog_resolves_native_adapter_and_account_specific_headers() {
         let catalog = crate::provider::ProviderCatalog::builtins();
-        let adapter = catalog.managed_oauth_adapter_for_source("kimi").unwrap();
-        assert_eq!(adapter.provider_driver(), PROVIDER_DRIVER);
-        assert!(adapter.normalize_url().is_none());
+        let adapter = catalog
+            .managed_oauth_adapter_for_driver(PROVIDER_DRIVER)
+            .unwrap();
         assert_eq!(adapter.refresh_url(), TOKEN_ENDPOINT);
-        assert!(adapter.can_refresh());
         assert!(!catalog.supports_direct_credential(PROVIDER_DRIVER, "oauth"));
         assert!(!catalog.supports_direct_credential(PROVIDER_DRIVER, "api_key"));
         for device in ["device-one", "device-two"] {
-            let mut source = document();
-            source["device_id"] = json!(device);
-            let credential = normalize(&source).unwrap().credential;
+            let credential = credential(device);
             let request = apply_headers(reqwest::Client::new().get(BASE_URL), &credential)
                 .unwrap()
                 .build()
@@ -377,7 +260,7 @@ mod tests {
                 .expect(1)
                 .mount(&server)
                 .await;
-            let credential = normalize(&document()).unwrap().credential;
+            let credential = credential("fixture-device");
             let result = refresh_at(
                 &crate::build_http_client().unwrap(),
                 &credential,
@@ -426,7 +309,7 @@ mod tests {
                 .respond_with(ResponseTemplate::new(status).set_body_json(response))
                 .mount(&server)
                 .await;
-            let credential = normalize(&document()).unwrap().credential;
+            let credential = credential("fixture-device");
             let error = refresh_at(
                 &crate::build_http_client().unwrap(),
                 &credential,

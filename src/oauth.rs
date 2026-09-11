@@ -8,24 +8,18 @@ pub mod codex_device;
 pub mod copilot;
 mod cursor;
 mod endpoint;
-pub mod managed;
+pub(crate) mod managed;
 
-pub use adapter::{
-    ManagedOAuthNormalizedAccount, normalize_managed_oauth_document,
-    refresh_managed_oauth_credential, resolve_managed_oauth_refresh_adapter,
-};
+pub(crate) use adapter::{refresh_managed_oauth_credential, resolve_managed_oauth_refresh_adapter};
 pub use cursor::{
     CursorOAuthEndpoints, CursorPollAuthority, CursorPollResult, DEFAULT_CURSOR_LOGIN_URL,
     DEFAULT_CURSOR_POLL_URL, DEFAULT_CURSOR_REFRESH_URL, OAuthLoginStart,
     OAuthReauthorizationTarget, ReadyCursorLogin, StartCursorLogin, cursor_account_id,
     poll_cursor_login, refresh_cursor_credential, start_cursor_login,
 };
-pub(crate) use endpoint::{
-    oauth_adapter_endpoint_scope, validate_managed_oauth_adapter_endpoint_with_policy,
-    validate_oauth_adapter_endpoint,
-};
 #[cfg(test)]
-pub(crate) use endpoint::{validate_managed_oauth_adapter_endpoint, validate_oauth_endpoint};
+pub(crate) use endpoint::validate_oauth_endpoint;
+pub(crate) use endpoint::{oauth_adapter_endpoint_scope, validate_oauth_adapter_endpoint};
 
 const MAX_OAUTH_RESPONSE_BYTES: usize = 1024 * 1024;
 
@@ -52,10 +46,7 @@ async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, AppError> 
 use crate::{
     db::Database,
     network::OutboundScope,
-    provider::{
-        MANAGED_OAUTH_ADAPTER_API_VERSION, ManagedOAuthAdapterBackend, ProviderCatalog,
-        ResolvedManagedOAuthAdapter, UpstreamCredential,
-    },
+    provider::{ManagedOAuthAdapterBackend, ProviderCatalog, UpstreamCredential},
 };
 #[cfg(test)]
 use serde_json::json;
@@ -66,7 +57,7 @@ mod tests {
     use super::*;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{body_json, method, path},
+        matchers::{method, path},
     };
 
     async fn sqlite_database() -> (tempfile::TempDir, Database) {
@@ -168,25 +159,6 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            validate_managed_oauth_adapter_endpoint(
-                "http://oauth-adapter.default.svc/poll",
-                "adapter_url",
-            )
-            .is_ok()
-        );
-        assert_eq!(
-            endpoint::managed_oauth_endpoint_scope("http://oauth-adapter.default.svc/poll", false,)
-                .unwrap()
-                .1,
-            OutboundScope::Private
-        );
-        assert_eq!(
-            endpoint::managed_oauth_endpoint_scope("https://oauth.example.com/poll", false)
-                .unwrap()
-                .1,
-            OutboundScope::Public
-        );
         assert_eq!(
             oauth_adapter_endpoint_scope(
                 "http://oauth-adapter.default.svc/poll",
@@ -237,10 +209,6 @@ mod tests {
                 .is_err(),
                 "interactive adapter accepted {endpoint}"
             );
-            assert!(
-                validate_managed_oauth_adapter_endpoint(endpoint, "adapter_url").is_err(),
-                "managed adapter accepted {endpoint}"
-            );
         }
         assert_eq!(
             oauth_adapter_endpoint_scope(
@@ -276,9 +244,11 @@ mod tests {
         )
         .await
         .unwrap();
+        let providers = ProviderCatalog::builtins();
 
         let error = poll_cursor_login(
             &database,
+            &providers,
             &reqwest::Client::new(),
             &started.session_token,
             key_material,
@@ -295,6 +265,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cursor_poll_rejects_a_provider_removed_after_session_creation_before_network_io() {
+        let server = MockServer::start().await;
+        let (_directory, database) = sqlite_database().await;
+        let now = crate::db::unix_millis();
+        let key_material = b"test material with at least 32 bytes";
+        let started = start_cursor_login(
+            &database,
+            StartCursorLogin {
+                tenant_external_id: "retired-provider-poll".to_owned(),
+                account_name: "retired-provider".to_owned(),
+                provider_driver: "retired-plugin-provider".to_owned(),
+                provider_config: json!({"base_url": "https://provider.example"}),
+                endpoints: CursorOAuthEndpoints {
+                    login_url: format!("{}/login", server.uri()),
+                    poll_url: format!("{}/poll", server.uri()),
+                    refresh_url: format!("{}/refresh", server.uri()),
+                },
+                oauth_driver: "cursor".to_owned(),
+                reauthorize: None,
+            },
+            None,
+            key_material,
+            now,
+        )
+        .await
+        .unwrap();
+
+        let error = poll_cursor_login(
+            &database,
+            &ProviderCatalog::builtins(),
+            &crate::build_http_client().unwrap(),
+            &started.session_token,
+            key_material,
+            now.saturating_add(1),
+            CursorPollAuthority {
+                required_tenant: Some("retired-provider-poll"),
+                operator_service_id: None,
+                allow_test_loopback: true,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid request: OAuth provider driver is no longer available"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn cursor_poll_result_is_durable_single_use_and_replayable() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -308,6 +328,7 @@ mod tests {
             .mount(&server)
             .await;
         let (_directory, database) = sqlite_database().await;
+        let providers = ProviderCatalog::builtins();
         let now = crate::db::unix_millis();
         let key_material = b"test material with at least 32 bytes";
         let started = start_cursor_login(
@@ -333,6 +354,7 @@ mod tests {
         .expect("start Cursor login");
         let (lease_owner, ready) = match poll_cursor_login(
             &database,
+            &providers,
             &crate::build_http_client().expect("HTTP client"),
             &started.session_token,
             key_material,
@@ -377,6 +399,7 @@ mod tests {
 
         match poll_cursor_login(
             &database,
+            &providers,
             &crate::build_http_client().expect("HTTP client"),
             &started.session_token,
             key_material,
@@ -434,170 +457,6 @@ mod tests {
         }
     }
 
-    fn managed_adapter(server: &MockServer) -> ResolvedManagedOAuthAdapter {
-        ResolvedManagedOAuthAdapter::for_test(
-            "managed-mock",
-            "codex-test",
-            format!("{}/normalize", server.uri()),
-            format!("{}/refresh", server.uri()),
-        )
-    }
-
-    fn assert_managed_error_is_redacted(error: &AppError) {
-        let rendered = format!("{error:?} {error}");
-        for secret in [
-            "source-document-secret",
-            "response-body-secret",
-            "adapter-token-secret",
-            "127.0.0.1",
-            "/normalize",
-        ] {
-            assert!(!rendered.contains(secret), "leaked {secret}: {rendered}");
-        }
-    }
-
-    #[tokio::test]
-    async fn managed_normalize_uses_fixed_protocol_and_returns_bounded_typed_result() {
-        let server = MockServer::start().await;
-        let adapter = managed_adapter(&server);
-        Mock::given(method("POST"))
-            .and(path("/normalize"))
-            .and(body_json(json!({
-                "api_version": MANAGED_OAUTH_ADAPTER_API_VERSION,
-                "source_type": "codex-test",
-                "payload": {"secret": "source-document-secret"}
-            })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "api_version": MANAGED_OAUTH_ADAPTER_API_VERSION,
-                "account": {
-                    "account_name": "Imported Codex",
-                    "config": {"base_url": "https://api.example.test"},
-                    "enabled": true,
-                    "credential": {
-                        "type": "oauth",
-                        "access_token": "adapter-token-secret",
-                        "refresh_token": "refresh-secret",
-                        "expires_at": 4_102_444_800_000_i64,
-                        "adapter_state": {"family": "opaque-state"}
-                    }
-                }
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let normalized = normalize_managed_oauth_document(
-            &crate::build_http_client().unwrap(),
-            &adapter,
-            &json!({"secret": "source-document-secret"}),
-            true,
-        )
-        .await
-        .unwrap();
-        assert_eq!(normalized.account_name, "Imported Codex");
-        assert_eq!(
-            normalized.credential.adapter_state().unwrap()["family"],
-            "opaque-state"
-        );
-        assert!(!format!("{:?}", normalized.credential).contains("adapter-token-secret"));
-    }
-
-    #[tokio::test]
-    async fn managed_normalize_never_follows_redirects_or_echoes_failures() {
-        let server = MockServer::start().await;
-        let adapter = managed_adapter(&server);
-        Mock::given(path("/normalize"))
-            .respond_with(
-                ResponseTemplate::new(302)
-                    .insert_header("location", format!("{}/target", server.uri())),
-            )
-            .mount(&server)
-            .await;
-        Mock::given(path("/target"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("response-body-secret"))
-            .expect(0)
-            .mount(&server)
-            .await;
-        let error = normalize_managed_oauth_document(
-            &crate::build_http_client().unwrap(),
-            &adapter,
-            &json!({"secret": "source-document-secret"}),
-            true,
-        )
-        .await
-        .unwrap_err();
-        assert_managed_error_is_redacted(&error);
-    }
-
-    #[tokio::test]
-    async fn managed_normalize_rejects_oversize_timeout_and_invalid_json_without_echoing_data() {
-        let responses = [
-            ResponseTemplate::new(200)
-                .set_body_string("response-body-secret".repeat(MAX_OAUTH_RESPONSE_BYTES / 20 + 2)),
-            ResponseTemplate::new(200)
-                .set_body_string("response-body-secret")
-                .set_delay(std::time::Duration::from_millis(500)),
-            ResponseTemplate::new(200)
-                .set_body_json(json!({"api_version": "wrong", "secret": "response-body-secret"})),
-        ];
-        for response in responses {
-            let server = MockServer::start().await;
-            let adapter = managed_adapter(&server);
-            Mock::given(path("/normalize"))
-                .respond_with(response)
-                .mount(&server)
-                .await;
-            let error = normalize_managed_oauth_document(
-                &crate::build_http_client().unwrap(),
-                &adapter,
-                &json!({"secret": "source-document-secret"}),
-                true,
-            )
-            .await
-            .unwrap_err();
-            assert_managed_error_is_redacted(&error);
-        }
-    }
-
-    #[tokio::test]
-    async fn managed_refresh_rejects_an_expired_replacement_credential() {
-        let server = MockServer::start().await;
-        let adapter = managed_adapter(&server);
-        Mock::given(method("POST"))
-            .and(path("/refresh"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "api_version": MANAGED_OAUTH_ADAPTER_API_VERSION,
-                "credential": {
-                    "type": "oauth",
-                    "access_token": "adapter-token-secret",
-                    "refresh_token": "replacement-refresh-secret",
-                    "expires_at": crate::db::unix_millis() - 1,
-                    "adapter_state": {"family": "response-body-secret"}
-                }
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let current: UpstreamCredential = serde_json::from_value(json!({
-            "type": "oauth",
-            "access_token": "current-access-secret",
-            "refresh_token": "current-refresh-secret",
-            "expires_at": crate::db::unix_millis() + 60_000
-        }))
-        .unwrap();
-        let error = refresh_managed_oauth_credential(
-            &crate::build_http_client().unwrap(),
-            &adapter,
-            &current,
-            true,
-        )
-        .await
-        .unwrap_err();
-        assert_managed_error_is_redacted(&error);
-        let rendered = format!("{error:?} {error}");
-        assert!(!rendered.contains("current-refresh-secret"));
-        assert!(!rendered.contains("replacement-refresh-secret"));
-    }
-
     #[test]
     fn managed_refresh_resolution_uses_current_catalog_and_fixed_mismatch_errors() {
         let catalog = ProviderCatalog::builtins();
@@ -607,20 +466,7 @@ mod tests {
             managed::codex::TOKEN_ENDPOINT,
         )
         .unwrap();
-        assert_eq!(adapter.provider_driver(), "openai-codex");
-        assert_eq!(adapter.backend(), &ManagedOAuthAdapterBackend::BuiltinCodex);
-        assert!(adapter.can_refresh());
-
-        let legacy_error = resolve_managed_oauth_refresh_adapter(
-            &catalog,
-            "cpa-gemini-oauth-legacy",
-            managed::legacy_gemini::TOKEN_ENDPOINT,
-        )
-        .unwrap_err();
-        assert_eq!(
-            legacy_error.to_string(),
-            "invalid request: managed OAuth adapter does not support refresh"
-        );
+        assert_eq!(adapter.backend(), &ManagedOAuthAdapterBackend::Codex);
 
         let stored_secret_url = "https://stored-lifecycle-secret.invalid/token";
         let error =

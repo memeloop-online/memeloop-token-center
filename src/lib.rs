@@ -28,7 +28,6 @@ mod request_event_stream;
 mod response_archive_spool;
 pub mod schema;
 pub mod server;
-pub mod session_archive_import;
 mod upstream_quota;
 pub mod worker;
 

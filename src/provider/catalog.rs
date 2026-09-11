@@ -5,8 +5,6 @@ use serde_json::{Value, json};
 
 use crate::error::AppError;
 
-pub const MANAGED_OAUTH_ADAPTER_API_VERSION: &str = "cpa-managed-oauth-adapter-v1";
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OAuthAdapterContribution {
@@ -19,100 +17,29 @@ pub struct OAuthAdapterContribution {
     pub refresh_url: String,
 }
 
-/// A non-interactive adapter for normalizing and refreshing CPA managed OAuth
-/// documents. This is deliberately separate from the interactive PKCE flow.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ManagedOAuthAdapterContribution {
-    pub api_version: String,
-    pub source_types: Vec<String>,
-    pub normalize_url: String,
-    pub refresh_url: String,
-}
-
 #[derive(Clone, Debug)]
-pub struct ResolvedManagedOAuthAdapter {
-    provider_driver: String,
-    source_type: String,
-    api_version: String,
+pub(crate) struct ResolvedManagedOAuthAdapter {
     backend: ManagedOAuthAdapterBackend,
 }
 
 /// The administrator-reviewed implementation selected by the server catalog.
 /// Builtins never synthesize an HTTP contribution or accept a client URL.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ManagedOAuthAdapterBackend {
-    BuiltinKimi,
-    BuiltinCodex,
-    BuiltinLegacyGemini,
-    ReviewedHttp {
-        normalize_url: String,
-        refresh_url: String,
-    },
+pub(crate) enum ManagedOAuthAdapterBackend {
+    Kimi,
+    Codex,
 }
 
 impl ResolvedManagedOAuthAdapter {
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        provider_driver: &str,
-        source_type: &str,
-        normalize_url: String,
-        refresh_url: String,
-    ) -> Self {
-        Self {
-            provider_driver: provider_driver.to_owned(),
-            source_type: source_type.to_owned(),
-            api_version: MANAGED_OAUTH_ADAPTER_API_VERSION.to_owned(),
-            backend: ManagedOAuthAdapterBackend::ReviewedHttp {
-                normalize_url,
-                refresh_url,
-            },
-        }
-    }
-
-    pub fn provider_driver(&self) -> &str {
-        &self.provider_driver
-    }
-
-    pub fn source_type(&self) -> &str {
-        &self.source_type
-    }
-
-    pub fn api_version(&self) -> &str {
-        &self.api_version
-    }
-
-    pub fn backend(&self) -> &ManagedOAuthAdapterBackend {
+    pub(crate) fn backend(&self) -> &ManagedOAuthAdapterBackend {
         &self.backend
     }
 
-    pub fn normalize_url(&self) -> Option<&str> {
+    pub(crate) fn refresh_url(&self) -> &str {
         match &self.backend {
-            ManagedOAuthAdapterBackend::ReviewedHttp { normalize_url, .. } => Some(normalize_url),
-            ManagedOAuthAdapterBackend::BuiltinCodex
-            | ManagedOAuthAdapterBackend::BuiltinKimi
-            | ManagedOAuthAdapterBackend::BuiltinLegacyGemini => None,
+            ManagedOAuthAdapterBackend::Kimi => crate::oauth::managed::kimi::TOKEN_ENDPOINT,
+            ManagedOAuthAdapterBackend::Codex => crate::oauth::managed::codex::TOKEN_ENDPOINT,
         }
-    }
-
-    pub fn refresh_url(&self) -> &str {
-        match &self.backend {
-            ManagedOAuthAdapterBackend::BuiltinKimi => crate::oauth::managed::kimi::TOKEN_ENDPOINT,
-            ManagedOAuthAdapterBackend::BuiltinCodex => {
-                crate::oauth::managed::codex::TOKEN_ENDPOINT
-            }
-            ManagedOAuthAdapterBackend::BuiltinLegacyGemini => {
-                crate::oauth::managed::legacy_gemini::TOKEN_ENDPOINT
-            }
-            ManagedOAuthAdapterBackend::ReviewedHttp { refresh_url, .. } => refresh_url,
-        }
-    }
-
-    pub fn can_refresh(&self) -> bool {
-        !matches!(
-            self.backend(),
-            ManagedOAuthAdapterBackend::BuiltinLegacyGemini
-        )
     }
 }
 
@@ -151,8 +78,6 @@ pub struct ProviderType {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_adapter: Option<OAuthAdapterContribution>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub managed_oauth_adapter: Option<ManagedOAuthAdapterContribution>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub component_adapter: Option<ComponentAdapterContribution>,
     #[serde(default)]
     pub source: String,
@@ -161,14 +86,12 @@ pub struct ProviderType {
 #[derive(Clone)]
 pub struct ProviderCatalog {
     pub(super) types: Arc<Vec<ProviderType>>,
-    legacy_types: Arc<Vec<ProviderType>>,
     pub(super) builtin_managed_oauth: Arc<Vec<BuiltinManagedOAuthRegistration>>,
 }
 
 #[derive(Clone)]
 pub(super) struct BuiltinManagedOAuthRegistration {
     provider_driver: &'static str,
-    source_type: &'static str,
     backend: ManagedOAuthAdapterBackend,
 }
 
@@ -303,7 +226,7 @@ impl ProviderCatalog {
                         "proxy_url": {"type": "string", "pattern": "^socks5h?://", "minLength": 1, "maxLength": 2048, "writeOnly": true},
                         "proxy_network_scope": {"type": "string", "const": "private"},
                         "adapter_state": {
-                            "description": "Opaque encrypted state for a server-installed managed OAuth adapter.",
+                            "description": "Opaque encrypted state for a server-owned OAuth driver.",
                             "writeOnly": true
                         }
                     }
@@ -327,7 +250,6 @@ impl ProviderCatalog {
             config_schema,
             credential_schema: credential_schema.clone(),
             oauth_adapter: None,
-            managed_oauth_adapter: None,
             component_adapter: None,
             source: "builtin".to_owned(),
         }];
@@ -363,7 +285,6 @@ impl ProviderCatalog {
             }),
             credential_schema: credential_schema.clone(),
             oauth_adapter: None,
-            managed_oauth_adapter: None,
             component_adapter: None,
             source: "builtin".to_owned(),
         });
@@ -400,7 +321,6 @@ impl ProviderCatalog {
             }),
             credential_schema,
             oauth_adapter: None,
-            managed_oauth_adapter: None,
             component_adapter: None,
             source: "builtin".to_owned(),
         });
@@ -497,33 +417,18 @@ impl ProviderCatalog {
         kimi.protocols = vec!["openai".to_owned(), "anthropic".to_owned()];
         kimi.credential_schema["properties"]["expires_at"] = json!({"type": ["integer", "null"], "description": "Unix milliseconds, absent source expiry remains unknown"});
         types.push(kimi);
-        let legacy_types = vec![builtin_managed_oauth_provider(
-            "cpa-gemini-oauth-legacy",
-            "Legacy Gemini OAuth import",
-            "https://cloudcode-pa.googleapis.com",
-            false,
-        )];
         Self {
             types: Arc::new(types),
-            legacy_types: Arc::new(legacy_types),
             builtin_managed_oauth: Arc::new(vec![
                 BuiltinManagedOAuthRegistration {
                     provider_driver: crate::oauth::managed::kimi::PROVIDER_DRIVER,
-                    source_type: "kimi",
-                    backend: ManagedOAuthAdapterBackend::BuiltinKimi,
+                    backend: ManagedOAuthAdapterBackend::Kimi,
                 },
                 BuiltinManagedOAuthRegistration {
-                    // Imports normalize directly to the native driver. The
-                    // controlled database upgrade handles the small number
-                    // of older rows before this catalog is used at runtime.
+                    // New authorization uses the native driver. Historical
+                    // rows are handled by the explicit database upgrade path.
                     provider_driver: "openai-codex",
-                    source_type: "codex",
-                    backend: ManagedOAuthAdapterBackend::BuiltinCodex,
-                },
-                BuiltinManagedOAuthRegistration {
-                    provider_driver: "cpa-gemini-oauth-legacy",
-                    source_type: "gemini-legacy",
-                    backend: ManagedOAuthAdapterBackend::BuiltinLegacyGemini,
+                    backend: ManagedOAuthAdapterBackend::Codex,
                 },
             ]),
         }
@@ -533,9 +438,8 @@ impl ProviderCatalog {
         &self.types
     }
 
-    /// Public provider types are the only drivers accepted for newly created
-    /// accounts. Legacy drivers remain resolvable for imported rows and routes,
-    /// but are never advertised as product capabilities.
+    /// Public provider types are the only drivers accepted for new accounts,
+    /// OAuth sessions, and proxy routing.
     pub fn is_public(&self, driver: &str) -> bool {
         self.types.iter().any(|provider| provider.id == driver)
     }
@@ -551,55 +455,14 @@ impl ProviderCatalog {
         })
     }
 
-    /// Return only the controlled source identifiers accepted by the current
-    /// server catalog. Backend identity and destinations remain server-private.
-    pub fn managed_oauth_source_types(&self) -> Vec<String> {
-        self.builtin_managed_oauth
-            .iter()
-            .map(|registration| registration.source_type.to_owned())
-            .chain(
-                self.types
-                    .iter()
-                    .filter_map(|provider| provider.managed_oauth_adapter.as_ref())
-                    .flat_map(|adapter| adapter.source_types.iter().cloned()),
-            )
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect()
-    }
-
     pub fn extend(
         &mut self,
         contributions: impl IntoIterator<Item = ProviderType>,
-    ) -> Result<(), AppError> {
-        self.extend_with_endpoint_policy(contributions, false)
-    }
-
-    /// Integration-test hook for mock adapters bound to loopback. Release
-    /// builds do not expose this method, and normal catalog extension remains
-    /// fail-closed.
-    #[cfg(debug_assertions)]
-    #[doc(hidden)]
-    pub fn extend_for_test(
-        &mut self,
-        contributions: impl IntoIterator<Item = ProviderType>,
-    ) -> Result<(), AppError> {
-        self.extend_with_endpoint_policy(contributions, true)
-    }
-
-    fn extend_with_endpoint_policy(
-        &mut self,
-        contributions: impl IntoIterator<Item = ProviderType>,
-        allow_test_loopback: bool,
     ) -> Result<(), AppError> {
         for contribution in contributions {
             if contribution.id.trim().is_empty()
                 || self
                     .types
-                    .iter()
-                    .any(|provider| provider.id == contribution.id)
-                || self
-                    .legacy_types
                     .iter()
                     .any(|provider| provider.id == contribution.id)
             {
@@ -610,23 +473,6 @@ impl ProviderCatalog {
             }
             crate::schema::validate_definition(&contribution.config_schema)?;
             crate::schema::validate_definition(&contribution.credential_schema)?;
-            if let Some(adapter) = &contribution.managed_oauth_adapter {
-                validate_managed_oauth_adapter_contribution_with_policy(
-                    adapter,
-                    allow_test_loopback,
-                )?;
-                for source_type in &adapter.source_types {
-                    if self
-                        .managed_oauth_source_types()
-                        .iter()
-                        .any(|existing| existing == source_type)
-                    {
-                        return Err(AppError::BadRequest(
-                            "duplicate managed OAuth source type contribution".into(),
-                        ));
-                    }
-                }
-            }
             Arc::make_mut(&mut self.types).push(contribution);
         }
         Ok(())
@@ -637,73 +483,16 @@ impl ProviderCatalog {
     }
 
     pub fn get(&self, driver: &str) -> Option<&ProviderType> {
-        self.types
-            .iter()
-            .chain(self.legacy_types.iter())
-            .find(|provider| provider.id == driver)
+        self.types.iter().find(|provider| provider.id == driver)
     }
 
-    pub fn managed_oauth_adapter_for_source(
-        &self,
-        source_type: &str,
-    ) -> Result<ResolvedManagedOAuthAdapter, AppError> {
-        validate_managed_oauth_source_type(source_type)?;
-        let mut builtin_matches = self
-            .builtin_managed_oauth
-            .iter()
-            .filter(|registration| registration.source_type == source_type);
-        if let Some(registration) = builtin_matches.next() {
-            if builtin_matches.next().is_some() {
-                return Err(AppError::BadRequest(
-                    "managed OAuth source type is ambiguous".into(),
-                ));
-            }
-            return Ok(ResolvedManagedOAuthAdapter {
-                provider_driver: registration.provider_driver.to_owned(),
-                source_type: source_type.to_owned(),
-                api_version: MANAGED_OAUTH_ADAPTER_API_VERSION.to_owned(),
-                backend: registration.backend.clone(),
-            });
-        }
-        let mut matches = self.types.iter().filter_map(|provider| {
-            let adapter = provider.managed_oauth_adapter.as_ref()?;
-            adapter
-                .source_types
-                .iter()
-                .any(|candidate| candidate == source_type)
-                .then_some((provider, adapter))
-        });
-        let Some((provider, adapter)) = matches.next() else {
-            return Err(AppError::BadRequest(
-                "managed OAuth source type is unsupported".into(),
-            ));
-        };
-        if matches.next().is_some() {
-            return Err(AppError::BadRequest(
-                "managed OAuth source type is ambiguous".into(),
-            ));
-        }
-        Ok(ResolvedManagedOAuthAdapter {
-            provider_driver: provider.id.clone(),
-            source_type: source_type.to_owned(),
-            api_version: adapter.api_version.clone(),
-            backend: ManagedOAuthAdapterBackend::ReviewedHttp {
-                normalize_url: adapter.normalize_url.clone(),
-                refresh_url: adapter.refresh_url.clone(),
-            },
-        })
-    }
-
-    pub fn managed_oauth_adapter_for_driver(
+    pub(crate) fn managed_oauth_adapter_for_driver(
         &self,
         driver: &str,
     ) -> Result<ResolvedManagedOAuthAdapter, AppError> {
         if driver == crate::oauth::codex_device::PROVIDER_DRIVER {
             return Ok(ResolvedManagedOAuthAdapter {
-                provider_driver: driver.to_owned(),
-                source_type: "codex".to_owned(),
-                api_version: MANAGED_OAUTH_ADAPTER_API_VERSION.to_owned(),
-                backend: ManagedOAuthAdapterBackend::BuiltinCodex,
+                backend: ManagedOAuthAdapterBackend::Codex,
             });
         }
         if let Some(registration) = self
@@ -712,27 +501,12 @@ impl ProviderCatalog {
             .find(|registration| registration.provider_driver == driver)
         {
             return Ok(ResolvedManagedOAuthAdapter {
-                provider_driver: registration.provider_driver.to_owned(),
-                source_type: registration.source_type.to_owned(),
-                api_version: MANAGED_OAUTH_ADAPTER_API_VERSION.to_owned(),
                 backend: registration.backend.clone(),
             });
         }
-        let provider = self.get(driver).ok_or_else(|| {
-            AppError::BadRequest("managed OAuth provider driver is unavailable".into())
-        })?;
-        let adapter = provider.managed_oauth_adapter.as_ref().ok_or_else(|| {
-            AppError::BadRequest("managed OAuth provider adapter is unavailable".into())
-        })?;
-        Ok(ResolvedManagedOAuthAdapter {
-            provider_driver: provider.id.clone(),
-            source_type: adapter.source_types[0].clone(),
-            api_version: adapter.api_version.clone(),
-            backend: ManagedOAuthAdapterBackend::ReviewedHttp {
-                normalize_url: adapter.normalize_url.clone(),
-                refresh_url: adapter.refresh_url.clone(),
-            },
-        })
+        Err(AppError::BadRequest(
+            "managed OAuth provider driver is unavailable".into(),
+        ))
     }
 }
 
@@ -797,7 +571,6 @@ fn builtin_managed_oauth_provider(
             }
         }),
         oauth_adapter: None,
-        managed_oauth_adapter: None,
         component_adapter: None,
         source: "builtin".to_owned(),
     }
@@ -854,62 +627,7 @@ fn builtin_interactive_oauth_provider(
             poll_url: oauth.poll_url.to_owned(),
             refresh_url: oauth.refresh_url.to_owned(),
         }),
-        managed_oauth_adapter: None,
         component_adapter: None,
         source: "builtin".to_owned(),
     }
-}
-
-pub(crate) fn validate_managed_oauth_adapter_contribution(
-    adapter: &ManagedOAuthAdapterContribution,
-) -> Result<(), AppError> {
-    validate_managed_oauth_adapter_contribution_with_policy(adapter, false)
-}
-
-fn validate_managed_oauth_adapter_contribution_with_policy(
-    adapter: &ManagedOAuthAdapterContribution,
-    allow_test_loopback: bool,
-) -> Result<(), AppError> {
-    if adapter.api_version != MANAGED_OAUTH_ADAPTER_API_VERSION
-        || adapter.source_types.is_empty()
-        || adapter.source_types.len() > 64
-    {
-        return Err(AppError::BadRequest(
-            "unsupported managed OAuth adapter contract".into(),
-        ));
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    for source_type in &adapter.source_types {
-        validate_managed_oauth_source_type(source_type)?;
-        if !seen.insert(source_type) {
-            return Err(AppError::BadRequest(
-                "managed OAuth adapter source types must be unique".into(),
-            ));
-        }
-    }
-    crate::oauth::validate_managed_oauth_adapter_endpoint_with_policy(
-        &adapter.normalize_url,
-        "normalize_url",
-        allow_test_loopback,
-    )?;
-    crate::oauth::validate_managed_oauth_adapter_endpoint_with_policy(
-        &adapter.refresh_url,
-        "refresh_url",
-        allow_test_loopback,
-    )?;
-    Ok(())
-}
-
-fn validate_managed_oauth_source_type(value: &str) -> Result<(), AppError> {
-    if value.is_empty()
-        || value.len() > 64
-        || !value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
-        })
-    {
-        return Err(AppError::BadRequest(
-            "managed OAuth source type must contain 1-64 controlled ASCII characters".into(),
-        ));
-    }
-    Ok(())
 }

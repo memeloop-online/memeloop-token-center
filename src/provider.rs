@@ -3,12 +3,11 @@ mod cbcnx;
 mod credential;
 mod types;
 
-pub(crate) use catalog::validate_managed_oauth_adapter_contribution;
 pub use catalog::{
-    ComponentAdapterContribution, MANAGED_OAUTH_ADAPTER_API_VERSION, ManagedOAuthAdapterBackend,
-    ManagedOAuthAdapterContribution, OAuthAdapterContribution, OAuthFlowKind, ProviderCatalog,
-    ProviderType, ResolvedManagedOAuthAdapter,
+    ComponentAdapterContribution, OAuthAdapterContribution, OAuthFlowKind, ProviderCatalog,
+    ProviderType,
 };
+pub(crate) use catalog::{ManagedOAuthAdapterBackend, ResolvedManagedOAuthAdapter};
 pub use cbcnx::{CBCNX_PROVIDER_DRIVER, is_openai_compatible_http_driver};
 pub use credential::{
     UpstreamCredential, open_credential, seal_credential, validate_adapter_state, validate_config,

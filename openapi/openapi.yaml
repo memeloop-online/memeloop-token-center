@@ -23,11 +23,6 @@ info:
   license:
     name: Apache-2.0
     identifier: Apache-2.0
-servers:
-  - url: https://token-center.api.onetwo.website
-    description: Gateway role
-  - url: https://token-center.k3s.onetwo.website
-    description: Control role
 tags:
   - name: System
     description: Process status and runtime-discovered schemas/plugins.
@@ -1917,68 +1912,6 @@ paths:
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
-        '502': { $ref: '#/components/responses/UpstreamError' }
-
-  /internal/v1/imports/cpa/managed-oauth/capabilities:
-    get:
-      tags: [Upstream providers]
-      operationId: getCpaManagedOAuthImportCapabilities
-      summary: Preflight the server-installed CPA managed OAuth source types
-      description: |
-        Global-operator preflight for fail-closed import planning. The stable
-        response contains only the contract version and sorted source type names;
-        provider drivers, adapter destinations, and internal topology are omitted.
-      security: [{ serviceBearer: [] }]
-      x-required-scope: imports:cpa:write
-      x-global-service-only: true
-      responses:
-        '200':
-          description: Stable managed OAuth import capabilities without adapter metadata.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/CpaManagedOAuthImportCapabilities' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-
-  /internal/v1/imports/cpa/managed-oauth:
-    post:
-      tags: [Upstream providers]
-      operationId: importCpaManagedOAuthAccount
-      summary: Import one CPA managed OAuth document through a server-installed adapter
-      description: |
-        Global-only import with a 1 MiB canonical-document limit and a bounded
-        64 KiB JSON envelope allowance. The source path is used only in a keyed
-        provenance identity and is never stored, logged, or returned.
-        Exact replays return the current account without resolving or calling
-        an adapter. A changed Codex document may atomically install a new
-        credential generation only when its encrypted external account
-        identity matches the existing source-bound account; other changes fail
-        closed and require explicit reauthorization.
-        Driver, account configuration, credentials, and adapter destinations are
-        derived by the current server catalog and cannot be supplied by the caller.
-      security: [{ serviceBearer: [] }]
-      x-required-scope: imports:cpa:write
-      x-global-service-only: true
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/CpaManagedOAuthImportRequest' }
-      responses:
-        '200':
-          description: Exact replay or identity-preserving credential-generation update.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/CpaManagedOAuthImportResult' }
-        '201':
-          description: Managed OAuth account created atomically.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/CpaManagedOAuthImportResult' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '409': { $ref: '#/components/responses/Conflict' }
         '502': { $ref: '#/components/responses/UpstreamError' }
 
   /internal/v1/migrations/openai-codex/prepare:
@@ -5298,7 +5231,6 @@ components:
         - plugins:read
         - plugins:write
         - oauth:write
-        - imports:cpa:write
         - imports:session_archive:quarantine:read
         - imports:session_archive:quarantine:resolve
         - routes:read
@@ -5369,7 +5301,9 @@ components:
       required: [api_version, flow_kind, login_url, poll_url, refresh_url]
       properties:
         api_version: { type: string, enum: [oauth-adapter-v1] }
-        flow_kind: { type: string, enum: [cursor_pkce] }
+        flow_kind:
+          type: string
+          enum: [cursor_pkce, openai_device, claude_manual_pkce, github_device_copilot]
         login_url: { type: string, format: uri }
         poll_url: { type: string, format: uri }
         refresh_url: { type: string, format: uri }
@@ -5722,46 +5656,6 @@ components:
         status: { const: pending }
         retry_after_seconds: { type: integer, format: int64, minimum: 0 }
         message: { type: [string, 'null'] }
-    CpaManagedOAuthImportCapabilities:
-      type: object
-      additionalProperties: false
-      required: [contract_version, source_types]
-      properties:
-        contract_version: { const: 1 }
-        source_types:
-          type: array
-          uniqueItems: true
-          items: { type: string, pattern: '^[a-z0-9._-]{1,64}$' }
-          description: Sorted source types contributed by the active server catalog.
-    CpaManagedOAuthImportRequest:
-      type: object
-      additionalProperties: false
-      required: [contract_version, tenant_external_id, source, source_type, document]
-      properties:
-        contract_version: { const: 1 }
-        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
-        source:
-          type: object
-          additionalProperties: false
-          required: [kind, relative_path]
-          properties:
-            kind: { const: auth_file }
-            relative_path:
-              type: string
-              minLength: 1
-              maxLength: 512
-              description: Strict POSIX relative path; absolute paths, empty/dot segments, backslashes, NUL, and control characters are rejected and never echoed.
-        source_type: { type: string, pattern: '^[a-z0-9._-]{1,64}$' }
-        document:
-          writeOnly: true
-          description: Opaque adapter input. The canonical encoded document is limited to 1 MiB; the complete request has a bounded 64 KiB JSON envelope allowance.
-    CpaManagedOAuthImportResult:
-      type: object
-      additionalProperties: false
-      required: [disposition, account]
-      properties:
-        disposition: { type: string, enum: [created, replayed, updated] }
-        account: { $ref: '#/components/schemas/UpstreamProvider' }
     NativeCodexUpgradeTarget:
       type: object
       additionalProperties: false

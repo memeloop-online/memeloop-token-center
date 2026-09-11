@@ -60,6 +60,7 @@ pub(crate) const PROXY_ROUTING_POLICY: RoutingAttemptPolicy = RoutingAttemptPoli
 pub struct AuthorizedUpstreamCandidate {
     pub route_id: Uuid,
     pub account_id: Uuid,
+    pub(crate) driver: String,
     pub(crate) transport_revision: i64,
     pub(crate) credential_generation: i64,
 }

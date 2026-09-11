@@ -86,7 +86,6 @@ pub(super) fn provider_type(credential_schema: Value) -> ProviderType {
         }),
         credential_schema,
         oauth_adapter: None,
-        managed_oauth_adapter: None,
         component_adapter: None,
         source: "builtin".to_owned(),
     }

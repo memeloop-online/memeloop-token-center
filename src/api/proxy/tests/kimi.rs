@@ -23,13 +23,22 @@ fn native_kimi_billing_does_not_depend_on_client_usage_opt_in() {
 
 #[test]
 fn native_kimi_headers_keep_one_bearer_and_preserve_sealed_device_identity() {
-    let normalized = crate::oauth::managed::kimi::normalize(&json!({
-        "type":"kimi", "access_token":"fixture-access", "refresh_token":"fixture-refresh",
-        "token_type":"Bearer", "device_id":"fixture-existing-device",
-    }))
-    .unwrap();
-    let request = normalized
-        .credential
+    let credential = UpstreamCredential::OAuth {
+        access_token: "fixture-access".to_owned(),
+        refresh_token: Some("fixture-refresh".to_owned()),
+        expires_at: None,
+        header: "authorization".to_owned(),
+        prefix: "Bearer ".to_owned(),
+        adapter_state: Some(json!({
+            "schema": "kimi-oauth-v1",
+            "device_id": "fixture-existing-device",
+            "scope": "coding",
+            "token_type": "Bearer"
+        })),
+        proxy_url: None,
+        proxy_network_scope: None,
+    };
+    let request = credential
         .apply(
             reqwest::Client::new().post(network::upstream_api_url(
                 crate::oauth::managed::kimi::BASE_URL,
@@ -38,7 +47,7 @@ fn native_kimi_headers_keep_one_bearer_and_preserve_sealed_device_identity() {
             unix_millis(),
         )
         .unwrap();
-    let request = crate::oauth::managed::kimi::apply_headers(request, &normalized.credential)
+    let request = crate::oauth::managed::kimi::apply_headers(request, &credential)
         .unwrap()
         .build()
         .unwrap();
