@@ -1611,11 +1611,14 @@ async fn credential_copy_hides_foreign_key_existence_and_atomically_limits_concu
     }
 
     let authorization = format!("Bearer {}", target_actor.token);
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(8));
     let attempts = (0..8).map(|_| {
         let control = control.clone();
         let copy_path = copy_path.clone();
         let authorization = authorization.clone();
+        let start = start.clone();
         async move {
+            start.wait().await;
             control
                 .oneshot(
                     Request::post(copy_path)

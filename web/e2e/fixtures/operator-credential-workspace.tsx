@@ -2,12 +2,14 @@ import { useState } from 'react';
 import { createRoot } from 'react-dom/client';
 
 import { I18nProvider } from '../../src/i18n';
-import { CredentialsPage } from '../../src/operator/pages/ManagementPages';
+import { CredentialsPage, ServiceCredentialsPage } from '../../src/operator/pages/ManagementPages';
 
-type Scenario = 'all-tenants' | 'route-failure' | 'scope-race' | 'scope-lock';
+type Scenario = 'all-tenants' | 'route-failure' | 'scope-race' | 'scope-lock' | 'service-plaintext' | 'service-scope-aba';
 
 interface FixtureState {
   calls: string[];
+  requests: Array<{ method: string; path: string }>;
+  releaseIssue: (token: string) => void;
 }
 
 declare global {
@@ -18,7 +20,16 @@ const parameters = new URLSearchParams(location.search);
 const scenario = (parameters.get('scenario') ?? 'all-tenants') as Scenario;
 const initialTenant = scenario === 'all-tenants' ? '' : 'tenant-a';
 
-window.credentialFixture = { calls: [] };
+const pendingIssues: Array<(response: Response) => void> = [];
+window.credentialFixture = {
+  calls: [],
+  requests: [],
+  releaseIssue(token) {
+    const resolve = pendingIssues.shift();
+    if (!resolve) throw new Error('no pending service credential issuance');
+    resolve(json({ token }));
+  },
+};
 
 function json(value: unknown, status = 200) {
   return new Response(JSON.stringify(value), {
@@ -76,13 +87,34 @@ function limitSnapshot(keyId: string) {
   };
 }
 
-globalThis.fetch = async (input: RequestInfo | URL) => {
+globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = new URL(typeof input === 'string' ? input : input.toString(), location.origin);
   const call = `${url.pathname}${url.search}`;
+  const method = init?.method ?? 'GET';
   window.credentialFixture.calls.push(call);
+  window.credentialFixture.requests.push({ method, path: call });
   if (url.pathname === '/internal/v1/schemas') {
-    return json({ key_create: { type: 'object', properties: {} }, key_policy: { type: 'object', properties: {} } });
+    return json({
+      key_create: { type: 'object', properties: {} },
+      key_policy: { type: 'object', properties: {} },
+      service_token: { type: 'object', properties: {} },
+    });
   }
+  if (url.pathname === '/internal/v1/service-tokens' && method === 'POST') {
+    // Deliberately ignore AbortSignal so the component, rather than the mock,
+    // must fence a response from an old tenant/auth epoch.
+    return new Promise<Response>((resolve) => pendingIssues.push(resolve));
+  }
+  if (url.pathname === '/internal/v1/service-tokens') return json([{
+    service_id: 'service-existing',
+    name: 'Existing service credential',
+    credential_generation: 1,
+    fingerprint: 'fixture-fingerprint',
+    scopes: ['keys:read'],
+    tenant_external_id: initialTenant || 'tenant-a',
+    status: 'active',
+    created_at: 1_700_000_000_000,
+  }]);
   if (url.pathname.endsWith('credential-groups') || url.pathname.endsWith('route-groups')) return json([]);
   if (url.pathname === '/internal/v1/model-routes') {
     if (scenario === 'route-failure') return json({ error: { message: 'route catalog unavailable' } }, 400);
@@ -119,6 +151,13 @@ globalThis.fetch = async (input: RequestInfo | URL) => {
 
 function Fixture() {
   const [tenant, setTenant] = useState(initialTenant);
+  if (scenario === 'service-plaintext' || scenario === 'service-scope-aba') {
+    return <>
+      {scenario === 'service-scope-aba' && <button type="button" onClick={() => setTenant((current) => current === 'tenant-a' ? 'tenant-b' : 'tenant-a')}>Switch tenant</button>}
+      <span>Tenant {tenant}</span>
+      <ServiceCredentialsPage token="mts_fixture" tenant={tenant} />
+    </>;
+  }
   return <>
     {(scenario === 'scope-race' || scenario === 'scope-lock') && <button type="button" onClick={() => setTenant('tenant-b')}>Switch tenant</button>}
     <CredentialsPage token="mts_fixture" tenant={tenant} />

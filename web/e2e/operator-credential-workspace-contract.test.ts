@@ -11,7 +11,13 @@ import { createServer } from 'vite';
 const webRoot = fileURLToPath(new URL('..', import.meta.url));
 
 declare global {
-  interface Window { credentialFixture: { calls: string[] } }
+  interface Window {
+    credentialFixture: {
+      calls: string[];
+      requests: Array<{ method: string; path: string }>;
+      releaseIssue: (token: string) => void;
+    };
+  }
 }
 
 async function localChromiumExecutable() {
@@ -31,7 +37,11 @@ async function calls(page: import('playwright').Page) {
   return page.evaluate(() => window.credentialFixture.calls);
 }
 
-test('CredentialWorkspace keeps global inventory readable and isolates independent loads', { timeout: 30_000 }, async () => {
+async function nextPaint(page: import('playwright').Page) {
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+}
+
+test('credential workspaces isolate loads and preserve one-time service plaintext', { timeout: 30_000 }, async () => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for the credential workspace CI gate');
@@ -83,6 +93,45 @@ test('CredentialWorkspace keeps global inventory readable and isolates independe
     const cursorCalls = (await calls(lock)).filter((call) => call.startsWith('/internal/v1/keys?') && call.includes('before_id='));
     assert.equal(cursorCalls.length, 1, 'the stale scope cannot release the active cursor request for a second load');
     assert.equal(await lock.getByText('Scope A client', { exact: true }).count(), 0, 'the old scope remains invisible while a replacement cursor page is pending');
+
+    const plaintext = await browser.newPage();
+    await plaintext.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await plaintext.goto(fixture('service-plaintext'));
+    await plaintext.getByText('Existing service credential', { exact: true }).waitFor();
+    const create = plaintext.getByRole('button', { name: 'Create service credential', exact: true });
+    await create.evaluate((button) => { button.click(); button.click(); });
+    await plaintext.waitForFunction(() => window.credentialFixture.requests.filter((request) => request.method === 'POST' && request.path === '/internal/v1/service-tokens').length === 1);
+    await plaintext.evaluate(() => window.credentialFixture.releaseIssue('mts_service_secret_first'));
+    await plaintext.getByText('mts_service_secret_first', { exact: true }).waitFor();
+    assert.equal(await create.isDisabled(), true, 'visible plaintext blocks another service credential issuance');
+    assert.equal(await plaintext.getByRole('button', { name: 'Rotate', exact: true }).isDisabled(), true, 'visible plaintext blocks rotation from replacing it');
+    plaintext.once('dialog', (dialog) => void dialog.accept());
+    await plaintext.getByRole('button', { name: 'Close', exact: true }).click();
+    await plaintext.getByText('mts_service_secret_first', { exact: true }).waitFor({ state: 'detached' });
+    await plaintext.waitForFunction(() => Array.from(document.querySelectorAll('button')).some((button) => button.textContent === 'Create service credential' && !button.disabled));
+    assert.equal(await create.isDisabled(), false, 'confirmed dismissal clears plaintext and releases issuance controls');
+    assert.equal(await plaintext.getByRole('button', { name: 'Rotate', exact: true }).isDisabled(), false);
+
+    const aba = await browser.newPage();
+    await aba.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await aba.goto(fixture('service-scope-aba'));
+    await aba.getByText('Existing service credential', { exact: true }).waitFor();
+    const abaCreate = aba.getByRole('button', { name: 'Create service credential', exact: true });
+    await abaCreate.click();
+    await aba.waitForFunction(() => window.credentialFixture.requests.filter((request) => request.method === 'POST' && request.path === '/internal/v1/service-tokens').length === 1);
+    await aba.getByRole('button', { name: 'Switch tenant', exact: true }).click();
+    await aba.getByText('Tenant tenant-b', { exact: true }).waitFor();
+    await aba.getByRole('button', { name: 'Switch tenant', exact: true }).click();
+    await aba.getByText('Tenant tenant-a', { exact: true }).waitFor();
+    await aba.evaluate(() => window.credentialFixture.releaseIssue('mts_service_secret_stale'));
+    await nextPaint(aba);
+    assert.equal(await aba.getByText('mts_service_secret_stale', { exact: true }).count(), 0, 'an old response cannot reappear after an A-B-A scope transition');
+    await aba.waitForFunction(() => Array.from(document.querySelectorAll('button')).some((button) => button.textContent === 'Create service credential' && !button.disabled));
+    assert.equal(await abaCreate.isDisabled(), false, 'scope cleanup releases the stale operation guard');
+    await abaCreate.click();
+    await aba.waitForFunction(() => window.credentialFixture.requests.filter((request) => request.method === 'POST' && request.path === '/internal/v1/service-tokens').length === 2);
+    await aba.evaluate(() => window.credentialFixture.releaseIssue('mts_service_secret_current'));
+    await aba.getByText('mts_service_secret_current', { exact: true }).waitFor();
   } finally {
     await browser.close();
     await server.close();

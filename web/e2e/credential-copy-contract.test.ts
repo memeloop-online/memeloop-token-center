@@ -9,10 +9,6 @@ const [copyButton, oneTimeSecret, managementPages, portal, settings] = await Pro
   readFile(new URL('../src/self/SelfPortal.tsx', import.meta.url), 'utf8'),
   readFile(new URL('../src/operator/pages/SystemSettingsPage.tsx', import.meta.url), 'utf8'),
 ]);
-const serviceWorkspace = managementPages.slice(
-  managementPages.indexOf('function ServiceCredentialWorkspace'),
-  managementPages.indexOf('interface OperatorPageProps'),
-);
 
 test('credential copying shares clipboard handling with accessible failure feedback', () => {
   assert.match(copyButton, /navigator\.clipboard\?\.writeText/);
@@ -44,18 +40,4 @@ test('only current plaintext credential sources are offered for copying', () => 
   assert.doesNotMatch(portal, /<CopyButton value=\{credentialView\.key_id\}/);
   assert.doesNotMatch(managementPages, /<OneTimeSecret value=\{value\.key_id\}/);
   assert.doesNotMatch(managementPages, /<OneTimeSecret value=\{value\.service_id\}/);
-});
-
-test('service credentials cannot be double-issued or overwrite visible plaintext', () => {
-  assert.match(serviceWorkspace, /Symbol\('service-credential-secret-operation'\)/);
-  assert.match(serviceWorkspace, /if \(secretOperation\.current \|\| secretRef\.current\) return undefined/);
-  assert.match(serviceWorkspace, /secretRef\.current = next;\s*setSecret\(next\)/);
-  assert.match(serviceWorkspace, /secret\?\.scopeGeneration === renderScope\.current\.generation/);
-  assert.match(serviceWorkspace, /renderScope\.current\.generation === operationScopeGeneration/);
-  assert.match(serviceWorkspace, /filename="service-credential\.txt" onDismiss=\{dismissSecret\}/);
-  assert.match(serviceWorkspace, /onClick=\{\(\) => void rotateServiceCredential\(value\)\}/);
-  assert.match(serviceWorkspace, /onSubmit=\{\(\{ formData \}\) => \{ void createServiceCredential\(formData\); \}\}/);
-  assert.match(serviceWorkspace, /disabled=\{!canManage\(value\) \|\| value\.status === 'revoked' \|\| Boolean\(busy\) \|\| Boolean\(visibleSecret\)\}/);
-  assert.match(serviceWorkspace, /disabled=\{!writeTenant \|\| Boolean\(busy\) \|\| Boolean\(visibleSecret\)\}/);
-  assert.doesNotMatch(serviceWorkspace, /setSecret\((created|result)\.token\)/);
 });
