@@ -5,7 +5,7 @@ use std::{
 };
 
 use cucumber::{World, given, then, when};
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use memeloop_token_center::{
     AppState, api,
     archive_staging::{
@@ -158,13 +158,35 @@ fn spawn_test_worker(state: AppState) -> (watch::Sender<bool>, JoinHandle<()>) {
 }
 
 async fn stop_test_worker(world: &mut TokenCenterWorld) {
-    let shutdown = world
-        .worker_shutdown
-        .take()
-        .expect("generation worker shutdown signal");
-    let task = world.worker_task.take().expect("generation worker task");
-    shutdown.send(true).expect("generation worker is running");
-    task.await.expect("generation worker shuts down cleanly");
+    if let Some(shutdown) = world.worker_shutdown.take() {
+        let _ = shutdown.send(true);
+    }
+    if let Some(task) = world.worker_task.take() {
+        task.await.expect("generation worker shuts down cleanly");
+    }
+}
+
+async fn verify_test_mocks(world: &mut TokenCenterWorld) {
+    let mock = world.mock.take();
+    let asset_mock = world.asset_mock.take();
+
+    if let Some(mock) = mock {
+        mock.verify().await;
+    }
+    if let Some(mock) = asset_mock {
+        mock.verify().await;
+    }
+}
+
+async fn finish_scenario(world: Option<&mut TokenCenterWorld>) {
+    let Some(world) = world else {
+        return;
+    };
+
+    // A generation worker can still make an upstream request after a scenario's final step.
+    // Stop and join it before inspecting mock expectations, so any failure belongs to this hook.
+    stop_test_worker(world).await;
+    verify_test_mocks(world).await;
 }
 
 #[given("a token center backed by SQLite and memory object storage")]
@@ -7861,8 +7883,53 @@ async fn main() {
         // default of 64 concurrent scenarios can turn the acceptance harness itself into a
         // multi-gigabyte workload and make CI results depend on host memory pressure.
         .max_concurrent_scenarios(2)
+        .after(|_, _, _, _, world| async move { finish_scenario(world).await }.boxed_local())
         .filter_run_and_exit("tests/features", move |_, _, scenario| {
             postgres_enabled || !scenario.tags.iter().any(|tag| tag == "postgres")
         })
         .await;
+}
+
+#[cfg(test)]
+mod lifecycle_contract_tests {
+    use std::panic::AssertUnwindSafe;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn mock_expectation_failure_is_readable_after_the_worker_exits() {
+        let (shutdown, mut receiver) = watch::channel(false);
+        let worker = tokio::spawn(async move {
+            receiver.changed().await.expect("worker shutdown signal");
+            assert!(*receiver.borrow(), "worker received shutdown");
+        });
+        let mut world = TokenCenterWorld::default();
+        world.worker_shutdown = Some(shutdown);
+        world.worker_task = Some(worker);
+
+        stop_test_worker(&mut world).await;
+        assert!(world.worker_shutdown.is_none());
+        assert!(world.worker_task.is_none());
+
+        let mock = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        world.mock = Some(mock);
+        let failure = AssertUnwindSafe(verify_test_mocks(&mut world))
+            .catch_unwind()
+            .await
+            .expect_err("unsatisfied mock expectation must fail explicitly");
+        assert!(world.mock.is_none());
+
+        let message = failure
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| failure.downcast_ref::<&str>().copied())
+            .expect("wiremock verification panic contains a message");
+        assert!(message.contains("Verifications failed"), "{message}");
+        assert!(message.contains("expected exactly 1"), "{message}");
+    }
 }
