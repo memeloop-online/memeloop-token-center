@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { ModelPriceView } from '../src/types';
+import type { ModelPriceView } from '../src/types.js';
 import {
   loadModelPricePages,
   MODEL_PRICE_PAGE_SIZE,
   modelPricePagePath,
-} from '../src/operator/pricingLoading';
+} from '../src/operator/pricingLoading.js';
 
 function price(model: string): ModelPriceView {
   return {
