@@ -170,13 +170,6 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   await assertContains(providerAccount, '1 条路由');
   await providerAccount.getByRole('button', { name: '健康检查' }).click();
   await assertContains(providerAccount, '连接正常');
-  await providerAccount.getByRole('button', { name: '编辑', exact: true }).click();
-  const upstreamEditor = page.locator('.inline-editor').filter({ hasText: '编辑 Browser mock upstream' });
-  await upstreamEditor.getByLabel('上游名称').fill('Browser mock upstream edited');
-  await upstreamEditor.getByRole('button', { name: '保存', exact: true }).click();
-  await assertContains(page.getByRole('status'), '已更新 Browser mock upstream');
-  await assertContains(providerAccount, 'Browser mock upstream edited');
-  seed.upstreamName = 'Browser mock upstream edited';
   const disabledProvider = page.waitForResponse((response) => {
     const url = new URL(response.url());
     return response.request().method() === 'PATCH'

@@ -199,8 +199,9 @@ impl<'a> TrafficPolicyProtocols<'a> {
 
 /// Traffic plugins run only after core key authentication. Both the client
 /// model and the effective rewritten model must resolve through normalized
-/// exact-route or route-group grants. A plugin may narrow the resulting
-/// account candidates, but cannot create a permission or bypass exclusions.
+/// exact-route or route-group grants. A plugin may prefer one account within
+/// the resulting authorized candidates, but cannot create a permission or
+/// bypass exclusions.
 pub(super) async fn apply_traffic_policy(
     state: &AppState,
     key: &AuthenticatedKey,

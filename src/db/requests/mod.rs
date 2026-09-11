@@ -21,7 +21,7 @@ pub use lifecycle::{
     NewRequest, ProxyConversationInput, StartProxyRequest,
 };
 pub(crate) use lifecycle::{
-    claim_request_event_locator, record_request_finished_in_transaction,
+    SwitchProxyCandidateInput, claim_request_event_locator, record_request_finished_in_transaction,
     record_request_started_in_transaction,
 };
 pub use metered_projection::MeteredUsageProjectionTask;

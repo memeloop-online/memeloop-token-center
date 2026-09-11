@@ -3,6 +3,7 @@ use super::super::*;
 use super::conversations::{
     ConversationProjectionEnqueueInput, enqueue_conversation_projection_in_transaction,
 };
+use super::settlement::resize_usage_reservation_in_transaction;
 use crate::archive_staging::{
     ArchiveStagingOwner, ArchiveStagingPurpose, ArchiveStagingWriteLease,
 };
@@ -46,6 +47,18 @@ pub struct StartProxyRequest<'a> {
     pub request_object: &'a str,
     pub upstream_account_id: Option<Uuid>,
     pub model_route_id: Option<Uuid>,
+}
+
+pub(crate) struct SwitchProxyCandidateInput<'a> {
+    pub request_id: Uuid,
+    pub tenant_id: Uuid,
+    pub key: &'a AuthenticatedKey,
+    pub price: &'a ModelPrice,
+    pub reservation: &'a UsageReservation,
+    pub input_token_ceiling: i64,
+    pub output_token_ceiling: i64,
+    pub expected_assignment: (Uuid, Uuid),
+    pub next_assignment: (Uuid, Uuid),
 }
 
 #[derive(Clone)]
@@ -194,6 +207,54 @@ impl Database {
         Err(AppError::Conflict(
             "proxy upstream assignment changed before failover".into(),
         ))
+    }
+
+    /// Atomically moves one pending downstream request to a newly selected
+    /// candidate and resizes its existing reservation to that candidate's
+    /// contract. The reservation identity and RPM/concurrency admission are
+    /// retained; only token/balance capacity changes.
+    pub(crate) async fn switch_pending_proxy_candidate(
+        &self,
+        input: SwitchProxyCandidateInput<'_>,
+    ) -> Result<UsageReservation, AppError> {
+        let mut transaction = self.begin_write_transaction().await?;
+        let (expected_upstream_account_id, expected_model_route_id) = input.expected_assignment;
+        let (next_upstream_account_id, next_model_route_id) = input.next_assignment;
+        let updated = sqlx::query(
+            "UPDATE request_records
+             SET upstream_account_id = $1, model_route_id = $2
+             WHERE id = $3 AND tenant_id = $4 AND key_id = $5 AND reservation_id = $6
+               AND upstream_account_id = $7 AND model_route_id = $8
+               AND completed_at IS NULL AND error_code IS NULL",
+        )
+        .bind(next_upstream_account_id.to_string())
+        .bind(next_model_route_id.to_string())
+        .bind(input.request_id.to_string())
+        .bind(input.tenant_id.to_string())
+        .bind(input.key.key_id.to_string())
+        .bind(input.reservation.id.to_string())
+        .bind(expected_upstream_account_id.to_string())
+        .bind(expected_model_route_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Err(AppError::Conflict(
+                "proxy candidate changed after downstream delivery preparation".into(),
+            ));
+        }
+        let resized = resize_usage_reservation_in_transaction(
+            &mut transaction,
+            input.key,
+            input.price,
+            input.reservation,
+            input.input_token_ceiling,
+            input.output_token_ceiling,
+            unix_millis(),
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(resized)
     }
 
     /// Legacy split attachment retained only for pre-v35 unit fixtures. The

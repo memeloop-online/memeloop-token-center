@@ -78,10 +78,10 @@ async fn credential_expiring_after_resolution_skips_to_prepared_standby() {
         .unwrap();
     let request_id = Uuid::now_v7();
     let request = json!({"model": fixture.model, "input": "expiry race", "stream": false});
-    let mut candidates = fixture
+    let candidates = fixture
         .state
         .db
-        .resolve_authorized_upstream_candidates_with_hint(
+        .list_authorized_upstream_candidates_with_hint(
             key.key_id,
             key.tenant_id,
             &fixture.model,
@@ -90,15 +90,11 @@ async fn credential_expiring_after_resolution_skips_to_prepared_standby() {
                 upstream_account_hint: None,
                 selection_seed: request_id,
             },
-            fixture.state.config.key_pepper.as_bytes(),
         )
         .await
         .unwrap();
     assert_eq!(candidates[0].account_id, fixture.upstream_account_id);
-    let UpstreamCredential::OAuth { expires_at, .. } = &mut candidates[0].credential else {
-        panic!("Codex fixture uses OAuth");
-    };
-    *expires_at = Some(crate::db::unix_millis());
+    expire_current_credential_metadata(&fixture).await;
 
     let prepared = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
         request: ProxyRequestContext {
@@ -110,12 +106,11 @@ async fn credential_expiring_after_resolution_skips_to_prepared_standby() {
             request_json: &request,
         },
         original_body_length: serde_json::to_vec(&request).unwrap().len(),
-        resolved_routes: candidates,
+        candidates,
     })
     .await
     .unwrap();
-    assert_eq!(prepared.direct_candidates.len(), 1);
-    assert_eq!(prepared.direct_candidates[0].account_id, standby);
+    assert_eq!(prepared.primary.route.account_id, standby);
 }
 
 #[tokio::test]
@@ -128,10 +123,57 @@ async fn local_codex_protocol_mismatch_skips_to_compatible_candidate() {
         .await
         .unwrap();
     let request_id = Uuid::now_v7();
-    let mut candidates = fixture
+    let compatible = fixture
         .state
         .db
-        .resolve_authorized_upstream_candidates_with_hint(
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "codex-route-local-protocol-mismatch".to_owned(),
+                name: "compatible-http-standby".to_owned(),
+                driver: "http-json".to_owned(),
+                config: json!({
+                    "base_url": "https://example.com",
+                    "network_scope": "public"
+                }),
+                credential: UpstreamCredential::None,
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            fixture.state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let compatible_route = fixture
+        .state
+        .db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: "codex-route-local-protocol-mismatch".to_owned(),
+            public_model: fixture.model.clone(),
+            upstream_account_id: compatible.id,
+            upstream_model: "compatible-model".to_owned(),
+            protocol: "openai".to_owned(),
+            priority: 10,
+        })
+        .await
+        .unwrap();
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query(
+        "INSERT INTO routing_grants (tenant_id, key_id, model_route_id, route_group_id, created_at)
+         VALUES ($1, $2, $3, NULL, $4)",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(compatible_route.id.to_string())
+    .bind(crate::db::unix_millis())
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    let candidates = fixture
+        .state
+        .db
+        .list_authorized_upstream_candidates_with_hint(
             key.key_id,
             key.tenant_id,
             &fixture.model,
@@ -140,19 +182,9 @@ async fn local_codex_protocol_mismatch_skips_to_compatible_candidate() {
                 upstream_account_hint: None,
                 selection_seed: request_id,
             },
-            fixture.state.config.key_pepper.as_bytes(),
         )
         .await
         .unwrap();
-    assert_eq!(candidates.len(), 1);
-    let mut compatible = candidates[0].clone();
-    compatible.route_id = Uuid::now_v7();
-    compatible.account_id = Uuid::now_v7();
-    compatible.driver = "http-json".to_owned();
-    compatible.base_url = "https://example.com".to_owned();
-    compatible.config = json!({"base_url": compatible.base_url.clone(), "network_scope": "public"});
-    compatible.credential = UpstreamCredential::None;
-    candidates.push(compatible.clone());
 
     let request = json!({
         "model": fixture.model,
@@ -169,15 +201,11 @@ async fn local_codex_protocol_mismatch_skips_to_compatible_candidate() {
             request_json: &request,
         },
         original_body_length: serde_json::to_vec(&request).unwrap().len(),
-        resolved_routes: candidates,
+        candidates,
     })
     .await
     .unwrap();
-    assert_eq!(prepared.direct_candidates.len(), 1);
-    assert_eq!(
-        prepared.direct_candidates[0].account_id,
-        compatible.account_id
-    );
+    assert_eq!(prepared.primary.route.account_id, compatible.id);
 }
 
 #[tokio::test]

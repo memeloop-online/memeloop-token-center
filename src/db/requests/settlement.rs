@@ -291,14 +291,14 @@ fn retry_after_until(reset_at: i64, now: i64) -> u64 {
         .max(1)
 }
 
-pub(crate) async fn reserve_usage_in_transaction(
-    tx: &mut Transaction<'_, Any>,
-    key: &AuthenticatedKey,
+pub(crate) fn reservation_ceiling_amounts(
     price: &ModelPrice,
     input_token_ceiling: i64,
     output_token_ceiling: i64,
-    now: i64,
-) -> Result<UsageReservation, AppError> {
+) -> Result<(i64, i64), AppError> {
+    if input_token_ceiling < 0 || output_token_ceiling < 0 {
+        return Err(AppError::Internal);
+    }
     let maximum_input_price = price
         .tiers
         .iter()
@@ -331,6 +331,19 @@ pub(crate) async fn reserve_usage_in_transaction(
             reason: LimitReason::TpmExhausted,
             retry_after_seconds: Some(60),
         })?;
+    Ok((reserved_micros, reserved_tokens))
+}
+
+pub(crate) async fn reserve_usage_in_transaction(
+    tx: &mut Transaction<'_, Any>,
+    key: &AuthenticatedKey,
+    price: &ModelPrice,
+    input_token_ceiling: i64,
+    output_token_ceiling: i64,
+    now: i64,
+) -> Result<UsageReservation, AppError> {
+    let (reserved_micros, reserved_tokens) =
+        reservation_ceiling_amounts(price, input_token_ceiling, output_token_ceiling)?;
     let window_start = now / 60_000 * 60_000;
     if !key.policy.enforcement_mode.enforces_prepaid_limits() {
         let id = Uuid::now_v7();
@@ -538,6 +551,208 @@ pub(crate) async fn reserve_usage_in_transaction(
         rate_window_start: window_start,
         reserved_tokens,
     })
+}
+
+pub(crate) async fn resize_usage_reservation_in_transaction(
+    tx: &mut Transaction<'_, Any>,
+    key: &AuthenticatedKey,
+    price: &ModelPrice,
+    reservation: &UsageReservation,
+    input_token_ceiling: i64,
+    output_token_ceiling: i64,
+    now: i64,
+) -> Result<UsageReservation, AppError> {
+    let (reserved_micros, reserved_tokens) =
+        reservation_ceiling_amounts(price, input_token_ceiling, output_token_ceiling)?;
+    let current = sqlx::query(
+        "UPDATE usage_reservations SET reserved_tokens = reserved_tokens
+         WHERE id = $1 AND account_id = $2 AND key_id = $3 AND status = 'reserved'
+         RETURNING reserved_micros, reserved_tokens, rate_window_start",
+    )
+    .bind(reservation.id.to_string())
+    .bind(reservation.account_id.to_string())
+    .bind(reservation.key_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| AppError::Conflict("proxy reservation is no longer active".into()))?;
+    let old_micros: i64 = current.try_get("reserved_micros")?;
+    let old_tokens: i64 = current.try_get("reserved_tokens")?;
+    let rate_window_start: i64 = current.try_get("rate_window_start")?;
+    if old_micros != reservation.reserved_micros
+        || old_tokens != reservation.reserved_tokens
+        || rate_window_start != reservation.rate_window_start
+    {
+        return Err(AppError::Conflict(
+            "proxy reservation changed before candidate switch".into(),
+        ));
+    }
+    if old_micros == reserved_micros && old_tokens == reserved_tokens {
+        return Ok(reservation.clone());
+    }
+    if !key.policy.enforcement_mode.enforces_prepaid_limits() {
+        let updated = sqlx::query(
+            "UPDATE usage_reservations SET reserved_micros = $1, reserved_tokens = $2
+             WHERE id = $3 AND account_id = $4 AND key_id = $5 AND status = 'reserved'
+               AND reserved_micros = $6 AND reserved_tokens = $7",
+        )
+        .bind(reserved_micros)
+        .bind(reserved_tokens)
+        .bind(reservation.id.to_string())
+        .bind(reservation.account_id.to_string())
+        .bind(reservation.key_id.to_string())
+        .bind(old_micros)
+        .bind(old_tokens)
+        .execute(&mut **tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(AppError::Conflict(
+                "proxy reservation changed before candidate switch".into(),
+            ));
+        }
+        let mut resized = reservation.clone();
+        resized.reserved_micros = reserved_micros;
+        resized.reserved_tokens = reserved_tokens;
+        return Ok(resized);
+    }
+    if reserved_tokens > key.policy.tokens_per_minute as i64 {
+        return Err(AppError::LimitExceeded {
+            reason: LimitReason::TpmExhausted,
+            retry_after_seconds: Some(retry_after_until(rate_window_start + 60_000, now)),
+        });
+    }
+    let (settled_lifetime_micros, active_reserved) =
+        lock_key_budget_state(tx, key.key_id, now).await?;
+    let adjusted_active_reserved = active_reserved
+        .checked_sub(old_micros)
+        .filter(|amount| *amount >= 0)
+        .and_then(|amount| amount.checked_add(reserved_micros))
+        .ok_or(AppError::Internal)?;
+    let daily_settled = if key.policy.daily_budget.is_some() {
+        key_budget_daily_settled(tx, key.key_id, now).await?
+    } else {
+        0
+    };
+    let weekly_settled = if key.policy.weekly_budget.is_some() {
+        key_budget_rolling_weekly_settled(tx, key.key_id, now).await?
+    } else {
+        0
+    };
+    for (configured_budget, settled, reason, retry_after_seconds) in [
+        (
+            key.policy.daily_budget.as_deref(),
+            daily_settled,
+            LimitReason::DailyBudgetExhausted,
+            Some(retry_after_until((now / 86_400_000 + 1) * 86_400_000, now)),
+        ),
+        (
+            key.policy.weekly_budget.as_deref(),
+            weekly_settled,
+            LimitReason::WeeklyBudgetExhausted,
+            Some(1),
+        ),
+        (
+            key.policy.lifetime_budget.as_deref(),
+            settled_lifetime_micros,
+            LimitReason::LifetimeBudgetExhausted,
+            None,
+        ),
+    ] {
+        let Some(configured_budget) = configured_budget else {
+            continue;
+        };
+        let budget_micros = decimal_to_micros(
+            Decimal::from_str_exact(configured_budget).map_err(|_| AppError::Internal)?,
+        )?;
+        if settled.saturating_add(adjusted_active_reserved) > budget_micros {
+            return Err(AppError::LimitExceeded {
+                reason,
+                retry_after_seconds,
+            });
+        }
+    }
+    let token_delta = reserved_tokens
+        .checked_sub(old_tokens)
+        .ok_or(AppError::Internal)?;
+    let rate_updated = sqlx::query(
+        "UPDATE rate_limit_windows SET tokens = tokens + $1
+         WHERE key_id = $2 AND window_start = $3
+           AND tokens + $4 >= 0 AND tokens + $5 <= $6",
+    )
+    .bind(token_delta)
+    .bind(key.key_id.to_string())
+    .bind(rate_window_start)
+    .bind(token_delta)
+    .bind(token_delta)
+    .bind(key.policy.tokens_per_minute as i64)
+    .execute(&mut **tx)
+    .await?;
+    if rate_updated.rows_affected() != 1 {
+        return Err(AppError::LimitExceeded {
+            reason: LimitReason::TpmExhausted,
+            retry_after_seconds: Some(retry_after_until(rate_window_start + 60_000, now)),
+        });
+    }
+    let micros_delta = reserved_micros
+        .checked_sub(old_micros)
+        .ok_or(AppError::Internal)?;
+    let balance_updated = sqlx::query(
+        "UPDATE credit_accounts
+         SET available_micros = available_micros - $1,
+             reserved_micros = reserved_micros + $2, updated_at = $3
+         WHERE id = $4 AND currency = $5
+           AND available_micros >= $6 AND reserved_micros + $7 >= 0",
+    )
+    .bind(micros_delta)
+    .bind(micros_delta)
+    .bind(now)
+    .bind(key.account_id.to_string())
+    .bind(&key.currency)
+    .bind(micros_delta.max(0))
+    .bind(micros_delta)
+    .execute(&mut **tx)
+    .await?;
+    if balance_updated.rows_affected() != 1 {
+        return Err(AppError::LimitExceeded {
+            reason: LimitReason::BalanceExhausted,
+            retry_after_seconds: None,
+        });
+    }
+    let budget_updated = sqlx::query(
+        "UPDATE key_budget_state SET reserved_micros = reserved_micros + $1, updated_at = $2
+         WHERE key_id = $3 AND reserved_micros + $4 >= 0",
+    )
+    .bind(micros_delta)
+    .bind(now)
+    .bind(key.key_id.to_string())
+    .bind(micros_delta)
+    .execute(&mut **tx)
+    .await?;
+    if budget_updated.rows_affected() != 1 {
+        return Err(AppError::Internal);
+    }
+    let reservation_updated = sqlx::query(
+        "UPDATE usage_reservations SET reserved_micros = $1, reserved_tokens = $2
+         WHERE id = $3 AND account_id = $4 AND key_id = $5 AND status = 'reserved'
+           AND reserved_micros = $6 AND reserved_tokens = $7",
+    )
+    .bind(reserved_micros)
+    .bind(reserved_tokens)
+    .bind(reservation.id.to_string())
+    .bind(reservation.account_id.to_string())
+    .bind(reservation.key_id.to_string())
+    .bind(old_micros)
+    .bind(old_tokens)
+    .execute(&mut **tx)
+    .await?;
+    if reservation_updated.rows_affected() != 1 {
+        return Err(AppError::Conflict(
+            "proxy reservation changed before candidate switch".into(),
+        ));
+    }
+    let mut resized = reservation.clone();
+    resized.reserved_micros = reserved_micros;
+    resized.reserved_tokens = reserved_tokens;
+    Ok(resized)
 }
 
 pub(crate) async fn settle_token_usage_in_transaction(
