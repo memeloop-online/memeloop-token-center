@@ -99,11 +99,12 @@ pub(in crate::api::proxy) async fn next_planned_proxy_candidate(
             preparation_now: unix_millis(),
         })
         .map(Some)
-        .inspect_err(|_| {
+        .inspect_err(|error| {
             tracing::warn!(
                 %request.request_id,
                 %route_id,
                 upstream_account_id = %account_id,
+                error_category = error.diagnostic_category(),
                 stage = "candidate_prepare",
                 "selected authorized proxy candidate is unusable"
             );

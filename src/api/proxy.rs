@@ -27,13 +27,13 @@ use lifecycle::{
     run_bounded_text_archive,
 };
 use routing::{
-    AdmittedProxyRouteInput, CandidateCompatibility, CandidatePreparationSummary,
-    CodexRetryTerminal, CodexRetryTerminalGuard, DeferredSharedProbe, NextSendableProxyRouteInput,
+    AdmittedProxyRouteInput, CandidatePreparationSummary, CodexRetryTerminal,
+    CodexRetryTerminalGuard, DeferredSharedProbe, NextSendableProxyRouteInput,
     PROXY_ROUTING_POLICY, PlannedProxyRoute, PreparedProxyRoute, PreparedRouteReadiness,
     ProxyRequestContext, ProxyRoutePlanInput, ProxySendError, UpstreamAttemptGuard,
-    UpstreamAttemptTerminal, candidate_compatibility, candidate_reservation_bounds,
-    exhausted_candidate_error, materialize_proxy_route, next_planned_proxy_candidate,
-    plan_proxy_route, prepare_admitted_proxy_route, refresh_route_snapshot, send_proxy_route,
+    UpstreamAttemptTerminal, candidate_reservation_bounds, exhausted_candidate_error,
+    materialize_proxy_route, next_planned_proxy_candidate, plan_proxy_route,
+    prepare_admitted_proxy_route, refresh_route_snapshot, send_proxy_route,
 };
 use upstream_response::UpstreamResponse;
 
@@ -193,7 +193,7 @@ async fn next_sendable_proxy_route(
     let strict_choice_count_is_incompatible = matches!(request.protocol, Protocol::OpenAiChat)
         && openai_chat_choice_count(request.request_json)? != 1;
     let mut summary = CandidatePreparationSummary::default();
-    while let Some(mut planned) = (match planned_candidate.take() {
+    while let Some(mut planned) = match planned_candidate.take() {
         Some(planned) => Some(planned),
         None => {
             next_planned_proxy_candidate(
@@ -204,7 +204,7 @@ async fn next_sendable_proxy_route(
             )
             .await?
         }
-    }) {
+    } {
         *candidate_rank = (*candidate_rank).saturating_add(1);
         let rank = *candidate_rank;
         if planned.is_component() {
@@ -522,6 +522,35 @@ async fn finish_non_sse_proxy_response(
     result
 }
 
+fn requested_service_tier(
+    request_json: &Value,
+    price: &ModelPrice,
+) -> Result<Option<String>, AppError> {
+    let requested = match request_json.get("service_tier") {
+        None => None,
+        Some(Value::String(tier)) if is_supported_service_tier(tier) => Some(tier.clone()),
+        Some(_) => {
+            return Err(AppError::BadRequest(
+                "service_tier must be default, auto, priority, flex, scale, batch, or standard_only"
+                    .into(),
+            ));
+        }
+    };
+    if let Some(tier) = requested.as_deref()
+        && !matches!(tier, "auto" | "standard_only")
+        && !(tier == "default" && price.tiers.is_empty())
+        && !price
+            .tiers
+            .iter()
+            .any(|price_tier| price_tier.service_tier == tier)
+    {
+        return Err(AppError::BadRequest(
+            "the requested service_tier has no configured price".into(),
+        ));
+    }
+    Ok(requested)
+}
+
 pub(super) async fn proxy(
     state: AppState,
     headers: HeaderMap,
@@ -584,28 +613,7 @@ pub(super) async fn proxy(
     let price = state.db.model_price(&model, &key.currency).await?;
     let input_token_ceiling = route_plan.input_token_ceiling;
     let output_token_ceiling = route_plan.output_token_ceiling;
-    let requested_service_tier = match request_json.get("service_tier") {
-        None => None,
-        Some(Value::String(tier)) if is_supported_service_tier(tier) => Some(tier.clone()),
-        Some(_) => {
-            return Err(AppError::BadRequest(
-                "service_tier must be default, auto, priority, flex, scale, batch, or standard_only"
-                    .into(),
-            ));
-        }
-    };
-    if let Some(tier) = requested_service_tier.as_deref()
-        && !matches!(tier, "auto" | "standard_only")
-        && !(tier == "default" && price.tiers.is_empty())
-        && !price
-            .tiers
-            .iter()
-            .any(|price_tier| price_tier.service_tier == tier)
-    {
-        return Err(AppError::BadRequest(
-            "the requested service_tier has no configured price".into(),
-        ));
-    }
+    let requested_service_tier = requested_service_tier(&request_json, &price)?;
     let request_digest = blake3::hash(&body).to_hex();
     let admitted_request_object = format!("gap://{request_id}/request");
     let request_archive_attempt =
