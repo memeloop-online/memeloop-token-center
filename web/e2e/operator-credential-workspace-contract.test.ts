@@ -100,6 +100,7 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     await plaintext.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await plaintext.goto(fixture('service-plaintext'));
     await plaintext.getByText('Existing service credential', { exact: true }).waitFor();
+    await plaintext.locator('details.create-resource > summary').click();
     const create = plaintext.getByRole('button', { name: 'Create service credential', exact: true });
     await create.evaluate((button) => {
       (button as HTMLButtonElement).click();
@@ -122,6 +123,7 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     await aba.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await aba.goto(fixture('service-scope-aba'));
     await aba.getByText('Existing service credential', { exact: true }).waitFor();
+    await aba.locator('details.create-resource > summary').click();
     const abaCreate = aba.getByRole('button', { name: 'Create service credential', exact: true });
     await abaCreate.click();
     await aba.waitForFunction(() => window.credentialFixture.requests.filter((request) => request.method === 'POST' && request.path === '/internal/v1/service-tokens').length === 1);
