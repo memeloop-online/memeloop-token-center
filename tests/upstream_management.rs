@@ -99,6 +99,16 @@ async fn codex_transport_proxy_rotation_is_sanitized_fenced_and_audited() {
         )
         .await
         .unwrap();
+    let upstream = state
+        .db
+        .set_upstream_account_status(
+            upstream.id,
+            "codex-proxy-tenant",
+            "disabled",
+            upstream.updated_at,
+        )
+        .await
+        .unwrap();
     assert_eq!(upstream.status, "disabled");
     assert!(!upstream.has_proxy);
     assert!(upstream.can_update_transport_proxy);

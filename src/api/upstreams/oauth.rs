@@ -230,7 +230,9 @@ pub(in crate::api) async fn poll_codex_oauth(
                         .await?
                 }
                 None => {
-                    state
+                    let missing_transport_proxy = ready.credential.proxy().is_none();
+                    let tenant_external_id = ready.tenant_external_id.clone();
+                    let created = state
                         .db
                         .create_upstream_account(
                             CreateUpstreamAccountInput {
@@ -247,7 +249,20 @@ pub(in crate::api) async fn poll_codex_oauth(
                             },
                             state.config.key_pepper.as_bytes(),
                         )
-                        .await?
+                        .await?;
+                    if missing_transport_proxy {
+                        state
+                            .db
+                            .set_upstream_account_status(
+                                created.id,
+                                &tenant_external_id,
+                                "disabled",
+                                created.updated_at,
+                            )
+                            .await?
+                    } else {
+                        created
+                    }
                 }
             };
             state

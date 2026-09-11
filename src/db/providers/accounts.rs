@@ -46,13 +46,6 @@ impl Database {
         let config_json = serde_json::to_string(&input.config).map_err(|_| AppError::Internal)?;
         let credential_ciphertext = seal_credential(&input.credential, key_material)?;
         let auth_kind = input.credential.auth_kind();
-        let status = if input.driver == crate::oauth::codex_device::PROVIDER_DRIVER
-            && input.credential.proxy().is_none()
-        {
-            "disabled"
-        } else {
-            "active"
-        };
         let credential_expires_at = input.credential.expires_at();
         let can_reauthorize = upstream_can_reauthorize(
             &input.driver,
@@ -99,7 +92,7 @@ impl Database {
             ));
         }
         sqlx::query(
-            "INSERT INTO upstream_accounts (id, tenant_id, name, driver, auth_kind, config_json, status, credential_generation, oauth_session_id, oauth_driver, oauth_refresh_url, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $9, $10, $11, $12)",
+            "INSERT INTO upstream_accounts (id, tenant_id, name, driver, auth_kind, config_json, status, credential_generation, oauth_session_id, oauth_driver, oauth_refresh_url, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, 'active', 1, $7, $8, $9, $10, $11)",
         )
         .bind(account_id.to_string())
         .bind(&tenant_id)
@@ -107,7 +100,6 @@ impl Database {
         .bind(&input.driver)
         .bind(auth_kind)
         .bind(config_json)
-        .bind(status)
         .bind(input.oauth_session_id.map(|id| id.to_string()))
         .bind(&input.oauth_driver)
         .bind(&input.oauth_refresh_url)
@@ -136,7 +128,7 @@ impl Database {
             auth_kind: auth_kind.to_owned(),
             connection_method: upstream_connection_method(&input.driver, auth_kind),
             credential_generation: 1,
-            status: status.to_owned(),
+            status: "active".to_owned(),
             config: input.config,
             credential_expires_at,
             has_proxy: false,
