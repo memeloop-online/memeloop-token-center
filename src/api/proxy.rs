@@ -524,7 +524,7 @@ async fn finish_non_sse_proxy_response(
 
 fn requested_service_tier(
     request_json: &Value,
-    price: &ModelPrice,
+    price: &crate::model::ModelPrice,
 ) -> Result<Option<String>, AppError> {
     let requested = match request_json.get("service_tier") {
         None => None,
