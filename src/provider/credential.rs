@@ -290,14 +290,14 @@ impl UpstreamCredential {
         key_material: &[u8],
         codex: bool,
     ) -> Result<UpstreamProxyMetadata, AppError> {
-        let Some((proxy_url, _)) = self.proxy() else {
+        let Some((proxy_url, proxy_scope)) = self.proxy() else {
             return Ok(UpstreamProxyMetadata::default());
         };
         let parsed = url::Url::parse(proxy_url).ok();
         let valid = if codex {
-            validate_codex_proxy_url(proxy_url).is_ok()
+            proxy_scope == OutboundScope::Private && validate_codex_proxy_url(proxy_url).is_ok()
         } else {
-            validate_proxy_url(proxy_url).is_ok()
+            proxy_scope == OutboundScope::Private && validate_proxy_url(proxy_url).is_ok()
         };
         let scheme = parsed
             .as_ref()
