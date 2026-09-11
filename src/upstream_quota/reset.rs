@@ -212,7 +212,7 @@ pub(crate) async fn confirm(
             )
             .await?
         {
-            QuotaResetClaim::Replayed(operation) => Ok(operation),
+            QuotaResetClaim::Replayed(operation) => Ok(*operation),
             QuotaResetClaim::Claimed { .. } => Err(AppError::Internal),
         };
     }
@@ -256,7 +256,7 @@ pub(crate) async fn confirm(
         .await?;
     let redeem = match claim {
         QuotaResetClaim::Claimed { redeem_request_id } => redeem_request_id,
-        QuotaResetClaim::Replayed(operation) => return Ok(operation),
+        QuotaResetClaim::Replayed(operation) => return Ok(*operation),
     };
     // No automatic retry and no new redeem ID on any ambiguous outcome.
     let result = dispatch_once(&http, credential, account_header, CONSUME_URL, &redeem).await;

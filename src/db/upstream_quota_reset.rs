@@ -52,7 +52,7 @@ pub(crate) struct PrepareQuotaResetResult {
 
 pub(crate) enum QuotaResetClaim {
     Claimed { redeem_request_id: String },
-    Replayed(QuotaResetOperation),
+    Replayed(Box<QuotaResetOperation>),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -356,9 +356,9 @@ impl Database {
             .await?;
             tx.commit().await?;
             if exact_replay.is_some() {
-                return Ok(QuotaResetClaim::Replayed(
+                return Ok(QuotaResetClaim::Replayed(Box::new(
                     self.quota_reset_operation(&tenant, &account_id, id).await?,
-                ));
+                )));
             }
             return Err(AppError::Conflict(
                 "reset confirmation is expired, mismatched, or uses another Idempotency-Key".into(),
