@@ -9,6 +9,7 @@ test('proxy update remains a redacted, explicit credential-versioned contract', 
   assert.match(source, /expected_credential_generation: account.credential_generation/);
   assert.match(source, /'Idempotency-Key': crypto.randomUUID\(\)/);
   assert.match(source, /account.has_proxy === undefined \? 'connection.proxyUnknown'/);
+  assert.match(source, /account.can_update_transport_proxy !== false/);
   assert.doesNotMatch(source, /localStorage|sessionStorage|console\./);
 });
 test('model submission validates integer priority and effective upstream protocol compatibility', async () => {

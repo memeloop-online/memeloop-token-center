@@ -183,6 +183,7 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   await page.locator('[data-resource-list-status-filter]').getByRole('button', { name: /显示非正常状态/ }).click();
   await assertContains(providerAccount, '已停用');
   await assertNotContains(providerAccount, '连接正常');
+  await providerAccount.locator('.upstream-danger-zone:not([open]) > summary').click();
   await providerAccount.getByRole('button', { name: '启用', exact: true }).click();
   await assertContains(providerAccount, '正常');
   await onboarding.getByRole('button', { name: '账户授权', exact: true }).click();

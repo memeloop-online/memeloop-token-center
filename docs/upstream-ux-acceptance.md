@@ -18,17 +18,16 @@ This PR's original backend baseline does **not** implement `PUT /internal/v1/ups
 - Enforce write tenant, optimistic concurrency, private-IP `socks5h` with remote DNS, credential encryption and idempotency. Reject unsupported providers or stale updates without replacing credentials. Saving must not trigger a health probe, quota refresh or model request.
 - Unknown proxy metadata displays as unknown, not proof of a missing or configured proxy. API errors retain the editor with a non-secret retry message.
 
-The browser mock asserts request shape and version/idempotency headers only. It is not proof of backend implementation, vendor behavior, or deployed availability.
+The backend transport-proxy workstream has confirmed this request/response contract, including the optional `can_update_transport_proxy` capability. The UI honors an explicit false value. Quota recovery hardening is tracked separately in [PR #23](https://github.com/memeloop-online/memeloop-token-center/pull/23); prepare and confirm each use their own idempotency key, and a user-requested confirmation retry reuses the original key and token.
+
+These dependencies must land before declaring end-to-end backend availability. The browser mock asserts request shape and version/idempotency headers only. It is not proof of backend implementation, vendor behavior, or deployed availability.
 
 ## Reproduction
 
-From `web`, start `npm run dev -- --host 127.0.0.1 --port 4175`, then run:
+Acceptance is performed by GitHub CI, not on the development host. Push the PR branch and inspect the `web` job. It runs type checking, production build, the browser-backed contracts and a loopback-only Vite server for these isolated interaction tests:
 
 ```sh
 MTC_UX_BASE_URL=http://127.0.0.1:4175 node --import tsx --test --test-concurrency=1 e2e/upstream-connection-browser.test.ts e2e/model-route-ux-browser.test.ts e2e/upstream-ux-static-browser.test.ts
-node --import tsx --test e2e/upstream-ux-contract.test.ts e2e/upstream-quota-window-contract.test.ts e2e/upstream-quota-reset-safety-contract.test.ts e2e/upstream-quota-browser-contract.test.ts
-npm run typecheck
-npm run build
 ```
 
-The static quota fixture forbids all fetches, directly renders presentation components and opens a preview confirmation without activating any quota button. Screenshot artifacts are saved under `/tmp/mtc-upstream-ux-*.png`, `/tmp/mtc-model-route-*.png`, and `web/e2e-artifacts/upstream-quota/`.
+The static quota fixture forbids all fetches, directly renders presentation components and opens a preview confirmation without activating any quota button. Download the `upstream-model-ux-browser-*` and `monitoring-interactions-browser-*` artifacts from that exact CI run. They retain mobile/desktop connection and model forms, quota unknown/stale/retained-error states and the Cancel-focused confirmation dialog. Old development-host screenshots are not acceptance evidence for this revision.
