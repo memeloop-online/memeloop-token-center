@@ -22,7 +22,13 @@
 .upstream-danger-zone summary { color: var(--danger, #b42318); }
 .upstream-danger-zone p { font-size: 12px; line-height: 1.6; }
 .route-form-sections { display: grid; gap: 20px; min-width: 0; }
-.route-form-sections fieldset { display: grid; gap: 16px; margin: 0; min-width: 0; padding: 16px; border: 1px solid #bdced0; }
+.route-form-sections fieldset { display: grid; gap: 16px; margin: 0; min-width: 0; padding: 16px; border: 1px solid var(--border); }
+.upstream-form-sections { display: grid; gap: 16px; min-width: 0; }
+.upstream-form-sections fieldset { min-width: 0; border: 1px solid var(--border); padding: 16px; }
+.upstream-form-sections legend { font-weight: 600; padding: 0 6px; }
+.upstream-advanced { border: 1px solid var(--border); padding: 16px; min-width: 0; }
+.upstream-advanced summary { cursor: pointer; font-weight: 600; }
+.upstream-advanced summary:focus-visible { outline: 2px solid var(--accent, #219b8a); outline-offset: 3px; }
 .route-form-sections legend { padding: 0 8px; font-weight: 600; }
 .route-form-sections .field-error { color: var(--danger, #b42318); }
 .upstream-proxy-editor input[aria-invalid='true'] { border-color: var(--danger, #b42318); }

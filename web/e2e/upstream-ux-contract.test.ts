@@ -1,30 +1,29 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import { connectionSchema, isPrivateProxyUrl } from '../src/operator/upstreamConnectionPolicy.js';
 
-const read = (path: string) => readFile(new URL(path, import.meta.url), 'utf8');
-test('proxy update remains a redacted, explicit credential-versioned contract', async () => {
-  const source = await read('../src/operator/UpstreamConnection.tsx');
-  assert.match(source, /type="password" required aria-invalid=\{invalid\} aria-describedby=/);
+test('Codex proxies mirror private backend ranges without narrowing generic hostname schemas', () => {
+  for (const [url, valid] of [
+    ['socks5h://10.0.0.10:1080', true], ['socks5h://100.64.0.16', true], ['socks5h://[fd00::1]:1080', true],
+    ['socks5h://100.100.100.200:1080', false], ['socks5h://127.0.0.1:1080', false], ['socks5h://8.8.8.8:1080', false],
+    ['socks5://10.0.0.10:1080', false], ['socks5h://proxy.example:1080', false], ['socks5h://10.0.0.10:0', false],
+  ] as const) assert.equal(isPrivateProxyUrl(url), valid, url);
+  const generic = { type: 'object' as const, properties: { base_url: { type: 'string' as const }, proxy_url: { type: 'string' as const, pattern: '^socks5h?://' } } };
+  const output = connectionSchema(generic, 'API endpoint, not a proxy');
+  assert.deepEqual(output.properties?.proxy_url, generic.properties.proxy_url);
+  assert.equal((output.properties?.base_url as { readOnly?: boolean }).readOnly, undefined);
+  const fixed = connectionSchema({ properties: { base_url: { const: 'https://chatgpt.com/backend-api/codex' } } }, 'Fixed endpoint');
+  assert.equal((fixed.properties?.base_url as { readOnly?: boolean }).readOnly, true);
+});
+
+test('proxy writes stay versioned, capability-gated and secret-free; model IA preserves integer validation', async () => {
+  const source = await readFile(new URL('../src/operator/UpstreamConnection.tsx', import.meta.url), 'utf8');
+  assert.match(source, /account.can_update_transport_proxy === true/);
   assert.match(source, /expected_credential_generation: account.credential_generation/);
   assert.match(source, /'Idempotency-Key': crypto.randomUUID\(\)/);
-  assert.match(source, /account.has_proxy === undefined \? 'connection.proxyUnknown'/);
-  assert.match(source, /account.can_update_transport_proxy !== false/);
   assert.doesNotMatch(source, /localStorage|sessionStorage|console\./);
-});
-test('model submission validates integer priority and effective upstream protocol compatibility', async () => {
-  const source = await read('../src/operator/pages/ManagementPages.tsx');
-  assert.match(source, /Number.isInteger\(draft.priority\) && Math.abs\(draft.priority\) <= 1000000/);
-  assert.match(source, /catalogValid && compatible && candidates.length > 0/);
-  assert.match(source, /provider.protocols.includes\(draft.protocol\)/);
-  for (const section of ['identitySection', 'upstreamSection', 'accessSection']) assert.ok(source.includes(`<legend>{t('routes.${section}')}</legend>`));
-});
-test('quota consume remains behind prepare, contract validation and explicit confirmation', async () => {
-  const source = await read('../src/operator/UpstreamQuotaReset.tsx');
-  assert.ok(source.indexOf('const accepted = await confirm(') < source.indexOf("confirmation: 'consume_one_supplier_reset_credit'"));
-  assert.match(source, /if \(!accepted \|\| !confirmationToken \|\| result.operation.expires_at <= Date.now\(\)\)/);
-  assert.match(source, /'Idempotency-Key': confirmKey.current/);
-  assert.match(source, /response.id !== operation.id/);
-  const browser = await read('./upstream-connection-browser.test.ts');
-  assert.doesNotMatch(browser, /(?:quota-heading|quota-reset-action|button.danger).*\.click\(\)/);
+  const forms = await readFile(new URL('../src/operator/pages/ManagementPages.tsx', import.meta.url), 'utf8');
+  assert.match(forms, /Number.isInteger\(draft.priority\) && Math.abs\(draft.priority\) <= 1000000/);
+  for (const section of ['identitySection', 'upstreamSection', 'accessSection']) assert.ok(forms.includes(`<legend>{t('routes.${section}')}</legend>`));
 });

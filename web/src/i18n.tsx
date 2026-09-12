@@ -4,6 +4,12 @@ export type Locale = 'zh-CN' | 'en';
 type Variables = Record<string, string | number>;
 
 const zh = {
+  'connection.identitySection': '1. 上游身份与认证', 'connection.endpointSection': '2. 服务地址与模型配置',
+  'connection.advancedSection': '3. 高级网络与重试策略', 'connection.advancedHint': '按需调整网络范围、请求超时与连接重试。保存配置不会探测上游或刷新额度。',
+  'connection.directEgress': '未配置账号代理 · 使用服务端默认出口', 'connection.proxyFingerprint': '代理标识（脱敏）',
+  'connection.proxyAdminOnly': '仅全局管理员可配置此账号的网络代理。',
+  'connection.genericProxyHint': '通用提供商的账号代理由凭据配置管理，可使用代理主机名；不受 Codex 的私网 IP 限制。',
+  'schema.Runtime retry policy': '运行时重试策略', 'schema.Connect attempts': '连接尝试次数', 'schema.Connect retry delay (ms)': '连接重试间隔（毫秒）', 'schema.Shared probe attempts': '共享探测次数',
   'routes.identitySection': '1. 对外模型名称', 'routes.identityHint': '客户端使用此名称调用模型；它可以与上游模型名称不同。',
   'routes.upstreamSection': '2. 上游来源与模型', 'routes.accessSection': '3. 优先级与访问授权', 'routes.accessHint': '按需选择分组和客户端凭据。保存配置不会发送模型测试请求。', 'routes.priorityHint': '请输入 -1000000 到 1000000 之间的整数。',
   'connection.required': '必填',
@@ -16,8 +22,10 @@ const zh = {
   'connection.remoteDns': '远端 DNS', 'connection.localDns': '本地 DNS',
   'connection.endpointHint': 'Base URL 是上游 API 服务地址，不是网络代理。固定官方地址不可修改；更换网络出口请单独配置网络代理。',
   'connection.editProxy': '配置网络代理', 'connection.proxyUrl': '新的代理地址（不回显）',
-  'connection.proxyHint': 'Codex 仅支持私网 IP 地址的 socks5h:// 代理，在代理端解析 DNS。socks5:// 使用本地 DNS，无法用于 Codex。代理地址及认证信息保存后不会回显；留空不会删除原代理。',
-  'connection.proxyInvalid': '请输入带端口的 socks5h 私网 IP 地址（IPv6 地址需要方括号）。', 'connection.saveProxy': '保存网络代理',
+  'connection.proxyHint': 'Codex 仅支持私网或 Tailnet IP 地址的 socks5h:// 代理，在代理端解析 DNS；省略端口时使用 1080。socks5:// 使用本地 DNS，无法用于 Codex。代理地址及认证信息保存后不会回显；留空不会删除原代理。',
+  'connection.proxyNeedsUpdate': '已存代理需要更新',
+  'connection.reauthorizationProxy': '重新授权复用已保存的代理，不会更换网络出口。代理缺失或无效时，请先由全局管理员配置网络代理。',
+  'connection.proxyInvalid': '请输入 socks5h 私网 IP 或 Tailnet 地址；禁用本机元数据地址。IPv6 需方括号，省略端口时为 1080。', 'connection.saveProxy': '保存网络代理',
   'connection.saveFailed': '代理保存失败。请检查地址、权限或重新载入账号后重试；原配置未在此表单中清除。',
   'connection.saved': '网络代理已保存。保存不会自动探测或刷新上游。',
   'quota.refreshFailedRetained': '刷新失败，下方保留上次读取结果，不代表当前额度。可再次手动刷新。',
@@ -424,6 +432,12 @@ const zh = {
 } as const;
 
 const en = {
+  'connection.identitySection': '1. Upstream identity and authentication', 'connection.endpointSection': '2. Service endpoint and model configuration',
+  'connection.advancedSection': '3. Advanced network and retry policy', 'connection.advancedHint': 'Adjust network scope, request timeout and connection retries when needed. Saving does not probe the upstream or refresh quota.',
+  'connection.directEgress': 'No account proxy · server default egress', 'connection.proxyFingerprint': 'Proxy identifier (redacted)',
+  'connection.proxyAdminOnly': 'Only a global administrator can configure this account proxy.',
+  'connection.genericProxyHint': 'Generic provider proxies are managed with credentials and may use hostnames; the Codex private-IP restriction does not apply.',
+  'schema.Runtime retry policy': 'Runtime retry policy', 'schema.Connect attempts': 'Connect attempts', 'schema.Connect retry delay (ms)': 'Connect retry delay (ms)', 'schema.Shared probe attempts': 'Shared probe attempts',
   'routes.identitySection': '1. Public model name', 'routes.identityHint': 'Clients use this name. It may differ from the upstream model name.',
   'routes.upstreamSection': '2. Upstream sources and model', 'routes.accessSection': '3. Priority and access', 'routes.accessHint': 'Choose groups and client credentials as needed. Saving does not send a model test request.', 'routes.priorityHint': 'Enter an integer from -1000000 to 1000000.',
   'connection.required': 'Required',
@@ -436,8 +450,10 @@ const en = {
   'connection.remoteDns': 'Remote DNS', 'connection.localDns': 'Local DNS',
   'connection.endpointHint': 'Base URL is the upstream API endpoint, not a network proxy. Fixed official endpoints cannot be changed; configure network egress separately below.',
   'connection.editProxy': 'Configure network proxy', 'connection.proxyUrl': 'New proxy URL (never displayed after saving)',
-  'connection.proxyHint': 'Codex requires socks5h:// with a private IP address and port, resolving DNS at the proxy. socks5:// uses local DNS and cannot be used for Codex. Saved addresses and credentials are not returned. Leaving this blank does not remove the existing proxy.',
-  'connection.proxyInvalid': 'Enter a socks5h private IP address with a port (brackets are required for IPv6).', 'connection.saveProxy': 'Save network proxy',
+  'connection.proxyHint': 'Codex requires socks5h:// with a private or Tailnet IP address, resolving DNS at the proxy; the default port is 1080. socks5:// uses local DNS and cannot be used for Codex. Saved addresses and credentials are not returned. Leaving this blank does not remove the existing proxy.',
+  'connection.proxyNeedsUpdate': 'Stored proxy requires update',
+  'connection.reauthorizationProxy': 'Reauthorization reuses the saved proxy without changing network egress. If it is missing or invalid, ask a global administrator to configure the network proxy first.',
+  'connection.proxyInvalid': 'Enter a socks5h private IP or Tailnet address, excluding local metadata. Bracket IPv6; the default port is 1080.', 'connection.saveProxy': 'Save network proxy',
   'connection.saveFailed': 'Proxy could not be saved. Check the address and permissions, or reload the account and retry. This form has not cleared the existing configuration.',
   'connection.saved': 'Network proxy saved. Saving does not automatically probe or refresh the upstream.',
   'quota.refreshFailedRetained': 'Refresh failed. The previous result remains below and may not reflect current quota. Retry manually.',

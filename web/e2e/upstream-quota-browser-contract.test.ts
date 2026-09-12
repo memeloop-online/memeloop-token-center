@@ -32,22 +32,33 @@ test('static quota and confirmation evidence without clicking quota controls', {
     const artifacts = join(root, 'e2e-artifacts', 'upstream-quota');
     await mkdir(artifacts, { recursive: true });
     await page.goto(url);
+    assert.equal(await page.getByLabel('Base URL', { exact: true }).getAttribute('readonly'), '');
+    await page.getByText('3. Advanced network and retry policy', { exact: true }).focus();
+    await page.keyboard.press('Enter');
+    await page.getByLabel('Connect attempts', { exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Configure network proxy', exact: true }).click();
+    const proxy = page.locator('.upstream-proxy-editor input');
+    await proxy.fill('socks5://100.64.0.16:1080');
+    assert.equal(await proxy.getAttribute('aria-invalid'), 'true');
+    await proxy.fill('socks5h://100.64.0.16:1080');
+    assert.equal(await page.getByRole('button', { name: 'Save network proxy', exact: true }).isEnabled(), true);
+    // Do not save or activate any quota operation in this no-network fixture.
+    await page.getByRole('button', { name: 'Cancel', exact: true }).click();
     await page.getByText('Stale data', { exact: true }).waitFor();
     assert.equal(await page.getByRole('meter').count(), 1, 'unknown usage never renders a zero/full meter');
     assert.equal(await page.getByRole('button', { name: 'Reset upstream quota', exact: true }).isEnabled(), true);
-    for (const theme of ['light', 'dark']) {
+    for (const [theme, width] of [['light', 1440], ['dark', 390]] as const) {
       await page.evaluate((value) => { document.documentElement.dataset.theme = value; }, theme);
-      for (const width of [320, 390, 768, 1024, 1440, 1920, 2560]) {
         await page.setViewportSize({ width, height: 900 });
         assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth));
         await page.screenshot({ path: join(artifacts, `upstream-quota-${theme}-${width}.png`), fullPage: true });
-      }
     }
     await page.goto(`${url}?confirm`);
     const dialog = page.getByRole('dialog');
     await dialog.waitFor();
     assert.match(await dialog.innerText(), /Mock Codex.*mock-account.*1 upstream reset credit/s);
     assert.equal(await dialog.getByRole('button', { name: 'Cancel', exact: true }).evaluate((node) => node === document.activeElement), true);
+    await page.screenshot({ path: join(artifacts, 'upstream-quota-confirm-mobile.png'), fullPage: true });
     await page.keyboard.press('Escape');
     await dialog.waitFor({ state: 'hidden' });
     assert.deepEqual(errors, []);

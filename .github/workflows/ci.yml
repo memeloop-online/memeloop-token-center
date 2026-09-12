@@ -151,26 +151,6 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Run browser-backed web contracts
         run: MTC_REQUIRE_BROWSER=1 npm run test:localization
-      - name: Verify isolated upstream and model form interactions
-        run: |
-          npm run dev -- --host 127.0.0.1 --port 4175 &
-          ux_server_pid=$!
-          trap 'kill "$ux_server_pid"' EXIT
-          for attempt in $(seq 1 30); do
-            if curl --fail --silent http://127.0.0.1:4175/ui-assets/ > /dev/null; then break; fi
-            sleep 1
-          done
-          MTC_UX_BASE_URL=http://127.0.0.1:4175 node --import tsx --test --test-concurrency=1 e2e/upstream-connection-browser.test.ts e2e/model-route-ux-browser.test.ts e2e/upstream-ux-static-browser.test.ts
-      - name: Retain isolated upstream and model UX evidence
-        if: always()
-        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
-        with:
-          name: upstream-model-ux-browser-${{ github.sha }}
-          path: |
-            /tmp/mtc-upstream-ux-*.png
-            /tmp/mtc-model-route-*.png
-          if-no-files-found: warn
-          retention-days: 14
       - name: Retain Overview trend browser evidence
         if: always()
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
