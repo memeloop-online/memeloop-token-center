@@ -66,6 +66,13 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   const [driver, setDriver] = useState('');
   const [rotating, setRotating] = useState<UpstreamAccount>();
   const [editing, setEditing] = useState<UpstreamAccount>();
+  const providerList = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (!editing) return;
+    const editor = providerList.current?.querySelector<HTMLElement>('.inline-editor');
+    editor?.scrollIntoView({ block: 'start' });
+    editor?.querySelector<HTMLInputElement>('input:not([type="hidden"]):not([disabled])')?.focus({ preventScroll: true });
+  }, [editing?.id]);
   const [reauthorizing, setReauthorizing] = useState<UpstreamAccount>();
   const [busy, setBusy] = useState('');
   const [health, setHealth] = useState<Record<string, UpstreamHealth>>({});
@@ -111,6 +118,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   } as RJSFSchema, locale) : undefined, [editing, editProvider, locale]);
   const uiSchema = {
     driver: { 'ui:widget': 'hidden' },
+    credential: { type: { 'ui:widget': 'hidden' } },
     config: {
       oauth: { 'ui:widget': 'hidden' },
       ...(provider?.id === 'comfyui' ? {
@@ -208,7 +216,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   }
 
   return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} /><section className="provider-layout">
-    <article className="panel provider-list"><div className="panel-title"><div><h2>{t('providers.title')}</h2><p className="muted">{t('providers.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>
+    <article ref={providerList} className="panel provider-list"><div className="panel-title"><div><h2>{t('providers.title')}</h2><p className="muted">{t('providers.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>
       {error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{availabilityError && <div className="notice error" role="alert">{availabilityError}</div>}{message && <div className="notice success" role="status">{message}</div>}
       <div className="account-list">{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('status.active')} empty={t('providers.empty')} />}{statusFilter.values.map((value) => {
         const providerAvailable = providers.some((provider) => provider.id === value.driver);

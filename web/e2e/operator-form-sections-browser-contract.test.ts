@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
@@ -19,7 +19,7 @@ test('advanced validation remains discoverable without losing field values or mo
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-form-sections.html`);
     const timeout = page.getByRole('spinbutton', { name: 'Timeout seconds' });
-    const advanced = page.locator('.operator-form-advanced');
+    const advanced = page.locator('.operator-form-advanced').filter({ hasText: 'Advanced network' });
     await page.getByLabel('Connection name').waitFor();
     assert.equal(await advanced.getAttribute('open'), null);
     await page.getByRole('button', { name: 'Save fixture' }).click();
@@ -30,10 +30,26 @@ test('advanced validation remains discoverable without losing field values or mo
     await timeout.waitFor({ state: 'hidden' });
     await page.keyboard.press('Enter');
     assert.equal(await timeout.inputValue(), '30');
+    // Optional capabilities collapse, but adapter-required and unknown plugin
+    // fields are never silently hidden. Disclosure retains entered values.
+    await page.getByLabel('Required video interface').waitFor({ state: 'visible' });
+    await page.getByLabel('Plugin extension').waitFor({ state: 'visible' });
+    const capabilities = page.locator('.operator-form-advanced').filter({ hasText: 'Optional capabilities' });
+    assert.equal(await capabilities.getAttribute('open'), null);
+    await capabilities.locator('summary').focus();
+    await page.keyboard.press('Enter');
+    await page.getByLabel('Image model').fill('image-example');
+    await capabilities.locator('summary').click();
+    await page.getByLabel('Image model').waitFor({ state: 'hidden' });
+    await capabilities.locator('summary').click();
+    assert.equal(await page.getByLabel('Image model').inputValue(), 'image-example');
     for (const theme of ['light', 'dark']) {
       await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
       assert.equal(await page.getByLabel('Connection name').evaluate(element => getComputedStyle(element).fontSize), '16px');
+      const artifacts = 'e2e-artifacts/upstream-availability';
+      mkdirSync(artifacts, { recursive: true });
+      await page.screenshot({ path: `${artifacts}/provider-form-${theme}-mobile.png`, fullPage: true });
     }
   } finally { await browser.close(); await server.close(); }
 });
