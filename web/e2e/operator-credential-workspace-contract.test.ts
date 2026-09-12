@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,6 +21,7 @@ declare global {
         credentials?: RequestCredentials;
         referrerPolicy?: ReferrerPolicy;
         hasSignal: boolean;
+        body?: string;
       }>;
       releaseIssue: (token: string) => void;
       releaseCredentialScopeA: () => void;
@@ -183,6 +184,80 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     await aba.waitForFunction(() => window.credentialFixture.requests.filter((request) => request.method === 'POST' && request.path === '/internal/v1/service-tokens').length === 2);
     await aba.evaluate(() => window.credentialFixture.releaseIssue('mts_service_secret_current'));
     await aba.getByText('mts_service_secret_current', { exact: true }).waitFor();
+
+    // Exercise the actual page and shipped schemas on this same server. Each
+    // locale creates and edits a different mode, covering both payload values
+    // in both endpoints without a second synthetic component/server fixture.
+    for (const locale of ['en', 'zh-CN'] as const) {
+      const client = await browser.newPage({ viewport: { width: 390, height: 844 } });
+      client.setDefaultTimeout(5_000);
+      await client.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
+      await client.goto(fixture('client-form'));
+      const english = locale === 'en';
+      const modeLabel = english ? 'Metering and limit mode' : '计量与限额模式';
+      await client.getByText('Editable client', { exact: true }).waitFor();
+      await client.getByRole('button', { name: english ? 'Policy and limits' : '权限与限流', exact: true }).click();
+      const edit = client.locator('.inline-editor.form-panel');
+      const editMode = edit.getByRole('combobox', { name: modeLabel, exact: true });
+      await edit.locator('#root_max_concurrency').focus();
+      await client.keyboard.press('Tab');
+      assert.equal(await editMode.evaluate(element => document.activeElement === element), true);
+      const editedMode = english ? 'metered_unlimited' : 'prepaid';
+      await editMode.selectOption(editedMode);
+      await edit.getByRole('button', { name: english ? 'Save' : '保存', exact: true }).click();
+      await nextPaint(client);
+      assert.deepEqual(await edit.locator('.schema-errors').allTextContents(), [], 'valid policy must submit without schema validation errors');
+      await client.waitForFunction(() => window.credentialFixture.requests.some(request => request.method === 'PUT' && request.path.endsWith('/key-form/policy')));
+      const policyRequest = await client.evaluate(() => window.credentialFixture.requests.find(request => request.method === 'PUT' && request.path.endsWith('/key-form/policy'))!);
+      assert.equal(JSON.parse(policyRequest.body!).enforcement_mode, editedMode);
+      assert.equal(JSON.parse(policyRequest.body!).daily_budget, null);
+
+      const create = client.locator('details.create-resource');
+      await create.locator(':scope > summary').click();
+      const routes = create.getByRole('combobox', { name: english ? 'Specific routes' : '具体路由', exact: true });
+      const groups = create.getByRole('combobox', { name: english ? 'Route groups' : '路由组', exact: true });
+      await routes.fill('Research model');
+      await routes.press('ArrowDown');
+      await routes.press('Enter');
+      await routes.press('Escape');
+      await groups.fill('Research group');
+      await groups.press('ArrowDown');
+      await groups.press('Enter');
+      await groups.press('Escape');
+      assert.equal(await create.locator('.schema-array').count(), 0, 'routing IDs have one named control each');
+      assert.equal(await create.getByText('Unsupported field schema', { exact: false }).count(), 0);
+      await create.locator('#root_principal_external_id').fill('fixture-principal');
+      await create.locator('#root_alias').fill('Created client');
+      const createMode = create.getByRole('combobox', { name: modeLabel, exact: true });
+      await create.locator('#root_policy_max_concurrency').focus();
+      await client.keyboard.press('Tab');
+      assert.equal(await createMode.evaluate(element => document.activeElement === element), true);
+      await client.keyboard.press('Shift+Tab');
+      assert.equal(await create.locator('#root_policy_max_concurrency').evaluate(element => document.activeElement === element), true);
+      const createdMode = english ? 'prepaid' : 'metered_unlimited';
+      await createMode.selectOption(createdMode);
+      for (const theme of ['light', 'dark']) {
+        await client.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
+        assert.equal(await client.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+        assert.equal(await createMode.evaluate(element => getComputedStyle(element).fontSize), '16px');
+      }
+      const artifacts = fileURLToPath(new URL('../e2e-artifacts/upstream-availability', import.meta.url));
+      mkdirSync(artifacts, { recursive: true });
+      await create.screenshot({ path: `${artifacts}/credential-workspace-${locale}-mobile.png` });
+      await create.locator('button[type="submit"]').click();
+      await client.getByText('mts_fixture_created', { exact: true }).waitFor();
+      const createRequests = await client.evaluate(() => window.credentialFixture.requests.filter(request => request.method === 'POST' && request.path === '/internal/v1/keys'));
+      assert.equal(createRequests.length, 1);
+      const body = JSON.parse(createRequests[0].body!);
+      assert.equal(body.tenant_external_id, 'tenant-a');
+      assert.equal(body.principal_external_id, 'fixture-principal');
+      assert.equal(body.alias, 'Created client');
+      assert.equal(body.policy.enforcement_mode, createdMode);
+      assert.deepEqual(body.route_ids, ['00000000-0000-4000-8000-000000000001']);
+      assert.deepEqual(body.route_group_ids, ['00000000-0000-4000-8000-000000000002']);
+      assert.equal('route_ids' in body.policy || 'route_group_ids' in body.policy, false);
+      await client.close();
+    }
   } finally {
     await browser.close();
     await server.close();

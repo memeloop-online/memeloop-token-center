@@ -47,6 +47,7 @@ test('Upstream availability shows complete account facts separately from routing
   try {
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await page.clock.setFixedTime(new Date('2026-09-09T12:00:00Z'));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/upstream-availability.html`);
     await page.getByText('Recent availability', { exact: true }).first().waitFor();
     assert.equal(await page.locator('.provider-recent-attempts > li').count(), 5, 'the component must retain only the five latest routed terminal attempts across the account models');

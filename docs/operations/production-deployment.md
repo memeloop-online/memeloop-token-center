@@ -155,9 +155,11 @@ See [disaster recovery](disaster-recovery.md) and
 
 ## Observability and release evidence
 
-The optional ServiceMonitor is disabled by default. The control role exposes
-`/metrics` only to a service credential with `metrics:read`. Gateway and worker
-roles do not register it. The handler emits Prometheus text format 0.0.4 and
+The optional ServiceMonitor is disabled by default. Gateway, control and all
+roles expose `/metrics` only to a service credential with `metrics:read`; the
+worker role does not register it. The monitor selects all gateway and control/all
+Services so each pod's process-local failover and health counters are scraped.
+The handler emits Prometheus text format 0.0.4 and
 sets `Cache-Control: no-store`; a scrape performs bounded `/proc/self` reads,
 advances the jemalloc statistics epoch and performs one bounded database
 aggregate query. It does not enumerate tenants, credentials, models, URLs,

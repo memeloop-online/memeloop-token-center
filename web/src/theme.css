@@ -2,6 +2,12 @@
   color-scheme: dark;
 }
 
+/* Shared links and keyboard rings must remain distinct on pale surfaces. */
+:root[data-theme='light'] .table-link { color: #08796e; }
+:root[data-theme='light'] :is(button, .button, input, select, textarea, summary):focus-visible {
+  outline-color: #08796e;
+}
+
 .theme-toggle {
   width: 36px;
   height: 36px;

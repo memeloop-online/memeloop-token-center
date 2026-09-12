@@ -7,6 +7,7 @@ import test from 'node:test';
 
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
+import { fixtureAssets } from './support/fixture-assets.js';
 
 declare global {
   interface Window {
@@ -47,7 +48,7 @@ test('Overview keeps current sections visible through independent endpoint failu
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for the Overview browser gate');
     return test.skip('a local Chromium runtime is required for Overview layout assertions');
   }
-  const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0, strictPort: false } });
+  const server = await createServer({ root: webRoot, configFile: false, plugins: [fixtureAssets()], logLevel: 'silent', server: { host: '127.0.0.1', port: 0, strictPort: false } });
   await server.listen();
   const address = server.httpServer?.address();
   assert.ok(address && typeof address !== 'string');

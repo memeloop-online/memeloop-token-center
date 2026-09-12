@@ -123,7 +123,7 @@ paths:
       operationId: getPrometheusMetrics
       summary: Export bounded-cardinality operational metrics
       description: |
-        Registered only by the control/all role. Labels are restricted to controlled
+        Registered by gateway, control and all roles. Labels are restricted to controlled
         methods, matched route templates, status classes, providers, operations,
         dependencies, pool states, and generation states. Tenant, credential, model,
         URL, resource ID, and error-text labels are deliberately excluded.

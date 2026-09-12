@@ -44,6 +44,11 @@ test("source directory is combined in stable relative path order", () => {
 test("comments are ignored and control guard is classified", () => {
   const routes = sourceRoutes(sourceWith()); assert.ok(!routes.some((route) => route.path === "/ghost")); assert.equal(routes.find((route) => route.path === "/metrics")?.source_role, "control"); assert.equal(routes.length, 4);
 });
+test("gateway metrics guard excludes worker and preserves control classification", () => {
+  const routes = sourceRoutes(sourceWith("", "", 'if matches!(role, RuntimeRole::Gateway | RuntimeRole::Control | RuntimeRole::All) { application = application.route("/gateway-metrics", get(metrics)); }'));
+  assert.equal(routes.find((route) => route.path === "/gateway-metrics")?.source_role, "observability");
+  assert.equal(routes.find((route) => route.path === "/metrics")?.source_role, "control");
+});
 test("route_service fails closed", () => assert.throws(() => sourceRoutes(sourceWith("", '.route_service("/opaque", service)')), /route_service/u));
 test("handler comments do not add methods", () => assert.deepEqual(sourceRoutes(sourceWith("", '.route("/v1/comment", post(handler) \/\* get(fake) \*\/)')).filter((route) => route.path === "/v1/comment").map((route) => route.method), ["post"]));
 test("fallback fails closed", () => assert.throws(() => sourceRoutes(sourceWith("", ".fallback(handler)")), /fallback/u));
