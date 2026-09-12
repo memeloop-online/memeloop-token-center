@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Plugin UI projection v1",
+  "description": "Server-authorized display data, not an executable UI extension. Exact link origin authorization is an additional server policy check.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "plugin_id", "slot_id", "components"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "plugin_id": { "$ref": "#/$defs/shortText" },
+    "slot_id": { "$ref": "#/$defs/shortText" },
+    "components": { "type": "array", "maxItems": 32, "items": { "oneOf": [
+      { "type": "object", "additionalProperties": false, "required": ["kind", "text"], "properties": { "kind": { "const": "text" }, "text": { "$ref": "#/$defs/longText" } } },
+      { "type": "object", "additionalProperties": false, "required": ["kind", "label", "value"], "properties": { "kind": { "const": "metric" }, "label": { "$ref": "#/$defs/shortText" }, "value": { "$ref": "#/$defs/shortText" } } },
+      { "type": "object", "additionalProperties": false, "required": ["kind", "label", "state"], "properties": { "kind": { "const": "status" }, "label": { "$ref": "#/$defs/shortText" }, "state": { "enum": ["ok", "warning", "error", "unknown"] } } },
+      { "type": "object", "additionalProperties": false, "required": ["kind", "label", "href"], "properties": { "kind": { "const": "link" }, "label": { "$ref": "#/$defs/shortText" }, "href": { "type": "string", "maxLength": 2048, "pattern": "^https://[^\\s\\\\]+$" } } }
+    ] } }
+  },
+  "$defs": {
+    "shortText": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\\u0000-\\u001f\\u007f\\u202a-\\u202e\\u2066-\\u2069]+$" },
+    "longText": { "type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^[^\\u0000-\\u001f\\u007f\\u202a-\\u202e\\u2066-\\u2069]+$" }
+  }
+}

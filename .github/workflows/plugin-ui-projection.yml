@@ -1,0 +1,48 @@
+name: Plugin UI projection
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/plugin-ui-projection.yml'
+      - 'schemas/plugin-ui-projection.schema.json'
+      - 'web/src/plugins/**'
+      - 'web/e2e/plugin-ui-*-contract.test.ts'
+      - 'web/e2e/fixtures/plugin-ui-slot.*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugin-ui-projection-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  browser-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci --no-audit
+      - run: npm run typecheck
+      - run: npx playwright install --with-deps chromium
+      - name: Check isolated projection and browser contracts
+        run: MTC_REQUIRE_BROWSER=1 node --import tsx --test e2e/plugin-ui-projection-contract.test.ts e2e/plugin-ui-slot-browser-contract.test.ts
+      - name: Retain synthetic mobile theme evidence
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: plugin-ui-slots-${{ github.sha }}
+          path: web/e2e-artifacts/plugin-ui-slots/
+          if-no-files-found: warn
+          retention-days: 14
