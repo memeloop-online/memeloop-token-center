@@ -20,10 +20,7 @@ use crate::{
     AppState,
     db::unix_millis,
     error::AppError,
-    filter_ast::{
-        TypedFilterAst, TypedFilterCondition, TypedFilterField, TypedFilterLogicalOperator,
-        TypedFilterOperator, TypedFilterValue,
-    },
+    filter_ast::TypedFilterAst,
     model::{AuthenticatedService, RequestListCursor, RequestListResponse},
 };
 
@@ -289,6 +286,8 @@ pub(super) struct FilterAssistantSettings {
     /// The only persisted execution reference.  The associated upstream
     /// credential remains encrypted and is never serialized by this API.
     pub model_route_id: Uuid,
+    #[serde(default)]
+    pub billing_key_id: Option<Uuid>,
     pub updated_at: i64,
 }
 
@@ -300,9 +299,46 @@ pub(super) struct FilterAssistantSettingsQuery {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct FilterAssistantBillingQuery {
+    tenant_external_id: Option<String>,
+    model_route_id: Uuid,
+}
+
+pub(super) async fn filter_assistant_billing_choices(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<FilterAssistantBillingQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "keys:read").await?;
+    let tenant = required_filter_tenant(&service, query.tenant_external_id)?;
+    state
+        .db
+        .filter_assistant_route(&tenant, query.model_route_id)
+        .await?;
+    let keys = state
+        .db
+        .list_managed_keys_page(Some(&tenant), None, None, 100, None)
+        .await?;
+    let mut choices = Vec::new();
+    for key in keys {
+        if key.status == "active"
+            && assistant_execution_context(&state, &tenant, query.model_route_id, key.key_id)
+                .await
+                .is_ok()
+        {
+            choices.push(json!({"key_id": key.key_id, "alias": key.alias, "principal": key.principal_external_id}));
+        }
+    }
+    Ok(Json(choices))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct PutFilterAssistantSettingsBody {
     tenant_external_id: Option<String>,
     model_route_id: Uuid,
+    billing_key_id: Uuid,
+    expected_updated_at: Option<i64>,
 }
 
 pub(super) async fn get_filter_assistant_settings(
@@ -325,15 +361,47 @@ pub(super) async fn put_filter_assistant_settings(
     // consume it but cannot redirect it to another model route.
     require_global_service(&service)?;
     let tenant = required_filter_tenant(&service, body.tenant_external_id)?;
-    state
-        .db
-        .require_enabled_model_route(&tenant, body.model_route_id)
-        .await?;
+    require_service(&headers, &state, "keys:write").await?;
+    let previous = load_filter_assistant_settings(&state, &tenant).await?;
+    if previous.as_ref().map(|value| value.updated_at) != body.expected_updated_at {
+        return Err(AppError::Conflict(
+            "filter assistant settings changed; reload before saving".into(),
+        ));
+    }
+    assistant_execution_context(&state, &tenant, body.model_route_id, body.billing_key_id).await?;
     let settings = FilterAssistantSettings {
         model_route_id: body.model_route_id,
-        updated_at: unix_millis(),
+        billing_key_id: Some(body.billing_key_id),
+        updated_at: unix_millis().max(body.expected_updated_at.unwrap_or(0).saturating_add(1)),
     };
-    store_filter_assistant_settings(&state, &tenant, &settings).await?;
+    let storage_key = filter_assistant_settings_storage_key(&tenant);
+    let expected = state
+        .db
+        .plugin_kv_get(TYPED_FILTER_KV_NAMESPACE, &storage_key)
+        .await?;
+    // Match the exact stored generation as well as its timestamp.
+    if expected
+        .as_deref()
+        .map(serde_json::from_slice::<FilterAssistantSettings>)
+        .transpose()
+        .map_err(|_| AppError::Internal)?
+        .map(|value| value.updated_at)
+        != body.expected_updated_at
+    {
+        return Err(AppError::Conflict(
+            "filter assistant settings changed; reload before saving".into(),
+        ));
+    }
+    let value = serde_json::to_vec(&settings).map_err(|_| AppError::Internal)?;
+    state
+        .db
+        .replace_filter_assistant_settings(
+            &storage_key,
+            expected.as_deref(),
+            &value,
+            service.service_id,
+        )
+        .await?;
     Ok(Json(Some(settings)))
 }
 
@@ -361,14 +429,20 @@ pub(super) async fn plan_filter_with_assistant(
     let settings = load_filter_assistant_settings(&state, &tenant)
         .await?
         .ok_or_else(|| AppError::BadRequest("filter assistant is not configured".into()))?;
-    // Revalidate on every plan: a disabled/deleted route cannot continue to
-    // authorize an assistant merely because an older setting pointed at it.
-    state
-        .db
-        .require_enabled_model_route(&tenant, settings.model_route_id)
-        .await?;
-    let ast = constrained_assistant_plan(&body.prompt);
-    ast.validate()?;
+    let billing_key_id = settings.billing_key_id.ok_or_else(|| AppError::BadRequest("filter assistant model execution is not enabled; configure a billing credential in System settings".into()))?;
+    let (key, model, protocol) =
+        assistant_execution_context(&state, &tenant, settings.model_route_id, billing_key_id)
+            .await?;
+    tracing::info!(actor_service_id = ?service.service_id, %billing_key_id, model_route_id = %settings.model_route_id, "filter assistant model execution admitted");
+    let ast = super::filter_assistant::execute(
+        state,
+        key,
+        settings.model_route_id,
+        &model,
+        &protocol,
+        &body.prompt,
+    )
+    .await?;
     Ok(Json(FilterAssistantPlan {
         model_route_id: settings.model_route_id,
         ast,
@@ -438,20 +512,47 @@ async fn load_filter_assistant_settings(
         .map_err(|_| AppError::Internal)
 }
 
-async fn store_filter_assistant_settings(
+async fn assistant_execution_context(
     state: &AppState,
     tenant: &str,
-    settings: &FilterAssistantSettings,
-) -> Result<(), AppError> {
-    let value = serde_json::to_vec(settings).map_err(|_| AppError::Internal)?;
-    state
+    route_id: Uuid,
+    billing_key_id: Uuid,
+) -> Result<(crate::model::AuthenticatedKey, String, String), AppError> {
+    let (model, protocol) = state.db.filter_assistant_route(tenant, route_id).await?;
+    let key = state
         .db
-        .plugin_kv_put(
-            TYPED_FILTER_KV_NAMESPACE,
-            &filter_assistant_settings_storage_key(tenant),
-            &value,
+        .filter_assistant_identity(tenant, billing_key_id)
+        .await?;
+    let candidates = state
+        .db
+        .list_authorized_upstream_candidates_with_hint(
+            key.key_id,
+            key.tenant_id,
+            &model,
+            &protocol,
+            crate::db::RouteSelectionOptions {
+                upstream_account_hint: None,
+                selection_seed: Uuid::now_v7(),
+            },
         )
-        .await
+        .await?;
+    if !candidates.iter().any(|candidate| {
+        candidate.route_id == route_id
+            && state
+                .providers
+                .get(&candidate.driver)
+                .is_some_and(|provider| {
+                    provider
+                        .modalities
+                        .iter()
+                        .any(|modality| modality == "text")
+                })
+    }) {
+        return Err(AppError::BadRequest(
+            "billing credential has no available text account on the selected route".into(),
+        ));
+    }
+    Ok((key, model, protocol))
 }
 
 fn filter_preset_storage_key(service: &AuthenticatedService, tenant: Option<&str>) -> String {
@@ -494,79 +595,6 @@ fn validate_assistant_prompt(prompt: &str) -> Result<(), AppError> {
         )));
     }
     Ok(())
-}
-
-/// The assistant boundary deliberately emits only the same AST accepted by the
-/// request endpoint.  It cannot return SQL, a table name, an arbitrary JSON
-/// expression, or an executable tool call.  The configured model route is a
-/// policy reference; this conservative planner is also a safe fallback while
-/// a route is synchronizing and provides a deterministic preview contract.
-fn constrained_assistant_plan(prompt: &str) -> TypedFilterAst {
-    let normalized = prompt.to_lowercase();
-    let now = unix_millis();
-    let window = if normalized.contains("30 day")
-        || normalized.contains("30d")
-        || prompt.contains("30 天")
-    {
-        30 * 86_400_000
-    } else if normalized.contains("7 day") || normalized.contains("7d") || prompt.contains("7 天")
-    {
-        7 * 86_400_000
-    } else {
-        86_400_000
-    };
-    let mut conditions = vec![TypedFilterCondition {
-        field: TypedFilterField::CreatedAt,
-        operator: TypedFilterOperator::Between,
-        value: TypedFilterValue::Timestamp(now.saturating_sub(window)),
-        upper: Some(TypedFilterValue::Timestamp(now)),
-    }];
-    if normalized.contains("error")
-        || normalized.contains("fail")
-        || prompt.contains("失败")
-        || prompt.contains("错误")
-    {
-        conditions.push(TypedFilterCondition {
-            field: TypedFilterField::Status,
-            operator: TypedFilterOperator::Equals,
-            value: TypedFilterValue::Status("error".into()),
-            upper: None,
-        });
-    } else if normalized.contains("success") || prompt.contains("成功") {
-        conditions.push(TypedFilterCondition {
-            field: TypedFilterField::Status,
-            operator: TypedFilterOperator::Equals,
-            value: TypedFilterValue::Status("success".into()),
-            upper: None,
-        });
-    }
-    if normalized.contains("slow")
-        || normalized.contains("latency")
-        || prompt.contains("慢")
-        || prompt.contains("延迟")
-    {
-        conditions.push(TypedFilterCondition {
-            field: TypedFilterField::DurationMs,
-            operator: TypedFilterOperator::GreaterThan,
-            value: TypedFilterValue::Integer(1_000),
-            upper: None,
-        });
-    }
-    for protocol in ["openai-image", "anthropic", "openai", "generation"] {
-        if normalized.contains(protocol) {
-            conditions.push(TypedFilterCondition {
-                field: TypedFilterField::Protocol,
-                operator: TypedFilterOperator::Equals,
-                value: TypedFilterValue::Protocol(protocol.into()),
-                upper: None,
-            });
-            break;
-        }
-    }
-    TypedFilterAst {
-        logical_operator: TypedFilterLogicalOperator::And,
-        conditions,
-    }
 }
 
 pub(super) async fn internal_request_detail(

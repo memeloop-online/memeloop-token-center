@@ -627,10 +627,23 @@ pub(super) async fn proxy(
     body: Bytes,
     protocol: Protocol,
 ) -> Result<Response, AppError> {
+    let key = authenticate_downstream(&headers, &state).await?;
+    proxy_with_identity(state, headers, body, protocol, key, None).await
+}
+
+/// Internal callers must establish an explicit billing identity. A pinned route
+/// narrows normal grants; it never grants access or falls back to another route.
+pub(in crate::api) async fn proxy_with_identity(
+    state: AppState,
+    headers: HeaderMap,
+    body: Bytes,
+    protocol: Protocol,
+    key: AuthenticatedKey,
+    pinned_route: Option<Uuid>,
+) -> Result<Response, AppError> {
     let _request_buffer = state
         .metrics
         .memory_usage(crate::metrics::MemoryComponent::RequestBuffer, body.len());
-    let key = authenticate_downstream(&headers, &state).await?;
     let proxy_lifecycle_permit = state
         .proxy_lifecycle_permits
         .clone()
@@ -650,7 +663,7 @@ pub(super) async fn proxy(
     let request_json = applied.request_json;
     let model = applied.model;
     let selection_seed = routing_selection_seed(&key, request_id, &conversation_hints);
-    let candidates = state
+    let mut candidates = state
         .db
         .list_authorized_upstream_candidates_with_hint(
             key.key_id,
@@ -663,6 +676,23 @@ pub(super) async fn proxy(
             },
         )
         .await?;
+    if let Some(route_id) = pinned_route {
+        candidates.retain(|candidate| {
+            candidate.route_id == route_id
+                && state
+                    .providers
+                    .get(&candidate.driver)
+                    .is_some_and(|provider| {
+                        provider
+                            .modalities
+                            .iter()
+                            .any(|modality| modality == "text")
+                    })
+        });
+        if candidates.is_empty() {
+            return Err(AppError::Forbidden);
+        }
+    }
     let request_context = ProxyRequestContext {
         state: &state,
         key: &key,

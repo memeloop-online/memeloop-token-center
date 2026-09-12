@@ -54,6 +54,10 @@ export function SystemSettingsPage({ token, tenant }: { token: string; tenant: s
   const [groups, setGroups] = useState<GroupView[]>([]);
   const [settings, setSettings] = useState<FilterAssistantSettings | null>();
   const [selectedRouteId, setSelectedRouteId] = useState('');
+  const [billingChoices, setBillingChoices] = useState<{ key_id: string; alias: string; principal: string }[]>([]);
+  const [selectedBillingId, setSelectedBillingId] = useState('');
+  const [billingLoading, setBillingLoading] = useState(false);
+  const [billingError, setBillingError] = useState('');
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -76,8 +80,9 @@ export function SystemSettingsPage({ token, tenant }: { token: string; tenant: s
         api<GroupView[]>(`/internal/v1/provider-groups${queryForTenant(tenant)}`, token),
       ]);
       if (request !== loadSequence.current) return;
-      const enabled = nextRoutes.filter((route) => route.enabled);
+      const enabled = nextRoutes.filter((route) => route.enabled && ['openai', 'anthropic'].includes(route.protocol));
       setRoutes(enabled); setSettings(nextSettings); setSelectedRouteId(nextSettings?.model_route_id ?? '');
+      setSelectedBillingId(nextSettings?.billing_key_id ?? '');
       setUpstreams(nextUpstreams); setGroups(nextGroups);
     } catch (reason) {
       if (request !== loadSequence.current) return;
@@ -94,12 +99,24 @@ export function SystemSettingsPage({ token, tenant }: { token: string; tenant: s
     return () => { loadSequence.current += 1; };
   }, [load]);
 
+  useEffect(() => {
+    let active = true;
+    setBillingChoices([]); setBillingError('');
+    if (!token || !tenant || !selectedRouteId) { setBillingLoading(false); return; }
+    setBillingLoading(true);
+    void api<{ key_id: string; alias: string; principal: string }[]>(`/internal/v1/filter-assistant/billing-choices?tenant_external_id=${encodeURIComponent(tenant)}&model_route_id=${encodeURIComponent(selectedRouteId)}`, token)
+      .then((choices) => { if (active) setBillingChoices(choices); })
+      .catch((reason) => { if (active) setBillingError(messageOf(reason, t('common.requestFailed'))); })
+      .finally(() => { if (active) setBillingLoading(false); });
+    return () => { active = false; };
+  }, [selectedRouteId, t, tenant, token]);
+
   const save = async () => {
-    if (!tenant || !selectedRouteId) return;
+    if (!tenant || !selectedRouteId || !billingChoices.some((choice) => choice.key_id === selectedBillingId)) return;
     setSaving(true); setError(''); setMessage('');
     try {
       const next = await api<FilterAssistantSettings>('/internal/v1/filter-assistant/settings', token, {
-        method: 'PUT', body: JSON.stringify({ tenant_external_id: tenant, model_route_id: selectedRouteId }),
+        method: 'PUT', body: JSON.stringify({ tenant_external_id: tenant, model_route_id: selectedRouteId, billing_key_id: selectedBillingId, expected_updated_at: settings?.updated_at ?? null }),
       });
       setSettings(next); setMessage(t('settings.filterAssistantSaved'));
     } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
@@ -123,13 +140,17 @@ export function SystemSettingsPage({ token, tenant }: { token: string; tenant: s
             <h3>{t('settings.filterAssistantTitle')}</h3>
             <p className="muted">{t('settings.filterAssistantDescription')}</p>
           </div>
-          {settings && <span className="status ok">{t('settings.configured')}</span>}
+          {settings?.billing_key_id && <span className="status ok">{t('settings.configured')}</span>}
         </div>
         {loading ? <div className="empty" role="status">{t('common.loading')}</div> : loadError ? <div className="settings-empty" role="alert"><b>{t('settings.filterAssistantLoadFailed')}</b><span>{loadError}</span><button type="button" className="secondary" onClick={() => void load()}>{t('common.retry')}</button></div> : routes.length === 0 ? <div className="settings-empty"><b>{t('settings.noEnabledRoute')}</b><span>{t('settings.noEnabledRouteHint')}</span></div> : <form className="system-settings-form" onSubmit={(event) => { event.preventDefault(); void save(); }}>
           <div><ModelPicker label={t('settings.filterAssistantRoute')} popupLabel={t('settings.filterAssistantRoute')} value={selectedRouteId} onChange={setSelectedRouteId} disabled={saving} options={assistantOptions} describedBy="filter-assistant-route-hint" /><small id="filter-assistant-route-hint">{t('settings.filterAssistantRouteHint')}</small>{selectedRouteId && !selectedRouteHasAvailableCandidate && <small className="error-text" role="alert">{t('settings.filterAssistantRouteUnavailable')}</small>}</div>
-          <button type="submit" disabled={saving || !selectedRouteId || !selectedRouteHasAvailableCandidate}>{saving ? t('common.loading') : t('common.save')}</button>
+          <label>{t('settings.assistantBillingCredential')}<select value={selectedBillingId} disabled={saving || billingLoading} onChange={(event) => setSelectedBillingId(event.target.value)}><option value="">{t('settings.assistantSelectBillingCredential')}</option>{billingChoices.map((choice) => <option key={choice.key_id} value={choice.key_id}>{choice.alias} · {choice.principal}</option>)}</select><small>{t('settings.assistantBillingHint')}</small></label>
+          {billingError && <div className="error-text" role="alert">{billingError}</div>}
+          {!billingLoading && selectedRouteId && !billingError && billingChoices.length === 0 && <p role="status">{t('settings.assistantNoBillingCredential')}</p>}
+          <button type="submit" disabled={saving || billingLoading || !selectedRouteId || !selectedRouteHasAvailableCandidate || !billingChoices.some((choice) => choice.key_id === selectedBillingId)}>{saving ? t('common.loading') : t('common.save')}</button>
         </form>}
         {settings === null && !loadError && <p className="settings-status-note">{t('settings.filterAssistantNotConfigured')}</p>}
+        {settings && !settings.billing_key_id && <p className="settings-status-note">{t('settings.assistantExecutionNotEnabled')}</p>}
       </article>
     </>}
   </section>;

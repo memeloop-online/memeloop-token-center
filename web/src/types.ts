@@ -60,7 +60,7 @@ export interface TypedFilterAst {
 }
 export interface NamedFilterPreset { name: string; ast: TypedFilterAst; updated_at: number }
 export interface FilterPresetState { named: NamedFilterPreset[]; recent: TypedFilterAst[] }
-export interface FilterAssistantSettings { model_route_id: string; updated_at: number }
+export interface FilterAssistantSettings { model_route_id: string; billing_key_id?: string | null; updated_at: number }
 export interface FilterAssistantPlan { model_route_id: string; ast: TypedFilterAst }
 
 export interface RequestSessionContext {
