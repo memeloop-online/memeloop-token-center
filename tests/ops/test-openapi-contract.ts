@@ -138,10 +138,28 @@ test("native Kimi cohort import advertises the atomic v2 fail-closed contract", 
   const upstream = document.components.schemas.UpstreamProvider; for (const field of ["import_source_identity_hash", "import_source_document_sha256"]) assert.ok(upstream.required.includes(field));
 });
 
-test("session archive quarantine is persistent global operator only", () => {
-  const document = cloneDocument(); const base = "/internal/v1/imports/session-archive/quarantine"; const operations = [[document.paths[base].get, "imports:session_archive:quarantine:read"], [document.paths[`${base}/{quarantine_id}`].get, "imports:session_archive:quarantine:read"], [document.paths[`${base}/{quarantine_id}/resolutions`].post, "imports:session_archive:quarantine:resolve"]] as const;
-  for (const [operation, scope] of operations) { assert.deepEqual(operation.security, [{ serviceBearer: [] }]); assert.equal(operation["x-required-scope"], scope); assert.equal(operation["x-global-service-only"], true); assert.equal(operation["x-persistent-service-only"], true); }
-  const scopes: string[] = document.components.schemas.ServiceScope.enum; assert.ok(scopes.includes("imports:session_archive:quarantine:read")); assert.ok(scopes.includes("imports:session_archive:quarantine:resolve")); const required: string[] = document.components.schemas.ResolveSessionArchiveQuarantineRequest.required; assert.ok(required.includes("expected_record_digest") && required.includes("evidence_digest")); const properties = document.components.schemas.SessionArchiveQuarantineRecord.properties; for (const field of ["identity_claim_digest", "proof_digest", "request_object", "response_object"]) assert.ok(!(field in properties));
+test("retired migration and archive-import surfaces are absent from the public contract", () => {
+  const document = cloneDocument();
+  const retiredPaths = [
+    "/internal/v1/migrations/" + "openai-codex/prepare",
+    "/internal/v1/migrations/" + "openai-codex/apply",
+    "/internal/v1/imports/" + "session-archive/quarantine",
+    "/internal/v1/imports/" + "session-archive/quarantine/{quarantine_id}",
+    "/internal/v1/imports/" + "session-archive/quarantine/{quarantine_id}/resolutions",
+  ];
+  for (const path of retiredPaths) assert.ok(!(path in document.paths));
+  for (const schema of [
+    "NativeCodex" + "UpgradeTarget",
+    "NativeCodex" + "UpgradePrepareRequest",
+    "NativeCodex" + "UpgradePlan",
+    "NativeCodex" + "UpgradeApplyRequest",
+    "NativeCodex" + "UpgradeResult",
+    "SessionArchive" + "QuarantineRecord",
+    "ResolveSessionArchive" + "QuarantineRequest",
+    "SessionArchive" + "QuarantineResolution",
+  ]) assert.ok(!(schema in document.components.schemas));
+  const scopes: string[] = document.components.schemas.ServiceScope.enum;
+  assert.ok(!scopes.some((scope) => scope.startsWith("imports:session_archive:" + "quarantine:")));
 });
 
 test("ContractFailure remains a distinct error type", () => assert.ok(new ContractFailure("x") instanceof Error));

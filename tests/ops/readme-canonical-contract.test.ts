@@ -6,12 +6,13 @@ import test from 'node:test';
 import { repository } from './contract-helpers.ts';
 
 const readme = readFileSync(resolve(repository, 'README.md'), 'utf8');
+const contractPath = 'tests/ops/readme-canonical-contract.test.ts';
 
 function trackedTextFiles(): Array<{ path: string; text: string }> {
   const paths = execFileSync('git', ['ls-files', '-z'], { cwd: repository })
     .toString('utf8')
     .split('\0')
-    .filter(Boolean);
+    .filter((path) => Boolean(path) && path !== contractPath);
   return paths.flatMap((path) => {
     const contents = readFileSync(resolve(repository, path));
     return contents.includes(0) ? [] : [{ path, text: contents.toString('utf8') }];
@@ -30,10 +31,13 @@ test('README contains no credential-retrieval commands', () => {
   assert.doesNotMatch(readme, /kubectl|\bget secret\b|base64|service-token|jsonpath/u);
 });
 
-test('tracked public sources omit private deployment markers and credential retrieval commands', () => {
+test('tracked sources omit private deployment markers, trial topology, and credential retrieval commands', () => {
   const forbiddenLiterals = [
     ['private deployment domain', 'one' + 'two.website'],
     ['retired trial environment', 'api2' + '-trial'],
+    ['retired deployment identity', 'memeloop-token-center-' + 'api2'],
+    ['trial-only topology guidance', 'trial-' + 'only static name mappings'],
+    ['trial provider topology', 'trial ' + 'provider'],
   ] as const;
   const credentialRead = new RegExp(
     String.raw`kubectl[^\n]{0,240}\bget\b[^\n]{0,80}\b(?:secret|secrets)\b`,
@@ -56,17 +60,29 @@ test('retired in-repository migration delivery surfaces stay absent', () => {
   const retiredPaths = [
     'src/bin/' + 'import-cpa-' + 'session-archive.rs',
     'src/api/upstreams/' + 'managed_import.rs',
+    'src/api/upstreams/' + 'native_codex_upgrade.rs',
+    'src/api/' + 'archive_quarantine.rs',
+    'src/db/providers/' + 'imports.rs',
+    'src/db/requests/' + 'session_archive_quarantine.rs',
     'src/' + 'session_archive_import',
+    'docs/evidence',
+    'docs/integrations/' + 'cloud-pr4-review-20260909.md',
+    'docs/integrations/' + 'cloud-principal-ensure-review.md',
+    'docs/experience-' + 'acceptance-20260909.md',
   ];
   for (const retired of retiredPaths) {
     assert.equal(
       paths.some((path) => path === retired || path.startsWith(`${retired}/`)),
       false,
-      `${retired} must live in the separate migration-tools repository`,
+      `${retired} is a retired migration, import, or deployment-evidence surface`,
     );
   }
 
-  const retiredApi = '/internal/v1/imports/' + 'cpa/managed-oauth';
+  const retiredApis = [
+    '/internal/v1/imports/' + 'cpa/managed-oauth',
+    '/internal/v1/migrations/' + 'openai-codex',
+    '/internal/v1/imports/' + 'session-archive/quarantine',
+  ];
   const retiredSymbols = [
     'import-cpa-' + 'session-archive',
     'CARGO_BIN_EXE_' + 'import-cpa-' + 'session-archive',
@@ -80,9 +96,15 @@ test('retired in-repository migration delivery surfaces stay absent', () => {
     'ManagedOAuthNormalized' + 'Account',
     '"managed_' + 'oauth_adapter"',
     'cpa-managed-' + 'oauth-adapter-v1',
+    'NativeCodex' + 'Upgrade',
+    'native_codex_' + 'upgrade',
+    'SessionArchive' + 'Quarantine',
+    'imports:session_archive:' + 'quarantine:',
   ];
   for (const { path, text } of trackedTextFiles()) {
-    assert.equal(text.includes(retiredApi), false, `${path} exposes the retired import API`);
+    for (const retiredApi of retiredApis) {
+      assert.equal(text.includes(retiredApi), false, `${path} exposes retired API ${retiredApi}`);
+    }
     for (const symbol of retiredSymbols) {
       assert.equal(text.includes(symbol), false, `${path} references retired symbol ${symbol}`);
     }

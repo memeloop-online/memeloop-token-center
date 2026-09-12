@@ -555,58 +555,6 @@ async fn every_service_scope_is_exact(world: &mut TokenCenterWorld) {
     assert_eq!(response.status(), StatusCode::CREATED);
     assert_scope_is_not_wildcard(world, "entitlements:write", &token).await;
 
-    let token = issue_service_token(
-        world,
-        "scope-quarantine-read",
-        &["imports:session_archive:quarantine:read"],
-    )
-    .await;
-    let response = world
-        .client
-        .get(format!(
-            "{}/internal/v1/imports/session-archive/quarantine?tenant_external_id=scope-tenant",
-            world.service_url
-        ))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .expect("imports:session_archive:quarantine:read operation");
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_scope_is_not_wildcard(world, "imports:session_archive:quarantine:read", &token).await;
-
-    let token = issue_service_token(
-        world,
-        "scope-quarantine-resolve",
-        &["imports:session_archive:quarantine:resolve"],
-    )
-    .await;
-    let response = world
-        .client
-        .post(format!(
-            "{}/internal/v1/imports/session-archive/quarantine/{}/resolutions",
-            world.service_url,
-            Uuid::now_v7()
-        ))
-        .bearer_auth(&token)
-        .header("idempotency-key", "security:scope-quarantine-resolution")
-        .json(&json!({
-            "tenant_external_id": "scope-tenant",
-            "action": "dismiss",
-            "key_id": null,
-            "expected_record_digest": "a".repeat(64),
-            "evidence_digest": "b".repeat(64),
-            "note": "scope authorization matrix"
-        }))
-        .send()
-        .await
-        .expect("imports:session_archive:quarantine:resolve operation");
-    assert_eq!(
-        response.status(),
-        StatusCode::NOT_FOUND,
-        "the exact scope passed authorization and reached the deliberately missing fixture"
-    );
-    assert_scope_is_not_wildcard(world, "imports:session_archive:quarantine:resolve", &token).await;
-
     for (scope, path) in [
         ("plugins:read", "/internal/v1/plugins"),
         ("prices:read", "/internal/v1/generation-prices"),
@@ -968,7 +916,7 @@ async fn authentication_precedes_body_parsing(world: &mut TokenCenterWorld) {
         ),
         (
             "invalid path extractor",
-            "/internal/v1/imports/session-archive/quarantine/not-a-uuid",
+            "/internal/v1/upstreams/not-a-uuid/quota",
         ),
     ] {
         let response = world
