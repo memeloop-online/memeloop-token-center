@@ -448,13 +448,14 @@ async fn cursor_contract(world: &TokenCenterWorld) {
             break;
         };
         path = format!(
-            "/self/v1/sessions?limit=2&before_last_activity_at={}&before_session_id={}",
+            "/self/v1/sessions?limit=2&before_last_activity_at={}&before_session_id={}&before_key_id={}",
             cursor["before_last_activity_at"]
                 .as_i64()
                 .expect("cursor activity"),
             cursor["before_session_id"]
                 .as_str()
-                .expect("cursor session")
+                .expect("cursor session"),
+            cursor["before_key_id"].as_str().expect("cursor key")
         );
         assert!(seen.len() <= expected.len(), "cursor loop: {body}");
     }

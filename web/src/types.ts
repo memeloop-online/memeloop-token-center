@@ -563,6 +563,7 @@ export interface LogicalSessionSummary {
 export interface LogicalSessionCursor {
   before_last_activity_at: number;
   before_session_id: string;
+  before_key_id: string;
 }
 
 export interface LogicalSessionListResponse {

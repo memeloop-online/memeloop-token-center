@@ -21,22 +21,45 @@ pub(super) struct RecentSessionsQuery {
     limit: i64,
     before_last_activity_at: Option<i64>,
     before_session_id: Option<String>,
+    before_key_id: Option<Uuid>,
     key_id: Option<Uuid>,
     state: Option<String>,
     model: Option<String>,
     q: Option<String>,
 }
 
+type ParsedSessionCursor = (Option<(i64, String, String)>, bool);
+
 impl RecentSessionsQuery {
-    fn cursor(&self) -> Result<Option<(i64, String)>, AppError> {
-        match (&self.before_last_activity_at, &self.before_session_id) {
-            (None, None) => Ok(None),
-            (Some(last_activity_at), Some(session_id)) => {
+    fn cursor(&self) -> Result<ParsedSessionCursor, AppError> {
+        match (
+            &self.before_last_activity_at,
+            &self.before_session_id,
+            &self.before_key_id,
+        ) {
+            (None, None, None) => Ok((None, false)),
+            (Some(last_activity_at), Some(session_id), Some(key_id)) => {
                 validate_session_id(session_id)?;
-                Ok(Some((*last_activity_at, session_id.clone())))
+                Ok((
+                    Some((
+                        *last_activity_at,
+                        session_id.clone(),
+                        key_id.to_string(),
+                    )),
+                    false,
+                ))
+            }
+            (Some(last_activity_at), Some(session_id), None) => {
+                validate_session_id(session_id)?;
+                // The database can safely infer the missing tie-breaker only
+                // after this cursor is scoped to one stable key.
+                Ok((
+                    Some((*last_activity_at, session_id.clone(), String::new())),
+                    true,
+                ))
             }
             _ => Err(AppError::BadRequest(
-                "before_last_activity_at and before_session_id must be supplied together".into(),
+                "before_last_activity_at and before_session_id must be supplied together; before_key_id is optional only for legacy cursors".into(),
             )),
         }
     }
@@ -62,9 +85,11 @@ impl RecentSessionsQuery {
                 )));
             }
         }
+        let (cursor, legacy_cursor) = self.cursor()?;
         Ok(LogicalSessionListFilter {
             limit: self.limit,
-            cursor: self.cursor()?,
+            cursor,
+            legacy_cursor,
             key_id: self.key_id,
             state: state.to_owned(),
             model: self.model.clone(),
@@ -179,6 +204,7 @@ fn session_list_response(
         LogicalSessionListCursor {
             before_last_activity_at: oldest.last_activity_at,
             before_session_id: oldest.session_id.clone(),
+            before_key_id: oldest.key_id,
         }
     });
     LogicalSessionListResponse {

@@ -648,6 +648,7 @@ pub struct LogicalSessionSummary {
 pub struct LogicalSessionListCursor {
     pub before_last_activity_at: i64,
     pub before_session_id: String,
+    pub before_key_id: Uuid,
 }
 
 #[derive(Clone, Debug, Serialize)]
