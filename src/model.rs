@@ -421,7 +421,7 @@ pub struct EntitlementReconcileResult {
     pub replaced_entitlement_id: Option<Uuid>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct RequestView {
     pub request_id: Uuid,
     pub created_at: i64,
@@ -446,13 +446,15 @@ pub struct RequestView {
     pub route_id: Option<Uuid>,
     pub status_code: Option<i64>,
     pub duration_ms: Option<i64>,
-    /// Compatibility token fields. They are nullable because generation and
-    /// archive-only history must not turn missing observations into zero.
-    pub input_tokens: Option<i64>,
-    pub cached_input_tokens: Option<i64>,
-    pub cache_write_tokens: Option<i64>,
-    pub output_tokens: Option<i64>,
-    pub cost: Option<String>,
+    /// Compatibility fields retained as scalar Rust values for existing
+    /// in-process callers. Serialization reads their nullable wire values from
+    /// `usage` and `billing`, so an unknown observation is never exposed as
+    /// zero to API clients.
+    pub input_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub output_tokens: i64,
+    pub cost: String,
     /// Historical request currency when it was durably captured. It remains
     /// absent for generation history whose currency cannot be recovered
     /// without consulting mutable key state.
@@ -475,6 +477,51 @@ pub struct RequestView {
     /// example a generation job); it is never synthesized from model or prompt
     /// text while serving history.
     pub session_context: Option<RequestSessionContext>,
+}
+
+impl Serialize for RequestView {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let tokens = self.usage.tokens.as_ref();
+        let mut state = serializer.serialize_struct("RequestView", 23)?;
+        state.serialize_field("request_id", &self.request_id)?;
+        state.serialize_field("created_at", &self.created_at)?;
+        state.serialize_field("completed_at", &self.completed_at)?;
+        state.serialize_field("source_completed_at", &self.source_completed_at)?;
+        state.serialize_field("lifecycle_state", &self.lifecycle_state)?;
+        state.serialize_field("protocol", &self.protocol)?;
+        state.serialize_field("model", &self.model)?;
+        state.serialize_field("upstream_account_id", &self.upstream_account_id)?;
+        state.serialize_field("route_id", &self.route_id)?;
+        state.serialize_field("status_code", &self.status_code)?;
+        state.serialize_field("duration_ms", &self.duration_ms)?;
+        state.serialize_field("input_tokens", &tokens.and_then(|value| value.input_tokens))?;
+        state.serialize_field(
+            "cached_input_tokens",
+            &tokens.and_then(|value| value.cached_input_tokens),
+        )?;
+        state.serialize_field(
+            "cache_write_tokens",
+            &tokens.and_then(|value| value.cache_write_tokens),
+        )?;
+        state.serialize_field(
+            "output_tokens",
+            &tokens.and_then(|value| value.output_tokens),
+        )?;
+        state.serialize_field("cost", &self.billing.cost)?;
+        state.serialize_field("currency", &self.currency)?;
+        state.serialize_field("usage", &self.usage)?;
+        state.serialize_field("billing", &self.billing)?;
+        state.serialize_field("error_code", &self.error_code)?;
+        state.serialize_field("archive_state", &self.archive_state)?;
+        state.serialize_field("credential_identity", &self.credential_identity)?;
+        state.serialize_field("session_context", &self.session_context)?;
+        state.end()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -588,7 +635,7 @@ impl RequestSessionContext {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct RequestEventView {
     pub event_id: Uuid,
     pub request_id: Uuid,
@@ -602,22 +649,71 @@ pub struct RequestEventView {
     pub upstream_account_id: Option<Uuid>,
     pub route_id: Option<Uuid>,
     pub currency: Option<String>,
-    pub cached_input_tokens: Option<i64>,
-    pub cache_write_tokens: Option<i64>,
+    pub cached_input_tokens: i64,
+    pub cache_write_tokens: i64,
     pub session_context: Option<RequestSessionContext>,
     pub key_id: Uuid,
     pub protocol: String,
     pub model: String,
     pub status_code: Option<i64>,
     pub duration_ms: Option<i64>,
-    pub input_tokens: Option<i64>,
-    pub output_tokens: Option<i64>,
-    pub cost: Option<String>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost: String,
     pub usage: RequestUsageView,
     pub billing: RequestBillingView,
     pub error_code: Option<String>,
     pub archive_state: RequestArchiveState,
     pub credential_identity: Option<RequestCredentialIdentityView>,
+}
+
+impl Serialize for RequestEventView {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let tokens = self.usage.tokens.as_ref();
+        let mut state = serializer.serialize_struct("RequestEventView", 27)?;
+        state.serialize_field("event_id", &self.event_id)?;
+        state.serialize_field("request_id", &self.request_id)?;
+        state.serialize_field("event_at", &self.event_at)?;
+        state.serialize_field("event_kind", &self.event_kind)?;
+        state.serialize_field("created_at", &self.created_at)?;
+        state.serialize_field("completed_at", &self.completed_at)?;
+        state.serialize_field("source_completed_at", &self.source_completed_at)?;
+        state.serialize_field("lifecycle_state", &self.lifecycle_state)?;
+        state.serialize_field("upstream_account_id", &self.upstream_account_id)?;
+        state.serialize_field("route_id", &self.route_id)?;
+        state.serialize_field("currency", &self.currency)?;
+        state.serialize_field(
+            "cached_input_tokens",
+            &tokens.and_then(|value| value.cached_input_tokens),
+        )?;
+        state.serialize_field(
+            "cache_write_tokens",
+            &tokens.and_then(|value| value.cache_write_tokens),
+        )?;
+        state.serialize_field("session_context", &self.session_context)?;
+        state.serialize_field("key_id", &self.key_id)?;
+        state.serialize_field("protocol", &self.protocol)?;
+        state.serialize_field("model", &self.model)?;
+        state.serialize_field("status_code", &self.status_code)?;
+        state.serialize_field("duration_ms", &self.duration_ms)?;
+        state.serialize_field("input_tokens", &tokens.and_then(|value| value.input_tokens))?;
+        state.serialize_field(
+            "output_tokens",
+            &tokens.and_then(|value| value.output_tokens),
+        )?;
+        state.serialize_field("cost", &self.billing.cost)?;
+        state.serialize_field("usage", &self.usage)?;
+        state.serialize_field("billing", &self.billing)?;
+        state.serialize_field("error_code", &self.error_code)?;
+        state.serialize_field("archive_state", &self.archive_state)?;
+        state.serialize_field("credential_identity", &self.credential_identity)?;
+        state.end()
+    }
 }
 
 #[derive(Clone, Debug)]

@@ -89,8 +89,8 @@ async fn terminal_gap_event_is_atomic_idempotent_and_preserves_snapshot_facts() 
     assert_eq!(event.event_kind, "archive_gap");
     assert_eq!(event.archive_state, crate::model::RequestArchiveState::Gap);
     assert_eq!(event.status_code, Some(503));
-    assert_eq!(event.input_tokens, Some(45));
-    assert_eq!(event.output_tokens, Some(67));
+    assert_eq!(event.input_tokens, 45);
+    assert_eq!(event.output_tokens, 67);
     assert_eq!(event.billing.cost.as_deref(), Some("0.000123"));
     assert_eq!(event.billing.currency.as_deref(), Some("USD"));
     assert_eq!(event.error_code.as_deref(), Some("upstream_error"));
@@ -533,8 +533,8 @@ async fn binding_is_atomic_with_staging_and_preserves_terminal_facts() {
         bound_events[0].archive_state,
         crate::model::RequestArchiveState::Bound
     );
-    assert_eq!(bound_events[0].input_tokens, Some(45));
-    assert_eq!(bound_events[0].output_tokens, Some(67));
+    assert_eq!(bound_events[0].input_tokens, 45);
+    assert_eq!(bound_events[0].output_tokens, 67);
     assert_eq!(bound_events[0].billing.cost.as_deref(), Some("0.000123"));
     // Simulate lost completion ACK and worker error handling: neither retry
     // nor producer failure may release the bound object or change its locator.

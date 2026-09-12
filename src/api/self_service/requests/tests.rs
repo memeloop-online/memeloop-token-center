@@ -15,11 +15,11 @@ fn request_detail_refs(request_id: Uuid) -> crate::model::RequestArchiveRefs {
             route_id: Some(Uuid::nil()),
             status_code: Some(200),
             duration_ms: Some(1),
-            input_tokens: Some(1),
-            cached_input_tokens: Some(0),
-            cache_write_tokens: Some(0),
-            output_tokens: Some(1),
-            cost: Some("0".to_owned()),
+            input_tokens: 1,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 1,
+            cost: "0".to_owned(),
             currency: Some("USD".to_owned()),
             usage: crate::model::RequestUsageView {
                 tokens: Some(crate::model::RequestTokenUsageView {

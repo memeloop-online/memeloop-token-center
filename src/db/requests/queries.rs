@@ -803,8 +803,6 @@ fn push_typed_filters(
             TypedFilterField::DurationMs => {
                 if source == RequestSourceKind::Generation {
                     format!("({source_alias}.completed_at - {source_alias}.created_at)")
-                } else if source == RequestSourceKind::Archive {
-                    format!("{source_alias}.duration_ms")
                 } else {
                     format!("{source_alias}.duration_ms")
                 }
@@ -1101,11 +1099,11 @@ fn request_view_from_row(row: &AnyRow) -> Result<RequestView, AppError> {
             .transpose()?,
         status_code,
         duration_ms: row.try_get("duration_ms")?,
-        input_tokens,
-        cached_input_tokens,
-        cache_write_tokens,
-        output_tokens,
-        cost: cost.clone(),
+        input_tokens: input_tokens.unwrap_or_default(),
+        cached_input_tokens: cached_input_tokens.unwrap_or_default(),
+        cache_write_tokens: cache_write_tokens.unwrap_or_default(),
+        output_tokens: output_tokens.unwrap_or_default(),
+        cost: cost.clone().unwrap_or_else(|| "0".to_owned()),
         currency: currency.clone(),
         usage: RequestUsageView { tokens, generation },
         billing: RequestBillingView {
@@ -1320,17 +1318,17 @@ fn request_event_views(rows: Vec<AnyRow>) -> Result<Vec<RequestEventView>, AppEr
                     .map(parse_uuid)
                     .transpose()?,
                 currency: currency.clone(),
-                cached_input_tokens,
-                cache_write_tokens,
+                cached_input_tokens: cached_input_tokens.unwrap_or_default(),
+                cache_write_tokens: cache_write_tokens.unwrap_or_default(),
                 session_context: request_session_context_from_row(&row)?,
                 key_id: parse_uuid(row.try_get("key_id")?)?,
                 protocol: row.try_get("protocol")?,
                 model: row.try_get("model")?,
                 status_code,
                 duration_ms: row.try_get("current_duration_ms")?,
-                input_tokens,
-                output_tokens,
-                cost: cost.clone(),
+                input_tokens: input_tokens.unwrap_or_default(),
+                output_tokens: output_tokens.unwrap_or_default(),
+                cost: cost.clone().unwrap_or_else(|| "0".to_owned()),
                 usage: RequestUsageView { tokens, generation },
                 billing: RequestBillingView {
                     billable: true,
@@ -1447,11 +1445,11 @@ fn session_archive_unlinked_refs_from_row(row: AnyRow) -> Result<RequestArchiveR
             route_id: None,
             status_code,
             duration_ms: row.try_get("duration_ms")?,
-            input_tokens,
-            cached_input_tokens,
-            cache_write_tokens,
-            output_tokens,
-            cost: None,
+            input_tokens: input_tokens.unwrap_or_default(),
+            cached_input_tokens: cached_input_tokens.unwrap_or_default(),
+            cache_write_tokens: cache_write_tokens.unwrap_or_default(),
+            output_tokens: output_tokens.unwrap_or_default(),
+            cost: "0".to_owned(),
             currency: None,
             usage: RequestUsageView {
                 tokens,
@@ -1552,11 +1550,11 @@ fn generation_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, A
                 .transpose()?,
             status_code,
             duration_ms: completed_at.map(|value| value - created_at),
-            input_tokens: None,
-            cached_input_tokens: None,
-            cache_write_tokens: None,
-            output_tokens: None,
-            cost: cost.clone(),
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 0,
+            cost: cost.clone().unwrap_or_else(|| "0".to_owned()),
             currency: currency.clone(),
             usage: RequestUsageView {
                 tokens: None,

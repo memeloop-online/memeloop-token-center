@@ -120,8 +120,11 @@ async fn request_projection_preserves_source_truth_scope_and_cross_source_cursor
         capturing.archive_state,
         memeloop_token_center::model::RequestArchiveState::Capturing
     );
-    assert!(capturing.input_tokens.is_none());
-    assert!(capturing.cost.is_none());
+    assert!(capturing.usage.tokens.is_none());
+    assert!(capturing.billing.cost.is_none());
+    let capturing_json = serde_json::to_value(capturing).unwrap();
+    assert!(capturing_json["input_tokens"].is_null());
+    assert!(capturing_json["cost"].is_null());
 
     state
         .db
@@ -277,9 +280,12 @@ async fn request_projection_preserves_source_truth_scope_and_cross_source_cursor
         .unwrap();
     assert!(archived.completed_at.is_none());
     assert_eq!(archived.source_completed_at, Some(archive_completed_at));
-    assert!(archived.input_tokens.is_none());
-    assert!(archived.output_tokens.is_none());
-    assert!(archived.cost.is_none());
+    assert!(archived.usage.tokens.is_none());
+    assert!(archived.billing.cost.is_none());
+    let archived_json = serde_json::to_value(archived).unwrap();
+    assert!(archived_json["input_tokens"].is_null());
+    assert!(archived_json["output_tokens"].is_null());
+    assert!(archived_json["cost"].is_null());
     assert!(!archived.billing.billable);
     assert_eq!(
         archived.archive_state,
