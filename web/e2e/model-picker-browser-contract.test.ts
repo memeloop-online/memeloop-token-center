@@ -85,7 +85,7 @@ test('filters are non-modal themed popovers and model selection is searchable by
     await settingsCatalog.getByRole('combobox').fill('friendly-custom-chat');
     assert.equal(await settingsCatalog.getByRole('option').count(), 0, 'an unobserved custom name is not treated as capability evidence');
     await settingsCatalog.getByRole('combobox').fill('Research account');
-    await settingsCatalog.getByRole('option').first().click();
+    await settingsCatalog.getByRole('option', { name: /research-model/i }).click();
     assert.match(await page.locator('.system-settings .model-picker-trigger').textContent() ?? '', /research-model/);
     await page.locator('.system-settings .model-picker-trigger').click();
     await settingsCatalog.getByRole('combobox').fill('Retired account');
