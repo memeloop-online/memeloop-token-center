@@ -470,7 +470,7 @@ mod tests {
                 freshness_deadline: instant + PLUGIN_CONFIGURATION_CACHE_TTL,
             };
             let newer_bytes = if mode == "uncached" {
-                PLUGIN_CONFIGURATION_CACHE_BYTES + 1
+                PLUGIN_CONFIGURATION_CACHE_BYTES / 6 + 1
             } else {
                 1024
             };
@@ -499,18 +499,20 @@ mod tests {
                     }
                 }
                 "byte_budget" => {
+                    // String accounting reserves six bytes per input byte
+                    // for JSON escaping. Keep the incoming entry cacheable
+                    // on its own while requiring eviction of the first one.
+                    let incoming = snapshot(
+                        Uuid::from_u128(2),
+                        PLUGIN_CONFIGURATION_CACHE_BYTES / 6 - 100,
+                    );
+                    assert!(
+                        estimated_json_bytes(&incoming.values["policy"]) + "policy".len()
+                            < PLUGIN_CONFIGURATION_CACHE_BYTES
+                    );
                     assert!(
                         runtime
-                            .cache_snapshot(
-                                &epoch,
-                                3,
-                                instant,
-                                snapshot(
-                                    Uuid::from_u128(2),
-                                    PLUGIN_CONFIGURATION_CACHE_BYTES - 100
-                                ),
-                                || instant,
-                            )
+                            .cache_snapshot(&epoch, 3, instant, incoming, || instant,)
                             .await
                     );
                 }
@@ -523,7 +525,8 @@ mod tests {
                     .read()
                     .await
                     .entries
-                    .contains_key(&tenant)
+                    .contains_key(&tenant),
+                "newer value must be absent after {mode}"
             );
             assert!(
                 !runtime
@@ -537,7 +540,7 @@ mod tests {
                         &epoch,
                         1,
                         instant,
-                        snapshot(tenant, PLUGIN_CONFIGURATION_CACHE_BYTES + 1),
+                        snapshot(tenant, PLUGIN_CONFIGURATION_CACHE_BYTES / 6 + 1),
                         || instant,
                     )
                     .await,
