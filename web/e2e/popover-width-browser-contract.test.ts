@@ -39,17 +39,19 @@ test('popover reopening and viewport resizing never expose old-width coordinates
     for (const width of [1024, 390, 320, 768]) {
       // Record every rendered frame across live resizing, not just a settled
       // final rectangle that could conceal a visible one-frame overflow.
-      await page.evaluate(() => {
-        const state = { frames: [] as Array<{ left: number; right: number; viewport: number }>, active: true };
+      // Keep this self-recursing browser script outside the Node-side TS
+      // transform, which injects a __name helper into named local callbacks.
+      await page.evaluate(`(() => {
+        const state = { frames: [], active: true };
         Object.assign(window, { popoverGeometry: state });
         const sample = () => {
           if (!state.active) return;
-          const bounds = document.querySelector('#panel')!.getBoundingClientRect();
+          const bounds = document.querySelector('#panel').getBoundingClientRect();
           state.frames.push({ left: bounds.left, right: bounds.right, viewport: innerWidth });
           requestAnimationFrame(sample);
         };
         requestAnimationFrame(sample);
-      });
+      })()`);
       await page.setViewportSize({ width, height: 600 });
       const frames = await page.evaluate(async () => {
         await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
