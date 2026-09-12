@@ -122,7 +122,7 @@ export function MultiCombobox({
         onKeyDown={onKeyDown}
       />
     </div>
-    {expanded && <section ref={panel} className="combobox-popover multi-combobox-popover" popover="auto" style={position}
+    {expanded && <section ref={panel} className="combobox-popover multi-combobox-popover" popover="auto" tabIndex={-1} style={position}
       onToggle={(event) => { if (event.target === event.currentTarget && event.newState === 'closed') setOpen(false); }}
       onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget) && event.relatedTarget !== inputRef.current) setOpen(false); }}>
       <div className="combobox-options" id={`${id}-listbox`} role="listbox" aria-labelledby={`${id}-label`} aria-busy={loading}>
