@@ -3513,9 +3513,11 @@ paths:
         accepted nor returned. The configured route is invoked through normal proxy
         accounting using the explicit billing credential. Only the bounded intent and
         fixed schema are sent. Missing billing configuration, revoked grants, exhausted
-        budgets and invalid model output fail without applying a filter.
+        budgets and invalid model output fail without applying a filter. Callers need
+        the dedicated `filter_assistant:execute` scope because this operation incurs
+        billable upstream execution; `requests:read` alone is deliberately insufficient.
       security: [{ serviceBearer: [] }]
-      x-required-scope: requests:read
+      x-required-scope: filter_assistant:execute
       requestBody:
         required: true
         content:
@@ -3531,6 +3533,9 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '424': { $ref: '#/components/responses/UnpricedModel' }
+        '429': { $ref: '#/components/responses/UsageRejected' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
 
   /internal/v1/sessions:
     get:
@@ -5417,6 +5422,7 @@ components:
         status: { $ref: '#/components/schemas/CredentialStatus' }
     ServiceScope:
       type: string
+      description: Exact service capability. filter_assistant:execute authorizes billable filter-assistant model execution independently of requests:read.
       enum:
         - keys:read
         - keys:write
@@ -5424,6 +5430,7 @@ components:
         - credits:write
         - entitlements:read
         - entitlements:write
+        - filter_assistant:execute
         - generations:write
         - requests:read
         - providers:read

@@ -223,6 +223,9 @@ secret is restored or returned. Settings without a billing reference do not
 invoke a model. Only the bounded user intent, current time and fixed AST schema
 are sent; request records and upstream configuration are excluded. Invalid,
 oversized or incomplete model output cannot become an applied filter.
+Invoking the model requires the dedicated `filter_assistant:execute` service
+scope; request readers do not inherit authority to spend the configured billing
+credential or disclose filter intent to its upstream provider.
 
 Conversation APIs remain credential-scoped. They expose explicit session and
 execution declarations, structured parent relations, bounded inferred edges and

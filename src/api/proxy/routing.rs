@@ -19,7 +19,7 @@ pub(super) use admission::{
 };
 pub(super) use candidates::{
     CandidatePreparationSummary, candidate_reservation_bounds, exhausted_candidate_error,
-    next_planned_proxy_candidate, prepared_input_reservation_bound,
+    next_planned_proxy_candidate, prepared_input_reservation_bound, retain_pinned_text_candidates,
 };
 pub(super) use clock::credential_application_now;
 #[cfg(test)]

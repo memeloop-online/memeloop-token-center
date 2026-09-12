@@ -12,6 +12,7 @@ const SUPPORTED_SERVICE_SCOPES: &[&str] = &[
     "credits:write",
     "entitlements:read",
     "entitlements:write",
+    "filter_assistant:execute",
     "generations:write",
     "imports:session_archive:quarantine:read",
     "imports:session_archive:quarantine:resolve",

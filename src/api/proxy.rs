@@ -33,7 +33,7 @@ use routing::{
     ProxySendError, UpstreamAttemptGuard, UpstreamAttemptTerminal, candidate_reservation_bounds,
     exhausted_candidate_error, materialize_proxy_route, next_planned_proxy_candidate,
     plan_proxy_route, prepare_admitted_proxy_route, prepared_input_reservation_bound,
-    refresh_route_snapshot, send_proxy_route,
+    refresh_route_snapshot, retain_pinned_text_candidates, send_proxy_route,
 };
 use upstream_response::UpstreamResponse;
 
@@ -631,6 +631,16 @@ pub(super) async fn proxy(
     proxy_with_identity(state, headers, body, protocol, key, None).await
 }
 
+fn pinned_request_envelope_changed(
+    pinned_route: Option<Uuid>,
+    original: &Value,
+    applied: &AppliedTraffic,
+) -> bool {
+    pinned_route.is_some()
+        && (original != &applied.request_json
+            || original.get("model").and_then(Value::as_str) != Some(applied.model.as_str()))
+}
+
 /// Internal callers must establish an explicit billing identity. A pinned route
 /// narrows normal grants; it never grants access or falls back to another route.
 pub(in crate::api) async fn proxy_with_identity(
@@ -660,6 +670,19 @@ pub(in crate::api) async fn proxy_with_identity(
         original_request_json.clone(),
     )
     .await?;
+    if pinned_request_envelope_changed(pinned_route, &original_request_json, &applied) {
+        // Pinned internal callers establish their own reviewed request
+        // envelope. Traffic policy may still deny it or rank an already
+        // authorized account, but must never add tools, replace instructions,
+        // redirect model input, enable streaming, or alter token ceilings.
+        // Keep the diagnostic fixed and exclude both request bodies.
+        tracing::warn!(
+            %request_id,
+            stage = "pinned_request_rewrite_rejected",
+            "traffic policy attempted to rewrite a pinned internal request"
+        );
+        return Err(AppError::Forbidden);
+    }
     let request_json = applied.request_json;
     let model = applied.model;
     let selection_seed = routing_selection_seed(&key, request_id, &conversation_hints);
@@ -676,23 +699,7 @@ pub(in crate::api) async fn proxy_with_identity(
             },
         )
         .await?;
-    if let Some(route_id) = pinned_route {
-        candidates.retain(|candidate| {
-            candidate.route_id == route_id
-                && state
-                    .providers
-                    .get(&candidate.driver)
-                    .is_some_and(|provider| {
-                        provider
-                            .modalities
-                            .iter()
-                            .any(|modality| modality == "text")
-                    })
-        });
-        if candidates.is_empty() {
-            return Err(AppError::Forbidden);
-        }
-    }
+    retain_pinned_text_candidates(&state, pinned_route, &mut candidates)?;
     let request_context = ProxyRequestContext {
         state: &state,
         key: &key,
