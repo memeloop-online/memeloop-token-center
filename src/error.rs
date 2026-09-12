@@ -227,6 +227,12 @@ impl From<reqwest::Error> for AppError {
 fn sqlx_error_kind(error: &sqlx::Error) -> &'static str {
     match error {
         sqlx::Error::Configuration(_) => "configuration",
+        sqlx::Error::Database(error) if error.code().as_deref() == Some("57014") => {
+            "query_cancelled"
+        }
+        sqlx::Error::Database(error) if error.code().as_deref() == Some("55P03") => {
+            "lock_unavailable"
+        }
         sqlx::Error::Database(error)
             if error.code().as_deref().is_some_and(|code| {
                 matches!(code, "5" | "6" | "SQLITE_BUSY" | "SQLITE_LOCKED")

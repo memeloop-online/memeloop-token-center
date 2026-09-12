@@ -86,6 +86,67 @@ async fn finish(pool: &sqlx::AnyPool, identity: ArchiveSpoolIdentity) {
 }
 
 #[tokio::test]
+async fn shutdown_at_claim_admission_preserves_attempts_and_never_starts_a_writer() {
+    let (_dir, state, pool, identity) = fixture().await;
+    let mut producer = ResponseArchiveProducer::begin_for_test(&state, identity)
+        .await
+        .unwrap();
+    producer
+        .append_for_test(vec![Bytes::from_static(b"data: [DONE]\n\n")])
+        .await
+        .unwrap();
+    producer.seal_for_test().await.unwrap();
+    finish(&pool, identity).await;
+
+    for _ in 0..10 {
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        // The seam executes after the real SELECT, while the transaction owns
+        // the budget lock, immediately before UPDATE would consume an attempt.
+        assert!(
+            !upload::process_one_with_admission(&state, Uuid::new_v4(), Some(&receiver), || {
+                sender.send(true).unwrap();
+                !*receiver.borrow()
+            })
+            .await
+        );
+        let row = sqlx::query("SELECT state, attempts, lease_token FROM response_archive_spools WHERE request_id = $1")
+            .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
+        assert_eq!(row.get::<String, _>("state"), "pending");
+        assert_eq!(row.get::<i64, _>("attempts"), 0);
+        assert!(row.get::<Option<String>, _>("lease_token").is_none());
+        let writers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archive_staging_attempts WHERE owner_id = $1 AND purpose = 'response'")
+            .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            writers, 0,
+            "no staging attempt means no object writer was opened"
+        );
+    }
+
+    // Once the admission decision is true, shutdown arriving before COMMIT
+    // must drain exactly that one upload, never strand a paid retry attempt.
+    let (sender, receiver) = tokio::sync::watch::channel(false);
+    assert!(
+        upload::process_one_with_admission(&state, Uuid::new_v4(), Some(&receiver), || {
+            sender.send(true).unwrap();
+            true
+        })
+        .await
+    );
+    assert!(!upload::process_one(&state, Uuid::new_v4()).await);
+    let row =
+        sqlx::query("SELECT state, attempts FROM response_archive_spools WHERE request_id = $1")
+            .bind(identity.request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row.get::<String, _>("state"), "bound");
+    assert_eq!(row.get::<i64, _>("attempts"), 1);
+    let writers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archive_staging_attempts WHERE owner_id = $1 AND purpose = 'response'")
+        .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!(writers, 1);
+}
+
+#[tokio::test]
 async fn nine_burst_frames_are_durable_before_any_object_store_consumer() {
     let (_dir, state, pool, identity) = fixture().await;
     // This regression covers durable burst buffering without a consumer. The

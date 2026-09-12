@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -12,6 +12,7 @@ use crate::{
 };
 
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const SLOW_CLAIM: Duration = Duration::from_secs(2);
 
 pub(crate) async fn run(state: AppState, mut shutdown: watch::Receiver<bool>) {
     let owner = Uuid::now_v7();
@@ -24,23 +25,51 @@ pub(crate) async fn run(state: AppState, mut shutdown: watch::Receiver<bool>) {
                 if changed.is_err() || *shutdown.borrow() { break; }
             }
             _ = interval.tick() => {
-                tokio::select! {
-                    biased;
-                    _ = shutdown.changed() => break,
-                    _ = async {
-                        // Bound each drain, but do not throttle a healthy store
-                        // to one completed request per second.
-                        for _ in 0..32 {
-                            if !process_one(&state, owner).await { break; }
-                        }
-                    } => {}
-                }
+                // Never cancel an in-flight claim/cleanup transaction on
+                // shutdown. The database's acquire/lock/statement deadlines
+                // bound SQL; shutdown is observed at transaction boundaries.
+                drain_batch(&shutdown, || process_one_until_shutdown(&state, owner, Some(&shutdown))).await;
             }
         }
     }
 }
 
+async fn drain_batch<F, Fut>(shutdown: &watch::Receiver<bool>, mut process: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    // Bound each drain without throttling a healthy store to one item/second.
+    for _ in 0..32 {
+        if stopping(shutdown) || !process().await {
+            break;
+        }
+    }
+}
+
+fn stopping(shutdown: &watch::Receiver<bool>) -> bool {
+    *shutdown.borrow() || shutdown.has_changed().is_err()
+}
+
+#[cfg(test)]
 pub(super) async fn process_one(state: &AppState, owner: Uuid) -> bool {
+    process_one_until_shutdown(state, owner, None).await
+}
+
+async fn process_one_until_shutdown(
+    state: &AppState,
+    owner: Uuid,
+    shutdown: Option<&watch::Receiver<bool>>,
+) -> bool {
+    process_one_with_admission(state, owner, shutdown, || !shutdown.is_some_and(stopping)).await
+}
+
+pub(super) async fn process_one_with_admission(
+    state: &AppState,
+    owner: Uuid,
+    shutdown: Option<&watch::Receiver<bool>>,
+    admit: impl FnOnce() -> bool,
+) -> bool {
     // Stop at a committed transaction boundary instead of cancelling a live
     // SQL future. The latter can race SQLx's asynchronous rollback with the
     // next pooled BEGIN and generate transaction-state protocol notices.
@@ -55,6 +84,9 @@ pub(super) async fn process_one(state: &AppState, owner: Uuid) -> bool {
             "response archive cleanup failed; committed batches are preserved"
         );
     }
+    if shutdown.is_some_and(stopping) {
+        return false;
+    }
     let Ok(_permit) = state
         .proxy_archive_stream_permits
         .clone()
@@ -62,22 +94,13 @@ pub(super) async fn process_one(state: &AppState, owner: Uuid) -> bool {
     else {
         return false;
     };
-    let task = match tokio::time::timeout(
-        Duration::from_secs(2),
-        state.db.claim_response_archive_spool(owner),
-    )
-    .await
-    {
-        Ok(Ok(Some(task))) => task,
-        Ok(Ok(None)) => return false,
-        _ => {
-            tracing::warn!(
-                stage = "response_spool_claim",
-                "response archive worker unavailable"
-            );
-            return false;
-        }
+    let task = match observe_claim(state.db.claim_response_archive_spool_if(owner, admit)).await {
+        Ok(Some(task)) => task,
+        Ok(None) | Err(_) => return false,
     };
+    // Admission happened inside the claim transaction. Complete this one
+    // bounded attempt even if shutdown arrived during COMMIT; never consume a
+    // retry merely to abandon a freshly committed claim without object I/O.
     let success = matches!(
         tokio::time::timeout(UPLOAD_TIMEOUT, upload(state, &task)).await,
         Ok(Ok(()))
@@ -96,6 +119,39 @@ pub(super) async fn process_one(state: &AppState, owner: Uuid) -> bool {
         tracing::warn!(request_id = %task.identity.request_id, stage = "response_spool_upload", "durable response archive retry pending");
     }
     true
+}
+
+pub(super) async fn observe_claim<T>(
+    claim: impl Future<Output = Result<Option<T>, AppError>>,
+) -> Result<Option<T>, AppError> {
+    let started = tokio::time::Instant::now();
+    // Two seconds is a diagnostic threshold, NOT a cancellation deadline.
+    // A cold connection/query must be allowed to reach COMMIT/rollback.
+    let result = claim.await;
+    let elapsed = started.elapsed();
+    let outcome = match &result {
+        Ok(Some(_)) => "claimed",
+        Ok(None) => "empty",
+        Err(_) => "database_error",
+    };
+    if let Err(error) = &result {
+        // SQLx separately emits a sanitized error_kind; never echo SQL/binds.
+        tracing::warn!(
+            stage = "response_spool_claim",
+            outcome,
+            elapsed_ms = elapsed.as_millis() as u64,
+            error_category = error.diagnostic_category(),
+            "response archive claim failed"
+        );
+    } else if elapsed >= SLOW_CLAIM {
+        tracing::warn!(
+            stage = "response_spool_claim",
+            outcome,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "response archive claim completed slowly"
+        );
+    }
+    result
 }
 
 async fn upload(state: &AppState, task: &ArchiveSpoolTask) -> Result<(), AppError> {
@@ -196,5 +252,71 @@ struct AbortOnDrop(tokio::task::JoinHandle<()>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_claim_keeps_its_result_instead_of_cancelling() {
+        let (entered, entering) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let claim = tokio::spawn(observe_claim(async {
+            entered.send(()).unwrap();
+            released.await.unwrap();
+            Ok(Some(17))
+        }));
+        entering.await.unwrap();
+        tokio::time::advance(SLOW_CLAIM * 3).await;
+        assert!(!claim.is_finished(), "slow is not a cancellation deadline");
+        release.send(()).unwrap();
+        assert_eq!(claim.await.unwrap().unwrap(), Some(17));
+    }
+
+    #[tokio::test]
+    async fn empty_claim_and_database_error_remain_distinct() {
+        assert_eq!(
+            observe_claim(async { Ok::<Option<()>, _>(None) })
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            observe_claim(async { Err::<Option<()>, _>(AppError::Internal) }).await,
+            Err(AppError::Internal)
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_current_boundary_without_starting_another_claim() {
+        let (shutdown, receiver) = watch::channel(false);
+        let (entered, mut entering) = tokio::sync::mpsc::channel(1);
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let drain_release = release.clone();
+        let drain_completed = completed.clone();
+        let drain = tokio::spawn(async move {
+            drain_batch(&receiver, || async {
+                entered.send(()).await.unwrap();
+                let permit = drain_release.acquire().await.unwrap();
+                permit.forget();
+                drain_completed.fetch_add(1, Ordering::SeqCst);
+                true
+            })
+            .await;
+        });
+        entering.recv().await.unwrap();
+        shutdown.send(true).unwrap();
+        assert_eq!(completed.load(Ordering::SeqCst), 0);
+        release.add_permits(1);
+        drain.await.unwrap();
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        assert_eq!(entering.recv().await, None);
     }
 }
