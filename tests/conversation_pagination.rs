@@ -168,6 +168,30 @@ async fn observe_request(
     (request_id, cluster_id)
 }
 
+fn assert_pending_accounting_is_unknown(view: &Value, source: &str) {
+    assert!(view["completed_at"].is_null(), "{source}: {view}");
+    for field in [
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_write_tokens",
+        "output_tokens",
+        "cost",
+        "currency",
+    ] {
+        assert!(view[field].is_null(), "{source}.{field}: {view}");
+    }
+    assert_eq!(
+        view["usage"],
+        json!({"tokens": null, "generation": null}),
+        "{source}: {view}"
+    );
+    assert_eq!(
+        view["billing"],
+        json!({"billable": true, "cost": null, "currency": null}),
+        "{source}: {view}"
+    );
+}
+
 #[tokio::test]
 async fn declared_execution_metadata_is_bounded_persisted_and_projected() {
     let fixture = Fixture::new("execution-metadata").await;
@@ -993,6 +1017,64 @@ async fn conversation_and_unlinked_session_detail_preserve_completion_timestamps
         archive.request.source_completed_at,
         Some(source_completed_at)
     );
+}
+
+#[tokio::test]
+async fn pending_accounting_is_consistent_across_request_and_session_views() {
+    let fixture = Fixture::new("pending-accounting-contract").await;
+    let (request_id, cluster_id) = observe_request(
+        &fixture.state,
+        &fixture.key,
+        &json!({"input": [{"role": "user", "content": "pending accounting"}]}),
+        &ConversationHints::default(),
+        "Codex",
+    )
+    .await;
+
+    let (status, request_list) = fixture.get("/self/v1/requests?limit=10").await;
+    assert_eq!(status, StatusCode::OK, "{request_list}");
+    let listed = request_list
+        .as_array()
+        .expect("request list")
+        .iter()
+        .find(|request| request["request_id"] == request_id.to_string())
+        .expect("pending listed request");
+
+    let (status, request_detail) = fixture
+        .get(&format!("/self/v1/requests/{request_id}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{request_detail}");
+
+    let (status, conversation) = fixture
+        .get(&format!("/self/v1/conversations/{cluster_id}?limit=10"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{conversation}");
+    let conversation_request = conversation["requests"]
+        .as_array()
+        .expect("conversation requests")
+        .iter()
+        .find(|request| request["request_id"] == request_id.to_string())
+        .expect("pending conversation request");
+
+    let (status, session) = fixture
+        .get(&format!("/self/v1/sessions/{cluster_id}?limit=10"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{session}");
+    let session_request = session["requests"]
+        .as_array()
+        .expect("session requests")
+        .iter()
+        .find(|request| request["request_id"] == request_id.to_string())
+        .expect("pending logical-session request");
+
+    for (source, view) in [
+        ("request_list", listed),
+        ("request_detail", &request_detail),
+        ("conversation_detail", conversation_request),
+        ("logical_session_detail", session_request),
+    ] {
+        assert_pending_accounting_is_unknown(view, source);
+    }
 }
 
 #[tokio::test]

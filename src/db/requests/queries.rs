@@ -1055,6 +1055,58 @@ fn request_views(rows: Vec<AnyRow>) -> Result<Vec<RequestView>, AppError> {
         .collect()
 }
 
+pub(crate) fn request_detail_accounting_projection(
+    billable: bool,
+    completed_at: Option<i64>,
+    token_values: [i64; 4],
+    cost_micros: i64,
+    persisted_currency: Option<String>,
+) -> (RequestUsageView, RequestBillingView, Option<String>) {
+    let [
+        raw_input_tokens,
+        raw_cached_input_tokens,
+        raw_cache_write_tokens,
+        raw_output_tokens,
+    ] = token_values;
+    let settled_live = billable && completed_at.is_some();
+    let imported_token = |value| (!billable && value != 0).then_some(value);
+    let input_tokens = settled_live
+        .then_some(raw_input_tokens)
+        .or_else(|| imported_token(raw_input_tokens));
+    let cached_input_tokens = settled_live.then_some(raw_cached_input_tokens);
+    let cache_write_tokens = settled_live.then_some(raw_cache_write_tokens);
+    let output_tokens = settled_live
+        .then_some(raw_output_tokens)
+        .or_else(|| imported_token(raw_output_tokens));
+    let tokens = (input_tokens.is_some()
+        || cached_input_tokens.is_some()
+        || cache_write_tokens.is_some()
+        || output_tokens.is_some())
+    .then_some(RequestTokenUsageView {
+        input_tokens,
+        cached_input_tokens,
+        cache_write_tokens,
+        output_tokens,
+    });
+    let cost = settled_live.then(|| micros_to_decimal_string(cost_micros));
+    let currency = settled_live
+        .then_some(persisted_currency)
+        .flatten()
+        .filter(|value| !value.is_empty());
+    (
+        RequestUsageView {
+            tokens,
+            generation: None,
+        },
+        RequestBillingView {
+            billable,
+            cost,
+            currency: currency.clone(),
+        },
+        currency,
+    )
+}
+
 fn request_view_from_row(row: &AnyRow) -> Result<RequestView, AppError> {
     let generation_status: Option<String> = row.try_get("generation_status")?;
     let persisted_status_code: Option<i64> = row.try_get("status_code")?;
