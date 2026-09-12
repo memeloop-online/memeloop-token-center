@@ -26,6 +26,9 @@ pub struct PluginGrant {
     /// Pins all declared providers, endpoints, schemas and UI contributions;
     /// a matching version alone is not permission to expand host surface area.
     pub manifest_digest: String,
+    /// Independently provisioned host approval, not copied from a candidate.
+    /// Pins executable bytes and the trusted installer's source/artifact receipt.
+    pub identity: super::PluginPackageIdentity,
 }
 
 pub fn manifest_digest(manifest: &super::PluginManifest) -> Result<String, AppError> {
@@ -53,6 +56,38 @@ struct Circuit {
     failures: u32,
     open_until: Option<Instant>,
     probe_active: bool,
+    epoch: Arc<()>,
+}
+
+impl Circuit {
+    fn admit(&mut self, now: Instant) -> Option<Arc<()>> {
+        if let Some(until) = self.open_until {
+            if now < until || self.probe_active {
+                return None;
+            }
+            self.probe_active = true;
+            self.epoch = Arc::new(());
+        }
+        Some(self.epoch.clone())
+    }
+
+    fn complete(&mut self, epoch: &Arc<()>, failed: bool, now: Instant) {
+        if failed {
+            // Closed-state concurrent failures count, but completions admitted
+            // before opening cannot extend or disturb an open/half-open epoch.
+            if self.open_until.is_some() && !Arc::ptr_eq(epoch, &self.epoch) {
+                return;
+            }
+            self.failures = self.failures.saturating_add(1);
+            self.probe_active = false;
+            self.epoch = Arc::new(());
+            if self.failures >= FAILURE_THRESHOLD {
+                self.open_until = Some(now + COOLDOWN);
+            }
+        } else if Arc::ptr_eq(epoch, &self.epoch) {
+            *self = Self::default();
+        }
+    }
 }
 
 pub struct RuntimeSnapshot {
@@ -86,16 +121,14 @@ impl RuntimeSnapshot {
                 || plugin.manifest.contributions.request_rewrite
         }) {
             let id = &plugin.manifest.id;
-            {
+            let epoch = {
                 let mut circuits = self.circuits.lock().map_err(|_| AppError::Internal)?;
                 let circuit = circuits.entry(id.clone()).or_default();
-                if let Some(until) = circuit.open_until {
-                    if Instant::now() < until || circuit.probe_active {
-                        return Ok(unavailable(id, "policy_circuit_open"));
-                    }
-                    circuit.probe_active = true;
-                }
-            }
+                let Some(epoch) = circuit.admit(Instant::now()) else {
+                    return Ok(unavailable(id, "policy_circuit_open"));
+                };
+                epoch
+            };
             // The legacy executor retains its typed WIT validation and resource
             // budgets. Restrict this invocation to exactly one installed plugin.
             let mut runtime = self.runtime.clone();
@@ -104,17 +137,12 @@ impl RuntimeSnapshot {
                 runtime.apply_traffic_with_config(context.clone(), &current, configurations);
             let mut circuits = self.circuits.lock().map_err(|_| AppError::Internal)?;
             let circuit = circuits.entry(id.clone()).or_default();
-            circuit.probe_active = false;
+            circuit.complete(&epoch, result.is_err(), Instant::now());
             match result {
                 Err(_) => {
-                    circuit.failures = circuit.failures.saturating_add(1);
-                    if circuit.failures >= FAILURE_THRESHOLD {
-                        circuit.open_until = Some(Instant::now() + COOLDOWN);
-                    }
                     return Ok(unavailable(id, "policy_execution_failed"));
                 }
                 Ok(next) => {
-                    *circuit = Circuit::default();
                     if !next.allow {
                         return Ok(next);
                     }
@@ -157,14 +185,14 @@ struct State {
 /// Atomic process-local revision publication. Database configuration already has
 /// independent durable CAS/idempotency. This does not claim cross-node reload.
 pub struct RuntimeRevisions {
-    grants: BTreeMap<String, PluginGrant>,
+    grants: BTreeMap<String, Vec<PluginGrant>>,
     state: RwLock<State>,
 }
 
 impl RuntimeRevisions {
     pub fn new(
         runtime: PluginRuntime,
-        grants: BTreeMap<String, PluginGrant>,
+        grants: BTreeMap<String, Vec<PluginGrant>>,
     ) -> Result<Self, AppError> {
         validate_grants(&runtime, &grants)?;
         Ok(Self {
@@ -195,6 +223,7 @@ impl RuntimeRevisions {
         validate_grants(&candidate, &self.grants)?;
         let mut state = self.state.write().map_err(|_| AppError::Internal)?;
         let revision = next_revision(&state, expected_revision)?;
+        validate_policy_transition(&state.current.runtime, &candidate)?;
         let old = state.current.runtime.clone();
         state.previous.push(old);
         if state.previous.len() > MAX_REVISIONS {
@@ -209,11 +238,35 @@ impl RuntimeRevisions {
         let revision = next_revision(&state, expected_revision)?;
         let runtime = state
             .previous
-            .pop()
+            .last()
             .ok_or_else(|| AppError::BadRequest("no previous plugin revision".into()))?;
+        validate_grants(runtime, &self.grants)?;
+        validate_policy_transition(&state.current.runtime, runtime)?;
+        let runtime = state.previous.pop().ok_or(AppError::Internal)?;
         state.current = snapshot(runtime, revision, RevisionReason::Rollback);
         Ok(state.current.receipt)
     }
+}
+
+fn validate_policy_transition(
+    current: &PluginRuntime,
+    candidate: &PluginRuntime,
+) -> Result<(), AppError> {
+    for old in current.plugins.iter() {
+        let next = candidate
+            .plugins
+            .iter()
+            .find(|plugin| plugin.manifest.id == old.manifest.id)
+            .ok_or(AppError::Forbidden)?;
+        if (old.manifest.contributions.traffic_policy
+            && !next.manifest.contributions.traffic_policy)
+            || (old.manifest.contributions.request_rewrite
+                && !next.manifest.contributions.request_rewrite)
+        {
+            return Err(AppError::Forbidden);
+        }
+    }
+    Ok(())
 }
 
 fn next_revision(state: &State, expected: u64) -> Result<u64, AppError> {
@@ -234,29 +287,82 @@ fn snapshot(runtime: PluginRuntime, revision: u64, reason: RevisionReason) -> Ar
 
 fn validate_grants(
     runtime: &PluginRuntime,
-    grants: &BTreeMap<String, PluginGrant>,
+    grants: &BTreeMap<String, Vec<PluginGrant>>,
 ) -> Result<(), AppError> {
+    // Grants describe the complete required inventory; omission is not disable.
+    if runtime.plugins.len() != grants.len() {
+        return Err(AppError::Forbidden);
+    }
     for plugin in runtime.plugins.iter() {
         let manifest = &plugin.manifest;
-        let Some(grant) = grants.get(&manifest.id) else {
+        let Some(versions) = grants.get(&manifest.id) else {
             return Err(AppError::Forbidden);
         };
-        if manifest_digest(manifest)? != grant.manifest_digest
-            || manifest.version != grant.version
-            || manifest
-                .capabilities
-                .iter()
-                .any(|capability| !grant.capabilities.contains(capability))
-        {
+        let digest = manifest_digest(manifest)?;
+        if !versions.iter().any(|grant| {
+            digest == grant.manifest_digest
+                && manifest.version == grant.version
+                && plugin.identity == grant.identity
+                && grant.identity.provenance.as_ref().is_some_and(|receipt| {
+                    receipt.format_version == 1
+                        && receipt.signature_policy == "cosign-public-key"
+                        && !receipt.source.is_empty()
+                        && valid_digest(&receipt.digest)
+                })
+                && grant
+                    .identity
+                    .component_sha256
+                    .as_ref()
+                    .is_none_or(|digest| valid_digest(digest))
+                && manifest
+                    .capabilities
+                    .iter()
+                    .all(|capability| capability_allowed(capability, &grant.capabilities))
+        }) {
             return Err(AppError::Forbidden);
         }
     }
     Ok(())
 }
 
+fn valid_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn capability_allowed(capability: &PluginCapability, grants: &[PluginCapability]) -> bool {
+    grants.iter().any(|grant| match (capability, grant) {
+        (
+            PluginCapability::Http { allowed_origins },
+            PluginCapability::Http {
+                allowed_origins: approved,
+            },
+        ) => allowed_origins
+            .iter()
+            .all(|origin| approved.contains(origin)),
+        _ => capability == grant,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn identity() -> super::super::PluginPackageIdentity {
+        super::super::PluginPackageIdentity {
+            component_sha256: None,
+            provenance: Some(super::super::PluginInstallProvenance {
+                format_version: 1,
+                source: "registry.example/plugins/policy".into(),
+                digest: format!("sha256:{}", "a".repeat(64)),
+                signature_policy: "cosign-public-key".into(),
+            }),
+        }
+    }
 
     #[test]
     fn revisions_are_atomic_pinned_and_monotonic() {
@@ -289,16 +395,19 @@ mod tests {
             version: manifest.version.clone(),
             capabilities: vec![],
             manifest_digest: manifest_digest(&manifest).unwrap(),
+            identity: identity(),
         };
         let candidate = |manifest| PluginRuntime {
             plugins: Arc::new(vec![super::super::LoadedPlugin {
                 manifest,
                 component: None,
                 configuration_validator: None,
+                identity: identity(),
             }]),
             ..PluginRuntime::default()
         };
-        let grants = BTreeMap::from([("policy".into(), grant)]);
+        let grants = BTreeMap::from([("policy".into(), vec![grant])]);
+        assert!(validate_grants(&PluginRuntime::default(), &grants).is_err());
         assert!(validate_grants(&candidate(manifest.clone()), &grants).is_ok());
         let mut changed = manifest.clone();
         changed.version = "1.0.1".into();
@@ -309,5 +418,42 @@ mod tests {
         let mut changed = manifest;
         changed.contributions.traffic_policy = true;
         assert!(validate_grants(&candidate(changed), &grants).is_err());
+    }
+
+    #[test]
+    fn stale_success_cannot_clear_new_failures_or_steal_half_open_probe() {
+        let now = Instant::now();
+        let mut circuit = Circuit::default();
+        let stale = circuit.admit(now).unwrap();
+        for _ in 0..3 {
+            let token = circuit.admit(now).unwrap();
+            circuit.complete(&token, true, now);
+        }
+        circuit.complete(&stale, false, now);
+        assert!(circuit.admit(now).is_none());
+        let probe = circuit.admit(now + COOLDOWN).unwrap();
+        circuit.complete(&stale, false, now + COOLDOWN);
+        assert!(circuit.admit(now + COOLDOWN).is_none());
+        circuit.complete(&probe, false, now + COOLDOWN);
+        assert!(circuit.admit(now + COOLDOWN).is_some());
+    }
+
+    #[test]
+    fn http_capability_origins_are_a_subset_not_vector_equality() {
+        let allowed = vec![PluginCapability::Http {
+            allowed_origins: vec!["https://a.example".into(), "https://b.example".into()],
+        }];
+        assert!(capability_allowed(
+            &PluginCapability::Http {
+                allowed_origins: vec!["https://b.example".into()]
+            },
+            &allowed
+        ));
+        assert!(!capability_allowed(
+            &PluginCapability::Http {
+                allowed_origins: vec!["https://c.example".into()]
+            },
+            &allowed
+        ));
     }
 }
