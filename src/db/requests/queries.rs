@@ -465,37 +465,46 @@ fn build_request_list_query(
         "SELECT id, created_at, completed_at, source_completed_at, protocol, model, upstream_account_id, route_id, status_code, generation_status, duration_ms, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, billed_units, billing_unit, cost_micros, currency, billable, error_code, archive_state, archive_reason, session_id, session_association, session_name, task_kind, agent_id, semantics_source, tenant_external_id, credential_key_id, key_alias, principal_external_id FROM (SELECT * FROM (SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, CAST(NULL AS TEXT) AS generation_status, r.duration_ms, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.input_tokens END AS input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cached_input_tokens END AS cached_input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cache_write_tokens END AS cache_write_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.output_tokens END AS output_tokens, CAST(NULL AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cost_micros END AS cost_micros, CASE WHEN r.completed_at IS NULL THEN NULL ELSE NULLIF(r.currency, '') END AS currency, CAST(1 AS BIGINT) AS billable, r.error_code, CASE WHEN r.request_object LIKE 'gap://%' THEN 'gap' ELSE COALESCE(spool.state, CASE WHEN r.completed_at IS NULL THEN 'capturing' WHEN r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END) END AS archive_state, CASE WHEN COALESCE(spool.state, '') = 'gap' THEN spool.last_error_code WHEN r.completed_at IS NOT NULL AND (r.response_object IS NULL OR r.response_object LIKE 'gap://%') THEN 'archive_object_unavailable' ELSE NULL END AS archive_reason, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source",
     );
     push_identity_projection(&mut query, scope, "r");
-    query.push(" FROM request_records r");
-    push_operator_identity_joins(&mut query, scope, "r", filter);
-    query.push(" LEFT JOIN conversation_observations observation ON observation.request_id = r.id AND observation.key_id = r.key_id AND observation.cluster_id = r.conversation_cluster_id");
-    query.push(" LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id");
+    query.push(" FROM (SELECT r.* FROM request_records r");
+    push_identity_filter_joins(&mut query, "r", filter);
     query.push(" WHERE 1 = 1");
+    push_identity_eligibility(&mut query, scope, "r");
     push_request_record_filters(&mut query, scope, filter);
     query.push(" ORDER BY r.created_at DESC, r.id DESC LIMIT ");
     query.bind_i64(page_limit);
+    query.push(") r");
+    push_operator_identity_joins(&mut query, scope, "r", &RequestListFilter::default());
+    query.push(" LEFT JOIN conversation_observations observation ON observation.request_id = r.id AND observation.key_id = r.key_id AND observation.cluster_id = r.conversation_cluster_id");
+    query.push(" LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id");
     query.push(") AS request_page");
 
     if generation_branch_can_match(filter) {
         query.push(" UNION ALL SELECT * FROM (SELECT g.id, g.created_at, g.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, 'generation' AS protocol, g.public_model AS model, g.upstream_account_id, g.model_route_id AS route_id, CAST(NULL AS BIGINT) AS status_code, g.status AS generation_status, CASE WHEN g.completed_at IS NULL THEN NULL ELSE g.completed_at - g.created_at END AS duration_ms, CAST(NULL AS BIGINT) AS input_tokens, CAST(NULL AS BIGINT) AS cached_input_tokens, CAST(NULL AS BIGINT) AS cache_write_tokens, CAST(NULL AS BIGINT) AS output_tokens, facts.billed_units, NULLIF(facts.billing_unit, '') AS billing_unit, facts.cost_micros, NULLIF(facts.currency, '') AS currency, CAST(1 AS BIGINT) AS billable, g.error_code, CASE WHEN g.status IN ('preparing', 'queued') THEN 'pending' WHEN g.status IN ('submitting', 'running', 'cancelling') THEN 'uploading' WHEN g.request_object LIKE 'gap://%' OR (g.status = 'succeeded' AND g.result_json IS NULL) THEN 'gap' ELSE 'bound' END AS archive_state, CASE WHEN g.request_object LIKE 'gap://%' OR (g.status = 'succeeded' AND g.result_json IS NULL) THEN 'archive_object_unavailable' ELSE NULL END AS archive_reason, CAST(NULL AS TEXT) AS session_id, CAST(NULL AS TEXT) AS session_association, CAST(NULL AS TEXT) AS session_name, CAST(NULL AS TEXT) AS task_kind, CAST(NULL AS TEXT) AS agent_id, CAST(NULL AS TEXT) AS semantics_source");
         push_identity_projection(&mut query, scope, "g");
-        query.push(" FROM generation_jobs g LEFT JOIN generation_stats_facts facts ON facts.job_id = g.id AND facts.tenant_id = g.tenant_id AND facts.key_id = g.key_id");
-        push_operator_identity_joins(&mut query, scope, "g", filter);
+        query.push(" FROM (SELECT g.* FROM generation_jobs g LEFT JOIN generation_stats_facts facts ON facts.job_id = g.id AND facts.tenant_id = g.tenant_id AND facts.key_id = g.key_id");
+        push_identity_filter_joins(&mut query, "g", filter);
         query.push(" WHERE 1 = 1");
+        push_identity_eligibility(&mut query, scope, "g");
         push_generation_job_filters(&mut query, scope, filter);
         query.push(" ORDER BY g.created_at DESC, g.id DESC LIMIT ");
         query.bind_i64(page_limit);
+        query.push(") g LEFT JOIN generation_stats_facts facts ON facts.job_id = g.id AND facts.tenant_id = g.tenant_id AND facts.key_id = g.key_id");
+        push_operator_identity_joins(&mut query, scope, "g", &RequestListFilter::default());
         query.push(") AS generation_page");
     }
 
     if archive_branch_can_match(filter) {
         query.push(" UNION ALL SELECT * FROM (SELECT u.archive_request_id AS id, u.source_started_at AS created_at, CAST(NULL AS BIGINT) AS completed_at, u.source_completed_at, u.protocol, u.model, CAST(NULL AS TEXT) AS upstream_account_id, CAST(NULL AS TEXT) AS route_id, u.status_code, CAST(NULL AS TEXT) AS generation_status, u.duration_ms, NULLIF(u.input_tokens, 0) AS input_tokens, CAST(NULL AS BIGINT) AS cached_input_tokens, CAST(NULL AS BIGINT) AS cache_write_tokens, NULLIF(u.output_tokens, 0) AS output_tokens, CAST(NULL AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit, CAST(NULL AS BIGINT) AS cost_micros, CAST(NULL AS TEXT) AS currency, CAST(0 AS BIGINT) AS billable, u.error_code, CASE WHEN u.request_object IS NULL OR u.request_object LIKE 'gap://%' OR u.response_object IS NULL OR u.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, CASE WHEN u.request_object IS NULL OR u.request_object LIKE 'gap://%' OR u.response_object IS NULL OR u.response_object LIKE 'gap://%' THEN 'archive_object_unavailable' ELSE NULL END AS archive_reason, u.conversation_cluster_id AS session_id, 'unlinked' AS session_association, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source");
         push_identity_projection(&mut query, scope, "u");
-        query.push(" FROM session_archive_unlinked_requests u LEFT JOIN conversation_observations observation ON observation.request_id = u.archive_request_id AND observation.key_id = u.key_id AND observation.cluster_id = u.conversation_cluster_id");
-        push_operator_identity_joins(&mut query, scope, "u", filter);
+        query.push(" FROM (SELECT u.* FROM session_archive_unlinked_requests u");
+        push_identity_filter_joins(&mut query, "u", filter);
         query.push(" WHERE 1 = 1");
+        push_identity_eligibility(&mut query, scope, "u");
         push_archive_request_filters(&mut query, scope, filter);
         query.push(" ORDER BY u.source_started_at DESC, u.archive_request_id DESC LIMIT ");
         query.bind_i64(page_limit);
+        query.push(") u LEFT JOIN conversation_observations observation ON observation.request_id = u.archive_request_id AND observation.key_id = u.key_id AND observation.cluster_id = u.conversation_cluster_id");
+        push_operator_identity_joins(&mut query, scope, "u", &RequestListFilter::default());
         query.push(") AS archive_page");
     }
 
@@ -524,9 +533,8 @@ fn push_operator_identity_joins(
     source_alias: &str,
     filter: &RequestListFilter,
 ) {
-    // Tenant isolation is enforced directly on the request/generation source below. These
-    // relations only provide searchable identity metadata; joining them on the default path
-    // prevents PostgreSQL from stopping after the first page in the ordered source index.
+    // Display-only identity joins run after the bounded source page. Filter dependencies
+    // are joined separately inside that page, so they cannot discard matches after LIMIT.
     if scope.includes_operator_identity()
         || filter_uses_key_alias(filter)
         || filter_uses_principal(filter)
@@ -543,6 +551,40 @@ fn push_operator_identity_joins(
     if scope.includes_operator_identity() || filter_uses_principal(filter) {
         query.push(" JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id");
     }
+}
+
+fn push_identity_filter_joins(
+    query: &mut PortableRequestListQuery,
+    source_alias: &str,
+    filter: &RequestListFilter,
+) {
+    // Key scope suppresses display enrichment; the UUID is unused by this join helper.
+    // Keeping ORDER/LIMIT inside the derived source prevents the planner from expanding
+    // every historical request through identity, observation and spool joins first.
+    push_operator_identity_joins(
+        query,
+        RequestListScope::Key(Uuid::nil()),
+        source_alias,
+        filter,
+    );
+}
+
+fn push_identity_eligibility(
+    query: &mut PortableRequestListQuery,
+    scope: RequestListScope<'_>,
+    source_alias: &str,
+) {
+    if !scope.includes_operator_identity() {
+        return;
+    }
+    // Historical imports need not have foreign keys. Preserve the previous inner-join
+    // eligibility before LIMIT, including for orphan rows. A scalar lookup cannot be
+    // flattened into the full-history join that caused the operator query timeout.
+    query.push(" AND (SELECT identity_key.id FROM key_records identity_key JOIN tenants identity_tenant ON identity_tenant.id = identity_key.tenant_id JOIN principals identity_principal ON identity_principal.id = identity_key.principal_id AND identity_principal.tenant_id = identity_key.tenant_id WHERE identity_key.id = ");
+    query.push(source_alias);
+    query.push(".key_id AND identity_key.tenant_id = ");
+    query.push(source_alias);
+    query.push(".tenant_id) IS NOT NULL");
 }
 
 fn push_list_scope_filter(
@@ -1708,6 +1750,10 @@ fn cursor_id(filter: &RequestListFilter) -> String {
 #[cfg(test)]
 #[path = "event_contract_tests.rs"]
 mod event_contract_tests;
+
+#[cfg(test)]
+#[path = "list_plan_tests.rs"]
+mod list_plan_tests;
 
 // Retained temporarily as historical context only. Behaviour is covered by
 // database/API integration tests; SQL-string assertions are intentionally not
