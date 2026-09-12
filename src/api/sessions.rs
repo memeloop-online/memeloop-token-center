@@ -21,6 +21,7 @@ pub(super) struct RecentSessionsQuery {
     limit: i64,
     before_last_activity_at: Option<i64>,
     before_session_id: Option<String>,
+    before_key_id: Option<Uuid>,
     key_id: Option<Uuid>,
     state: Option<String>,
     model: Option<String>,
@@ -28,15 +29,27 @@ pub(super) struct RecentSessionsQuery {
 }
 
 impl RecentSessionsQuery {
-    fn cursor(&self) -> Result<Option<(i64, String)>, AppError> {
-        match (&self.before_last_activity_at, &self.before_session_id) {
-            (None, None) => Ok(None),
-            (Some(last_activity_at), Some(session_id)) => {
+    fn cursor(&self) -> Result<Option<(i64, String, String)>, AppError> {
+        match (
+            &self.before_last_activity_at,
+            &self.before_session_id,
+            &self.before_key_id,
+        ) {
+            (None, None, None) => Ok(None),
+            (Some(last_activity_at), Some(session_id), key_id) => {
                 validate_session_id(session_id)?;
-                Ok(Some((*last_activity_at, session_id.clone())))
+                // Legacy two-field cursors have no stable position among rows
+                // that share the same activity time and session id across
+                // keys. Resume before a sentinel above every canonical UUID:
+                // this may repeat the boundary row once, but cannot silently
+                // skip an unseen key. Every newly issued cursor is complete.
+                let key_id = key_id
+                    .map(|key_id| key_id.to_string())
+                    .unwrap_or_else(|| "~".to_owned());
+                Ok(Some((*last_activity_at, session_id.clone(), key_id)))
             }
             _ => Err(AppError::BadRequest(
-                "before_last_activity_at and before_session_id must be supplied together".into(),
+                "before_last_activity_at and before_session_id must be supplied together; before_key_id is optional only for legacy cursors".into(),
             )),
         }
     }
@@ -179,6 +192,7 @@ fn session_list_response(
         LogicalSessionListCursor {
             before_last_activity_at: oldest.last_activity_at,
             before_session_id: oldest.session_id.clone(),
+            before_key_id: oldest.key_id,
         }
     });
     LogicalSessionListResponse {

@@ -37,6 +37,7 @@ function sessionsPath(tenant: string, filters: SessionFilters, before?: LogicalS
   if (before) {
     params.set('before_last_activity_at', String(before.before_last_activity_at));
     params.set('before_session_id', before.before_session_id);
+    params.set('before_key_id', before.before_key_id);
   }
   return `/internal/v1/sessions?${params}`;
 }

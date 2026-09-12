@@ -3368,12 +3368,16 @@ paths:
           schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
         - name: before_last_activity_at
           in: query
-          description: Exclusive descending cursor; must be paired with `before_session_id`.
+          description: Exclusive descending cursor; must be paired with `before_session_id`. New cursors also include `before_key_id`.
           schema: { type: integer, format: int64 }
         - name: before_session_id
           in: query
           description: Exclusive descending cursor; must be paired with `before_last_activity_at`.
           schema: { type: string, minLength: 1, maxLength: 80 }
+        - name: before_key_id
+          in: query
+          description: Final key tie-breaker for new cursors. May be omitted only when resuming a legacy two-field cursor, which can repeat its boundary row rather than skip data.
+          schema: { type: string, format: uuid }
         - name: key_id
           in: query
           schema: { type: string, format: uuid }
@@ -4126,12 +4130,16 @@ paths:
           schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
         - name: before_last_activity_at
           in: query
-          description: Exclusive descending cursor; must be paired with `before_session_id`.
+          description: Exclusive descending cursor; must be paired with `before_session_id`. New cursors also include `before_key_id`.
           schema: { type: integer, format: int64 }
         - name: before_session_id
           in: query
           description: Exclusive descending cursor; must be paired with `before_last_activity_at`.
           schema: { type: string, minLength: 1, maxLength: 80 }
+        - name: before_key_id
+          in: query
+          description: Final key tie-breaker for new cursors. May be omitted only when resuming a legacy two-field cursor, which can repeat its boundary row rather than skip data.
+          schema: { type: string, format: uuid }
         - name: state
           in: query
           schema: { type: string, enum: [all, active, has_errors], default: all }
@@ -7502,10 +7510,11 @@ components:
     LogicalSessionListCursor:
       type: object
       additionalProperties: false
-      required: [before_last_activity_at, before_session_id]
+      required: [before_last_activity_at, before_session_id, before_key_id]
       properties:
         before_last_activity_at: { type: integer, format: int64 }
         before_session_id: { type: string, minLength: 1, maxLength: 80 }
+        before_key_id: { type: string, format: uuid }
     LogicalSessionListResponse:
       type: object
       additionalProperties: false

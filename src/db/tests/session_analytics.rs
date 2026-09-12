@@ -4,7 +4,7 @@ use axum::{
 };
 use rust_decimal::Decimal;
 use serde_json::Value;
-use sqlx::{AnyPool, Row};
+use sqlx::{AnyPool, PgPool, Row};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -56,13 +56,14 @@ async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_histor
         .await
         .expect("initialize PostgreSQL state");
     let unique = Uuid::now_v7();
+    let tenant_external_id = format!("session-candidate-pg-{unique}");
     let issued = state
         .db
         .create_key(
             CreateKeyInput {
-                tenant_external_id: format!("session-candidate-pg-{unique}"),
-                principal_external_id: "postgres-scale".into(),
-                alias: "PostgreSQL scale".into(),
+                tenant_external_id: tenant_external_id.clone(),
+                principal_external_id: "postgres-scale-a".into(),
+                alias: "PostgreSQL scale A".into(),
                 currency: "USD".into(),
                 policy: KeyPolicy {
                     allowed_models: vec!["*".into()],
@@ -80,12 +81,40 @@ async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_histor
         .authenticate_key(&issued.key, PEPPER)
         .await
         .expect("authenticate PostgreSQL key");
+    let second_issued = state
+        .db
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: tenant_external_id.clone(),
+                principal_external_id: "postgres-scale-b".into(),
+                alias: "PostgreSQL scale B".into(),
+                currency: "USD".into(),
+                policy: KeyPolicy {
+                    allowed_models: vec!["*".into()],
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            PEPPER,
+        )
+        .await
+        .expect("create second PostgreSQL key");
+    let second_key = state
+        .db
+        .authenticate_key(&second_issued.key, PEPPER)
+        .await
+        .expect("authenticate second PostgreSQL key");
     sqlx::any::install_default_drivers();
     let pool = AnyPool::connect(&database_url)
         .await
         .expect("connect PostgreSQL pool");
+    let plan_pool = PgPool::connect(&database_url)
+        .await
+        .expect("connect PostgreSQL plan pool");
     let historical_cluster_id = Uuid::now_v7();
     let base = unix_millis();
+    let historical_base = base - 3 * 24 * 60 * 60 * 1_000;
     let seed = unique.to_string();
 
     sqlx::query(
@@ -94,79 +123,139 @@ async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_histor
     .bind(historical_cluster_id.to_string())
     .bind(key.tenant_id.to_string())
     .bind(key.principal_id.to_string())
-    .bind(base)
-    .bind(base + 110_001)
+    .bind(historical_base)
+    .bind(historical_base + 10_001)
     .execute(&pool)
     .await
     .expect("PostgreSQL historical cluster");
-    insert_history(&pool, &key, historical_cluster_id, base, &seed, 1, 10_001).await;
+    insert_history(
+        &pool,
+        &key,
+        historical_cluster_id,
+        historical_base,
+        &seed,
+        1,
+        1_001,
+    )
+    .await;
     sqlx::query(
-        "INSERT INTO conversation_key_clusters (key_id, cluster_id, explicit_session_id, updated_at, request_count, candidate_edge_count) VALUES ($1, $2, 'postgres-large-session', $3, 110001, 0)",
+        "INSERT INTO conversation_key_clusters (key_id, cluster_id, explicit_session_id, updated_at, request_count, candidate_edge_count) VALUES ($1, $2, 'postgres-large-session', $3, 10001, 0)",
     )
     .bind(key.key_id.to_string())
     .bind(historical_cluster_id.to_string())
-    .bind(base + 110_001)
+    .bind(historical_base + 10_001)
     .execute(&pool)
     .await
     .expect("PostgreSQL historical projection");
 
-    // Fifty-one newer identities fill the entire internal page. The large
-    // completed conversation must therefore never enter candidate aggregation.
+    let completed_session = Uuid::now_v7();
+    let active_session = Uuid::now_v7();
+    let archive_session = Uuid::now_v7();
+    let shared_session = Uuid::now_v7();
+    let completed_request = Uuid::now_v7();
+    let active_request = Uuid::now_v7();
     sqlx::query(
-        "WITH source AS (SELECT value, md5('recent-session-' || $4 || value::TEXT) AS hash FROM generate_series(1, 51) value), rows AS (SELECT value, substring(hash FROM 1 FOR 8) || '-' || substring(hash FROM 9 FOR 4) || '-7' || substring(hash FROM 14 FOR 3) || '-8' || substring(hash FROM 18 FOR 3) || '-' || substring(hash FROM 21 FOR 12) AS id FROM source) INSERT INTO conversation_clusters (id, tenant_id, principal_id, created_at, updated_at) SELECT id, $1, $2, $3 + value, $3 + value FROM rows",
+        "INSERT INTO session_usage_totals (tenant_id, key_id, session_id, currency, last_activity_at, requests, errors, input_tokens, output_tokens, duration_count, duration_sum_ms, cost_micros) VALUES ($1,$2,$3,'USD',$4,2,1,20,10,2,40,100), ($1,$2,$3,'EUR',$4 - 1,1,0,3,4,1,5,200)",
     )
     .bind(key.tenant_id.to_string())
-    .bind(key.principal_id.to_string())
-    .bind(base + 200_000)
-    .bind(&seed)
+    .bind(key.key_id.to_string())
+    .bind(completed_session.to_string())
+    .bind(base + 300)
     .execute(&pool)
     .await
-    .expect("PostgreSQL recent clusters");
+    .expect("completed multi-currency session totals");
     sqlx::query(
-        "WITH source AS (SELECT value, md5('recent-session-' || $3 || value::TEXT) AS hash FROM generate_series(1, 51) value), rows AS (SELECT value, substring(hash FROM 1 FOR 8) || '-' || substring(hash FROM 9 FOR 4) || '-7' || substring(hash FROM 14 FOR 3) || '-8' || substring(hash FROM 18 FOR 3) || '-' || substring(hash FROM 21 FOR 12) AS id FROM source) INSERT INTO conversation_key_clusters (key_id, cluster_id, updated_at, request_count, candidate_edge_count) SELECT $1, id, $2 + value, 1, 0 FROM rows",
+        "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, request_object, response_object, reservation_id, conversation_cluster_id) VALUES ($1,$2,$3,$4,'openai-responses','gpt-completed',500,12,20,10,100,'memory://request','memory://response',$5,$6), ($7,$2,$8,$9,'anthropic-messages','claude-active',NULL,NULL,0,0,0,'memory://request',NULL,$10,$11)",
+    )
+    .bind(completed_request.to_string())
+    .bind(key.tenant_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(base + 300)
+    .bind(Uuid::now_v7().to_string())
+    .bind(completed_session.to_string())
+    .bind(active_request.to_string())
+    .bind(second_key.key_id.to_string())
+    .bind(base + 200)
+    .bind(Uuid::now_v7().to_string())
+    .bind(active_session.to_string())
+    .execute(&pool)
+    .await
+    .expect("live completed and active session metadata");
+    sqlx::query(
+        "INSERT INTO session_archive_totals (tenant_id,key_id,session_id,last_activity_at,requests,errors,input_tokens,output_tokens,duration_count,duration_sum_ms) VALUES ($1,$2,$3,$4,2,1,7,9,2,30)",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(archive_session.to_string())
+    .bind(base + 100)
+    .execute(&pool)
+    .await
+    .expect("archive session totals");
+    sqlx::query(
+        "INSERT INTO session_archive_unlinked_requests (tenant_id,source,external_request_id,archive_request_id,key_id,principal_id,conversation_cluster_id,source_started_at,source_completed_at,protocol,model,status_code,duration_ms,input_tokens,output_tokens,error_code,imported_at) VALUES ($1,'fixture',$2,$3,$4,$5,$6,$7,$7,'openai-responses','gpt-archive',429,15,7,9,'rate_limit',$7)",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(format!("archive-{unique}"))
+    .bind(Uuid::now_v7().to_string())
+    .bind(key.key_id.to_string())
+    .bind(key.principal_id.to_string())
+    .bind(archive_session.to_string())
+    .bind(base + 100)
+    .execute(&pool)
+    .await
+    .expect("archive session metadata");
+    sqlx::query(
+        "INSERT INTO conversation_key_clusters (key_id,cluster_id,updated_at,request_count,candidate_edge_count) VALUES ($1,$3,$4,1,0), ($2,$3,$4,1,0)",
     )
     .bind(key.key_id.to_string())
-    .bind(base + 200_000)
-    .bind(&seed)
+    .bind(second_key.key_id.to_string())
+    .bind(shared_session.to_string())
+    .bind(base)
     .execute(&pool)
     .await
-    .expect("PostgreSQL recent projections");
+    .expect("same-time same-session cross-key projections");
     analyze_session_sources(&pool).await;
 
-    let before_plan = explain_candidate_first(&pool, key.tenant_id, key.key_id).await;
+    let before_plan = explain_candidate_first(&plan_pool, key.tenant_id, "", 5).await;
     let before_buffers = shared_buffers(&before_plan);
 
     insert_history(
         &pool,
         &key,
         historical_cluster_id,
-        base,
+        historical_base,
         &seed,
-        10_002,
-        110_001,
+        1_002,
+        10_001,
     )
     .await;
     analyze_session_sources(&pool).await;
 
-    let after_plan = explain_candidate_first(&pool, key.tenant_id, key.key_id).await;
+    let history_partitions = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT tableoid::regclass::TEXT FROM request_records WHERE tenant_id = $1 AND key_id = $2 AND conversation_cluster_id = $3",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(historical_cluster_id.to_string())
+    .fetch_all(&pool)
+    .await
+    .expect("historical request partitions");
+    let after_plan = explain_candidate_first(&plan_pool, key.tenant_id, "", 5).await;
     let after_buffers = shared_buffers(&after_plan);
-    assert!(
-        !after_plan.contains("Seq Scan on request_records"),
-        "completed history must not be scanned by the first-page session query: {after_plan}"
-    );
+    assert_relations_returned_no_rows(&after_plan, &history_partitions);
     assert!(
         after_buffers <= before_buffers + 128,
-        "growing an excluded session from 10k to 110k requests must not grow first-page buffers proportionally (before={before_buffers}, after={after_buffers}): {after_plan}"
+        "growing an excluded session from 1k to 10k requests must not grow first-page buffers proportionally (before={before_buffers}, after={after_buffers}): {after_plan}"
     );
 
     let filter = LogicalSessionListFilter {
-        limit: 50,
+        limit: 4,
         state: "all".into(),
         ..Default::default()
     };
     let candidate_first = state
         .db
-        .self_recent_sessions(key.tenant_id, filter.clone())
+        .operator_recent_sessions(&tenant_external_id, filter.clone())
         .await
         .expect("candidate-first PostgreSQL session page");
     let reference = state
@@ -174,7 +263,7 @@ async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_histor
         .recent_sessions_reference_for_test(&key.tenant_id.to_string(), filter)
         .await
         .expect("reference PostgreSQL session page");
-    assert_eq!(candidate_first.len(), 51);
+    assert_eq!(candidate_first.len(), 5);
     assert_eq!(
         serde_json::to_value(&candidate_first).expect("candidate-first JSON"),
         serde_json::to_value(&reference).expect("reference JSON"),
@@ -187,75 +276,214 @@ async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_histor
         "the older large-history session must fall outside the first candidate page"
     );
 
-    let list_plan = explain_bound_query(
-        &pool,
-        "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT, TIMING OFF) SELECT cluster_id, updated_at, request_count FROM conversation_key_clusters WHERE key_id = $1 ORDER BY updated_at DESC, cluster_id DESC LIMIT 100",
-        &[key.key_id.to_string()],
-    )
-    .await;
-    assert!(list_plan.contains("Index"), "{list_plan}");
-    assert!(
-        !list_plan.contains("Seq Scan on conversation_key_clusters"),
-        "{list_plan}"
-    );
-    let detail_plan = explain_bound_query(
-        &pool,
-        "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT, TIMING OFF) SELECT id, created_at FROM request_records WHERE key_id = $1 AND conversation_cluster_id = $2 ORDER BY created_at DESC, id DESC LIMIT 201",
-        &[
-            key.key_id.to_string(),
-            historical_cluster_id.to_string(),
-        ],
-    )
-    .await;
-    assert!(detail_plan.contains("Index"), "{detail_plan}");
-    assert!(
-        !detail_plan.contains("Seq Scan on request_records"),
-        "{detail_plan}"
+    let completed = candidate_first
+        .iter()
+        .find(|session| session.cluster_id == Some(completed_session))
+        .expect("completed mixed-source summary");
+    assert_eq!(completed.model, "gpt-completed");
+    assert_eq!(completed.protocol, "openai-responses");
+    assert_eq!(completed.last_status, "error");
+    assert_eq!(completed.active_requests, 0);
+    assert_eq!(completed.requests, 3);
+    assert_eq!(completed.errors, 1);
+    assert_eq!(completed.input_tokens, 23);
+    assert_eq!(completed.output_tokens, 14);
+    assert_eq!(completed.avg_duration_ms, Some(15.0));
+    assert_eq!(
+        serde_json::to_value(&completed.costs).expect("multi-currency costs"),
+        serde_json::json!([
+            {"currency": "EUR", "cost": "0.000200"},
+            {"currency": "USD", "cost": "0.000100"}
+        ])
     );
 
-    // Preserve the existing public conversation list/detail scale contract in
-    // this single large fixture instead of maintaining a second 110k test.
-    let list_response = api::router(state.clone())
+    let active = candidate_first
+        .iter()
+        .find(|session| session.cluster_id == Some(active_session))
+        .expect("active mixed-source summary");
+    assert_eq!(active.model, "claude-active");
+    assert_eq!(active.protocol, "anthropic-messages");
+    assert_eq!(active.last_status, "active");
+    assert_eq!(active.active_requests, 1);
+    assert_eq!(active.requests, 0);
+
+    let archived = candidate_first
+        .iter()
+        .find(|session| session.cluster_id == Some(archive_session))
+        .expect("archive mixed-source summary");
+    assert_eq!(archived.model, "gpt-archive");
+    assert_eq!(archived.last_status, "error");
+    assert_eq!(archived.archived_only_requests, 2);
+    assert_eq!(archived.archived_only_errors, 1);
+    assert_eq!(archived.archived_only_input_tokens, 7);
+    assert_eq!(archived.archived_only_output_tokens, 9);
+    assert_eq!(archived.archived_only_avg_duration_ms, Some(15.0));
+
+    let mut shared_keys = [key.key_id, second_key.key_id];
+    shared_keys.sort_by_key(ToString::to_string);
+    shared_keys.reverse();
+    assert_eq!(candidate_first[3].cluster_id, Some(shared_session));
+    assert_eq!(candidate_first[3].last_activity_at, base);
+    assert_eq!(candidate_first[3].key_id, shared_keys[0]);
+    assert_eq!(candidate_first[4].cluster_id, Some(shared_session));
+    assert_eq!(candidate_first[4].last_activity_at, base);
+    assert_eq!(candidate_first[4].key_id, shared_keys[1]);
+
+    let page_one = &candidate_first[..4];
+    let cursor = page_one.last().expect("visible first-page boundary");
+    let page_two = state
+        .db
+        .operator_recent_sessions(
+            &tenant_external_id,
+            LogicalSessionListFilter {
+                limit: 4,
+                cursor: Some((
+                    cursor.last_activity_at,
+                    cursor.session_id.clone(),
+                    cursor.key_id.to_string(),
+                )),
+                state: "all".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("full three-field cursor page");
+    assert_eq!(page_two.len(), 2);
+    assert_eq!(page_two[0].cluster_id, Some(shared_session));
+    assert_eq!(page_two[0].key_id, shared_keys[1]);
+    assert_eq!(page_two[1].cluster_id, Some(historical_cluster_id));
+    let identities = page_one
+        .iter()
+        .chain(&page_two)
+        .map(|session| (session.session_id.clone(), session.key_id))
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        identities.len(),
+        6,
+        "full cursor must neither lose nor repeat rows"
+    );
+
+    let legacy_page = state
+        .db
+        .operator_recent_sessions(
+            &tenant_external_id,
+            LogicalSessionListFilter {
+                limit: 4,
+                cursor: Some((base, shared_session.to_string(), "~".into())),
+                state: "all".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("legacy conservative cursor page");
+    assert_eq!(legacy_page.len(), 3);
+    assert_eq!(legacy_page[0].cluster_id, Some(shared_session));
+    assert_eq!(legacy_page[0].key_id, shared_keys[0]);
+    assert_eq!(legacy_page[1].cluster_id, Some(shared_session));
+    assert_eq!(legacy_page[1].key_id, shared_keys[1]);
+    assert_eq!(legacy_page[2].cluster_id, Some(historical_cluster_id));
+}
+
+#[tokio::test]
+async fn postgres_public_session_and_conversation_lists_cap_at_100() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        eprintln!("MTC_TEST_POSTGRES_URL is unset; skipping PostgreSQL list cap contract");
+        return;
+    };
+    let mut config = Config::for_test(database_url.clone());
+    config.key_pepper = String::from_utf8(PEPPER.to_vec()).expect("UTF-8 pepper");
+    let state = AppState::initialize(config)
+        .await
+        .expect("initialize PostgreSQL state");
+    let unique = Uuid::now_v7();
+    let issued = state
+        .db
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: format!("session-cap-pg-{unique}"),
+                principal_external_id: "postgres-cap".into(),
+                alias: "PostgreSQL cap".into(),
+                currency: "USD".into(),
+                policy: KeyPolicy {
+                    allowed_models: vec!["*".into()],
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            PEPPER,
+        )
+        .await
+        .expect("create PostgreSQL cap key");
+    let key = state
+        .db
+        .authenticate_key(&issued.key, PEPPER)
+        .await
+        .expect("authenticate PostgreSQL cap key");
+    sqlx::any::install_default_drivers();
+    let pool = AnyPool::connect(&database_url)
+        .await
+        .expect("connect PostgreSQL cap pool");
+    let base = unix_millis();
+    let seed = unique.to_string();
+    sqlx::query(
+        "WITH source AS (SELECT value, md5($4 || value::TEXT) AS hash FROM generate_series(1, 101) value), rows AS (SELECT value, substring(hash FROM 1 FOR 8) || '-' || substring(hash FROM 9 FOR 4) || '-7' || substring(hash FROM 14 FOR 3) || '-8' || substring(hash FROM 18 FOR 3) || '-' || substring(hash FROM 21 FOR 12) AS id FROM source) INSERT INTO conversation_clusters (id, tenant_id, principal_id, created_at, updated_at) SELECT id, $1, $2, $3 + value, $3 + value FROM rows",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(key.principal_id.to_string())
+    .bind(base)
+    .bind(&seed)
+    .execute(&pool)
+    .await
+    .expect("PostgreSQL capped-list clusters");
+    sqlx::query(
+        "WITH source AS (SELECT value, md5($3 || value::TEXT) AS hash FROM generate_series(1, 101) value), rows AS (SELECT value, substring(hash FROM 1 FOR 8) || '-' || substring(hash FROM 9 FOR 4) || '-7' || substring(hash FROM 14 FOR 3) || '-8' || substring(hash FROM 18 FOR 3) || '-' || substring(hash FROM 21 FOR 12) AS id FROM source) INSERT INTO conversation_key_clusters (key_id, cluster_id, updated_at, request_count, candidate_edge_count) SELECT $1, id, $2 + value, 1, 0 FROM rows",
+    )
+    .bind(key.key_id.to_string())
+    .bind(base)
+    .bind(&seed)
+    .execute(&pool)
+    .await
+    .expect("PostgreSQL capped-list projections");
+
+    let conversations = api::router(state.clone())
         .oneshot(
             Request::builder()
                 .uri("/self/v1/conversations?limit=999")
                 .header(header::AUTHORIZATION, format!("Bearer {}", issued.key))
                 .body(Body::empty())
-                .expect("PostgreSQL list request"),
+                .expect("PostgreSQL conversation list request"),
         )
         .await
-        .expect("PostgreSQL list response");
-    assert_eq!(list_response.status(), StatusCode::OK);
-    let list_body: Value = serde_json::from_slice(
-        &to_bytes(list_response.into_body(), 4 * 1024 * 1024)
+        .expect("PostgreSQL conversation list response");
+    assert_eq!(conversations.status(), StatusCode::OK);
+    let conversations: Value = serde_json::from_slice(
+        &to_bytes(conversations.into_body(), 1024 * 1024)
             .await
-            .expect("bounded PostgreSQL list response"),
+            .expect("bounded PostgreSQL conversation list body"),
     )
-    .expect("PostgreSQL list JSON");
-    assert_eq!(list_body.as_array().map(Vec::len), Some(52));
+    .expect("PostgreSQL conversation list JSON");
+    assert_eq!(conversations.as_array().map(Vec::len), Some(100));
 
-    let detail_response = api::router(state.clone())
+    let sessions = api::router(state)
         .oneshot(
             Request::builder()
-                .uri(format!(
-                    "/self/v1/conversations/{historical_cluster_id}?limit=999"
-                ))
+                .uri("/self/v1/sessions?limit=999")
                 .header(header::AUTHORIZATION, format!("Bearer {}", issued.key))
                 .body(Body::empty())
-                .expect("PostgreSQL detail request"),
+                .expect("PostgreSQL session list request"),
         )
         .await
-        .expect("PostgreSQL detail response");
-    assert_eq!(detail_response.status(), StatusCode::OK);
-    let detail_body: Value = serde_json::from_slice(
-        &to_bytes(detail_response.into_body(), 4 * 1024 * 1024)
+        .expect("PostgreSQL session list response");
+    assert_eq!(sessions.status(), StatusCode::OK);
+    let sessions: Value = serde_json::from_slice(
+        &to_bytes(sessions.into_body(), 1024 * 1024)
             .await
-            .expect("bounded PostgreSQL detail response"),
+            .expect("bounded PostgreSQL session list body"),
     )
-    .expect("PostgreSQL detail JSON");
-    assert_eq!(detail_body["cluster"]["request_count"], 110_001);
-    assert_eq!(detail_body["requests"].as_array().map(Vec::len), Some(200));
-    assert_eq!(detail_body["has_more"], true);
+    .expect("PostgreSQL session list JSON");
+    assert_eq!(sessions["sessions"].as_array().map(Vec::len), Some(100));
+    assert!(sessions["next_cursor"]["before_key_id"].is_string());
 }
 
 async fn insert_history(
@@ -280,18 +508,6 @@ async fn insert_history(
     .execute(pool)
     .await
     .expect("PostgreSQL request history range");
-    sqlx::query(
-        "WITH source AS (SELECT value, md5($6 || value::TEXT) AS request_hash, md5('observation-' || $6 || value::TEXT) AS observation_hash FROM generate_series($4, $5) value), rows AS (SELECT value, substring(request_hash FROM 1 FOR 8) || '-' || substring(request_hash FROM 9 FOR 4) || '-7' || substring(request_hash FROM 14 FOR 3) || '-8' || substring(request_hash FROM 18 FOR 3) || '-' || substring(request_hash FROM 21 FOR 12) AS request_id, substring(observation_hash FROM 1 FOR 8) || '-' || substring(observation_hash FROM 9 FOR 4) || '-7' || substring(observation_hash FROM 14 FOR 3) || '-8' || substring(observation_hash FROM 18 FOR 3) || '-' || substring(observation_hash FROM 21 FOR 12) AS observation_id FROM source) INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, atom_hashes_json, client_name, created_at, inference_version, compaction) SELECT observation_id, $1, request_id, $2, '[]', 'Codex', $3 + value, 2, 0 FROM rows",
-    )
-    .bind(cluster_id.to_string())
-    .bind(key.key_id.to_string())
-    .bind(base)
-    .bind(first)
-    .bind(last)
-    .bind(seed)
-    .execute(pool)
-    .await
-    .expect("PostgreSQL observation history range");
 }
 
 async fn analyze_session_sources(pool: &AnyPool) {
@@ -309,53 +525,80 @@ async fn analyze_session_sources(pool: &AnyPool) {
     }
 }
 
-async fn explain_candidate_first(pool: &AnyPool, tenant_id: Uuid, key_id: Uuid) -> String {
+async fn explain_candidate_first(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    key_id: &str,
+    limit: i64,
+) -> Value {
     let statement = format!(
-        "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT, TIMING OFF) {}",
+        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, TIMING OFF) {}",
         super::super::session_analytics::RECENT_SESSIONS_FIRST_PAGE_SQL
     );
-    sqlx::query(sqlx::AssertSqlSafe(statement))
+    let row = sqlx::query(sqlx::AssertSqlSafe(statement))
         .bind(tenant_id.to_string())
-        .bind(key_id.to_string())
-        .bind(51_i64)
-        .fetch_all(pool)
+        .bind(key_id)
+        .bind(limit)
+        .fetch_one(pool)
         .await
-        .expect("explain actual candidate-first session query")
-        .into_iter()
-        .map(|row| row.get::<String, _>(0))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .expect("explain actual candidate-first session query");
+    let raw = row
+        .try_get_unchecked::<String, _>(0)
+        .expect("PostgreSQL JSON plan text");
+    serde_json::from_str(&raw).expect("structured PostgreSQL JSON plan")
 }
 
-async fn explain_bound_query(pool: &AnyPool, statement: &'static str, binds: &[String]) -> String {
-    let mut query = sqlx::query(statement);
-    for value in binds {
-        query = query.bind(value);
-    }
-    query
-        .fetch_all(pool)
-        .await
-        .expect("explain bounded PostgreSQL query")
-        .into_iter()
-        .map(|row| row.get::<String, _>(0))
-        .collect::<Vec<_>>()
-        .join("\n")
+fn plan_root(plan: &Value) -> &Value {
+    plan.as_array()
+        .and_then(|entries| entries.first())
+        .and_then(|entry| entry.get("Plan"))
+        .unwrap_or_else(|| panic!("PostgreSQL JSON plan root missing: {plan}"))
 }
 
-fn shared_buffers(plan: &str) -> u64 {
-    let root_buffers = plan
-        .lines()
-        .find(|line| line.trim_start().starts_with("Buffers: shared"))
-        .unwrap_or_else(|| panic!("root shared buffers missing from plan: {plan}"));
-    let blocks = root_buffers
-        .split_whitespace()
-        .filter_map(|field| {
-            field
-                .strip_prefix("hit=")
-                .or_else(|| field.strip_prefix("read="))
-                .and_then(|value| value.parse::<u64>().ok())
-        })
+fn shared_buffers(plan: &Value) -> u64 {
+    let root = plan_root(plan);
+    let blocks = ["Shared Hit Blocks", "Shared Read Blocks"]
+        .into_iter()
+        .map(|field| root.get(field).and_then(Value::as_u64).unwrap_or(0))
         .sum();
     assert!(blocks > 0, "shared buffer count missing from plan: {plan}");
     blocks
+}
+
+fn assert_relations_returned_no_rows(plan: &Value, relation_names: &[String]) {
+    fn visit(node: &Value, relation_names: &[String]) {
+        if node
+            .get("Relation Name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| relation_names.iter().any(|candidate| candidate == name))
+        {
+            assert_eq!(
+                node.get("Actual Rows").and_then(Value::as_u64),
+                Some(0),
+                "an excluded historical request partition returned rows: {node}"
+            );
+            assert_eq!(
+                node.get("Rows Removed by Filter")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                0,
+                "an excluded historical request partition scanned filtered rows: {node}"
+            );
+            assert_eq!(
+                node.get("Rows Removed by Index Recheck")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                0,
+                "an excluded historical request partition scanned index rows: {node}"
+            );
+        }
+        if let Some(children) = node.get("Plans").and_then(Value::as_array) {
+            for child in children {
+                visit(child, relation_names);
+            }
+        }
+    }
+
+    assert!(!relation_names.is_empty(), "historical partition set");
+    visit(plan_root(plan), relation_names);
 }

@@ -74,6 +74,7 @@ export function sessionsPath(before?: LogicalSessionCursor, queryText?: string) 
   if (before) {
     query.set('before_last_activity_at', String(before.before_last_activity_at));
     query.set('before_session_id', before.before_session_id);
+    query.set('before_key_id', before.before_key_id);
   }
   return `/self/v1/sessions?${query}`;
 }

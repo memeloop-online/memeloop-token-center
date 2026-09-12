@@ -12,7 +12,7 @@ use crate::model::{
 #[derive(Clone, Debug, Default)]
 pub struct LogicalSessionListFilter {
     pub limit: i64,
-    pub cursor: Option<(i64, String)>,
+    pub cursor: Option<(i64, String, String)>,
     pub key_id: Option<Uuid>,
     pub state: String,
     pub model: Option<String>,
@@ -64,7 +64,8 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
             WHERE totals.tenant_id = $1
               AND ($2 = '' OR totals.key_id = $2)
             GROUP BY totals.tenant_id, totals.key_id, totals.session_id
-            ORDER BY MAX(totals.last_activity_at) DESC, totals.session_id DESC
+            ORDER BY MAX(totals.last_activity_at) DESC, totals.session_id DESC,
+                     totals.key_id DESC
             LIMIT $3
        ), active_candidates AS MATERIALIZED (
            SELECT request.tenant_id, request.key_id,
@@ -80,7 +81,8 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
                          'unlinked:' || request.key_id)
             ORDER BY MAX(request.created_at) DESC,
                      COALESCE(request.conversation_cluster_id,
-                         'unlinked:' || request.key_id) DESC
+                         'unlinked:' || request.key_id) DESC,
+                     request.key_id DESC
             LIMIT $3
        ), projected_candidates AS MATERIALIZED (
            SELECT key_record.tenant_id, projection.key_id,
@@ -90,13 +92,14 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
              JOIN key_records key_record ON key_record.id = projection.key_id
             WHERE key_record.tenant_id = $1
               AND ($2 = '' OR projection.key_id = $2)
-            ORDER BY projection.updated_at DESC, projection.cluster_id DESC
+            ORDER BY projection.updated_at DESC, projection.cluster_id DESC,
+                     projection.key_id DESC
             LIMIT $3
        ), archived_candidates AS MATERIALIZED (
            SELECT tenant_id, key_id, session_id, last_activity_at
              FROM session_archive_totals
             WHERE tenant_id = $1 AND ($2 = '' OR key_id = $2)
-            ORDER BY last_activity_at DESC, session_id DESC
+            ORDER BY last_activity_at DESC, session_id DESC, key_id DESC
             LIMIT $3
        ), candidate_activity AS (
            SELECT * FROM completed_candidates
@@ -108,7 +111,7 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
                   MAX(last_activity_at) AS last_activity_at
              FROM candidate_activity
             GROUP BY tenant_id, key_id, session_id
-            ORDER BY MAX(last_activity_at) DESC, session_id DESC
+            ORDER BY MAX(last_activity_at) DESC, session_id DESC, key_id DESC
             LIMIT $3
        ), completed AS (
            SELECT totals.tenant_id, totals.key_id, totals.session_id,
@@ -427,8 +430,8 @@ impl Database {
         let limit = filter.limit.clamp(1, 100) + 1;
         let key_id = filter.key_id.map(|id| id.to_string()).unwrap_or_default();
         let has_cursor = filter.cursor.is_some();
-        let (before_last_activity_at, before_session_id) =
-            filter.cursor.unwrap_or((-1, String::new()));
+        let (before_last_activity_at, before_session_id, before_key_id) =
+            filter.cursor.unwrap_or((-1, String::new(), String::new()));
         let model = filter.model.unwrap_or_default();
         let query = search_prefix(filter.query.as_deref());
         let use_candidate_first_page = should_use_candidate_first_page(
@@ -547,8 +550,9 @@ impl Database {
                ), recent AS (
                    SELECT * FROM filterable
                     WHERE $4 < 0 OR last_activity_at < $4
-                       OR (last_activity_at = $4 AND session_id < $5)
-                    ORDER BY last_activity_at DESC, session_id DESC
+                       OR (last_activity_at = $4 AND (session_id < $5
+                           OR (session_id = $5 AND key_id < $9)))
+                    ORDER BY last_activity_at DESC, session_id DESC, key_id DESC
                     LIMIT $3
                ), latest_ids AS MATERIALIZED (
                    SELECT recent.key_id, recent.session_id,
@@ -706,7 +710,8 @@ impl Database {
                 .bind(&before_session_id)
                 .bind(&filter.state)
                 .bind(&model)
-                .bind(&query);
+                .bind(&query)
+                .bind(&before_key_id);
         }
         let rows = session_query.fetch_all(&self.pool).await?;
         let mut sessions = BTreeMap::<(String, String), SessionAccumulator>::new();

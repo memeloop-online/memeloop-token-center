@@ -829,15 +829,19 @@ async fn logical_session_api_is_stable_key_scoped_and_cursor_paginated() {
 
     let (status, first_page) = fixture.get("/self/v1/sessions?limit=1").await;
     assert_eq!(status, StatusCode::OK, "{first_page}");
-    let first_page = first_page["sessions"].as_array().expect("session list");
-    assert_eq!(first_page.len(), 1);
-    assert_eq!(first_page[0]["key_id"], fixture.key.key_id.to_string());
-    assert_eq!(first_page[0]["active_requests"], 1);
-    let cursor_at = first_page[0]["last_activity_at"].as_i64().unwrap();
-    let cursor_session = first_page[0]["session_id"].as_str().unwrap();
+    let cursor = first_page["next_cursor"]
+        .as_object()
+        .expect("full session cursor");
+    let cursor_at = cursor["before_last_activity_at"].as_i64().unwrap();
+    let cursor_session = cursor["before_session_id"].as_str().unwrap();
+    let cursor_key = cursor["before_key_id"].as_str().unwrap();
+    let first_sessions = first_page["sessions"].as_array().expect("session list");
+    assert_eq!(first_sessions.len(), 1);
+    assert_eq!(first_sessions[0]["key_id"], fixture.key.key_id.to_string());
+    assert_eq!(first_sessions[0]["active_requests"], 1);
     let (status, second_page) = fixture
         .get(&format!(
-            "/self/v1/sessions?limit=1&before_last_activity_at={cursor_at}&before_session_id={cursor_session}"
+            "/self/v1/sessions?limit=1&before_last_activity_at={cursor_at}&before_session_id={cursor_session}&before_key_id={cursor_key}"
         ))
         .await;
     assert_eq!(status, StatusCode::OK, "{second_page}");
@@ -846,6 +850,17 @@ async fn logical_session_api_is_stable_key_scoped_and_cursor_paginated() {
         .expect("second session page");
     assert_eq!(second_page.len(), 1);
     assert_ne!(second_page[0]["session_id"], cursor_session);
+
+    let (legacy_status, legacy_page) = fixture
+        .get(&format!(
+            "/self/v1/sessions?limit=1&before_last_activity_at={cursor_at}&before_session_id={cursor_session}"
+        ))
+        .await;
+    assert_eq!(legacy_status, StatusCode::OK, "{legacy_page}");
+    assert_eq!(
+        legacy_page["sessions"][0]["session_id"], cursor_session,
+        "a legacy cursor repeats its boundary instead of skipping a tied key"
+    );
 
     let (status, detail) = fixture
         .get(&format!("/self/v1/sessions/{first_cluster}"))
