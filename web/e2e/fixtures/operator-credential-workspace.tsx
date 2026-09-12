@@ -2,12 +2,27 @@ import { useState } from 'react';
 import { createRoot } from 'react-dom/client';
 
 import { I18nProvider } from '../../src/i18n';
-import { CredentialsPage } from '../../src/operator/pages/ManagementPages';
+import { CredentialsPage, ServiceCredentialsPage } from '../../src/operator/pages/ManagementPages';
 
-type Scenario = 'all-tenants' | 'route-failure' | 'scope-race' | 'scope-lock';
+type Scenario = 'all-tenants' | 'route-failure' | 'scope-race' | 'scope-lock' | 'client-recovery' | 'service-plaintext' | 'service-scope-aba';
+
+interface RecordedRequest {
+  method: string;
+  path: string;
+  cache?: RequestCache;
+  credentials?: RequestCredentials;
+  referrerPolicy?: ReferrerPolicy;
+  hasSignal: boolean;
+}
 
 interface FixtureState {
   calls: string[];
+  requests: RecordedRequest[];
+  releaseIssue: (token: string) => void;
+  releaseCredentialScopeA: () => void;
+  releaseCredentialCursor: () => void;
+  createdObjectUrls: string[];
+  revokedObjectUrls: string[];
 }
 
 declare global {
@@ -18,7 +33,41 @@ const parameters = new URLSearchParams(location.search);
 const scenario = (parameters.get('scenario') ?? 'all-tenants') as Scenario;
 const initialTenant = scenario === 'all-tenants' ? '' : 'tenant-a';
 
-window.credentialFixture = { calls: [] };
+const pendingIssues: Array<(response: Response) => void> = [];
+const pendingCredentialScopeA: Array<(response: Response) => void> = [];
+const pendingCredentialCursor: Array<(response: Response) => void> = [];
+window.credentialFixture = {
+  calls: [],
+  requests: [],
+  createdObjectUrls: [],
+  revokedObjectUrls: [],
+  releaseIssue(token) {
+    const resolve = pendingIssues.shift();
+    if (!resolve) throw new Error('no pending service credential issuance');
+    resolve(json({ token }));
+  },
+  releaseCredentialScopeA() {
+    const resolve = pendingCredentialScopeA.shift();
+    if (!resolve) throw new Error('no pending tenant-a credential page');
+    resolve(json([credential('Scope A client', 'tenant-a', 'key-a')]));
+  },
+  releaseCredentialCursor() {
+    const resolve = pendingCredentialCursor.shift();
+    if (!resolve) throw new Error('no pending tenant-b credential cursor');
+    resolve(json([credential('Scope B older client', 'tenant-b', 'scope-b-001')]));
+  },
+};
+
+if (scenario === 'service-plaintext') {
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
+  document.execCommand = () => { throw new Error('fixture clipboard failure'); };
+  URL.createObjectURL = () => {
+    const url = `blob:credential-fixture-${window.credentialFixture.createdObjectUrls.length + 1}`;
+    window.credentialFixture.createdObjectUrls.push(url);
+    return url;
+  };
+  URL.revokeObjectURL = (url) => { window.credentialFixture.revokedObjectUrls.push(url); };
+}
 
 function json(value: unknown, status = 200) {
   return new Response(JSON.stringify(value), {
@@ -76,12 +125,43 @@ function limitSnapshot(keyId: string) {
   };
 }
 
-globalThis.fetch = async (input: RequestInfo | URL) => {
+globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = new URL(typeof input === 'string' ? input : input.toString(), location.origin);
   const call = `${url.pathname}${url.search}`;
+  const method = init?.method ?? 'GET';
   window.credentialFixture.calls.push(call);
+  window.credentialFixture.requests.push({
+    method,
+    path: call,
+    cache: init?.cache,
+    credentials: init?.credentials,
+    referrerPolicy: init?.referrerPolicy,
+    hasSignal: Boolean(init?.signal),
+  });
   if (url.pathname === '/internal/v1/schemas') {
-    return json({ key_create: { type: 'object', properties: {} }, key_policy: { type: 'object', properties: {} } });
+    return json({
+      key_create: { type: 'object', properties: {} },
+      key_policy: { type: 'object', properties: {} },
+      service_token: { type: 'object', properties: {} },
+    });
+  }
+  if (url.pathname === '/internal/v1/service-tokens' && method === 'POST') {
+    // Deliberately ignore AbortSignal so the component, rather than the mock,
+    // must fence a response from an old tenant/auth epoch.
+    return new Promise<Response>((resolve) => pendingIssues.push(resolve));
+  }
+  if (url.pathname === '/internal/v1/service-tokens') return json([{
+    service_id: 'service-existing',
+    name: 'Existing service credential',
+    credential_generation: 1,
+    fingerprint: 'fixture-fingerprint',
+    scopes: ['keys:read'],
+    tenant_external_id: initialTenant || 'tenant-a',
+    status: 'active',
+    created_at: 1_700_000_000_000,
+  }]);
+  if (url.pathname === '/internal/v1/keys/key-recovery/credential-recovery/copy' && method === 'POST') {
+    return json({ key_id: 'key-recovery', credential_generation: 1, key: 'mts_client_recovered' });
   }
   if (url.pathname.endsWith('credential-groups') || url.pathname.endsWith('route-groups')) return json([]);
   if (url.pathname === '/internal/v1/model-routes') {
@@ -90,26 +170,24 @@ globalThis.fetch = async (input: RequestInfo | URL) => {
   }
   if (url.pathname === '/internal/v1/keys') {
     const tenant = url.searchParams.get('tenant_external_id');
+    if (scenario === 'client-recovery') return json([{
+      ...credential('Recoverable client', 'tenant-a', 'key-recovery'),
+      credential_recovery_available: true,
+    }]);
     if (scenario === 'all-tenants') return json([credential('All tenant client', 'tenant-visible', 'key-all')]);
     if ((scenario === 'scope-race' || scenario === 'scope-lock') && tenant === 'tenant-a') {
       // Deliberately ignore the aborted signal.  The component must reject this
       // stale result instead of releasing the active tenant-b request.
-      return new Promise((resolve) => window.setTimeout(() => resolve(json([
-        credential('Scope A client', 'tenant-a', 'key-a'),
-      ])), scenario === 'scope-lock' ? 500 : 240));
+      return new Promise<Response>((resolve) => pendingCredentialScopeA.push(resolve));
     }
     if (scenario === 'scope-race' && tenant === 'tenant-b') {
-      return new Promise((resolve) => window.setTimeout(() => resolve(json([
-        credential('Scope B client', 'tenant-b', 'key-b'),
-      ])), 40));
+      return json([credential('Scope B client', 'tenant-b', 'key-b')]);
     }
     if (scenario === 'scope-lock' && tenant === 'tenant-b') {
       if (url.searchParams.has('before_id')) {
-        return new Promise((resolve) => window.setTimeout(() => resolve(json([
-          credential('Scope B older client', 'tenant-b', 'scope-b-001'),
-        ])), 700));
+        return new Promise<Response>((resolve) => pendingCredentialCursor.push(resolve));
       }
-      return new Promise((resolve) => window.setTimeout(() => resolve(json(credentialPage('Scope B', 101))), 20));
+      return json(credentialPage('Scope B', 101));
     }
     return json([credential('Route failure client', 'tenant-a', 'key-route-failure')]);
   }
@@ -119,6 +197,13 @@ globalThis.fetch = async (input: RequestInfo | URL) => {
 
 function Fixture() {
   const [tenant, setTenant] = useState(initialTenant);
+  if (scenario === 'service-plaintext' || scenario === 'service-scope-aba') {
+    return <>
+      {scenario === 'service-scope-aba' && <button type="button" onClick={() => setTenant((current) => current === 'tenant-a' ? 'tenant-b' : 'tenant-a')}>Switch tenant</button>}
+      <span>Tenant {tenant}</span>
+      <ServiceCredentialsPage token="mts_fixture" tenant={tenant} />
+    </>;
+  }
   return <>
     {(scenario === 'scope-race' || scenario === 'scope-lock') && <button type="button" onClick={() => setTenant('tenant-b')}>Switch tenant</button>}
     <CredentialsPage token="mts_fixture" tenant={tenant} />

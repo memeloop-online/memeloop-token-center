@@ -1335,8 +1335,34 @@ mod tests {
             .await
             .unwrap();
         assert!(listed[0].credential_recovery_available);
+        let scope_denied_actor = Uuid::now_v7();
+        assert!(matches!(
+            database
+                .copy_key_credential(
+                    issued.key_id,
+                    pepper,
+                    Some(scope_denied_actor),
+                    Some("credential-recovery"),
+                    false,
+                )
+                .await,
+            Err(AppError::Forbidden)
+        ));
+        let tenant_denied_actor = Uuid::now_v7();
+        assert!(matches!(
+            database
+                .copy_key_credential(
+                    issued.key_id,
+                    pepper,
+                    Some(tenant_denied_actor),
+                    Some("another-tenant"),
+                    true,
+                )
+                .await,
+            Err(AppError::Forbidden)
+        ));
         let copied = database
-            .copy_key_credential(issued.key_id, pepper, None)
+            .copy_key_credential(issued.key_id, pepper, None, None, true)
             .await
             .unwrap();
         assert_eq!(copied.key, issued.key);
@@ -1377,6 +1403,35 @@ mod tests {
                 .unwrap()
                 .is_none()
         }));
+        let access_audit = sqlx::query(
+            "SELECT tenant_id, outcome, actor_service_id FROM key_credential_recovery_access_audit WHERE key_id = $1 ORDER BY created_at, id",
+        )
+        .bind(issued.key_id.to_string())
+        .fetch_all(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(access_audit.len(), 3);
+        let mut outcomes = access_audit
+            .iter()
+            .map(|row| row.try_get::<String, _>("outcome").unwrap())
+            .collect::<Vec<_>>();
+        outcomes.sort();
+        assert_eq!(outcomes, ["retrieved", "scope_denied", "tenant_denied"]);
+        assert!(
+            access_audit
+                .iter()
+                .all(|row| { !row.try_get::<String, _>("tenant_id").unwrap().is_empty() })
+        );
+        assert_eq!(
+            access_audit
+                .iter()
+                .filter(|row| row
+                    .try_get::<Option<String>, _>("actor_service_id")
+                    .unwrap()
+                    .is_none())
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1414,7 +1469,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             database
-                .copy_key_credential(issued.key_id, pepper, None)
+                .copy_key_credential(issued.key_id, pepper, None, None, true)
                 .await,
             Err(AppError::NotFound)
         ));
@@ -1434,7 +1489,7 @@ mod tests {
             .await
             .unwrap();
         let copied = database
-            .copy_key_credential(issued.key_id, pepper, None)
+            .copy_key_credential(issued.key_id, pepper, None, None, true)
             .await
             .unwrap();
         assert_eq!(copied.key, issued.key);
@@ -1446,7 +1501,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             database
-                .copy_key_credential(issued.key_id, pepper, None)
+                .copy_key_credential(issued.key_id, pepper, None, None, true)
                 .await,
             Err(AppError::Forbidden)
         ));
@@ -1460,6 +1515,18 @@ mod tests {
         .try_get("count")
         .unwrap();
         assert_eq!(remaining, 0);
+        let mut access_outcomes = sqlx::query(
+            "SELECT outcome FROM key_credential_recovery_access_audit WHERE key_id = $1",
+        )
+        .bind(issued.key_id.to_string())
+        .fetch_all(&database.pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.try_get::<String, _>("outcome").unwrap())
+        .collect::<Vec<_>>();
+        access_outcomes.sort();
+        assert_eq!(access_outcomes, ["inactive", "retrieved", "unavailable"]);
     }
 
     #[tokio::test]
@@ -1526,7 +1593,7 @@ mod tests {
         assert_eq!(authenticated.policy.requests_per_minute, 60);
         assert_eq!(
             database
-                .copy_key_credential(issued.key_id, pepper, None)
+                .copy_key_credential(issued.key_id, pepper, None, None, true)
                 .await
                 .unwrap()
                 .key,
