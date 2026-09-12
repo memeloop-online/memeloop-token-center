@@ -32,6 +32,15 @@ canonical request is rejected. Secret values are never returned after issuance.
 
 ## Provider accounts and routes
 
+Experimental application plugin publication is documented separately in
+[the draft runtime contract](plugin-runtime-application-draft.md). Its three
+`/internal/v1/plugin-runtime/*` POST operations are global `plugins:write`
+management only and require both the compile-time experimental feature and
+host-provisioned inventory opt-in. They are not enabled in the production binary.
+Candidate requests accept opaque preinstalled inventory IDs, never package URLs,
+paths, Wasm or grants. Publish and rollback use revision CAS and idempotency;
+rollback always creates a new revision. This draft must not ship with #64/#65/#66.
+
 One provider account may use an API credential, native OAuth, plugin-provided
 authorization or no credential. Its authentication method is metadata, not a
 separate resource type. Inactive records remain readable for audit but cannot be

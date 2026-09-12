@@ -360,7 +360,8 @@ async fn postgres_two_appstates_cas_idempotency_missed_notifications_and_replay(
     let pool = sqlx::AnyPool::connect(&url).await.unwrap();
     // UUID is namespace isolation only, never a concurrency scheduling input.
     let schema = format!("plugin_revision_test_{}", uuid::Uuid::now_v7().simple());
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+    // SQL identifier consists solely of the fixed prefix and UUID hex digits.
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
         .execute(&pool)
         .await
         .unwrap();
@@ -370,7 +371,7 @@ async fn postgres_two_appstates_cas_idempotency_missed_notifications_and_replay(
         .append_pair("options", &format!("-c search_path={schema}"));
     let directory = tempfile::tempdir().unwrap();
     exercise_authority(isolated.to_string(), directory.path(), true).await;
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&pool)
         .await
         .unwrap();
