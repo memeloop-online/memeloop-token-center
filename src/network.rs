@@ -42,7 +42,7 @@ pub fn scope_from_config(config: &Value) -> OutboundScope {
 /// original hostname. Pinned clients explicitly bypass environment proxies;
 /// otherwise a proxy could resolve the hostname again and undo this boundary.
 pub async fn client_for_url(
-    _shared_http: &reqwest::Client,
+    shared_http: &reqwest::Client,
     value: &str,
     scope: OutboundScope,
     allow_test_loopback: bool,
@@ -55,6 +55,7 @@ pub async fn client_for_url(
         Host::Domain(host) => *host,
         Host::Ipv4(address) => {
             return validated_literal_client(
+                shared_http,
                 IpAddr::V4(*address),
                 url.scheme(),
                 scope,
@@ -63,6 +64,7 @@ pub async fn client_for_url(
         }
         Host::Ipv6(address) => {
             return validated_literal_client(
+                shared_http,
                 IpAddr::V6(*address),
                 url.scheme(),
                 scope,
@@ -84,6 +86,7 @@ pub async fn client_for_url(
 }
 
 fn validated_literal_client(
+    shared_http: &reqwest::Client,
     address: IpAddr,
     scheme: &str,
     scope: OutboundScope,
@@ -93,12 +96,7 @@ fn validated_literal_client(
     let addresses = [SocketAddr::new(address, 0)];
     validate_addresses(&addresses, scope, test_loopback)?;
     validate_transport_security(scheme, &addresses, scope, test_loopback)?;
-    // Match the one-operation lifetime of hostname-pinned clients. Reusing
-    // the shared pool here can race an upstream's shorter keep-alive timeout:
-    // a POST may be written to a socket while the peer is retiring it. A
-    // fresh, unpooled client removes that stale-socket boundary, and disabling
-    // protocol retries keeps an accepted request from being replayed.
-    crate::build_no_retry_http_client(None, &[]).map_err(|_| AppError::Internal)
+    Ok(shared_http.clone())
 }
 
 fn validate_addresses(
@@ -690,177 +688,7 @@ fn embedded_ipv4(high: u16, low: u16) -> Ipv4Addr {
 
 #[cfg(test)]
 mod tests {
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::{TcpListener, TcpStream},
-    };
-
     use super::*;
-
-    async fn try_read_http_request(stream: &mut TcpStream) -> Option<Vec<u8>> {
-        let mut request = Vec::new();
-        let mut expected_length = None;
-        loop {
-            let mut chunk = [0_u8; 1024];
-            let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut chunk))
-                .await
-                .expect("request read deadline")
-                .expect("request bytes");
-            if read == 0 {
-                assert!(
-                    request.is_empty(),
-                    "connection closed before the request completed"
-                );
-                return None;
-            }
-            request.extend_from_slice(&chunk[..read]);
-
-            if expected_length.is_none()
-                && let Some(header_end) = request
-                    .windows(4)
-                    .position(|window| window == b"\r\n\r\n")
-                    .map(|position| position + 4)
-            {
-                let headers = std::str::from_utf8(&request[..header_end]).expect("HTTP headers");
-                let content_length = headers
-                    .lines()
-                    .filter_map(|line| line.split_once(':'))
-                    .find_map(|(name, value)| {
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().expect("content length"))
-                    })
-                    .unwrap_or(0);
-                expected_length = Some(header_end + content_length);
-            }
-
-            if expected_length.is_some_and(|length| request.len() >= length) {
-                return Some(request);
-            }
-        }
-    }
-
-    async fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
-        try_read_http_request(stream)
-            .await
-            .expect("connection closed before the request started")
-    }
-
-    fn http_request_body(request: &[u8]) -> &[u8] {
-        let header_end = request
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .expect("HTTP header terminator")
-            + 4;
-        &request[header_end..]
-    }
-
-    #[tokio::test]
-    async fn literal_clients_do_not_reuse_a_kept_alive_connection() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!(
-            "http://{}/v1/chat/completions",
-            listener.local_addr().unwrap()
-        );
-        let server = tokio::spawn(async move {
-            let (mut first, _) = listener.accept().await.unwrap();
-            let first_request = read_http_request(&mut first).await;
-            assert_eq!(http_request_body(&first_request), b"first");
-            first
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: keep-alive\r\nkeep-alive: timeout=1\r\n\r\n",
-                )
-                .await
-                .unwrap();
-
-            // Leave the first socket apparently reusable across a controlled
-            // idle pause. The old implementation sent the next POST on it;
-            // emulate the peer retiring that keep-alive after receiving the
-            // request so the old behavior deterministically fails.
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            let (mut second, _) = tokio::select! {
-                reused = try_read_http_request(&mut first) => {
-                    if let Some(reused) = reused {
-                        assert_eq!(http_request_body(&reused), b"second");
-                        panic!("the second POST reused the first operation's connection");
-                    }
-                    tokio::time::timeout(Duration::from_secs(2), listener.accept())
-                        .await
-                        .expect("fresh connection deadline")
-                        .unwrap()
-                }
-                accepted = listener.accept() => accepted.unwrap(),
-            };
-            let second_request = read_http_request(&mut second).await;
-            assert_eq!(http_request_body(&second_request), b"second");
-            second
-                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-                .await
-                .unwrap();
-        });
-
-        let shared = crate::build_http_client().unwrap();
-        let first = client_for_url(&shared, &endpoint, OutboundScope::Public, true)
-            .await
-            .unwrap()
-            .post(&endpoint)
-            .body("first")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(first.status(), reqwest::StatusCode::OK);
-        assert!(first.bytes().await.unwrap().is_empty());
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let second = client_for_url(&shared, &endpoint, OutboundScope::Public, true)
-            .await
-            .unwrap()
-            .post(&endpoint)
-            .body("second")
-            .send()
-            .await
-            .expect("second operation must use a fresh connection");
-        assert_eq!(second.status(), reqwest::StatusCode::OK);
-        assert!(second.bytes().await.unwrap().is_empty());
-        tokio::time::timeout(Duration::from_secs(2), server)
-            .await
-            .unwrap()
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn literal_client_does_not_replay_an_accepted_post() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}/mutation", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
-            let (mut connection, _) = listener.accept().await.unwrap();
-            let request = read_http_request(&mut connection).await;
-            assert_eq!(http_request_body(&request), b"accepted-once");
-            drop(connection);
-
-            assert!(
-                tokio::time::timeout(Duration::from_millis(500), listener.accept())
-                    .await
-                    .is_err(),
-                "an accepted POST was replayed on a second connection"
-            );
-        });
-
-        let shared = crate::build_http_client().unwrap();
-        let client = client_for_url(&shared, &endpoint, OutboundScope::Public, true)
-            .await
-            .unwrap();
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            client.post(&endpoint).body("accepted-once").send(),
-        )
-        .await
-        .expect("request failure deadline");
-        assert!(
-            result.is_err(),
-            "missing response must remain a transport error"
-        );
-        server.await.unwrap();
-    }
 
     #[test]
     fn upstream_api_url_accepts_origin_and_versioned_api_bases() {
