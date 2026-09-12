@@ -74,10 +74,13 @@ async fn terminal_delivery_observes_sealed_spool_or_explicit_capture_gap() {
         .await;
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
         if fail_append {
-            // Synthetic storage failure only: neither upstream nor production
-            // process is killed, and healthy text must remain deliverable.
-            sqlx::query("CREATE TRIGGER reject_terminal_capture BEFORE INSERT ON response_archive_spool_chunks BEGIN SELECT RAISE(ABORT, 'injected capture failure'); END")
-                .execute(&pool).await.unwrap();
+            // A SQLite RAISE(ABORT) queues transaction rollback when SQLx drops
+            // the failed append. Under executor load that rollback can delay
+            // the gap write past its separate ACK budget, injecting two
+            // failures instead of the one this contract covers. The
+            // fixture-scoped, one-shot latch fails only the producer append and
+            // leaves gap persistence healthy.
+            crate::response_archive_spool::fail_next_append_for_test(&fixture.state);
         }
         let response = send_resilient_chat(&fixture, None, true).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -85,11 +88,16 @@ async fn terminal_delivery_observes_sealed_spool_or_explicit_capture_gap() {
         assert_eq!(body.as_ref(), payload.as_bytes());
         // No polling: receipt of terminal/EOF itself guarantees that capture
         // is no longer left as an unrecoverable "capturing" success.
-        let state: String = sqlx::query_scalar("SELECT state FROM response_archive_spools")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let (state, gap_reason): (String, Option<String>) =
+            sqlx::query_as("SELECT state, last_error_code FROM response_archive_spools")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(state, if fail_append { "gap" } else { "pending" });
+        assert_eq!(
+            gap_reason.as_deref(),
+            fail_append.then_some("capture_failed")
+        );
         upstream.verify().await;
         pool.close().await;
     }
