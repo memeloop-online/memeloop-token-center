@@ -83,6 +83,25 @@ test('shared surfaces contain long content and retain keyboard actions across lo
         }
         if (route.name === 'request-diagnostics') {
           assert.equal(await action.textContent(), 'session_'.repeat(40), `${label}: full label retained`);
+          const sessionCell = await page.locator('.request-session-cell').first().evaluate(cell => {
+            const bounds = cell.getBoundingClientRect();
+            return {
+              client: cell.clientWidth,
+              scroll: cell.scrollWidth,
+              children: [...cell.children].map(child => {
+                const childBounds = child.getBoundingClientRect();
+                return { left: childBounds.left, right: childBounds.right, text: child.textContent };
+              }),
+              left: bounds.left,
+              right: bounds.right,
+            };
+          });
+          assert.ok(sessionCell.scroll <= sessionCell.client, `${label}: session cell content contained`);
+          assert.ok(sessionCell.children.length >= 2, `${label}: session label and metadata retained`);
+          for (const child of sessionCell.children) {
+            assert.ok(child.left >= sessionCell.left && child.right <= sessionCell.right, `${label}: session child inside its table cell`);
+          }
+          assert.match(sessionCell.children.at(-1)?.text ?? '', /agent_agent_agent_/, `${label}: full agent metadata retained for copying`);
           if (theme === 'light') assert.equal(await action.evaluate(element => getComputedStyle(element).color), 'rgb(8, 121, 110)', `${label}: accessible light-theme link token`);
           if (width <= 390) assert.ok(await page.locator('.request-diagnostics .copy-control button').first().evaluate(element => element.getBoundingClientRect().height >= 44), `${label}: copy target`);
         }
