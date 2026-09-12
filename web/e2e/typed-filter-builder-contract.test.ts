@@ -14,7 +14,7 @@ test('professional request filters are schema-backed, previewed, and bound to pu
   assert.match(catalog, /valueKind === 'route' \? route\.id : route\.public_model/);
   assert.match(catalog, /route\.protocol/);
   assert.match(builder, /popover="auto"/);
-  assert.match(builder, /aria-modal="false"/);
+  assert.doesNotMatch(builder, /aria-modal=/);
   assert.match(builder, /event\.target === event\.currentTarget && event\.newState === 'closed'/);
   assert.doesNotMatch(builder, /typed-filter-overlay|aria-modal="true"/);
   assert.doesNotMatch(builder, /\/internal\/v1\/upstream-models/);
