@@ -69,7 +69,7 @@ test('request popover stays non-modal across themes, locales and widths; models 
           assert.equal(surface.modal, false);
           assert.equal(surface.backdrop, 'rgba(0, 0, 0, 0)');
           assert.equal(surface.background, theme === 'light' ? 'rgb(255, 255, 255)' : 'rgb(13, 28, 32)');
-          assert.ok(surface.left >= 0 && surface.right <= width);
+          assert.ok(surface.left >= 0 && surface.right <= width, JSON.stringify({ locale, theme, width, surface }));
           assert.equal(surface.overflow, false);
           await page.keyboard.press('Escape');
           await panel.waitFor({ state: 'detached' });
