@@ -169,13 +169,17 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
               AND archive.session_id = recent.session_id
        ), latest_ids AS MATERIALIZED (
            SELECT recent.key_id, recent.session_id,
-                  (SELECT latest.id FROM request_records latest
-                    WHERE latest.key_id = recent.key_id
-                      AND latest.conversation_cluster_id IS NOT NULL
-                      AND latest.conversation_cluster_id = recent.session_id
-                    ORDER BY latest.key_id ASC,
-                             latest.conversation_cluster_id ASC,
-                             latest.created_at DESC, latest.id DESC LIMIT 1) AS request_id,
+                  (SELECT matched.id
+                     FROM (
+                           SELECT latest.id, latest.created_at
+                             FROM request_records latest
+                            WHERE latest.key_id = recent.key_id
+                              AND latest.conversation_cluster_id IS NOT NULL
+                              AND latest.conversation_cluster_id = recent.session_id
+                           OFFSET 0
+                          ) matched
+                    ORDER BY matched.created_at DESC, matched.id DESC
+                    LIMIT 1) AS request_id,
                   (SELECT latest.archive_request_id FROM session_archive_unlinked_requests latest
                     WHERE latest.key_id = recent.key_id
                       AND latest.conversation_cluster_id = recent.session_id
@@ -184,12 +188,16 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
             WHERE recent.session_id <> 'unlinked:' || recent.key_id
            UNION ALL
            SELECT recent.key_id, recent.session_id,
-                  (SELECT latest.id FROM request_records latest
-                    WHERE latest.key_id = recent.key_id
-                      AND latest.conversation_cluster_id IS NULL
-                    ORDER BY latest.key_id ASC,
-                             latest.conversation_cluster_id ASC,
-                             latest.created_at DESC, latest.id DESC LIMIT 1),
+                  (SELECT matched.id
+                     FROM (
+                           SELECT latest.id, latest.created_at
+                             FROM request_records latest
+                            WHERE latest.key_id = recent.key_id
+                              AND latest.conversation_cluster_id IS NULL
+                           OFFSET 0
+                          ) matched
+                    ORDER BY matched.created_at DESC, matched.id DESC
+                    LIMIT 1),
                   (SELECT latest.archive_request_id FROM session_archive_unlinked_requests latest
                     WHERE latest.key_id = recent.key_id
                       AND latest.conversation_cluster_id IS NULL
@@ -563,13 +571,17 @@ impl Database {
                     LIMIT $3
                ), latest_ids AS MATERIALIZED (
                    SELECT recent.key_id, recent.session_id,
-                          (SELECT latest.id FROM request_records latest
-                            WHERE latest.key_id = recent.key_id
-                              AND latest.conversation_cluster_id IS NOT NULL
-                              AND latest.conversation_cluster_id = recent.session_id
-                            ORDER BY latest.key_id ASC,
-                                     latest.conversation_cluster_id ASC,
-                                     latest.created_at DESC, latest.id DESC LIMIT 1) AS request_id,
+                          (SELECT matched.id
+                             FROM (
+                                   SELECT latest.id, latest.created_at
+                                     FROM request_records latest
+                                    WHERE latest.key_id = recent.key_id
+                                      AND latest.conversation_cluster_id IS NOT NULL
+                                      AND latest.conversation_cluster_id = recent.session_id
+                                   OFFSET 0
+                                  ) matched
+                            ORDER BY matched.created_at DESC, matched.id DESC
+                            LIMIT 1) AS request_id,
                           (SELECT latest.archive_request_id FROM session_archive_unlinked_requests latest
                             WHERE latest.key_id = recent.key_id
                               AND latest.conversation_cluster_id = recent.session_id
@@ -578,12 +590,16 @@ impl Database {
                     WHERE recent.session_id <> 'unlinked:' || recent.key_id
                    UNION ALL
                    SELECT recent.key_id, recent.session_id,
-                          (SELECT latest.id FROM request_records latest
-                            WHERE latest.key_id = recent.key_id
-                              AND latest.conversation_cluster_id IS NULL
-                            ORDER BY latest.key_id ASC,
-                                     latest.conversation_cluster_id ASC,
-                                     latest.created_at DESC, latest.id DESC LIMIT 1),
+                          (SELECT matched.id
+                             FROM (
+                                   SELECT latest.id, latest.created_at
+                                     FROM request_records latest
+                                    WHERE latest.key_id = recent.key_id
+                                      AND latest.conversation_cluster_id IS NULL
+                                   OFFSET 0
+                                  ) matched
+                            ORDER BY matched.created_at DESC, matched.id DESC
+                            LIMIT 1),
                           (SELECT latest.archive_request_id FROM session_archive_unlinked_requests latest
                             WHERE latest.key_id = recent.key_id
                               AND latest.conversation_cluster_id IS NULL
