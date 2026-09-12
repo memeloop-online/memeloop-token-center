@@ -691,22 +691,23 @@ pub(crate) async fn refresh_managed_upstream_oauth(
     account_id: Uuid,
     idempotency_key: &str,
 ) -> Result<crate::provider::UpstreamAccountView, AppError> {
-    refresh_managed_upstream_oauth_impl(state, account_id, idempotency_key, false).await
+    refresh_managed_upstream_oauth_impl(state, account_id, idempotency_key, None).await
 }
 
 pub(crate) async fn refresh_managed_upstream_oauth_for_worker(
     state: &AppState,
     account_id: Uuid,
     idempotency_key: &str,
+    blocking: &crate::worker::BlockingTasks,
 ) -> Result<crate::provider::UpstreamAccountView, AppError> {
-    refresh_managed_upstream_oauth_impl(state, account_id, idempotency_key, true).await
+    refresh_managed_upstream_oauth_impl(state, account_id, idempotency_key, Some(blocking)).await
 }
 
 async fn refresh_managed_upstream_oauth_impl(
     state: &AppState,
     account_id: Uuid,
     idempotency_key: &str,
-    supervised: bool,
+    blocking: Option<&crate::worker::BlockingTasks>,
 ) -> Result<crate::provider::UpstreamAccountView, AppError> {
     let (driver, refresh_url) = state.db.upstream_oauth_lifecycle(account_id).await?;
     if let Some(replay) = state
@@ -825,10 +826,10 @@ async fn refresh_managed_upstream_oauth_impl(
             state.config.key_pepper.as_bytes(),
         )
         .await?;
-    if supervised {
+    if let Some(blocking) = blocking {
         // The worker owns this future: no detached model-sync survives its
         // role's shutdown/join boundary.
-        super::models::sync_upstream_models_after_refresh(state, account.id).await;
+        super::models::sync_upstream_models_after_refresh(state, account.id, Some(blocking)).await;
     } else {
         super::trigger_upstream_model_sync(state.clone(), account.id);
     }
