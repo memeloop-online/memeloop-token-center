@@ -1,5 +1,17 @@
 use super::super::*;
 
+fn health_probe_error(driver: &str, status: StatusCode) -> Option<&'static str> {
+    match status {
+        StatusCode::TOO_MANY_REQUESTS => Some("rate_limited"),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Some("authentication_failed"),
+        // This provider probes a deliberately nonexistent task without creating
+        // a billable generation. Its authenticated not-found reply is expected.
+        StatusCode::NOT_FOUND if driver == "volcengine-seedance" => None,
+        status if status.is_success() => None,
+        _ => Some("upstream_unavailable"),
+    }
+}
+
 fn upstream_health_probe_url(driver: &str, config: &Value, base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
     match driver {
@@ -64,6 +76,26 @@ pub(in crate::api) async fn probe_upstream_health(
             "status": "unhealthy",
             "error_code": "credential_invalid",
             "checked_at": unix_millis()
+        })));
+    }
+    let checked_at = unix_millis();
+    if let Some((failure, retry_at)) = state
+        .db
+        .upstream_manual_health_suppression(account_id, account.credential_generation, checked_at)
+        .await?
+    {
+        let error_code = match failure.as_str() {
+            "quota_exhausted" => "quota_exhausted",
+            "rate_limited" => "rate_limited",
+            _ => "upstream_unavailable",
+        };
+        return Ok(Json(json!({
+            "account_id": account_id,
+            "status": "unhealthy",
+            "error_code": error_code,
+            "retry_at": retry_at,
+            "source": "routing_state",
+            "checked_at": checked_at
         })));
     }
     let base_url = validate_config(&account.config)?;
@@ -142,15 +174,13 @@ pub(in crate::api) async fn probe_upstream_health(
             // bounded and prevents provider error text or secrets from being
             // copied into logs or the management response.
             let upstream_status = response.status();
-            let authentication_failed = matches!(
-                upstream_status,
-                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-            );
-            let healthy = !authentication_failed && !upstream_status.is_server_error();
+            let error_code = health_probe_error(&account.driver, upstream_status);
+            let healthy = error_code.is_none();
             Ok(Json(json!({
                 "account_id": account_id,
                 "status": if healthy { "healthy" } else { "unhealthy" },
-                "error_code": if healthy { Value::Null } else if authentication_failed { json!("authentication_failed") } else { json!("upstream_unavailable") },
+                "error_code": error_code,
+                "source": "connection_probe",
                 "upstream_status": upstream_status.as_u16(),
                 "latency_ms": latency_ms,
                 "checked_at": checked_at
@@ -171,6 +201,34 @@ mod tests {
     use serde_json::json;
 
     use super::upstream_health_probe_url;
+
+    #[test]
+    fn probe_rejections_are_not_reported_as_healthy() {
+        use super::{StatusCode, health_probe_error};
+        for (status, expected) in [
+            (200, None),
+            (302, Some("upstream_unavailable")),
+            (400, Some("upstream_unavailable")),
+            (401, Some("authentication_failed")),
+            (403, Some("authentication_failed")),
+            (404, Some("upstream_unavailable")),
+            (429, Some("rate_limited")),
+            (503, Some("upstream_unavailable")),
+        ] {
+            assert_eq!(
+                health_probe_error("openai-codex", StatusCode::from_u16(status).unwrap()),
+                expected
+            );
+        }
+        assert_eq!(
+            health_probe_error("volcengine-seedance", StatusCode::NOT_FOUND),
+            None
+        );
+        assert_eq!(
+            health_probe_error("volcengine-seedance", StatusCode::TOO_MANY_REQUESTS),
+            Some("rate_limited")
+        );
+    }
 
     #[test]
     fn codex_health_uses_the_authenticated_model_catalog_endpoint() {

@@ -56,7 +56,8 @@ test('Upstream availability shows complete account facts separately from routing
     assert.equal(await page.locator('.provider-account-metrics dd').first().textContent(), '1,234', 'account metrics must not come from the capped model snapshot');
     assert.equal(await page.getByRole('button', { name: 'Open request req-not-in-model-snapshot details' }).count(), 1, 'latest account outcomes include models outside the routing snapshot');
     assert.equal(await page.getByText('Awaiting recovery probe', { exact: true }).count(), 2, 'breaker cooldown is presented as the current routing state for each listed model');
-    assert.equal(await page.getByText('Connection unhealthy', { exact: true }).count(), 1, 'manual probe failure stays distinct from the breaker state');
+    assert.equal(await page.getByText('Upstream rate limited', { exact: true }).count(), 1, 'a 429 probe must explain rate limiting rather than claim a healthy connection');
+    assert.equal(await page.locator('.provider-manual-health .status.ok').count(), 0, 'a 429 response never receives healthy styling');
     await page.locator('.provider-attempt-link').first().click();
     assert.equal(await page.evaluate(() => window.upstreamAvailabilityFixture.openedRequestId), 'req-newest', 'a routed request result delegates to the exact request-detail drilldown');
 
