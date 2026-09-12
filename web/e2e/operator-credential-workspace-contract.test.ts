@@ -205,6 +205,8 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
       const editedMode = english ? 'metered_unlimited' : 'prepaid';
       await editMode.selectOption(editedMode);
       await edit.getByRole('button', { name: english ? 'Save' : '保存', exact: true }).click();
+      await nextPaint(client);
+      assert.deepEqual(await edit.locator('.schema-errors').allTextContents(), [], 'valid policy must submit without schema validation errors');
       await client.waitForFunction(() => window.credentialFixture.requests.some(request => request.method === 'PUT' && request.path.endsWith('/key-form/policy')));
       const policyRequest = await client.evaluate(() => window.credentialFixture.requests.find(request => request.method === 'PUT' && request.path.endsWith('/key-form/policy'))!);
       assert.equal(JSON.parse(policyRequest.body!).enforcement_mode, editedMode);
