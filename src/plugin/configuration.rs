@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, future::Future, sync::Arc, time::Instant};
+use std::{
+    collections::{BTreeMap, hash_map::DefaultHasher},
+    future::Future,
+    hash::{Hash, Hasher},
+    sync::Arc,
+    time::Instant,
+};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -10,6 +16,12 @@ use super::{
     StoredPluginConfiguration, estimated_json_bytes, plugin_configuration_schema_digest,
 };
 use crate::error::AppError;
+
+fn publication_shard(tenant_id: Uuid) -> usize {
+    let mut hash = DefaultHasher::new();
+    tenant_id.hash(&mut hash);
+    (hash.finish() % 32) as usize
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -212,20 +224,22 @@ impl PluginRuntime {
         {
             return false;
         }
+        // Publication includes a result returned without caching. Its fence
+        // must outlive any value eviction and must be checked before the byte
+        // budget fast path. Fixed shards avoid unbounded tenant tombstones.
+        let published = &mut state.published_generations[publication_shard(snapshot.tenant_id)];
+        if *published > read_generation {
+            return false;
+        }
+        *published = read_generation;
         if estimated_bytes > PLUGIN_CONFIGURATION_CACHE_BYTES {
+            state.entries.remove(&snapshot.tenant_id);
             return true;
         }
         let cache = &mut state.entries;
         cache.retain(|_, entry| {
             current_time.saturating_duration_since(entry.loaded_at) < PLUGIN_CONFIGURATION_CACHE_TTL
         });
-        // A late older read must not replace a newer already-published read.
-        if cache
-            .get(&snapshot.tenant_id)
-            .is_some_and(|entry| entry.read_generation > read_generation)
-        {
-            return false;
-        }
         cache.remove(&snapshot.tenant_id);
         loop {
             let bytes = cache.values().fold(0usize, |total, entry| {
@@ -249,7 +263,6 @@ impl PluginRuntime {
             snapshot.tenant_id,
             CachedPluginConfigurations {
                 loaded_at: read_started,
-                read_generation,
                 snapshot,
                 estimated_bytes,
             },
@@ -438,7 +451,106 @@ mod tests {
         assert_eq!(resolved.unwrap().revisions["policy"].version, 2);
         let cache = runtime.configuration_cache.read().await;
         assert_eq!(cache.read_generation, 2);
-        assert_eq!(cache.entries[&tenant].read_generation, 2);
+        assert_eq!(cache.published_generations[publication_shard(tenant)], 2);
+    }
+
+    #[tokio::test]
+    async fn publication_fence_survives_count_byte_eviction_and_uncached_results() {
+        // All completions use the same timestamp: no sleeps, TTL expiry or
+        // scheduler timing can accidentally protect the old read.
+        for mode in ["entry_count", "byte_budget", "uncached"] {
+            let runtime = runtime();
+            let tenant = Uuid::from_u128(1);
+            let instant = Instant::now();
+            let epoch = runtime.configuration_cache.read().await.epoch.clone();
+            let snapshot = |tenant_id, bytes| ResolvedTrafficSnapshot {
+                tenant_id,
+                values: BTreeMap::from([("policy".into(), Value::String("x".repeat(bytes)))]),
+                revisions: BTreeMap::new(),
+                freshness_deadline: instant + PLUGIN_CONFIGURATION_CACHE_TTL,
+            };
+            let newer_bytes = if mode == "uncached" {
+                PLUGIN_CONFIGURATION_CACHE_BYTES + 1
+            } else {
+                1024
+            };
+            assert!(
+                runtime
+                    .cache_snapshot(&epoch, 2, instant, snapshot(tenant, newer_bytes), || {
+                        instant
+                    })
+                    .await
+            );
+            match mode {
+                "entry_count" => {
+                    // Equal loaded_at values evict the lowest UUID first.
+                    for index in 0..PLUGIN_CONFIGURATION_CACHE_ENTRIES {
+                        assert!(
+                            runtime
+                                .cache_snapshot(
+                                    &epoch,
+                                    index as u64 + 3,
+                                    instant,
+                                    snapshot(Uuid::from_u128(index as u128 + 2), 1),
+                                    || instant,
+                                )
+                                .await
+                        );
+                    }
+                }
+                "byte_budget" => {
+                    assert!(
+                        runtime
+                            .cache_snapshot(
+                                &epoch,
+                                3,
+                                instant,
+                                snapshot(
+                                    Uuid::from_u128(2),
+                                    PLUGIN_CONFIGURATION_CACHE_BYTES - 100
+                                ),
+                                || instant,
+                            )
+                            .await
+                    );
+                }
+                "uncached" => {}
+                _ => unreachable!(),
+            }
+            assert!(
+                !runtime
+                    .configuration_cache
+                    .read()
+                    .await
+                    .entries
+                    .contains_key(&tenant)
+            );
+            assert!(
+                !runtime
+                    .cache_snapshot(&epoch, 1, instant, snapshot(tenant, 1), || instant)
+                    .await,
+                "old in-flight result must not be returned after {mode}"
+            );
+            assert!(
+                !runtime
+                    .cache_snapshot(
+                        &epoch,
+                        1,
+                        instant,
+                        snapshot(tenant, PLUGIN_CONFIGURATION_CACHE_BYTES + 1),
+                        || instant,
+                    )
+                    .await,
+                "oversized old result must also be rejected after {mode}"
+            );
+            runtime.invalidate_configuration_cache(None).await;
+            assert!(
+                !runtime
+                    .cache_snapshot(&epoch, 100, instant, snapshot(tenant, 1), || instant)
+                    .await,
+                "an old epoch cannot publish even a higher generation"
+            );
+        }
     }
 
     #[tokio::test]

@@ -27,8 +27,14 @@ reads, while retaining unaffected cached entries.
 Cache TTL starts **before** the database read, not when that read completes.
 Expired reads are rejected rather than receiving a new TTL on refill. Reads
 receive a checked, monotonic generation under the cache lock; older in-flight
-reads cannot replace a cache entry with a later generation even when their
-monotonic clock timestamps are identical. Generation exhaustion fails closed.
+reads cannot publish after a later generation even when their monotonic clock
+timestamps are identical. Publication high-water marks live in 32 fixed hash
+shards independently of cached values, so count/byte eviction and oversized
+uncached results cannot erase the fence. A hash collision may conservatively
+reject an older read for a different tenant; the existing one-retry limit then
+applies. This uses constant metadata space without retaining tenant tombstones.
+Generation exhaustion fails closed. Epoch invalidation still rejects every
+in-flight read holding the old epoch regardless of its generation.
 The entry-count and byte budgets include revision metadata and remain bounded.
 
 Other processes have independent cache epochs. An API update invalidates only
