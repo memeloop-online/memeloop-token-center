@@ -290,14 +290,13 @@ mod tests {
             capabilities: vec![],
             manifest_digest: manifest_digest(&manifest).unwrap(),
         };
-        let candidate = |manifest| {
-            let mut runtime = PluginRuntime::default();
-            runtime.plugins = Arc::new(vec![super::super::LoadedPlugin {
+        let candidate = |manifest| PluginRuntime {
+            plugins: Arc::new(vec![super::super::LoadedPlugin {
                 manifest,
                 component: None,
                 configuration_validator: None,
-            }]);
-            runtime
+            }]),
+            ..PluginRuntime::default()
         };
         let grants = BTreeMap::from([("policy".into(), grant)]);
         assert!(validate_grants(&candidate(manifest.clone()), &grants).is_ok());
