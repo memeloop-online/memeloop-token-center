@@ -1,0 +1,6 @@
+.plugin-ui-slot { min-inline-size: 0; max-inline-size: 100%; overflow-wrap: anywhere; }
+.plugin-ui-components { display: grid; gap: .75rem; }
+.plugin-ui-components p, .plugin-ui-components dl { margin: 0; }
+.plugin-ui-components dd { margin-inline-start: 0; font-size: 1.25em; font-weight: 600; }
+.plugin-ui-components a { color: inherit; text-decoration: underline; }
+.plugin-ui-components a:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
