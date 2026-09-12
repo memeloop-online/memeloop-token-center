@@ -1757,7 +1757,12 @@ async fn sqlite_110k_history_is_keyset_paginated_and_uses_covering_indexes() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        detail_plan.contains("request_records_conversation_time_idx"),
+        detail_plan.contains("USING COVERING INDEX request_records_session_latest_idx"),
         "{detail_plan}"
     );
+    assert!(
+        !detail_plan.contains("SCAN request_records"),
+        "{detail_plan}"
+    );
+    assert!(!detail_plan.contains("USE TEMP B-TREE"), "{detail_plan}");
 }
