@@ -419,6 +419,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "native OAuth import cohorts",
         sql: include_str!("../../../migrations/common/0078_native_oauth_import_cohorts.sql"),
     },
+    Migration {
+        version: 79,
+        name: "immutable account settlement feed",
+        sql: include_str!("../../../migrations/common/0079_account_settlement_feed.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -823,6 +828,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 78,
         name: "native OAuth import cohorts",
         sql: include_str!("../../../migrations/common/0078_native_oauth_import_cohorts.sql"),
+    },
+    Migration {
+        version: 79,
+        name: "immutable account settlement feed",
+        sql: include_str!("../../../migrations/common/0079_account_settlement_feed.sql"),
     },
 ];
 

@@ -308,6 +308,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             get(list_account_ledger),
         )
         .route(
+            "/internal/v1/accounts/{account_id}/settlements",
+            get(list_account_settlements),
+        )
+        .route(
             "/internal/v1/entitlements",
             get(list_entitlements).put(reconcile_entitlement),
         )

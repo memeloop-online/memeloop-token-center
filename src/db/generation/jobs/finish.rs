@@ -201,6 +201,11 @@ impl Database {
                     "generation job already has a different terminal result".into(),
                 ));
             }
+            super::super::super::billing::publish_generation_settlement_in_transaction(
+                &mut transaction,
+                input.job_id,
+            )
+            .await?;
             transaction.commit().await?;
             return Ok(existing_cost_micros);
         }
@@ -296,6 +301,11 @@ impl Database {
         if inserted.rows_affected() != 1 {
             return Err(AppError::Internal);
         }
+        super::super::super::billing::publish_generation_settlement_in_transaction(
+            &mut transaction,
+            input.job_id,
+        )
+        .await?;
         transaction.commit().await?;
         Ok(cost_micros)
     }

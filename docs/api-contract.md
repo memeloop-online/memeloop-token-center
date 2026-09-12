@@ -197,6 +197,33 @@ bounds. Terminal settlement records actual usage and releases unused reservation
 Async generation uses durable leases, idempotency and cancellation semantics.
 Completed assets use authorized archive URLs rather than provider URLs.
 
+### Account settlement evidence
+
+`GET /internal/v1/accounts/{account_id}/settlements` requires both `credits:read`
+and `requests:read`; tenant-scoped service credentials can read only their tenant's
+accounts. It returns `{ items, next_cursor }`, with `Cache-Control: no-store`, a
+default limit of 100 and maximum 500. Each item binds the actual usage ledger ID
+to its request/job, account, key, model, decimal cost, currency, settlement time,
+completion time and token dimensions. Bodies and reservation IDs are omitted.
+Async generation token dimensions are null.
+
+The feed covers prepaid terminal transactions published after migration 79.
+Historical terminal records are not bulk-backfilled. Metered-unlimited usage is
+not included: that path uses its separate asynchronous accounting projection.
+Consumers must not interpret an empty exact lookup as a zero-cost settlement.
+Enable consumption against a fresh account or establish an explicit cutover
+before using this feed for reconciliation.
+
+Publication increments the account row's sequence and inserts an immutable
+snapshot in the terminal transaction. This preserves account commit order even
+when timestamps arrive out of order. Rollback also rolls back the sequence;
+replay keeps the original snapshot. A split settle/finish repair publishes only
+when the terminal snapshot is complete. Read pages using the final item's paired
+`after_sequence` and `after_id`; the pair must identify an existing account row.
+`next_cursor` is null when the current page has no further rows; polling consumers
+retain the final item's cursor for their next poll. An exact `request_id` lookup
+is mutually exclusive with cursor parameters. Unknown parameters are rejected.
+
 ## History and conversations
 
 Request search accepts bounded time intervals, stable keyset cursors and exact

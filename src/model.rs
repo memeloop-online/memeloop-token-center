@@ -386,6 +386,44 @@ pub struct LedgerEntryView {
     pub created_at: i64,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountSettlementKind {
+    Text,
+    Generation,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct AccountSettlementView {
+    pub settlement_id: Uuid,
+    pub settlement_sequence: i64,
+    pub request_id: Uuid,
+    pub kind: AccountSettlementKind,
+    pub account_id: Uuid,
+    pub key_id: Uuid,
+    pub model: String,
+    pub cost: String,
+    pub currency: String,
+    pub settled_at: i64,
+    pub completed_at: i64,
+    pub input_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct AccountSettlementCursor {
+    pub after_sequence: i64,
+    pub after_id: Uuid,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct AccountSettlementPage {
+    pub items: Vec<AccountSettlementView>,
+    pub next_cursor: Option<AccountSettlementCursor>,
+}
+
 /// Stable subscription identity plus the currently effective billing-cycle
 /// entitlement. Rotating downstream credentials never changes either ID.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
