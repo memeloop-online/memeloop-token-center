@@ -29,7 +29,7 @@ test('credential mode remains editable without raw routing arrays or mobile over
     assert.equal(await mode.inputValue(), 'prepaid');
     assert.equal(await page.getByText('Unsupported field schema', { exact: false }).count(), 0);
     assert.equal(await page.locator('.schema-array').count(), 0);
-    await page.getByLabel('Alias', { exact: true }).fill('Example');
+    await page.getByRole('textbox', { name: /^Alias/ }).fill('Example');
     await page.getByLabel('Extension field').fill('retained');
     await mode.selectOption('metered_unlimited');
     await page.getByRole('button', { name: 'Create fixture' }).click();
