@@ -118,7 +118,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   } as RJSFSchema, locale) : undefined, [editing, editProvider, locale]);
   const uiSchema = {
     driver: { 'ui:widget': 'hidden' },
-    credential: { type: { 'ui:widget': 'hidden' } },
+    ...(provider?.id === 'http-json' ? { credential: { type: { 'ui:widget': 'hidden' } } } : {}),
     config: {
       oauth: { 'ui:widget': 'hidden' },
       ...(provider?.id === 'comfyui' ? {
