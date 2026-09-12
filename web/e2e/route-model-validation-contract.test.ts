@@ -1,6 +1,26 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { modelConfirmationValidity } from '../src/operator/modelConfirmation.js';
+import { catalogEvidenceVerified, modelConfirmationValidity } from '../src/operator/modelConfirmation.js';
+
+test('aggregate evidence counts candidates, not just HTTP success or returned models', () => {
+  for (const catalog of [
+    { eligible_account_count: 1, unknown_account_count: 1, stale_account_count: 0 },
+    { eligible_account_count: 2, unknown_account_count: 1, stale_account_count: 1 },
+    { eligible_account_count: 0, unknown_account_count: 0, stale_account_count: 0 },
+    { eligible_account_count: 1, unknown_account_count: 0, stale_account_count: 2 },
+  ]) {
+    for (const customConfirmed of [false, true]) for (const catalogListed of [false, true]) {
+      assert.equal(catalogEvidenceVerified(catalog), false);
+      assert.deepEqual(modelConfirmationValidity({ hasValue: true, catalogListed, customAllowed: true, customConfirmed, catalogVerified: catalogEvidenceVerified(catalog) }), {
+        needsCustomConfirmation: false, allowCustom: false, valid: false,
+      });
+    }
+  }
+  const stale = { eligible_account_count: 2, unknown_account_count: 0, stale_account_count: 2 };
+  assert.equal(catalogEvidenceVerified(stale, 2), true, 'current-generation stale snapshots remain evidence');
+  assert.equal(catalogEvidenceVerified(stale, 3), false, 'an omitted explicit candidate cannot authorize a custom bypass');
+  assert.equal(catalogEvidenceVerified(undefined), false);
+});
 
 test('unresolved catalog evidence neither accuses a model nor permits custom bypass', () => {
   for (const catalogListed of [false, true]) {

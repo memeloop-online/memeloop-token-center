@@ -5,7 +5,7 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
 
-for (const model of ['gpt-5.6-luna', 'gpt-5.6-terra']) test(`${model} waits for scoped evidence and recovers with a read-only retry`, { timeout: 30_000 }, async () => {
+for (const model of ['gpt-5.6-luna', 'gpt-5.6-terra']) for (const confirmed of [false, true]) test(`${model} with stored confirmation=${confirmed} requires resolved evidence and retains retry focus`, { timeout: 30_000 }, async () => {
   if (!existsSync(chromium.executablePath())) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
     return test.skip('Chromium is not installed');
@@ -24,7 +24,7 @@ for (const model of ['gpt-5.6-luna', 'gpt-5.6-terra']) test(`${model} waits for 
     let announceRead: (release: () => void) => void;
     const nextRead = () => new Promise<() => void>((resolve) => { announceRead = resolve; });
     let pendingRead = nextRead();
-    let response: 'ready' | 'failed' | 'empty' = 'ready';
+    let response: 'unknown' | 'ready' | 'failed' | 'empty' = 'unknown';
     await page.route('**/internal/v1/**', async (route) => {
       const request = route.request();
       if (request.method() !== 'GET') { writes.push(request.method()); return route.abort(); }
@@ -32,9 +32,13 @@ for (const model of ['gpt-5.6-luna', 'gpt-5.6-terra']) test(`${model} waits for 
       reads.push(request.url());
       await new Promise<void>((resolve) => { announceRead(resolve); });
       if (response === 'failed') return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: { message: 'Catalog temporarily unavailable' } }) });
-      return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ data: response === 'empty' ? [] : [{ id: model, protocol: 'openai', complete_coverage: true }], stale_account_count: 0 }) });
+      return route.fulfill({ contentType: 'application/json', body: JSON.stringify({
+        data: response === 'empty' || response === 'unknown' ? [] : [{ id: model, protocol: 'openai', supported_account_count: 1, eligible_account_count: 1, complete_coverage: true, context_window: null, reservation_token_bound: null }],
+        eligible_account_count: 1, unknown_account_count: response === 'unknown' ? 1 : 0,
+        stale_account_count: response === 'ready' ? 1 : 0,
+      }) });
     });
-    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/route-model-validation.html?model=${model}`);
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/route-model-validation.html?model=${model}&confirmed=${confirmed}`);
     const save = page.getByRole('button', { name: 'Save route', exact: true });
     const assertPending = async () => {
       assert.equal(await save.isDisabled(), true);
@@ -47,8 +51,25 @@ for (const model of ['gpt-5.6-luna', 'gpt-5.6-terra']) test(`${model} waits for 
     // The request is deliberately held: advancing is controlled by the test,
     // not a larger wall-clock sleep or a timing-dependent server fixture.
     (await pendingRead)();
+    const retry = page.getByRole('button', { name: 'Retry', exact: true });
+    await retry.waitFor();
+    await assertPending();
+    assert.match(await page.locator('.catalog-status').textContent() ?? '', /lack a current catalog snapshot/);
+    response = 'ready';
+    pendingRead = nextRead();
+    await retry.focus();
+    await retry.press('Enter');
+    await assertPending();
+    assert.equal(await retry.getAttribute('aria-disabled'), 'true');
+    assert.equal(await retry.evaluate(element => element === document.activeElement), true, 'retry remains focused during debounce');
+    const releaseRetry = await pendingRead;
+    await retry.press('Enter');
+    assert.equal(reads.length, 2, 'loading retry cannot issue another read');
+    releaseRetry();
     await save.waitFor();
     await page.waitForFunction(() => !document.querySelector<HTMLButtonElement>('main > button:last-of-type')?.disabled);
+    assert.equal(await retry.evaluate(element => element === document.activeElement), true, 'successful retry preserves keyboard focus');
+    assert.equal(await page.locator('[data-custom]').textContent(), 'false', 'stale listed model stays catalog-restricted');
     const picker = page.getByRole('combobox');
     await picker.focus();
     await picker.press('ArrowDown');
@@ -65,20 +86,21 @@ for (const model of ['gpt-5.6-luna', 'gpt-5.6-terra']) test(`${model} waits for 
     await page.getByRole('button', { name: 'Change account' }).click();
     await assertPending();
     (await pendingRead)();
-    const retry = page.getByRole('button', { name: 'Retry', exact: true });
     await retry.waitFor();
     await assertPending();
     response = 'empty';
     pendingRead = nextRead();
-    await retry.click();
+    await retry.focus();
+    await retry.press('Enter');
     await assertPending();
+    assert.equal(await retry.evaluate(element => element === document.activeElement), true);
     (await pendingRead)();
     const confirmation = page.locator('.custom-model-confirm input');
     await confirmation.waitFor();
     assert.equal(await save.isDisabled(), true);
     await confirmation.check();
     assert.equal(await save.isEnabled(), true);
-    assert.equal(reads.length, 3);
+    assert.equal(reads.length, 4);
     assert.deepEqual(writes, [], 'retry must never synchronize upstream catalogs or save a route');
   } finally {
     await browser.close();

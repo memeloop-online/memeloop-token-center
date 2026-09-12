@@ -13,7 +13,7 @@ function Fixture() {
   const [custom, setCustom] = useState(false);
   return <main style={{ padding: 12 }}>
     <button onClick={() => setAccount('second')}>Change account</button>
-    <UpstreamModelCombobox token="fixture" tenant="fixture" accountIds={[account]} includedProviderGroupIds={[]} excludedProviderGroupIds={[]} syncAccountIds={[account]} protocol="openai" value={value} onChange={setValue} customModelConfirmed onValidityChange={(next, allowed) => { setValid(next); setCustom(allowed); }} />
+    <UpstreamModelCombobox token="fixture" tenant="fixture" accountIds={[account]} includedProviderGroupIds={[]} excludedProviderGroupIds={[]} syncAccountIds={[account]} protocol="openai" value={value} onChange={setValue} customModelConfirmed={new URLSearchParams(location.search).get('confirmed') !== 'false'} onValidityChange={(next, allowed) => { setValid(next); setCustom(allowed); }} />
     <button disabled={!valid}>Save route</button><output data-custom>{String(custom)}</output>
   </main>;
 }
