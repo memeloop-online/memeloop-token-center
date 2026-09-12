@@ -7,7 +7,8 @@ use memeloop_token_center::{
     config::{Config, RuntimeRole},
     db::{
         CreateGroupInput, CreateKeyInput, CreateModelRouteInput, CreateServiceTokenInput,
-        CreateUpstreamAccountInput, GroupKind, NewRequest, ReplaceGroupMembersInput,
+        CreateUpstreamAccountInput, GroupKind, NewRequest, ReplaceCredentialRoutingInput,
+        ReplaceGroupMembersInput,
     },
     model::KeyPolicy,
     provider::{ModelRouteView, UpstreamCredential},
@@ -513,6 +514,27 @@ async fn route_mutations_are_scoped_optimistic_idempotent_and_history_safe() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    let grants = state
+        .db
+        .credential_routing(authenticated_key.key_id, "route-tenant-a")
+        .await
+        .unwrap();
+    let regrant = state
+        .db
+        .replace_credential_routing(
+            authenticated_key.key_id,
+            ReplaceCredentialRoutingInput {
+                tenant_external_id: "route-tenant-a".into(),
+                route_ids: vec![historical_route.id],
+                route_group_ids: vec![],
+                expected_grant_revision: grants.grant_revision,
+            },
+        )
+        .await;
+    assert!(matches!(
+        regrant,
+        Err(memeloop_token_center::error::AppError::NotFound)
+    ));
     let group = state
         .db
         .create_group(
