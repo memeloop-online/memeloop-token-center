@@ -54,5 +54,25 @@ test('advanced validation remains discoverable without losing field values or mo
       mkdirSync(artifacts, { recursive: true });
       await page.screenshot({ path: `${artifacts}/provider-form-${theme}-mobile.png`, fullPage: true });
     }
+    const editBeta = page.getByRole('button', { name: 'Edit Beta', exact: true });
+    const editValue = page.getByLabel('Edit value');
+    await editBeta.click();
+    assert.equal(await editValue.evaluate(element => document.activeElement === element), true);
+    await page.getByRole('button', { name: 'Cancel edit', exact: true }).click();
+    assert.equal(await editBeta.evaluate(element => document.activeElement === element), true);
+    await editBeta.click();
+    await page.getByRole('button', { name: 'Save edit', exact: true }).click();
+    assert.equal(await editValue.evaluate(element => document.activeElement === element), true);
+    await editValue.fill('Edited');
+    await page.getByRole('button', { name: 'Save edit', exact: true }).click();
+    await page.getByRole('button', { name: 'Reject save', exact: true }).click();
+    assert.equal(await editBeta.evaluate(element => document.activeElement === element), false);
+    await editValue.waitFor({ state: 'visible' });
+    await page.getByRole('button', { name: 'Save edit', exact: true }).click();
+    await page.getByRole('button', { name: 'Accept save and refresh rows', exact: true }).click();
+    await editValue.waitFor({ state: 'detached' });
+    assert.equal(await editBeta.isDisabled(), true);
+    await page.getByRole('button', { name: 'Finish refresh', exact: true }).click();
+    assert.equal(await editBeta.evaluate(element => document.activeElement === element), true);
   } finally { await browser.close(); await server.close(); }
 });

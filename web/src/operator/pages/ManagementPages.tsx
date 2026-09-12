@@ -31,6 +31,7 @@ import { connectionSchema, isPrivateProxyUrl, ProxyInput, UpstreamConnection } f
 import { upstreamFormTemplates } from '../UpstreamFormTemplates';
 import { upstreamAvailabilityPath, type UpstreamAvailabilityWindow } from '../upstreamAvailabilityWindow';
 import { useOperatorResource, type ResourceState } from '../hooks/useOperatorResource';
+import { useInlineEditorFocus } from '../hooks/useInlineEditorFocus';
 import { loadModelPricePages } from '../pricingLoading';
 import { enumLabel, messageOf, OneTimeSecret, queryForTenant, WriteScopeNotice } from '../scope/operatorShared';
 
@@ -66,15 +67,9 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   const [driver, setDriver] = useState('');
   const [rotating, setRotating] = useState<UpstreamAccount>();
   const [editing, setEditing] = useState<UpstreamAccount>();
-  const providerList = useRef<HTMLElement>(null);
-  useEffect(() => {
-    if (!editing) return;
-    const editor = providerList.current?.querySelector<HTMLElement>('.inline-editor');
-    editor?.scrollIntoView({ block: 'start' });
-    editor?.querySelector<HTMLInputElement>('input:not([type="hidden"]):not([disabled])')?.focus({ preventScroll: true });
-  }, [editing?.id]);
   const [reauthorizing, setReauthorizing] = useState<UpstreamAccount>();
   const [busy, setBusy] = useState('');
+  const { container: providerList, rememberTrigger } = useInlineEditorFocus(editing?.id, Boolean(busy), `${token}\0${tenant}\0${writeTenant}`);
   const [health, setHealth] = useState<Record<string, UpstreamHealth>>({});
   const [deletionReadiness, setDeletionReadiness] = useState<Record<string, UpstreamDeletionReadiness>>({});
   const [message, setMessage] = useState('');
@@ -244,7 +239,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             <span className="pill">{t('providers.routes', { count: formatNumber(value.route_count, locale) })}</span>
             <details className="upstream-secondary-actions"><summary>{t('connection.manageAccount')}</summary><div className="row-actions">
               {providerAvailable && <>
-                <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setEditing(value)}>{t('providers.edit')}</button>
+                <button type="button" className="secondary" data-inline-edit-trigger={value.id} disabled={!manageable || Boolean(busy)} onClick={(event) => { rememberTrigger(value.id, event.currentTarget); setEditing(value); }}>{t('providers.edit')}</button>
                 <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void checkHealth(value)}>{t('providers.runManualHealthCheck')}</button>
                 {value.can_refresh && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void refreshOAuth(value)}>{t('providers.refreshAuthorization')}</button>}
                 {value.can_reauthorize && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setReauthorizing(value)}>{t('providers.reauthorize')}</button>}
