@@ -15,6 +15,9 @@ pub(in crate::api::proxy) struct CodexRuntimeTransportPolicy {
     pub(in crate::api::proxy) shared_probe_attempts: u32,
     pub(in crate::api::proxy) source: &'static str,
     pub(in crate::api::proxy) version: u32,
+    connect_timeout: std::time::Duration,
+    read_timeout: std::time::Duration,
+    request_timeout: std::time::Duration,
 }
 
 #[derive(Clone, Copy)]
@@ -23,6 +26,12 @@ struct CodexAttemptContext {
     candidate_rank: usize,
     outbound_attempt: usize,
     transport_policy: CodexRuntimeTransportPolicy,
+}
+
+#[derive(Clone, Copy)]
+struct CodexAttemptDeadline {
+    request: tokio::time::Instant,
+    read_inactivity: std::time::Duration,
 }
 
 pub(in crate::api::proxy) fn runtime_transport_policy(
@@ -43,6 +52,9 @@ pub(in crate::api::proxy) fn runtime_transport_policy(
         } else {
             "default"
         },
+        connect_timeout: std::time::Duration::from_millis(policy.connect_timeout_millis),
+        read_timeout: std::time::Duration::from_millis(policy.read_timeout_millis),
+        request_timeout: std::time::Duration::from_millis(policy.request_timeout_millis),
     })
 }
 
@@ -136,7 +148,6 @@ pub(super) async fn send_proxy_route(
                 return Err(error);
             }
         };
-        let response = UpstreamResponse::Codex(response);
         if response.status() == StatusCode::BAD_REQUEST {
             let disposition = codex_transport::classify_bad_request(response).await;
             observe_bad_request_disposition(&state.metrics, disposition);
@@ -222,15 +233,23 @@ async fn send_codex_attempt(
     session_id: &str,
     context: CodexAttemptContext,
     client: &wreq::Client,
-) -> Result<(wreq::Response, crate::metrics::ActivityGuard), ProxySendError> {
+) -> Result<(UpstreamResponse, crate::metrics::ActivityGuard), ProxySendError> {
     let CodexAttemptContext {
         request_id,
         candidate_rank,
         outbound_attempt,
         transport_policy,
     } = context;
+    let deadline = CodexAttemptDeadline {
+        request: tokio::time::Instant::now() + transport_policy.request_timeout,
+        read_inactivity: transport_policy.read_timeout,
+    };
     for connect_attempt in 1..=transport_policy.connect_attempts {
-        match send_codex_attempt_once(state, headers, target_url, route, session_id, client).await {
+        match send_codex_attempt_once(
+            state, headers, target_url, route, session_id, client, deadline,
+        )
+        .await
+        {
             Err(ProxySendError::RetryableConnection(failure_stage))
                 if connect_attempt < transport_policy.connect_attempts =>
             {
@@ -248,6 +267,17 @@ async fn send_codex_attempt(
                     stage = "codex_pre_delivery_connect_retry",
                     "retrying a Codex connection failure before breaker accounting"
                 );
+                // Do not start a retry whose own typed connection deadline
+                // cannot fit in the remaining absolute request budget. Every
+                // attempt so admitted can still prove non-delivery before the
+                // request-level ambiguity boundary.
+                if !connect_retry_fits_before_request_deadline(
+                    deadline.request,
+                    transport_policy.connect_retry_delay,
+                    transport_policy.connect_timeout,
+                ) {
+                    return Err(ProxySendError::RetryableConnection(failure_stage));
+                }
                 tokio::time::sleep(transport_policy.connect_retry_delay).await;
             }
             result @ Err(ProxySendError::RetryableConnection(failure_stage)) => {
@@ -273,6 +303,14 @@ async fn send_codex_attempt(
     unreachable!("bounded Codex connection attempt loop always returns")
 }
 
+fn connect_retry_fits_before_request_deadline(
+    request_deadline: tokio::time::Instant,
+    retry_delay: std::time::Duration,
+    connect_timeout: std::time::Duration,
+) -> bool {
+    tokio::time::Instant::now() + retry_delay + connect_timeout < request_deadline
+}
+
 async fn send_codex_attempt_once(
     state: &AppState,
     headers: &HeaderMap,
@@ -280,7 +318,8 @@ async fn send_codex_attempt_once(
     route: &PreparedProxyRoute,
     session_id: &str,
     client: &wreq::Client,
-) -> Result<(wreq::Response, crate::metrics::ActivityGuard), ProxySendError> {
+    deadline: CodexAttemptDeadline,
+) -> Result<(UpstreamResponse, crate::metrics::ActivityGuard), ProxySendError> {
     #[cfg(test)]
     if TEST_PRE_DELIVERY_CONNECT_FAILURES
         .try_with(|remaining| {
@@ -309,7 +348,10 @@ async fn send_codex_attempt_once(
     .map_err(|_| credential_application_error(&route.route.credential, credential_now))?;
     let upstream_activity = state.metrics.active_upstream(&route.route.driver, "proxy");
     let upstream_started = Instant::now();
-    let upstream_result = request.send().await;
+    let upstream_result = send_until_request_deadline(deadline.request, async {
+        request.send().await.map_err(classify_wreq_send_error)
+    })
+    .await;
     state.metrics.observe_upstream(
         &route.route.driver,
         "proxy",
@@ -317,26 +359,102 @@ async fn send_codex_attempt_once(
         upstream_started.elapsed(),
     );
     match upstream_result {
-        Ok(response) => Ok((response, upstream_activity)),
-        Err(error)
-            if error.is_connect()
-                || error.is_proxy_connect()
-                || error.is_dns()
-                || error.is_tls() =>
-        {
-            let stage = if error.is_proxy_connect() {
-                "proxy_connect"
-            } else if error.is_dns() {
-                "dns"
-            } else if error.is_tls() {
-                "tls"
-            } else {
-                "connect"
-            };
-            Err(ProxySendError::RetryableConnection(stage))
-        }
+        Ok(response) => Ok((
+            UpstreamResponse::Codex(response)
+                .with_body_timeouts(deadline.request, deadline.read_inactivity),
+            upstream_activity,
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+fn classify_wreq_send_error(error: wreq::Error) -> ProxySendError {
+    if error.is_connect() || error.is_proxy_connect() || error.is_dns() || error.is_tls() {
+        let stage = if error.is_proxy_connect() {
+            "proxy_connect"
+        } else if error.is_dns() {
+            "dns"
+        } else if error.is_tls() {
+            "tls"
+        } else {
+            "connect"
+        };
+        ProxySendError::RetryableConnection(stage)
+    } else {
         // A send error after the request leaves the client is ambiguous and is
         // never replayed by this state machine.
-        Err(_) => Err(ProxySendError::NonRetryableTransport),
+        ProxySendError::NonRetryableTransport
+    }
+}
+
+async fn send_until_request_deadline<T, F>(
+    deadline: tokio::time::Instant,
+    send: F,
+) -> Result<T, ProxySendError>
+where
+    F: std::future::Future<Output = Result<T, ProxySendError>>,
+{
+    tokio::pin!(send);
+    tokio::select! {
+        // Preserve a connector's typed pre-delivery result when its own
+        // deadline and the request deadline become ready in the same poll.
+        biased;
+        result = &mut send => result,
+        _ = tokio::time::sleep_until(deadline) => Err(ProxySendError::NonRetryableTransport),
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::super::outcome::FailoverDisposition;
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn typed_connect_deadline_wins_at_the_request_boundary() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let result = send_until_request_deadline(deadline, async move {
+            tokio::time::sleep_until(deadline).await;
+            Err::<(), _>(ProxySendError::RetryableConnection("proxy_connect"))
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(ProxySendError::RetryableConnection("proxy_connect"))
+        ));
+        assert_eq!(
+            failover_disposition(None, result.as_ref().err()),
+            FailoverDisposition::ConnectionNotDelivered
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unclassified_header_deadline_never_grants_replay() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let result = send_until_request_deadline(
+            deadline,
+            std::future::pending::<Result<(), ProxySendError>>(),
+        )
+        .await;
+        assert!(matches!(result, Err(ProxySendError::NonRetryableTransport)));
+        assert_eq!(
+            failover_disposition(None, result.as_ref().err()),
+            FailoverDisposition::Stop
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_retry_requires_room_for_its_typed_deadline() {
+        let now = tokio::time::Instant::now();
+        let deadline = now + std::time::Duration::from_secs(3);
+        assert!(connect_retry_fits_before_request_deadline(
+            deadline,
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(2_499),
+        ));
+        assert!(!connect_retry_fits_before_request_deadline(
+            deadline,
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(2_500),
+        ));
     }
 }

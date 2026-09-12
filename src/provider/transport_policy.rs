@@ -52,7 +52,7 @@ impl CodexTransportPolicy {
             || !(100..=60_000).contains(&policy.connect_timeout_millis)
             || !(1_000..=1_260_000).contains(&policy.read_timeout_millis)
             || !(1_000..=1_260_000).contains(&policy.request_timeout_millis)
-            || policy.connect_timeout_millis > policy.request_timeout_millis
+            || policy.connect_timeout_millis >= policy.request_timeout_millis
             || policy.read_timeout_millis > policy.request_timeout_millis
             || value.is_some_and(|value| value.get("shared_probe_attempts") == Some(&Value::Null))
         {
@@ -86,6 +86,14 @@ mod tests {
         assert_eq!(policy.connect_timeout_millis, 5_000);
         assert_eq!(policy.read_timeout_millis, 600_000);
         assert_eq!(policy.request_timeout_millis, 1_260_000);
+        let independent_phases = CodexTransportPolicy::parse(Some(&json!({
+            "connect_timeout_millis": 5_000,
+            "read_timeout_millis": 1_000,
+            "request_timeout_millis": 6_000
+        })))
+        .unwrap();
+        assert_eq!(independent_phases.connect_timeout_millis, 5_000);
+        assert_eq!(independent_phases.read_timeout_millis, 1_000);
     }
 
     #[test]
@@ -112,6 +120,7 @@ mod tests {
             json!({"request_timeout_millis": 1260001}),
             json!({"read_timeout_millis": 2000, "request_timeout_millis": 1000}),
             json!({"connect_timeout_millis": 2000, "read_timeout_millis": 1000, "request_timeout_millis": 1000}),
+            json!({"connect_timeout_millis": 1000, "read_timeout_millis": 1000, "request_timeout_millis": 1000}),
         ] {
             assert!(
                 CodexTransportPolicy::parse(Some(&invalid)).is_err(),
