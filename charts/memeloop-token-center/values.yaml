@@ -360,6 +360,7 @@ networkPolicy:
     #     ports: [{ protocol: TCP, port: 1080 }]
 
 serviceMonitor:
+  # Scrape each gateway and control/all pod; failover counters are process-local.
   enabled: false
   interval: 30s
   scrapeTimeout: 10s

@@ -10,10 +10,14 @@ pub fn router_for_role(state: AppState, role: RuntimeRole) -> Router {
         .route("/healthz", get(deprecated_health))
         .route("/livez", get(liveness))
         .route("/readyz", get(readiness));
+    if matches!(
+        role,
+        RuntimeRole::Gateway | RuntimeRole::Control | RuntimeRole::All
+    ) {
+        application = application.route("/metrics", get(prometheus_metrics));
+    }
     if matches!(role, RuntimeRole::Control | RuntimeRole::All) {
-        application = application
-            .route("/metrics", get(prometheus_metrics))
-            .route("/version", get(version));
+        application = application.route("/version", get(version));
         if state.config.runtime_profiling_enabled {
             application =
                 application.route("/internal/v1/diagnostics/runtime", get(runtime_diagnostics));

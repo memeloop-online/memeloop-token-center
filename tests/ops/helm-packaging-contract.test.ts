@@ -22,6 +22,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       default: render('default'),
       dev: render('dev', ['--values', join(chart, 'values-dev.yaml')]),
       observed: render('observed', ['--set', 'serviceMonitor.enabled=true', '--set', 'roles.gateway.autoscaling.enabled=true']),
+      gatewayMetrics: render('gateway-metrics', ['--show-only', 'templates/servicemonitor.yaml', '--set', 'serviceMonitor.enabled=true', '--set', 'roles.control.enabled=false']),
       profiling: render('profiling', ['--show-only', 'templates/deployment.yaml', '--set', 'config.runtimeProfiling.enabled=true']),
       digest: render('digest', ['--set-string', 'image.tag=must-not-render', '--set-string', `image.digest=${reviewed}`]),
       configmap: render('configmap-plugin', ['--set', 'plugins.enabled=true', '--set', 'plugins.existingConfigMap=token-center-plugins']),
@@ -57,6 +58,12 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       }
     }
     has('observed', 'kind: HorizontalPodAutoscaler'); has('observed', 'kind: ServiceMonitor');
+    for (const variant of ['observed', 'gatewayMetrics']) {
+      const monitor = output[variant]!.split(/^---$/m).find((document) => document.includes('kind: ServiceMonitor'))!;
+      assert.match(monitor, /matchExpressions:\s+- key: app.kubernetes.io\/component\s+operator: In\s+values: \[gateway, control, all\]/);
+      assert.match(monitor, /authorization:\s+type: Bearer\s+credentials:/);
+      assert.doesNotMatch(monitor, /app.kubernetes.io\/component: control/);
+    }
     const migrationVersions = (directory: string): number[] => readdirSync(join(repository, 'migrations', directory)).flatMap((name) => /^([0-9]{4})_.*\.sql$/.exec(name)?.[1] ?? []).map(Number);
     const sqlite = Math.max(...migrationVersions('common'), ...migrationVersions('sqlite'));
     const postgres = Math.max(...migrationVersions('common'), ...migrationVersions('postgres'));
