@@ -519,6 +519,44 @@ async fn fuel_exhaustion_and_guest_traps_fail_closed() {
 }
 
 #[tokio::test]
+async fn revision_policy_failures_open_only_their_own_circuit() {
+    use memeloop_token_center::plugin::lifecycle::{
+        PluginGrant, RuntimeRevisions, manifest_digest,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let plugins = directory.path().join("plugins");
+    fs::create_dir(&plugins).unwrap();
+    write_policy_package(&plugins, "trap-policy", "unreachable");
+    let runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await).unwrap();
+    let manifest = runtime.manifests().remove(0);
+    let grant = PluginGrant {
+        version: manifest.version.clone(),
+        capabilities: manifest.capabilities.clone(),
+        manifest_digest: manifest_digest(&manifest).unwrap(),
+    };
+    let revisions = RuntimeRevisions::new(
+        runtime.clone(),
+        BTreeMap::from([(manifest.id.clone(), grant)]),
+    )
+    .unwrap();
+    let pinned = revisions.pin().unwrap();
+    for _ in 0..3 {
+        let decision = pinned
+            .apply_traffic_with_config(context(), &json!({"model": "test"}), &BTreeMap::new())
+            .unwrap();
+        assert!(!decision.allow);
+        assert!(format!("{decision:?}").contains("policy_execution_failed"));
+    }
+    let decision = pinned
+        .apply_traffic_with_config(context(), &json!({"model": "test"}), &BTreeMap::new())
+        .unwrap();
+    assert!(!decision.allow);
+    assert!(format!("{decision:?}").contains("policy_circuit_open"));
+    assert!(RuntimeRevisions::new(runtime, BTreeMap::new()).is_err());
+}
+
+#[tokio::test]
 async fn a_traffic_policy_can_explicitly_deny_after_core_authentication() {
     let directory = tempfile::tempdir().unwrap();
     let plugins = directory.path().join("plugins");

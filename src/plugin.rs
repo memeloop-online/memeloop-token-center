@@ -22,6 +22,8 @@ use crate::{
     provider::ProviderType,
 };
 
+pub mod lifecycle;
+
 const PLUGIN_FUEL: u64 = 5_000_000;
 const PLUGIN_MEMORY_BYTES: usize = 32 * 1024 * 1024;
 const PLUGIN_TABLE_ELEMENTS: usize = 100_000;
@@ -271,7 +273,7 @@ fn empty_json_object() -> Value {
     serde_json::json!({})
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PluginCapability {
     Log,
@@ -408,6 +410,15 @@ pub struct PluginRuntime {
     service_data_cache: Arc<tokio::sync::RwLock<BTreeMap<String, CachedPluginServiceData>>>,
     execution_timeout: Duration,
     fuel: u64,
+    _epoch_task: Option<Arc<EpochTask>>,
+}
+
+struct EpochTask(tokio::task::JoinHandle<()>);
+
+impl Drop for EpochTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[derive(Clone)]
@@ -444,13 +455,13 @@ impl PluginRuntime {
         let engine = Engine::new(&engine_config)
             .map_err(|_| plugin_runtime_failure("engine_initialization"))?;
         let epoch_engine = engine.clone();
-        tokio::spawn(async move {
+        let epoch_task = Arc::new(EpochTask(tokio::spawn(async move {
             let mut interval = tokio::time::interval(PLUGIN_EPOCH_TICK);
             loop {
                 interval.tick().await;
                 epoch_engine.increment_epoch();
             }
-        });
+        })));
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(30))
@@ -516,6 +527,8 @@ impl PluginRuntime {
             });
         }
         validate_loaded_operator_ui_contributions(&plugins)?;
+        // Directory enumeration order must not change policy precedence.
+        plugins.sort_by(|left, right| left.manifest.id.cmp(&right.manifest.id));
 
         Ok(Self {
             engine: Some(engine),
@@ -528,6 +541,7 @@ impl PluginRuntime {
             service_data_cache: Arc::default(),
             execution_timeout: PLUGIN_EXECUTION_TIMEOUT,
             fuel: PLUGIN_FUEL,
+            _epoch_task: Some(epoch_task),
         })
     }
 
