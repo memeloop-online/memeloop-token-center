@@ -637,7 +637,8 @@ fn pinned_request_envelope_changed(
     applied: &AppliedTraffic,
 ) -> bool {
     pinned_route.is_some()
-        && (original != &applied.request_json
+        && (applied.request_rewrite_supplied
+            || original != &applied.request_json
             || original.get("model").and_then(Value::as_str) != Some(applied.model.as_str()))
 }
 
