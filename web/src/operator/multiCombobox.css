@@ -2,7 +2,7 @@
 
 /* A field and its top-layer menu share tokens, independent of page or theme. */
 .multi-combobox { min-width: 0; }
-.multi-combobox > label { color: var(--picker-text); font-size: 12px; font-weight: 600; }
+.multi-combobox.multi-combobox > label { color: var(--picker-text); font-size: 12px; font-weight: 600; }
 .multi-combobox .field-hint { color: var(--picker-muted); font-size: 12px; line-height: 1.5; }
 .multi-combobox .multi-combobox-control {
   background: var(--picker-inset); border-color: var(--picker-border); border-radius: 8px;
