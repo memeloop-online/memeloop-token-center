@@ -47,6 +47,8 @@ test('advanced validation remains discoverable without losing field values or mo
       await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
       assert.equal(await page.getByLabel('Connection name').evaluate(element => getComputedStyle(element).fontSize), '16px');
+      assert.equal(await capabilities.locator('label').first().evaluate(element => getComputedStyle(element).color),
+        await page.locator('.operator-form-section label').first().evaluate(element => getComputedStyle(element).color));
       const artifacts = 'e2e-artifacts/upstream-availability';
       mkdirSync(artifacts, { recursive: true });
       await page.screenshot({ path: `${artifacts}/provider-form-${theme}-mobile.png`, fullPage: true });

@@ -18,7 +18,7 @@
 .operator-form-section-fields { display: grid; gap: 14px; min-width: 0; }
 .operator-form-section-fields > .form-group { margin: 0; min-width: 0; }
 .operator-form-section .operator-form-section-fields > fieldset { border: 0; margin: 0; padding: 0; }
-.operator-form-section label { color: var(--picker-text); font-size: 12px; line-height: 1.5; }
+.operator-form-section label, .operator-form-advanced label { color: var(--picker-text); font-size: 12px; line-height: 1.5; }
 .operator-form-advanced > summary { color: var(--picker-text); font-size: 13px; line-height: 1.6; }
 .operator-form-advanced[open] > summary { margin-bottom: 12px; }
 .operator-form-advanced > .field-hint { color: var(--picker-muted); font-size: 12px; line-height: 1.6; margin: 8px 0 16px; }
