@@ -46,6 +46,7 @@ mod limits;
 mod model_picker;
 mod model_routes;
 mod monitoring_snapshot;
+mod plugin_execution;
 mod plugins;
 mod proxy;
 mod request_detail;
