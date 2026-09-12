@@ -7046,8 +7046,58 @@ async fn own_conversation_detail(world: &TokenCenterWorld) -> Value {
         .expect("conversation detail JSON")
 }
 
+async fn wait_for_finished_conversation_requests(world: &TokenCenterWorld, expected: usize) {
+    let key_id = world
+        .stable_key_id
+        .expect("conversation key id")
+        .to_string();
+    let key_needle = format!("\"key_id\":\"{key_id}\"");
+    let response = world
+        .client
+        .get(format!(
+            "{}/internal/v1/request-events?after_event_at=0",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .send()
+        .await
+        .expect("conversation request event stream");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut stream = response.bytes_stream();
+    let finished = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut frame = String::new();
+        let mut count = 0;
+        while let Some(chunk) = stream.next().await {
+            frame.push_str(&String::from_utf8_lossy(
+                &chunk.expect("conversation request SSE chunk"),
+            ));
+            while let Some(end) = frame.find("\n\n") {
+                let event = frame[..end].to_owned();
+                frame.drain(..end + 2);
+                if event.contains("event: request.finished") && event.contains(&key_needle) {
+                    count += 1;
+                    if count >= expected {
+                        return count;
+                    }
+                }
+            }
+        }
+        count
+    })
+    .await
+    .expect("finished conversation requests before timeout");
+    assert!(
+        finished >= expected,
+        "expected {expected} finished conversation requests, observed {finished}"
+    );
+}
+
 #[then("the two Responses requests have a direct continuation edge")]
 async fn responses_requests_have_direct_parent_edge(world: &mut TokenCenterWorld) {
+    // Request EOF can precede the terminal transaction. Wait for its durable finished events;
+    // conversation observations commit in that same transaction for these prepaid requests.
+    wait_for_finished_conversation_requests(world, 2).await;
     let detail = own_conversation_detail(world).await;
     assert_eq!(detail["cluster"]["request_count"], 2, "{detail}");
     assert_eq!(
