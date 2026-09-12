@@ -656,6 +656,11 @@ impl Database {
                     .try_get::<Option<String>, _>("response_object")?
                     .ok_or(AppError::Internal)?,
             };
+            super::super::billing::publish_text_settlement_in_transaction(
+                &mut transaction,
+                input.request_id,
+            )
+            .await?;
             transaction.commit().await?;
             return Ok(result);
         }
@@ -833,8 +838,8 @@ impl Database {
                 )
                 .await?
             }
-            // Repair compatibility for a request left pending by the old
-            // split settle/finish implementation. Never settle it twice.
+            // A split settlement acquires its feed sequence only when this
+            // transaction publishes the complete terminal snapshot.
             "settled" => reservation_row
                 .try_get::<Option<i64>, _>("actual_micros")?
                 .ok_or(AppError::Internal)?,
@@ -1243,6 +1248,7 @@ pub(crate) async fn record_request_finished_in_transaction(
     if updated.rows_affected() == 0 {
         return Ok(false);
     }
+    super::super::billing::publish_text_settlement_in_transaction(tx, request.request_id).await?;
     if project_aggregates {
         sqlx::query(
             "INSERT INTO usage_daily_aggregates (key_id, day_bucket, model, status_class, error_code, requests, input_tokens, output_tokens, cost_micros) SELECT key_id, created_at / 86400000, model, CASE WHEN status_code >= 200 AND status_code < 400 THEN 'success' ELSE 'failure' END, COALESCE(error_code, ''), 1, input_tokens, output_tokens, cost_micros FROM request_records WHERE id = $1 AND created_at = $2 ON CONFLICT(key_id, day_bucket, model, status_class, error_code) DO UPDATE SET requests = usage_daily_aggregates.requests + 1, input_tokens = usage_daily_aggregates.input_tokens + excluded.input_tokens, output_tokens = usage_daily_aggregates.output_tokens + excluded.output_tokens, cost_micros = usage_daily_aggregates.cost_micros + excluded.cost_micros",

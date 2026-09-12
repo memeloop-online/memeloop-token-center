@@ -23,6 +23,9 @@ use serde_json::json;
 use sqlx::{AnyPool, Row};
 use uuid::Uuid;
 
+#[path = "generation_jobs/settlement_feed.rs"]
+mod settlement_feed;
+
 const PEPPER: &[u8] = b"generation test pepper longer than thirty-two bytes";
 
 async fn fixture() -> (
@@ -1467,6 +1470,7 @@ async fn preparation_reaper_is_idempotent_and_refunds_every_reserved_dimension()
             .unwrap(),
         0
     );
+    settlement_feed::assert_zero_settlement(&fixture.database, &fixture.key, started.job_id).await;
     let failed = fixture
         .database
         .generation_job(fixture.key.key_id, started.job_id)
@@ -1544,6 +1548,7 @@ async fn queued_cancellation_is_idempotent_and_refunds_in_one_transaction() {
     assert_eq!(cancelled.status, "cancelled");
     assert_eq!(cancelled.error_code.as_deref(), Some("cancelled_by_user"));
     assert_eq!(cancelled.cost, "0");
+    let settlement_id = settlement_feed::assert_zero_settlement(&database, &key, job.job_id).await;
     assert_eq!(
         database.key_view(&key).await.unwrap().available_balance,
         "10"
@@ -1554,6 +1559,10 @@ async fn queued_cancellation_is_idempotent_and_refunds_in_one_transaction() {
         .await
         .unwrap();
     assert_eq!(replayed.status, "cancelled");
+    assert_eq!(
+        settlement_feed::assert_zero_settlement(&database, &key, job.job_id).await,
+        settlement_id,
+    );
     assert_eq!(
         database.key_view(&key).await.unwrap().available_balance,
         "10"

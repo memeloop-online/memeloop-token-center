@@ -3004,6 +3004,48 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /internal/v1/accounts/{account_id}/settlements:
+    get:
+      tags: [Credits]
+      operationId: listAccountSettlements
+      summary: List immutable account usage settlements
+      description: |
+        Requires both `credits:read` and `requests:read`. Results are ordered by the
+        immutable account-local `(settlement_sequence, settlement_id)` ascending key.
+        Use the final row's `settlement_sequence` and `settlement_id` as the paired,
+        exclusive `after_sequence` and `after_id` cursor. The paired `request_kind`
+        and `request_id` select one settlement and cannot be combined with either
+        cursor parameter. Every
+        page remains bound to the path account, and a tenant-scoped service credential
+        may inspect only an account in its own tenant. The cursor pair must identify
+        an existing settlement in that account. Unknown query parameters are rejected.
+        Covers prepaid terminal snapshots published after migration 79; historical
+        records are not bulk-backfilled and metered-unlimited usage is excluded.
+        An empty exact lookup is not evidence of zero cost. Polling consumers retain
+        the final item's cursor even when next_cursor is null.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: credits:read
+      x-required-scopes: [credits:read, requests:read]
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/SettlementListLimit500'
+        - $ref: '#/components/parameters/AfterSettlementSequence'
+        - $ref: '#/components/parameters/AfterSettlementId'
+        - $ref: '#/components/parameters/SettlementRequestKind'
+        - $ref: '#/components/parameters/SettlementRequestId'
+      responses:
+        '200':
+          description: Immutable account settlements in ascending sequence order.
+          headers:
+            Cache-Control: { schema: { const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountSettlementPage' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /internal/v1/entitlements:
     get:
       tags: [Entitlements]
@@ -4730,6 +4772,30 @@ components:
       required: false
       description: Stable row UUID from the last row of the prior page. Use together with `before_created_at`; the concrete response documents whether this is a key, ledger-entry, request, or generation ID.
       schema: { type: string, format: uuid }
+    AfterSettlementSequence:
+      name: after_sequence
+      in: query
+      required: false
+      description: Immutable account-local sequence from the final row of the prior page. Use together with `after_id` as an exclusive ascending keyset cursor.
+      schema: { type: integer, format: int64, minimum: 1 }
+    AfterSettlementId:
+      name: after_id
+      in: query
+      required: false
+      description: Settlement UUID from the final row of the prior page. Use together with `after_sequence` as an exclusive ascending keyset cursor.
+      schema: { type: string, format: uuid }
+    SettlementRequestId:
+      name: request_id
+      in: query
+      required: false
+      description: Request or generation UUID for an exact settlement lookup. Must be paired with `request_kind`; the pair cannot be combined with `after_sequence` or `after_id`.
+      schema: { type: string, format: uuid }
+    SettlementRequestKind:
+      name: request_kind
+      in: query
+      required: false
+      description: Request type for an exact settlement lookup. Must be paired with `request_id`; the pair cannot be combined with `after_sequence` or `after_id`.
+      schema: { $ref: '#/components/schemas/AccountSettlementKind' }
     RequestPageEnvelope:
       name: paged
       in: query
@@ -4866,6 +4932,12 @@ components:
       in: query
       required: false
       schema: { type: integer, format: int64, minimum: 1, maximum: 500, default: 50 }
+    SettlementListLimit500:
+      name: limit
+      in: query
+      required: false
+      description: Maximum immutable account settlements returned in this page.
+      schema: { type: integer, format: int64, minimum: 1, maximum: 500, default: 100 }
     CredentialListLimit500:
       name: limit
       in: query
@@ -6866,6 +6938,49 @@ components:
         source: { type: string }
         idempotency_key: { type: [string, 'null'] }
         created_at: { type: integer, format: int64 }
+    AccountSettlementKind:
+      type: string
+      enum: [text, generation]
+    AccountSettlement:
+      type: object
+      additionalProperties: false
+      required: [settlement_id, settlement_sequence, request_id, kind, account_id, key_id, model, cost, currency, settled_at, completed_at, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens]
+      properties:
+        settlement_id: { type: string, format: uuid }
+        settlement_sequence: { type: integer, format: int64 }
+        request_id: { type: string, format: uuid }
+        kind: { $ref: '#/components/schemas/AccountSettlementKind' }
+        account_id: { type: string, format: uuid }
+        key_id: { type: string, format: uuid }
+        model: { type: string }
+        cost: { $ref: '#/components/schemas/NonNegativeMoney' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        settled_at: { type: integer, format: int64 }
+        completed_at: { type: integer, format: int64 }
+        input_tokens: { type: [integer, 'null'], format: int64 }
+        cached_input_tokens: { type: [integer, 'null'], format: int64 }
+        cache_write_tokens: { type: [integer, 'null'], format: int64 }
+        output_tokens: { type: [integer, 'null'], format: int64 }
+    AccountSettlementCursor:
+      type: object
+      additionalProperties: false
+      required: [after_sequence, after_id]
+      properties:
+        after_sequence: { type: integer, format: int64 }
+        after_id: { type: string, format: uuid }
+    AccountSettlementPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          maxItems: 500
+          items: { $ref: '#/components/schemas/AccountSettlement' }
+        next_cursor:
+          oneOf:
+            - $ref: '#/components/schemas/AccountSettlementCursor'
+            - type: 'null'
     EntitlementIdentity:
       type: string
       minLength: 1

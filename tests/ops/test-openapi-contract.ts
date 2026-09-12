@@ -125,6 +125,27 @@ test("upstream availability requires both scopes and an explicit tenant/window",
   assert.equal(account.properties.terminal_outcomes.items.$ref, "#/components/schemas/MonitoringTerminalOutcome");
 });
 
+test("account settlements require both scopes and expose an immutable sequence cursor envelope", () => {
+  const document = cloneDocument(); const operation = document.paths["/internal/v1/accounts/{account_id}/settlements"].get;
+  assert.deepEqual(operation.security, [{ serviceBearer: [] }]);
+  assert.equal(operation["x-required-scope"], "credits:read");
+  assert.deepEqual(operation["x-required-scopes"], ["credits:read", "requests:read"]);
+  assert.deepEqual(operation.parameters.map((parameter: Obj) => parameter.$ref), ["#/components/parameters/AccountId", "#/components/parameters/SettlementListLimit500", "#/components/parameters/AfterSettlementSequence", "#/components/parameters/AfterSettlementId", "#/components/parameters/SettlementRequestKind", "#/components/parameters/SettlementRequestId"]);
+  assert.deepEqual(document.components.parameters.SettlementListLimit500.schema, { type: "integer", format: "int64", minimum: 1, maximum: 500, default: 100 });
+  assert.deepEqual(document.components.parameters.AfterSettlementSequence.schema, { type: "integer", format: "int64", minimum: 1 });
+  assert.deepEqual(document.components.parameters.AfterSettlementId.schema, { type: "string", format: "uuid" });
+  assert.deepEqual(document.components.parameters.SettlementRequestKind.schema, { $ref: "#/components/schemas/AccountSettlementKind" });
+  assert.deepEqual(document.components.parameters.SettlementRequestId.schema, { type: "string", format: "uuid" });
+  assert.equal(operation.responses["200"].headers["Cache-Control"].schema.const, "no-store");
+  assert.equal(operation.responses["200"].content["application/json"].schema.$ref, "#/components/schemas/AccountSettlementPage");
+  const page = document.components.schemas.AccountSettlementPage;
+  assert.equal(page.additionalProperties, false); assert.deepEqual(page.required, ["items", "next_cursor"]); assert.equal(page.properties.items.maxItems, 500); assert.equal(page.properties.items.items.$ref, "#/components/schemas/AccountSettlement"); assert.deepEqual(page.properties.next_cursor.oneOf, [{ $ref: "#/components/schemas/AccountSettlementCursor" }, { type: "null" }]);
+  const cursor = document.components.schemas.AccountSettlementCursor;
+  assert.equal(cursor.additionalProperties, false); assert.deepEqual(cursor.required, ["after_sequence", "after_id"]); assert.deepEqual(cursor.properties.after_sequence, { type: "integer", format: "int64" }); assert.deepEqual(cursor.properties.after_id, { type: "string", format: "uuid" });
+  const item = document.components.schemas.AccountSettlement;
+  assert.equal(item.additionalProperties, false); assert.deepEqual(item.required, ["settlement_id", "settlement_sequence", "request_id", "kind", "account_id", "key_id", "model", "cost", "currency", "settled_at", "completed_at", "input_tokens", "cached_input_tokens", "cache_write_tokens", "output_tokens"]); assert.deepEqual(document.components.schemas.AccountSettlementKind.enum, ["text", "generation"]); assert.deepEqual(item.properties.settlement_sequence, { type: "integer", format: "int64" }); assert.equal(item.properties.cost.$ref, "#/components/schemas/NonNegativeMoney"); for (const name of ["input_tokens", "cached_input_tokens", "cache_write_tokens", "output_tokens"]) assert.deepEqual(item.properties[name], { type: ["integer", "null"], format: "int64" });
+});
+
 test("OAuth reauthorization reuses the unified upstream resource", () => {
   const document = cloneDocument(); for (const [segment, schema] of [["cursor", "StartCursorOAuthRequest"], ["provider-adapter", "StartProviderAdapterOAuthRequest"], ["codex", "StartCodexOAuthRequest"]] as const) { const start = document.paths[`/internal/v1/oauth/${segment}/start`].post; const poll = document.paths[`/internal/v1/oauth/${segment}/poll`].post; assert.equal(start["x-required-scope"], "oauth:write"); assert.equal(poll["x-required-scope"], "oauth:write"); const target = document.components.schemas[schema].properties.upstream_account_id; assert.deepEqual([target.type, target.format], ["string", "uuid"]); assert.equal(poll.responses["200"].content["application/json"].schema.$ref, "#/components/schemas/UpstreamProvider"); }
   for (const path of ["/internal/v1/oauth/subscription-bridge/start", "/internal/v1/oauth/subscription-bridge/poll", "/internal/v1/imports/cpa/subscription-accounts"]) assert.ok(!(path in document.paths)); for (const schema of ["StartSubscriptionBridgeRequest", "SubscriptionBridgeCredential"]) assert.ok(!(schema in document.components.schemas)); assert.equal(document.paths["/internal/v1/oauth/codex/start"].post.responses["200"].content["application/json"].schema.$ref, "#/components/schemas/CodexDeviceLoginStart"); assert.equal(document.components.schemas.CodexDeviceLoginStart.properties.security_notice.const, "only_continue_if_you_started_this_login");
