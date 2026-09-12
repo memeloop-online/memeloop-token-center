@@ -579,11 +579,11 @@ fn push_request_record_filters(
     query.push(" AND r.created_at <= ");
     query.bind_i64(filter.to_created_at.unwrap_or(i64::MAX));
     push_keyset_cursor(query, "r", filter);
-    if !matches!(scope, RequestListScope::Key(_)) {
-        if let Some(key_id) = filter.key_id {
-            query.push(" AND r.key_id = ");
-            query.bind_text(key_id.to_string());
-        }
+    if !matches!(scope, RequestListScope::Key(_))
+        && let Some(key_id) = filter.key_id
+    {
+        query.push(" AND r.key_id = ");
+        query.bind_text(key_id.to_string());
     }
     if let Some(model) = &filter.model {
         query.push(" AND r.model = ");
@@ -644,11 +644,11 @@ fn push_generation_job_filters(
     query.push(" AND g.created_at <= ");
     query.bind_i64(filter.to_created_at.unwrap_or(i64::MAX));
     push_keyset_cursor(query, "g", filter);
-    if !matches!(scope, RequestListScope::Key(_)) {
-        if let Some(key_id) = filter.key_id {
-            query.push(" AND g.key_id = ");
-            query.bind_text(key_id.to_string());
-        }
+    if !matches!(scope, RequestListScope::Key(_))
+        && let Some(key_id) = filter.key_id
+    {
+        query.push(" AND g.key_id = ");
+        query.bind_text(key_id.to_string());
     }
     if let Some(model) = &filter.model {
         query.push(" AND g.public_model = ");
@@ -707,11 +707,11 @@ fn push_archive_request_filters(
     query.push(" AND u.source_started_at <= ");
     query.bind_i64(filter.to_created_at.unwrap_or(i64::MAX));
     push_archive_keyset_cursor(query, filter);
-    if !matches!(scope, RequestListScope::Key(_)) {
-        if let Some(key_id) = filter.key_id {
-            query.push(" AND u.key_id = ");
-            query.bind_text(key_id.to_string());
-        }
+    if !matches!(scope, RequestListScope::Key(_))
+        && let Some(key_id) = filter.key_id
+    {
+        query.push(" AND u.key_id = ");
+        query.bind_text(key_id.to_string());
     }
     if let Some(model) = &filter.model {
         query.push(" AND u.model = ");
