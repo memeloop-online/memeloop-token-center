@@ -315,8 +315,8 @@ async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_histor
     assert_eq!(
         serde_json::to_value(&completed.costs).expect("multi-currency costs"),
         serde_json::json!([
-            {"currency": "EUR", "cost": "0.000200"},
-            {"currency": "USD", "cost": "0.000100"}
+            {"currency": "EUR", "cost": "0.0002"},
+            {"currency": "USD", "cost": "0.0001"}
         ])
     );
 
