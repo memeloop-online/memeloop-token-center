@@ -1131,7 +1131,7 @@ async fn postgres_migrations_queue_aggregates_and_events_work_together() {
     assert_eq!(requests[0].upstream_account_id, Some(account.id));
     assert!(requests[0].route_id.is_none());
     assert!(requests[0].completed_at.is_some());
-    assert!(requests[0].currency.is_none());
+    assert_eq!(requests[0].currency.as_deref(), Some("USD"));
     let key_detail = database
         .request_archive_refs(key.key_id, job_id)
         .await
@@ -1155,7 +1155,7 @@ async fn postgres_migrations_queue_aggregates_and_events_work_together() {
     assert_eq!(operator_detail.view.upstream_account_id, Some(account.id));
     assert!(operator_detail.view.route_id.is_none());
     assert!(operator_detail.view.completed_at.is_some());
-    assert!(operator_detail.view.currency.is_none());
+    assert_eq!(operator_detail.view.currency.as_deref(), Some("USD"));
     assert_eq!(operator_detail.view.cost, "0.25");
     assert_eq!(operator_detail.response_json, Some(result));
     let events = database
