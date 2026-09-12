@@ -809,12 +809,12 @@ impl Database {
             (filter.before_created_at, filter.before_request_id)
         {
             sqlx::query(
-                r#"SELECT id, created_at, protocol, model, status_code, duration_ms,
+                r#"SELECT id, created_at, completed_at, source_completed_at, protocol, model, status_code, duration_ms,
                           input_tokens, cached_input_tokens, cache_write_tokens, output_tokens,
                           cost_micros, currency, error_code, archive_state,
                           source_kind, provenance_kind, archive_source, external_request_id
                      FROM (
-                         SELECT r.id, r.created_at, r.protocol, r.model, r.status_code, r.duration_ms,
+                         SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.status_code, r.duration_ms,
                                 r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens,
                                 r.cost_micros, r.currency, r.error_code,
                                 CASE WHEN r.request_object LIKE 'gap://%' THEN 'gap'
@@ -828,7 +828,7 @@ impl Database {
                             AND spool.reservation_id = r.reservation_id
                           WHERE r.key_id = $1 AND r.conversation_cluster_id IS NULL
                          UNION ALL
-                         SELECT archive_request_id, source_started_at, protocol, model,
+                         SELECT archive_request_id, source_started_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model,
                                 status_code, duration_ms, input_tokens,
                                 CAST(0 AS BIGINT) AS cached_input_tokens,
                                 CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens,
@@ -852,12 +852,12 @@ impl Database {
             .await?
         } else {
             sqlx::query(
-                r#"SELECT id, created_at, protocol, model, status_code, duration_ms,
+                r#"SELECT id, created_at, completed_at, source_completed_at, protocol, model, status_code, duration_ms,
                           input_tokens, cached_input_tokens, cache_write_tokens, output_tokens,
                           cost_micros, currency, error_code, archive_state,
                           source_kind, provenance_kind, archive_source, external_request_id
                      FROM (
-                         SELECT r.id, r.created_at, r.protocol, r.model, r.status_code, r.duration_ms,
+                         SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.status_code, r.duration_ms,
                                 r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens,
                                 r.cost_micros, r.currency, r.error_code,
                                 CASE WHEN r.request_object LIKE 'gap://%' THEN 'gap'
@@ -871,7 +871,7 @@ impl Database {
                             AND spool.reservation_id = r.reservation_id
                           WHERE r.key_id = $1 AND r.conversation_cluster_id IS NULL
                          UNION ALL
-                         SELECT archive_request_id, source_started_at, protocol, model,
+                         SELECT archive_request_id, source_started_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model,
                                 status_code, duration_ms, input_tokens,
                                 CAST(0 AS BIGINT) AS cached_input_tokens,
                                 CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens,
@@ -929,8 +929,8 @@ impl Database {
                     request: RequestView {
                         request_id: parse_uuid(row.try_get("id")?)?,
                         created_at: row.try_get("created_at")?,
-                        completed_at: None,
-                        source_completed_at: None,
+                        completed_at: row.try_get("completed_at")?,
+                        source_completed_at: row.try_get("source_completed_at")?,
                         lifecycle_state: match row.try_get::<Option<i64>, _>("status_code")? {
                             None => crate::model::RequestLifecycleState::Pending,
                             Some(499) => crate::model::RequestLifecycleState::Cancelled,
