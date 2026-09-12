@@ -4,6 +4,8 @@ mod cipher;
 mod producer;
 mod upload;
 
+#[cfg(test)]
+pub(crate) use producer::fail_next_append_for_test;
 pub(crate) use producer::{ResponseArchiveProducer, mark_gap};
 pub(crate) use upload::run;
 

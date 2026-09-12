@@ -4,6 +4,28 @@ use bytes::Bytes;
 
 use crate::{AppState, db::ArchiveSpoolIdentity, error::AppError};
 
+#[cfg(test)]
+static FAIL_NEXT_APPEND: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+#[cfg(test)]
+/// Latch one producer failure without opening a database transaction, so tests
+/// can isolate capture failure from persistence failure on the following gap.
+pub(crate) fn fail_next_append_for_test(state: &AppState) {
+    let mut latched = FAIL_NEXT_APPEND
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(latched.insert(state.config.database_url.clone()));
+}
+
+#[cfg(test)]
+fn take_append_failure_for_test(state: &AppState) -> bool {
+    FAIL_NEXT_APPEND
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&state.config.database_url)
+}
+
 pub(crate) struct ResponseArchiveProducer {
     state: AppState,
     identity: ArchiveSpoolIdentity,
@@ -46,6 +68,10 @@ impl ResponseArchiveProducer {
     }
 
     pub(crate) async fn append(&mut self, chunks: Vec<Bytes>) -> bool {
+        #[cfg(test)]
+        if take_append_failure_for_test(&self.state) {
+            return false;
+        }
         let _memory = self.state.metrics.memory_usage(
             crate::metrics::MemoryComponent::StreamCapture,
             super::CHUNK_BYTES * 5,
