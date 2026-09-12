@@ -316,6 +316,7 @@ pub struct PluginPackageIdentity {
 #[derive(Clone)]
 struct CachedPluginConfigurations {
     loaded_at: Instant,
+    read_generation: u64,
     snapshot: ResolvedTrafficSnapshot,
     estimated_bytes: usize,
 }
@@ -324,6 +325,7 @@ struct CachedPluginConfigurations {
 struct ConfigurationCache {
     // An identity token cannot wrap/reuse a counter while an old read holds it.
     epoch: Arc<()>,
+    read_generation: u64,
     entries: BTreeMap<Uuid, CachedPluginConfigurations>,
 }
 
@@ -2545,6 +2547,7 @@ mod tests {
             runtime
                 .cache_snapshot(
                     &epoch,
+                    index as u64 + 1,
                     Instant::now(),
                     ResolvedTrafficSnapshot {
                         tenant_id: Uuid::from_u128(index as u128 + 1),
