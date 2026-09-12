@@ -21,7 +21,7 @@ test('credential mode remains editable without raw routing arrays or mobile over
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/credential-form.html`);
     await page.locator('.rjsf').waitFor();
-    const artifacts = fileURLToPath(new URL('./e2e-artifacts/upstream-availability', import.meta.url));
+    const artifacts = fileURLToPath(new URL('../e2e-artifacts/upstream-availability', import.meta.url));
     mkdirSync(artifacts, { recursive: true });
     await page.screenshot({ path: `${artifacts}/credential-form-mobile.png`, fullPage: true });
     const mode = page.getByRole('combobox', { name: 'Metering and limit mode' });
