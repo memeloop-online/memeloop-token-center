@@ -164,6 +164,18 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             "/internal/v1/requests/{request_id}/assets/{asset_id}",
             get(internal_request_asset),
         )
+        .route(
+            "/internal/v1/generations/quarantine",
+            get(super::super::generation_quarantine::list_generation_quarantine),
+        )
+        .route(
+            "/internal/v1/generations/quarantine/{job_id}",
+            get(super::super::generation_quarantine::get_generation_quarantine),
+        )
+        .route(
+            "/internal/v1/generations/quarantine/{job_id}/resolutions",
+            post(super::super::generation_quarantine::resolve_generation_quarantine),
+        )
         .route("/internal/v1/generations", get(internal_generations))
         .route(
             "/internal/v1/generations/{job_id}",

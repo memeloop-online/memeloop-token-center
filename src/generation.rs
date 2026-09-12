@@ -397,9 +397,12 @@ async fn process_claimed(
     job: &GenerationJobWork,
     quarantine_on_drop: bool,
 ) -> Result<(), AppError> {
-    if job.status != "cancelling"
-        && unix_millis().saturating_sub(job.created_at) > MAX_JOB_AGE_MILLIS
-    {
+    // Manual proof of a previously unknown delivery starts one bounded polling
+    // window. Preserve admission time and every ordinary job's timeout policy.
+    let deadline = job
+        .reconciliation_deadline_at
+        .unwrap_or_else(|| job.created_at.saturating_add(MAX_JOB_AGE_MILLIS));
+    if job.status != "cancelling" && unix_millis() > deadline {
         return terminal_failure(state, worker_id, job, "generation_timeout").await;
     }
     if job.status == "submitting"
