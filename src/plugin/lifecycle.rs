@@ -388,7 +388,11 @@ fn next_revision(state: &State, expected: u64) -> Result<u64, AppError> {
     expected.checked_add(1).ok_or(AppError::Internal)
 }
 
-fn snapshot(runtime: PluginRuntime, revision: u64, reason: RevisionReason) -> Arc<RuntimeSnapshot> {
+pub(super) fn snapshot(
+    runtime: PluginRuntime,
+    revision: u64,
+    reason: RevisionReason,
+) -> Arc<RuntimeSnapshot> {
     tracing::info!(
         event = "plugin_runtime_revision_published",
         schema_version = 1_u8,
@@ -403,7 +407,7 @@ fn snapshot(runtime: PluginRuntime, revision: u64, reason: RevisionReason) -> Ar
     })
 }
 
-fn validate_grants(
+pub(super) fn validate_grants(
     runtime: &PluginRuntime,
     grants: &BTreeMap<String, Vec<PluginGrant>>,
 ) -> Result<(), AppError> {

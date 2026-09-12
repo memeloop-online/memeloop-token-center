@@ -34,6 +34,7 @@ async fn proxy_openai_image_generation(
     request_json: Value,
 ) -> Result<Response, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
+    let state = state.pin_application_plugins().await?;
     let downstream_idempotency_key = image_idempotency_key(&headers)?;
     let existing_idempotency = match downstream_idempotency_key.as_deref() {
         Some(idempotency_key) => {
