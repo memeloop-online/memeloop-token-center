@@ -83,6 +83,17 @@ export function SchemaFieldErrorTemplate({ errors, fieldPathId }: FieldErrorProp
   return <div className="schema-field-error" id={`${fieldPathId.$id}__error`} role="status">{t('schemaError.invalidField')}</div>;
 }
 
+// RJSF's default fallback prints the complete schema, including defaults and
+// examples. Unknown plugin fields must not expose those values or force the
+// surrounding form to adopt an unbounded preformatted width.
+export function SchemaUnsupportedFieldTemplate() {
+  const { t } = useI18n();
+  return <div className="schema-unsupported" role="note">
+    <strong>{t('schemaError.unsupportedTitle')}</strong>
+    <p>{t('schemaError.unsupportedHint')}</p>
+  </div>;
+}
+
 export function SchemaJsonObjectField({
   autofocus,
   disabled,
@@ -119,6 +130,7 @@ export function SchemaJsonObjectField({
 }
 
 export const schemaFormTemplates = {
+  UnsupportedFieldTemplate: SchemaUnsupportedFieldTemplate,
   ArrayFieldTemplate: SchemaArrayFieldTemplate,
   ArrayFieldItemTemplate: SchemaArrayItemTemplate,
   ErrorListTemplate: SchemaErrorListTemplate,
