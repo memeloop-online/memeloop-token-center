@@ -34,8 +34,44 @@ async fn assistant_invokes_selected_route_and_bills_explicit_key_then_rejects_di
             "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":suggestion.to_string()}]}],
             "usage":{"input_tokens":100,"output_tokens":30,"total_tokens":130}
         }))).expect(1).mount(&upstream).await;
-    let fixture = response_usage_fixture("filter-assistant", &upstream, 0).await;
+    let mut fixture = response_usage_fixture("filter-assistant", &upstream, 0).await;
     let tenant = "compatibility-route-filter-assistant";
+    // Both routes are authorized for the same public model. Ordinary priority
+    // selection would choose the decoy; the configured route must win instead.
+    let decoy = fixture
+        .state
+        .db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: tenant.into(),
+            public_model: fixture.model.clone(),
+            upstream_account_id: fixture.upstream_account_id,
+            upstream_model: "must-not-be-selected".into(),
+            protocol: "openai".into(),
+            priority: -100,
+        })
+        .await
+        .unwrap();
+    let billed = fixture
+        .state
+        .db
+        .create_key_with_routing(
+            CreateKeyInput {
+                tenant_external_id: tenant.into(),
+                principal_external_id: "assistant-owner".into(),
+                alias: "assistant-billing".into(),
+                currency: "USD".into(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::ONE,
+                idempotency_key: None,
+            },
+            &[fixture.route_id, decoy.id],
+            &[],
+            fixture.state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    fixture.key_id = billed.key_id;
+    fixture.key = billed.key;
     let settings = json!({"tenant_external_id":tenant,"model_route_id":fixture.route_id,"billing_key_id":fixture.key_id,"expected_updated_at":null});
     let saved = management_request(
         &fixture,
