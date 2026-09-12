@@ -857,10 +857,11 @@ async fn logical_session_api_is_stable_key_scoped_and_cursor_paginated() {
         ))
         .await;
     assert_eq!(legacy_status, StatusCode::OK, "{legacy_page}");
-    assert_eq!(
+    assert_ne!(
         legacy_page["sessions"][0]["session_id"], cursor_session,
-        "a legacy cursor repeats its boundary instead of skipping a tied key"
+        "a key-scoped legacy cursor must infer its key and advance strictly"
     );
+    assert_eq!(legacy_page["sessions"][0], second_page[0]);
 
     let (status, detail) = fixture
         .get(&format!("/self/v1/sessions/{first_cluster}"))

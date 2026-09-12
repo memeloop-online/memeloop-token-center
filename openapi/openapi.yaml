@@ -3376,7 +3376,7 @@ paths:
           schema: { type: string, minLength: 1, maxLength: 80 }
         - name: before_key_id
           in: query
-          description: Final key tie-breaker for new cursors. May be omitted only when resuming a legacy two-field cursor, which can repeat its boundary row rather than skip data.
+          description: Final key tie-breaker for new cursors. A legacy two-field cursor may omit it only when `key_id` scopes the request to one stable key; unscoped legacy cursors require refresh or upgrade.
           schema: { type: string, format: uuid }
         - name: key_id
           in: query
@@ -4138,7 +4138,7 @@ paths:
           schema: { type: string, minLength: 1, maxLength: 80 }
         - name: before_key_id
           in: query
-          description: Final key tie-breaker for new cursors. May be omitted only when resuming a legacy two-field cursor, which can repeat its boundary row rather than skip data.
+          description: Final key tie-breaker for new cursors. A legacy two-field cursor may omit it because this operation is already scoped to the authenticated stable key.
           schema: { type: string, format: uuid }
         - name: state
           in: query

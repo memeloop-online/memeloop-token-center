@@ -439,8 +439,17 @@ impl Database {
         let limit = filter.limit.clamp(1, 100) + 1;
         let key_id = filter.key_id.map(|id| id.to_string()).unwrap_or_default();
         let has_cursor = filter.cursor.is_some();
-        let (before_last_activity_at, before_session_id, before_key_id) =
+        let (before_last_activity_at, before_session_id, mut before_key_id) =
             filter.cursor.unwrap_or((-1, String::new(), String::new()));
+        if filter.legacy_cursor {
+            if key_id.is_empty() {
+                return Err(AppError::BadRequest(
+                    "legacy session cursor requires key_id; refresh and use the returned three-field cursor"
+                        .into(),
+                ));
+            }
+            before_key_id.clone_from(&key_id);
+        }
         let model = filter.model.unwrap_or_default();
         let query = search_prefix(filter.query.as_deref());
         let use_candidate_first_page = should_use_candidate_first_page(
@@ -560,7 +569,7 @@ impl Database {
                    SELECT * FROM filterable
                     WHERE $4 < 0 OR last_activity_at < $4
                        OR (last_activity_at = $4 AND (session_id < $5
-                           OR (session_id = $5 AND ($10 OR key_id < $9))))
+                           OR (session_id = $5 AND key_id < $9)))
                     ORDER BY last_activity_at DESC, session_id DESC, key_id DESC
                     LIMIT $3
                ), latest_ids AS MATERIALIZED (
@@ -728,8 +737,7 @@ impl Database {
                 .bind(&filter.state)
                 .bind(&model)
                 .bind(&query)
-                .bind(&before_key_id)
-                .bind(filter.legacy_cursor);
+                .bind(&before_key_id);
         }
         let rows = session_query.fetch_all(&self.pool).await?;
         let mut sessions = BTreeMap::<(String, String), SessionAccumulator>::new();

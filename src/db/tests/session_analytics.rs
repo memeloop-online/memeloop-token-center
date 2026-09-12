@@ -396,7 +396,7 @@ async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_histor
         "full cursor must neither lose nor repeat rows"
     );
 
-    let legacy_page = state
+    let legacy_error = state
         .db
         .operator_recent_sessions(
             &tenant_external_id,
@@ -409,13 +409,12 @@ async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_histor
             },
         )
         .await
-        .expect("legacy conservative cursor page");
-    assert_eq!(legacy_page.len(), 3);
-    assert_eq!(legacy_page[0].cluster_id, Some(shared_session));
-    assert_eq!(legacy_page[0].key_id, shared_keys[0]);
-    assert_eq!(legacy_page[1].cluster_id, Some(shared_session));
-    assert_eq!(legacy_page[1].key_id, shared_keys[1]);
-    assert_eq!(legacy_page[2].cluster_id, Some(historical_cluster_id));
+        .expect_err("unscoped legacy cursor must fail closed");
+    assert!(matches!(
+        legacy_error,
+        AppError::BadRequest(message)
+            if message == "legacy session cursor requires key_id; refresh and use the returned three-field cursor"
+    ));
 }
 
 #[tokio::test]

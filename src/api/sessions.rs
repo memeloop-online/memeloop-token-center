@@ -51,10 +51,8 @@ impl RecentSessionsQuery {
             }
             (Some(last_activity_at), Some(session_id), None) => {
                 validate_session_id(session_id)?;
-                // A legacy two-field cursor cannot identify its position
-                // among keys tied on the first two fields. Include that whole
-                // pair explicitly: the boundary can repeat, but no tied key
-                // can disappear due to a database collation assumption.
+                // The database can safely infer the missing tie-breaker only
+                // after this cursor is scoped to one stable key.
                 Ok((
                     Some((*last_activity_at, session_id.clone(), String::new())),
                     true,
