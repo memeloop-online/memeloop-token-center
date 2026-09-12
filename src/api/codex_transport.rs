@@ -387,26 +387,7 @@ pub(super) fn validate_route_config(config: &Value) -> Result<(), AppError> {
 }
 
 fn valid_transport_policy(policy: Option<&Value>) -> bool {
-    let Some(policy) = policy else {
-        return true;
-    };
-    let Some(policy) = policy.as_object() else {
-        return false;
-    };
-    policy.keys().all(|key| {
-        matches!(
-            key.as_str(),
-            "connect_attempts" | "connect_retry_delay_millis" | "shared_probe_attempts"
-        )
-    }) && policy
-        .get("connect_attempts")
-        .is_none_or(|value| value.as_u64().is_some_and(|value| (1..=4).contains(&value)))
-        && policy
-            .get("connect_retry_delay_millis")
-            .is_none_or(|value| value.as_u64().is_some_and(|value| value <= 2_000))
-        && policy
-            .get("shared_probe_attempts")
-            .is_none_or(|value| value.as_u64().is_some_and(|value| value <= 4))
+    crate::provider::CodexTransportPolicy::parse(policy).is_ok()
 }
 
 fn trusted_reservation_token_bound(config: &Value, upstream_model: &str) -> Result<i64, AppError> {

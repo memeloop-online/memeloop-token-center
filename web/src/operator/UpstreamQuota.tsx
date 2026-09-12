@@ -84,6 +84,7 @@ export function UpstreamQuota({ accountId, accountName = accountId, tenant, toke
   return <section className="upstream-quota" aria-label={t('quota.title')} aria-busy={busy}>
     <div className="upstream-quota-heading"><h3>{t('quota.title')}</h3><button type="button" className="secondary" disabled={busy || !tenant} onClick={() => void load()}>{t(busy ? 'common.loading' : snapshot ? 'quota.refresh' : 'quota.view')}</button></div>
     {error && <p className="notice error" role="alert">{t(snapshot ? 'quota.refreshFailedRetained' : 'quota.readFailed')}</p>}
+    {!snapshot && busy && <div className="upstream-quota-loading" role="status"><span>{t('common.loading')}</span><div className="upstream-quota-skeleton" aria-hidden="true"><i /><i /></div></div>}
     {!snapshot && !busy && !error && <p>{t(tenant ? 'quota.notLoaded' : 'quota.selectTenant')}</p>}
     {snapshot && <UpstreamQuotaDetails snapshot={snapshot} />}
     {snapshot && snapshot.reset_capability.provider_supported === true && snapshot.reset_capability.implementation_available && <details className="upstream-danger-zone"><summary>{t('quota.resetAction')}</summary><p>{t('quota.resetWarning')}</p><UpstreamQuotaReset key={scope} accountId={accountId} accountName={accountName} tenant={tenant} token={token} snapshot={snapshot} /></details>}

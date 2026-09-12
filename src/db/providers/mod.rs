@@ -1,6 +1,7 @@
 mod accounts;
 mod imports;
 mod model_catalog;
+mod model_picker;
 mod native_oauth_imports;
 mod oauth;
 mod routes;
@@ -10,6 +11,13 @@ pub use imports::{NativeCodexUpgradeReport, NativeCodexUpgradeTarget};
 pub use model_catalog::{
     AggregatedUpstreamModelCatalogView, AggregatedUpstreamModelView, DiscoveredUpstreamModel,
     ReplaceModelCatalogResult, UpstreamModelCatalogView, UpstreamModelView,
+};
+pub use model_picker::{
+    MODEL_PICKER_GROUP_LIMIT, MODEL_PICKER_ITEM_LIMIT, MODEL_PICKER_SOURCE_LIMIT,
+    ModelPickerCatalogEvidence, ModelPickerConfigurationAvailability, ModelPickerHealthEvidence,
+    ModelPickerItem, ModelPickerNamedIdentity, ModelPickerProjectionFilter,
+    ModelPickerProviderIdentity, ModelPickerSelectionIdentity, ModelPickerSelectionKind,
+    ModelPickerSource, ModelPickerSourceCapabilities,
 };
 pub use native_oauth_imports::{
     NativeOAuthImportAccountInput, NativeOAuthImportApproval, NativeOAuthImportCohortResult,

@@ -1,7 +1,7 @@
 import { useConfirmDialog } from '../../useConfirmDialog';
 import RjsfForm, { type FormProps } from '@rjsf/core/lib/components/Form.js';
 import type { RJSFSchema } from '@rjsf/utils';
-import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { ApiError, api, apiRead } from '../../api';
 import { formatCurrency, formatNumber } from '../../format';
 import { localizeSchema, useI18n } from '../../i18n';
@@ -37,6 +37,12 @@ import { enumLabel, messageOf, OneTimeSecret, queryForTenant, WriteScopeNotice }
 function Form(props: FormProps) {
   return <RjsfForm {...props} noHtml5Validate onError={() => { /* Validation is rendered inline. */ }} />;
 }
+
+const secretResponseRequestPolicy = {
+  cache: 'no-store',
+  credentials: 'omit',
+  referrerPolicy: 'no-referrer',
+} as const;
 
 function recentAvailabilityPath(tenant: string, now: number) {
   const query = new URLSearchParams({
@@ -495,12 +501,87 @@ function selections(ids: string[], options: ComboboxOption[]) {
   return ids.map((id) => options.find((option) => option.value === id) ?? { value: id, label: id });
 }
 
+function ExactCredentialCombobox({ token, tenant, credentials, value, onChange }: {
+  token: string;
+  tenant: string;
+  credentials: KeyView[];
+  value: string[];
+  onChange: (ids: string[]) => void;
+}) {
+  const { t } = useI18n();
+  const [resolved, setResolved] = useState<KeyView[]>([]);
+  const [search, setSearch] = useState({ query: '', loading: false, error: '', resultId: '' });
+  const sequence = useRef(0);
+  const request = useRef<AbortController | undefined>(undefined);
+  const scope = useRef({ token, tenant });
+  const committedScope = useRef({ token, tenant });
+  scope.current = { token, tenant };
+  const credentialOptions = [
+    ...credentials,
+    ...resolved.filter((match) => !credentials.some((credential) => credential.key_id === match.key_id)),
+  ].map((credential) => ({ value: credential.key_id, label: credential.alias, description: credential.key_id }));
+
+  const searchCredential = (query: string) => {
+    request.current?.abort();
+    const currentSequence = ++sequence.current;
+    const keyId = query.trim();
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(keyId) || !token || !tenant) {
+      setSearch({ query: '', loading: false, error: '', resultId: '' });
+      return;
+    }
+    const controller = new AbortController();
+    request.current = controller;
+    const searchScope = { token, tenant };
+    const queryParameters = new URLSearchParams({ tenant_external_id: tenant, key_id: keyId, limit: '1' });
+    setSearch({ query: keyId, loading: true, error: '', resultId: '' });
+    void apiRead<KeyView[]>(`/internal/v1/keys?${queryParameters}`, token, {
+      // Exact lookup has no hidden automatic retry. The explicit bound is
+      // configurable per read, query/scope changes cancel it, and a visible
+      // retry remains under operator control.
+      attempts: 1,
+      attemptTimeoutMilliseconds: 15_000,
+      signal: controller.signal,
+    }).then((matches) => {
+      if (controller.signal.aborted || currentSequence !== sequence.current
+        || scope.current.token !== searchScope.token || scope.current.tenant !== searchScope.tenant) return;
+      setResolved((current) => [
+        ...matches,
+        ...current.filter((credential) => value.includes(credential.key_id)
+          && !matches.some((match) => match.key_id === credential.key_id)),
+      ]);
+      setSearch({ query: keyId, loading: false, error: '', resultId: matches[0]?.key_id ?? '' });
+    }).catch((reason) => {
+      if (controller.signal.aborted || currentSequence !== sequence.current
+        || scope.current.token !== searchScope.token || scope.current.tenant !== searchScope.tenant) return;
+      setSearch({ query: keyId, loading: false, error: messageOf(reason, t('routes.credentialSearchFailed')), resultId: '' });
+    });
+  };
+
+  useLayoutEffect(() => {
+    if (committedScope.current.token === token && committedScope.current.tenant === tenant) return;
+    committedScope.current = { token, tenant };
+    request.current?.abort();
+    sequence.current += 1;
+    setResolved([]);
+    setSearch({ query: '', loading: false, error: '', resultId: '' });
+  }, [token, tenant]);
+  useLayoutEffect(() => () => {
+    request.current?.abort();
+    sequence.current += 1;
+  }, []);
+  useEffect(() => {
+    setResolved((current) => current.filter((credential) => value.includes(credential.key_id) || credential.key_id === search.resultId));
+  }, [value, search.resultId]);
+
+  return <MultiCombobox label={t('routes.exactCredentials')} options={credentialOptions} value={selections(value, credentialOptions)} onChange={(selected) => onChange(selected.map((item) => item.value))} placeholder={t('routes.searchCredentials')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('routes.exactCredentialsHint')} onQueryChange={searchCredential} loading={search.loading} loadingText={t('routes.credentialSearchLoading')} error={search.error} retryLabel={t('common.retry')} onRetry={() => searchCredential(search.query)} />;
+}
+
 function routeRequest(draft: RouteDraft, customModelConfirmed: boolean) {
   const { upstream_account_id: _legacyAccountId, ...request } = draft;
   return { ...request, custom_model_confirmed: customModelConfirmed };
 }
 
-function RouteFields({ token, tenant, draft, upstreams, providers, providerGroups, routeGroups, credentials, onChange, onCatalogValidity, onCredentialQuery }: {
+function RouteFields({ token, tenant, draft, upstreams, providers, providerGroups, routeGroups, credentials, onChange, onCatalogValidity }: {
   token: string;
   tenant: string;
   draft: RouteDraft;
@@ -511,7 +592,6 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
   credentials: KeyView[];
   onChange: (draft: RouteDraft) => void;
   onCatalogValidity: (valid: boolean, allowCustom: boolean) => void;
-  onCredentialQuery: (query: string) => void;
 }) {
   const { locale, t } = useI18n();
   const knownProtocols = ['openai', 'anthropic', 'generation'];
@@ -530,7 +610,6 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
   const upstreamOptions = upstreams.map((value) => ({ value: value.id, label: value.name, description: value.driver }));
   const providerGroupOptions = providerGroups.map((value) => ({ value: value.id, label: value.name, description: t('groups.memberCount', { count: formatNumber(value.member_count, locale) }) }));
   const routeGroupOptions = routeGroups.map((value) => ({ value: value.id, label: value.name, description: t('groups.memberCount', { count: formatNumber(value.member_count, locale) }) }));
-  const credentialOptions = credentials.map((value) => ({ value: value.key_id, label: value.alias, description: value.key_id }));
   const routeGroupValue = [
     ...selections(draft.route_group_ids, routeGroupOptions),
     ...draft.route_group_names.map((name) => ({ value: `new:${name}`, label: name, created: true })),
@@ -554,7 +633,7 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
     </fieldset><fieldset><legend>{t('routes.accessSection')}</legend><p className="field-hint">{t('routes.accessHint')}</p>
     <label>{t('routes.priority')}<input type="number" required step={1} aria-invalid={!priorityValid} aria-describedby={priorityHintId} min={-1000000} max={1000000} value={Number.isNaN(draft.priority) ? '' : draft.priority} onChange={(event) => onChange({ ...draft, priority: event.target.valueAsNumber })} /></label><small id={priorityHintId} className={priorityValid ? 'field-hint' : 'field-error'}>{t('routes.priorityHint')}</small>
     <MultiCombobox label={t('routes.routeGroups')} options={routeGroupOptions} value={routeGroupValue} onChange={(selected) => onChange({ ...draft, route_group_ids: selected.filter((item) => !item.created).map((item) => item.value), route_group_names: selected.filter((item) => item.created).map((item) => item.label) })} placeholder={t('routes.searchOrCreateRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} allowCreate createLabel={(name) => t('routes.createRouteGroupNamed', { name })} hint={t('routes.routeGroupsHint')} />
-    <MultiCombobox label={t('routes.exactCredentials')} options={credentialOptions} value={selections(draft.granted_credential_ids, credentialOptions)} onChange={(selected) => onChange({ ...draft, granted_credential_ids: selected.map((item) => item.value) })} placeholder={t('routes.searchCredentials')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('routes.exactCredentialsHint')} onQueryChange={onCredentialQuery} />
+    <ExactCredentialCombobox token={token} tenant={tenant} credentials={credentials} value={draft.granted_credential_ids} onChange={(granted_credential_ids) => onChange({ ...draft, granted_credential_ids })} />
     </fieldset>
   </div>;
 }
@@ -580,7 +659,6 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   const loadAbort = useRef<AbortController | undefined>(undefined);
   const credentialLoadSequence = useRef(0);
   const credentialLoadAbort = useRef<AbortController | undefined>(undefined);
-  const credentialSearchAbort = useRef<AbortController | undefined>(undefined);
   const scopeRef = useRef({ token, tenant, writeTenant });
   scopeRef.current = { token, tenant, writeTenant };
   const load = async () => {
@@ -599,22 +677,6 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
       setRoutes(nextRoutes); setError('');
     }
     catch (reason) { if (!controller.signal.aborted && sequence === loadSequence.current && scopeRef.current.token === loadToken && scopeRef.current.tenant === loadTenant) setError(messageOf(reason, t('common.requestFailed'))); }
-  };
-  const searchCredential = (query: string) => {
-    credentialSearchAbort.current?.abort();
-    const keyId = query.trim();
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(keyId) || !token || !writeTenant) return;
-    const controller = new AbortController();
-    credentialSearchAbort.current = controller;
-    const searchToken = token; const searchTenant = tenant; const searchWriteTenant = writeTenant;
-    const queryParameters = new URLSearchParams({ tenant_external_id: searchWriteTenant, key_id: keyId, limit: '1' });
-    void apiRead<KeyView[]>(`/internal/v1/keys?${queryParameters}`, searchToken, { signal: controller.signal }).then((matches) => {
-      if (controller.signal.aborted || scopeRef.current.token !== searchToken || scopeRef.current.tenant !== searchTenant || scopeRef.current.writeTenant !== searchWriteTenant) return;
-      setCredentials((current) => [...matches, ...current.filter((value) => !matches.some((match) => match.key_id === value.key_id))]);
-      setError('');
-    }).catch((reason) => {
-      if (!controller.signal.aborted && scopeRef.current.token === searchToken && scopeRef.current.tenant === searchTenant && scopeRef.current.writeTenant === searchWriteTenant) setError(messageOf(reason, t('common.requestFailed')));
-    });
   };
   useEffect(() => {
     credentialLoadAbort.current?.abort();
@@ -642,7 +704,7 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
     loadSequence.current += 1; credentialLoadSequence.current += 1; setRoutes([]); setCredentials([]); setCredentialsRequested(false); setCredentialError(''); setForm(emptyRouteDraft); setFormCatalog({ valid: false, allowCustom: false });
     setEditing(undefined); setEditForm(emptyRouteDraft); setEditCatalog({ valid: false, allowCustom: false });
     setBusy(''); setMessage(''); setError(''); void load();
-    return () => { loadAbort.current?.abort(); credentialLoadAbort.current?.abort(); credentialSearchAbort.current?.abort(); };
+    return () => { loadAbort.current?.abort(); credentialLoadAbort.current?.abort(); };
   }, [token, tenant, writeTenant]);
   const statusFilter = useResourceListStatusFilter('model-routes', tenant, routes, (route) => route.enabled);
   const scopedUpstreams = upstreams.filter((value) => !value.tenant_external_id || value.tenant_external_id === writeTenant);
@@ -712,9 +774,9 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   };
   return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} /><section className="management-layout">
     <article className="panel"><div className="panel-title"><div><h2>{t('routes.title')}</h2><p className="muted">{t('routes.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>{error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{credentialError && <div className="notice error" role="alert">{credentialError}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="table-scroll"><table><thead><tr>{!tenant && <th>{t('credentials.tenant')}</th>}<th>{t('routes.publicModel')}</th><th>{t('routes.upstream')}</th><th>{t('routes.groups')}</th><th>{t('routes.upstreamModel')}</th><th>{t('routes.protocol')}</th><th>{t('routes.priority')}</th><th>{t('request.status')}</th><th>{t('routes.actions')}</th></tr></thead><tbody>{statusFilter.values.map((route) => <tr key={route.id}>{!tenant && <td><code>{route.tenant_external_id ?? '—'}</code></td>}<td><code>{route.public_model}</code></td><td><div className="table-chip-list">{(route.upstream_account_ids ?? (route.upstream_account_id ? [route.upstream_account_id] : [])).map((id) => <span key={id}>{upstreams.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><div className="table-chip-list">{(route.route_group_ids ?? []).map((id) => <span key={id}>{routeGroups.groups.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><code>{route.upstream_model}</code></td><td>{route.protocol}</td><td>{formatNumber(route.priority, locale)}</td><td><span className={`status ${route.enabled ? 'ok' : 'pending'}`}>{route.enabled ? t('common.enabled') : t('common.disabled')}</span></td><td><div className="row-actions"><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => beginEdit(route)}>{t('routes.edit')}</button><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => void setEnabled(route, !route.enabled)}>{route.enabled ? t('routes.disable') : t('routes.enable')}</button><button type="button" className="danger" title={route.enabled ? t('routes.disableBeforeDelete') : undefined} disabled={busy === route.id || !canManage(route) || route.enabled} onClick={() => void remove(route)}>{t('common.remove')}</button></div></td></tr>)}</tbody></table>{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('common.enabled')} empty={t('routes.empty')} />}</div>
-      {editing && <div className="inline-editor form-panel"><div className="panel-title"><h3>{t('routes.editTitle', { model: editing.public_model })}</h3><button type="button" className="secondary" onClick={() => setEditing(undefined)}>{t('common.cancel')}</button></div><RouteFields token={token} tenant={writeTenant} draft={editForm} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setEditForm} onCatalogValidity={(valid, allowCustom) => setEditCatalog({ valid, allowCustom })} onCredentialQuery={searchCredential} /><button type="button" disabled={busy === editing.id || !canSubmit(editForm, editCatalog.valid)} onClick={() => void saveEdit()}>{t('common.save')}</button></div>}
+      {editing && <div className="inline-editor form-panel"><div className="panel-title"><h3>{t('routes.editTitle', { model: editing.public_model })}</h3><button type="button" className="secondary" onClick={() => setEditing(undefined)}>{t('common.cancel')}</button></div><RouteFields token={token} tenant={writeTenant} draft={editForm} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setEditForm} onCatalogValidity={(valid, allowCustom) => setEditCatalog({ valid, allowCustom })} /><button type="button" disabled={busy === editing.id || !canSubmit(editForm, editCatalog.valid)} onClick={() => void saveEdit()}>{t('common.save')}</button></div>}
     </article>
-    <details className="panel create-resource" onToggle={(event) => { if (event.currentTarget.open) setCredentialsRequested(true); }}><summary><span><b>{t('routes.createTitle')}</b><small>{t('routes.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel"><RouteFields token={token} tenant={writeTenant} draft={form} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setForm} onCatalogValidity={(valid, allowCustom) => setFormCatalog({ valid, allowCustom })} onCredentialQuery={searchCredential} /><button type="button" disabled={busy === 'create' || !canSubmit(form, formCatalog.valid)} onClick={async () => { setBusy('create'); setMessage(''); setError(''); try { await api('/internal/v1/model-routes', token, { method: 'POST', body: JSON.stringify({ ...routeRequest(form, formCatalog.allowCustom), tenant_external_id: writeTenant }) }); setForm(emptyRouteDraft); setFormCatalog({ valid: false, allowCustom: false }); setMessage(t('routes.created')); await Promise.all([load(), routeGroups.load]); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}>{t('routes.create')}</button></div></details>
+    <details className="panel create-resource" onToggle={(event) => { if (event.currentTarget.open) setCredentialsRequested(true); }}><summary><span><b>{t('routes.createTitle')}</b><small>{t('routes.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel"><RouteFields token={token} tenant={writeTenant} draft={form} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setForm} onCatalogValidity={(valid, allowCustom) => setFormCatalog({ valid, allowCustom })} /><button type="button" disabled={busy === 'create' || !canSubmit(form, formCatalog.valid)} onClick={async () => { setBusy('create'); setMessage(''); setError(''); try { await api('/internal/v1/model-routes', token, { method: 'POST', body: JSON.stringify({ ...routeRequest(form, formCatalog.allowCustom), tenant_external_id: writeTenant }) }); setForm(emptyRouteDraft); setFormCatalog({ valid: false, allowCustom: false }); setMessage(t('routes.created')); await Promise.all([load(), routeGroups.load]); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}>{t('routes.create')}</button></div></details>
   </section><section className="routing-group-managers">
     <GroupManager kind="provider" token={token} tenant={writeTenant} groups={providerGroups.groups} resources={scopedUpstreams.map((value) => ({ value: value.id, label: value.name, description: value.driver }))} onChanged={providerGroups.load} />
     <GroupManager kind="route" token={token} tenant={writeTenant} groups={routeGroups.groups} resources={routes.filter(canManage).map((route) => ({ value: route.id, label: route.public_model, description: route.protocol }))} onChanged={async () => { await Promise.all([routeGroups.load(), load()]); }} />
@@ -724,6 +786,10 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
 function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema, policySchema }: { token: string; tenant: string; writeTenant?: string; createSchema?: Record<string, unknown>; policySchema?: Record<string, unknown> }) {
   const { locale, t } = useI18n();
   const { confirm, confirmationDialog } = useConfirmDialog([token, tenant, writeTenant]);
+  const renderScope = useRef({ token, tenant, writeTenant, generation: 0 });
+  if (renderScope.current.token !== token || renderScope.current.tenant !== tenant || renderScope.current.writeTenant !== writeTenant) {
+    renderScope.current = { token, tenant, writeTenant, generation: renderScope.current.generation + 1 };
+  }
   const [values, setValues] = useState<KeyView[]>([]);
   const [routes, setRoutes] = useState<ModelRouteView[]>([]);
   const [editingPolicy, setEditingPolicy] = useState<string>();
@@ -743,8 +809,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const [keyListState, setKeyListState] = useState<KeyListLoadState>('idle');
   const [keyError, setKeyError] = useState('');
   const [routeError, setRouteError] = useState('');
-  const [secret, setSecret] = useState('');
-  const [manualRecoverySecret, setManualRecoverySecret] = useState<{ keyId: string; key: string }>();
+  const [secret, setSecret] = useState<{ value: string; recovered: boolean; displayId: string; scopeGeneration: number }>();
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const scopeGeneration = useRef(0);
@@ -752,8 +817,18 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const routeRequestGeneration = useRef(0);
   const keyRequest = useRef<{ identity: KeyListRequestIdentity; controller: AbortController } | undefined>(undefined);
   const routeRequest = useRef<{ generation: number; scopeGeneration: number; controller: AbortController } | undefined>(undefined);
+  const secretRequest = useRef<AbortController | undefined>(undefined);
+  const secretOperation = useRef<symbol | undefined>(undefined);
+  const visibleSecret = secret?.scopeGeneration === renderScope.current.generation ? secret : undefined;
+  const secretRef = useRef(visibleSecret);
+  secretRef.current = visibleSecret;
   const scopeRef = useRef({ token, tenant, writeTenant });
   scopeRef.current = { token, tenant, writeTenant };
+  const ownsSecretScope = (operationToken: string, operationTenant: string, operationWriteTenant: string, operationScopeGeneration: number) =>
+    renderScope.current.generation === operationScopeGeneration
+    && scopeRef.current.token === operationToken
+    && scopeRef.current.tenant === operationTenant
+    && scopeRef.current.writeTenant === operationWriteTenant;
   const credentialGroups = useGroups('credential', token, writeTenant);
   const routeGroups = useGroups('route', token, writeTenant);
   const createFormSchema = createSchema;
@@ -824,10 +899,11 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
     }
   };
   useEffect(() => {
+    secretRequest.current?.abort(); secretRequest.current = undefined; secretOperation.current = undefined; secretRef.current = undefined;
     scopeGeneration.current += 1; setValues([]); setRoutes([]); setEditingPolicy(undefined); setEditingRouting(undefined); setRoutingDraft(undefined);
     setRenaming(undefined); setAliasDraft(''); setLimitSnapshots({}); setGranting(undefined); setGrant({ amount: '', source: '' }); setBusy('');
-    setNewRouteIds([]); setNewRouteGroupIds([]); setGroupFilter('all'); setSearch(''); setNextCursor(undefined); setKeyListState('initial-loading'); setKeyError(''); setRouteError(''); setSecret(''); setManualRecoverySecret(undefined); setMessage(''); setError(''); void load();
-    return () => { keyRequest.current?.controller.abort(); routeRequest.current?.controller.abort(); };
+    setNewRouteIds([]); setNewRouteGroupIds([]); setGroupFilter('all'); setSearch(''); setNextCursor(undefined); setKeyListState('initial-loading'); setKeyError(''); setRouteError(''); setSecret(undefined); setMessage(''); setError(''); void load();
+    return () => { keyRequest.current?.controller.abort(); routeRequest.current?.controller.abort(); secretRequest.current?.abort(); };
   }, [token, tenant, writeTenant]);
   const loadMore = async () => {
     if (!canLoadMoreKeys(keyListState, Boolean(nextCursor), Boolean(keyRequest.current)) || !nextCursor || !token) return;
@@ -865,29 +941,74 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const canReadLimits = canReadCredentialLimits(token);
   const canWrite = canWriteCredential(writeTenant);
   const canManage = (value: KeyView) => canWrite && value.tenant_external_id === writeTenant;
-  const copyRecoveredCredential = async (value: KeyView) => {
-    if (!canManage(value) || value.status !== 'active' || !value.credential_recovery_available) return;
-    const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant;
-    setBusy(`copy-${value.key_id}`); setError(''); setMessage(''); setManualRecoverySecret(undefined);
+  const beginSecretOperation = () => {
+    if (secretOperation.current || secretRef.current) return undefined;
+    const operation = Symbol('credential-secret-operation');
+    secretOperation.current = operation;
+    return operation;
+  };
+  const finishSecretOperation = (operation: symbol) => {
+    if (secretOperation.current !== operation) return;
+    secretOperation.current = undefined;
+    setBusy('');
+  };
+  const showSecret = (next: { value: string; recovered: boolean; displayId: string }) => {
+    // Update the ref synchronously so another submit in the same browser task
+    // cannot replace plaintext before React commits the state update.
+    const scoped = { ...next, scopeGeneration: renderScope.current.generation };
+    secretRef.current = scoped;
+    setSecret(scoped);
+  };
+  const dismissSecret = () => {
+    secretRef.current = undefined;
+    setSecret(undefined);
+  };
+  const rotateCredential = async (value: KeyView) => {
+    if (!canManage(value) || value.status === 'revoked') return;
+    const operation = beginSecretOperation();
+    if (!operation) return;
+    const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant; const operationScopeGeneration = renderScope.current.generation;
+    setBusy(`rotate-${value.key_id}`); setError(''); setMessage('');
+    const controller = new AbortController();
+    secretRequest.current?.abort();
+    secretRequest.current = controller;
     try {
-      const result = await api<{ key_id: string; credential_generation: number; key: string }>(`/internal/v1/keys/${value.key_id}/credential-recovery/copy`, operationToken, { method: 'POST' });
-      if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || scopeRef.current.writeTenant !== operationWriteTenant) return;
-      if (result.key_id !== value.key_id || result.credential_generation !== value.credential_generation) throw new Error(t('common.requestFailed'));
-      try {
-        if (!navigator.clipboard?.writeText) throw new Error('Clipboard API unavailable');
-        await navigator.clipboard.writeText(result.key);
-        if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || scopeRef.current.writeTenant !== operationWriteTenant) return;
-        setMessage(t('credentials.copySuccess', { alias: value.alias }));
-      } catch {
-        if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || scopeRef.current.writeTenant !== operationWriteTenant) return;
-        // The recovered value remains only in this component state so the
-        // authorized operator can manually copy it. It is never persisted.
-        setManualRecoverySecret({ keyId: value.key_id, key: result.key });
-      }
+      if (!await confirm(`${t('credentials.rotate')} · ${value.alias}\n${value.key_id}`)) return;
+      const result = await api<{ key: string }>(`/internal/v1/keys/${value.key_id}/rotate`, operationToken, { ...secretResponseRequestPolicy, method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() }, signal: controller.signal });
+      if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
+      showSecret({ value: result.key, recovered: false, displayId: crypto.randomUUID() }); setMessage(t('credentials.rotated', { alias: value.alias })); await load();
     } catch (reason) {
-      if (scopeRef.current.token === operationToken && scopeRef.current.tenant === operationTenant && scopeRef.current.writeTenant === operationWriteTenant) setError(messageOf(reason, t('common.requestFailed')));
+      if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setError(messageOf(reason, t('common.requestFailed')));
     } finally {
-      if (scopeRef.current.token === operationToken && scopeRef.current.tenant === operationTenant && scopeRef.current.writeTenant === operationWriteTenant) setBusy('');
+      if (secretRequest.current === controller) secretRequest.current = undefined;
+      if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) finishSecretOperation(operation);
+    }
+  };
+  const recoverCredential = async (value: KeyView) => {
+    if (!canManage(value) || value.status !== 'active' || !value.credential_recovery_available) return;
+    const operation = beginSecretOperation();
+    if (!operation) return;
+    const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant; const operationScopeGeneration = renderScope.current.generation;
+    setBusy(`recover-${value.key_id}`); setError(''); setMessage('');
+    const controller = new AbortController();
+    secretRequest.current?.abort();
+    secretRequest.current = controller;
+    try {
+      if (!await confirm(t('credentials.confirmRecovery', { alias: value.alias }))) return;
+      // This is the only historical-credential read. The server enforces
+      // keys:write, tenant scope, active generation and a valid envelope.
+      const result = await api<{ key_id: string; credential_generation: number; key: string }>(`/internal/v1/keys/${value.key_id}/credential-recovery/copy`, operationToken, {
+        ...secretResponseRequestPolicy, method: 'POST', signal: controller.signal,
+      });
+      if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
+      if (result.key_id !== value.key_id || result.credential_generation !== value.credential_generation) throw new Error(t('common.requestFailed'));
+      showSecret({ value: result.key, recovered: true, displayId: crypto.randomUUID() });
+      setMessage(t('credentials.recovered', { alias: value.alias }));
+    } catch (reason) {
+      if (!controller.signal.aborted && ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setError(messageOf(reason, t('common.requestFailed')));
+    } finally {
+      if (secretRequest.current === controller) secretRequest.current = undefined;
+      if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) finishSecretOperation(operation);
     }
   };
   const routeOptions = routes.filter((route) => route.tenant_external_id === writeTenant).map((route) => ({ value: route.id, label: route.public_model, description: route.protocol }));
@@ -917,8 +1038,9 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
       } else setError(messageOf(reason, t('common.requestFailed')));
     }
   };
-  return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} />{secret && <OneTimeSecret value={secret} message={t('credentials.oneTimeSecret')} />}<section className="management-layout">
+  return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} />{visibleSecret && <OneTimeSecret key={visibleSecret.displayId} value={visibleSecret.value} recovered={visibleSecret.recovered} recoveryAvailable={!visibleSecret.recovered} filename="client-credential.txt" onDismiss={dismissSecret} message={t(visibleSecret.recovered ? 'credentials.recoveredSecret' : 'credentials.oneTimeSecret')} />}<section className="management-layout">
     <article className="panel"><div className="panel-title"><div><h2>{t('credentials.title')}</h2><p className="muted">{t('credentials.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>
+      <div className="notice warning" role="note">{t('credentials.secretUnavailable')}</div>
       <div className="credential-list-controls"><label>{t('credentials.search')}<input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t('credentials.searchPlaceholder')} /></label>{writeTenant && <label>{t('credentials.groupFilter')}<select value={groupFilter} onChange={(event) => setGroupFilter(event.target.value)}><option value="all">{t('common.all')}</option><option value="unassigned">{t('credentials.ungrouped')}</option>{credentialGroups.groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select></label>}</div>
       <p className="credential-list-summary" role="status">{listPresentation === 'loading' ? t('credentials.loadingList') : listPresentation === 'loading-more' ? t('credentials.loadingMore', { count: formatNumber(values.length, locale) }) : listPresentation === 'failed' ? t('credentials.loadFailed', { count: formatNumber(values.length, locale) }) : listPresentation === 'filtered' ? t('credentials.filteredLoaded', { shown: formatNumber(filteredValues.length, locale), loaded: formatNumber(values.length, locale) }) : listPresentation === 'more' ? t('credentials.loadedMore', { count: formatNumber(values.length, locale) }) : t('credentials.loadedComplete', { count: formatNumber(values.length, locale) })}</p>
       {keyError && <div className="notice error" role="alert">{keyError}</div>}{routeError && <div className="notice error" role="alert">{routeError}</div>}{error && <div className="notice error" role="alert">{error}</div>}{credentialGroups.error && <div className="notice error" role="alert">{credentialGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{message && <div className="notice success" role="status">{message}</div>}
@@ -927,17 +1049,13 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
         return <div className="managed-resource" key={value.key_id}><div className="managed-resource-header"><div><b>{value.alias}</b><small>{value.key_id}</small><span>{!tenant && <>{t('credentials.tenant')}: {value.tenant_external_id ?? '—'} · </>}{value.principal_external_id ?? t('common.unknownPrincipal')} · {formatCurrency(value.available_balance, value.currency, locale)}</span></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div>
           <div className="credential-recovery-control">
             {value.credential_recovery_available && value.status === 'active'
-              ? <button type="button" className="secondary" disabled={!canManage(value) || Boolean(busy)} onClick={() => void copyRecoveredCredential(value)}>{busy === `copy-${value.key_id}` ? t('common.loading') : t('credentials.copy')}</button>
-              : <span className="pill credential-recovery-unavailable" title={t(value.status === 'revoked' ? 'credentials.copyRevoked' : value.status === 'suspended' ? 'credentials.copySuspended' : 'credentials.copyNotStored')}>{t(value.status === 'revoked' ? 'credentials.copyRevoked' : value.status === 'suspended' ? 'credentials.copySuspended' : 'credentials.copyNotStored')}</span>}
-            {manualRecoverySecret?.keyId === value.key_id && <div className="credential-recovery-manual" role="status">
-              <b>{t('credentials.copyManual')}</b>
-              <code>{manualRecoverySecret.key}</code>
-              <button type="button" className="secondary" onClick={() => setManualRecoverySecret(undefined)}>{t('common.close')}</button>
-            </div>}
+              ? <button type="button" className="secondary" disabled={!canManage(value) || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void recoverCredential(value)}>{busy === `recover-${value.key_id}` ? t('common.loading') : t('credentials.recoverAndCopy')}</button>
+              : <><span className="pill credential-recovery-unavailable" title={t(value.status === 'revoked' ? 'credentials.copyRevoked' : value.status === 'suspended' ? 'credentials.copySuspended' : 'credentials.copyNotStored')}>{t(value.status === 'revoked' ? 'credentials.copyRevoked' : value.status === 'suspended' ? 'credentials.copySuspended' : 'credentials.copyNotStored')}</span>
+                {value.status !== 'revoked' && <button type="button" className="secondary" disabled={!canManage(value) || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void rotateCredential(value)}>{t('credentials.rotateToCopy')}</button>}</>}
           </div>
           {memberships.length > 0 && <div className="table-chip-list credential-group-chips" aria-label={t('groups.credential.title')}>{memberships.map((group) => <span key={group.id}>{group.name}</span>)}</div>}
           <div className="policy-chips"><span>{enumLabel(t, 'enforcementMode', value.policy.enforcement_mode)}</span><span>RPM {formatNumber(value.policy.requests_per_minute, locale)}</span><span>TPM {formatNumber(value.policy.tokens_per_minute, locale)}</span><span>{t('self.concurrency')} {formatNumber(value.policy.max_concurrency, locale)}</span><span>{t('budget.daily')}: {value.policy.daily_budget === null ? '—' : formatCurrency(value.policy.daily_budget, value.currency, locale)}</span><span>{t('budget.weekly')}: {value.policy.weekly_budget === null ? '—' : formatCurrency(value.policy.weekly_budget, value.currency, locale)}</span><span>{t('budget.lifetime')}: {value.policy.lifetime_budget === null ? '—' : formatCurrency(value.policy.lifetime_budget, value.currency, locale)}</span></div>
-          <div className="row-actions"><button type="button" className="secondary" disabled={!canWrite} onClick={() => { setRenaming(renaming === value.key_id ? undefined : value.key_id); setAliasDraft(value.alias); }}>{t('credentials.rename')}</button><button type="button" className="secondary" disabled={!canReadLimits} onClick={async () => { try { const snapshot = await api<KeyLimitSnapshot>(`/internal/v1/keys/${value.key_id}/limits`, token); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setLimitSnapshots((current) => ({ ...current, [value.key_id]: snapshot })); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } }}>{t('credentials.viewLimits')}</button><button type="button" className="secondary" disabled={!canWrite || value.status === 'revoked' || Boolean(busy)} onClick={async () => { if (!await confirm(`${t('credentials.rotate')} · ${value.alias}\n${value.key_id}`)) return; setBusy(`rotate-${value.key_id}`); try { const result = await api<{ key: string }>(`/internal/v1/keys/${value.key_id}/rotate`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() } }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setSecret(result.key); setMessage(t('credentials.rotated', { alias: value.alias })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setBusy(''); } }}>{t('credentials.rotate')}</button><button type="button" className="secondary" disabled={!canWrite || value.status === 'revoked'} onClick={() => setEditingPolicy(editingPolicy === value.key_id ? undefined : value.key_id)}>{t('credentials.editPolicy')}</button><button type="button" className="secondary" disabled={!canWrite || value.status === 'revoked'} onClick={() => void openRouting(value)}>{t('credentials.routing')}</button><button type="button" className="secondary" disabled={!canWrite || !value.account_id || value.status === 'revoked'} title={!value.account_id ? t('credentials.accountMissing') : undefined} onClick={() => setGranting(granting === value.key_id ? undefined : value.key_id)}>{t('credentials.grant')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" disabled={!canWrite} onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; try { await api(`/internal/v1/keys/${value.key_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setMessage(t(nextStatus === 'active' ? 'credentials.resumed' : 'credentials.suspended', { alias: value.alias })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } }}>{value.status === 'active' ? t('credentials.suspend') : t('credentials.resume')}</button>}</div>
+          <div className="row-actions"><button type="button" className="secondary" disabled={!canWrite} onClick={() => { setRenaming(renaming === value.key_id ? undefined : value.key_id); setAliasDraft(value.alias); }}>{t('credentials.rename')}</button><button type="button" className="secondary" disabled={!canReadLimits} onClick={async () => { try { const snapshot = await api<KeyLimitSnapshot>(`/internal/v1/keys/${value.key_id}/limits`, token); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setLimitSnapshots((current) => ({ ...current, [value.key_id]: snapshot })); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } }}>{t('credentials.viewLimits')}</button><button type="button" className="secondary" disabled={!canWrite || value.status === 'revoked' || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void rotateCredential(value)}>{t('credentials.rotate')}</button><button type="button" className="secondary" disabled={!canWrite || value.status === 'revoked'} onClick={() => setEditingPolicy(editingPolicy === value.key_id ? undefined : value.key_id)}>{t('credentials.editPolicy')}</button><button type="button" className="secondary" disabled={!canWrite || value.status === 'revoked'} onClick={() => void openRouting(value)}>{t('credentials.routing')}</button><button type="button" className="secondary" disabled={!canWrite || !value.account_id || value.status === 'revoked'} title={!value.account_id ? t('credentials.accountMissing') : undefined} onClick={() => setGranting(granting === value.key_id ? undefined : value.key_id)}>{t('credentials.grant')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" disabled={!canWrite} onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; try { await api(`/internal/v1/keys/${value.key_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setMessage(t(nextStatus === 'active' ? 'credentials.resumed' : 'credentials.suspended', { alias: value.alias })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } }}>{value.status === 'active' ? t('credentials.suspend') : t('credentials.resume')}</button>}</div>
           {renaming === value.key_id && <div className="inline-editor form-panel"><h3>{t('credentials.renameFor', { alias: value.alias })}</h3><label>{t('schema.Credential alias')}<input value={aliasDraft} maxLength={200} onChange={(event) => setAliasDraft(event.target.value)} /></label><button type="button" disabled={!canWrite || !aliasDraft.trim()} onClick={async () => { try { await api(`/internal/v1/keys/${value.key_id}/alias`, token, { method: 'PATCH', body: JSON.stringify({ alias: aliasDraft }) }); setRenaming(undefined); setMessage(t('credentials.renamed', { alias: aliasDraft.trim() })); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}>{t('common.save')}</button></div>}
           {limitSnapshots[value.key_id] && <LimitSnapshot value={limitSnapshots[value.key_id]} />}
           {editingPolicy === value.key_id && policyFormSchema && <div className="inline-editor form-panel"><h3>{t('credentials.policyFor', { alias: value.alias })}</h3><Form key={`${value.key_id}-${locale}`} schema={localizeSchema(policyFormSchema as RJSFSchema, locale)} formData={value.policy} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { try { await api(`/internal/v1/keys/${value.key_id}/policy`, token, { method: 'PUT', body: JSON.stringify(formData) }); setEditingPolicy(undefined); setMessage(t('credentials.policySaved')); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!canWrite}>{t('common.save')}</button></Form></div>}
@@ -952,11 +1070,26 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
     <details className="panel create-resource"><summary><span><b>{t('credentials.createTitle')}</b><small>{t('credentials.createRoutingHint')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">
       <MultiCombobox label={t('credentials.exactRoutes')} options={routeOptions} value={selections(newRouteIds, routeOptions)} onChange={(selected) => setNewRouteIds(selected.map((item) => item.value))} placeholder={t('credentials.searchRoutes')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} />
       <MultiCombobox label={t('credentials.routeGroups')} options={routeGroupOptions} value={selections(newRouteGroupIds, routeGroupOptions)} onChange={(selected) => setNewRouteGroupIds(selected.map((item) => item.value))} placeholder={t('credentials.searchRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('credentials.existingGroupsOnly')} />
-      {createFormSchema ? <Form key={`${tenant}-${writeTenant}-${locale}`} schema={localizeSchema(createFormSchema as RJSFSchema, locale)} uiSchema={{ tenant_external_id: { 'ui:widget': 'hidden' } }} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!writeTenant) return; try {
-        const created = await api<{ key: string; key_id: string }>('/internal/v1/keys', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant, route_ids: newRouteIds, route_group_ids: newRouteGroupIds }) });
-        if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return;
-        setNewRouteIds([]); setNewRouteGroupIds([]); setSecret(created.key); setMessage(t(newRouteIds.length || newRouteGroupIds.length ? 'credentials.created' : 'credentials.createdNoRoutes')); await load();
-      } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!canWrite}>{t('credentials.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
+      {createFormSchema ? <Form key={`${tenant}-${writeTenant}-${locale}`} schema={localizeSchema(createFormSchema as RJSFSchema, locale)} uiSchema={{ tenant_external_id: { 'ui:widget': 'hidden' } }} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => {
+        if (!writeTenant) return;
+        const operation = beginSecretOperation();
+        if (!operation) return;
+        const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant; const operationScopeGeneration = renderScope.current.generation;
+        setBusy('create-credential'); setError(''); setMessage('');
+        const controller = new AbortController();
+        secretRequest.current?.abort();
+        secretRequest.current = controller;
+        try {
+          const created = await api<{ key: string; key_id: string }>('/internal/v1/keys', operationToken, { ...secretResponseRequestPolicy, method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: operationWriteTenant, route_ids: newRouteIds, route_group_ids: newRouteGroupIds }), signal: controller.signal });
+          if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
+          setNewRouteIds([]); setNewRouteGroupIds([]); showSecret({ value: created.key, recovered: false, displayId: crypto.randomUUID() }); setMessage(t(newRouteIds.length || newRouteGroupIds.length ? 'credentials.created' : 'credentials.createdNoRoutes')); await load();
+        } catch (reason) {
+          if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setError(messageOf(reason, t('common.requestFailed')));
+        } finally {
+          if (secretRequest.current === controller) secretRequest.current = undefined;
+          if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) finishSecretOperation(operation);
+        }
+      }}><button type="submit" disabled={!canWrite || Boolean(busy) || Boolean(visibleSecret)}>{busy === 'create-credential' ? t('common.loading') : t('credentials.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
     </div></details>
   </section>{writeTenant && <GroupManager kind="credential" token={token} tenant={writeTenant} groups={credentialGroups.groups} resources={values.filter(canManage).map((value) => ({ value: value.key_id, label: value.alias, description: value.key_id }))} onChanged={credentialGroups.load} />}</>;
 }
@@ -964,14 +1097,28 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
 function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schema }: { token: string; tenant: string; writeTenant?: string; schema?: Record<string, unknown> }) {
   const { locale, t } = useI18n();
   const { confirm, confirmationDialog } = useConfirmDialog([token, tenant, writeTenant]);
+  const renderScope = useRef({ token, tenant, writeTenant, generation: 0 });
+  if (renderScope.current.token !== token || renderScope.current.tenant !== tenant || renderScope.current.writeTenant !== writeTenant) {
+    renderScope.current = { token, tenant, writeTenant, generation: renderScope.current.generation + 1 };
+  }
   const [values, setValues] = useState<ServiceTokenView[]>([]);
-  const [secret, setSecret] = useState('');
+  const [secret, setSecret] = useState<{ value: string; displayId: string; scopeGeneration: number }>();
   const [busy, setBusy] = useState('');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const loadSequence = useRef(0);
+  const secretRequest = useRef<AbortController | undefined>(undefined);
+  const secretOperation = useRef<symbol | undefined>(undefined);
+  const visibleSecret = secret?.scopeGeneration === renderScope.current.generation ? secret : undefined;
+  const secretRef = useRef(visibleSecret);
+  secretRef.current = visibleSecret;
   const scopeRef = useRef({ token, tenant, writeTenant });
   scopeRef.current = { token, tenant, writeTenant };
+  const ownsSecretScope = (operationToken: string, operationTenant: string, operationWriteTenant: string, operationScopeGeneration: number) =>
+    renderScope.current.generation === operationScopeGeneration
+    && scopeRef.current.token === operationToken
+    && scopeRef.current.tenant === operationTenant
+    && scopeRef.current.writeTenant === operationWriteTenant;
   const load = async () => {
     const sequence = ++loadSequence.current;
     const loadToken = token; const loadTenant = tenant;
@@ -983,13 +1130,75 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schem
     } catch (reason) { if (sequence === loadSequence.current && scopeRef.current.token === loadToken && scopeRef.current.tenant === loadTenant) setError(messageOf(reason, t('common.requestFailed'))); }
   };
   useEffect(() => {
-    loadSequence.current += 1; setValues([]); setSecret(''); setBusy(''); setMessage(''); setError(''); void load();
+    secretRequest.current?.abort(); secretRequest.current = undefined; secretOperation.current = undefined; secretRef.current = undefined;
+    loadSequence.current += 1; setValues([]); setSecret(undefined); setBusy(''); setMessage(''); setError(''); void load();
+    return () => { secretRequest.current?.abort(); };
   }, [token, tenant, writeTenant]);
   const statusFilter = useResourceListStatusFilter('service-credentials', tenant, values, (value) => (value.status ?? 'active') === 'active');
   const canManage = (value: ServiceTokenView) => Boolean(writeTenant) && (!value.tenant_external_id || value.tenant_external_id === writeTenant);
-  return <>{confirmationDialog}{secret && <OneTimeSecret value={secret} message={t('services.oneTimeSecret')} />}<section className="management-layout">
-    <article className="panel"><div className="panel-title"><div><h2>{t('services.title')}</h2><p className="muted">{t('services.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>{error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="account-list">{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('status.active')} empty={t('services.empty')} />}{statusFilter.values.map((value) => <div className="managed-resource" key={value.service_id}><div className="managed-resource-header"><div><b>{value.name}</b><small>{value.service_id}</small><span>{value.tenant_external_id ?? t('services.globalScope')} · {value.scopes.join(' · ')}</span></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div><div className="row-actions"><button type="button" className="secondary" disabled={!canManage(value) || value.status === 'revoked' || Boolean(busy)} onClick={async () => { if (!await confirm(`${t('services.rotate')} · ${value.name}\n${value.service_id}`)) return; setBusy(`rotate-${value.service_id}`); try { const result = await api<{ token: string }>(`/internal/v1/service-tokens/${value.service_id}/rotate`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() } }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setSecret(result.token); setMessage(t('services.rotated', { name: value.name })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); } }}>{t('services.rotate')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" disabled={!canManage(value) || Boolean(busy)} onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; setBusy(`status-${value.service_id}`); try { await api(`/internal/v1/service-tokens/${value.service_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setMessage(t(nextStatus === 'active' ? 'services.resumed' : 'services.suspended', { name: value.name })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); } } }>{value.status === 'active' ? t('services.suspend') : t('services.resume')}</button>}</div></div>)}</div></article>
-    <details className="panel create-resource"><summary><span><b>{t('services.createTitle')}</b><small>{t('services.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">{schema ? <Form key={`${tenant}-${writeTenant}-${locale}`} schema={localizeSchema(schema as RJSFSchema, locale)} uiSchema={{ tenant_external_id: { 'ui:widget': 'hidden' } }} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!writeTenant) return; try { const created = await api<{ token: string }>('/internal/v1/service-tokens', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant }) }); setSecret(created.token); setMessage(t('services.created')); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!writeTenant}>{t('services.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}</div></details>
+  const beginSecretOperation = () => {
+    if (secretOperation.current || secretRef.current) return undefined;
+    const operation = Symbol('service-credential-secret-operation');
+    secretOperation.current = operation;
+    return operation;
+  };
+  const finishSecretOperation = (operation: symbol) => {
+    if (secretOperation.current !== operation) return;
+    secretOperation.current = undefined;
+    setBusy('');
+  };
+  const showSecret = (value: string) => {
+    const next = { value, displayId: crypto.randomUUID(), scopeGeneration: renderScope.current.generation };
+    secretRef.current = next;
+    setSecret(next);
+  };
+  const dismissSecret = () => {
+    secretRef.current = undefined;
+    setSecret(undefined);
+  };
+  const rotateServiceCredential = async (value: ServiceTokenView) => {
+    if (!canManage(value) || value.status === 'revoked') return;
+    const operation = beginSecretOperation();
+    if (!operation) return;
+    const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant; const operationScopeGeneration = renderScope.current.generation;
+    const controller = new AbortController();
+    secretRequest.current?.abort(); secretRequest.current = controller;
+    setBusy(`rotate-${value.service_id}`); setError(''); setMessage('');
+    try {
+      if (!await confirm(`${t('services.rotate')} · ${value.name}\n${value.service_id}`)) return;
+      const result = await api<{ token: string }>(`/internal/v1/service-tokens/${value.service_id}/rotate`, operationToken, { ...secretResponseRequestPolicy, method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() }, signal: controller.signal });
+      if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
+      showSecret(result.token); setMessage(t('services.rotated', { name: value.name })); await load();
+    } catch (reason) {
+      if (!controller.signal.aborted && ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setError(messageOf(reason, t('common.requestFailed')));
+    } finally {
+      if (secretRequest.current === controller) secretRequest.current = undefined;
+      if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) finishSecretOperation(operation);
+    }
+  };
+  const createServiceCredential = async (formData: unknown) => {
+    if (!writeTenant) return;
+    const operation = beginSecretOperation();
+    if (!operation) return;
+    const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant; const operationScopeGeneration = renderScope.current.generation;
+    const controller = new AbortController();
+    secretRequest.current?.abort(); secretRequest.current = controller;
+    setBusy('create-service-credential'); setError(''); setMessage('');
+    const fields = formData && typeof formData === 'object' ? formData : {};
+    try {
+      const created = await api<{ token: string }>('/internal/v1/service-tokens', operationToken, { ...secretResponseRequestPolicy, method: 'POST', body: JSON.stringify({ ...fields, tenant_external_id: operationWriteTenant }), signal: controller.signal });
+      if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
+      showSecret(created.token); setMessage(t('services.created')); await load();
+    } catch (reason) {
+      if (!controller.signal.aborted && ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setError(messageOf(reason, t('common.requestFailed')));
+    } finally {
+      if (secretRequest.current === controller) secretRequest.current = undefined;
+      if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) finishSecretOperation(operation);
+    }
+  };
+  return <>{confirmationDialog}{visibleSecret && <OneTimeSecret key={visibleSecret.displayId} value={visibleSecret.value} filename="service-credential.txt" onDismiss={dismissSecret} message={t('services.oneTimeSecret')} />}<section className="management-layout">
+    <article className="panel"><div className="panel-title"><div><h2>{t('services.title')}</h2><p className="muted">{t('services.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>{error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="account-list">{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('status.active')} empty={t('services.empty')} />}{statusFilter.values.map((value) => <div className="managed-resource" key={value.service_id}><div className="managed-resource-header"><div><b>{value.name}</b><small>{value.service_id}</small><span>{value.tenant_external_id ?? t('services.globalScope')} · {value.scopes.join(' · ')}</span></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div><div className="row-actions"><button type="button" className="secondary" disabled={!canManage(value) || value.status === 'revoked' || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void rotateServiceCredential(value)}>{t('services.rotate')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" disabled={!canManage(value) || Boolean(busy)} onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; setBusy(`status-${value.service_id}`); try { await api(`/internal/v1/service-tokens/${value.service_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setMessage(t(nextStatus === 'active' ? 'services.resumed' : 'services.suspended', { name: value.name })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); } } }>{value.status === 'active' ? t('services.suspend') : t('services.resume')}</button>}</div></div>)}</div></article>
+    <details className="panel create-resource"><summary><span><b>{t('services.createTitle')}</b><small>{t('services.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">{schema ? <Form key={`${tenant}-${writeTenant}-${locale}`} schema={localizeSchema(schema as RJSFSchema, locale)} uiSchema={{ tenant_external_id: { 'ui:widget': 'hidden' } }} validator={validator} templates={schemaFormTemplates} onSubmit={({ formData }) => { void createServiceCredential(formData); }}><button type="submit" disabled={!writeTenant || Boolean(busy) || Boolean(visibleSecret)}>{busy === 'create-service-credential' ? t('common.loading') : t('services.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}</div></details>
   </section></>;
 }
 

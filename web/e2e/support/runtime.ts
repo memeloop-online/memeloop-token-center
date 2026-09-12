@@ -51,7 +51,12 @@ export async function waitForPendingSessionRequests(expected: number): Promise<v
 
 export interface SessionReadyObservation {
   opened: Promise<void>;
-  completed: Promise<Set<string>>;
+  completed: Promise<SessionReadyRequests>;
+}
+
+export interface SessionReadyRequests {
+  requestIds: ReadonlySet<string>;
+  sessionId: string;
 }
 
 export function observeSessionReadyRequests({
@@ -71,16 +76,17 @@ export function observeSessionReadyRequests({
   const deadline = AbortSignal.timeout(15_000);
   const signal = AbortSignal.any([controller.signal, deadline]);
   const requestIds = new Set<string>();
+  let sessionId: string | undefined;
   let openedResolve!: () => void;
   let openedReject!: (reason: unknown) => void;
-  let completedResolve!: (requestIds: Set<string>) => void;
+  let completedResolve!: (requests: SessionReadyRequests) => void;
   let completedReject!: (reason: unknown) => void;
   let settled = false;
   const opened = new Promise<void>((resolve, reject) => {
     openedResolve = resolve;
     openedReject = reject;
   });
-  const completed = new Promise<Set<string>>((resolve, reject) => {
+  const completed = new Promise<SessionReadyRequests>((resolve, reject) => {
     completedResolve = resolve;
     completedReject = reject;
   });
@@ -106,10 +112,14 @@ export function observeSessionReadyRequests({
       assert.equal(eventName, `request.${event.event_kind}`, 'request-event SSE name must match its event kind');
       if (event.key_id !== keyId || event.model !== requestModel
         || !matchesReadySessionEvent(event, sessionName)) return;
+      const eventSessionId = event.session_context?.session_id;
+      assert.ok(eventSessionId, 'confirmed session-ready events must name their logical session');
+      if (sessionId === undefined) sessionId = eventSessionId;
+      else assert.equal(eventSessionId, sessionId, 'the four declared turns must commit to one logical session');
       requestIds.add(event.request_id);
       if (requestIds.size !== expected || settled) return;
       settled = true;
-      completedResolve(requestIds);
+      completedResolve({ requestIds: new Set(requestIds), sessionId: eventSessionId });
       controller.abort();
     },
     openedResolve,

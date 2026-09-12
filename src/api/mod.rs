@@ -43,6 +43,7 @@ mod groups;
 mod health;
 mod kimi_transport;
 mod limits;
+mod model_picker;
 mod model_routes;
 mod monitoring_snapshot;
 mod plugins;
@@ -65,8 +66,8 @@ use archive_quarantine::{
 };
 use auth::{
     admit_cloud_webhook_before_body, authenticate_control_before_body, authenticate_downstream,
-    authenticate_gateway_before_body, management_tenant, require_global_service, require_service,
-    require_service_any, require_service_tenant,
+    authenticate_gateway_before_body, authenticated_service, management_tenant,
+    require_global_service, require_service, require_service_any, require_service_tenant,
 };
 use billing::*;
 use cloud_entitlements::{
@@ -95,6 +96,7 @@ use health::{
     version,
 };
 use limits::*;
+use model_picker::list_model_picker_options;
 use model_routes::{
     create_model_route, delete_model_route, list_model_routes, retire_model_route_upstreams,
     set_model_route_enabled, update_model_route,

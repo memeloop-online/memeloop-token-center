@@ -206,16 +206,19 @@ pub(in crate::api) async fn copy_key_credential(
     headers: HeaderMap,
     Path(key_id): Path<Uuid>,
 ) -> Result<Response, AppError> {
-    let service = require_service(&headers, &state, "keys:write").await?;
-    if let Some(tenant) = service.tenant_external_id.as_deref() {
-        state.db.require_key_tenant(key_id, tenant).await?;
-    }
+    // Authenticate first, then let the database atomically rate-limit and
+    // audit authorized-service failures as well as successful retrievals.
+    // Invalid bearer tokens are rejected by the control middleware before
+    // this handler and never get to amplify durable audit writes.
+    let service = authenticated_service(&headers, &state).await?;
     let recovered = state
         .db
         .copy_key_credential(
             key_id,
             state.config.key_pepper.as_bytes(),
             service.service_id,
+            service.tenant_external_id.as_deref(),
+            service.allows("keys:write"),
         )
         .await?;
     let mut response = Json(recovered).into_response();

@@ -122,10 +122,15 @@ pub use monitoring_snapshot::{MonitoringScope, MonitoringSnapshotFilter};
 pub use oauth_sessions::{BeginOAuthLoginSession, OAuthLoginClaim, OAuthLoginSessionReference};
 pub use providers::{
     AggregatedUpstreamModelCatalogView, AggregatedUpstreamModelView, CreateModelRouteInput,
-    CreateUpstreamAccountInput, DiscoveredUpstreamModel, NativeCodexUpgradeReport,
-    NativeCodexUpgradeTarget, NativeOAuthImportAccountInput, NativeOAuthImportApproval,
-    NativeOAuthImportCohortResult, ReauthorizeUpstreamAccountInput, ReplaceModelCatalogResult,
-    UpdateModelRouteInput, UpdateUpstreamAccountInput, UpstreamModelCatalogView, UpstreamModelView,
+    CreateUpstreamAccountInput, DiscoveredUpstreamModel, MODEL_PICKER_GROUP_LIMIT,
+    MODEL_PICKER_ITEM_LIMIT, MODEL_PICKER_SOURCE_LIMIT, ModelPickerCatalogEvidence,
+    ModelPickerConfigurationAvailability, ModelPickerHealthEvidence, ModelPickerItem,
+    ModelPickerNamedIdentity, ModelPickerProjectionFilter, ModelPickerProviderIdentity,
+    ModelPickerSelectionIdentity, ModelPickerSelectionKind, ModelPickerSource,
+    ModelPickerSourceCapabilities, NativeCodexUpgradeReport, NativeCodexUpgradeTarget,
+    NativeOAuthImportAccountInput, NativeOAuthImportApproval, NativeOAuthImportCohortResult,
+    ReauthorizeUpstreamAccountInput, ReplaceModelCatalogResult, UpdateModelRouteInput,
+    UpdateUpstreamAccountInput, UpstreamModelCatalogView, UpstreamModelView,
 };
 pub use requests::{
     AttachProxyArchiveResult, ConversationDetailFilter, ConversationListFilter,
@@ -171,12 +176,32 @@ pub use usage_analysis::{UsageAnalysisFilter, UsageAnalysisUpstreamFilter};
 pub struct Database {
     pool: AnyPool,
     backend: DatabaseBackend,
+    #[cfg(test)]
+    pub(crate) oauth_refresh_write_phase_seam:
+        std::sync::Arc<tokio::sync::Mutex<Option<OAuthRefreshWritePhaseSeam>>>,
 }
 
 #[derive(Clone, Copy)]
 enum DatabaseBackend {
     PostgreSql,
     Sqlite,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OAuthRefreshWritePhase {
+    Claim,
+    Stage,
+    Finalize,
+    Abort,
+}
+
+#[cfg(test)]
+pub(crate) struct OAuthRefreshWritePhaseSeam {
+    pub(crate) account_id: Uuid,
+    pub(crate) entered: tokio::sync::mpsc::UnboundedSender<OAuthRefreshWritePhase>,
+    pub(crate) resume: std::sync::Arc<
+        tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<OAuthRefreshWritePhase>>,
+    >,
 }
 
 impl Database {
@@ -314,7 +339,12 @@ impl Database {
                 .fetch_one(&pool)
                 .await?;
         }
-        Ok(Self { pool, backend })
+        Ok(Self {
+            pool,
+            backend,
+            #[cfg(test)]
+            oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        })
     }
 
     pub(crate) async fn begin_write_transaction(

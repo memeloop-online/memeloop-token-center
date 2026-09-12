@@ -9,6 +9,7 @@ import {
   requestJson,
   runtime,
   sessionModel,
+  type SessionReadyRequests,
   tenant,
   waitForPendingSessionRequests,
 } from '../support/runtime.js';
@@ -17,7 +18,7 @@ import { appPreferenceControls, openAppRoute } from './app-route.support.js';
 
 interface SessionObservation {
   liveRequests: Promise<Response>[];
-  sessionReadyRequests?: Promise<Set<string>>;
+  sessionReadyRequests?: Promise<SessionReadyRequests>;
   sessionListRequests: string[];
   detailRequests: string[];
   baselineSessionListRequests: number;
@@ -277,7 +278,20 @@ Then('Codex 上报的会话名称、代理层级和任务分类进入真实语�
   const page = this.requirePage();
   const sessionReadyRequests = observations.get(this)!.sessionReadyRequests;
   assert.ok(sessionReadyRequests, 'session-ready request observation must start before the live calls');
-  assert.equal((await sessionReadyRequests).size, 4, 'all four durable session semantics must commit');
+  const ready = await sessionReadyRequests;
+  assert.equal(ready.requestIds.size, 4, 'all four durable session semantics must commit');
+  const seed = runtime.requireSeed();
+  const detailParams = new URLSearchParams({
+    tenant_external_id: tenant,
+    key_id: seed.sessionClientKeyId,
+    limit: '100',
+  });
+  const detail = await requestJson<{ requests: Array<{ request_id: string }> }>(
+    `/internal/v1/sessions/${encodeURIComponent(ready.sessionId)}?${detailParams}`,
+    { credential: seed.serviceCredential },
+  );
+  assert.deepEqual(new Set(detail.requests.map((request) => request.request_id)), ready.requestIds,
+    'the committed logical-session detail must contain the exact four observed turns');
   const controls = page.locator('.session-controls');
   await controls.getByLabel('会话状态').selectOption('');
   await controls.getByLabel('搜索').fill('Codex release dogfood');

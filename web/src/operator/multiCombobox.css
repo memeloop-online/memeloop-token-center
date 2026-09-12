@@ -1,0 +1,34 @@
+@import '../modelPicker.css';
+
+/* A field and its top-layer menu share tokens, independent of page or theme. */
+.multi-combobox { min-width: 0; }
+.multi-combobox.multi-combobox > label { color: var(--picker-text); font-size: 12px; font-weight: 600; }
+.multi-combobox .field-hint { color: var(--picker-muted); font-size: 12px; line-height: 1.5; }
+.multi-combobox .multi-combobox-control {
+  background: var(--picker-inset); border-color: var(--picker-border); border-radius: 8px;
+  gap: 6px; min-height: 44px; padding: 6px;
+}
+.multi-combobox .multi-combobox-control input { color: var(--picker-text); font-size: 14px; min-width: 0; }
+.multi-combobox .selection-chip { background: var(--picker-hover); border-color: var(--picker-border); border-radius: 6px; color: var(--picker-text); font-size: 12px; }
+.selection-chip-label { min-width: 0; overflow-wrap: anywhere; }
+.multi-combobox .selection-chip button { flex: 0 0 auto; min-height: 24px; min-width: 24px; }
+.multi-combobox-popover[popover] {
+  background: var(--picker-surface); border: 1px solid var(--picker-border); border-radius: 8px;
+  box-sizing: border-box; color: var(--picker-text); inset: auto; margin: 0;
+  max-height: 280px; overflow: auto; overscroll-behavior: contain; padding: 4px; position: fixed;
+}
+.multi-combobox-popover[popover]:not(:popover-open) { display: none; }
+.multi-combobox-popover .combobox-options { display: grid; }
+.multi-combobox-popover[popover] button[role='option'] {
+  border-radius: 5px; color: var(--picker-text); display: grid; gap: 3px;
+  justify-content: stretch; min-height: 44px; overflow-wrap: anywhere; padding: 8px 10px; width: 100%;
+}
+.multi-combobox-popover[popover] button[role='option']:is(.active, :hover) { background: var(--picker-hover); color: var(--picker-text); }
+.multi-combobox-popover[popover] small { color: var(--picker-muted); font-size: 12px; margin: 0; }
+.multi-combobox-popover[popover] :is(.combobox-empty, .combobox-state) { color: var(--picker-muted); font-size: 12px; line-height: 1.5; padding: 12px; }
+.multi-combobox-popover[popover] .combobox-state.error { color: var(--picker-text); }
+.multi-combobox :focus-visible, .multi-combobox-popover :focus-visible { outline: 2px solid var(--picker-border); outline-offset: 2px; }
+@media (max-width: 600px) {
+  .multi-combobox .multi-combobox-control input { font-size: 16px; }
+  .multi-combobox .selection-chip button { min-height: 32px; min-width: 32px; }
+}

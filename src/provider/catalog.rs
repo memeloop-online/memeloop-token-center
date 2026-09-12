@@ -339,6 +339,23 @@ impl ProviderCatalog {
             "default": {},
             "description": "Runtime-adjustable recovery policy for this account and its encrypted SOCKS5H binding. Changes apply to newly prepared requests without a service release.",
             "properties": {
+                "version": {
+                    "type": "integer",
+                    "enum": [1],
+                    "default": 1
+                },
+                "candidate_attempts": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 8,
+                    "default": 3
+                },
+                "failover_deadline_millis": {
+                    "type": "integer",
+                    "minimum": 1000,
+                    "maximum": 300000,
+                    "default": 300000
+                },
                 "connect_attempts": {
                     "type": "integer",
                     "minimum": 1,

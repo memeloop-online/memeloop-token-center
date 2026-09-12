@@ -371,6 +371,16 @@ pub(in crate::api) async fn update_upstream(
     validate_upstream_destination(&driver, &body.config, &service, &state).await?;
     let should_sync_models = driver != crate::oauth::codex_device::PROVIDER_DRIVER
         || codex_model_sync_config(&current.config) != codex_model_sync_config(&body.config);
+    let policy_change = if driver == crate::oauth::codex_device::PROVIDER_DRIVER
+        && current.config.get("transport_policy") != body.config.get("transport_policy")
+    {
+        Some(
+            crate::provider::CodexTransportPolicy::parse(body.config.get("transport_policy"))
+                .map_err(|_| AppError::BadRequest("invalid Codex transport policy".into()))?,
+        )
+    } else {
+        None
+    };
     let mut account = state
         .db
         .update_upstream_account(
@@ -383,6 +393,18 @@ pub(in crate::api) async fn update_upstream(
             },
         )
         .await?;
+    if let Some(policy) = policy_change {
+        tracing::info!(%account_id, tenant_id = %account.tenant_id,
+            actor_service_id = ?service.service_id,
+            expected_revision = body.expected_updated_at, accepted_revision = account.updated_at,
+            policy_version = policy.version, candidate_attempts = policy.candidate_attempts,
+            failover_deadline_millis = policy.failover_deadline_millis,
+            connect_attempts = policy.connect_attempts,
+            connect_retry_delay_millis = policy.connect_retry_delay_millis,
+            shared_probe_attempts = ?policy.shared_probe_attempts,
+            stage = "upstream_transport_policy_update_accepted",
+            "authorized upstream transport policy update accepted");
+    }
     account.attach_proxy_metadata(&current_credential, state.config.key_pepper.as_bytes())?;
     account.can_update_transport_proxy &= credential_active;
     super::restrict_transport_proxy_capability(&service, &mut account);

@@ -33,6 +33,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             patch(set_service_token_status),
         )
         .route("/internal/v1/provider-types", get(provider_types))
+        .route(
+            "/internal/v1/model-picker-options",
+            get(list_model_picker_options),
+        )
         .route("/internal/v1/requests/query", post(typed_internal_requests))
         .route(
             "/internal/v1/filter-presets",

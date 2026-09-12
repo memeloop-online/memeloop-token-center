@@ -1436,8 +1436,9 @@ async fn credential_copy_is_explicit_authorized_and_never_part_of_the_key_list()
     assert_eq!(listed[0]["credential_recovery_available"], true);
 
     let copied = control
+        .clone()
         .oneshot(
-            Request::post(copy_path)
+            Request::post(&copy_path)
                 .header(header::AUTHORIZATION, format!("Bearer {service_token}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -1457,6 +1458,194 @@ async fn credential_copy_is_explicit_authorized_and_never_part_of_the_key_list()
     .unwrap();
     assert_eq!(copied["key"], issued.key);
     assert_eq!(copied["credential_generation"], 1);
+
+    for _ in 0..2 {
+        let repeated = control
+            .clone()
+            .oneshot(
+                Request::post(&copy_path)
+                    .header(header::AUTHORIZATION, format!("Bearer {service_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeated.status(), StatusCode::OK);
+    }
+    let limited = control
+        .oneshot(
+            Request::post(copy_path)
+                .header(header::AUTHORIZATION, format!("Bearer {service_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        limited.headers().get(header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static("no-store"))
+    );
+}
+
+#[tokio::test]
+async fn credential_copy_hides_foreign_key_existence_and_atomically_limits_concurrent_replay() {
+    let (state, _directory) = test_state().await;
+    let target = state
+        .db
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "credential-copy-target".to_owned(),
+                principal_external_id: "member".to_owned(),
+                alias: "target".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::ZERO,
+                idempotency_key: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    state
+        .db
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "credential-copy-foreign".to_owned(),
+                principal_external_id: "member".to_owned(),
+                alias: "foreign-tenant-seed".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::ZERO,
+                idempotency_key: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let foreign_actor = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "credential-copy-foreign-actor".to_owned(),
+                scopes: vec!["keys:write".to_owned()],
+                tenant_external_id: Some("credential-copy-foreign".to_owned()),
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let target_actor = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "credential-copy-target-actor".to_owned(),
+                scopes: vec!["keys:write".to_owned()],
+                tenant_external_id: Some("credential-copy-target".to_owned()),
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let control = router_for_role(state, RuntimeRole::Control);
+    let copy_path = format!(
+        "/internal/v1/keys/{}/credential-recovery/copy",
+        target.key_id
+    );
+    let foreign = control
+        .clone()
+        .oneshot(
+            Request::post(&copy_path)
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", foreign_actor.token),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let unknown = control
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/internal/v1/keys/{}/credential-recovery/copy",
+                Uuid::now_v7()
+            ))
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", foreign_actor.token),
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+    assert_eq!(unknown.status(), foreign.status());
+    assert_eq!(
+        axum::body::to_bytes(unknown.into_body(), 4096)
+            .await
+            .unwrap(),
+        axum::body::to_bytes(foreign.into_body(), 4096)
+            .await
+            .unwrap()
+    );
+    // Authorization precedes quota consumption: repeated probes must not turn
+    // a foreign-key denial into 429 while an unknown UUID remains 403.
+    for _ in 0..3 {
+        let repeated_foreign = control
+            .clone()
+            .oneshot(
+                Request::post(&copy_path)
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", foreign_actor.token),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeated_foreign.status(), StatusCode::FORBIDDEN);
+    }
+
+    let authorization = format!("Bearer {}", target_actor.token);
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+    let attempts = (0..8).map(|_| {
+        let control = control.clone();
+        let copy_path = copy_path.clone();
+        let authorization = authorization.clone();
+        let start = start.clone();
+        async move {
+            start.wait().await;
+            control
+                .oneshot(
+                    Request::post(copy_path)
+                        .header(header::AUTHORIZATION, authorization)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        }
+    });
+    let statuses = futures_util::future::join_all(attempts).await;
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::OK)
+            .count(),
+        3
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::TOO_MANY_REQUESTS)
+            .count(),
+        5
+    );
 }
 
 #[tokio::test]
