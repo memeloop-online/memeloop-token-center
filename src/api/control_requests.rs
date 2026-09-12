@@ -302,6 +302,8 @@ pub(super) struct FilterAssistantSettingsQuery {
 pub(super) struct FilterAssistantBillingQuery {
     tenant_external_id: Option<String>,
     model_route_id: Uuid,
+    before_created_at: Option<i64>,
+    before_id: Option<Uuid>,
 }
 
 pub(super) async fn filter_assistant_billing_choices(
@@ -315,21 +317,37 @@ pub(super) async fn filter_assistant_billing_choices(
         .db
         .filter_assistant_route(&tenant, query.model_route_id)
         .await?;
+    let before = match (query.before_created_at, query.before_id) {
+        (Some(created_at), Some(id)) => Some((created_at, id)),
+        (None, None) => None,
+        _ => {
+            return Err(AppError::BadRequest(
+                "billing choice cursor requires timestamp and ID".into(),
+            ));
+        }
+    };
     let keys = state
         .db
-        .list_managed_keys_page(Some(&tenant), None, None, 100, None)
+        .list_managed_keys_page(Some(&tenant), None, None, 100, before)
         .await?;
+    let next_cursor = if keys.len() == 100 {
+        keys.last()
+            .map(|key| json!({"before_created_at": key.created_at, "before_id": key.key_id}))
+    } else {
+        None
+    };
     let mut choices = Vec::new();
     for key in keys {
-        if key.status == "active"
-            && assistant_execution_context(&state, &tenant, query.model_route_id, key.key_id)
-                .await
-                .is_ok()
-        {
-            choices.push(json!({"key_id": key.key_id, "alias": key.alias, "principal": key.principal_external_id}));
+        if key.status != "active" {
+            continue;
+        }
+        match assistant_execution_context(&state, &tenant, query.model_route_id, key.key_id).await {
+            Ok(_) => choices.push(json!({"key_id": key.key_id, "alias": key.alias, "principal": key.principal_external_id})),
+            Err(AppError::Forbidden | AppError::Unauthorized | AppError::BadRequest(_) | AppError::NotFound) => {},
+            Err(error) => return Err(error),
         }
     }
-    Ok(Json(choices))
+    Ok(Json(json!({"data": choices, "next_cursor": next_cursor})))
 }
 
 #[derive(Debug, Deserialize)]

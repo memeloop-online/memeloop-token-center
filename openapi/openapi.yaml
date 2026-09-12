@@ -3454,7 +3454,7 @@ paths:
       tags: [Operator traffic]
       operationId: getFilterAssistantBillingChoices
       summary: List eligible billing credential references for a text route
-      description: Checks the newest 100 tenant credentials against current route grants and availability. Returns only identity labels and UUIDs, never secrets, and never probes an upstream.
+      description: Checks a bounded keyset page of 100 tenant credentials against current route grants and availability. Returns only identity labels and UUIDs, never secrets, and never probes an upstream. Empty data can still have a next cursor when no credential on that page is eligible.
       security: [{ serviceBearer: [] }]
       x-required-scope: keys:read
       parameters:
@@ -3463,22 +3463,40 @@ paths:
           in: query
           required: true
           schema: { type: string, format: uuid }
+        - name: before_created_at
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: before_id
+          in: query
+          schema: { type: string, format: uuid }
       responses:
         '200':
           description: Eligible billing identities.
           content:
             application/json:
               schema:
-                type: array
-                maxItems: 100
-                items:
-                  type: object
-                  additionalProperties: false
-                  required: [key_id, alias, principal]
-                  properties:
-                    key_id: { type: string, format: uuid }
-                    alias: { type: string }
-                    principal: { type: string }
+                type: object
+                additionalProperties: false
+                required: [data, next_cursor]
+                properties:
+                  data:
+                    type: array
+                    maxItems: 100
+                    items:
+                      type: object
+                      additionalProperties: false
+                      required: [key_id, alias, principal]
+                      properties:
+                        key_id: { type: string, format: uuid }
+                        alias: { type: string }
+                        principal: { type: string }
+                  next_cursor:
+                    type: [object, 'null']
+                    additionalProperties: false
+                    required: [before_created_at, before_id]
+                    properties:
+                      before_created_at: { type: integer, format: int64 }
+                      before_id: { type: string, format: uuid }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }

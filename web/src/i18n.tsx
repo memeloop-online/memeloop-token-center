@@ -4,6 +4,7 @@ export type Locale = 'zh-CN' | 'en';
 type Variables = Record<string, string | number>;
 
 const zh = {
+  'settings.assistantMoreCredentials': '加载更多凭据',
   'settings.assistantBillingCredential': '计费凭据',
   'settings.assistantSelectBillingCredential': '选择计费凭据',
   'settings.assistantBillingHint': '生成建议会消耗此凭据的额度，遵循它的模型授权和预算限制。仅发送输入的筛选意图，不发送请求记录；请勿输入敏感信息。',
@@ -458,6 +459,7 @@ const zh = {
 } as const;
 
 const en = {
+  'settings.assistantMoreCredentials': 'Load more credentials',
   'settings.assistantBillingCredential': 'Billing credential',
   'settings.assistantSelectBillingCredential': 'Choose a billing credential',
   'settings.assistantBillingHint': 'Suggestions consume this credential’s balance and follow its model grants and budget. Only your filter intent is sent, never request records. Do not enter sensitive information.',

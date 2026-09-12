@@ -7,6 +7,10 @@ import type { FilterAssistantSettings, GroupView, ModelRouteView, UpstreamAccoun
 import { routeModelOptions } from '../modelCatalog';
 import { messageOf, queryForTenant } from '../scope/operatorShared';
 
+type BillingChoice = { key_id: string; alias: string; principal: string };
+type BillingCursor = { before_created_at: number; before_id: string };
+type BillingPage = { data: BillingChoice[]; next_cursor: BillingCursor | null };
+
 export interface OperatorAccessSettingsProps {
   credentialInput: string;
   credential: string;
@@ -54,7 +58,9 @@ export function SystemSettingsPage({ token, tenant }: { token: string; tenant: s
   const [groups, setGroups] = useState<GroupView[]>([]);
   const [settings, setSettings] = useState<FilterAssistantSettings | null>();
   const [selectedRouteId, setSelectedRouteId] = useState('');
-  const [billingChoices, setBillingChoices] = useState<{ key_id: string; alias: string; principal: string }[]>([]);
+  const [billingChoices, setBillingChoices] = useState<BillingChoice[]>([]);
+  const [billingCursor, setBillingCursor] = useState<BillingCursor | null>(null);
+  const billingSequence = useRef(0);
   const [selectedBillingId, setSelectedBillingId] = useState('');
   const [billingLoading, setBillingLoading] = useState(false);
   const [billingError, setBillingError] = useState('');
@@ -99,17 +105,23 @@ export function SystemSettingsPage({ token, tenant }: { token: string; tenant: s
     return () => { loadSequence.current += 1; };
   }, [load]);
 
-  useEffect(() => {
-    let active = true;
-    setBillingChoices([]); setBillingError('');
+  const loadBilling = useCallback(async (cursor?: BillingCursor) => {
+    const request = ++billingSequence.current;
+    if (!cursor) { setBillingChoices([]); setBillingCursor(null); }
+    setBillingError('');
     if (!token || !tenant || !selectedRouteId) { setBillingLoading(false); return; }
     setBillingLoading(true);
-    void api<{ key_id: string; alias: string; principal: string }[]>(`/internal/v1/filter-assistant/billing-choices?tenant_external_id=${encodeURIComponent(tenant)}&model_route_id=${encodeURIComponent(selectedRouteId)}`, token)
-      .then((choices) => { if (active) setBillingChoices(choices); })
-      .catch((reason) => { if (active) setBillingError(messageOf(reason, t('common.requestFailed'))); })
-      .finally(() => { if (active) setBillingLoading(false); });
-    return () => { active = false; };
+    try {
+      const suffix = cursor ? `&before_created_at=${cursor.before_created_at}&before_id=${encodeURIComponent(cursor.before_id)}` : '';
+      const page = await api<BillingPage>(`/internal/v1/filter-assistant/billing-choices?tenant_external_id=${encodeURIComponent(tenant)}&model_route_id=${encodeURIComponent(selectedRouteId)}${suffix}`, token);
+      if (request !== billingSequence.current) return;
+      setBillingChoices((current) => cursor ? [...current, ...page.data.filter((choice) => !current.some((previous) => previous.key_id === choice.key_id))] : page.data);
+      setBillingCursor(page.next_cursor);
+    } catch (reason) { if (request === billingSequence.current) setBillingError(messageOf(reason, t('common.requestFailed'))); }
+    finally { if (request === billingSequence.current) setBillingLoading(false); }
   }, [selectedRouteId, t, tenant, token]);
+
+  useEffect(() => { void loadBilling(); return () => { billingSequence.current += 1; }; }, [loadBilling]);
 
   const save = async () => {
     if (!tenant || !selectedRouteId || !billingChoices.some((choice) => choice.key_id === selectedBillingId)) return;
@@ -145,8 +157,10 @@ export function SystemSettingsPage({ token, tenant }: { token: string; tenant: s
         {loading ? <div className="empty" role="status">{t('common.loading')}</div> : loadError ? <div className="settings-empty" role="alert"><b>{t('settings.filterAssistantLoadFailed')}</b><span>{loadError}</span><button type="button" className="secondary" onClick={() => void load()}>{t('common.retry')}</button></div> : routes.length === 0 ? <div className="settings-empty"><b>{t('settings.noEnabledRoute')}</b><span>{t('settings.noEnabledRouteHint')}</span></div> : <form className="system-settings-form" onSubmit={(event) => { event.preventDefault(); void save(); }}>
           <div><ModelPicker label={t('settings.filterAssistantRoute')} popupLabel={t('settings.filterAssistantRoute')} value={selectedRouteId} onChange={setSelectedRouteId} disabled={saving} options={assistantOptions} describedBy="filter-assistant-route-hint" /><small id="filter-assistant-route-hint">{t('settings.filterAssistantRouteHint')}</small>{selectedRouteId && !selectedRouteHasAvailableCandidate && <small className="error-text" role="alert">{t('settings.filterAssistantRouteUnavailable')}</small>}</div>
           <label>{t('settings.assistantBillingCredential')}<select value={selectedBillingId} disabled={saving || billingLoading} onChange={(event) => setSelectedBillingId(event.target.value)}><option value="">{t('settings.assistantSelectBillingCredential')}</option>{billingChoices.map((choice) => <option key={choice.key_id} value={choice.key_id}>{choice.alias} · {choice.principal}</option>)}</select><small>{t('settings.assistantBillingHint')}</small></label>
-          {billingError && <div className="error-text" role="alert">{billingError}</div>}
-          {!billingLoading && selectedRouteId && !billingError && billingChoices.length === 0 && <p role="status">{t('settings.assistantNoBillingCredential')}</p>}
+          {billingError && <div className="error-text" role="alert">{billingError}<button type="button" className="secondary" disabled={billingLoading} onClick={() => void loadBilling(billingCursor ?? undefined)}>{t('common.retry')}</button></div>}
+          {billingLoading && <p role="status">{t('common.loading')}</p>}
+          {billingCursor && <button type="button" className="secondary" disabled={billingLoading} onClick={() => void loadBilling(billingCursor)}>{t('settings.assistantMoreCredentials')}</button>}
+          {!billingLoading && selectedRouteId && !billingError && !billingCursor && billingChoices.length === 0 && <p role="status">{t('settings.assistantNoBillingCredential')}</p>}
           <button type="submit" disabled={saving || billingLoading || !selectedRouteId || !selectedRouteHasAvailableCandidate || !billingChoices.some((choice) => choice.key_id === selectedBillingId)}>{saving ? t('common.loading') : t('common.save')}</button>
         </form>}
         {settings === null && !loadError && <p className="settings-status-note">{t('settings.filterAssistantNotConfigured')}</p>}
