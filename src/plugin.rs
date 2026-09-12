@@ -22,9 +22,13 @@ use crate::{
     provider::ProviderType,
 };
 
+mod configuration;
 /// Experimental primitives only; not connected to AppState or management APIs.
 #[cfg(feature = "experimental-plugin-revisions")]
 pub mod lifecycle;
+pub use configuration::{
+    ConfigurationSource, ResolvedConfigurationRevision, ResolvedTrafficSnapshot,
+};
 
 const PLUGIN_FUEL: u64 = 5_000_000;
 const PLUGIN_MEMORY_BYTES: usize = 32 * 1024 * 1024;
@@ -309,8 +313,19 @@ pub struct PluginPackageIdentity {
 #[derive(Clone)]
 struct CachedPluginConfigurations {
     loaded_at: Instant,
-    values: BTreeMap<String, Value>,
+    snapshot: ResolvedTrafficSnapshot,
     estimated_bytes: usize,
+}
+
+#[derive(Default)]
+struct ConfigurationCache {
+    // An identity token cannot wrap/reuse a counter while an old read holds it.
+    epoch: Arc<()>,
+    read_generation: u64,
+    // Fixed-size completion fences survive value eviction and uncached reads.
+    // Hash collisions conservatively fence older reads for another tenant.
+    published_generations: [u64; 32],
+    entries: BTreeMap<Uuid, CachedPluginConfigurations>,
 }
 
 #[derive(Clone)]
@@ -424,7 +439,7 @@ pub struct PluginRuntime {
     kv: Option<PluginKv>,
     plugins: Arc<Vec<LoadedPlugin>>,
     providers: Arc<Vec<ProviderType>>,
-    configuration_cache: Arc<tokio::sync::RwLock<BTreeMap<Uuid, CachedPluginConfigurations>>>,
+    configuration_cache: Arc<tokio::sync::RwLock<ConfigurationCache>>,
     service_data_cache: Arc<tokio::sync::RwLock<BTreeMap<String, CachedPluginServiceData>>>,
     execution_timeout: Duration,
     fuel: u64,
@@ -630,9 +645,11 @@ impl PluginRuntime {
         PluginRuntimeMetrics {
             loaded_plugins: self.plugins.len(),
             cache_entries: configuration_cache
+                .entries
                 .len()
                 .saturating_add(service_data_cache.len()),
             cache_bytes: configuration_cache
+                .entries
                 .values()
                 .fold(0usize, |total, entry| {
                     total.saturating_add(entry.estimated_bytes)
@@ -843,112 +860,19 @@ impl PluginRuntime {
         &self,
         tenant_id: Uuid,
     ) -> Result<BTreeMap<String, Value>, AppError> {
-        let configurable: Vec<_> = self
-            .plugins
-            .iter()
-            .filter(|plugin| {
-                (plugin.manifest.contributions.traffic_policy
-                    || plugin.manifest.contributions.request_rewrite)
-                    && plugin.manifest.contributions.configuration.is_some()
-            })
-            .collect();
-        if configurable.is_empty() {
-            return Ok(BTreeMap::new());
-        }
-        if let Some(cached) = self.configuration_cache.read().await.get(&tenant_id)
-            && cached.loaded_at.elapsed() < PLUGIN_CONFIGURATION_CACHE_TTL
-        {
-            return Ok(cached.values.clone());
-        }
-        let database = &self.kv.as_ref().ok_or(AppError::Internal)?.database;
-        let layers = database.plugin_configuration_layers(tenant_id).await?;
-        let mut resolved = BTreeMap::new();
-        for plugin in configurable {
-            let contribution = plugin
-                .manifest
-                .contributions
-                .configuration
-                .as_ref()
-                .expect("filtered configurable plugin");
-            let stored = layers
-                .iter()
-                .find(|layer| {
-                    layer.plugin_id == plugin.manifest.id && layer.tenant_id == Some(tenant_id)
-                })
-                .or_else(|| {
-                    layers.iter().find(|layer| {
-                        layer.plugin_id == plugin.manifest.id && layer.tenant_id.is_none()
-                    })
-                });
-            let value = stored
-                .map(|configuration| configuration.value.clone())
-                .unwrap_or_else(|| contribution.default.clone());
-            plugin
-                .configuration_validator
-                .as_ref()
-                .ok_or(AppError::Internal)?
-                .validate(&value)?;
-            resolved.insert(plugin.manifest.id.clone(), value);
-        }
-        self.cache_resolved_configurations(tenant_id, resolved.clone())
-            .await;
-        Ok(resolved)
-    }
-
-    async fn cache_resolved_configurations(
-        &self,
-        tenant_id: Uuid,
-        values: BTreeMap<String, Value>,
-    ) {
-        let estimated_bytes = values.iter().fold(0usize, |total, (plugin_id, value)| {
-            total
-                .saturating_add(plugin_id.len())
-                .saturating_add(estimated_json_bytes(value))
-        });
-        if estimated_bytes > PLUGIN_CONFIGURATION_CACHE_BYTES {
-            return;
-        }
-        let now = Instant::now();
-        let mut cache = self.configuration_cache.write().await;
-        cache.retain(|_, entry| {
-            now.duration_since(entry.loaded_at) <= PLUGIN_CONFIGURATION_CACHE_TTL
-        });
-        cache.remove(&tenant_id);
-        loop {
-            let current_bytes = cache.values().fold(0usize, |total, entry| {
-                total.saturating_add(entry.estimated_bytes)
-            });
-            if cache.len() < PLUGIN_CONFIGURATION_CACHE_ENTRIES
-                && current_bytes.saturating_add(estimated_bytes) <= PLUGIN_CONFIGURATION_CACHE_BYTES
-            {
-                break;
-            }
-            let Some(oldest) = cache
-                .iter()
-                .min_by_key(|(_, entry)| entry.loaded_at)
-                .map(|(id, _)| *id)
-            else {
-                break;
-            };
-            cache.remove(&oldest);
-        }
-        cache.insert(
-            tenant_id,
-            CachedPluginConfigurations {
-                loaded_at: now,
-                values,
-                estimated_bytes,
-            },
-        );
+        Ok(self.resolved_traffic_snapshot(tenant_id).await?.values)
     }
 
     pub async fn invalidate_configuration_cache(&self, tenant_id: Option<Uuid>) {
         let mut cache = self.configuration_cache.write().await;
+        // Publish the fence and remove entries under the same lock as refill.
+        // A tenant write also fences other in-flight reads, conservatively.
+        cache.epoch = Arc::new(());
         if let Some(tenant_id) = tenant_id {
-            cache.remove(&tenant_id);
+            cache.entries.remove(&tenant_id);
         } else {
             // A global write may affect every tenant without an override.
-            cache.clear();
+            cache.entries.clear();
         }
     }
 
@@ -2561,18 +2485,31 @@ mod tests {
     #[tokio::test]
     async fn plugin_configuration_cache_has_entry_and_byte_bounds() {
         let runtime = PluginRuntime::default();
+        let epoch = runtime.configuration_cache.read().await.epoch.clone();
         for index in 0..(PLUGIN_CONFIGURATION_CACHE_ENTRIES + 10) {
             runtime
-                .cache_resolved_configurations(
-                    Uuid::from_u128(index as u128 + 1),
-                    BTreeMap::from([("plugin".to_owned(), Value::String("x".repeat(512 * 1024)))]),
+                .cache_snapshot(
+                    &epoch,
+                    index as u64 + 1,
+                    Instant::now(),
+                    ResolvedTrafficSnapshot {
+                        tenant_id: Uuid::from_u128(index as u128 + 1),
+                        values: BTreeMap::from([(
+                            "plugin".to_owned(),
+                            Value::String("x".repeat(512 * 1024)),
+                        )]),
+                        revisions: BTreeMap::new(),
+                        freshness_deadline: Instant::now() + PLUGIN_CONFIGURATION_CACHE_TTL,
+                    },
+                    Instant::now,
                 )
                 .await;
         }
         let cache = runtime.configuration_cache.read().await;
-        assert!(cache.len() <= PLUGIN_CONFIGURATION_CACHE_ENTRIES);
+        assert!(cache.entries.len() <= PLUGIN_CONFIGURATION_CACHE_ENTRIES);
         assert!(
             cache
+                .entries
                 .values()
                 .map(|entry| entry.estimated_bytes)
                 .sum::<usize>()
