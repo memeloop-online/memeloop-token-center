@@ -4,8 +4,8 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
-import { formatMilliseconds, formatNumber, formatPercent } from '../src/format';
-import { requestOverviewFacts } from './fixtures/request-overview-facts';
+import { formatMilliseconds, formatNumber, formatPercent } from '../src/format.js';
+import { requestOverviewFacts } from './fixtures/request-overview-facts.js';
 
 test('request popover stays non-modal across themes, locales and widths; models retain distinct account facts', { timeout: 60_000 }, async (t) => {
   if (!existsSync(chromium.executablePath())) {

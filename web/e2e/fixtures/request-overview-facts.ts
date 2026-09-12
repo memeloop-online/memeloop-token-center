@@ -1,4 +1,4 @@
-import type { MonitoringUpstreamModel } from '../../src/types';
+import type { MonitoringUpstreamModel } from '../../src/types.js';
 
 // Synthetic presentation facts only: provider labels do not establish real
 // Copilot, Cursor or Kimi authentication, routing, billing or integration.
