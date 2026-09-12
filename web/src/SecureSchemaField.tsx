@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import SchemaField from '@rjsf/core/lib/components/fields/SchemaField.js';
 import type { FieldProps, RJSFSchema } from '@rjsf/utils';
+import { ariaDescribedByIds, ErrorSchemaBuilder } from '@rjsf/utils';
 import { SecretInput } from './SecretInput';
 import { useI18n } from './i18n';
 
@@ -18,7 +19,7 @@ export function withoutSecretDefaults(schema: RJSFSchema): RJSFSchema {
   return visit(schema) as RJSFSchema;
 }
 
-function SecretSchemaValue({ schema, formData, fieldPathId, onChange, onBlur, onFocus, disabled, readonly, required, autofocus }: FieldProps) {
+function SecretSchemaValue({ schema, formData, fieldPathId, onChange, onBlur, onFocus, disabled, readonly, required, autofocus, errorSchema }: FieldProps) {
   const { t } = useI18n();
   const id = fieldPathId.$id;
   const label = typeof schema.title === 'string' ? schema.title : String(fieldPathId.path.at(-1) ?? t('secret.value'));
@@ -35,12 +36,12 @@ function SecretSchemaValue({ schema, formData, fieldPathId, onChange, onBlur, on
       onChange(value, fieldPathId.path, undefined, id);
     } catch {
       setInvalid(true);
-      onChange(formData, fieldPathId.path, { __errors: [t('secret.invalidJson')] }, id);
+      onChange(formData, fieldPathId.path, new ErrorSchemaBuilder().addErrors(t('secret.invalidJson')).ErrorSchema, id);
     }
   }
   return <div className="schema-secret-field">
     <label htmlFor={id}>{label}{required ? ' *' : ''}</label>
-    <SecretInput id={id} label={label} value={text} onChange={(event) => update(event.target.value)} disabled={disabled} readOnly={readonly} required={required} autoFocus={autofocus} aria-invalid={invalid} aria-describedby={invalid ? `${id}-secret-error` : undefined} onBlur={() => onBlur(id, formData)} onFocus={() => onFocus(id, formData)} />
+    <SecretInput id={id} label={label} value={text} onChange={(event) => update(event.target.value)} disabled={disabled} readOnly={readonly} required={required} autoFocus={autofocus} aria-invalid={invalid || Boolean(errorSchema?.__errors?.length)} aria-describedby={`${ariaDescribedByIds(id)}${invalid ? ` ${id}-secret-error` : ''}`} onBlur={() => onBlur(id, formData)} onFocus={() => onFocus(id, formData)} />
     {invalid && <p id={`${id}-secret-error`} className="schema-field-error" role="alert">{t('secret.invalidJson')}</p>}
   </div>;
 }
