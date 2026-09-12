@@ -1,4 +1,6 @@
-import { useId, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { useAnchoredPopover } from '../useAnchoredPopover';
+import './multiCombobox.css';
 
 export interface ComboboxOption {
   value: string;
@@ -53,28 +55,36 @@ export function MultiCombobox({
   const [query, setQuery] = useState('');
   const [open, setOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
+  const expanded = open && !disabled;
+  const { anchor, panel, position } = useAnchoredPopover<HTMLDivElement>(expanded, true);
   const rows = useMemo(() => rowsForQuery(options, value, query, allowCreate), [options, value, query, allowCreate]);
+  useEffect(() => { setActiveIndex(-1); }, [options, value]);
+  useEffect(() => {
+    if (expanded && activeIndex >= 0) panel.current?.querySelector(`#${CSS.escape(`${id}-option-${activeIndex}`)}`)?.scrollIntoView({ block: 'nearest' });
+  }, [expanded, activeIndex, id, panel]);
 
   const choose = (item: ComboboxOption) => {
     onChange([...value, item]);
     setQuery('');
+    onQueryChange?.('');
     setActiveIndex(-1);
     setOpen(true);
-    requestAnimationFrame(() => inputRef.current?.focus());
+    inputRef.current?.focus();
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.nativeEvent.isComposing) return;
     if (event.key === 'ArrowDown') {
       event.preventDefault(); setOpen(true); setActiveIndex((current) => Math.min(current + 1, Math.max(rows.length - 1, 0)));
     } else if (event.key === 'ArrowUp') {
-      event.preventDefault(); setOpen(true); setActiveIndex((current) => Math.max(current - 1, 0));
-    } else if (event.key === 'Enter') {
+      event.preventDefault(); setOpen(true); setActiveIndex((current) => current < 0 ? rows.length - 1 : Math.max(current - 1, 0));
+    } else if (event.key === 'Enter' && expanded) {
       // React may not have committed the input/open state before a fast keyboard user presses Enter.
       const currentRows = rowsForQuery(options, value, event.currentTarget.value, allowCreate);
       const item = currentRows[activeIndex >= 0 ? activeIndex : 0];
       if (item) { event.preventDefault(); choose(item); }
     } else if (event.key === 'Escape') {
-      event.preventDefault(); setOpen(false);
+      if (expanded) { event.preventDefault(); event.stopPropagation(); setOpen(false); }
     } else if (event.key === 'Backspace' && !query && value.length > 0) {
       onChange(value.slice(0, -1));
     }
@@ -83,9 +93,9 @@ export function MultiCombobox({
   return <div className={`multi-combobox${disabled ? ' disabled' : ''}`}>
     <label id={`${id}-label`} htmlFor={`${id}-input`}>{label}</label>
     {hint && <small className="field-hint" id={`${id}-hint`}>{hint}</small>}
-    <div className="multi-combobox-control" onClick={() => inputRef.current?.focus()}>
+    <div ref={anchor} className="multi-combobox-control" onClick={() => inputRef.current?.focus()}>
       {value.map((item) => <span className={`selection-chip${item.created ? ' pending' : ''}`} key={item.value}>
-        {item.label}
+        <span className="selection-chip-label">{item.label}</span>
         <button type="button" disabled={disabled} aria-label={removeLabel(item.label)} onClick={(event) => {
           event.stopPropagation(); onChange(value.filter((selectedItem) => selectedItem.value !== item.value));
         }}>×</button>
@@ -95,16 +105,16 @@ export function MultiCombobox({
         ref={inputRef}
         role="combobox"
         aria-autocomplete="list"
-        aria-expanded={open}
-        aria-controls={`${id}-listbox`}
-        aria-activedescendant={open && activeIndex >= 0 && rows[activeIndex] ? `${id}-option-${activeIndex}` : undefined}
+        aria-expanded={expanded}
+        aria-controls={expanded ? `${id}-listbox` : undefined}
+        aria-activedescendant={expanded && activeIndex >= 0 && rows[activeIndex] ? `${id}-option-${activeIndex}` : undefined}
         aria-describedby={hint ? `${id}-hint` : undefined}
         autoComplete="off"
         disabled={disabled}
         placeholder={value.length === 0 ? placeholder : ''}
         value={query}
         onFocus={() => setOpen(true)}
-        onBlur={() => window.setTimeout(() => setOpen(false), 100)}
+        onBlur={(event) => { if (!panel.current?.contains(event.relatedTarget)) setOpen(false); }}
         onChange={(event) => {
           setQuery(event.target.value); setActiveIndex(-1); setOpen(true);
           onQueryChange?.(event.target.value);
@@ -112,11 +122,14 @@ export function MultiCombobox({
         onKeyDown={onKeyDown}
       />
     </div>
-    {open && !disabled && <div className="combobox-popover">
+    {expanded && <section ref={panel} className="combobox-popover multi-combobox-popover" popover="auto" style={position}
+      onToggle={(event) => { if (event.target === event.currentTarget && event.newState === 'closed') setOpen(false); }}
+      onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget) && event.relatedTarget !== inputRef.current) setOpen(false); }}>
       <div className="combobox-options" id={`${id}-listbox`} role="listbox" aria-labelledby={`${id}-label`} aria-busy={loading}>
         {rows.map((item, index) => <button
           type="button"
           role="option"
+          tabIndex={-1}
           aria-selected={index === activeIndex}
           className={index === activeIndex ? 'active' : ''}
           id={`${id}-option-${index}`}
@@ -128,7 +141,7 @@ export function MultiCombobox({
       </div>
       {loading && <div className="combobox-state" role="status">{loadingText}</div>}
       {!loading && error && <div className="combobox-state error" role="alert"><span>{error}</span>{onRetry && <button type="button" className="secondary" onMouseDown={(event) => event.preventDefault()} onClick={onRetry}>{retryLabel}</button>}</div>}
-      {!loading && !error && rows.length === 0 && <div className="combobox-empty">{emptyText}</div>}
-    </div>}
+      {!loading && !error && rows.length === 0 && <div className="combobox-empty" role="status">{emptyText}</div>}
+    </section>}
   </div>;
 }
