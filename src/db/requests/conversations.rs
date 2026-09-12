@@ -899,24 +899,75 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
     rows.into_iter()
         .map(|row| {
             let unlinked = row.try_get::<i64, _>("unlinked")? != 0;
+            let source: String = row.try_get("source_kind")?;
+            let billable = source == "live";
+            let raw_input_tokens: i64 = row.try_get("input_tokens")?;
+            let raw_cached_input_tokens: i64 = row.try_get("cached_input_tokens")?;
+            let raw_cache_write_tokens: i64 = row.try_get("cache_write_tokens")?;
+            let raw_output_tokens: i64 = row.try_get("output_tokens")?;
+            let input_tokens = billable
+                .then_some(raw_input_tokens)
+                .or_else(|| (raw_input_tokens != 0).then_some(raw_input_tokens));
+            let cached_input_tokens = billable.then_some(raw_cached_input_tokens);
+            let cache_write_tokens = billable.then_some(raw_cache_write_tokens);
+            let output_tokens = billable
+                .then_some(raw_output_tokens)
+                .or_else(|| (raw_output_tokens != 0).then_some(raw_output_tokens));
+            let cost_micros: i64 = row.try_get("cost_micros")?;
+            let cost = billable.then(|| micros_to_decimal_string(cost_micros));
+            let currency: Option<String> = if billable {
+                row.try_get("currency")?
+            } else {
+                None
+            };
+            let tokens = (input_tokens.is_some()
+                || cached_input_tokens.is_some()
+                || cache_write_tokens.is_some()
+                || output_tokens.is_some())
+            .then_some(crate::model::RequestTokenUsageView {
+                input_tokens,
+                cached_input_tokens,
+                cache_write_tokens,
+                output_tokens,
+            });
             Ok(ConversationRequestView {
                 request: RequestView {
                     request_id: parse_uuid(row.try_get("id")?)?,
                     created_at: row.try_get("created_at")?,
                     completed_at: None,
+                    source_completed_at: None,
+                    lifecycle_state: match row.try_get::<Option<i64>, _>("status_code")? {
+                        None => crate::model::RequestLifecycleState::Pending,
+                        Some(499) => crate::model::RequestLifecycleState::Cancelled,
+                        Some(code) if (200..400).contains(&code) => {
+                            crate::model::RequestLifecycleState::Succeeded
+                        }
+                        Some(_) => crate::model::RequestLifecycleState::Failed,
+                    },
                     protocol: row.try_get("protocol")?,
                     model: row.try_get("model")?,
                     upstream_account_id: None,
                     route_id: None,
                     status_code: row.try_get("status_code")?,
                     duration_ms: row.try_get("duration_ms")?,
-                    input_tokens: row.try_get("input_tokens")?,
-                    cached_input_tokens: row.try_get("cached_input_tokens")?,
-                    cache_write_tokens: row.try_get("cache_write_tokens")?,
-                    output_tokens: row.try_get("output_tokens")?,
-                    cost: micros_to_decimal_string(row.try_get("cost_micros")?),
-                    currency: None,
+                    input_tokens,
+                    cached_input_tokens,
+                    cache_write_tokens,
+                    output_tokens,
+                    cost: cost.clone(),
+                    currency: currency.clone(),
+                    usage: crate::model::RequestUsageView {
+                        tokens,
+                        generation: None,
+                    },
+                    billing: crate::model::RequestBillingView {
+                        billable,
+                        cost,
+                        currency: currency.clone(),
+                    },
                     error_code: row.try_get("error_code")?,
+                    archive_state: crate::model::RequestArchiveState::Gap,
+                    credential_identity: None,
                     session_context: Some(RequestSessionContext {
                         session_id: row.try_get("session_id")?,
                         association: if unlinked {
@@ -930,10 +981,10 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
                         semantics_source: row.try_get("metadata_source")?,
                     }),
                 },
-                source: row.try_get("source_kind")?,
+                source,
                 provenance: row.try_get("provenance_kind")?,
                 unlinked,
-                currency: row.try_get("currency")?,
+                currency,
                 archive_source: row.try_get("archive_source")?,
                 external_request_id: row.try_get("external_request_id")?,
                 execution: execution_metadata_from_row(&row)?,

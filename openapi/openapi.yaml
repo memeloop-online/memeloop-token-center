@@ -3777,8 +3777,15 @@ paths:
     get:
       tags: [Operator traffic]
       operationId: streamRequestEvents
-      summary: Tail request lifecycle events over SSE
-      description: Use the `(after_event_at, after_event_id)` pair as the durable resume cursor. Event names are `request.started`, `request.finished`, and `request.projected`; the last is committed only after asynchronous session semantics are queryable.
+      summary: Tail request lifecycle and archive transitions over SSE
+      description: |
+        Use the `(after_event_at, after_event_id)` pair as the durable resume cursor.
+        Event data is an authoritative bounded RequestEvent snapshot. Clients merge
+        by request_id and may refetch that one detail; they do not poll the list.
+        Event names include `request.started`, `request.finished`, and
+        `request.projected`; the last is committed only after asynchronous session
+        semantics are queryable. Archive terminal events are bounded convergence
+        signals and never include archive bodies or object locators.
       security: [{ serviceBearer: [] }]
       x-required-scope: requests:read
       parameters:
@@ -3791,10 +3798,12 @@ paths:
           schema: { type: string, format: uuid }
       responses:
         '200':
-          description: SSE stream. Each `data` field is a RequestEvent JSON object.
+          description: SSE stream. Each `data` field conforms to RequestEvent.
           content:
             text/event-stream:
-              schema: { type: string }
+              schema:
+                type: string
+                description: JSON-encoded RequestEvent in each SSE data field.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
@@ -6859,7 +6868,7 @@ components:
           items: { $ref: '#/components/schemas/MemeLoopCloudSubscriptionEvent' }
     RequestSummary:
       type: object
-      required: [request_id, created_at, completed_at, protocol, model, upstream_account_id, route_id, status_code, duration_ms, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, cost, currency, error_code, session_context]
+      required: [request_id, created_at, completed_at, source_completed_at, lifecycle_state, protocol, model, upstream_account_id, route_id, status_code, duration_ms, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, cost, currency, usage, billing, error_code, archive_state, credential_identity, session_context]
       properties:
         request_id: { type: string, format: uuid }
         created_at: { type: integer, format: int64 }
@@ -6867,6 +6876,11 @@ components:
           type: [integer, 'null']
           format: int64
           description: Terminal accounting timestamp in Unix milliseconds; null while pending or when the historical record lacks a terminal timestamp.
+        source_completed_at:
+          type: [integer, 'null']
+          format: int64
+          description: Source-reported completion time for archive-only history; native records do not synthesize it.
+        lifecycle_state: { $ref: '#/components/schemas/RequestLifecycleState' }
         protocol: { type: string }
         model: { type: string }
         upstream_account_id:
@@ -6879,23 +6893,34 @@ components:
           description: Stable recorded route assignment; null when historical traffic has no route snapshot.
         status_code: { type: [integer, 'null'], format: int64 }
         duration_ms: { type: [integer, 'null'], format: int64 }
-        input_tokens: { type: integer, format: int64 }
+        input_tokens: { type: [integer, 'null'], format: int64 }
         cached_input_tokens:
-          type: integer
+          type: [integer, 'null']
           format: int64
           minimum: 0
           description: Input tokens served from the upstream cache tier.
         cache_write_tokens:
-          type: integer
+          type: [integer, 'null']
           format: int64
           minimum: 0
           description: Input tokens written to the upstream cache tier.
-        output_tokens: { type: integer, format: int64 }
-        cost: { $ref: '#/components/schemas/Money' }
+        output_tokens: { type: [integer, 'null'], format: int64 }
+        cost:
+          oneOf:
+            - $ref: '#/components/schemas/Money'
+            - type: 'null'
         currency:
           type: [string, 'null']
-          description: Durably recorded historical billing currency. Generation history returns null rather than consulting current key configuration.
+          description: Durably recorded historical billing currency; null when the immutable source fact is unavailable.
+        usage: { $ref: '#/components/schemas/RequestUsage' }
+        billing: { $ref: '#/components/schemas/RequestBilling' }
         error_code: { type: [string, 'null'] }
+        archive_state: { $ref: '#/components/schemas/RequestArchiveState' }
+        credential_identity:
+          description: Operator-scoped stable credential identity; null in self-service projections.
+          oneOf:
+            - $ref: '#/components/schemas/RequestCredentialIdentity'
+            - type: 'null'
         session_context:
           description: |
             Persisted logical-session projection for request records. `confirmed`
@@ -6905,6 +6930,65 @@ components:
           oneOf:
             - $ref: '#/components/schemas/RequestSessionContext'
             - type: 'null'
+    RequestLifecycleState:
+      type: string
+      enum: [preparing, queued, submitting, running, cancelling, pending, succeeded, failed, cancelled]
+      description: Execution lifecycle, independent from the persisted product error code.
+    RequestArchiveState:
+      type: string
+      enum: [capturing, pending, uploading, bound, gap]
+      description: Current durable archive workflow state.
+    RequestTokenUsage:
+      type: object
+      additionalProperties: false
+      required: [input_tokens, cached_input_tokens, cache_write_tokens, output_tokens]
+      properties:
+        input_tokens: { type: [integer, 'null'], format: int64, minimum: 0 }
+        cached_input_tokens: { type: [integer, 'null'], format: int64, minimum: 0 }
+        cache_write_tokens: { type: [integer, 'null'], format: int64, minimum: 0 }
+        output_tokens: { type: [integer, 'null'], format: int64, minimum: 0 }
+    RequestGenerationUsage:
+      type: object
+      additionalProperties: false
+      required: [billed_units, billing_unit]
+      properties:
+        billed_units: { type: [integer, 'null'], format: int64, minimum: 0 }
+        billing_unit: { type: [string, 'null'] }
+    RequestUsage:
+      type: object
+      additionalProperties: false
+      required: [tokens, generation]
+      properties:
+        tokens:
+          oneOf:
+            - $ref: '#/components/schemas/RequestTokenUsage'
+            - type: 'null'
+        generation:
+          oneOf:
+            - $ref: '#/components/schemas/RequestGenerationUsage'
+            - type: 'null'
+    RequestBilling:
+      type: object
+      additionalProperties: false
+      required: [billable, cost, currency]
+      properties:
+        billable:
+          type: boolean
+          description: False for archive-only projections, which never enter MTC billing aggregates.
+        cost:
+          oneOf:
+            - $ref: '#/components/schemas/Money'
+            - type: 'null'
+        currency: { type: [string, 'null'] }
+    RequestCredentialIdentity:
+      type: object
+      additionalProperties: false
+      required: [tenant_external_id, key_id, key_alias, principal_external_id]
+      properties:
+        tenant_external_id: { type: string, minLength: 1 }
+        key_id: { type: string, format: uuid }
+        key_alias: { type: string, minLength: 1 }
+        principal_external_id: { type: string, minLength: 1 }
     RequestListCursor:
       type: object
       additionalProperties: false
@@ -6935,7 +7019,7 @@ components:
       oneOf:
         - { type: object, additionalProperties: false, required: [type, value], properties: { type: { const: text }, value: { type: string, minLength: 1, maxLength: 200 } } }
         - { type: object, additionalProperties: false, required: [type, value], properties: { type: { const: model }, value: { type: string, minLength: 1, maxLength: 200 } } }
-        - { type: object, additionalProperties: false, required: [type, value], properties: { type: { const: protocol }, value: { type: string, enum: [openai, anthropic, openai-image, generation] } } }
+        - { type: object, additionalProperties: false, required: [type, value], properties: { type: { const: protocol }, value: { type: string, minLength: 1, maxLength: 128, description: Exact historical protocol value. } } }
         - { type: object, additionalProperties: false, required: [type, value], properties: { type: { const: status }, value: { type: string, enum: [success, error, pending] } } }
         - { type: object, additionalProperties: false, required: [type, value], properties: { type: { const: uuid }, value: { type: string, format: uuid } } }
         - { type: object, additionalProperties: false, required: [type, value], properties: { type: { const: integer }, value: { type: integer, format: int64 } } }
@@ -7054,15 +7138,45 @@ components:
       allOf:
         - $ref: '#/components/schemas/RequestSummary'
         - type: object
-          required: [request_body, response_body, archive_complete]
+          required: [request_body, response_body, archive_complete, archive]
           properties:
             request_body: true
             response_body: true
             archive_complete: { type: boolean }
+            archive: { $ref: '#/components/schemas/RequestArchiveCompleteness' }
             provenance:
               oneOf:
                 - $ref: '#/components/schemas/RequestProvenance'
                 - type: 'null'
+    RequestArchiveSide:
+      type: object
+      additionalProperties: false
+      required: [state, complete, reason]
+      properties:
+        state: { $ref: '#/components/schemas/RequestArchiveState' }
+        complete: { type: boolean }
+        reason:
+          type: [string, 'null']
+          description: Sanitized product reason code; never an object locator or storage error text.
+    RequestArchiveCompleteness:
+      type: object
+      additionalProperties: false
+      required: [request, response]
+      properties:
+        request: { $ref: '#/components/schemas/RequestArchiveSide' }
+        response: { $ref: '#/components/schemas/RequestArchiveSide' }
+    RequestEvent:
+      allOf:
+        - $ref: '#/components/schemas/RequestSummary'
+        - type: object
+          required: [event_id, event_at, event_kind, key_id]
+          properties:
+            event_id: { type: string, format: uuid }
+            event_at: { type: integer, format: int64 }
+            event_kind:
+              type: string
+              enum: [started, finished, archive_bound, archive_gap]
+            key_id: { type: string, format: uuid }
     RequestProvenance:
       type: object
       additionalProperties: false

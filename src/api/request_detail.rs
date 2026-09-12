@@ -13,29 +13,88 @@ pub(super) async fn request_detail(
     state: &AppState,
     refs: crate::model::RequestArchiveRefs,
 ) -> crate::model::RequestDetail {
-    let (request_body, request_complete) = archive_value(state, &refs.request_object).await;
-    let (response_body, response_complete) = match refs.response_object.as_deref() {
+    let request = archive_value(state, &refs.request_object).await;
+    let response = match refs.response_object.as_deref() {
         Some(location) => archive_value(state, location).await,
         None => match refs.response_json {
-            Some(value) if json_value_structure_is_bounded(&value) => (value, true),
-            Some(_) | None => (Value::Null, false),
+            Some(value) if json_value_structure_is_bounded(&value) => ArchiveValue {
+                value,
+                complete: true,
+                reason: None,
+            },
+            Some(_) => ArchiveValue::gap("archive_payload_invalid"),
+            None if refs.response_archive_state == crate::model::RequestArchiveState::Bound => {
+                ArchiveValue {
+                    value: Value::Null,
+                    complete: true,
+                    reason: None,
+                }
+            }
+            None => ArchiveValue {
+                value: Value::Null,
+                complete: false,
+                reason: refs.response_archive_reason.clone(),
+            },
         },
     };
+    let request_state = resolved_archive_state(refs.request_archive_state, request.complete);
+    let response_state = resolved_archive_state(refs.response_archive_state, response.complete);
     crate::model::RequestDetail {
         view: refs.view,
-        request_body,
-        response_body,
-        archive_complete: request_complete && response_complete,
+        request_body: request.value,
+        response_body: response.value,
+        archive_complete: request.complete && response.complete,
+        archive: crate::model::RequestArchiveCompletenessView {
+            request: crate::model::RequestArchiveSideView {
+                state: request_state,
+                complete: request.complete,
+                reason: request.reason.or(refs.request_archive_reason),
+            },
+            response: crate::model::RequestArchiveSideView {
+                state: response_state,
+                complete: response.complete,
+                reason: response.reason.or(refs.response_archive_reason),
+            },
+        },
         provenance: refs.provenance,
     }
 }
 
-async fn archive_value(state: &AppState, location: &str) -> (Value, bool) {
+struct ArchiveValue {
+    value: Value,
+    complete: bool,
+    reason: Option<String>,
+}
+
+impl ArchiveValue {
+    fn gap(reason: &str) -> Self {
+        Self {
+            value: Value::Null,
+            complete: false,
+            reason: Some(reason.to_owned()),
+        }
+    }
+}
+
+fn resolved_archive_state(
+    projected: crate::model::RequestArchiveState,
+    complete: bool,
+) -> crate::model::RequestArchiveState {
+    if complete {
+        crate::model::RequestArchiveState::Bound
+    } else if projected == crate::model::RequestArchiveState::Bound {
+        crate::model::RequestArchiveState::Gap
+    } else {
+        projected
+    }
+}
+
+async fn archive_value(state: &AppState, location: &str) -> ArchiveValue {
     if let Some(value) = location.strip_prefix("inline-json:") {
         return decode_archive_value(value.as_bytes());
     }
     if location.starts_with("gap://") {
-        return (Value::Null, false);
+        return ArchiveValue::gap("archive_object_unavailable");
     }
     match state
         .archive
@@ -50,22 +109,27 @@ async fn archive_value(state: &AppState, location: &str) -> (Value, bool) {
                 error_code = "archive_object_unavailable",
                 "archived request object is unavailable"
             );
-            (Value::Null, false)
+            ArchiveValue::gap("archive_object_unavailable")
         }
     }
 }
 
-fn decode_archive_value(bytes: &[u8]) -> (Value, bool) {
+fn decode_archive_value(bytes: &[u8]) -> ArchiveValue {
     if bytes.len() > MAX_ARCHIVE_DETAIL_BODY || !json_bytes_structure_is_bounded(bytes) {
-        return (Value::Null, false);
+        return ArchiveValue::gap("archive_payload_invalid");
     }
     match serde_json::from_slice(bytes) {
-        Ok(value) if json_value_structure_is_bounded(&value) => (value, true),
-        Ok(_) => (Value::Null, false),
-        Err(_) => (
-            Value::String(String::from_utf8_lossy(bytes).into_owned()),
-            true,
-        ),
+        Ok(value) if json_value_structure_is_bounded(&value) => ArchiveValue {
+            value,
+            complete: true,
+            reason: None,
+        },
+        Ok(_) => ArchiveValue::gap("archive_payload_invalid"),
+        Err(_) => ArchiveValue {
+            value: Value::String(String::from_utf8_lossy(bytes).into_owned()),
+            complete: true,
+            reason: None,
+        },
     }
 }
 
@@ -186,10 +250,10 @@ mod tests {
                 .join(",")
         );
         assert!(!json_bytes_structure_is_bounded(flat_array.as_bytes()));
-        assert_eq!(
-            decode_archive_value(flat_array.as_bytes()),
-            (Value::Null, false)
-        );
+        let rejected = decode_archive_value(flat_array.as_bytes());
+        assert_eq!(rejected.value, Value::Null);
+        assert!(!rejected.complete);
+        assert_eq!(rejected.reason.as_deref(), Some("archive_payload_invalid"));
 
         let deep = format!(
             "{}0{}",
@@ -206,6 +270,6 @@ mod tests {
 
         let safe = br#"{"items":[1,2,3],"text":"brackets [inside] a string"}"#;
         assert!(json_bytes_structure_is_bounded(safe));
-        assert!(decode_archive_value(safe).1);
+        assert!(decode_archive_value(safe).complete);
     }
 }

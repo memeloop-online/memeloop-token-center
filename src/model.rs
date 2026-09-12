@@ -429,6 +429,12 @@ pub struct RequestView {
     /// request that is still pending (or an imported record without a native
     /// terminal timestamp).
     pub completed_at: Option<i64>,
+    /// Completion timestamp reported by an imported source. Native request
+    /// records do not synthesize this field from their local completion time.
+    pub source_completed_at: Option<i64>,
+    /// Request execution lifecycle. This is deliberately separate from
+    /// `error_code`, which remains the persisted failure classification.
+    pub lifecycle_state: RequestLifecycleState,
     pub protocol: String,
     pub model: String,
     /// Stable upstream identity assigned to this request. For text traffic
@@ -440,21 +446,94 @@ pub struct RequestView {
     pub route_id: Option<Uuid>,
     pub status_code: Option<i64>,
     pub duration_ms: Option<i64>,
-    pub input_tokens: i64,
-    pub cached_input_tokens: i64,
-    pub cache_write_tokens: i64,
-    pub output_tokens: i64,
-    pub cost: String,
+    /// Compatibility token fields. They are nullable because generation and
+    /// archive-only history must not turn missing observations into zero.
+    pub input_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cost: Option<String>,
     /// Historical request currency when it was durably captured. It remains
     /// absent for generation history whose currency cannot be recovered
     /// without consulting mutable key state.
     pub currency: Option<String>,
+    /// Protocol-specific usage avoids overloading text-token fields for
+    /// asynchronous generation jobs.
+    pub usage: RequestUsageView,
+    /// Billing is a separate nullable observation. Archive-only records are
+    /// explicitly non-billable and never enter request or generation totals.
+    pub billing: RequestBillingView,
     pub error_code: Option<String>,
+    /// Current durable archive workflow state. Terminal spool transitions are
+    /// also emitted on the request event stream so an open view can converge.
+    pub archive_state: RequestArchiveState,
+    /// Present only on operator-scoped projections. Self-service responses do
+    /// not need to repeat or broaden credential identity metadata.
+    pub credential_identity: Option<RequestCredentialIdentityView>,
     /// Bounded, persisted conversation semantics for this request. A missing
     /// value means this request kind has no request/session projection (for
     /// example a generation job); it is never synthesized from model or prompt
     /// text while serving history.
     pub session_context: Option<RequestSessionContext>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestLifecycleState {
+    Preparing,
+    Queued,
+    Submitting,
+    Running,
+    Cancelling,
+    Pending,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestArchiveState {
+    Capturing,
+    Pending,
+    Uploading,
+    Bound,
+    Gap,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RequestTokenUsageView {
+    pub input_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RequestGenerationUsageView {
+    pub billed_units: Option<i64>,
+    pub billing_unit: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RequestUsageView {
+    pub tokens: Option<RequestTokenUsageView>,
+    pub generation: Option<RequestGenerationUsageView>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RequestBillingView {
+    pub billable: bool,
+    pub cost: Option<String>,
+    pub currency: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RequestCredentialIdentityView {
+    pub tenant_external_id: String,
+    pub key_id: Uuid,
+    pub key_alias: String,
+    pub principal_external_id: String,
 }
 
 /// Exclusive keyset cursor for the operator request history.  A timestamp is
@@ -518,6 +597,8 @@ pub struct RequestEventView {
     /// Receipt time from the tenant/key-owned request record, not event time.
     pub created_at: Option<i64>,
     pub completed_at: Option<i64>,
+    pub source_completed_at: Option<i64>,
+    pub lifecycle_state: RequestLifecycleState,
     pub upstream_account_id: Option<Uuid>,
     pub route_id: Option<Uuid>,
     pub currency: Option<String>,
@@ -529,10 +610,14 @@ pub struct RequestEventView {
     pub model: String,
     pub status_code: Option<i64>,
     pub duration_ms: Option<i64>,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cost: String,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cost: Option<String>,
+    pub usage: RequestUsageView,
+    pub billing: RequestBillingView,
     pub error_code: Option<String>,
+    pub archive_state: RequestArchiveState,
+    pub credential_identity: Option<RequestCredentialIdentityView>,
 }
 
 #[derive(Clone, Debug)]
@@ -542,6 +627,10 @@ pub struct RequestArchiveRefs {
     pub response_object: Option<String>,
     pub response_json: Option<serde_json::Value>,
     pub provenance: Option<RequestProvenanceView>,
+    pub request_archive_state: RequestArchiveState,
+    pub request_archive_reason: Option<String>,
+    pub response_archive_state: RequestArchiveState,
+    pub response_archive_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -560,8 +649,22 @@ pub struct RequestDetail {
     pub request_body: serde_json::Value,
     pub response_body: serde_json::Value,
     pub archive_complete: bool,
+    pub archive: RequestArchiveCompletenessView,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provenance: Option<RequestProvenanceView>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RequestArchiveSideView {
+    pub state: RequestArchiveState,
+    pub complete: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RequestArchiveCompletenessView {
+    pub request: RequestArchiveSideView,
+    pub response: RequestArchiveSideView,
 }
 
 #[derive(Clone, Debug, Serialize)]
