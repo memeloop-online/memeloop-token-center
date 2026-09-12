@@ -101,6 +101,23 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     await page.waitForFunction(() => window.quotaReconciles === 1 && !document.querySelector<HTMLButtonElement>('.upstream-quota-reset-action button')?.disabled);
     assert.deepEqual(await page.evaluate(() => [window.quotaPrepares, window.quotaConfirms, window.quotaStatuses, window.quotaReconciles, window.quotaWrites]), [1, 1, 1, 1, 3], 'inspection never repeats preparation or consumption');
     assert.equal(await reset.count(), 0);
+    // Read failures are mock-only; no reset/prepare/reconcile calls are made.
+    for (const [mode, message] of [
+      ['stale-error', 'Quota destination validation failed. Check this account’s endpoint, proxy and DNS configuration.'],
+      ['rate-limited', 'The supplier rate-limited quota reading. Retry manually later; this does not mean quota is exhausted.'],
+      ['permission', 'Your current credential cannot read upstream quota for this tenant. Check your sign-in and read permissions.'],
+    ]) {
+      await page.goto(`${base}/e2e/fixtures/upstream-quota.html?mode=${mode}`);
+      await view.click();
+      await page.getByRole('alert').getByText(message, { exact: true }).waitFor();
+      if (mode !== 'permission') {
+        await page.getByText('Primary window', { exact: true }).waitFor();
+        await page.getByText('Refresh failed. The previous result remains below and may not reflect current quota. Retry manually.', { exact: true }).waitFor();
+        assert.equal(await page.getByRole('meter').count(), 1);
+      }
+      assert.equal(await page.getByText('fixture-sensitive-message-must-not-render').count(), 0);
+      assert.deepEqual(await page.evaluate(() => [window.quotaReads, window.quotaWrites, window.quotaPrepares, window.quotaConfirms, window.quotaReconciles]), [1, 0, 0, 0, 0]);
+    }
     assert.deepEqual(errors, []);
   } finally {
     await browser.close();
