@@ -74,6 +74,8 @@ test('filters are non-modal themed popovers and model selection is searchable by
     context.diagnostic('checking settings provider/account autocomplete');
     await page.locator('.system-settings .model-picker-trigger').click();
     const settingsCatalog = page.locator('.system-settings .shared-model-popover');
+    await settingsCatalog.getByRole('combobox').fill('only');
+    assert.equal(await settingsCatalog.getByRole('option').count(), 0, 'non-conversational routes never appear in assistant suggestions');
     await settingsCatalog.getByRole('combobox').fill('Research account');
     await settingsCatalog.getByRole('option').first().click();
     assert.match(await page.locator('.system-settings .model-picker-trigger').textContent() ?? '', /research-model/);
