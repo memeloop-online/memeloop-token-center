@@ -7,7 +7,7 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
 
-test('static quota and confirmation evidence without clicking quota controls', { timeout: 90_000 }, async () => {
+test('upstream themes and mock-only quota demand, consent and reconciliation contract', { timeout: 90_000 }, async () => {
   if (!existsSync(chromium.executablePath())) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
     return test.skip('Chromium required');
@@ -49,18 +49,56 @@ test('static quota and confirmation evidence without clicking quota controls', {
     assert.equal(await page.getByRole('button', { name: 'Reset upstream quota', exact: true }).isEnabled(), true);
     for (const [theme, width] of [['light', 1440], ['dark', 390]] as const) {
       await page.evaluate((value) => { document.documentElement.dataset.theme = value; }, theme);
+      const styles = await page.evaluate(() => {
+        const border = getComputedStyle(document.querySelector('.upstream-connection')!);
+        const label = getComputedStyle(document.querySelector('.upstream-connection dt')!);
+        const advanced = getComputedStyle(document.querySelector('.upstream-advanced')!);
+        return { border: border.borderTopColor, width: border.borderTopWidth, style: border.borderTopStyle, muted: label.color, advanced: advanced.borderTopColor };
+      });
+      assert.deepEqual(styles, { border: theme === 'light' ? 'rgb(195, 213, 219)' : 'rgb(61, 105, 113)', width: '1px', style: 'solid', muted: theme === 'light' ? 'rgb(82, 105, 112)' : 'rgb(145, 170, 176)', advanced: theme === 'light' ? 'rgb(195, 213, 219)' : 'rgb(61, 105, 113)' });
         await page.setViewportSize({ width, height: 900 });
         assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth));
         await page.screenshot({ path: join(artifacts, `upstream-quota-${theme}-${width}.png`), fullPage: true });
     }
-    await page.goto(`${url}?confirm`);
+    // Exercise the real UpstreamQuota, with fetch replaced by the strict local fixture.
+    const quotaUrl = `${base}/e2e/fixtures/upstream-quota.html?mode=unknown`;
+    await page.goto(quotaUrl);
+    const view = page.getByRole('button', { name: 'View quota', exact: true });
+    await view.waitFor();
+    assert.deepEqual(await page.evaluate(() => [window.quotaReads, window.quotaWrites]), [0, 0]);
+    await view.click();
+    await page.getByText('Primary window', { exact: true }).waitFor();
+    await page.locator('.upstream-danger-zone > summary').click();
+    const reset = page.getByRole('button', { name: 'Reset upstream quota', exact: true });
+    await reset.hover();
+    assert.deepEqual(await page.evaluate(() => [window.quotaReads, window.quotaPrepares, window.quotaConfirms, window.quotaWrites]), [1, 0, 0, 0]);
+    await reset.click();
     const dialog = page.getByRole('dialog');
     await dialog.waitFor();
-    assert.match(await dialog.innerText(), /Mock Codex.*mock-account.*1 upstream reset credit/s);
+    assert.match(await dialog.innerText(), /quota-account.*1 upstream reset credit/s);
     assert.equal(await dialog.getByRole('button', { name: 'Cancel', exact: true }).evaluate((node) => node === document.activeElement), true);
     await page.screenshot({ path: join(artifacts, 'upstream-quota-confirm-mobile.png'), fullPage: true });
-    await page.keyboard.press('Escape');
+    await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
     await dialog.waitFor({ state: 'hidden' });
+    const status = page.getByRole('button', { name: 'Check operation status', exact: true });
+    await status.waitFor();
+    assert.deepEqual(await page.evaluate(() => [window.quotaPrepares, window.quotaConfirms, window.quotaWrites]), [1, 0, 1], 'cancel permits only non-consuming preparation');
+    assert.equal(await reset.count(), 0, 'cancelled preparation remains locked');
+    // Fresh mount starts an independent operation; only explicit confirmation consumes.
+    await page.goto(quotaUrl);
+    await view.click();
+    await page.locator('.upstream-danger-zone > summary').click();
+    await reset.click();
+    await dialog.getByRole('button', { name: 'Confirm and continue', exact: true }).click();
+    const reconcile = page.getByRole('button', { name: 'Reconcile upstream quota (read only)', exact: true });
+    await reconcile.waitFor();
+    assert.deepEqual(await page.evaluate(() => [window.quotaPrepares, window.quotaConfirms]), [1, 1]);
+    await status.click();
+    await page.waitForFunction(() => window.quotaStatuses === 1 && !document.querySelector<HTMLButtonElement>('.upstream-quota-reset-action button')?.disabled);
+    await reconcile.click();
+    await page.waitForFunction(() => window.quotaReconciles === 1 && !document.querySelector<HTMLButtonElement>('.upstream-quota-reset-action button')?.disabled);
+    assert.deepEqual(await page.evaluate(() => [window.quotaPrepares, window.quotaConfirms, window.quotaStatuses, window.quotaReconciles, window.quotaWrites]), [1, 1, 1, 1, 3], 'inspection never repeats preparation or consumption');
+    assert.equal(await reset.count(), 0);
     assert.deepEqual(errors, []);
   } finally {
     await browser.close();

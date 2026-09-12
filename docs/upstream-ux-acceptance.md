@@ -1,6 +1,6 @@
 # Upstream and model form UX acceptance
 
-PR #15 is based on the merged transport-proxy and quota-reset contracts. Acceptance runs only in GitHub CI. No development-host compilation or browser execution, live upstream calls, quota refresh, reset preparation or reset confirmation are permitted for this acceptance.
+PR #15 is based on the merged transport-proxy and quota-reset contracts. Acceptance runs only in GitHub CI. No development-host compilation or browser execution or live upstream/quota/reset calls are permitted. Quota interactions below use a strict in-page mock only; browser routing blocks all API and external network traffic.
 
 ## Interaction contract
 
@@ -15,7 +15,7 @@ PR #15 is based on the merged transport-proxy and quota-reset contracts. Accepta
 Each retained test covers an independent failure mode:
 
 - `upstream-ux-contract.test.ts`: deterministic proxy-policy boundary table prevents rejecting valid Tailnet proxies or accepting public/metadata/local-DNS endpoints; schema assertions protect immutable official URLs without restricting generic hostname proxy configuration. Source guards protect strict capability/version/idempotency behavior and the shared form structure.
-- `upstream-quota-browser-contract.test.ts`: one loopback-only static fixture checks read-only endpoint, keyboard-opened advanced settings, proxy validation, unknown quota meter semantics, representative desktop/light and mobile/dark overflow, and Cancel-focused/Escape-dismissable confirmation. All API/external requests are blocked. It never saves a proxy or activates quota controls; confirmation is a presentation-only preview.
+- `upstream-quota-browser-contract.test.ts`: one browser scenario checks read-only endpoint, keyboard-opened advanced settings, proxy validation, unknown quota meter semantics, and representative desktop/light and mobile/dark overflow. Computed border/label styles must resolve to the existing theme tokens in both themes. It then mounts the real `UpstreamQuota` against strict mock fetch: initial reads/writes zero, hover no preparation, Cancel no consuming confirmation, explicit Confirm exactly once, status/reconciliation never repeat preparation or consumption. The confirmation screenshot comes from the real component. Cancel leaves the prepared operation locked; a fresh mount supplies the independent confirmed operation. No sleep, randomized timing, live fetch or proxy save is used.
 - Existing provider-routing Cucumber steps cover upstream creation/editing and collapsed account controls. Existing quota-reset contracts cover the merged reset workflow; no duplicate reset state-machine tests are introduced.
 
 The existing `web` CI job supplies compilation and browser evidence. Download `monitoring-interactions-browser-*` from the exact accepted head for screenshots under `upstream-quota/`. There is no separate fixed-port Vite process, sleep loop or duplicate browser matrix. Historical screenshots do not validate this head. Mock evidence establishes UI behavior only, not deployed vendor availability.

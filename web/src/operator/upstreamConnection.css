@@ -1,8 +1,9 @@
-.upstream-connection { border: 1px solid var(--border); border-radius: 12px; padding: 16px; min-width: 0; }
+@import '../modelPicker.css';
+.upstream-connection { border: 1px solid var(--picker-border); border-radius: 12px; padding: 16px; min-width: 0; }
 .upstream-connection h3 { margin: 0 0 12px; font-size: 14px; }
 .upstream-connection dl { display: grid; gap: 12px; margin: 0; }
 .upstream-connection dl > div { display: grid; grid-template-columns: minmax(100px, 140px) minmax(0, 1fr); gap: 12px; }
-.upstream-connection dt { font-size: 12px; color: var(--muted); }
+.upstream-connection dt { font-size: 12px; color: var(--picker-muted); }
 .upstream-connection dd { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0; min-width: 0; }
 .upstream-connection code { overflow-wrap: anywhere; white-space: normal; }
 .upstream-connection p { font-size: 12px; line-height: 1.6; }
@@ -10,23 +11,23 @@
 .upstream-proxy-editor label { display: grid; gap: 8px; }
 .upstream-proxy-editor input { width: 100%; min-width: 0; }
 .provider-onboarding .rjsf fieldset { min-width: 0; }
-.provider-onboarding .rjsf fieldset fieldset { padding: 16px; margin: 16px 0; border: 1px solid var(--border); border-radius: 12px; }
+.provider-onboarding .rjsf fieldset fieldset { padding: 16px; margin: 16px 0; border: 1px solid var(--picker-border); border-radius: 12px; }
 .provider-onboarding .rjsf legend { font-weight: 600; padding: 0 6px; }
 .provider-list .account-list { grid-template-columns: minmax(0, 1fr); }
 .provider-account { padding: 20px; }
-.provider-account > .account-meta { border-top: 1px solid var(--border); padding-top: 16px; width: 100%; }
+.provider-account > .account-meta { border-top: 1px solid var(--picker-border); padding-top: 16px; width: 100%; }
 .upstream-secondary-actions, .upstream-danger-zone { width: 100%; }
 .upstream-secondary-actions summary, .upstream-danger-zone summary, .upstream-health-details summary { cursor: pointer; padding: 10px 0; font-size: 13px; }
 .upstream-secondary-actions .row-actions, .upstream-danger-zone .row-actions { padding: 12px 0; }
-.upstream-danger-zone { border-top: 1px solid var(--border); margin-top: 8px; }
+.upstream-danger-zone { border-top: 1px solid var(--picker-border); margin-top: 8px; }
 .upstream-danger-zone summary { color: var(--danger, #b42318); }
 .upstream-danger-zone p { font-size: 12px; line-height: 1.6; }
 .route-form-sections { display: grid; gap: 20px; min-width: 0; }
-.route-form-sections fieldset { display: grid; gap: 16px; margin: 0; min-width: 0; padding: 16px; border: 1px solid var(--border); }
+.route-form-sections fieldset { display: grid; gap: 16px; margin: 0; min-width: 0; padding: 16px; border: 1px solid var(--picker-border); }
 .upstream-form-sections { display: grid; gap: 16px; min-width: 0; }
-.upstream-form-sections fieldset { min-width: 0; border: 1px solid var(--border); padding: 16px; }
+.upstream-form-sections fieldset { min-width: 0; border: 1px solid var(--picker-border); padding: 16px; }
 .upstream-form-sections legend { font-weight: 600; padding: 0 6px; }
-.upstream-advanced { border: 1px solid var(--border); padding: 16px; min-width: 0; }
+.upstream-advanced { border: 1px solid var(--picker-border); padding: 16px; min-width: 0; }
 .upstream-advanced summary { cursor: pointer; font-weight: 600; }
 .upstream-advanced summary:focus-visible { outline: 2px solid var(--accent, #219b8a); outline-offset: 3px; }
 .route-form-sections legend { padding: 0 8px; font-weight: 600; }

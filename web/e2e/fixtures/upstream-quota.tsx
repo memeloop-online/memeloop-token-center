@@ -21,11 +21,23 @@ const snapshot: UpstreamQuotaSnapshot = {
   reset_capability: { provider_supported: mode === 'unsupported' ? false : true, implementation_available: mode === 'reset' || mode === 'unknown', prepare_available: mode === 'reset' || mode === 'unknown', confirmation_required: mode === 'reset' || mode === 'unknown', retryable: false, available_credits: 2, applicable_credits: 1, reason: null, credit_error_code: null },
   error_code: null,
 };
-declare global { interface Window { quotaReads: number; quotaWrites: number; quotaPrepares: number; quotaConfirms: number } }
+declare global { interface Window { quotaReads: number; quotaWrites: number; quotaPrepares: number; quotaConfirms: number; quotaStatuses: number; quotaReconciles: number } }
 window.quotaReads = 0; window.quotaWrites = 0;
 window.quotaPrepares = 0; window.quotaConfirms = 0;
+window.quotaStatuses = 0; window.quotaReconciles = 0;
 let operation = { id: 'mock-operation', upstream_account_id: 'quota-account', state: 'prepared', expires_at: now + 120_000, effect: 'supplier_defined_codex_rate_limits', consumes_credits: 1, last_reconciled_at: null as number | null, reconciled_available_credits: null as number | null, reconciled_applicable_credits: null as number | null };
 window.fetch = async (_input, init) => {
+  const url = new URL(String(_input), location.origin);
+  const method = init?.method ?? 'GET';
+  const quota = '/internal/v1/upstreams/quota-account/quota';
+  const reset = '/internal/v1/upstreams/quota-account/quota-reset/';
+  if (url.origin !== location.origin || url.searchParams.get('tenant_external_id') !== 'default'
+    || !((url.pathname === quota && method === 'GET')
+      || (url.pathname === `${reset}prepare` && method === 'POST')
+      || (url.pathname === `${reset}mock-operation` && method === 'GET')
+      || (['confirm', 'reconcile'].some((action) => url.pathname === `${reset}mock-operation/${action}`) && method === 'POST'))) {
+    throw new Error('Unexpected request in mock-only quota fixture');
+  }
   if (init?.method && init.method !== 'GET') window.quotaWrites += 1;
   window.quotaReads += 1;
   const path = String(_input);
@@ -35,10 +47,13 @@ window.fetch = async (_input, init) => {
       return new Response(JSON.stringify({ operation, confirmation_token: 'mock-confirmation-not-a-real-credential' }));
     }
     if (path.includes('/confirm')) {
+      const body = JSON.parse(String(init?.body));
+      if (body.confirmation !== 'consume_one_supplier_reset_credit' || body.confirmation_token !== 'mock-confirmation-not-a-real-credential') throw new Error('Invalid mock confirmation');
       window.quotaConfirms += 1;
       operation = { ...operation, state: mode === 'unknown' ? 'unknown' : 'accepted' };
     }
-    if (path.includes('/reconcile')) operation = { ...operation, last_reconciled_at: Date.now(), reconciled_available_credits: 1, reconciled_applicable_credits: 0 };
+    if (path.includes('/reconcile')) { window.quotaReconciles += 1; operation = { ...operation, last_reconciled_at: Date.now(), reconciled_available_credits: 1, reconciled_applicable_credits: 0 }; }
+    if (method === 'GET') window.quotaStatuses += 1;
     return new Response(JSON.stringify(operation));
   }
   return new Response(JSON.stringify(mode === 'error' ? { error: { message: 'read unavailable' } } : snapshot), { status: mode === 'error' ? 503 : 200 });
