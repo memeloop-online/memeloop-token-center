@@ -25,7 +25,7 @@ import {
   type KeyListLoadState, type KeyListRequestIdentity,
 } from '../keyPagination';
 import { directCredentialSchema, supportsDirectConnection } from '../providerConnectionMethods';
-import { UpstreamAvailability } from '../UpstreamAvailability';
+import { UpstreamAvailability, manualHealthLabel } from '../UpstreamAvailability';
 import { UpstreamQuota } from '../UpstreamQuota';
 import { connectionSchema, isPrivateProxyUrl, ProxyInput, UpstreamConnection } from '../UpstreamConnection';
 import { upstreamFormTemplates } from '../UpstreamFormTemplates';
@@ -229,7 +229,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             <small>{value.id}</small>
             <UpstreamConnection key={`connection\0${token}\0${writeTenant}\0${value.id}`} account={value} token={token} tenant={writeTenant} disabled={!manageable || Boolean(busy)} onChanged={onChanged} />
             {value.credential_expires_at && <small>{t('providers.expires')}: {new Date(value.credential_expires_at).toLocaleString(locale)}</small>}
-            <details className="upstream-health-details"><summary>{t('providers.recentAvailability')} · {currentHealth ? t(currentHealth.status === 'healthy' ? 'providers.healthy' : 'providers.unhealthy') : t('providers.manualHealthCheck')}</summary><UpstreamAvailability account={value} snapshot={availabilitySnapshot} window={availabilityWindow} loading={availabilityLoading} manualHealth={currentHealth} onOpenRequest={onOpenRequest} /></details>
+            <details className="upstream-health-details"><summary>{t('providers.recentAvailability')} · {currentHealth ? t(manualHealthLabel(currentHealth)) : t('providers.manualHealthCheck')}</summary><UpstreamAvailability account={value} snapshot={availabilitySnapshot} window={availabilityWindow} loading={availabilityLoading} manualHealth={currentHealth} onOpenRequest={onOpenRequest} /></details>
             <UpstreamQuota key={`${token}\0${tenant}\0${value.id}`} accountId={value.id} accountName={value.name} tenant={value.tenant_external_id ?? tenant} token={token} />
             {currentReadiness && <small className={`status ${currentReadiness.can_delete ? 'ok' : 'pending'}`}>{deletionBlockers.join(' · ')}</small>}
           </div>

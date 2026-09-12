@@ -88,7 +88,7 @@ function Fixture() {
   return <main className="main">
     <div className="hero compact"><div><span className="eyebrow">Fixture</span><h1>Upstream availability</h1></div></div>
     <article className="panel provider-list">
-      <div className="account provider-account"><div className="account-main"><b>{observedAccount.name}</b><span>openai · API credential</span><UpstreamAvailability account={observedAccount} snapshot={snapshot} window={selectedWindow} manualHealth={{ account_id: observedAccount.id, status: 'unhealthy', error_code: 'probe_timeout', upstream_status: 504, latency_ms: 1_200, checked_at: now - 1_000 }} onOpenRequest={(requestId) => { window.upstreamAvailabilityFixture.openedRequestId = requestId; }} /></div></div>
+      <div className="account provider-account"><div className="account-main"><b>{observedAccount.name}</b><span>openai · API credential</span><UpstreamAvailability account={observedAccount} snapshot={snapshot} window={selectedWindow} manualHealth={{ account_id: observedAccount.id, status: 'unhealthy', error_code: 'rate_limited', upstream_status: 429, latency_ms: 1_200, checked_at: now - 1_000 }} onOpenRequest={(requestId) => { window.upstreamAvailabilityFixture.openedRequestId = requestId; }} /></div></div>
       <div className="account provider-account"><div className="account-main"><b>{unobservedAccount.name}</b><span>anthropic · API credential</span><UpstreamAvailability account={unobservedAccount} snapshot={snapshot} window={selectedWindow} /></div></div>
     </article>
   </main>;

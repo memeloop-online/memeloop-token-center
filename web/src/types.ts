@@ -752,6 +752,8 @@ export interface UpstreamHealth {
   upstream_status?: number;
   latency_ms?: number;
   checked_at: number;
+  retry_at?: number;
+  source?: 'routing_state' | 'connection_probe';
 }
 
 export interface ConfigurationSchemas {
