@@ -955,10 +955,10 @@ impl Database {
         let mut transaction = self.pool.begin().await?;
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "SELECT id FROM generation_jobs WHERE status IN ('queued', 'running', 'submitting', 'cancelling') AND next_attempt_at <= $1 AND (lease_expires_at IS NULL OR lease_expires_at < $2) ORDER BY next_attempt_at, created_at, id FOR UPDATE SKIP LOCKED LIMIT 1"
+                "SELECT id FROM generation_jobs WHERE status IN ('queued', 'running', 'submitting', 'cancelling') AND (error_code IS NULL OR error_code <> 'shutdown_delivery_unknown') AND next_attempt_at <= $1 AND (lease_expires_at IS NULL OR lease_expires_at < $2) ORDER BY next_attempt_at, created_at, id FOR UPDATE SKIP LOCKED LIMIT 1"
             }
             DatabaseBackend::Sqlite => {
-                "SELECT id FROM generation_jobs WHERE status IN ('queued', 'running', 'submitting', 'cancelling') AND next_attempt_at <= $1 AND (lease_expires_at IS NULL OR lease_expires_at < $2) ORDER BY next_attempt_at, created_at, id LIMIT 1"
+                "SELECT id FROM generation_jobs WHERE status IN ('queued', 'running', 'submitting', 'cancelling') AND (error_code IS NULL OR error_code <> 'shutdown_delivery_unknown') AND next_attempt_at <= $1 AND (lease_expires_at IS NULL OR lease_expires_at < $2) ORDER BY next_attempt_at, created_at, id LIMIT 1"
             }
         };
         let candidate = sqlx::query(select)
@@ -972,7 +972,7 @@ impl Database {
         };
         let job_id: String = candidate.try_get("id")?;
         let claimed = sqlx::query(
-            "UPDATE generation_jobs SET lease_owner = $1, lease_expires_at = $2, attempt_count = attempt_count + 1, updated_at = $3 WHERE id = $4 AND status IN ('queued', 'running', 'submitting', 'cancelling') AND (lease_expires_at IS NULL OR lease_expires_at < $5)",
+            "UPDATE generation_jobs SET lease_owner = $1, lease_expires_at = $2, attempt_count = attempt_count + 1, updated_at = $3 WHERE id = $4 AND status IN ('queued', 'running', 'submitting', 'cancelling') AND (error_code IS NULL OR error_code <> 'shutdown_delivery_unknown') AND (lease_expires_at IS NULL OR lease_expires_at < $5)",
         )
         .bind(worker_id)
         .bind(now.saturating_add(60_000))
@@ -1117,6 +1117,28 @@ impl Database {
             .bind(worker_id)
             .execute(&self.pool)
             .await?,
+        )
+    }
+
+    /// Arm before a supervised provider POST, not while shutting down. The
+    /// existing submission_nonce, attempt_count, updated_at, and submitting
+    /// status identify the fenced attempt without retaining provider secrets.
+    /// An abandoned guard is never automatically reclaimed, even after expiry;
+    /// only explicit operator/provider reconciliation may resolve it.
+    pub async fn arm_generation_shutdown_quarantine(
+        &self,
+        job_id: Uuid,
+        worker_id: &str,
+        submission_nonce: Uuid,
+    ) -> Result<(), AppError> {
+        generation_update_claimed(
+            sqlx::query("UPDATE generation_jobs SET error_code = 'shutdown_delivery_unknown', updated_at = $1 WHERE id = $2 AND lease_owner = $3 AND status = 'submitting' AND submission_nonce = $4 AND upstream_job_id IS NULL AND lease_expires_at >= $1")
+                .bind(unix_millis())
+                .bind(job_id.to_string())
+                .bind(worker_id)
+                .bind(submission_nonce.to_string())
+                .execute(&self.pool)
+                .await?,
         )
     }
 
