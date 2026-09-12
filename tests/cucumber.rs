@@ -1,11 +1,13 @@
 use std::{
+    any::Any,
     fmt,
+    panic::AssertUnwindSafe,
     str::FromStr,
     time::{Duration, Instant},
 };
 
 use cucumber::{World, given, then, when};
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use memeloop_token_center::{
     AppState, api,
     archive_staging::{
@@ -158,13 +160,153 @@ fn spawn_test_worker(state: AppState) -> (watch::Sender<bool>, JoinHandle<()>) {
 }
 
 async fn stop_test_worker(world: &mut TokenCenterWorld) {
-    let shutdown = world
+    let shutdown_error = world
         .worker_shutdown
         .take()
-        .expect("generation worker shutdown signal");
-    let task = world.worker_task.take().expect("generation worker task");
-    shutdown.send(true).expect("generation worker is running");
-    task.await.expect("generation worker shuts down cleanly");
+        .and_then(|shutdown| shutdown.send(true).err());
+    let worker_error = match world.worker_task.take() {
+        Some(task) => task.await.err(),
+        None => None,
+    };
+
+    if let Some(error) = shutdown_error {
+        panic!("generation worker shutdown receiver dropped before shutdown: {error}");
+    }
+    if let Some(error) = worker_error {
+        panic!("generation worker did not shut down cleanly: {error}");
+    }
+}
+
+fn panic_message(panic: Box<dyn Any + Send>) -> String {
+    match panic.downcast::<String>() {
+        Ok(message) => *message,
+        Err(panic) => match panic.downcast::<&str>() {
+            Ok(message) => (*message).to_owned(),
+            Err(_) => "mock verification panicked without a string message".to_owned(),
+        },
+    }
+}
+
+async fn verify_test_mock(name: &str, mock: MockServer) -> Option<String> {
+    let verification = AssertUnwindSafe(mock.verify()).catch_unwind().await;
+    let failure = verification.err().map(panic_message);
+    // `MockServer::Drop` verifies again. Clearing the expectations makes the explicit result
+    // above the only diagnostic and lets every server finish cleanup without another panic.
+    mock.reset().await;
+    failure.map(|failure| format!("{name} mock verification failed:\n{failure}"))
+}
+
+async fn verify_test_mocks(world: &mut TokenCenterWorld) {
+    let mocks = [
+        ("upstream", world.mock.take()),
+        ("asset", world.asset_mock.take()),
+    ];
+    let mut failures = Vec::new();
+
+    for (name, mock) in mocks {
+        if let Some(mock) = mock
+            && let Some(failure) = verify_test_mock(name, mock).await
+        {
+            failures.push(failure);
+        }
+    }
+
+    if !failures.is_empty() {
+        panic!("Mock verification failures:\n{}", failures.join("\n\n"));
+    }
+}
+
+async fn finish_scenario(world: Option<&mut TokenCenterWorld>) {
+    let Some(world) = world else {
+        return;
+    };
+
+    // A generation worker can still make an upstream request after a scenario's final step.
+    // Stop and join it before inspecting mock expectations, so any failure belongs to this hook.
+    stop_test_worker(world).await;
+    verify_test_mocks(world).await;
+}
+
+type PanicHook = dyn for<'a> Fn(&std::panic::PanicHookInfo<'a>) + Send + Sync + 'static;
+
+struct PanicHookSilencer {
+    previous: Option<Box<PanicHook>>,
+}
+
+impl PanicHookSilencer {
+    fn new() -> Self {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        Self {
+            previous: Some(previous),
+        }
+    }
+}
+
+impl Drop for PanicHookSilencer {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            std::panic::set_hook(previous);
+        }
+    }
+}
+
+async fn assert_lifecycle_contract() {
+    let (shutdown, mut receiver) = watch::channel(false);
+    let worker = tokio::spawn(async move {
+        receiver.changed().await.expect("worker shutdown signal");
+        assert!(*receiver.borrow(), "worker received shutdown");
+    });
+    let mock = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let asset_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&asset_mock)
+        .await;
+
+    let mut world = TokenCenterWorld::default();
+    world.worker_shutdown = Some(shutdown);
+    world.worker_task = Some(worker);
+    world.mock = Some(mock);
+    world.asset_mock = Some(asset_mock);
+    let verification = {
+        // This preflight runs before Cucumber starts concurrent scenarios. Its deliberately
+        // unsatisfied mocks prove the hook's diagnostic path without polluting a passing run.
+        let _panic_hook = PanicHookSilencer::new();
+        AssertUnwindSafe(finish_scenario(Some(&mut world)))
+            .catch_unwind()
+            .await
+    };
+    let failure = verification
+        .expect_err("unsatisfied mock expectations must fail in the scenario after hook");
+    assert!(world.worker_shutdown.is_none());
+    assert!(world.worker_task.is_none());
+    assert!(world.mock.is_none());
+    assert!(world.asset_mock.is_none());
+
+    let message = failure
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| failure.downcast_ref::<&str>().copied())
+        .expect("wiremock verification panic contains a message");
+    assert!(
+        message.contains("upstream mock verification failed"),
+        "{message}"
+    );
+    assert!(
+        message.contains("asset mock verification failed"),
+        "{message}"
+    );
+    assert!(
+        message.contains("Number of matched incoming requests: 0"),
+        "{message}"
+    );
 }
 
 #[given("a token center backed by SQLite and memory object storage")]
@@ -6904,8 +7046,58 @@ async fn own_conversation_detail(world: &TokenCenterWorld) -> Value {
         .expect("conversation detail JSON")
 }
 
+async fn wait_for_finished_conversation_requests(world: &TokenCenterWorld, expected: usize) {
+    let key_id = world
+        .stable_key_id
+        .expect("conversation key id")
+        .to_string();
+    let key_needle = format!("\"key_id\":\"{key_id}\"");
+    let response = world
+        .client
+        .get(format!(
+            "{}/internal/v1/request-events?after_event_at=0",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .send()
+        .await
+        .expect("conversation request event stream");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut stream = response.bytes_stream();
+    let finished = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut frame = String::new();
+        let mut count = 0;
+        while let Some(chunk) = stream.next().await {
+            frame.push_str(&String::from_utf8_lossy(
+                &chunk.expect("conversation request SSE chunk"),
+            ));
+            while let Some(end) = frame.find("\n\n") {
+                let event = frame[..end].to_owned();
+                frame.drain(..end + 2);
+                if event.contains("event: request.finished") && event.contains(&key_needle) {
+                    count += 1;
+                    if count >= expected {
+                        return count;
+                    }
+                }
+            }
+        }
+        count
+    })
+    .await
+    .expect("finished conversation requests before timeout");
+    assert!(
+        finished >= expected,
+        "expected {expected} finished conversation requests, observed {finished}"
+    );
+}
+
 #[then("the two Responses requests have a direct continuation edge")]
 async fn responses_requests_have_direct_parent_edge(world: &mut TokenCenterWorld) {
+    // Request EOF can precede the terminal transaction. Wait for its durable finished events;
+    // conversation observations commit in that same transaction for these prepaid requests.
+    wait_for_finished_conversation_requests(world, 2).await;
     let detail = own_conversation_detail(world).await;
     assert_eq!(detail["cluster"]["request_count"], 2, "{detail}");
     assert_eq!(
@@ -7855,12 +8047,14 @@ async fn rotated_group_routing_is_stable(world: &mut TokenCenterWorld) {
 
 #[tokio::main]
 async fn main() {
+    assert_lifecycle_contract().await;
     let postgres_enabled = std::env::var_os("MTC_TEST_POSTGRES_URL").is_some();
     TokenCenterWorld::cucumber()
         // Every scenario boots an isolated application, database and plugin runtime. Cucumber's
         // default of 64 concurrent scenarios can turn the acceptance harness itself into a
         // multi-gigabyte workload and make CI results depend on host memory pressure.
         .max_concurrent_scenarios(2)
+        .after(|_, _, _, _, world| async move { finish_scenario(world).await }.boxed_local())
         .filter_run_and_exit("tests/features", move |_, _, scenario| {
             postgres_enabled || !scenario.tags.iter().any(|tag| tag == "postgres")
         })
