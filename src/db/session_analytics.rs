@@ -13,6 +13,7 @@ use crate::model::{
 pub struct LogicalSessionListFilter {
     pub limit: i64,
     pub cursor: Option<(i64, String, String)>,
+    pub legacy_cursor: bool,
     pub key_id: Option<Uuid>,
     pub state: String,
     pub model: Option<String>,
@@ -170,8 +171,11 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
            SELECT recent.key_id, recent.session_id,
                   (SELECT latest.id FROM request_records latest
                     WHERE latest.key_id = recent.key_id
+                      AND latest.conversation_cluster_id IS NOT NULL
                       AND latest.conversation_cluster_id = recent.session_id
-                    ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1) AS request_id,
+                    ORDER BY latest.key_id ASC,
+                             latest.conversation_cluster_id ASC,
+                             latest.created_at DESC, latest.id DESC LIMIT 1) AS request_id,
                   (SELECT latest.archive_request_id FROM session_archive_unlinked_requests latest
                     WHERE latest.key_id = recent.key_id
                       AND latest.conversation_cluster_id = recent.session_id
@@ -183,7 +187,9 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
                   (SELECT latest.id FROM request_records latest
                     WHERE latest.key_id = recent.key_id
                       AND latest.conversation_cluster_id IS NULL
-                    ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1),
+                    ORDER BY latest.key_id ASC,
+                             latest.conversation_cluster_id ASC,
+                             latest.created_at DESC, latest.id DESC LIMIT 1),
                   (SELECT latest.archive_request_id FROM session_archive_unlinked_requests latest
                     WHERE latest.key_id = recent.key_id
                       AND latest.conversation_cluster_id IS NULL
@@ -198,6 +204,7 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
              FROM latest_ids recent
              JOIN request_records request
                ON request.key_id = recent.key_id
+              AND request.conversation_cluster_id IS NOT NULL
               AND request.conversation_cluster_id = recent.session_id
               AND request.id = recent.request_id
              LEFT JOIN conversation_observations observation
@@ -551,15 +558,18 @@ impl Database {
                    SELECT * FROM filterable
                     WHERE $4 < 0 OR last_activity_at < $4
                        OR (last_activity_at = $4 AND (session_id < $5
-                           OR (session_id = $5 AND key_id < $9)))
+                           OR (session_id = $5 AND ($10 OR key_id < $9))))
                     ORDER BY last_activity_at DESC, session_id DESC, key_id DESC
                     LIMIT $3
                ), latest_ids AS MATERIALIZED (
                    SELECT recent.key_id, recent.session_id,
                           (SELECT latest.id FROM request_records latest
                             WHERE latest.key_id = recent.key_id
+                              AND latest.conversation_cluster_id IS NOT NULL
                               AND latest.conversation_cluster_id = recent.session_id
-                            ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1) AS request_id,
+                            ORDER BY latest.key_id ASC,
+                                     latest.conversation_cluster_id ASC,
+                                     latest.created_at DESC, latest.id DESC LIMIT 1) AS request_id,
                           (SELECT latest.archive_request_id FROM session_archive_unlinked_requests latest
                             WHERE latest.key_id = recent.key_id
                               AND latest.conversation_cluster_id = recent.session_id
@@ -571,7 +581,9 @@ impl Database {
                           (SELECT latest.id FROM request_records latest
                             WHERE latest.key_id = recent.key_id
                               AND latest.conversation_cluster_id IS NULL
-                            ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1),
+                            ORDER BY latest.key_id ASC,
+                                     latest.conversation_cluster_id ASC,
+                                     latest.created_at DESC, latest.id DESC LIMIT 1),
                           (SELECT latest.archive_request_id FROM session_archive_unlinked_requests latest
                             WHERE latest.key_id = recent.key_id
                               AND latest.conversation_cluster_id IS NULL
@@ -586,6 +598,7 @@ impl Database {
                      FROM latest_ids recent
                      JOIN request_records request
                        ON request.key_id = recent.key_id
+                      AND request.conversation_cluster_id IS NOT NULL
                       AND request.conversation_cluster_id = recent.session_id
                       AND request.id = recent.request_id
                      LEFT JOIN conversation_observations observation
@@ -711,7 +724,8 @@ impl Database {
                 .bind(&filter.state)
                 .bind(&model)
                 .bind(&query)
-                .bind(&before_key_id);
+                .bind(&before_key_id)
+                .bind(filter.legacy_cursor);
         }
         let rows = session_query.fetch_all(&self.pool).await?;
         let mut sessions = BTreeMap::<(String, String), SessionAccumulator>::new();

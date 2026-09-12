@@ -409,6 +409,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "global request event cursor index",
         sql: include_str!("../../../migrations/sqlite/0076_request_event_global_cursor.sql"),
     },
+    Migration {
+        version: 77,
+        name: "bounded latest request per logical session",
+        sql: include_str!("../../../migrations/common/0077_request_session_latest.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -803,6 +808,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 76,
         name: "global request event cursor index",
         sql: include_str!("../../../migrations/postgres/0076_request_event_global_cursor.sql"),
+    },
+    Migration {
+        version: 77,
+        name: "bounded latest request per logical session",
+        sql: include_str!("../../../migrations/common/0077_request_session_latest.sql"),
     },
 ];
 

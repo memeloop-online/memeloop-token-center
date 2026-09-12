@@ -152,6 +152,7 @@ async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_histor
     let active_session = Uuid::now_v7();
     let archive_session = Uuid::now_v7();
     let shared_session = Uuid::now_v7();
+    let unlinked_session = format!("unlinked:{}", second_key.key_id);
     let completed_request = Uuid::now_v7();
     let active_request = Uuid::now_v7();
     sqlx::query(
@@ -164,6 +165,16 @@ async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_histor
     .execute(&pool)
     .await
     .expect("completed multi-currency session totals");
+    sqlx::query(
+        "INSERT INTO session_usage_totals (tenant_id,key_id,session_id,currency,last_activity_at,requests,errors,input_tokens,output_tokens,duration_count,duration_sum_ms,cost_micros) VALUES ($1,$2,$3,'USD',$4,1,0,5,6,1,9,25)",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(second_key.key_id.to_string())
+    .bind(&unlinked_session)
+    .bind(base + 250)
+    .execute(&pool)
+    .await
+    .expect("completed unlinked session totals");
     sqlx::query(
         "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, request_object, response_object, reservation_id, conversation_cluster_id) VALUES ($1,$2,$3,$4,'openai-responses','gpt-completed',500,12,20,10,100,'memory://request','memory://response',$5,$6), ($7,$2,$8,$9,'anthropic-messages','claude-active',NULL,NULL,0,0,0,'memory://request',NULL,$10,$11)",
     )
@@ -181,6 +192,17 @@ async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_histor
     .execute(&pool)
     .await
     .expect("live completed and active session metadata");
+    sqlx::query(
+        "INSERT INTO request_records (id,tenant_id,key_id,created_at,protocol,model,status_code,duration_ms,input_tokens,output_tokens,cost_micros,request_object,response_object,reservation_id) VALUES ($1,$2,$3,$4,'openai-responses','gpt-unlinked',200,9,5,6,25,'memory://request','memory://response',$5)",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(key.tenant_id.to_string())
+    .bind(second_key.key_id.to_string())
+    .bind(base + 250)
+    .bind(Uuid::now_v7().to_string())
+    .execute(&pool)
+    .await
+    .expect("completed unlinked session metadata");
     sqlx::query(
         "INSERT INTO session_archive_totals (tenant_id,key_id,session_id,last_activity_at,requests,errors,input_tokens,output_tokens,duration_count,duration_sum_ms) VALUES ($1,$2,$3,$4,2,1,7,9,2,30)",
     )
@@ -216,7 +238,7 @@ async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_histor
     .expect("same-time same-session cross-key projections");
     analyze_session_sources(&pool).await;
 
-    let before_plan = explain_candidate_first(&plan_pool, key.tenant_id, "", 5).await;
+    let before_plan = explain_candidate_first(&plan_pool, key.tenant_id, "", 6).await;
     let before_buffers = shared_buffers(&before_plan);
 
     insert_history(
@@ -240,7 +262,7 @@ async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_histor
     .fetch_all(&pool)
     .await
     .expect("historical request partitions");
-    let after_plan = explain_candidate_first(&plan_pool, key.tenant_id, "", 5).await;
+    let after_plan = explain_candidate_first(&plan_pool, key.tenant_id, "", 6).await;
     let after_buffers = shared_buffers(&after_plan);
     assert_relations_returned_no_rows(&after_plan, &history_partitions);
     assert!(
@@ -249,7 +271,7 @@ async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_histor
     );
 
     let filter = LogicalSessionListFilter {
-        limit: 4,
+        limit: 5,
         state: "all".into(),
         ..Default::default()
     };
@@ -263,7 +285,7 @@ async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_histor
         .recent_sessions_reference_for_test(&key.tenant_id.to_string(), filter)
         .await
         .expect("reference PostgreSQL session page");
-    assert_eq!(candidate_first.len(), 5);
+    assert_eq!(candidate_first.len(), 6);
     assert_eq!(
         serde_json::to_value(&candidate_first).expect("candidate-first JSON"),
         serde_json::to_value(&reference).expect("reference JSON"),
@@ -307,6 +329,16 @@ async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_histor
     assert_eq!(active.active_requests, 1);
     assert_eq!(active.requests, 0);
 
+    let unlinked = candidate_first
+        .iter()
+        .find(|session| session.session_id == unlinked_session)
+        .expect("completed unlinked summary");
+    assert!(unlinked.unlinked);
+    assert_eq!(unlinked.cluster_id, None);
+    assert_eq!(unlinked.model, "gpt-unlinked");
+    assert_eq!(unlinked.last_status, "success");
+    assert_eq!(unlinked.requests, 1);
+
     let archived = candidate_first
         .iter()
         .find(|session| session.cluster_id == Some(archive_session))
@@ -322,21 +354,21 @@ async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_histor
     let mut shared_keys = [key.key_id, second_key.key_id];
     shared_keys.sort_by_key(ToString::to_string);
     shared_keys.reverse();
-    assert_eq!(candidate_first[3].cluster_id, Some(shared_session));
-    assert_eq!(candidate_first[3].last_activity_at, base);
-    assert_eq!(candidate_first[3].key_id, shared_keys[0]);
     assert_eq!(candidate_first[4].cluster_id, Some(shared_session));
     assert_eq!(candidate_first[4].last_activity_at, base);
-    assert_eq!(candidate_first[4].key_id, shared_keys[1]);
+    assert_eq!(candidate_first[4].key_id, shared_keys[0]);
+    assert_eq!(candidate_first[5].cluster_id, Some(shared_session));
+    assert_eq!(candidate_first[5].last_activity_at, base);
+    assert_eq!(candidate_first[5].key_id, shared_keys[1]);
 
-    let page_one = &candidate_first[..4];
+    let page_one = &candidate_first[..5];
     let cursor = page_one.last().expect("visible first-page boundary");
     let page_two = state
         .db
         .operator_recent_sessions(
             &tenant_external_id,
             LogicalSessionListFilter {
-                limit: 4,
+                limit: 5,
                 cursor: Some((
                     cursor.last_activity_at,
                     cursor.session_id.clone(),
@@ -359,7 +391,7 @@ async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_histor
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(
         identities.len(),
-        6,
+        7,
         "full cursor must neither lose nor repeat rows"
     );
 
@@ -369,7 +401,8 @@ async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_histor
             &tenant_external_id,
             LogicalSessionListFilter {
                 limit: 4,
-                cursor: Some((base, shared_session.to_string(), "~".into())),
+                cursor: Some((base, shared_session.to_string(), String::new())),
+                legacy_cursor: true,
                 state: "all".into(),
                 ..Default::default()
             },

@@ -28,25 +28,37 @@ pub(super) struct RecentSessionsQuery {
     q: Option<String>,
 }
 
+type ParsedSessionCursor = (Option<(i64, String, String)>, bool);
+
 impl RecentSessionsQuery {
-    fn cursor(&self) -> Result<Option<(i64, String, String)>, AppError> {
+    fn cursor(&self) -> Result<ParsedSessionCursor, AppError> {
         match (
             &self.before_last_activity_at,
             &self.before_session_id,
             &self.before_key_id,
         ) {
-            (None, None, None) => Ok(None),
-            (Some(last_activity_at), Some(session_id), key_id) => {
+            (None, None, None) => Ok((None, false)),
+            (Some(last_activity_at), Some(session_id), Some(key_id)) => {
                 validate_session_id(session_id)?;
-                // Legacy two-field cursors have no stable position among rows
-                // that share the same activity time and session id across
-                // keys. Resume before a sentinel above every canonical UUID:
-                // this may repeat the boundary row once, but cannot silently
-                // skip an unseen key. Every newly issued cursor is complete.
-                let key_id = key_id
-                    .map(|key_id| key_id.to_string())
-                    .unwrap_or_else(|| "~".to_owned());
-                Ok(Some((*last_activity_at, session_id.clone(), key_id)))
+                Ok((
+                    Some((
+                        *last_activity_at,
+                        session_id.clone(),
+                        key_id.to_string(),
+                    )),
+                    false,
+                ))
+            }
+            (Some(last_activity_at), Some(session_id), None) => {
+                validate_session_id(session_id)?;
+                // A legacy two-field cursor cannot identify its position
+                // among keys tied on the first two fields. Include that whole
+                // pair explicitly: the boundary can repeat, but no tied key
+                // can disappear due to a database collation assumption.
+                Ok((
+                    Some((*last_activity_at, session_id.clone(), String::new())),
+                    true,
+                ))
             }
             _ => Err(AppError::BadRequest(
                 "before_last_activity_at and before_session_id must be supplied together; before_key_id is optional only for legacy cursors".into(),
@@ -75,9 +87,11 @@ impl RecentSessionsQuery {
                 )));
             }
         }
+        let (cursor, legacy_cursor) = self.cursor()?;
         Ok(LogicalSessionListFilter {
             limit: self.limit,
-            cursor: self.cursor()?,
+            cursor,
+            legacy_cursor,
             key_id: self.key_id,
             state: state.to_owned(),
             model: self.model.clone(),
