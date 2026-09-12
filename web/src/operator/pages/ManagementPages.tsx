@@ -31,6 +31,7 @@ import { connectionSchema, isPrivateProxyUrl, ProxyInput, UpstreamConnection } f
 import { upstreamFormTemplates } from '../UpstreamFormTemplates';
 import { upstreamAvailabilityPath, type UpstreamAvailabilityWindow } from '../upstreamAvailabilityWindow';
 import { useOperatorResource, type ResourceState } from '../hooks/useOperatorResource';
+import { useInlineEditorFocus } from '../hooks/useInlineEditorFocus';
 import { loadModelPricePages } from '../pricingLoading';
 import { enumLabel, messageOf, OneTimeSecret, queryForTenant, WriteScopeNotice } from '../scope/operatorShared';
 
@@ -68,6 +69,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   const [editing, setEditing] = useState<UpstreamAccount>();
   const [reauthorizing, setReauthorizing] = useState<UpstreamAccount>();
   const [busy, setBusy] = useState('');
+  const { container: providerList, rememberTrigger } = useInlineEditorFocus(editing?.id, Boolean(busy), `${token}\0${tenant}\0${writeTenant}`);
   const [health, setHealth] = useState<Record<string, UpstreamHealth>>({});
   const [deletionReadiness, setDeletionReadiness] = useState<Record<string, UpstreamDeletionReadiness>>({});
   const [message, setMessage] = useState('');
@@ -111,6 +113,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   } as RJSFSchema, locale) : undefined, [editing, editProvider, locale]);
   const uiSchema = {
     driver: { 'ui:widget': 'hidden' },
+    ...(provider?.id === 'http-json' ? { credential: { type: { 'ui:widget': 'hidden' } } } : {}),
     config: {
       oauth: { 'ui:widget': 'hidden' },
       ...(provider?.id === 'comfyui' ? {
@@ -208,7 +211,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   }
 
   return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} /><section className="provider-layout">
-    <article className="panel provider-list"><div className="panel-title"><div><h2>{t('providers.title')}</h2><p className="muted">{t('providers.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>
+    <article ref={providerList} className="panel provider-list"><div className="panel-title"><div><h2>{t('providers.title')}</h2><p className="muted">{t('providers.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>
       {error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{availabilityError && <div className="notice error" role="alert">{availabilityError}</div>}{message && <div className="notice success" role="status">{message}</div>}
       <div className="account-list">{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('status.active')} empty={t('providers.empty')} />}{statusFilter.values.map((value) => {
         const providerAvailable = providers.some((provider) => provider.id === value.driver);
@@ -236,7 +239,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             <span className="pill">{t('providers.routes', { count: formatNumber(value.route_count, locale) })}</span>
             <details className="upstream-secondary-actions"><summary>{t('connection.manageAccount')}</summary><div className="row-actions">
               {providerAvailable && <>
-                <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setEditing(value)}>{t('providers.edit')}</button>
+                <button type="button" className="secondary" data-inline-edit-trigger={value.id} disabled={!manageable || Boolean(busy)} onClick={(event) => { rememberTrigger(value.id, event.currentTarget); setEditing(value); }}>{t('providers.edit')}</button>
                 <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void checkHealth(value)}>{t('providers.runManualHealthCheck')}</button>
                 {value.can_refresh && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void refreshOAuth(value)}>{t('providers.refreshAuthorization')}</button>}
                 {value.can_reauthorize && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setReauthorizing(value)}>{t('providers.reauthorize')}</button>}

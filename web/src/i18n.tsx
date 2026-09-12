@@ -4,6 +4,20 @@ export type Locale = 'zh-CN' | 'en';
 type Variables = Record<string, string | number>;
 
 const zh = {
+  'connection.baseUrl': '上游 API 地址（Base URL）',
+  'connection.capabilitiesSection': '可选能力与用量契约',
+  'connection.capabilitiesHint': '仅在使用图片、视频或供应商特有的用量协议时配置。收起不会丢失已填写内容；校验失败会自动展开。',
+  'schema.Network scope': '网络访问范围',
+  'schema.Private destinations require a global operator credential.': '访问私网目标需要全局管理员凭据。',
+  'schema.Input token overhead ceiling': '额外输入 Token 预留上限',
+  'schema.Trusted reservation allowance for input tokens added by a compatible upstream outside the forwarded request body.': '为上游在转发请求之外添加的输入 Token 预留额度，仅对已确认可信的上游设置。',
+  'schema.Streaming usage contract': '流式用量报告协议',
+  'schema.Require the OpenAI Chat include_usage terminal chunk for this compatible upstream.': '要求此兼容上游在 OpenAI Chat 流末尾返回 include_usage 用量块。',
+  'schema.Video generation API': '视频生成接口', 'schema.Video generation models': '视频生成模型',
+  'schema.Generated asset origins': '生成文件来源域名',
+  'schema.Exact origins allowed for generated asset archival.': '允许归档生成文件的准确来源域名。',
+  'schema.Enable SiliconFlow\'s fixed /v1/video/submit and /v1/video/status asynchronous video contract.': '启用 SiliconFlow 的 /v1/video/submit 与 /v1/video/status 异步视频协议。',
+  'schema.Exact upstream model IDs that use the configured video API; at least one is required when a video API is enabled. Other routes on this account retain their normal text/image capabilities.': '填写使用此视频接口的准确上游模型 ID；启用视频接口时至少需要一个。该账号的其他路由仍保留原有文字及图片能力。',
   'connection.identitySection': '1. 上游身份与认证', 'connection.endpointSection': '2. 服务地址与模型配置',
   'connection.advancedSection': '3. 高级网络与重试策略', 'connection.advancedHint': '按需调整网络范围、请求超时与连接重试。保存配置不会探测上游或刷新额度。',
   'connection.directEgress': '未配置账号代理 · 使用服务端默认出口', 'connection.proxyFingerprint': '代理标识（脱敏）',
@@ -437,6 +451,20 @@ const zh = {
 } as const;
 
 const en = {
+  'connection.baseUrl': 'Upstream API address (Base URL)',
+  'connection.capabilitiesSection': 'Optional capabilities and usage contracts',
+  'connection.capabilitiesHint': 'Configure only for images, video, or provider-specific usage contracts. Collapsing preserves your values; validation errors reveal the relevant section.',
+  'schema.Network scope': 'Network scope',
+  'schema.Private destinations require a global operator credential.': 'Private destinations require a global operator credential.',
+  'schema.Input token overhead ceiling': 'Input token overhead ceiling',
+  'schema.Trusted reservation allowance for input tokens added by a compatible upstream outside the forwarded request body.': 'Trusted reservation allowance for input tokens added by a compatible upstream outside the forwarded request body.',
+  'schema.Streaming usage contract': 'Streaming usage contract',
+  'schema.Require the OpenAI Chat include_usage terminal chunk for this compatible upstream.': 'Require the OpenAI Chat include_usage terminal chunk for this compatible upstream.',
+  'schema.Video generation API': 'Video generation API', 'schema.Video generation models': 'Video generation models',
+  'schema.Generated asset origins': 'Generated asset origins',
+  'schema.Exact origins allowed for generated asset archival.': 'Exact origins allowed for generated asset archival.',
+  'schema.Enable SiliconFlow\'s fixed /v1/video/submit and /v1/video/status asynchronous video contract.': 'Enable SiliconFlow\'s fixed /v1/video/submit and /v1/video/status asynchronous video contract.',
+  'schema.Exact upstream model IDs that use the configured video API; at least one is required when a video API is enabled. Other routes on this account retain their normal text/image capabilities.': 'Exact upstream model IDs that use the configured video API; at least one is required when a video API is enabled. Other routes on this account retain their normal text/image capabilities.',
   'connection.identitySection': '1. Upstream identity and authentication', 'connection.endpointSection': '2. Service endpoint and model configuration',
   'connection.advancedSection': '3. Advanced network and retry policy', 'connection.advancedHint': 'Adjust network scope, request timeout and connection retries when needed. Saving does not probe the upstream or refresh quota.',
   'connection.directEgress': 'No account proxy · server default egress', 'connection.proxyFingerprint': 'Proxy identifier (redacted)',
@@ -869,6 +897,7 @@ export const translationCatalogs: Readonly<Record<Locale, Readonly<Record<string
 };
 
 const schemaFields: Record<string, [string, string]> = {
+  timeout_seconds: ['请求超时（秒）', 'Request timeout (seconds)'],
   tenant_external_id: ['租户', 'Tenant'], principal_external_id: ['用户主体', 'Principal'], alias: ['凭据别名', 'Credential alias'],
   currency: ['币种', 'Currency'], initial_balance: ['初始额度', 'Initial credit'], policy: ['权限与限流策略', 'Policy and rate limits'],
   requests_per_minute: ['每分钟请求数', 'Requests per minute'],

@@ -6,8 +6,8 @@ import { AdvancedFormSection, FormSection } from './FormSection';
 
 function UpstreamObjectTemplate(props: ObjectFieldTemplateProps) {
   const { t } = useI18n();
-  const advancedNames = ['network_scope', 'timeout_seconds', 'transport_policy'];
-  const hasAdvancedError = advancedNames.some((name) => Boolean(props.errorSchema?.[name]));
+  const networkNames = ['network_scope', 'timeout_seconds', 'transport_policy'];
+  const capabilityNames = ['image_api_mode', 'image_main_model', 'video_api', 'video_models', 'result_origins', 'input_token_overhead_ceiling', 'stream_usage_contract'];
   if (props.fieldPathId.path.length === 0 && props.schema.properties?.name && props.schema.properties?.config) {
     return <div className="upstream-form-sections">
       <FormSection title={t('connection.identitySection')}>{props.properties.filter((field) => field.name !== 'config').map((field) => field.content)}</FormSection>
@@ -15,12 +15,18 @@ function UpstreamObjectTemplate(props: ObjectFieldTemplateProps) {
     </div>;
   }
   if (props.fieldPathId.path.at(-1) === 'config') {
-    const fields = props.properties.filter((field) => advancedNames.includes(field.name));
+    // Unknown plugin fields stay visible. Required capability fields also stay
+    // visible: disclosure must not hide an adapter's minimum configuration.
+    const optionalNetwork = networkNames.filter((name) => !props.schema.required?.includes(name));
+    const optionalCapabilities = capabilityNames.filter((name) => !props.schema.required?.includes(name));
+    const network = props.properties.filter((field) => optionalNetwork.includes(field.name));
+    const capabilities = props.properties.filter((field) => optionalCapabilities.includes(field.name));
     return <div className="upstream-form-sections">
       <FormSection title={t('connection.endpointSection')}>
-        <ObjectFieldTemplate {...props} title="" properties={props.properties.filter((field) => !advancedNames.includes(field.name))} />
+        <ObjectFieldTemplate {...props} title="" properties={props.properties.filter((field) => !optionalNetwork.includes(field.name) && !optionalCapabilities.includes(field.name))} />
       </FormSection>
-      {fields.length > 0 && <AdvancedFormSection title={t('connection.advancedSection')} description={t('connection.advancedHint')} invalid={hasAdvancedError}>{fields.map((field) => field.content)}</AdvancedFormSection>}
+      {network.length > 0 && <AdvancedFormSection title={t('connection.advancedSection')} description={t('connection.advancedHint')} invalid={network.some((field) => Boolean(props.errorSchema?.[field.name]))}>{network.map((field) => field.content)}</AdvancedFormSection>}
+      {capabilities.length > 0 && <AdvancedFormSection title={t('connection.capabilitiesSection')} description={t('connection.capabilitiesHint')} invalid={capabilities.some((field) => Boolean(props.errorSchema?.[field.name]))}>{capabilities.map((field) => field.content)}</AdvancedFormSection>}
     </div>;
   }
   return <ObjectFieldTemplate {...props} />;
