@@ -19,7 +19,7 @@ test('operator tenant and settings writes retain native form submission', () => 
   assert.match(tenants, /id="tenant-external-id" name="tenant_external_id" autoComplete="off"/);
   assert.match(tenants, /<button type="submit" disabled=\{loading \|\| busy === 'create' \|\| !name\.trim\(\)\}/);
   assert.match(settings, /<form className="system-settings-form" onSubmit=/);
-  assert.match(settings, /<button type="submit" disabled=\{saving \|\| !selectedRouteId \|\| !selectedRouteHasAvailableCandidate\}/);
+  assert.match(settings, /<button type="submit" disabled=\{saving \|\| billingLoading \|\| !selectedRouteId \|\| !selectedRouteHasAvailableCandidate \|\| !billingChoices\.some\(/);
 });
 
 test('system-settings load failure cannot be rendered as the no-enabled-route empty state', () => {
