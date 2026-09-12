@@ -33,44 +33,6 @@ struct TokenResponse {
     expires_in: i64,
 }
 
-pub(crate) fn validate_native_credential(credential: &UpstreamCredential) -> Result<(), AppError> {
-    credential.validate(i64::MIN)?;
-    validate_adapter_state(credential.adapter_state())
-}
-
-/// Preserve the operator-selected SOCKS DNS semantics. `socks5` may use a
-/// private DNS name because MTC resolves and pins it locally. `socks5h` is
-/// accepted only with a safe private IP-literal proxy so the connection-time
-/// resolver is an explicit, reviewable operator trust boundary.
-pub(super) fn normalize_private_proxy_url(value: &str) -> Result<String, AppError> {
-    if value.len() > 2_048 || value.trim() != value || value.bytes().any(|byte| byte < 0x20) {
-        return Err(invalid_document());
-    }
-    let parsed = url::Url::parse(value).map_err(|_| invalid_document())?;
-    if !matches!(parsed.scheme(), "socks5" | "socks5h")
-        || parsed.host_str().is_none()
-        || parsed.port().is_none_or(|port| port == 0)
-        || (parsed.path() != "" && parsed.path() != "/")
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        return Err(invalid_document());
-    }
-    let host = parsed.host_str().ok_or_else(invalid_document)?;
-    let unbracketed = host
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .unwrap_or(host);
-    if let Ok(address) = unbracketed.parse::<std::net::IpAddr>() {
-        if !network::is_safe_private_upstream_ip(address) {
-            return Err(invalid_document());
-        }
-    } else if parsed.scheme() == "socks5h" {
-        return Err(invalid_document());
-    }
-    Ok(value.to_owned())
-}
-
 pub async fn refresh(
     http: &reqwest::Client,
     credential: &UpstreamCredential,
@@ -244,10 +206,6 @@ async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, AppError> 
         body.extend_from_slice(&chunk);
     }
     Ok(body)
-}
-
-fn invalid_document() -> AppError {
-    super::invalid_document("Codex")
 }
 
 fn refresh_failed() -> AppError {
