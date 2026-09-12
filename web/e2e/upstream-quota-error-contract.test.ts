@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { quotaReadErrorMessage } from '../src/operator/upstreamQuota';
+import { quotaReadErrorMessage } from '../src/operator/upstreamQuota.js';
 
 test('normalized quota read failures have distinct safe recovery semantics', () => {
   const expected = {
