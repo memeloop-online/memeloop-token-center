@@ -177,13 +177,15 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
     return response.request().method() === 'PATCH'
       && url.pathname === `/internal/v1/upstreams/${seed.upstreamId}`;
   });
-  await providerAccount.locator('.upstream-danger-zone > summary').click();
+  // Account lifecycle and quota reset share danger styling. Identify the
+  // lifecycle disclosure by its user-facing label, never its visual class.
+  await providerAccount.locator('summary').filter({ hasText: /^危险操作$/ }).click();
   await providerAccount.getByRole('button', { name: '停用', exact: true }).click();
   assert.equal((await disabledProvider).status(), 200);
   await page.locator('[data-resource-list-status-filter]').getByRole('button', { name: /显示非正常状态/ }).click();
   await assertContains(providerAccount, '已停用');
   await assertNotContains(providerAccount, '连接正常');
-  await providerAccount.locator('.upstream-danger-zone:not([open]) > summary').click();
+  await providerAccount.locator('details:not([open]) > summary').filter({ hasText: /^危险操作$/ }).click();
   await providerAccount.getByRole('button', { name: '启用', exact: true }).click();
   await assertContains(providerAccount, '正常');
   await onboarding.getByRole('button', { name: '账户授权', exact: true }).click();
