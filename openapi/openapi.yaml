@@ -2349,6 +2349,67 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
 
+  /internal/v1/model-routes/{route_id}/archive:
+    post:
+      tags: [Routes and pricing]
+      operationId: archiveModelRoute
+      summary: Archive a disabled route while retaining request history
+      description: Removes live grants and memberships and hides the route from management and selection. Archived routes cannot be edited or reactivated. Repeating an archive is idempotent.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:write
+      parameters: [{ $ref: '#/components/parameters/RouteId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [tenant_external_id, expected_updated_at]
+              properties:
+                tenant_external_id: { type: string }
+                expected_updated_at: { type: integer, format: int64 }
+      responses:
+        '204': { description: Route archived or already archived. }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/archived-model-routes/{route_id}:
+    get:
+      tags: [Routes and pricing]
+      operationId: getArchivedModelRoute
+      summary: Look up a retained route identity for historical audit
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:read
+      parameters:
+        - $ref: '#/components/parameters/RouteId'
+        - $ref: '#/components/parameters/RequiredTenant'
+      responses:
+        '200':
+          description: Archived identity; no active configuration edges or credentials.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, tenant_external_id, public_model, upstream_model, protocol, priority, enabled, created_at, archived_at]
+                properties:
+                  id: { type: string, format: uuid }
+                  tenant_external_id: { type: string }
+                  public_model: { type: string }
+                  upstream_model: { type: string }
+                  protocol: { type: string }
+                  priority: { type: integer, format: int64 }
+                  enabled: { type: boolean, const: false }
+                  created_at: { type: integer, format: int64 }
+                  archived_at: { type: integer, format: int64 }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /internal/v1/model-routes/{route_id}/retire-upstreams:
     post:
       tags: [Routing]

@@ -245,6 +245,14 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(retire_model_route_upstreams),
         )
         .route(
+            "/internal/v1/model-routes/{route_id}/archive",
+            post(archive_model_route),
+        )
+        .route(
+            "/internal/v1/archived-model-routes/{route_id}",
+            get(get_archived_model_route),
+        )
+        .route(
             "/internal/v1/model-routes/{route_id}/routing",
             get(get_route_routing).put(replace_route_routing),
         )

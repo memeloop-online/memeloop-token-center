@@ -426,6 +426,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
             "../../../migrations/common/0079_key_credential_recovery_access_limits.sql"
         ),
     },
+    Migration {
+        version: 80,
+        name: "model route archive",
+        sql: include_str!("../../../migrations/common/0080_model_route_archive.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -837,6 +842,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         sql: include_str!(
             "../../../migrations/common/0079_key_credential_recovery_access_limits.sql"
         ),
+    },
+    Migration {
+        version: 80,
+        name: "model route archive",
+        sql: include_str!("../../../migrations/common/0080_model_route_archive.sql"),
     },
 ];
 

@@ -419,4 +419,98 @@ async fn route_mutations_are_scoped_optimistic_idempotent_and_history_safe() {
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
+    // Archiving is distinct from destructive deletion: historical identities
+    // survive while everyday management can no longer resurrect the route.
+    let archive_path = format!("/internal/v1/model-routes/{}/archive", historical_route.id);
+    let archive_body = json!({
+        "tenant_external_id": "route-tenant-a",
+        "expected_updated_at": historical_route.updated_at
+    });
+    let (status, _) = json_request(
+        &state,
+        "POST",
+        &archive_path,
+        &tenant_service.token,
+        Some(json!({
+            "tenant_external_id": "route-tenant-a",
+            "expected_updated_at": historical_route.updated_at - 1
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    for _ in 0..2 {
+        let (status, _) = json_request(
+            &state,
+            "POST",
+            &archive_path,
+            &tenant_service.token,
+            Some(archive_body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+    let (status, routes) = json_request(
+        &state,
+        "GET",
+        "/internal/v1/model-routes?tenant_external_id=route-tenant-a",
+        &tenant_service.token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !routes
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|route| route["id"] == historical_route.id.to_string())
+    );
+    let (status, audit) = json_request(
+        &state,
+        "GET",
+        &format!(
+            "/internal/v1/archived-model-routes/{}?tenant_external_id=route-tenant-a",
+            historical_route.id
+        ),
+        &tenant_service.token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(audit["public_model"], historical_route.public_model);
+    assert!(audit["archived_at"].as_i64().is_some());
+    let history = state
+        .db
+        .list_requests(authenticated_key.key_id, 10)
+        .await
+        .unwrap();
+    assert!(
+        history
+            .iter()
+            .any(|request| request.route_id == Some(historical_route.id))
+    );
+    let (status, _) = json_request(
+        &state,
+        "GET",
+        &format!(
+            "/internal/v1/archived-model-routes/{}?tenant_external_id=route-tenant-b",
+            historical_route.id
+        ),
+        &tenant_service.token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = json_request(
+        &state,
+        "PATCH",
+        &format!("/internal/v1/model-routes/{}", historical_route.id),
+        &tenant_service.token,
+        Some(json!({
+            "tenant_external_id": "route-tenant-a", "enabled": true,
+            "expected_updated_at": audit["archived_at"]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
