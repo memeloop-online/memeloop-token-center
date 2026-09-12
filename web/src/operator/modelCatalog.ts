@@ -1,11 +1,84 @@
 import type { GroupView, ModelRouteView, UpstreamAccount } from '../types.js';
 
+export interface ModelPickerProjectionSource {
+  route_id: string;
+  provider: { id: string; label: string; protocols: string[]; modalities: string[] };
+  provider_groups: Array<{ id: string; label: string }>;
+  account: { id: string; label: string };
+  configuration_availability: { status: 'available' | 'unavailable'; reasons: string[] };
+  catalog: { status: 'never_observed' | 'loading' | 'ready' | 'stale' | 'partial' | 'error'; model_listed: boolean };
+  capabilities: { route_protocol: string; upstream_model: string; catalog_model_listed: boolean };
+}
+
+export interface ModelPickerProjectionItem {
+  selection: { kind: 'route'; route_id: string };
+  value: string;
+  label: string;
+  sources: ModelPickerProjectionSource[];
+}
+
+export interface ModelPickerProjectionPage {
+  contract_version: 'model_picker_projection_v1';
+  data: ModelPickerProjectionItem[];
+  next_cursor: string | null;
+}
+
 export interface RouteModelOption {
   key: string; value: string; label: string; providerGroup?: string; provider: string; upstream: string; description: string;
   availability: 'available' | 'unavailable' | 'unknown';
   health: 'unknown';
   capabilities: string[];
   disabled: boolean;
+}
+
+export interface AssistantRouteCatalog {
+  options: RouteModelOption[];
+  unverifiedRoutes: Array<{ value: string; label: string }>;
+}
+
+/**
+ * Admit a filter-assistant source only when the authoritative provider catalog
+ * and the current model catalog jointly prove text generation. The projection
+ * has no model-level modality, so a provider that declares any non-text
+ * modality is ambiguous and must fail closed. Model names and custom aliases
+ * are deliberately never treated as capability evidence.
+ */
+export function assistantRouteCatalog(items: ModelPickerProjectionItem[]): AssistantRouteCatalog {
+  const options: RouteModelOption[] = [];
+  const unverifiedRoutes: AssistantRouteCatalog['unverifiedRoutes'] = [];
+  for (const item of items) {
+    const verifiedSources = item.sources.filter((source) => {
+      const protocol = source.capabilities.route_protocol;
+      return (protocol === 'openai' || protocol === 'anthropic')
+        && source.provider.protocols.includes(protocol)
+        && source.provider.modalities.length === 1
+        && source.provider.modalities[0] === 'text'
+        && source.catalog.status === 'ready'
+        && source.catalog.model_listed
+        && source.capabilities.catalog_model_listed;
+    });
+    if (verifiedSources.length === 0) {
+      unverifiedRoutes.push({ value: item.value, label: item.label });
+      continue;
+    }
+    for (const source of verifiedSources) {
+      const available = source.configuration_availability.status === 'available';
+      options.push({
+        key: `${source.route_id}:${source.account.id}`,
+        value: item.value,
+        label: item.label,
+        providerGroup: source.provider_groups.map((group) => group.label).join(' · ') || undefined,
+        provider: source.provider.label,
+        upstream: source.account.label,
+        description: source.capabilities.upstream_model,
+        availability: available ? 'available' : 'unavailable',
+        health: 'unknown',
+        capabilities: [source.capabilities.route_protocol, 'text'],
+        disabled: !available,
+      });
+    }
+  }
+  return { options, unverifiedRoutes };
 }
 
 /** Preserve recorded public-model/route identity; never infer providers from model names. */
