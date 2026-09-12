@@ -33,6 +33,7 @@ test('advanced validation remains discoverable without losing field values or mo
     // Optional capabilities collapse, but adapter-required and unknown plugin
     // fields are never silently hidden. Disclosure retains entered values.
     await page.getByLabel('Required video interface').waitFor({ state: 'visible' });
+    await page.getByLabel('Required network scope').waitFor({ state: 'visible' });
     await page.getByLabel('Plugin extension').waitFor({ state: 'visible' });
     const capabilities = page.locator('.operator-form-advanced').filter({ hasText: 'Optional capabilities' });
     assert.equal(await capabilities.getAttribute('open'), null);
@@ -49,7 +50,7 @@ test('advanced validation remains discoverable without losing field values or mo
       assert.equal(await page.getByLabel('Connection name').evaluate(element => getComputedStyle(element).fontSize), '16px');
       assert.equal(await capabilities.locator('label').first().evaluate(element => getComputedStyle(element).color),
         await page.locator('.operator-form-section label').first().evaluate(element => getComputedStyle(element).color));
-      const artifacts = 'e2e-artifacts/upstream-availability';
+      const artifacts = fileURLToPath(new URL('../e2e-artifacts/upstream-availability', import.meta.url));
       mkdirSync(artifacts, { recursive: true });
       await page.screenshot({ path: `${artifacts}/provider-form-${theme}-mobile.png`, fullPage: true });
     }

@@ -11,9 +11,10 @@ import '../../src/operator/upstreamConnection.css';
 window.fetch = async () => { throw new Error('No network is allowed in the form layout fixture'); };
 const schema = { type: 'object' as const, properties: {
   name: { type: 'string' as const, title: 'Connection name' },
-  config: { type: 'object' as const, required: ['video_api'], properties: {
+  config: { type: 'object' as const, required: ['video_api', 'network_scope'], properties: {
     base_url: { type: 'string' as const, title: 'Base URL' },
     timeout_seconds: { type: 'integer' as const, title: 'Timeout seconds', minimum: 1, maximum: 120 },
+    network_scope: { type: 'string' as const, title: 'Required network scope', const: 'public', readOnly: true, default: 'public' },
     image_main_model: { type: 'string' as const, title: 'Image model' },
     video_api: { type: 'string' as const, title: 'Required video interface', default: 'video-v1' },
     plugin_extension: { type: 'string' as const, title: 'Plugin extension' },

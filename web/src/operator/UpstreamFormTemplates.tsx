@@ -17,12 +17,13 @@ function UpstreamObjectTemplate(props: ObjectFieldTemplateProps) {
   if (props.fieldPathId.path.at(-1) === 'config') {
     // Unknown plugin fields stay visible. Required capability fields also stay
     // visible: disclosure must not hide an adapter's minimum configuration.
+    const optionalNetwork = networkNames.filter((name) => !props.schema.required?.includes(name));
     const optionalCapabilities = capabilityNames.filter((name) => !props.schema.required?.includes(name));
-    const network = props.properties.filter((field) => networkNames.includes(field.name));
+    const network = props.properties.filter((field) => optionalNetwork.includes(field.name));
     const capabilities = props.properties.filter((field) => optionalCapabilities.includes(field.name));
     return <div className="upstream-form-sections">
       <FormSection title={t('connection.endpointSection')}>
-        <ObjectFieldTemplate {...props} title="" properties={props.properties.filter((field) => !networkNames.includes(field.name) && !optionalCapabilities.includes(field.name))} />
+        <ObjectFieldTemplate {...props} title="" properties={props.properties.filter((field) => !optionalNetwork.includes(field.name) && !optionalCapabilities.includes(field.name))} />
       </FormSection>
       {network.length > 0 && <AdvancedFormSection title={t('connection.advancedSection')} description={t('connection.advancedHint')} invalid={network.some((field) => Boolean(props.errorSchema?.[field.name]))}>{network.map((field) => field.content)}</AdvancedFormSection>}
       {capabilities.length > 0 && <AdvancedFormSection title={t('connection.capabilitiesSection')} description={t('connection.capabilitiesHint')} invalid={capabilities.some((field) => Boolean(props.errorSchema?.[field.name]))}>{capabilities.map((field) => field.content)}</AdvancedFormSection>}
