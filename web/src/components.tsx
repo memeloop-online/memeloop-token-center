@@ -199,8 +199,8 @@ export function RequestTable({
   if (!requests.length) return <div className="empty">{t('common.noRequests')}</div>;
   const showsSession = requests.some((request) => request.session_context !== undefined);
   return (
-    <div className="table-scroll">
-      <table>
+    <div className="table-scroll request-table-scroll" role="region" aria-label={t('request.table')} tabIndex={0}>
+      <table className="request-table">
         <thead><tr><th>{t('request.receivedAt')}</th>{showRoutingDetails && <th>{t('request.completedAt')}</th>}<th>{t('request.model')}</th>{showsSession && <th>{t('request.session')}</th>}<th>{t('request.protocol')}</th>{showRoutingDetails && <><th>{t('request.upstreamId')}</th><th>{t('request.routeId')}</th></>}<th>{t('request.status')}</th><th>{t('request.duration')}</th><th>{t('request.tokens')}</th><th>{t('request.cost')}</th><th>{t('request.error')}</th>{onSelect && <th><span className="visually-hidden">{t('request.actions')}</span></th>}</tr></thead>
         <tbody>
           {requests.map((request) => {
@@ -211,8 +211,8 @@ export function RequestTable({
             const currencyForRequest = recordedCurrency(request, currency);
             return <tr key={request.request_id}>
               <td className="request-time-cell"><time>{new Date(request.created_at).toLocaleString(locale)}</time><RequestIdentifier requestId={request.request_id} compact /></td>
-              {showRoutingDetails && <td>{request.completed_at == null ? '—' : <time>{new Date(request.completed_at).toLocaleString(locale)}</time>}</td>}
-              <td><code>{request.model}</code></td>
+              {showRoutingDetails && <td className="request-completed-cell">{request.completed_at == null ? '—' : <time>{new Date(request.completed_at).toLocaleString(locale)}</time>}</td>}
+              <td className="request-model-cell"><code>{request.model}</code></td>
               {showsSession && <td className="request-session-cell">
                 {!context
                   ? '—'
@@ -221,10 +221,10 @@ export function RequestTable({
                       ? <button type="button" className="table-link" onClick={() => onOpenSession(context.session_id!)}>{sessionLabel}</button>
                       : <span className="request-session-name">{sessionLabel}</span>
                     : <span className="request-session-unlinked">{t('sessions.unlinkedRequests')}</span>}
-                {sessionMeta && <small>{sessionMeta}</small>}
+                {sessionMeta && <details className="request-session-metadata"><summary>{t('request.sessionMetadata')}</summary><small>{sessionMeta}</small></details>}
               </td>}
               <td>{request.protocol}</td>
-              {showRoutingDetails && <><td className="request-upstream-cell">{request.upstream_account_id && upstreamNames?.get(request.upstream_account_id) && <span>{upstreamNames.get(request.upstream_account_id)}</span>}<code>{request.upstream_account_id ?? '—'}</code></td><td><code>{request.route_id ?? '—'}</code></td></>}
+              {showRoutingDetails && <><td className="request-upstream-cell">{request.upstream_account_id && upstreamNames?.get(request.upstream_account_id) && <span>{upstreamNames.get(request.upstream_account_id)}</span>}<code>{request.upstream_account_id ?? '—'}</code></td><td className="request-route-cell"><code>{request.route_id ?? '—'}</code></td></>}
               <td><span className={`status ${request.status_code && request.status_code < 400 ? 'ok' : request.status_code ? 'bad' : 'pending'}`}>{request.status_code ?? t('common.running')}</span></td>
               <td>{request.duration_ms === null ? '—' : `${formatNumber(request.duration_ms, locale, 2)} ms`}</td>
               <td className="request-token-cell"><span>{formatNumber(request.input_tokens + request.output_tokens, locale)}</span><RequestTokenSummary request={request} /></td>
