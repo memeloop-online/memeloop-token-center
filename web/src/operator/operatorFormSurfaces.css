@@ -5,6 +5,9 @@
 :root[data-theme='light'] { --form-danger: #922f2f; --form-danger-surface: #fff5f4; --form-focus: #08796e; }
 .create-resource-body.form-panel, .inline-editor.form-panel, .provider-list > .inline-editor { color: var(--picker-text); min-width: 0; }
 .create-resource-body.form-panel { padding: clamp(16px, 2.5vw, 28px); }
+.form-panel :is(.rjsf, .form-group, fieldset, .schema-array-control) { min-width: 0; max-width: 100%; }
+.form-panel :is(legend, label, .field-description, .schema-errors) { overflow-wrap: anywhere; }
+.credential-enforcement-field { min-width: 0; }
 .form-panel :is(input, select, textarea):not([type='checkbox'], [type='radio'], [type='hidden']),
 .operator-form-section :is(input, select, textarea):not([type='checkbox'], [type='radio'], [type='hidden']) {
   border-radius: 7px; box-sizing: border-box; font-size: 14px; min-height: 42px; min-width: 0; width: 100%;
