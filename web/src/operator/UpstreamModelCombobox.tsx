@@ -52,9 +52,9 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
   const { locale, t } = useI18n();
   const sourceKey = JSON.stringify([accountIds, includedProviderGroupIds, excludedProviderGroupIds, syncAccountIds, protocol]);
   const confirmationScope = JSON.stringify([token, tenant, sourceKey, value]);
-  const [catalogResult, setCatalogResult] = useState<{ scope: string; data: AggregateCatalog }>();
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
+  const [catalogResult, setCatalogResult] = useState<{ scope: string; data?: AggregateCatalog; error?: string }>();
+  const [syncLoading, setLoading] = useState(false);
+  const [syncError, setError] = useState('');
   const [syncMessage, setSyncMessage] = useState('');
   const [open, setOpen] = useState(false);
   const [accountCatalogs, setAccountCatalogs] = useState<Map<string, AccountCatalog>>(new Map());
@@ -73,6 +73,13 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
   const validityCallback = useRef(onValidityChange);
   useLayoutEffect(() => { validityCallback.current = onValidityChange; }, [onValidityChange]);
   const hasCandidates = accountIds.length > 0 || includedProviderGroupIds.length > 0;
+  const scopedResult = catalogResult?.scope === catalogScope ? catalogResult : undefined;
+  // An unresolved read is not evidence that the model is absent. Include the
+  // debounce window and invalidate the previous scope synchronously.
+  const catalogPending = Boolean(token && tenant && hasCandidates && !scopedResult);
+  const loading = syncLoading || catalogPending;
+  const error = scopedResult?.error || syncError;
+  const catalogVerified = Boolean(catalog) && !loading && !error;
   const customAllowed = accountIds.length > 0 && includedProviderGroupIds.length === 0 && excludedProviderGroupIds.length === 0;
   const hasExplicitCodexOAuth = upstreams.some((account) => accountIds.includes(account.id)
     && account.driver === 'openai-codex' && account.connection_method === 'oauth');
@@ -82,7 +89,8 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
     // this effect or the debounced read runs. A new candidate set must never
     // borrow the previous catalog's coverage or suppress its own confirmation.
     setCatalogResult(undefined);
-    if (!token || !tenant || !hasCandidates) { setError(''); setLoading(false); return; }
+    setError('');
+    if (!token || !tenant || !hasCandidates) return;
     const controller = new AbortController();
     const timeout = window.setTimeout(async () => {
       const query = new URLSearchParams({ tenant_external_id: tenant, limit: '100' });
@@ -90,13 +98,11 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
       if (includedProviderGroupIds.length) query.set('include_provider_group_ids', includedProviderGroupIds.join(','));
       if (excludedProviderGroupIds.length) query.set('exclude_provider_group_ids', excludedProviderGroupIds.join(','));
       if (value.trim()) query.set('q', value.trim());
-      setLoading(true); setError('');
       try {
         const data = await api<AggregateCatalog>(`/internal/v1/upstream-models?${query}`, token, { signal: controller.signal });
         if (!controller.signal.aborted) setCatalogResult({ scope: catalogScope, data });
       }
-      catch (reason) { if (!controller.signal.aborted) { setCatalogResult(undefined); setError(reason instanceof Error ? reason.message : t('routes.catalogFailed')); } }
-      finally { if (!controller.signal.aborted) setLoading(false); }
+      catch (reason) { if (!controller.signal.aborted) setCatalogResult({ scope: catalogScope, error: reason instanceof Error ? reason.message : t('routes.catalogFailed') }); }
     }, 250);
     return () => { window.clearTimeout(timeout); controller.abort(); };
   }, [token, tenant, sourceKey, value, refreshVersion]);
@@ -136,6 +142,7 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
   // discovered model into an explicit_custom bypass.
   const { needsCustomConfirmation, allowCustom, valid } = modelConfirmationValidity({
     hasValue: Boolean(value.trim()), catalogListed: Boolean(selected), customAllowed, customConfirmed,
+    catalogVerified,
   });
   useLayoutEffect(() => validityCallback.current(valid, allowCustom), [valid, allowCustom]);
 
@@ -176,12 +183,12 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
   });
 
   return <div className="model-combobox">
-    <ModelPicker label={t('routes.upstreamModel')} editable invalid={!valid && Boolean(value.trim())} value={value} options={groupedOptions} loading={loading} error={error} onOpen={() => setOpen(true)} onChange={(next) => {
+    <ModelPicker label={t('routes.upstreamModel')} editable invalid={catalogVerified && !valid && Boolean(value.trim())} value={value} options={groupedOptions} loading={loading} error={error} onOpen={() => setOpen(true)} onChange={(next) => {
       const option = options.find((model) => model.id === next);
       if (option) choose(option);
       else { onChange(next); setCustomConfirmed(false); }
     }} />
-    <div className="catalog-status"><small className="field-hint">{loading ? t('routes.catalogLoading') : error || syncMessage || (selected ? (catalog && catalog.stale_account_count > 0 ? t('routes.catalogLastVerified') : selected.complete_coverage ? t('routes.catalogVerified') : t('routes.catalogRestricted')) : catalog ? t('routes.catalogReady') : t('routes.selectCandidatesFirst'))}</small>{syncAccountIds.length > 0 && <button type="button" className="secondary" disabled={loading} onClick={() => void sync()}>{t('routes.syncModels')}</button>}</div>
+    <div className="catalog-status"><small className="field-hint" role="status">{loading ? t('routes.catalogLoading') : error || syncMessage || (selected ? (catalog && catalog.stale_account_count > 0 ? t('routes.catalogLastVerified') : selected.complete_coverage ? t('routes.catalogVerified') : t('routes.catalogRestricted')) : catalog ? t('routes.catalogReady') : t('routes.selectCandidatesFirst'))}</small>{scopedResult?.error && <button type="button" className="secondary" disabled={loading} onClick={() => setRefreshVersion((current) => current + 1)}>{t('common.retry')}</button>}{syncAccountIds.length > 0 && <button type="button" className="secondary" disabled={loading} onClick={() => void sync()}>{t('routes.syncModels')}</button>}</div>
     {needsCustomConfirmation && customAllowed && <div className="notice warning compact">{t('routes.catalogUnverified')}{hasExplicitCodexOAuth && <> {t('routes.codexCapabilityHint')}</>}</div>}
     {needsCustomConfirmation && <div className={`custom-model-confirm${customAllowed ? '' : ' disabled'}`}>
       {customAllowed ? <label><input type="checkbox" checked={customConfirmed} onChange={(event) => setCustomConfirmed(event.target.checked)} />{t('routes.confirmCustomModel', { model: value.trim() })}</label> : <span>{t('routes.customUnavailableForGroups')}</span>}
