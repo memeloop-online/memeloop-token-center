@@ -73,6 +73,7 @@ impl PgFixture {
         let db = Database {
             pool: schema_pool(&url, &schema).await,
             backend: DatabaseBackend::PostgreSql,
+            oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         };
         // Same request columns exercised by the production spool API; there is
         // deliberately no FK to billing tables, matching request_records.
@@ -246,6 +247,7 @@ async fn postgres_seal_precedes_terminal_delivery_and_survives_producer_loss() {
     fixture.db = Database {
         pool: schema_pool(&fixture.url, &fixture.schema).await,
         backend: DatabaseBackend::PostgreSql,
+        oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
     };
     // Simulate the existing orphan finalizer. It remains the only owner of
     // settlement; spool recovery never edits the stored charged cost.
@@ -313,6 +315,7 @@ async fn postgres_seal_cancelled_inside_commit_remains_recoverable_after_reconne
     fixture.db = Database {
         pool: schema_pool(&fixture.url, &fixture.schema).await,
         backend: DatabaseBackend::PostgreSql,
+        oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
     };
     fixture
         .db
