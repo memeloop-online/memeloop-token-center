@@ -406,6 +406,7 @@ async fn runtime_management_rejects_scoped_credentials_and_forged_candidate_fiel
         .with_application_plugin_inventory(BTreeMap::new())
         .unwrap();
     let body = json!({"inventory_id":"a", "expected_revision":0});
+    state.db.create_tenant("tenant", None).await.unwrap();
     for tenant in [None, Some("tenant".to_owned())] {
         let scoped = state
             .db
