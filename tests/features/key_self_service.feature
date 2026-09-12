@@ -200,13 +200,13 @@ Feature: Stable key identity and read-only self-service statistics
     Then the response status is 202
     And the malicious Seedance job id is neither stored nor exposed
 
-  Scenario: An ambiguous non-idempotent Seedance submission fails closed without a duplicate
+  Scenario: An ambiguous non-idempotent Seedance submission stays quarantined without a duplicate or refund
     Given a token center backed by SQLite and memory object storage
     And the mock Seedance upstream returns an ambiguous server error after one submission
     When the service creates a metered Seedance route and key
     And the client creates a five second Seedance generation
     Then the response status is 202
-    And the ambiguous Seedance submission fails closed without a second upstream POST
+    And the ambiguous Seedance submission stays quarantined without a second upstream POST or refund
 
   Scenario: Seedance provider usage cannot exceed the admitted reservation
     Given a token center backed by SQLite and memory object storage

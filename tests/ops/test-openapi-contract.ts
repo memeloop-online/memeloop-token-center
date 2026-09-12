@@ -145,3 +145,25 @@ test("session archive quarantine is persistent global operator only", () => {
 });
 
 test("ContractFailure remains a distinct error type", () => assert.ok(new ContractFailure("x") instanceof Error));
+
+test("generation quarantine has dedicated tenant-bound reconciliation authority", () => {
+  const document = cloneDocument();
+  const base = "/internal/v1/generations/quarantine";
+  for (const [operation, scope] of [
+    [document.paths[base].get, "generations:quarantine:read"],
+    [document.paths[`${base}/{job_id}`].get, "generations:quarantine:read"],
+    [document.paths[`${base}/{job_id}/resolutions`].post, "generations:reconcile"],
+  ] as const) {
+    assert.deepEqual(operation.security, [{ serviceBearer: [] }]);
+    assert.equal(operation["x-required-scope"], scope);
+    assert.equal(operation["x-persistent-service-only"], true);
+    assert.ok(document.components.schemas.ServiceScope.enum.includes(scope));
+  }
+  const operation = document.paths[`${base}/{job_id}/resolutions`].post;
+  assert.ok(operation.parameters.some((parameter: Obj) => parameter.$ref === "#/components/parameters/RequiredIdempotencyKey"));
+  const body = operation.requestBody.content["application/json"].schema;
+  assert.equal(body.additionalProperties, false);
+  assert.deepEqual(body.properties.action.enum, ["confirmed_submitted"]);
+  for (const field of ["expected_revision", "tenant_external_id", "evidence_digest"]) assert.ok(body.required.includes(field));
+  for (const field of ["request_object", "credential", "submission_nonce"]) assert.ok(!(field in document.components.schemas.GenerationQuarantine.properties));
+});

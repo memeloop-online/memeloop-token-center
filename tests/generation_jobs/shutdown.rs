@@ -196,7 +196,7 @@ async fn quarantine_fences_nonce_and_ack_clears_it_without_changing_ordinary_rec
 }
 
 #[tokio::test]
-async fn normal_attempt_error_preserves_existing_retry_policy() {
+async fn generic_retry_cannot_clear_an_armed_delivery_unknown_guard() {
     let (_directory, database, key, upstream_id, price) = fixture().await;
     let reservation = reserve(&database, &key, &price).await;
     let job = database
@@ -217,16 +217,21 @@ async fn normal_attempt_error_preserves_existing_retry_policy() {
         .arm_generation_shutdown_quarantine(job.job_id, "normal-error", nonce)
         .await
         .unwrap();
-    database
-        .reschedule_generation_job(job.job_id, "normal-error", 500, Some("upstream_retry"))
-        .await
-        .unwrap();
+    assert!(
+        database
+            .reschedule_generation_job(job.job_id, "normal-error", 500, Some("upstream_retry"))
+            .await
+            .is_err()
+    );
     let retried = database
         .generation_job(key.key_id, job.job_id)
         .await
         .unwrap();
     assert_eq!(retried.status, "submitting");
-    assert_eq!(retried.error_code.as_deref(), Some("upstream_retry"));
+    assert_eq!(
+        retried.error_code.as_deref(),
+        Some("shutdown_delivery_unknown")
+    );
     assert_eq!(
         database.key_view(&key).await.unwrap().available_balance,
         "9.75"

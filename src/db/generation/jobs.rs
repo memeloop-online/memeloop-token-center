@@ -986,7 +986,7 @@ impl Database {
             return Ok(None);
         }
         let row = sqlx::query(
-            "SELECT j.id, j.created_at, j.tenant_id, j.key_id, j.model_route_id, j.upstream_account_id, j.public_model, j.upstream_model, j.driver, j.status, j.request_object, j.upstream_job_id, j.submission_nonce, j.staged_assets_json, j.billing_unit_snapshot, j.estimated_units, j.attempt_count, j.failure_count, r.id AS reservation_id, r.account_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.rate_window_start, j.micros_per_unit_snapshot FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1",
+            "SELECT j.id, j.created_at, j.reconciliation_deadline_at, j.tenant_id, j.key_id, j.model_route_id, j.upstream_account_id, j.public_model, j.upstream_model, j.driver, j.status, j.request_object, j.upstream_job_id, j.submission_nonce, j.staged_assets_json, j.billing_unit_snapshot, j.estimated_units, j.attempt_count, j.failure_count, r.id AS reservation_id, r.account_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.rate_window_start, j.micros_per_unit_snapshot FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1",
         )
         .bind(&job_id)
         .fetch_one(&mut *transaction)
@@ -1006,6 +1006,7 @@ impl Database {
         Ok(Some(GenerationJobWork {
             job_id: parse_uuid(row.try_get("id")?)?,
             created_at: row.try_get("created_at")?,
+            reconciliation_deadline_at: row.try_get("reconciliation_deadline_at")?,
             tenant_id: parse_uuid(row.try_get("tenant_id")?)?,
             key_id,
             model_route_id: row
@@ -1120,7 +1121,7 @@ impl Database {
         )
     }
 
-    /// Arm before a supervised provider POST, not while shutting down. The
+    /// Arm before a provider POST, not while shutting down. The
     /// existing submission_nonce, attempt_count, updated_at, and submitting
     /// status identify the fenced attempt without retaining provider secrets.
     /// An abandoned guard is never automatically reclaimed, even after expiry;
@@ -1160,6 +1161,22 @@ impl Database {
                 .execute(&self.pool)
                 .await?,
         )
+    }
+
+    /// Release only the lease, never the durable unknown-delivery guard or its
+    /// reservation. Return true when generic attempt failure handling must stop.
+    pub async fn retain_generation_delivery_unknown(
+        &self,
+        job_id: Uuid,
+        worker_id: &str,
+    ) -> Result<bool, AppError> {
+        let updated = sqlx::query("UPDATE generation_jobs SET lease_owner = NULL, lease_expires_at = NULL, updated_at = $1 WHERE id = $2 AND lease_owner = $3 AND status = 'submitting' AND upstream_job_id IS NULL AND error_code = 'shutdown_delivery_unknown'")
+            .bind(unix_millis())
+            .bind(job_id.to_string())
+            .bind(worker_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(updated.rows_affected() == 1)
     }
 
     pub async fn save_generation_staged_assets(
@@ -1267,7 +1284,7 @@ impl Database {
     ) -> Result<(), AppError> {
         let now = unix_millis();
         generation_update_claimed(
-            sqlx::query("UPDATE generation_jobs SET next_attempt_at = $1, error_code = $2, failure_count = CASE WHEN $3 IS NULL THEN 0 ELSE failure_count + 1 END, lease_owner = NULL, lease_expires_at = NULL, updated_at = $4 WHERE id = $5 AND lease_owner = $6")
+            sqlx::query("UPDATE generation_jobs SET next_attempt_at = $1, error_code = $2, failure_count = CASE WHEN $3 IS NULL THEN 0 ELSE failure_count + 1 END, lease_owner = NULL, lease_expires_at = NULL, updated_at = $4 WHERE id = $5 AND lease_owner = $6 AND (error_code IS NULL OR error_code <> 'shutdown_delivery_unknown')")
                 .bind(now.saturating_add(delay_ms.max(500)))
                 .bind(error_code)
                 .bind(error_code)

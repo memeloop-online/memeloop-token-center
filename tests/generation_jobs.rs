@@ -28,6 +28,9 @@ const PEPPER: &[u8] = b"generation test pepper longer than thirty-two bytes";
 #[path = "generation_jobs/shutdown.rs"]
 mod shutdown;
 
+#[path = "generation_jobs/reconciliation.rs"]
+mod reconciliation;
+
 async fn fixture() -> (
     tempfile::TempDir,
     Database,

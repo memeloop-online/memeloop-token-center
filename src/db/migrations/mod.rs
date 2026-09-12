@@ -426,6 +426,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
             "../../../migrations/common/0079_key_credential_recovery_access_limits.sql"
         ),
     },
+    Migration {
+        version: 80,
+        name: "audited generation quarantine reconciliation",
+        sql: include_str!("../../../migrations/common/0080_generation_quarantine_resolutions.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -837,6 +842,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         sql: include_str!(
             "../../../migrations/common/0079_key_credential_recovery_access_limits.sql"
         ),
+    },
+    Migration {
+        version: 80,
+        name: "audited generation quarantine reconciliation",
+        sql: include_str!("../../../migrations/common/0080_generation_quarantine_resolutions.sql"),
     },
 ];
 

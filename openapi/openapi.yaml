@@ -48,6 +48,8 @@ tags:
     description: Tenant/global traffic statistics, request detail, and live events.
   - name: Session archive quarantine
     description: Global persistent-operator review and immutable resolution of uncorrelated archive records.
+  - name: Generation quarantine
+    description: Tenant-bound evidence-confirmed reconciliation of interrupted provider submissions.
   - name: Self service
     description: Credential-scoped, read-only usage and logical-conversation views.
   - name: OpenAI compatible
@@ -2104,6 +2106,124 @@ paths:
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/generations/quarantine:
+    get:
+      tags: [Generation quarantine]
+      operationId: listGenerationQuarantine
+      summary: List one tenant's interrupted generation submissions
+      description: |
+        Requires a persistent service credential bound to exactly the requested tenant.
+        Global credentials, bootstrap, client keys, and cross-tenant access are rejected.
+        Metadata only; no provider credentials, request objects, or submission payloads.
+        Ordered by job_id ascending; continue with the last job_id as after_id.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: generations:quarantine:read
+      x-persistent-service-only: true
+      parameters:
+        - $ref: '#/components/parameters/RequiredTenant'
+        - name: limit
+          in: query
+          schema: { type: integer, format: int64, minimum: 1, maximum: 100, default: 100 }
+        - name: after_id
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Bounded quarantine metadata page.
+          content:
+            application/json:
+              schema:
+                type: array
+                maxItems: 100
+                items: { $ref: '#/components/schemas/GenerationQuarantine' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/generations/quarantine/{job_id}:
+    get:
+      tags: [Generation quarantine]
+      operationId: getGenerationQuarantine
+      summary: Read an exact tenant-bound pending quarantine and revision
+      security: [{ serviceBearer: [] }]
+      x-required-scope: generations:quarantine:read
+      x-persistent-service-only: true
+      parameters:
+        - $ref: '#/components/parameters/RequiredTenant'
+        - name: job_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Safe metadata; revision is required for resolution.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GenerationQuarantine' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/generations/quarantine/{job_id}/resolutions:
+    post:
+      tags: [Generation quarantine]
+      operationId: resolveGenerationQuarantine
+      summary: Reconcile an interrupted submission using independently retained evidence
+      description: |
+        Requires a persistent service credential bound to the requested tenant with
+        generations:reconcile. Bootstrap, global, broad generations:write, client keys,
+        cross-tenant access, active leases, stale revisions, unknown actions and duplicate
+        decisions are rejected. Only confirmed_submitted is supported: it requires a
+        provider submission ID and resumes normal running processing. Unknown and
+        confirmed_not_submitted assertions are rejected and leave credit reserved.
+        An expired lease alone cannot prove the old process cannot resume its POST;
+        safe release requires a future server-verifiable dispatch-stop protocol.
+        This API never directly contacts a provider or settles/refunds credit.
+        Confirmed delivery starts a bounded 24-hour polling window at confirmation time;
+        the original admission timestamp is preserved. The normal timeout policy resumes
+        at that deadline. Replaying a resolution never extends the window.
+        evidence_digest is the lowercase SHA-256 of independently retained confirmation
+        evidence, never the raw evidence or credentials. The operator is responsible for
+        verifying the evidence against the provider before making this assertion.
+        CAS transition, immutable audit and Idempotency-Key receipt commit together.
+        An exact same-actor, same-tenant replay returns the original receipt; changed
+        payloads or a second key for an already resolved attempt return 409.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: generations:reconcile
+      x-persistent-service-only: true
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [tenant_external_id, expected_revision, action, evidence_digest, upstream_job_id]
+              properties:
+                tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+                expected_revision: { type: string, pattern: '^[0-9a-f]{64}$' }
+                action: { type: string, enum: [confirmed_submitted] }
+                evidence_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
+                upstream_job_id: { type: string, minLength: 1, maxLength: 256, pattern: '^[A-Za-z0-9_.:-]+$' }
+      responses:
+        '200':
+          description: Immutable reconciliation receipt, including exact idempotent replay.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GenerationQuarantineResolution' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
   /internal/v1/imports/session-archive/quarantine:
@@ -5370,6 +5490,8 @@ components:
         - entitlements:read
         - entitlements:write
         - generations:write
+        - generations:quarantine:read
+        - generations:reconcile
         - requests:read
         - providers:read
         - providers:write
@@ -7817,6 +7939,37 @@ components:
           maxItems: 168
           description: Missing UTC hour-of-week coordinates mean zero activity.
           items: { $ref: '#/components/schemas/UsageAnalysisHeatmapBucket' }
+    GenerationQuarantine:
+      type: object
+      additionalProperties: false
+      required: [job_id, tenant_external_id, model, driver, attempt_count, updated_at, lease_expires_at, revision]
+      properties:
+        job_id: { type: string, format: uuid }
+        tenant_external_id: { type: string }
+        model: { type: string }
+        driver: { type: string }
+        attempt_count: { type: integer, format: int64 }
+        updated_at: { type: integer, format: int64 }
+        lease_expires_at: { type: [integer, 'null'], format: int64 }
+        revision: { type: string, pattern: '^[0-9a-f]{64}$' }
+
+    GenerationQuarantineResolution:
+      type: object
+      additionalProperties: false
+      required: [resolution_id, job_id, tenant_external_id, action, upstream_job_id, evidence_digest, resolved_by_service_id, resulting_status, delivery_confirmed_at, reconciliation_deadline_at, created_at]
+      properties:
+        resolution_id: { type: string, format: uuid }
+        job_id: { type: string, format: uuid }
+        tenant_external_id: { type: string }
+        action: { type: string, enum: [confirmed_submitted] }
+        upstream_job_id: { type: [string, 'null'] }
+        evidence_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
+        resolved_by_service_id: { type: string, format: uuid }
+        resulting_status: { type: string, enum: [running] }
+        delivery_confirmed_at: { type: [integer, 'null'], format: int64 }
+        reconciliation_deadline_at: { type: [integer, 'null'], format: int64 }
+        created_at: { type: integer, format: int64 }
+
     GenerationJob:
       type: object
       required: [job_id, created_at, updated_at, completed_at, model, driver, billing_unit, status, upstream_job_id, estimated_units, billed_units, cost, error_code, result, assets]

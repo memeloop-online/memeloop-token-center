@@ -106,7 +106,8 @@ pub use credentials::{CreateKeyInput, CreateServiceTokenInput, ProvisionedCloudC
 pub use generation::{
     AttachGenerationJobResult, AttachSynchronousImageRequestObject, CreateGenerationJobInput,
     CreateGenerationJobResult, FinishGenerationJobInput, FinishSynchronousImageRequest,
-    FinishSynchronousImageResult, GenerationJobIdempotency, StartGenerationJobInput,
+    FinishSynchronousImageResult, GenerationJobIdempotency, GenerationQuarantineResolution,
+    GenerationQuarantineView, ResolveGenerationQuarantine, StartGenerationJobInput,
     StartSynchronousImageRequest, StartSynchronousImageResult, SynchronousImageIdempotencyClaim,
 };
 pub use groups::{

@@ -1316,6 +1316,8 @@ pub struct OperatorGenerationJobView {
 pub struct GenerationJobWork {
     pub job_id: Uuid,
     pub created_at: i64,
+    /// Only evidence-confirmed quarantines receive a fresh, bounded poll window.
+    pub reconciliation_deadline_at: Option<i64>,
     pub tenant_id: Uuid,
     pub key_id: Uuid,
     /// Immutable route selected at admission. Historical jobs created before
