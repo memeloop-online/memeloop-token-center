@@ -59,6 +59,11 @@ pub struct AppState {
     pub(crate) codex_http: wreq::Client,
     pub providers: ProviderCatalog,
     pub plugins: PluginRuntime,
+    #[cfg(feature = "experimental-plugin-revisions")]
+    pub(crate) application_plugins: Option<Arc<plugin::application::ApplicationPlugins>>,
+    #[cfg(feature = "experimental-plugin-revisions")]
+    pub(crate) pinned_application_plugins:
+        Option<Arc<plugin::application::ApplicationPluginSnapshot>>,
     pub metrics: metrics::Metrics,
     pub(crate) request_event_streams: request_event_stream::RequestEventStreamLimiter,
     pub(crate) gateway_body_read_permits: Arc<tokio::sync::Semaphore>,
@@ -122,6 +127,10 @@ impl AppState {
             archive,
             providers,
             plugins,
+            #[cfg(feature = "experimental-plugin-revisions")]
+            application_plugins: None,
+            #[cfg(feature = "experimental-plugin-revisions")]
+            pinned_application_plugins: None,
             metrics: metrics::Metrics::default(),
             request_event_streams: request_event_stream::RequestEventStreamLimiter::default(),
             upstream_quota: Arc::new(upstream_quota::QuotaCache::default()),
@@ -141,6 +150,42 @@ impl AppState {
             http: build_http_client().map_err(|_| InitializationError::HttpClient)?,
             codex_http: build_codex_http_client().map_err(|_| InitializationError::HttpClient)?,
         })
+    }
+
+    /// Explicit host-only draft opt-in. Configuration, HTTP input and plugin
+    /// guests cannot grant inventory access or enable revision publication.
+    #[cfg(feature = "experimental-plugin-revisions")]
+    pub fn with_application_plugin_inventory(
+        mut self,
+        inventory: std::collections::BTreeMap<String, plugin::application::PreinstalledInventory>,
+    ) -> Result<Self, error::AppError> {
+        self.application_plugins = Some(Arc::new(plugin::application::ApplicationPlugins::new(
+            self.db.clone(),
+            inventory,
+            &self.plugins,
+        )?));
+        self.pinned_application_plugins = None;
+        Ok(self)
+    }
+
+    /// Called once at a request entry point. A cloned request state retains the
+    /// atomic runtime/catalog pair through policy, prepare, retries and normalize.
+    pub(crate) async fn pin_application_plugins(self) -> Result<Self, error::AppError> {
+        #[cfg(feature = "experimental-plugin-revisions")]
+        {
+            let mut state = self;
+            if state.pinned_application_plugins.is_none()
+                && let Some(authority) = &state.application_plugins
+            {
+                let snapshot = authority.pin().await?;
+                state.plugins = snapshot.runtime.runtime().clone();
+                state.providers = snapshot.providers.clone();
+                state.pinned_application_plugins = Some(snapshot);
+            }
+            Ok(state)
+        }
+        #[cfg(not(feature = "experimental-plugin-revisions"))]
+        Ok(self)
     }
 }
 

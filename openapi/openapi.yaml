@@ -820,6 +820,108 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
+  /internal/v1/plugin-runtime/candidates:
+    post:
+      tags: [System]
+      operationId: stageApplicationPluginInventory
+      summary: Validate a preinstalled application plugin inventory (experimental)
+      description: Requires experimental-plugin-revisions and explicit host-only inventory opt-in, neither enabled in production. Global operators only; no URL, path, Wasm, grant, or tenant override is accepted. Only already-approved unchanged contracts can be staged.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:write
+      x-global-operator-only: true
+      x-experimental-feature: experimental-plugin-revisions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [inventory_id]
+              properties:
+                inventory_id: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
+      responses:
+        '204': { description: Verified immutable inventory identity staged. }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { description: Unknown or malformed request fields. }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /internal/v1/plugin-runtime/publish:
+    post:
+      tags: [System]
+      operationId: publishApplicationPluginInventory
+      summary: Publish a global application snapshot using revision CAS (experimental)
+      description: Requires experimental-plugin-revisions and explicit host-only inventory opt-in, neither enabled in production. Validates a preinstalled inventory and atomically publishes expected_revision plus one. Zero bootstraps an absent head. Exact idempotency replay returns its original receipt, not the latest head. Global operators only; unknown fields and remote installation inputs are rejected.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:write
+      x-global-operator-only: true
+      x-experimental-feature: experimental-plugin-revisions
+      parameters: [{ $ref: '#/components/parameters/RequiredIdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [inventory_id, expected_revision]
+              properties:
+                inventory_id: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
+                expected_revision: { type: integer, format: int64, minimum: 0 }
+      responses:
+        '200':
+          description: Original publication receipt, including exact replay.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApplicationPluginRevision' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { description: Unknown or malformed request fields. }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /internal/v1/plugin-runtime/rollback:
+    post:
+      tags: [System]
+      operationId: rollbackApplicationPluginInventory
+      summary: Publish an earlier inventory as a new monotonic revision (experimental)
+      description: Requires experimental-plugin-revisions and explicit host-only inventory opt-in, neither enabled in production. Global operators only. Target must be earlier than expected_revision and locally available with the original approved identity. Rollback publishes expected_revision plus one and never rewinds head.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:write
+      x-global-operator-only: true
+      x-experimental-feature: experimental-plugin-revisions
+      parameters: [{ $ref: '#/components/parameters/RequiredIdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [target_revision, expected_revision]
+              properties:
+                target_revision: { type: integer, format: int64, minimum: 1 }
+                expected_revision: { type: integer, format: int64, minimum: 2 }
+      responses:
+        '200':
+          description: Original rollback receipt with a strictly new revision.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApplicationPluginRevision' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { description: Unknown or malformed request fields. }
+        '500': { $ref: '#/components/responses/InternalError' }
+
   /internal/v1/plugins/{plugin_id}/configuration:
     parameters:
       - name: plugin_id
@@ -4989,6 +5091,14 @@ components:
           schema: { type: object, additionalProperties: true }
 
   schemas:
+    ApplicationPluginRevision:
+      type: object
+      additionalProperties: false
+      required: [revision, inventory_id, reason]
+      properties:
+        revision: { type: integer, format: int64, minimum: 1 }
+        inventory_id: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
+        reason: { type: string, enum: [initial, reload, rollback] }
     UpstreamQuotaResetOperation:
       type: object
       required: [id, upstream_account_id, state, credential_generation, available_credits, applicable_credits, observed_at, expires_at, prepared_by_service_id, confirmed_by_service_id, confirmed_at, created_at, updated_at, last_reconciled_at, reconciled_available_credits, reconciled_applicable_credits, error_code, audit, effect, consumes_credits]
