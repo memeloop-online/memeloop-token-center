@@ -1,6 +1,8 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use object_store::{ObjectStore, RetryConfig, aws::AmazonS3Builder, memory::InMemory};
+use object_store::{
+    ClientOptions, ObjectStore, RetryConfig, aws::AmazonS3Builder, memory::InMemory,
+};
 
 use super::{ArchiveStore, ReadinessCache, path::archive_path};
 use crate::{
@@ -10,6 +12,10 @@ use crate::{
 
 impl ArchiveStore {
     pub async fn from_config(config: &Config) -> Result<Self, AppError> {
+        config
+            .s3_timeouts
+            .validate()
+            .map_err(|_| AppError::BadRequest("invalid S3 timeout configuration".into()))?;
         let inner: Arc<dyn ObjectStore> =
             match config.archive_backend {
                 ArchiveBackend::Memory => Arc::new(InMemory::new()),
@@ -36,6 +42,16 @@ impl ArchiveStore {
                         })?)
                         .with_region(&config.s3_region)
                         .with_allow_http(config.s3_allow_http)
+                        .with_client_options(
+                            ClientOptions::new()
+                                .with_allow_http(config.s3_allow_http)
+                                .with_connect_timeout(Duration::from_millis(
+                                    config.s3_timeouts.connect_millis.into(),
+                                ))
+                                .with_timeout(Duration::from_millis(
+                                    config.s3_timeouts.request_millis.into(),
+                                )),
+                        )
                         .with_retry(RetryConfig {
                             max_retries: 3,
                             retry_timeout: Duration::from_secs(10),
@@ -61,6 +77,8 @@ impl ArchiveStore {
             inner,
             readiness: Arc::new(tokio::sync::Mutex::new(ReadinessCache::default())),
             readiness_path,
+            readiness_deadline: Duration::from_millis(config.s3_timeouts.readiness_millis.into()),
+            readiness_metrics: Arc::default(),
         })
     }
 }

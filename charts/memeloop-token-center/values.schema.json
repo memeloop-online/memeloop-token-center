@@ -201,6 +201,9 @@
             "endpoint": { "type": "string" },
             "region": { "type": "string", "minLength": 1 },
             "allowHttp": { "type": "boolean" },
+            "connectTimeoutMillis": { "type": "integer", "minimum": 100, "maximum": 30000 },
+            "requestTimeoutMillis": { "type": "integer", "minimum": 100, "maximum": 120000 },
+            "readinessDeadlineMillis": { "type": "integer", "minimum": 100, "maximum": 30000 },
             "credentialsSecret": {
               "type": "object",
               "additionalProperties": false,

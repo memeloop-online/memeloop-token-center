@@ -2,6 +2,31 @@
 
 This document defines release gates for Memeloop Token Center.
 
+## Archive network diagnostics
+
+All roles use the same S3 settings. Helm `config.s3.connectTimeoutMillis`,
+`requestTimeoutMillis` and `readinessDeadlineMillis` map to
+`MTC_S3_CONNECT_TIMEOUT_MILLIS`, `MTC_S3_REQUEST_TIMEOUT_MILLIS` and
+`MTC_S3_READINESS_DEADLINE_MILLIS`. Defaults remain 5000, 30000 and 5000 ms.
+Connect/readiness accept 100–30000 ms; requests accept 100–120000 ms;
+connect must not exceed request. Invalid settings fail startup. Change values
+through a controlled rolling rollout; no image rebuild is needed. This is not
+hot reload. Request timeout covers the response body, per attempt; the existing
+three-retry/ten-second retry budget remains unchanged. The canary deadline bounds
+the entire LIST/PUT/GET/read/DELETE sequence, including retries.
+
+Canary logs report operation stage, elapsed time, configured deadline, bounded
+error class and stale-success grace. The object-store abstraction does not expose
+DNS, connect or TTFB timings: `transport_phase=opaque` is intentional, and
+`transport_or_service` does not establish a network root cause. No endpoint,
+object path, credentials or raw error strings are logged. Prometheus exposes
+`memeloop_token_center_archive_canary_total` by fixed stage/outcome, cumulative
+duration and cache hits, including successful recovery. Cached checks do not
+count as new attempts. Cold startup has no stale success; later failures retain
+the existing bounded grace. Database-healthy `/readyz` remains HTTP 200 with
+`degraded` archive status; Kubernetes `/livez` is unchanged. Consumers timing
+`/readyz` must allow the configured archive deadline plus one second.
+
 ## Release identity
 
 - Deploy immutable service and plugin-installer image digests built from the exact

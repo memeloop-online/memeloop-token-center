@@ -49,6 +49,11 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     const count = (key: string, pattern: string | RegExp, expected: number): void => assert.equal(occurrences(output[key]!, pattern), expected, `${key} count for ${String(pattern)}`);
 
     has('default', 'kind: NetworkPolicy'); has('default', 'kind: PodDisruptionBudget');
+    for (const deployment of output.default!.split(/^---$/m).filter((document) => document.includes('kind: Deployment'))) {
+      for (const [name, value] of [['CONNECT_TIMEOUT', '5000'], ['REQUEST_TIMEOUT', '30000'], ['READINESS_DEADLINE', '5000']]) {
+        assert.match(deployment, new RegExp(`name: MTC_S3_${name}_MILLIS\\s+value: "${value}"`), 'every role must use the same bounded S3 defaults');
+      }
+    }
     has('observed', 'kind: HorizontalPodAutoscaler'); has('observed', 'kind: ServiceMonitor');
     const migrationVersions = (directory: string): number[] => readdirSync(join(repository, 'migrations', directory)).flatMap((name) => /^([0-9]{4})_.*\.sql$/.exec(name)?.[1] ?? []).map(Number);
     const sqlite = Math.max(...migrationVersions('common'), ...migrationVersions('sqlite'));

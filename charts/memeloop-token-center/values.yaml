@@ -161,6 +161,11 @@ config:
   # create a single-replica, non-durable archive.
   archiveBackend: s3
   s3:
+    # Shared by all roles; configuration changes need a rolling restart, not a build.
+    # connect/readiness: 100..30000; request: 100..120000; connect <= request.
+    connectTimeoutMillis: 5000
+    requestTimeoutMillis: 30000
+    readinessDeadlineMillis: 5000
     bucket: memeloop-token-center
     endpoint: ""
     region: us-east-1
