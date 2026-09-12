@@ -24,6 +24,10 @@ struct ReconcileFixture {
 
 impl ReconcileFixture {
     async fn new() -> Self {
+        Self::new_with_submitting(true).await
+    }
+
+    async fn new_with_submitting(submitting: bool) -> Self {
         let (directory, database, key, upstream_id, price) = fixture().await;
         let url = format!(
             "sqlite://{}?mode=rwc",
@@ -44,20 +48,22 @@ impl ReconcileFixture {
             .await
             .unwrap()
             .job_id;
-        database
-            .claim_generation_job("interrupted-worker")
-            .await
-            .unwrap()
-            .unwrap();
         let nonce = Uuid::now_v7();
-        database
-            .mark_generation_submitting(job, "interrupted-worker", nonce)
-            .await
-            .unwrap();
-        database
-            .arm_generation_shutdown_quarantine(job, "interrupted-worker", nonce)
-            .await
-            .unwrap();
+        if submitting {
+            database
+                .claim_generation_job("interrupted-worker")
+                .await
+                .unwrap()
+                .unwrap();
+            database
+                .mark_generation_submitting(job, "interrupted-worker", nonce)
+                .await
+                .unwrap();
+            database
+                .arm_generation_shutdown_quarantine(job, "interrupted-worker", nonce)
+                .await
+                .unwrap();
+        }
         let token = state
             .db
             .create_service_token(
@@ -176,6 +182,207 @@ impl ReconcileFixture {
         let status: String = sqlx::query_scalar("SELECT r.status FROM usage_reservations r JOIN generation_jobs j ON j.reservation_id = r.id WHERE j.id = $1")
             .bind(self.job.to_string()).fetch_one(&self.pool).await.unwrap();
         assert_eq!(status, "reserved");
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SubmitResponse {
+    Lost,
+    TruncatedBody,
+    MissingProviderId,
+    RetryableStatus,
+    AckStorageFailure,
+    ExplicitRejection,
+}
+
+// Read the actual HTTP POST completely before returning an error/response.
+// This establishes delivery deterministically, without a timing sleep or a
+// future that merely pretends to have dispatched to an upstream provider.
+async fn provider_connection(
+    mut stream: tokio::net::TcpStream,
+    mode: SubmitResponse,
+    posts: &std::sync::atomic::AtomicUsize,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut bytes = Vec::new();
+    loop {
+        let mut chunk = [0_u8; 1024];
+        let read = stream.read(&mut chunk).await.unwrap();
+        if read == 0 {
+            return;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        assert!(bytes.len() < 16 * 1024);
+        if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+            assert!(headers.starts_with("POST /api/v3/contents/generations/tasks "));
+            let length: usize = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .unwrap()
+                .1
+                .trim()
+                .parse()
+                .unwrap();
+            if bytes.len() < end + 4 + length {
+                continue;
+            }
+            let body: Value = serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap();
+            assert_eq!(body["model"], "workflow-v1");
+            posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            break;
+        }
+    }
+    match mode {
+        SubmitResponse::Lost => {} // EOF before HTTP headers: send() fails.
+        SubmitResponse::TruncatedBody => {
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 99\r\nConnection: close\r\n\r\n{\"id\":").await.unwrap();
+        }
+        mode => {
+            let (status, body) = match mode {
+                SubmitResponse::ExplicitRejection => ("400 Bad Request", "{}"),
+                SubmitResponse::RetryableStatus => ("503 Service Unavailable", "{}"),
+                SubmitResponse::AckStorageFailure => {
+                    ("200 OK", "{\"id\":\"provider-confirmed-123\"}")
+                }
+                SubmitResponse::MissingProviderId => ("200 OK", "{}"),
+                _ => unreachable!(),
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    }
+    stream.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn delivered_post_errors_never_retry_refund_or_lose_reconciliation() {
+    use memeloop_token_center::generation;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+    for mode in [
+        SubmitResponse::Lost,
+        SubmitResponse::TruncatedBody,
+        SubmitResponse::MissingProviderId,
+        SubmitResponse::RetryableStatus,
+        SubmitResponse::AckStorageFailure,
+        SubmitResponse::ExplicitRejection,
+    ] {
+        let f = ReconcileFixture::new_with_submitting(false).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let observed = posts.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                provider_connection(stream, mode, &observed).await;
+            }
+        });
+        let locator = f
+            .state
+            .archive
+            .put_content(bytes::Bytes::from_static(b"{\"input\":{}}"))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE upstream_accounts SET driver = 'volcengine-seedance', config_json = $1 WHERE id = (SELECT upstream_account_id FROM generation_jobs WHERE id = $2)")
+            .bind(json!({"base_url": format!("http://{address}")}).to_string()).bind(f.job.to_string()).execute(&f.pool).await.unwrap();
+        // Exhaustion must not turn even the first ambiguous response into a refund.
+        sqlx::query("UPDATE generation_jobs SET driver = 'volcengine-seedance', request_object = $1, failure_count = 100 WHERE id = $2")
+            .bind(locator).bind(f.job.to_string()).execute(&f.pool).await.unwrap();
+        if matches!(mode, SubmitResponse::AckStorageFailure) {
+            sqlx::query("CREATE TRIGGER reject_submit_ack BEFORE UPDATE OF upstream_job_id ON generation_jobs WHEN NEW.upstream_job_id IS NOT NULL BEGIN SELECT RAISE(ABORT, 'test ACK persistence unavailable'); END")
+                .execute(&f.pool).await.unwrap();
+        }
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                generation::process_one(&f.state, "response-lost-worker")
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            "{mode:?}"
+        );
+        assert_eq!(posts.load(Ordering::SeqCst), 1, "{mode:?}");
+        if matches!(mode, SubmitResponse::ExplicitRejection) {
+            let job = f
+                .state
+                .db
+                .generation_job(f.key.key_id, f.job)
+                .await
+                .unwrap();
+            assert_eq!(job.status, "failed");
+            assert_eq!(job.error_code.as_deref(), Some("generation_rejected"));
+            assert_eq!(
+                f.state.db.key_view(&f.key).await.unwrap().available_balance,
+                "10"
+            );
+        } else {
+            f.assert_reserved().await;
+            let row = sqlx::query("SELECT status, error_code, submission_nonce, lease_owner, failure_count FROM generation_jobs WHERE id = $1")
+                .bind(f.job.to_string()).fetch_one(&f.pool).await.unwrap();
+            assert_eq!(row.get::<String, _>("status"), "submitting");
+            assert_eq!(
+                row.get::<String, _>("error_code"),
+                "shutdown_delivery_unknown"
+            );
+            assert!(row.get::<Option<String>, _>("submission_nonce").is_some());
+            assert!(row.get::<Option<String>, _>("lease_owner").is_none());
+            assert_eq!(row.get::<i64, _>("failure_count"), 100);
+            sqlx::query("UPDATE generation_jobs SET next_attempt_at = 0, lease_expires_at = 0, created_at = 0 WHERE id = $1")
+                .bind(f.job.to_string()).execute(&f.pool).await.unwrap();
+            // Reopen the durable DB, rather than relying on an in-memory guard.
+            let restarted = AppState::initialize(f.state.config.as_ref().clone())
+                .await
+                .unwrap();
+            assert!(
+                !generation::process_one(&restarted, "second-claim")
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !generation::process_one(&restarted, "third-claim")
+                    .await
+                    .unwrap()
+            );
+            f.assert_reserved().await;
+            assert_eq!(posts.load(Ordering::SeqCst), 1);
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'finished'")
+                .bind(f.job.to_string()).fetch_one(&f.pool).await.unwrap();
+            assert_eq!(count, 0);
+            if matches!(mode, SubmitResponse::AckStorageFailure) {
+                sqlx::query("DROP TRIGGER reject_submit_ack")
+                    .execute(&f.pool)
+                    .await
+                    .unwrap();
+            }
+            // The unchanged quarantined reservation remains actionable through
+            // the scoped, evidence-bearing production reconciliation endpoint.
+            let body = f.body("confirmed_submitted").await;
+            let (status, receipt) = f
+                .request(
+                    "POST",
+                    &f.resolution_path(),
+                    &f.token,
+                    &["confirmed-after-response-loss"],
+                    Some(body),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{receipt}");
+            assert_eq!(receipt["resulting_status"], "running");
+            f.assert_reserved().await;
+            assert_eq!(posts.load(Ordering::SeqCst), 1);
+        }
+        server.abort();
+        let _ = server.await;
     }
 }
 

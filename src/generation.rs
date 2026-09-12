@@ -207,7 +207,7 @@ fn is_asset_archive_limit_error(error: &AppError) -> bool {
     matches!(error, AppError::Upstream(message) if message == ASSET_ARCHIVE_LIMIT_ERROR)
 }
 
-/// Supervised dispatch durably arms a quarantine before the provider POST.
+/// Dispatch durably arms a quarantine before the provider POST.
 /// Dropping this future therefore needs no shutdown-time database availability.
 pub async fn process_one_until_shutdown(
     state: &AppState,
@@ -217,27 +217,32 @@ pub async fn process_one_until_shutdown(
     tokio::select! {
         biased;
         _ = crate::worker::wait_for_shutdown(&mut shutdown) => Ok(false),
-        outcome = process_one_inner(state, worker_id, true) => outcome,
+        outcome = process_one(state, worker_id) => outcome,
     }
 }
 
 pub async fn process_one(state: &AppState, worker_id: &str) -> Result<bool, AppError> {
-    process_one_inner(state, worker_id, false).await
-}
-
-async fn process_one_inner(
-    state: &AppState,
-    worker_id: &str,
-    quarantine_on_drop: bool,
-) -> Result<bool, AppError> {
     let Some(job) = state.db.claim_generation_job(worker_id).await? else {
         return Ok(false);
     };
     // An outer error means the lease could no longer be renewed. In that case
     // the in-flight upstream future is dropped and this worker must not settle,
     // reschedule, or otherwise mutate a job that another worker may now own.
-    let outcome = process_claimed_with_lease(state, worker_id, &job, quarantine_on_drop).await?;
+    let outcome = process_claimed_with_lease(state, worker_id, &job).await?;
     if let Err(error) = outcome {
+        // A send, response-body, response-parsing, or ACK-persistence error
+        // cannot prove non-delivery. Inspect the durable state, not the claimed
+        // snapshot (which was queued before submit armed its guard). Never let
+        // generic retry/exhaustion turn an unknown provider side effect into a
+        // refund. This also covers a guard commit whose acknowledgement failed.
+        if state
+            .db
+            .retain_generation_delivery_unknown(job.job_id, worker_id)
+            .await?
+        {
+            tracing::warn!(job_id = %job.job_id, "generation delivery remains quarantined pending provider confirmation");
+            return Ok(true);
+        }
         let next_failure = job.failure_count.saturating_add(1);
         tracing::warn!(job_id = %job.job_id, attempt = job.attempt_count, failure = next_failure, %error, "generation job attempt failed");
         if job.status == "cancelling" {
@@ -278,9 +283,8 @@ async fn process_claimed_with_lease(
     state: &AppState,
     worker_id: &str,
     job: &GenerationJobWork,
-    quarantine_on_drop: bool,
 ) -> Result<Result<(), AppError>, AppError> {
-    let attempt = process_claimed(state, worker_id, job, quarantine_on_drop);
+    let attempt = process_claimed(state, worker_id, job);
     tokio::pin!(attempt);
     let period = std::time::Duration::from_secs(20);
     let start = tokio::time::Instant::now() + period;
@@ -395,7 +399,6 @@ async fn process_claimed(
     state: &AppState,
     worker_id: &str,
     job: &GenerationJobWork,
-    quarantine_on_drop: bool,
 ) -> Result<(), AppError> {
     // Manual proof of a previously unknown delivery starts one bounded polling
     // window. Preserve admission time and every ordinary job's timeout policy.
@@ -432,7 +435,7 @@ async fn process_claimed(
         return cancel_upstream_generation(state, worker_id, job, &route, upstream_job_id).await;
     }
     match job.upstream_job_id.as_deref() {
-        None => submit(state, worker_id, job, &route, quarantine_on_drop).await,
+        None => submit(state, worker_id, job, &route).await,
         Some(upstream_job_id) => poll(state, worker_id, job, &route, upstream_job_id).await,
     }
 }
@@ -551,7 +554,6 @@ async fn submit(
     worker_id: &str,
     job: &GenerationJobWork,
     route: &ResolvedUpstream,
-    quarantine_on_drop: bool,
 ) -> Result<(), AppError> {
     let capabilities = generation_driver_capabilities(&route.driver);
     let submission_nonce = if job.status == "submitting" {
@@ -639,16 +641,14 @@ async fn submit(
         .header("idempotency-key", job.job_id.to_string())
         .json(&input);
     let request = route.credential.apply(request, unix_millis())?;
-    if quarantine_on_drop {
-        // Commit before send, including before its first poll. If shutdown,
-        // abort, or lease loss drops the attempt, no recovery worker may refund
-        // or redispatch this unknown delivery. Normal completion clears the
-        // guard through the existing ACK/retry/terminal database transitions.
-        state
-            .db
-            .arm_generation_shutdown_quarantine(job.job_id, worker_id, submission_nonce)
-            .await?;
-    }
+    // Commit before send, including before its first poll, for both supervised
+    // and single-attempt workers. Only a durable provider ACK or an explicit
+    // provider rejection may clear this guard; transport/response/ACK errors
+    // and cancellation retain it for evidence-bearing reconciliation.
+    state
+        .db
+        .arm_generation_shutdown_quarantine(job.job_id, worker_id, submission_nonce)
+        .await?;
     let _upstream_activity = state
         .metrics
         .active_upstream(&route.driver, "generation_submit");
