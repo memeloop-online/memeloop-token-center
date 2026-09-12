@@ -585,12 +585,15 @@ impl Database {
                 "proxy response archive lease does not match its request owner".into(),
             ));
         }
-        let now = unix_millis();
         let request_id = input.request_id.to_string();
         let tenant_id = input.tenant_id.to_string();
         let key_id = input.reservation.key_id.to_string();
         let reservation_id = input.reservation.id.to_string();
         let mut transaction = self.begin_write_transaction().await?;
+        // SQLite's BEGIN IMMEDIATE can wait for an earlier terminal writer.
+        // Capture the observation boundary only after that wait so live writes
+        // cannot acquire timestamps in the opposite order from their commits.
+        let now = unix_millis();
 
         // This no-op update is the portable owner CAS. PostgreSQL takes a row
         // lock and rechecks the pending predicate after a concurrent owner

@@ -15,6 +15,7 @@ const MAX_CONVERSATION_FINGERPRINT_JSON_BYTES: usize = 70_000;
 const CONVERSATION_INSERT_BATCH_BIND_LIMIT: usize = 900;
 const SEMANTIC_ATOM_INSERT_BIND_COUNT: usize = 7;
 const CONTEXT_NODE_INSERT_BIND_COUNT: usize = 6;
+const EXPLICIT_SESSION_LOCK_SEED: i64 = 734_627_102_948_338;
 
 #[derive(Clone, Debug)]
 pub struct ConversationListFilter {
@@ -268,7 +269,7 @@ impl Database {
         hints: &ConversationHints,
         client_name: Option<&str>,
     ) -> Result<Uuid, AppError> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let cluster_id = self
             .record_conversation_observation_in_transaction(
                 &mut transaction,
@@ -328,6 +329,19 @@ impl Database {
             None
         };
 
+        if matches!(self.backend, DatabaseBackend::PostgreSql)
+            && let Some(session_id) = hints.session_id.as_deref()
+        {
+            // Explicit session identity is authoritative within one stable key.
+            // Serialize candidate selection for that identity so two PostgreSQL
+            // writers cannot both observe an empty cluster and create one.
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, $2))")
+                .bind(format!("{}:{session_id}", key.key_id))
+                .bind(EXPLICIT_SESSION_LOCK_SEED)
+                .execute(&mut **transaction)
+                .await?;
+        }
+
         let tenant_id = key.tenant_id.to_string();
         for atom_batch in
             atoms.chunks(CONVERSATION_INSERT_BATCH_BIND_LIMIT / SEMANTIC_ATOM_INSERT_BIND_COUNT)
@@ -379,7 +393,7 @@ impl Database {
             || hints.session_id.is_some()
         {
             sqlx::query(
-                "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.created_at <= $7 AND (($4 IS NOT NULL AND (o.turn_id = $4 OR o.upstream_response_id = $4)) OR ($5 IS NOT NULL AND o.turn_id = $5) OR ($6 IS NOT NULL AND o.explicit_session_id = $6)) ORDER BY CASE WHEN $4 IS NOT NULL AND (o.turn_id = $4 OR o.upstream_response_id = $4) THEN 0 WHEN $5 IS NOT NULL AND o.turn_id = $5 THEN 1 ELSE 2 END, o.created_at DESC LIMIT 50",
+                "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND (($6 IS NOT NULL AND o.explicit_session_id = $6) OR (o.created_at <= $7 AND (($4 IS NOT NULL AND (o.turn_id = $4 OR o.upstream_response_id = $4)) OR ($5 IS NOT NULL AND o.turn_id = $5)))) ORDER BY CASE WHEN o.created_at <= $7 THEN 0 ELSE 1 END, CASE WHEN $4 IS NOT NULL AND (o.turn_id = $4 OR o.upstream_response_id = $4) THEN 0 WHEN $5 IS NOT NULL AND o.turn_id = $5 THEN 1 ELSE 2 END, o.created_at DESC LIMIT 50",
             )
             .bind(&tenant_id)
             .bind(&principal_id)
@@ -450,6 +464,7 @@ impl Database {
                     (RelationKind::Candidate, 0)
                 };
             let created_at: i64 = row.try_get("created_at")?;
+            let causally_prior = created_at <= now;
             let direct_parent = hints.parent_turn_id.is_some()
                 && (hints.parent_turn_id.as_deref() == candidate_turn.as_deref()
                     || hints.parent_turn_id.as_deref() == candidate_response.as_deref());
@@ -515,7 +530,8 @@ impl Database {
                     // continuation. Persist a directed edge only when the protocol names
                     // the parent/turn, the payload establishes a Merkle-prefix relation,
                     // or the client explicitly marks a compaction.
-                    write_edge: direct_parent || same_turn || exact_prefix || hints.compaction,
+                    write_edge: causally_prior
+                        && (direct_parent || same_turn || exact_prefix || hints.compaction),
                 });
                 if direct_parent || same_turn || explicit_match || exact_prefix {
                     break;
