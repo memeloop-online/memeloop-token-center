@@ -14,6 +14,67 @@ const routes = [
   { name: 'operator-form-sections', ready: '.operator-form-section', surface: '.operator-form-section, .operator-form-advanced', action: '.operator-form-advanced > summary' },
 ] as const;
 
+type SurfaceLayout = { client: number; scroll: number; left: number; right: number };
+type LayoutStability = { observer: ResizeObserver; generation: number; checkedGeneration: number; stableFrames: number };
+
+declare global {
+  interface Window { __uiSystemLayoutStability?: Record<string, LayoutStability> }
+}
+
+async function measuredLayout(page: import('playwright').Page, surface: string): Promise<{ documentClient: number; documentScroll: number; surfaces: SurfaceLayout[] }> {
+  return page.evaluate((selector) => ({
+    documentClient: document.documentElement.clientWidth,
+    documentScroll: document.documentElement.scrollWidth,
+    surfaces: [...document.querySelectorAll<HTMLElement>(selector)].map((element) => {
+      const bounds = element.getBoundingClientRect();
+      return { client: element.clientWidth, scroll: element.scrollWidth, left: bounds.left, right: bounds.right };
+    }),
+  }), surface);
+}
+
+async function waitForStableLayout(page: import('playwright').Page, surface: string, label: string) {
+  try {
+    await page.waitForFunction((selector) => {
+      const surfaces = [...document.querySelectorAll<HTMLElement>(selector)];
+      const layouts = window.__uiSystemLayoutStability ??= {};
+      const stability = layouts[selector] ??= (() => {
+        const state: LayoutStability = { observer: undefined as never, generation: 0, checkedGeneration: -1, stableFrames: 0 };
+        state.observer = new ResizeObserver(() => { state.generation += 1; });
+        state.observer.observe(document.documentElement);
+        surfaces.forEach((element) => state.observer.observe(element));
+        return state;
+      })();
+      const contained = surfaces.length > 0
+        && document.documentElement.scrollWidth <= innerWidth
+        && surfaces.every((element) => {
+          const bounds = element.getBoundingClientRect();
+          return element.scrollWidth <= element.clientWidth && bounds.left >= 0 && bounds.right <= innerWidth;
+        });
+      if (!contained) {
+        stability.stableFrames = 0;
+        return false;
+      }
+      if (stability.checkedGeneration !== stability.generation) {
+        stability.checkedGeneration = stability.generation;
+        stability.stableFrames = 1;
+        return false;
+      }
+      stability.stableFrames += 1;
+      return stability.stableFrames >= 2;
+    }, surface);
+  } catch {
+    const layout = await measuredLayout(page, surface);
+    assert.fail(`${label}: layout did not stabilize within the existing browser deadline: ${JSON.stringify(layout)}`);
+  } finally {
+    await page.evaluate((selector) => {
+      const stability = window.__uiSystemLayoutStability?.[selector];
+      stability?.observer.disconnect();
+      if (window.__uiSystemLayoutStability) delete window.__uiSystemLayoutStability[selector];
+    }, surface).catch(() => undefined);
+  }
+  return measuredLayout(page, surface);
+}
+
 test('shared surfaces contain long content and retain keyboard actions across locale/theme/viewport', { timeout: 120_000 }, async (context) => {
   if (!existsSync(chromium.executablePath())) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required for UI system contracts');
@@ -56,16 +117,14 @@ test('shared surfaces contain long content and retain keyboard actions across lo
         await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
         await page.setViewportSize({ width, height: 900 });
         await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
-        const surfaces = await page.locator(route.surface).evaluateAll(elements => elements.map(element => {
-          const bounds = element.getBoundingClientRect();
-          return { client: element.clientWidth, scroll: element.scrollWidth, left: bounds.left, right: bounds.right };
-        }));
+        const layout = await waitForStableLayout(page, route.surface, label);
+        const surfaces = layout.surfaces;
         assert.ok(surfaces.length > 0, label);
         for (const surface of surfaces) {
           assert.ok(surface.scroll <= surface.client, `${label}: component overflow, not merely hidden by body`);
           assert.ok(surface.left >= 0 && surface.right <= width, `${label}: surface inside viewport`);
         }
-        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, label);
+        assert.ok(layout.documentScroll <= layout.documentClient, `${label}: document overflow ${layout.documentScroll}/${layout.documentClient}`);
         const action = page.locator(route.action).first();
         await page.keyboard.press('Tab');
         await action.focus();

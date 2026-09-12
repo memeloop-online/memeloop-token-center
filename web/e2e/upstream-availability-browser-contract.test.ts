@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdir, readdir, stat } from 'node:fs/promises';
+import { mkdir, readdir, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -33,23 +33,56 @@ async function nextPaint(page: import('playwright').Page) {
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
 }
 
+async function waitForFixture(page: import('playwright').Page, url: string) {
+  const deadline = Date.now() + 15_000;
+  const remaining = () => {
+    const milliseconds = deadline - Date.now();
+    if (milliseconds <= 0) throw new Error('upstream availability fixture did not become ready within 15 seconds');
+    return milliseconds;
+  };
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: remaining() });
+  await page.locator('[data-fixture-ready="upstream-availability"]').waitFor({ state: 'attached', timeout: remaining() });
+  await page.getByText('Recent availability', { exact: true }).first().waitFor({ state: 'visible', timeout: remaining() });
+}
+
+async function retainFailureDiagnostics(page: import('playwright').Page) {
+  await mkdir(artifactRoot, { recursive: true });
+  await Promise.allSettled([
+    page.screenshot({ path: join(artifactRoot, 'upstream-availability-ready-failure.png'), fullPage: true }),
+    page.evaluate(() => {
+      const locationUrl = new URL(location.href);
+      return {
+        url: `${locationUrl.origin}${locationUrl.pathname}`,
+        document_ready_state: document.readyState,
+        fixture_ready: document.querySelector('[data-fixture-ready="upstream-availability"]') !== null,
+        root_child_count: document.getElementById('root')?.childElementCount ?? 0,
+        body_text_length: document.body.textContent?.length ?? 0,
+      };
+    }).then((diagnostics) => writeFile(join(artifactRoot, 'upstream-availability-ready-failure.json'), `${JSON.stringify(diagnostics)}\n`)),
+  ]);
+}
+
 test('Upstream availability shows complete account facts separately from routing samples and manual probes', { timeout: 90_000 }, async () => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for the upstream availability browser gate');
     return test.skip('a local Chromium runtime is required for upstream availability layout assertions');
   }
-  const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0, strictPort: false } });
-  await server.listen();
-  const address = server.httpServer?.address();
-  assert.ok(address && typeof address !== 'string');
-  const browser = await chromium.launch({ executablePath, headless: true });
+  let server: Awaited<ReturnType<typeof createServer>> | undefined;
+  let browser: import('playwright').Browser | undefined;
+  let diagnosticPage: import('playwright').Page | undefined;
   try {
+    server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0, strictPort: false } });
+    await server.listen();
+    const address = server.httpServer?.address();
+    assert.ok(address && typeof address !== 'string');
+    browser = await chromium.launch({ executablePath, headless: true });
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+    diagnosticPage = page;
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.clock.setFixedTime(new Date('2026-09-09T12:00:00Z'));
-    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/upstream-availability.html`);
-    await page.getByText('Recent availability', { exact: true }).first().waitFor();
+    const fixtureUrl = `http://127.0.0.1:${address.port}/e2e/fixtures/upstream-availability.html`;
+    await waitForFixture(page, fixtureUrl);
     assert.equal(await page.locator('.provider-recent-attempts > li').count(), 5, 'the component must retain only the five latest routed terminal attempts across the account models');
     assert.equal(await page.getByText('Manual health check', { exact: true }).count(), 2, 'a manual probe is a separately labelled status, never a routed-attempt row');
     assert.equal(await page.getByText('No actual requests observed in this window.', { exact: true }).count(), 1, 'zero-traffic accounts remain explicitly unobserved');
@@ -66,7 +99,7 @@ test('Upstream availability shows complete account facts separately from routing
       for (const width of widths) {
         await page.setViewportSize({ width, height: 900 });
         await nextPaint(page);
-        const layout = await page.evaluate(() => ({
+        const layout: { clientWidth: number; scrollWidth: number; cards: { clientWidth: number; scrollWidth: number; parentWidth: number; labelSize: number }[] } = await page.evaluate(() => ({
           clientWidth: document.documentElement.clientWidth,
           scrollWidth: document.documentElement.scrollWidth,
           cards: [...document.querySelectorAll<HTMLElement>('.provider-availability')].map((element) => ({
@@ -88,14 +121,18 @@ test('Upstream availability shows complete account facts separately from routing
       }
     }
     for (const mode of ['missing', 'foreign']) {
-      await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/upstream-availability.html?window=${mode}`);
-      await page.getByText('Recent availability', { exact: true }).first().waitFor();
+      await waitForFixture(page, `${fixtureUrl}?window=${mode}`);
       assert.equal(await page.locator('.provider-account-metrics').count(), 0, `${mode} account data must not render totals`);
       assert.equal(await page.locator('.provider-recent-attempts > li').count(), 0, `${mode} account data must not fall back to routing samples`);
       assert.equal(await page.getByText('No actual requests observed in this window.', { exact: true }).count(), 0, `${mode} data is unavailable, not zero traffic`);
     }
+  } catch (error) {
+    if (diagnosticPage) await retainFailureDiagnostics(diagnosticPage);
+    throw error;
   } finally {
-    await browser.close();
-    await server.close();
+    await Promise.allSettled([
+      ...(browser ? [browser.close()] : []),
+      ...(server ? [server.close()] : []),
+    ]);
   }
 });
