@@ -78,6 +78,11 @@ impl PgFixture {
         // deliberately no FK to billing tables, matching request_records.
         sqlx::raw_sql("CREATE TABLE request_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, reservation_id TEXT NOT NULL, completed_at BIGINT, response_object TEXT, status_code BIGINT NOT NULL DEFAULT 200, cost_micros BIGINT NOT NULL DEFAULT 123)")
             .execute(&db.pool).await.unwrap();
+        // This focused fixture intentionally omits the production request
+        // projection tables. Keeping the locator table empty exercises the
+        // legacy/audit-row path where no request-stream signal is emitted.
+        sqlx::raw_sql("CREATE TABLE request_record_locators (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, key_id TEXT NOT NULL)")
+            .execute(&db.pool).await.unwrap();
         sqlx::raw_sql(include_str!(
             "../../../migrations/common/0035_archive_staging_attempts.sql"
         ))

@@ -177,16 +177,10 @@ fn validate_condition(condition: &TypedFilterCondition) -> Result<(), AppError> 
     if let Some(upper) = condition.upper.as_ref() {
         validate_value(upper)?;
     }
-    if let TypedFilterValue::Protocol(value) = &condition.value
-        && !matches!(
-            value.as_str(),
-            "openai" | "anthropic" | "openai-image" | "generation"
-        )
-    {
-        return Err(AppError::BadRequest(
-            "filter protocol is not supported".into(),
-        ));
-    }
+    // Protocol is historical request data, not the current route protocol
+    // catalogue. The generic text guard below still bounds and rejects control
+    // characters, while exact matching lets operators find imported protocol
+    // names such as `openai-responses` without pretending they are routable.
     if let TypedFilterValue::Status(value) = &condition.value
         && !matches!(value.as_str(), "success" | "error" | "pending")
     {

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use sqlx::{Any, Row, Transaction, any::AnyRow};
 use uuid::Uuid;
 
-use super::{AppError, Database, DatabaseBackend};
+use super::{AppError, Database, DatabaseBackend, allocate_request_event_cursor};
 use crate::archive_staging::{
     ArchiveStagingOwner, ArchiveStagingPurpose, ArchiveStagingWriteLease,
 };
@@ -177,9 +177,18 @@ impl Database {
     ) -> Result<(), AppError> {
         let (mut tx, now) = self.spool_transaction().await?;
         // A lost seal ACK must not destroy a complete, recoverable pending spool.
-        sqlx::query("UPDATE response_archive_spools SET state = 'gap', last_error_code = $1, updated_at = $2, expires_at = $3, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $4 AND tenant_id = $5 AND reservation_id = $6 AND state = 'capturing'")
+        let changed = sqlx::query("UPDATE response_archive_spools SET state = 'gap', last_error_code = $1, updated_at = $2, expires_at = $3, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $4 AND tenant_id = $5 AND reservation_id = $6 AND state = 'capturing'")
             .bind(reason_code(reason)).bind(now).bind(now + CAPTURE_TTL).bind(identity.request_id.to_string())
             .bind(identity.tenant_id.to_string()).bind(identity.reservation_id.to_string()).execute(&mut *tx).await?;
+        if changed.rows_affected() == 1 {
+            emit_response_archive_transition_event_in_transaction(
+                &mut tx,
+                identity.request_id,
+                now,
+                "archive_gap",
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -318,8 +327,20 @@ impl Database {
         {
             return Ok(false);
         }
-        sqlx::query("UPDATE response_archive_spools SET state = 'bound', bound_locator = $1, updated_at = $2, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $3")
-            .bind(locator).bind(now).bind(task.identity.request_id.to_string()).execute(&mut *tx).await?;
+        let bound = sqlx::query("UPDATE response_archive_spools SET state = 'bound', bound_locator = $1, updated_at = $2, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $3 AND tenant_id = $4 AND reservation_id = $5 AND state = 'uploading'")
+            .bind(locator).bind(now).bind(task.identity.request_id.to_string())
+            .bind(task.identity.tenant_id.to_string()).bind(task.identity.reservation_id.to_string())
+            .execute(&mut *tx).await?;
+        if bound.rows_affected() != 1 {
+            return Ok(false);
+        }
+        emit_response_archive_transition_event_in_transaction(
+            &mut tx,
+            task.identity.request_id,
+            now,
+            "archive_bound",
+        )
+        .await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -338,8 +359,18 @@ impl Database {
             .ok_or(AppError::Internal)?;
         let attempts: i64 = row.try_get("attempts")?;
         let backoff = 5_000_i64 * (1_i64 << attempts.clamp(0, 10) as u32);
+        let terminal = attempts >= 10;
         sqlx::query("UPDATE response_archive_spools SET state = $1, next_attempt_at = $2, updated_at = $3, last_error_code = $4, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $5")
             .bind(if attempts >= 10 { "gap" } else { "pending" }).bind(now + backoff).bind(now).bind(reason_code(reason)).bind(task.identity.request_id.to_string()).execute(&mut *tx).await?;
+        if terminal {
+            emit_response_archive_transition_event_in_transaction(
+                &mut tx,
+                task.identity.request_id,
+                now,
+                "archive_gap",
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -516,7 +547,8 @@ impl Database {
         // Partial cleanup fences expired uploaders immediately, but retains
         // the fixed overhead and cleaned_at=NULL until the final chunk is gone.
         // Every deletion and both accounting changes commit or roll back together.
-        let bound = row.try_get::<String, _>("state")? == "bound";
+        let previous_state: String = row.try_get("state")?;
+        let bound = previous_state == "bound";
         sqlx::query("UPDATE response_archive_spools SET state = $1, cleaned_at = $2, cipher_bytes = cipher_bytes - $3, updated_at = $4, expires_at = CASE WHEN $5 = 1 THEN expires_at ELSE $4 END, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $6")
             .bind(if bound { "bound" } else { "gap" }).bind(cleaned.then_some(now))
             .bind(released).bind(now).bind(i64::from(bound)).bind(&id).execute(&mut *tx).await?;
@@ -532,6 +564,16 @@ impl Database {
         // The shared budget is held only for this decrement and commit.
         sqlx::query("UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes - $1 WHERE singleton = 1")
             .bind(released).execute(&mut *tx).await?;
+        if !matches!(previous_state.as_str(), "bound" | "gap") {
+            let request_id = Uuid::parse_str(&id).map_err(|_| AppError::Internal)?;
+            emit_response_archive_transition_event_in_transaction(
+                &mut tx,
+                request_id,
+                now,
+                "archive_gap",
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok(Some(cleaned))
     }
@@ -560,6 +602,48 @@ impl Database {
         let now: i64 = sqlx::query_scalar(clock).fetch_one(&mut *tx).await?;
         Ok((tx, now))
     }
+}
+
+/// Emit a sparse, locator-free convergence signal only after a real terminal
+/// spool transition. The same write transaction owns both the state change and
+/// the globally monotonic request-event cursor, so rollback cannot expose one
+/// without the other. Missing legacy request rows are tolerated for bounded GC
+/// of pre-invariant audit data; live spool admission always has this owner row.
+async fn emit_response_archive_transition_event_in_transaction(
+    tx: &mut Transaction<'_, Any>,
+    request_id: Uuid,
+    now: i64,
+    event_kind: &'static str,
+) -> Result<(), AppError> {
+    debug_assert!(matches!(event_kind, "archive_bound" | "archive_gap"));
+    let request_id = request_id.to_string();
+    let owner = sqlx::query(
+        "SELECT r.tenant_id, locator.key_id FROM request_records r JOIN request_record_locators locator ON locator.id = r.id AND locator.tenant_id = r.tenant_id JOIN response_archive_spools s ON s.request_id = r.id AND s.tenant_id = r.tenant_id AND s.reservation_id = r.reservation_id WHERE r.id = $1",
+    )
+    .bind(&request_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(owner) = owner else {
+        return Ok(());
+    };
+    let tenant_id: String = owner.try_get("tenant_id")?;
+    let key_id: String = owner.try_get("key_id")?;
+    let cursor = allocate_request_event_cursor(tx, now, &tenant_id, &key_id, &request_id).await?;
+    let inserted = sqlx::query(
+        "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT $1, tenant_id, key_id, id, $2, $3, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_records WHERE id = $4 AND tenant_id = $5 AND key_id = $6",
+    )
+    .bind(cursor.event_id)
+    .bind(cursor.event_at)
+    .bind(event_kind)
+    .bind(request_id)
+    .bind(tenant_id)
+    .bind(key_id)
+    .execute(&mut **tx)
+    .await?;
+    if inserted.rows_affected() != 1 {
+        return Err(AppError::Internal);
+    }
+    Ok(())
 }
 
 async fn spool_row(

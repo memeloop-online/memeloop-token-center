@@ -744,7 +744,7 @@ impl Database {
             (filter.before_created_at, filter.before_request_id)
         {
             sqlx::query(
-                "SELECT requests.*, observation.session_name, observation.trace_id, observation.span_id, observation.parent_span_id, observation.agent_id, observation.parent_agent_id, observation.task_kind, observation.labels_json, observation.metadata_source, observation.explicit_session_id, observation.turn_id, observation.parent_turn_id, observation.upstream_response_id, observation.branch_id, observation.compaction, observation.client_name FROM (SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, cost_micros, currency, error_code, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id, conversation_cluster_id AS session_id, 'confirmed' AS session_association FROM request_records WHERE key_id = $1 AND conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, protocol, model, status_code, duration_ms, input_tokens, CAST(0 AS BIGINT) AS cached_input_tokens, CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens, CAST(0 AS BIGINT) AS cost_micros, NULL AS currency, error_code, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id, conversation_cluster_id AS session_id, 'unlinked' AS session_association FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2) requests LEFT JOIN conversation_observations observation ON observation.request_id = requests.id AND observation.key_id = $1 AND observation.cluster_id = requests.session_id WHERE requests.created_at < $3 OR (requests.created_at = $3 AND requests.id < $4) ORDER BY requests.created_at DESC, requests.id DESC LIMIT $5",
+                "SELECT requests.*, observation.session_name, observation.trace_id, observation.span_id, observation.parent_span_id, observation.agent_id, observation.parent_agent_id, observation.task_kind, observation.labels_json, observation.metadata_source, observation.explicit_session_id, observation.turn_id, observation.parent_turn_id, observation.upstream_response_id, observation.branch_id, observation.compaction, observation.client_name FROM (SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.status_code, r.duration_ms, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.cost_micros, r.currency, r.error_code, CASE WHEN r.request_object LIKE 'gap://%' THEN 'gap' ELSE COALESCE(spool.state, CASE WHEN r.completed_at IS NULL THEN 'capturing' WHEN r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END) END AS archive_state, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id, r.conversation_cluster_id AS session_id, 'confirmed' AS session_association FROM request_records r LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id WHERE r.key_id = $1 AND r.conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model, status_code, duration_ms, input_tokens, CAST(0 AS BIGINT) AS cached_input_tokens, CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens, CAST(0 AS BIGINT) AS cost_micros, NULL AS currency, error_code, CASE WHEN request_object IS NULL OR request_object LIKE 'gap://%' OR response_object IS NULL OR response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id, conversation_cluster_id AS session_id, 'unlinked' AS session_association FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2) requests LEFT JOIN conversation_observations observation ON observation.request_id = requests.id AND observation.key_id = $1 AND observation.cluster_id = requests.session_id WHERE requests.created_at < $3 OR (requests.created_at = $3 AND requests.id < $4) ORDER BY requests.created_at DESC, requests.id DESC LIMIT $5",
             )
             .bind(&key_id)
             .bind(&cluster_id)
@@ -755,7 +755,7 @@ impl Database {
             .await?
         } else {
             sqlx::query(
-                "SELECT requests.*, observation.session_name, observation.trace_id, observation.span_id, observation.parent_span_id, observation.agent_id, observation.parent_agent_id, observation.task_kind, observation.labels_json, observation.metadata_source, observation.explicit_session_id, observation.turn_id, observation.parent_turn_id, observation.upstream_response_id, observation.branch_id, observation.compaction, observation.client_name FROM (SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, cost_micros, currency, error_code, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id, conversation_cluster_id AS session_id, 'confirmed' AS session_association FROM request_records WHERE key_id = $1 AND conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, protocol, model, status_code, duration_ms, input_tokens, CAST(0 AS BIGINT) AS cached_input_tokens, CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens, CAST(0 AS BIGINT) AS cost_micros, NULL AS currency, error_code, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id, conversation_cluster_id AS session_id, 'unlinked' AS session_association FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2) requests LEFT JOIN conversation_observations observation ON observation.request_id = requests.id AND observation.key_id = $1 AND observation.cluster_id = requests.session_id ORDER BY requests.created_at DESC, requests.id DESC LIMIT $3",
+                "SELECT requests.*, observation.session_name, observation.trace_id, observation.span_id, observation.parent_span_id, observation.agent_id, observation.parent_agent_id, observation.task_kind, observation.labels_json, observation.metadata_source, observation.explicit_session_id, observation.turn_id, observation.parent_turn_id, observation.upstream_response_id, observation.branch_id, observation.compaction, observation.client_name FROM (SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.status_code, r.duration_ms, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.cost_micros, r.currency, r.error_code, CASE WHEN r.request_object LIKE 'gap://%' THEN 'gap' ELSE COALESCE(spool.state, CASE WHEN r.completed_at IS NULL THEN 'capturing' WHEN r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END) END AS archive_state, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id, r.conversation_cluster_id AS session_id, 'confirmed' AS session_association FROM request_records r LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id WHERE r.key_id = $1 AND r.conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model, status_code, duration_ms, input_tokens, CAST(0 AS BIGINT) AS cached_input_tokens, CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens, CAST(0 AS BIGINT) AS cost_micros, NULL AS currency, error_code, CASE WHEN request_object IS NULL OR request_object LIKE 'gap://%' OR response_object IS NULL OR response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id, conversation_cluster_id AS session_id, 'unlinked' AS session_association FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2) requests LEFT JOIN conversation_observations observation ON observation.request_id = requests.id AND observation.key_id = $1 AND observation.cluster_id = requests.session_id ORDER BY requests.created_at DESC, requests.id DESC LIMIT $3",
             )
             .bind(&key_id)
             .bind(&cluster_id)
@@ -899,24 +899,60 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
     rows.into_iter()
         .map(|row| {
             let unlinked = row.try_get::<i64, _>("unlinked")? != 0;
+            let source: String = row.try_get("source_kind")?;
+            let billable = source == "live";
+            let raw_input_tokens: i64 = row.try_get("input_tokens")?;
+            let raw_cached_input_tokens: i64 = row.try_get("cached_input_tokens")?;
+            let raw_cache_write_tokens: i64 = row.try_get("cache_write_tokens")?;
+            let raw_output_tokens: i64 = row.try_get("output_tokens")?;
+            let cost_micros: i64 = row.try_get("cost_micros")?;
+            let completed_at = row.try_get("completed_at")?;
+            let (usage, billing, currency) = super::request_detail_accounting_projection(
+                billable,
+                completed_at,
+                [
+                    raw_input_tokens,
+                    raw_cached_input_tokens,
+                    raw_cache_write_tokens,
+                    raw_output_tokens,
+                ],
+                cost_micros,
+                row.try_get("currency")?,
+            );
             Ok(ConversationRequestView {
                 request: RequestView {
                     request_id: parse_uuid(row.try_get("id")?)?,
                     created_at: row.try_get("created_at")?,
-                    completed_at: None,
+                    completed_at,
+                    source_completed_at: row.try_get("source_completed_at")?,
+                    lifecycle_state: match row.try_get::<Option<i64>, _>("status_code")? {
+                        None => crate::model::RequestLifecycleState::Pending,
+                        Some(499) => crate::model::RequestLifecycleState::Cancelled,
+                        Some(code) if (200..400).contains(&code) => {
+                            crate::model::RequestLifecycleState::Succeeded
+                        }
+                        Some(_) => crate::model::RequestLifecycleState::Failed,
+                    },
                     protocol: row.try_get("protocol")?,
                     model: row.try_get("model")?,
                     upstream_account_id: None,
                     route_id: None,
                     status_code: row.try_get("status_code")?,
                     duration_ms: row.try_get("duration_ms")?,
-                    input_tokens: row.try_get("input_tokens")?,
-                    cached_input_tokens: row.try_get("cached_input_tokens")?,
-                    cache_write_tokens: row.try_get("cache_write_tokens")?,
-                    output_tokens: row.try_get("output_tokens")?,
-                    cost: micros_to_decimal_string(row.try_get("cost_micros")?),
-                    currency: None,
+                    input_tokens: raw_input_tokens,
+                    cached_input_tokens: raw_cached_input_tokens,
+                    cache_write_tokens: raw_cache_write_tokens,
+                    output_tokens: raw_output_tokens,
+                    cost: micros_to_decimal_string(cost_micros),
+                    currency: currency.clone(),
+                    usage,
+                    billing,
                     error_code: row.try_get("error_code")?,
+                    archive_state: crate::model::RequestArchiveState::from_storage(
+                        row.try_get::<String, _>("archive_state")?.as_str(),
+                    )
+                    .ok_or(AppError::Internal)?,
+                    credential_identity: None,
                     session_context: Some(RequestSessionContext {
                         session_id: row.try_get("session_id")?,
                         association: if unlinked {
@@ -930,10 +966,10 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
                         semantics_source: row.try_get("metadata_source")?,
                     }),
                 },
-                source: row.try_get("source_kind")?,
+                source,
                 provenance: row.try_get("provenance_kind")?,
                 unlinked,
-                currency: row.try_get("currency")?,
+                currency,
                 archive_source: row.try_get("archive_source")?,
                 external_request_id: row.try_get("external_request_id")?,
                 execution: execution_metadata_from_row(&row)?,

@@ -72,8 +72,8 @@ async fn assert_event_enrichment(database: &Database) {
     assert_eq!(event.upstream_account_id, Some(upstream));
     assert_eq!(event.route_id, Some(route));
     assert_eq!(event.currency.as_deref(), Some("USD"));
-    assert_eq!(event.cached_input_tokens, Some(30));
-    assert_eq!(event.cache_write_tokens, Some(10));
+    assert_eq!(event.cached_input_tokens, 30);
+    assert_eq!(event.cache_write_tokens, 10);
     let context = event.session_context.as_ref().unwrap();
     assert_eq!(context.session_id.as_deref(), Some("recorded-session"));
     assert_eq!(context.session_name.as_deref(), Some("recorded-name"));
@@ -86,8 +86,19 @@ async fn assert_event_enrichment(database: &Database) {
     assert!(foreign[0].upstream_account_id.is_none());
     assert!(foreign[0].route_id.is_none());
     assert!(foreign[0].currency.is_none());
-    assert!(foreign[0].cached_input_tokens.is_none());
+    assert_eq!(foreign[0].cached_input_tokens, 0);
+    assert!(
+        foreign[0]
+            .usage
+            .tokens
+            .as_ref()
+            .unwrap()
+            .cached_input_tokens
+            .is_none()
+    );
     assert!(foreign[0].session_context.is_none());
+    let foreign_json = serde_json::to_value(&foreign[0]).unwrap();
+    assert!(foreign_json["cached_input_tokens"].is_null());
     // The SQLite fixture owns its pool. PostgreSQL CI shares its database
     // with concurrent high-volume tests, so a global first page is not ours.
     if matches!(database.backend, DatabaseBackend::Sqlite) {

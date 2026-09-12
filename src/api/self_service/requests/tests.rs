@@ -7,6 +7,8 @@ fn request_detail_refs(request_id: Uuid) -> crate::model::RequestArchiveRefs {
             request_id,
             created_at: 1,
             completed_at: Some(2),
+            source_completed_at: None,
+            lifecycle_state: crate::model::RequestLifecycleState::Succeeded,
             protocol: "openai".to_owned(),
             model: "request-detail-test".to_owned(),
             upstream_account_id: Some(Uuid::nil()),
@@ -19,13 +21,33 @@ fn request_detail_refs(request_id: Uuid) -> crate::model::RequestArchiveRefs {
             output_tokens: 1,
             cost: "0".to_owned(),
             currency: Some("USD".to_owned()),
+            usage: crate::model::RequestUsageView {
+                tokens: Some(crate::model::RequestTokenUsageView {
+                    input_tokens: Some(1),
+                    cached_input_tokens: Some(0),
+                    cache_write_tokens: Some(0),
+                    output_tokens: Some(1),
+                }),
+                generation: None,
+            },
+            billing: crate::model::RequestBillingView {
+                billable: true,
+                cost: Some("0".to_owned()),
+                currency: Some("USD".to_owned()),
+            },
             error_code: None,
+            archive_state: crate::model::RequestArchiveState::Bound,
+            credential_identity: None,
             session_context: None,
         },
         request_object: "inline-json:{\"prompt\":\"detail body\"}".to_owned(),
         response_object: None,
         response_json: Some(json!({"output": "detail body"})),
         provenance: None,
+        request_archive_state: crate::model::RequestArchiveState::Bound,
+        request_archive_reason: None,
+        response_archive_state: crate::model::RequestArchiveState::Bound,
+        response_archive_reason: None,
     }
 }
 
@@ -51,4 +73,24 @@ async fn request_detail_response_has_exact_content_length_and_bounded_json_body(
     assert_eq!(detail["currency"], "USD");
     assert_eq!(detail["request_body"]["prompt"], "detail body");
     assert_eq!(detail["response_body"]["output"], "detail body");
+}
+
+#[tokio::test]
+async fn request_detail_failure_keeps_durable_archive_state_separate() {
+    let (state, _directory) = test_state().await;
+    let mut refs = request_detail_refs(Uuid::now_v7());
+    refs.request_object = format!("inline-json:{}0{}", "[".repeat(65), "]".repeat(65));
+    let response = request_detail_response(&state, refs)
+        .await
+        .expect("bounded request detail response");
+    let body = axum::body::to_bytes(response.into_body(), MAX_ARCHIVE_DETAIL_RESPONSE)
+        .await
+        .expect("bounded request detail body");
+    let detail: Value = serde_json::from_slice(&body).expect("request detail JSON body");
+    assert_eq!(detail["archive"]["request"]["state"], "bound");
+    assert_eq!(detail["archive"]["request"]["complete"], false);
+    assert_eq!(
+        detail["archive"]["request"]["reason"],
+        "archive_payload_invalid"
+    );
 }

@@ -27,7 +27,7 @@ pub(crate) use lifecycle::{
 };
 pub use metered_projection::MeteredUsageProjectionTask;
 pub use queries::RequestListFilter;
-pub(crate) use queries::search_prefix;
+pub(crate) use queries::{request_detail_accounting_projection, search_prefix};
 pub use session_archive_quarantine::{
     SessionArchiveQuarantineFilter, SessionArchiveQuarantineRecordView,
     SessionArchiveQuarantineResolutionInput, SessionArchiveQuarantineResolutionView,
