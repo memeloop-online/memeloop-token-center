@@ -294,8 +294,11 @@ paths:
       description: |
         Returns plaintext only for an explicit, authorized copy action and only while the
         matching key generation remains active. Credential lists and self-service APIs never
-        contain the secret. A key created before recovery envelopes were enabled returns 404
-        until an authorized importer stores its still-valid source credential. Retrieval
+        contain the secret. This operation never rotates or replaces the credential; repeated
+        authorized calls return the same current-generation credential while its envelope
+        remains available and rate limits permit. A key created before recovery envelopes were
+        enabled returns 404 and is explicitly unrecoverable through this endpoint unless an
+        authorized importer still has the source credential and stores its envelope. Retrieval
         attempts are durably audited without credential material and limited in a short window
         by target tenant, authenticated actor, and key; the actor also has a tenant-wide cap to
         prevent bulk plaintext recovery across keys.

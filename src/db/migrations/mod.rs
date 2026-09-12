@@ -423,7 +423,7 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         version: 79,
         name: "bounded client credential recovery access",
         sql: include_str!(
-            "../../../migrations/common/0075_key_credential_recovery_access_limits.sql"
+            "../../../migrations/common/0079_key_credential_recovery_access_limits.sql"
         ),
     },
 ];
@@ -835,7 +835,7 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 79,
         name: "bounded client credential recovery access",
         sql: include_str!(
-            "../../../migrations/common/0075_key_credential_recovery_access_limits.sql"
+            "../../../migrations/common/0079_key_credential_recovery_access_limits.sql"
         ),
     },
 ];
