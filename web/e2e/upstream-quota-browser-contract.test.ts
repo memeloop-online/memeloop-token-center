@@ -7,6 +7,8 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
 
+declare global { interface Window { quotaReads: number; quotaWrites: number; quotaPrepares: number; quotaConfirms: number; quotaStatuses: number; quotaReconciles: number } }
+
 test('upstream themes and mock-only quota demand, consent and reconciliation contract', { timeout: 90_000 }, async () => {
   if (!existsSync(chromium.executablePath())) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
