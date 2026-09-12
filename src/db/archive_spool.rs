@@ -200,7 +200,10 @@ impl Database {
         let (mut tx, now) = self.spool_transaction().await?;
         let row = sqlx::query("SELECT s.* FROM response_archive_spools s WHERE s.expires_at > $1 AND s.attempts < 10 AND ((s.state = 'pending' AND s.next_attempt_at <= $1) OR (s.state = 'uploading' AND s.lease_expires_at <= $1)) AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND r.completed_at IS NOT NULL AND r.response_object = 'gap://' || s.request_id || '/response') ORDER BY s.next_attempt_at, s.request_id LIMIT 1")
             .bind(now).fetch_optional(&mut *tx).await?;
-        let Some(row) = row else { return Ok(None) };
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
         let identity = identity_from_row(&row)?;
         let lease_token = Uuid::new_v4();
         sqlx::query("UPDATE response_archive_spools SET state = 'uploading', lease_owner = $1, lease_token = $2, lease_expires_at = $3, attempts = attempts + 1, updated_at = $4 WHERE request_id = $5")
