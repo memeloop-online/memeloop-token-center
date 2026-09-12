@@ -50,27 +50,27 @@ async fn create_account(state: &AppState, tenant: &str, name: &str, driver: &str
         .id
 }
 
-async fn create_route(
-    state: &AppState,
-    tenant: &str,
-    public_model: &str,
-    upstream_model: &str,
-    protocol: &str,
+struct RouteFixtureInput<'a> {
+    public_model: &'a str,
+    upstream_model: &'a str,
+    protocol: &'a str,
     priority: i64,
     account_ids: Vec<Uuid>,
     included_provider_group_ids: Vec<Uuid>,
-) -> Uuid {
+}
+
+async fn create_route(state: &AppState, tenant: &str, input: RouteFixtureInput<'_>) -> Uuid {
     state
         .db
         .create_routed_model_route(CreateRoutedModelRouteInput {
             tenant_external_id: tenant.to_owned(),
-            public_model: public_model.to_owned(),
-            upstream_model: upstream_model.to_owned(),
-            protocol: protocol.to_owned(),
-            priority,
+            public_model: input.public_model.to_owned(),
+            upstream_model: input.upstream_model.to_owned(),
+            protocol: input.protocol.to_owned(),
+            priority: input.priority,
             enabled: true,
-            upstream_account_ids: account_ids,
-            included_provider_group_ids,
+            upstream_account_ids: input.account_ids,
+            included_provider_group_ids: input.included_provider_group_ids,
             excluded_provider_group_ids: Vec::new(),
             route_group_ids: Vec::new(),
             route_group_names: Vec::new(),
@@ -166,45 +166,53 @@ async fn seed_projection(state: &AppState, label: &str) -> ProjectionFixture {
     let first_route = create_route(
         state,
         &tenant,
-        "shared-model",
-        "native-shared",
-        "openai",
-        0,
-        vec![first_account, second_account],
-        vec![provider_group.id],
+        RouteFixtureInput {
+            public_model: "shared-model",
+            upstream_model: "native-shared",
+            protocol: "openai",
+            priority: 0,
+            account_ids: vec![first_account, second_account],
+            included_provider_group_ids: vec![provider_group.id],
+        },
     )
     .await;
     let second_route = create_route(
         state,
         &tenant,
-        "shared-model",
-        "native-shared",
-        "anthropic",
-        1,
-        vec![third_account, fourth_account],
-        Vec::new(),
+        RouteFixtureInput {
+            public_model: "shared-model",
+            upstream_model: "native-shared",
+            protocol: "anthropic",
+            priority: 1,
+            account_ids: vec![third_account, fourth_account],
+            included_provider_group_ids: Vec::new(),
+        },
     )
     .await;
     create_route(
         state,
         &tenant,
-        "hidden-internal-model",
-        "hidden-internal-model",
-        "openai",
-        0,
-        vec![hidden_account],
-        Vec::new(),
+        RouteFixtureInput {
+            public_model: "hidden-internal-model",
+            upstream_model: "hidden-internal-model",
+            protocol: "openai",
+            priority: 0,
+            account_ids: vec![hidden_account],
+            included_provider_group_ids: Vec::new(),
+        },
     )
     .await;
     create_route(
         state,
         &other_tenant,
-        "other-tenant-model",
-        "other-tenant-model",
-        "openai",
-        0,
-        vec![other_account],
-        Vec::new(),
+        RouteFixtureInput {
+            public_model: "other-tenant-model",
+            upstream_model: "other-tenant-model",
+            protocol: "openai",
+            priority: 0,
+            account_ids: vec![other_account],
+            included_provider_group_ids: Vec::new(),
+        },
     )
     .await;
 
