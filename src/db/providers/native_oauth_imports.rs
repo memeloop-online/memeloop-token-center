@@ -79,10 +79,10 @@ impl Database {
                 || !ordinals.insert(input.ordinal)
                 || !identities.insert(input.source_identity_hash.clone())
                 || input.account_name != format!("Kimi OAuth {}", input.ordinal)
-                || !input
+                || input
                     .credential
                     .expires_at()
-                    .is_some_and(|expires_at| expires_at > now)
+                    .is_none_or(|expires_at| expires_at <= now)
             {
                 return Err(AppError::BadRequest(
                     "native Kimi OAuth cohort is invalid or expired".into(),
@@ -513,9 +513,9 @@ fn validate_existing_kimi_account(
         || row.try_get::<String, _>("name")? != input.account_name
         || config != input.config
         || row.try_get::<String, _>("status")? != "active"
-        || !row
+        || row
             .try_get::<Option<i64>, _>("expires_at")?
-            .is_some_and(|expires_at| expires_at > now)
+            .is_none_or(|expires_at| expires_at <= now)
         || row.try_get::<i64, _>("route_count")? != 0
     {
         return Err(AppError::Conflict(
