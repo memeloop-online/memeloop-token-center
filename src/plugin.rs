@@ -313,7 +313,6 @@ pub struct PluginPackageIdentity {
 #[derive(Clone)]
 struct CachedPluginConfigurations {
     loaded_at: Instant,
-    read_generation: u64,
     snapshot: ResolvedTrafficSnapshot,
     estimated_bytes: usize,
 }
@@ -323,6 +322,9 @@ struct ConfigurationCache {
     // An identity token cannot wrap/reuse a counter while an old read holds it.
     epoch: Arc<()>,
     read_generation: u64,
+    // Fixed-size completion fences survive value eviction and uncached reads.
+    // Hash collisions conservatively fence older reads for another tenant.
+    published_generations: [u64; 32],
     entries: BTreeMap<Uuid, CachedPluginConfigurations>,
 }
 
