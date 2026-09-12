@@ -1,7 +1,7 @@
 import { useConfirmDialog } from '../../useConfirmDialog';
 import RjsfForm, { type FormProps } from '@rjsf/core/lib/components/Form.js';
 import type { RJSFSchema } from '@rjsf/utils';
-import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { ApiError, api, apiRead } from '../../api';
 import { formatCurrency, formatNumber } from '../../format';
 import { localizeSchema, useI18n } from '../../i18n';
@@ -495,12 +495,87 @@ function selections(ids: string[], options: ComboboxOption[]) {
   return ids.map((id) => options.find((option) => option.value === id) ?? { value: id, label: id });
 }
 
+function ExactCredentialCombobox({ token, tenant, credentials, value, onChange }: {
+  token: string;
+  tenant: string;
+  credentials: KeyView[];
+  value: string[];
+  onChange: (ids: string[]) => void;
+}) {
+  const { t } = useI18n();
+  const [resolved, setResolved] = useState<KeyView[]>([]);
+  const [search, setSearch] = useState({ query: '', loading: false, error: '', resultId: '' });
+  const sequence = useRef(0);
+  const request = useRef<AbortController | undefined>(undefined);
+  const scope = useRef({ token, tenant });
+  const committedScope = useRef({ token, tenant });
+  scope.current = { token, tenant };
+  const credentialOptions = [
+    ...credentials,
+    ...resolved.filter((match) => !credentials.some((credential) => credential.key_id === match.key_id)),
+  ].map((credential) => ({ value: credential.key_id, label: credential.alias, description: credential.key_id }));
+
+  const searchCredential = (query: string) => {
+    request.current?.abort();
+    const currentSequence = ++sequence.current;
+    const keyId = query.trim();
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(keyId) || !token || !tenant) {
+      setSearch({ query: '', loading: false, error: '', resultId: '' });
+      return;
+    }
+    const controller = new AbortController();
+    request.current = controller;
+    const searchScope = { token, tenant };
+    const queryParameters = new URLSearchParams({ tenant_external_id: tenant, key_id: keyId, limit: '1' });
+    setSearch({ query: keyId, loading: true, error: '', resultId: '' });
+    void apiRead<KeyView[]>(`/internal/v1/keys?${queryParameters}`, token, {
+      // Exact lookup has no hidden automatic retry. The explicit bound is
+      // configurable per read, query/scope changes cancel it, and a visible
+      // retry remains under operator control.
+      attempts: 1,
+      attemptTimeoutMilliseconds: 15_000,
+      signal: controller.signal,
+    }).then((matches) => {
+      if (controller.signal.aborted || currentSequence !== sequence.current
+        || scope.current.token !== searchScope.token || scope.current.tenant !== searchScope.tenant) return;
+      setResolved((current) => [
+        ...matches,
+        ...current.filter((credential) => value.includes(credential.key_id)
+          && !matches.some((match) => match.key_id === credential.key_id)),
+      ]);
+      setSearch({ query: keyId, loading: false, error: '', resultId: matches[0]?.key_id ?? '' });
+    }).catch((reason) => {
+      if (controller.signal.aborted || currentSequence !== sequence.current
+        || scope.current.token !== searchScope.token || scope.current.tenant !== searchScope.tenant) return;
+      setSearch({ query: keyId, loading: false, error: messageOf(reason, t('routes.credentialSearchFailed')), resultId: '' });
+    });
+  };
+
+  useLayoutEffect(() => {
+    if (committedScope.current.token === token && committedScope.current.tenant === tenant) return;
+    committedScope.current = { token, tenant };
+    request.current?.abort();
+    sequence.current += 1;
+    setResolved([]);
+    setSearch({ query: '', loading: false, error: '', resultId: '' });
+  }, [token, tenant]);
+  useLayoutEffect(() => () => {
+    request.current?.abort();
+    sequence.current += 1;
+  }, []);
+  useEffect(() => {
+    setResolved((current) => current.filter((credential) => value.includes(credential.key_id) || credential.key_id === search.resultId));
+  }, [value, search.resultId]);
+
+  return <MultiCombobox label={t('routes.exactCredentials')} options={credentialOptions} value={selections(value, credentialOptions)} onChange={(selected) => onChange(selected.map((item) => item.value))} placeholder={t('routes.searchCredentials')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('routes.exactCredentialsHint')} onQueryChange={searchCredential} loading={search.loading} loadingText={t('routes.credentialSearchLoading')} error={search.error} retryLabel={t('common.retry')} onRetry={() => searchCredential(search.query)} />;
+}
+
 function routeRequest(draft: RouteDraft, customModelConfirmed: boolean) {
   const { upstream_account_id: _legacyAccountId, ...request } = draft;
   return { ...request, custom_model_confirmed: customModelConfirmed };
 }
 
-function RouteFields({ token, tenant, draft, upstreams, providers, providerGroups, routeGroups, credentials, onChange, onCatalogValidity, onCredentialQuery }: {
+function RouteFields({ token, tenant, draft, upstreams, providers, providerGroups, routeGroups, credentials, onChange, onCatalogValidity }: {
   token: string;
   tenant: string;
   draft: RouteDraft;
@@ -511,7 +586,6 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
   credentials: KeyView[];
   onChange: (draft: RouteDraft) => void;
   onCatalogValidity: (valid: boolean, allowCustom: boolean) => void;
-  onCredentialQuery: (query: string) => void;
 }) {
   const { locale, t } = useI18n();
   const knownProtocols = ['openai', 'anthropic', 'generation'];
@@ -530,7 +604,6 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
   const upstreamOptions = upstreams.map((value) => ({ value: value.id, label: value.name, description: value.driver }));
   const providerGroupOptions = providerGroups.map((value) => ({ value: value.id, label: value.name, description: t('groups.memberCount', { count: formatNumber(value.member_count, locale) }) }));
   const routeGroupOptions = routeGroups.map((value) => ({ value: value.id, label: value.name, description: t('groups.memberCount', { count: formatNumber(value.member_count, locale) }) }));
-  const credentialOptions = credentials.map((value) => ({ value: value.key_id, label: value.alias, description: value.key_id }));
   const routeGroupValue = [
     ...selections(draft.route_group_ids, routeGroupOptions),
     ...draft.route_group_names.map((name) => ({ value: `new:${name}`, label: name, created: true })),
@@ -554,7 +627,7 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
     </fieldset><fieldset><legend>{t('routes.accessSection')}</legend><p className="field-hint">{t('routes.accessHint')}</p>
     <label>{t('routes.priority')}<input type="number" required step={1} aria-invalid={!priorityValid} aria-describedby={priorityHintId} min={-1000000} max={1000000} value={Number.isNaN(draft.priority) ? '' : draft.priority} onChange={(event) => onChange({ ...draft, priority: event.target.valueAsNumber })} /></label><small id={priorityHintId} className={priorityValid ? 'field-hint' : 'field-error'}>{t('routes.priorityHint')}</small>
     <MultiCombobox label={t('routes.routeGroups')} options={routeGroupOptions} value={routeGroupValue} onChange={(selected) => onChange({ ...draft, route_group_ids: selected.filter((item) => !item.created).map((item) => item.value), route_group_names: selected.filter((item) => item.created).map((item) => item.label) })} placeholder={t('routes.searchOrCreateRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} allowCreate createLabel={(name) => t('routes.createRouteGroupNamed', { name })} hint={t('routes.routeGroupsHint')} />
-    <MultiCombobox label={t('routes.exactCredentials')} options={credentialOptions} value={selections(draft.granted_credential_ids, credentialOptions)} onChange={(selected) => onChange({ ...draft, granted_credential_ids: selected.map((item) => item.value) })} placeholder={t('routes.searchCredentials')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('routes.exactCredentialsHint')} onQueryChange={onCredentialQuery} />
+    <ExactCredentialCombobox token={token} tenant={tenant} credentials={credentials} value={draft.granted_credential_ids} onChange={(granted_credential_ids) => onChange({ ...draft, granted_credential_ids })} />
     </fieldset>
   </div>;
 }
@@ -580,7 +653,6 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   const loadAbort = useRef<AbortController | undefined>(undefined);
   const credentialLoadSequence = useRef(0);
   const credentialLoadAbort = useRef<AbortController | undefined>(undefined);
-  const credentialSearchAbort = useRef<AbortController | undefined>(undefined);
   const scopeRef = useRef({ token, tenant, writeTenant });
   scopeRef.current = { token, tenant, writeTenant };
   const load = async () => {
@@ -599,22 +671,6 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
       setRoutes(nextRoutes); setError('');
     }
     catch (reason) { if (!controller.signal.aborted && sequence === loadSequence.current && scopeRef.current.token === loadToken && scopeRef.current.tenant === loadTenant) setError(messageOf(reason, t('common.requestFailed'))); }
-  };
-  const searchCredential = (query: string) => {
-    credentialSearchAbort.current?.abort();
-    const keyId = query.trim();
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(keyId) || !token || !writeTenant) return;
-    const controller = new AbortController();
-    credentialSearchAbort.current = controller;
-    const searchToken = token; const searchTenant = tenant; const searchWriteTenant = writeTenant;
-    const queryParameters = new URLSearchParams({ tenant_external_id: searchWriteTenant, key_id: keyId, limit: '1' });
-    void apiRead<KeyView[]>(`/internal/v1/keys?${queryParameters}`, searchToken, { signal: controller.signal }).then((matches) => {
-      if (controller.signal.aborted || scopeRef.current.token !== searchToken || scopeRef.current.tenant !== searchTenant || scopeRef.current.writeTenant !== searchWriteTenant) return;
-      setCredentials((current) => [...matches, ...current.filter((value) => !matches.some((match) => match.key_id === value.key_id))]);
-      setError('');
-    }).catch((reason) => {
-      if (!controller.signal.aborted && scopeRef.current.token === searchToken && scopeRef.current.tenant === searchTenant && scopeRef.current.writeTenant === searchWriteTenant) setError(messageOf(reason, t('common.requestFailed')));
-    });
   };
   useEffect(() => {
     credentialLoadAbort.current?.abort();
@@ -642,7 +698,7 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
     loadSequence.current += 1; credentialLoadSequence.current += 1; setRoutes([]); setCredentials([]); setCredentialsRequested(false); setCredentialError(''); setForm(emptyRouteDraft); setFormCatalog({ valid: false, allowCustom: false });
     setEditing(undefined); setEditForm(emptyRouteDraft); setEditCatalog({ valid: false, allowCustom: false });
     setBusy(''); setMessage(''); setError(''); void load();
-    return () => { loadAbort.current?.abort(); credentialLoadAbort.current?.abort(); credentialSearchAbort.current?.abort(); };
+    return () => { loadAbort.current?.abort(); credentialLoadAbort.current?.abort(); };
   }, [token, tenant, writeTenant]);
   const statusFilter = useResourceListStatusFilter('model-routes', tenant, routes, (route) => route.enabled);
   const scopedUpstreams = upstreams.filter((value) => !value.tenant_external_id || value.tenant_external_id === writeTenant);
@@ -712,9 +768,9 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   };
   return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} /><section className="management-layout">
     <article className="panel"><div className="panel-title"><div><h2>{t('routes.title')}</h2><p className="muted">{t('routes.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>{error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{credentialError && <div className="notice error" role="alert">{credentialError}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="table-scroll"><table><thead><tr>{!tenant && <th>{t('credentials.tenant')}</th>}<th>{t('routes.publicModel')}</th><th>{t('routes.upstream')}</th><th>{t('routes.groups')}</th><th>{t('routes.upstreamModel')}</th><th>{t('routes.protocol')}</th><th>{t('routes.priority')}</th><th>{t('request.status')}</th><th>{t('routes.actions')}</th></tr></thead><tbody>{statusFilter.values.map((route) => <tr key={route.id}>{!tenant && <td><code>{route.tenant_external_id ?? '—'}</code></td>}<td><code>{route.public_model}</code></td><td><div className="table-chip-list">{(route.upstream_account_ids ?? (route.upstream_account_id ? [route.upstream_account_id] : [])).map((id) => <span key={id}>{upstreams.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><div className="table-chip-list">{(route.route_group_ids ?? []).map((id) => <span key={id}>{routeGroups.groups.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><code>{route.upstream_model}</code></td><td>{route.protocol}</td><td>{formatNumber(route.priority, locale)}</td><td><span className={`status ${route.enabled ? 'ok' : 'pending'}`}>{route.enabled ? t('common.enabled') : t('common.disabled')}</span></td><td><div className="row-actions"><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => beginEdit(route)}>{t('routes.edit')}</button><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => void setEnabled(route, !route.enabled)}>{route.enabled ? t('routes.disable') : t('routes.enable')}</button><button type="button" className="danger" title={route.enabled ? t('routes.disableBeforeDelete') : undefined} disabled={busy === route.id || !canManage(route) || route.enabled} onClick={() => void remove(route)}>{t('common.remove')}</button></div></td></tr>)}</tbody></table>{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('common.enabled')} empty={t('routes.empty')} />}</div>
-      {editing && <div className="inline-editor form-panel"><div className="panel-title"><h3>{t('routes.editTitle', { model: editing.public_model })}</h3><button type="button" className="secondary" onClick={() => setEditing(undefined)}>{t('common.cancel')}</button></div><RouteFields token={token} tenant={writeTenant} draft={editForm} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setEditForm} onCatalogValidity={(valid, allowCustom) => setEditCatalog({ valid, allowCustom })} onCredentialQuery={searchCredential} /><button type="button" disabled={busy === editing.id || !canSubmit(editForm, editCatalog.valid)} onClick={() => void saveEdit()}>{t('common.save')}</button></div>}
+      {editing && <div className="inline-editor form-panel"><div className="panel-title"><h3>{t('routes.editTitle', { model: editing.public_model })}</h3><button type="button" className="secondary" onClick={() => setEditing(undefined)}>{t('common.cancel')}</button></div><RouteFields token={token} tenant={writeTenant} draft={editForm} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setEditForm} onCatalogValidity={(valid, allowCustom) => setEditCatalog({ valid, allowCustom })} /><button type="button" disabled={busy === editing.id || !canSubmit(editForm, editCatalog.valid)} onClick={() => void saveEdit()}>{t('common.save')}</button></div>}
     </article>
-    <details className="panel create-resource" onToggle={(event) => { if (event.currentTarget.open) setCredentialsRequested(true); }}><summary><span><b>{t('routes.createTitle')}</b><small>{t('routes.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel"><RouteFields token={token} tenant={writeTenant} draft={form} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setForm} onCatalogValidity={(valid, allowCustom) => setFormCatalog({ valid, allowCustom })} onCredentialQuery={searchCredential} /><button type="button" disabled={busy === 'create' || !canSubmit(form, formCatalog.valid)} onClick={async () => { setBusy('create'); setMessage(''); setError(''); try { await api('/internal/v1/model-routes', token, { method: 'POST', body: JSON.stringify({ ...routeRequest(form, formCatalog.allowCustom), tenant_external_id: writeTenant }) }); setForm(emptyRouteDraft); setFormCatalog({ valid: false, allowCustom: false }); setMessage(t('routes.created')); await Promise.all([load(), routeGroups.load]); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}>{t('routes.create')}</button></div></details>
+    <details className="panel create-resource" onToggle={(event) => { if (event.currentTarget.open) setCredentialsRequested(true); }}><summary><span><b>{t('routes.createTitle')}</b><small>{t('routes.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel"><RouteFields token={token} tenant={writeTenant} draft={form} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setForm} onCatalogValidity={(valid, allowCustom) => setFormCatalog({ valid, allowCustom })} /><button type="button" disabled={busy === 'create' || !canSubmit(form, formCatalog.valid)} onClick={async () => { setBusy('create'); setMessage(''); setError(''); try { await api('/internal/v1/model-routes', token, { method: 'POST', body: JSON.stringify({ ...routeRequest(form, formCatalog.allowCustom), tenant_external_id: writeTenant }) }); setForm(emptyRouteDraft); setFormCatalog({ valid: false, allowCustom: false }); setMessage(t('routes.created')); await Promise.all([load(), routeGroups.load]); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}>{t('routes.create')}</button></div></details>
   </section><section className="routing-group-managers">
     <GroupManager kind="provider" token={token} tenant={writeTenant} groups={providerGroups.groups} resources={scopedUpstreams.map((value) => ({ value: value.id, label: value.name, description: value.driver }))} onChanged={providerGroups.load} />
     <GroupManager kind="route" token={token} tenant={writeTenant} groups={routeGroups.groups} resources={routes.filter(canManage).map((route) => ({ value: route.id, label: route.public_model, description: route.protocol }))} onChanged={async () => { await Promise.all([routeGroups.load(), load()]); }} />
