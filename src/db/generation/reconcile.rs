@@ -39,8 +39,6 @@ pub struct ResolveGenerationQuarantine<'a> {
     pub evidence_digest: &'a str,
 }
 
-const QUARANTINE_COLUMNS: &str = "j.id, j.tenant_id, t.external_id AS tenant_external_id, j.public_model, j.driver, j.attempt_count, j.updated_at, j.lease_expires_at, j.submission_nonce";
-
 impl Database {
     pub async fn list_generation_quarantine(
         &self,
@@ -53,7 +51,7 @@ impl Database {
                 "limit must be between 1 and 100".into(),
             ));
         }
-        let rows = sqlx::query(&format!("SELECT {QUARANTINE_COLUMNS} FROM generation_jobs j JOIN tenants t ON t.id = j.tenant_id WHERE t.external_id = $1 AND j.status = 'submitting' AND j.error_code = 'shutdown_delivery_unknown' AND j.upstream_job_id IS NULL AND j.id > $2 ORDER BY j.id LIMIT $3"))
+        let rows = sqlx::query("SELECT j.id, j.tenant_id, t.external_id AS tenant_external_id, j.public_model, j.driver, j.attempt_count, j.updated_at, j.lease_expires_at, j.submission_nonce FROM generation_jobs j JOIN tenants t ON t.id = j.tenant_id WHERE t.external_id = $1 AND j.status = 'submitting' AND j.error_code = 'shutdown_delivery_unknown' AND j.upstream_job_id IS NULL AND j.id > $2 ORDER BY j.id LIMIT $3")
             .bind(tenant).bind(after_id.map(|id| id.to_string()).unwrap_or_default()).bind(limit)
             .fetch_all(&self.pool).await?;
         rows.iter().map(quarantine_view).collect()
@@ -64,7 +62,7 @@ impl Database {
         tenant: &str,
         job_id: Uuid,
     ) -> Result<GenerationQuarantineView, AppError> {
-        let row = sqlx::query(&format!("SELECT {QUARANTINE_COLUMNS} FROM generation_jobs j JOIN tenants t ON t.id = j.tenant_id WHERE t.external_id = $1 AND j.id = $2 AND j.status = 'submitting' AND j.error_code = 'shutdown_delivery_unknown' AND j.upstream_job_id IS NULL"))
+        let row = sqlx::query("SELECT j.id, j.tenant_id, t.external_id AS tenant_external_id, j.public_model, j.driver, j.attempt_count, j.updated_at, j.lease_expires_at, j.submission_nonce FROM generation_jobs j JOIN tenants t ON t.id = j.tenant_id WHERE t.external_id = $1 AND j.id = $2 AND j.status = 'submitting' AND j.error_code = 'shutdown_delivery_unknown' AND j.upstream_job_id IS NULL")
             .bind(tenant).bind(job_id.to_string()).fetch_optional(&self.pool).await?
             .ok_or(AppError::NotFound)?;
         quarantine_view(&row)
@@ -90,13 +88,20 @@ impl Database {
         .to_hex()
         .to_string();
         let mut transaction = self.begin_write_transaction().await?;
-        let lock = match self.backend {
-            DatabaseBackend::PostgreSql => " FOR UPDATE OF j",
-            DatabaseBackend::Sqlite => "",
+        let select = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT j.id, j.tenant_id, t.external_id AS tenant_external_id, j.public_model, j.driver, j.attempt_count, j.updated_at, j.lease_expires_at, j.submission_nonce, j.status, j.error_code, j.upstream_job_id FROM generation_jobs j JOIN tenants t ON t.id = j.tenant_id WHERE t.external_id = $1 AND j.id = $2 FOR UPDATE OF j"
+            }
+            DatabaseBackend::Sqlite => {
+                "SELECT j.id, j.tenant_id, t.external_id AS tenant_external_id, j.public_model, j.driver, j.attempt_count, j.updated_at, j.lease_expires_at, j.submission_nonce, j.status, j.error_code, j.upstream_job_id FROM generation_jobs j JOIN tenants t ON t.id = j.tenant_id WHERE t.external_id = $1 AND j.id = $2"
+            }
         };
-        let row = sqlx::query(&format!("SELECT {QUARANTINE_COLUMNS}, j.status, j.error_code, j.upstream_job_id FROM generation_jobs j JOIN tenants t ON t.id = j.tenant_id WHERE t.external_id = $1 AND j.id = $2{lock}"))
-            .bind(input.tenant_external_id).bind(input.job_id.to_string())
-            .fetch_optional(&mut *transaction).await?.ok_or(AppError::NotFound)?;
+        let row = sqlx::query(select)
+            .bind(input.tenant_external_id)
+            .bind(input.job_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(AppError::NotFound)?;
         let tenant_id: String = row.try_get("tenant_id")?;
         let replay = sqlx::query("SELECT request_digest, result_json FROM generation_quarantine_resolutions WHERE tenant_id = $1 AND actor_service_id = $2 AND idempotency_hash = $3")
             .bind(&tenant_id).bind(input.actor_service_id.to_string()).bind(input.idempotency_hash)
