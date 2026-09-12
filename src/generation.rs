@@ -207,6 +207,27 @@ fn is_asset_archive_limit_error(error: &AppError) -> bool {
     matches!(error, AppError::Upstream(message) if message == ASSET_ARCHIVE_LIMIT_ERROR)
 }
 
+/// Cancellation is not an attempt failure: leave the persisted fencing and
+/// reservation untouched for recovery, especially after provider dispatch.
+pub(crate) async fn process_one_until_shutdown(
+    state: &AppState,
+    worker_id: &str,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<bool, AppError> {
+    finish_attempt_until_shutdown(process_one(state, worker_id), shutdown).await
+}
+
+pub(crate) async fn finish_attempt_until_shutdown(
+    attempt: impl std::future::Future<Output = Result<bool, AppError>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<bool, AppError> {
+    tokio::select! {
+        biased;
+        _ = crate::worker::wait_for_shutdown(&mut shutdown) => Ok(false),
+        outcome = attempt => outcome,
+    }
+}
+
 pub async fn process_one(state: &AppState, worker_id: &str) -> Result<bool, AppError> {
     let Some(job) = state.db.claim_generation_job(worker_id).await? else {
         return Ok(false);
