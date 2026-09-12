@@ -16,6 +16,8 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     outputs:
+      rust: ${{ steps.scope.outputs.rust }}
+      migration: ${{ steps.scope.outputs.migration }}
       memory: ${{ steps.scope.outputs.memory }}
       plugin_installer: ${{ steps.scope.outputs.plugin_installer }}
     steps:
@@ -26,13 +28,13 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
-      - name: Resolve expensive CI scopes
+      - name: Resolve fail-closed CI scopes including both sides of renames
         id: scope
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
-          changed="$RUNNER_TEMP/ci-changed-paths.txt"
+          changed="$RUNNER_TEMP/ci-changed-paths.z"
           : > "$changed"
           if [ "$EVENT_NAME" = pull_request ]; then
             case "$BASE_SHA" in
@@ -43,7 +45,7 @@ jobs:
             esac
             test "${#BASE_SHA}" -eq 40
             git cat-file -e "$BASE_SHA^{commit}"
-            git diff --name-only --diff-filter=ACDMRT "$BASE_SHA" "$GITHUB_SHA" > "$changed"
+            git diff --name-status --find-renames=100% --diff-filter=ACDMRT -z "$BASE_SHA" "$GITHUB_SHA" > "$changed"
           fi
           node ops/ci/detect-expensive-ci-scopes.ts "$EVENT_NAME" "$changed" "$GITHUB_OUTPUT"
 
@@ -184,6 +186,8 @@ jobs:
       - run: npm run test:e2e
 
   rust:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     # Wasmtime plus every integration-test binary can exhaust the hosted
@@ -279,6 +283,8 @@ jobs:
           MTC_TEST_S3_LIST_ONLY_SECRET_KEY: mtc-list-only-secret
 
   migration-smoke:
+    needs: changes
+    if: needs.changes.outputs.migration == 'true'
     runs-on: ubuntu-latest
     services:
       postgres:
