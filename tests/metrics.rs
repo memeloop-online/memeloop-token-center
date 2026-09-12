@@ -299,10 +299,6 @@ async fn gateway_and_control_roles_return_404_for_every_opposite_operation_famil
         (Method::POST, "/internal/v1/oauth/cursor/start".to_owned()),
         (Method::GET, "/internal/v1/upstreams".to_owned()),
         (Method::GET, format!("/internal/v1/upstreams/{id}/models")),
-        (
-            Method::GET,
-            "/internal/v1/imports/session-archive/quarantine?tenant_external_id=t".to_owned(),
-        ),
         (Method::GET, "/internal/v1/requests".to_owned()),
         (Method::GET, "/internal/v1/stats".to_owned()),
         (Method::GET, "/internal/v1/request-events".to_owned()),

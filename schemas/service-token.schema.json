@@ -29,8 +29,6 @@
           "plugins:read",
           "plugins:write",
           "oauth:write",
-          "imports:session_archive:quarantine:read",
-          "imports:session_archive:quarantine:resolve",
           "routes:write",
           "routes:read",
           "prices:write",

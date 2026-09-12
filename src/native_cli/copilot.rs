@@ -1,6 +1,6 @@
 //! Native Copilot CLI stdio protocol, pinned to official SDK v1.0.8 / protocol 3.
 //!
-//! No CPA runtime, URL, token exchange, shell, or user-selected RPC method is
+//! No legacy runtime, URL, token exchange, shell, or user-selected RPC method is
 //! involved. The process supervisor owns the official binary and sealed account
 //! home. This module deliberately does not turn missing provider usage into zero.
 

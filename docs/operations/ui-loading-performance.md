@@ -1,8 +1,7 @@
 # Operator loading performance audit
 
-Static baseline: product `2b01afe2388523771a472c131053fe18df6b0426`.
-This is a request-dependency/code audit, not measured production latency.
-No production load test or local build was performed.
+This document describes request-dependency and loading-performance design. It
+does not report production measurements or deployment acceptance.
 
 | Surface | Observed dependency / cost | Priority |
 | --- | --- | --- |
