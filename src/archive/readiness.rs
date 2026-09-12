@@ -2,7 +2,7 @@ use std::{
     future::Future,
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -28,6 +28,7 @@ const READINESS_FAILURE_GRACE: Duration = Duration::from_secs(3 * 60);
 // Give that bounded sequence enough time to survive ordinary network jitter,
 // while still failing a genuine storage outage before the outer readiness and
 // Kubernetes probe deadlines.
+#[cfg(test)]
 const READINESS_DEADLINE: Duration = Duration::from_secs(5);
 const READINESS_CANARY: &[u8] = b"memeloop-token-center/archive-readiness/v1";
 
@@ -89,6 +90,54 @@ impl CanaryProgress {
 struct CanaryFailure {
     stage: CanaryStage,
     timed_out: bool,
+    error_class: &'static str,
+}
+
+// Fixed labels only: never put endpoint, object key or underlying error text in
+// logs/metrics. object_store does not expose portable DNS/connect/TTFB timings.
+#[derive(Default)]
+pub(super) struct ReadinessMetrics {
+    attempts: [[AtomicU64; 3]; 7],
+    elapsed_millis: AtomicU64,
+    cache_hits: AtomicU64,
+}
+
+impl ReadinessMetrics {
+    fn observe(&self, stage: CanaryStage, outcome: usize, elapsed: Duration) {
+        self.attempts[stage as usize][outcome].fetch_add(1, Ordering::Relaxed);
+        self.elapsed_millis
+            .fetch_add(elapsed.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn render(&self) -> String {
+        use std::fmt::Write;
+        let mut output =
+            String::from("# TYPE memeloop_token_center_archive_canary_total counter\n");
+        for stage in 0..7 {
+            for (outcome, label) in ["success", "operation_error", "deadline"]
+                .iter()
+                .enumerate()
+            {
+                let _ = writeln!(
+                    output,
+                    "memeloop_token_center_archive_canary_total{{stage=\"{}\",outcome=\"{label}\"}} {}",
+                    CanaryStage::from_u8(stage).as_str(),
+                    self.attempts[stage as usize][outcome].load(Ordering::Relaxed)
+                );
+            }
+        }
+        let _ = writeln!(
+            output,
+            "# TYPE memeloop_token_center_archive_canary_duration_seconds_total counter\nmemeloop_token_center_archive_canary_duration_seconds_total {}",
+            self.elapsed_millis.load(Ordering::Relaxed) as f64 / 1000.0
+        );
+        let _ = writeln!(
+            output,
+            "# TYPE memeloop_token_center_archive_canary_cache_hits_total counter\nmemeloop_token_center_archive_canary_cache_hits_total {}",
+            self.cache_hits.load(Ordering::Relaxed)
+        );
+        output
+    }
 }
 
 impl CanaryFailure {
@@ -96,6 +145,7 @@ impl CanaryFailure {
         Self {
             stage,
             timed_out: false,
+            error_class: "operation_error",
         }
     }
 
@@ -103,6 +153,24 @@ impl CanaryFailure {
         Self {
             stage: progress.current(),
             timed_out: true,
+            error_class: "deadline",
+        }
+    }
+
+    fn storage(stage: CanaryStage, error: object_store::Error) -> Self {
+        let error_class = match error {
+            object_store::Error::PermissionDenied { .. } => "permission_denied",
+            object_store::Error::Unauthenticated { .. } => "unauthenticated",
+            object_store::Error::NotFound { .. } => "not_found",
+            // Generic includes transport and service failures; do not infer a
+            // DNS/connect/TTFB cause by parsing possibly secret-bearing text.
+            object_store::Error::Generic { .. } => "transport_or_service",
+            _ => "operation_error",
+        };
+        Self {
+            stage,
+            timed_out: false,
+            error_class,
         }
     }
 }
@@ -150,10 +218,18 @@ fn readiness_failure() -> AppError {
 }
 
 impl ArchiveStore {
+    pub fn readiness_deadline(&self) -> Duration {
+        self.readiness_deadline
+    }
+
+    pub fn readiness_metrics(&self) -> String {
+        self.readiness_metrics.render()
+    }
+
     pub async fn readiness_check(&self) -> Result<(), AppError> {
         let progress = CanaryProgress::new();
         self.readiness_check_with(
-            READINESS_DEADLINE,
+            self.readiness_deadline,
             progress.clone(),
             self.run_readiness_canary(progress),
         )
@@ -172,6 +248,9 @@ impl ArchiveStore {
         let mut cache = self.readiness.lock().await;
         let now = tokio::time::Instant::now();
         if let Some(result) = cache.cached_result(now) {
+            self.readiness_metrics
+                .cache_hits
+                .fetch_add(1, Ordering::Relaxed);
             return result;
         }
 
@@ -179,12 +258,26 @@ impl ArchiveStore {
             .await
             .unwrap_or_else(|_| Err(CanaryFailure::timeout(&progress)));
         let completed_at = tokio::time::Instant::now();
+        let elapsed = completed_at.duration_since(now);
         match check {
             Ok(()) => {
+                self.readiness_metrics
+                    .observe(CanaryStage::Content, 0, elapsed);
+                tracing::info!(
+                    canary_stage = "complete",
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    deadline_ms = deadline.as_millis() as u64,
+                    "archive readiness canary succeeded"
+                );
                 cache.record_success(completed_at);
                 Ok(())
             }
             Err(failure) => {
+                self.readiness_metrics.observe(
+                    failure.stage,
+                    if failure.timed_out { 2 } else { 1 },
+                    elapsed,
+                );
                 let effective = cache.record_failure(completed_at);
                 let age = cache
                     .last_success_at
@@ -193,6 +286,10 @@ impl ArchiveStore {
                 tracing::warn!(
                     canary_stage = failure.stage.as_str(),
                     timed_out = failure.timed_out,
+                    error_class = failure.error_class,
+                    transport_phase = "opaque",
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    deadline_ms = deadline.as_millis() as u64,
                     retaining_stale_success = effective.is_ok(),
                     stale_success_age_ms = age.as_millis() as u64,
                     failure_grace_remaining_ms = cache
@@ -221,7 +318,7 @@ impl ArchiveStore {
         progress.enter(CanaryStage::List);
         let mut objects = self.inner.list(Some(&readiness_prefix));
         if let Some(first) = objects.next().await {
-            first.map_err(|_| CanaryFailure::operation(CanaryStage::List))?;
+            first.map_err(|error| CanaryFailure::storage(CanaryStage::List, error))?;
         }
         progress.enter(CanaryStage::Put);
         self.inner
@@ -230,26 +327,26 @@ impl ArchiveStore {
                 PutPayload::from_static(READINESS_CANARY),
             )
             .await
-            .map_err(|_| CanaryFailure::operation(CanaryStage::Put))?;
+            .map_err(|error| CanaryFailure::storage(CanaryStage::Put, error))?;
         progress.enter(CanaryStage::Get);
         let read = self
             .inner
             .get(&self.readiness_path)
             .await
-            .map_err(|_| CanaryFailure::operation(CanaryStage::Get));
+            .map_err(|error| CanaryFailure::storage(CanaryStage::Get, error));
         let read = match read {
             Ok(read) => {
                 progress.enter(CanaryStage::Read);
                 read.bytes()
                     .await
-                    .map_err(|_| CanaryFailure::operation(CanaryStage::Read))
+                    .map_err(|error| CanaryFailure::storage(CanaryStage::Read, error))
             }
             Err(error) => Err(error),
         };
         progress.enter(CanaryStage::Delete);
         let delete = self.inner.delete(&self.readiness_path).await;
         let read = read?;
-        delete.map_err(|_| CanaryFailure::operation(CanaryStage::Delete))?;
+        delete.map_err(|error| CanaryFailure::storage(CanaryStage::Delete, error))?;
         if read.as_ref() != READINESS_CANARY {
             progress.enter(CanaryStage::Content);
             return Err(CanaryFailure::operation(CanaryStage::Content));
@@ -273,6 +370,8 @@ mod tests {
                 super::super::ReadinessCache::default(),
             )),
             readiness_path: archive_path("readiness/unit-test.bin").expect("readiness path"),
+            readiness_deadline: READINESS_DEADLINE,
+            readiness_metrics: Arc::default(),
         }
     }
 
@@ -335,6 +434,31 @@ mod tests {
                 "start" | "list" | "put" | "get" | "read" | "delete" | "content"
             ));
         }
+    }
+
+    #[test]
+    fn storage_diagnostics_do_not_guess_transport_phase_or_expose_error_text() {
+        let failure = CanaryFailure::storage(
+            CanaryStage::List,
+            object_store::Error::Generic {
+                store: "secret-endpoint",
+                source: std::io::Error::other("secret-url?credential=secret").into(),
+            },
+        );
+        assert_eq!(failure.error_class, "transport_or_service");
+        assert_eq!(failure.stage.as_str(), "list");
+        assert!(
+            !failure.timed_out,
+            "an opaque source is not evidence of a deadline"
+        );
+        let failure = CanaryFailure::storage(
+            CanaryStage::Put,
+            object_store::Error::PermissionDenied {
+                path: "secret-path".into(),
+                source: std::io::Error::other("secret").into(),
+            },
+        );
+        assert_eq!(failure.error_class, "permission_denied");
     }
 
     #[test]
@@ -487,6 +611,40 @@ mod tests {
     async fn a_startup_canary_timeout_fails_closed_immediately() {
         let store = memory_store();
         assert!(timed_out_canary(&store).await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_deadline_is_observable_and_startup_recovers_after_retry_cache() {
+        let mut store = memory_store();
+        store.readiness_deadline = Duration::from_millis(750);
+        assert_eq!(store.readiness_deadline(), Duration::from_millis(750));
+        let progress = CanaryProgress::new();
+        progress.enter(CanaryStage::List);
+        assert!(
+            store
+                .readiness_check_with(store.readiness_deadline(), progress, std::future::pending())
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .readiness_check_with(store.readiness_deadline(), CanaryProgress::new(), async {
+                    panic!("failure cache must suppress a canary")
+                })
+                .await
+                .is_err()
+        );
+        tokio::time::advance(READINESS_FAILURE_RETRY).await;
+        store
+            .readiness_check()
+            .await
+            .expect("recovered memory canary");
+        let rendered = store.readiness_metrics();
+        assert!(rendered.contains("stage=\"list\",outcome=\"deadline\"} 1"));
+        assert!(rendered.contains("stage=\"content\",outcome=\"success\"} 1"));
+        assert!(rendered.contains("archive_canary_cache_hits_total 1"));
+        assert!(rendered.contains("archive_canary_duration_seconds_total 0.75"));
+        assert!(!rendered.contains("unit-test.bin"));
     }
 
     #[tokio::test(start_paused = true)]

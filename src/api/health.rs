@@ -1,9 +1,6 @@
 use super::*;
 
-// The archive check has its own five-second deadline. Keep one second of
-// headroom here so it can return a deliberate failure instead of being
-// cancelled by the dependency aggregator first. The Helm probe adds one
-// further second around this handler.
+// The database timeout is independent of configurable archive deadlines.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(6);
 
 pub(super) async fn liveness() -> impl IntoResponse {
@@ -58,7 +55,10 @@ pub(super) async fn readiness(State(state): State<AppState>) -> Response {
         .readiness(move || async move {
             let (database, archive) = tokio::join!(
                 tokio::time::timeout(CHECK_TIMEOUT, database.readiness_check()),
-                tokio::time::timeout(CHECK_TIMEOUT, archive.readiness_check()),
+                tokio::time::timeout(
+                    archive.readiness_deadline() + Duration::from_secs(1),
+                    archive.readiness_check()
+                ),
             );
             let database_ready = matches!(database, Ok(Ok(())));
             let archive_ready = matches!(archive, Ok(Ok(())));
@@ -120,7 +120,7 @@ pub(super) async fn prometheus_metrics(
             ),
             (header::CACHE_CONTROL, "no-store"),
         ],
-        state.metrics.render(&runtime),
+        state.metrics.render(&runtime) + &state.archive.readiness_metrics(),
     )
         .into_response())
 }

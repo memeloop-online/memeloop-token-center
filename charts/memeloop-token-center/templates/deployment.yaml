@@ -1,3 +1,10 @@
+{{- $archiveProbeMinimum := add (div (add (int .Values.config.s3.readinessDeadlineMillis) 999) 1000) 2 -}}
+{{- if and (eq .Values.probes.readiness.path "/readyz") (lt (int .Values.probes.readiness.timeoutSeconds) (int $archiveProbeMinimum)) -}}
+{{- fail (printf "probes.readiness.timeoutSeconds must be >= %d for /readyz (archive deadline rounded up plus 2 seconds)" $archiveProbeMinimum) -}}
+{{- end -}}
+{{- if gt (int .Values.config.s3.connectTimeoutMillis) (int .Values.config.s3.requestTimeoutMillis) -}}
+{{- fail "config.s3.connectTimeoutMillis must not exceed requestTimeoutMillis" -}}
+{{- end -}}
 {{- range $role := list "gateway" "control" "worker" "all" }}
 {{- $roleConfig := index $.Values.roles $role }}
 {{- if $roleConfig.enabled }}

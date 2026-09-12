@@ -159,6 +159,8 @@ pub struct Config {
     pub s3_access_key: Option<String>,
     pub s3_secret_key: Option<String>,
     pub s3_allow_http: bool,
+    #[serde(default)]
+    pub s3_timeouts: S3Timeouts,
     pub upstream_openai_url: Option<String>,
     pub upstream_openai_key: Option<String>,
     pub upstream_anthropic_url: Option<String>,
@@ -260,6 +262,52 @@ pub enum ArchiveBackend {
     Memory,
 }
 
+/// Role-independent settings, applied by rolling restart without rebuilding.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct S3Timeouts {
+    pub connect_millis: u32,
+    pub request_millis: u32,
+    pub readiness_millis: u32,
+}
+
+impl Default for S3Timeouts {
+    fn default() -> Self {
+        Self {
+            connect_millis: 5_000,
+            request_millis: 30_000,
+            readiness_millis: 5_000,
+        }
+    }
+}
+
+impl S3Timeouts {
+    fn from_env() -> Result<Self, ConfigError> {
+        let defaults = Self::default();
+        let value = Self {
+            connect_millis: env_u32("MTC_S3_CONNECT_TIMEOUT_MILLIS", defaults.connect_millis)?,
+            request_millis: env_u32("MTC_S3_REQUEST_TIMEOUT_MILLIS", defaults.request_millis)?,
+            readiness_millis: env_u32(
+                "MTC_S3_READINESS_DEADLINE_MILLIS",
+                defaults.readiness_millis,
+            )?,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(self) -> Result<(), ConfigError> {
+        if !(100..=30_000).contains(&self.connect_millis)
+            || !(100..=120_000).contains(&self.request_millis)
+            || !(100..=30_000).contains(&self.readiness_millis)
+            || self.connect_millis > self.request_millis
+        {
+            return Err(ConfigError::InvalidS3Timeouts);
+        }
+        Ok(())
+    }
+}
+
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         let archive_backend = production_archive_backend(&env_string("MTC_ARCHIVE_BACKEND", "s3"))?;
@@ -327,6 +375,7 @@ impl Config {
             s3_access_key: env::var("MTC_S3_ACCESS_KEY").ok(),
             s3_secret_key: env::var("MTC_S3_SECRET_KEY").ok(),
             s3_allow_http: env_bool("MTC_S3_ALLOW_HTTP", false),
+            s3_timeouts: S3Timeouts::from_env()?,
             upstream_openai_url: env::var("MTC_UPSTREAM_OPENAI_URL").ok(),
             upstream_openai_key: env::var("MTC_UPSTREAM_OPENAI_KEY").ok(),
             upstream_anthropic_url: env::var("MTC_UPSTREAM_ANTHROPIC_URL").ok(),
@@ -365,6 +414,7 @@ impl Config {
             s3_access_key: None,
             s3_secret_key: None,
             s3_allow_http: true,
+            s3_timeouts: S3Timeouts::default(),
             upstream_openai_url: None,
             upstream_openai_key: None,
             upstream_anthropic_url: None,
@@ -504,6 +554,10 @@ fn responses_body_read_concurrency(value: u32) -> u32 {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    #[error(
+        "S3 timeouts must be bounded: connect/readiness 100..30000 ms, request 100..120000 ms, connect <= request"
+    )]
+    InvalidS3Timeouts,
     #[error("missing required environment variable {0}")]
     Missing(&'static str),
     #[error("MTC_KEY_PEPPER must contain at least 32 bytes")]
@@ -529,6 +583,56 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn s3_timeout_defaults_and_bounds_are_role_independent() {
+        let defaults = S3Timeouts::default();
+        assert_eq!(
+            (
+                defaults.connect_millis,
+                defaults.request_millis,
+                defaults.readiness_millis
+            ),
+            (5000, 30000, 5000)
+        );
+        assert!(defaults.validate().is_ok());
+        for value in [0, 99, 30_001, u32::MAX] {
+            assert!(
+                S3Timeouts {
+                    connect_millis: value,
+                    ..defaults
+                }
+                .validate()
+                .is_err()
+            );
+            assert!(
+                S3Timeouts {
+                    readiness_millis: value,
+                    ..defaults
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        for value in [0, 99, 120_001, u32::MAX] {
+            assert!(
+                S3Timeouts {
+                    request_millis: value,
+                    ..defaults
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            S3Timeouts {
+                request_millis: 100,
+                ..defaults
+            }
+            .validate()
+            .is_err()
+        );
+    }
 
     #[test]
     fn debug_output_never_contains_runtime_credentials_or_credential_bearing_urls() {

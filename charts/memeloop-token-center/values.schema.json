@@ -201,6 +201,9 @@
             "endpoint": { "type": "string" },
             "region": { "type": "string", "minLength": 1 },
             "allowHttp": { "type": "boolean" },
+            "connectTimeoutMillis": { "type": "integer", "minimum": 100, "maximum": 30000 },
+            "requestTimeoutMillis": { "type": "integer", "minimum": 100, "maximum": 120000 },
+            "readinessDeadlineMillis": { "type": "integer", "minimum": 100, "maximum": 30000 },
             "credentialsSecret": {
               "type": "object",
               "additionalProperties": false,
@@ -512,6 +515,7 @@
       "properties": {
         "startup": { "$ref": "#/definitions/probe" },
         "readiness": {
+          "description": "For /readyz, Helm also enforces timeoutSeconds >= ceil(config.s3.readinessDeadlineMillis / 1000) + 2. /livez does not depend on archive deadlines.",
           "allOf": [
             { "$ref": "#/definitions/probe" },
             {

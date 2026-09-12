@@ -39,6 +39,8 @@ pub struct ArchiveStore {
     inner: Arc<dyn ObjectStore>,
     readiness: Arc<tokio::sync::Mutex<ReadinessCache>>,
     readiness_path: object_store::path::Path,
+    readiness_deadline: Duration,
+    readiness_metrics: Arc<readiness::ReadinessMetrics>,
 }
 
 struct ReadinessCache {

@@ -70,6 +70,12 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
   value: {{ .Values.config.archiveBackend | quote }}
 - name: MTC_S3_BUCKET
   value: {{ .Values.config.s3.bucket | quote }}
+- name: MTC_S3_CONNECT_TIMEOUT_MILLIS
+  value: {{ .Values.config.s3.connectTimeoutMillis | quote }}
+- name: MTC_S3_REQUEST_TIMEOUT_MILLIS
+  value: {{ .Values.config.s3.requestTimeoutMillis | quote }}
+- name: MTC_S3_READINESS_DEADLINE_MILLIS
+  value: {{ .Values.config.s3.readinessDeadlineMillis | quote }}
 - name: MTC_S3_ENDPOINT
   value: {{ .Values.config.s3.endpoint | quote }}
 - name: MTC_S3_REGION

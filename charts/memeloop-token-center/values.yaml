@@ -161,6 +161,11 @@ config:
   # create a single-replica, non-durable archive.
   archiveBackend: s3
   s3:
+    # Shared by all roles; configuration changes need a rolling restart, not a build.
+    # connect/readiness: 100..30000; request: 100..120000; connect <= request.
+    connectTimeoutMillis: 5000
+    requestTimeoutMillis: 30000
+    readinessDeadlineMillis: 5000
     bucket: memeloop-token-center
     endpoint: ""
     region: us-east-1
@@ -272,6 +277,7 @@ probes:
     # process-jittered four-to-five-minute schedule, and retry for a bounded
     # three minutes after the first failure. Kubernetes still needs seven
     # seconds for each five-second canary plus dependency-aggregator headroom.
+    # With /readyz, Helm requires >= ceil(s3 readinessDeadlineMillis / 1000) + 2.
     timeoutSeconds: 7
     failureThreshold: 3
   liveness:
