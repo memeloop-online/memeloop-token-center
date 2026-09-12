@@ -250,6 +250,12 @@ async fn native_kimi_cohort_contract_is_atomic_rotatable_and_secret_free() {
     ] {
         assert!(!response.contains(forbidden));
     }
+    let (status, create_retry, _) =
+        call(&state, "POST", COHORT, &issued.token, Some(&create)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(create_retry["disposition"], "replayed");
+    assert_eq!(create_retry["accounts"][0]["credential_generation"], 1);
+    assert_eq!(create_retry["accounts"][1]["credential_generation"], 1);
     let (status, inventory, _) = call(
         &state,
         "GET",
@@ -283,6 +289,12 @@ async fn native_kimi_cohort_contract_is_atomic_rotatable_and_secret_free() {
     assert_eq!(rotated["disposition"], "rotated");
     assert_eq!(rotated["accounts"][0]["credential_generation"], 2);
     assert_eq!(rotated["accounts"][1]["credential_generation"], 2);
+    let (status, rotation_retry, _) =
+        call(&state, "POST", COHORT, &issued.token, Some(&rotation)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rotation_retry["disposition"], "replayed");
+    assert_eq!(rotation_retry["accounts"][0]["credential_generation"], 2);
+    assert_eq!(rotation_retry["accounts"][1]["credential_generation"], 2);
     let stale = cohort_request(tenant, stale);
     assert_eq!(
         call(&state, "POST", COHORT, &issued.token, Some(&stale))

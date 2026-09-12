@@ -164,12 +164,20 @@ impl Database {
         }
 
         let cohort = native_oauth_cohort_row(self.backend, &mut tx, &tenant_id).await?;
+        let prior_approval_matches = if let Some(row) = cohort.as_ref() {
+            row.try_get::<String, _>("expected_current_cohort_sha256")?
+                == approval.expected_current_cohort_sha256
+                && row.try_get::<String, _>("new_cohort_sha256")? == approval.new_cohort_sha256
+        } else {
+            false
+        };
         let existing_cohort_id = cohort
             .as_ref()
             .map(|row| row.try_get::<String, _>("id"))
             .transpose()?;
         let mut exists = Vec::with_capacity(2);
         let mut changed = Vec::with_capacity(2);
+        let mut current_cas_matches = Vec::with_capacity(2);
         for (_, _, input) in &prepared {
             let row = native_oauth_receipt_row(
                 self.backend,
@@ -189,6 +197,7 @@ impl Database {
                 }
                 exists.push(false);
                 changed.push(false);
+                current_cas_matches.push(false);
                 continue;
             };
             if row.try_get::<String, _>("cohort_id")?
@@ -207,14 +216,22 @@ impl Database {
                     || row.try_get::<String, _>("import_source_document_sha256")?
                         != input.source_document_sha256,
             );
+            current_cas_matches.push(current_cas_matches_account(&row, input)?);
         }
 
         let existing_count = exists.iter().filter(|value| **value).count();
         let changed_count = changed.iter().filter(|value| **value).count();
-        let allowed = matches!(
-            (existing_count, changed_count),
-            (0, 0) | (1, 0) | (2, 0) | (2, 2)
-        );
+        let all_existing_cas_match = exists
+            .iter()
+            .zip(&current_cas_matches)
+            .all(|(exists, matches)| !exists || *matches);
+        let allowed = match (existing_count, changed_count) {
+            (0, 0) => true,
+            (1, 0) => all_existing_cas_match,
+            (2, 0) => all_existing_cas_match || prior_approval_matches,
+            (2, 2) => all_existing_cas_match,
+            _ => false,
+        };
         if !allowed || (existing_count == 0) != cohort.is_none() {
             return Err(AppError::Conflict(
                 "native Kimi OAuth cohort cannot mix rotation, replay, or foreign state".into(),
@@ -437,10 +454,10 @@ async fn native_oauth_cohort_row(
 ) -> Result<Option<sqlx::any::AnyRow>, AppError> {
     let query = match backend {
         DatabaseBackend::PostgreSql => {
-            "SELECT id, updated_at FROM native_oauth_import_cohorts WHERE tenant_id = $1 AND contract = $2 FOR UPDATE"
+            "SELECT id, expected_current_cohort_sha256, new_cohort_sha256, updated_at FROM native_oauth_import_cohorts WHERE tenant_id = $1 AND contract = $2 FOR UPDATE"
         }
         DatabaseBackend::Sqlite => {
-            "SELECT id, updated_at FROM native_oauth_import_cohorts WHERE tenant_id = $1 AND contract = $2"
+            "SELECT id, expected_current_cohort_sha256, new_cohort_sha256, updated_at FROM native_oauth_import_cohorts WHERE tenant_id = $1 AND contract = $2"
         }
     };
     Ok(sqlx::query(query)
@@ -478,16 +495,9 @@ fn validate_existing_kimi_account(
     key_material: &[u8],
 ) -> Result<(), AppError> {
     let account_id: String = row.try_get("id")?;
-    let generation: i64 = row.try_get("credential_generation")?;
     let config: Value = serde_json::from_str(&row.try_get::<String, _>("config_json")?)
         .map_err(|_| AppError::Internal)?;
-    if input.expected_current_account_id.as_deref() != Some(account_id.as_str())
-        || input.expected_current_document_sha256.as_deref()
-            != row
-                .try_get::<Option<String>, _>("import_source_document_sha256")?
-                .as_deref()
-        || input.expected_current_credential_generation != Some(generation)
-        || row.try_get::<i64, _>("ordinal")? != input.ordinal
+    if row.try_get::<i64, _>("ordinal")? != input.ordinal
         || row.try_get::<String, _>("driver")? != crate::oauth::managed::kimi::PROVIDER_DRIVER
         || row.try_get::<String, _>("auth_kind")? != "oauth"
         || row
@@ -524,6 +534,22 @@ fn validate_existing_kimi_account(
     }
     crate::oauth::managed::kimi::validate_credential(&current)
         .map_err(|_| AppError::Conflict("native Kimi OAuth credential shape changed".into()))
+}
+
+fn current_cas_matches_account(
+    row: &sqlx::any::AnyRow,
+    input: &NativeOAuthImportAccountInput,
+) -> Result<bool, AppError> {
+    let account_id: String = row.try_get("id")?;
+    Ok(
+        input.expected_current_account_id.as_deref() == Some(account_id.as_str())
+            && input.expected_current_document_sha256.as_deref()
+                == row
+                    .try_get::<Option<String>, _>("import_source_document_sha256")?
+                    .as_deref()
+            && input.expected_current_credential_generation
+                == Some(row.try_get::<i64, _>("credential_generation")?),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -688,6 +714,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((created.created, created.rotated), (2, 0));
+        let create_retry = db
+            .import_native_kimi_oauth_cohort(created_inputs.clone(), approval(), key)
+            .await
+            .unwrap();
+        assert_eq!((create_retry.created, create_retry.rotated), (0, 0));
 
         let mut current_inputs = created_inputs;
         bind_current(&mut current_inputs, &created.accounts);
@@ -711,6 +742,17 @@ mod tests {
         assert_eq!((rotated.created, rotated.rotated), (0, 2));
         assert!(
             rotated
+                .accounts
+                .iter()
+                .all(|account| account.credential_generation == 2)
+        );
+        let rotation_retry = db
+            .import_native_kimi_oauth_cohort(current_inputs.clone(), approval(), key)
+            .await
+            .unwrap();
+        assert_eq!((rotation_retry.created, rotation_retry.rotated), (0, 0));
+        assert!(
+            rotation_retry
                 .accounts
                 .iter()
                 .all(|account| account.credential_generation == 2)

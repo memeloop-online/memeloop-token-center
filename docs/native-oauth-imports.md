@@ -36,6 +36,10 @@ outcomes:
 - Two changed accounts with matching CAS and approval: rotate both sealed
   credentials and increment both generations (`rotated`, HTTP 200).
 
+An exact retry after a committed create, convergence, or rotation is also
+replayed when its old/new approval pair matches the stored transaction receipt;
+this makes a lost response safe without allowing stale CAS to change data.
+
 Any foreign, legacy, disabled, expired, routed, differently configured, or
 mixed-rotation state returns HTTP 409 and writes nothing. Device identity must
 also remain unchanged during rotation. Accounts are returned in request order;
