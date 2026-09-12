@@ -22,6 +22,8 @@ test('advanced validation remains discoverable without losing field values or mo
     const advanced = page.locator('.operator-form-advanced').filter({ hasText: 'Advanced network' });
     await page.getByLabel('Connection name').waitFor();
     assert.equal(await advanced.getAttribute('open'), null);
+    await page.getByLabel('Required network scope').waitFor({ state: 'visible' });
+    await page.getByLabel('Required video interface').waitFor({ state: 'visible' });
     await page.getByRole('button', { name: 'Save fixture' }).click();
     await timeout.waitFor({ state: 'visible' });
     await timeout.fill('30');
@@ -32,8 +34,6 @@ test('advanced validation remains discoverable without losing field values or mo
     assert.equal(await timeout.inputValue(), '30');
     // Optional capabilities collapse, but adapter-required and unknown plugin
     // fields are never silently hidden. Disclosure retains entered values.
-    await page.getByLabel('Required video interface').waitFor({ state: 'visible' });
-    await page.getByLabel('Required network scope').waitFor({ state: 'visible' });
     await page.getByLabel('Plugin extension').waitFor({ state: 'visible' });
     const capabilities = page.locator('.operator-form-advanced').filter({ hasText: 'Optional capabilities' });
     assert.equal(await capabilities.getAttribute('open'), null);
