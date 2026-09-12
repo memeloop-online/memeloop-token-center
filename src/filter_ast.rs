@@ -50,7 +50,12 @@ pub enum TypedFilterOperator {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+#[serde(
+    tag = "type",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum TypedFilterValue {
     Text(String),
     /// A model remains distinct from generic text in the wire contract.  The

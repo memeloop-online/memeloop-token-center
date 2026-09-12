@@ -47,6 +47,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             get(get_filter_assistant_settings).put(put_filter_assistant_settings),
         )
         .route(
+            "/internal/v1/filter-assistant/billing-choices",
+            get(filter_assistant_billing_choices),
+        )
+        .route(
             "/internal/v1/filter-assistant/plan",
             post(plan_filter_with_assistant),
         )

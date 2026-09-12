@@ -5,6 +5,11 @@ type Variables = Record<string, string | number>;
 
 const zh = {
   'secret.show': '显示', 'secret.hide': '隐藏', 'secret.showField': '显示{{field}}', 'secret.hideField': '隐藏{{field}}', 'secret.value': '敏感值', 'secret.invalidJson': '请输入有效 JSON；敏感内容不会显示在错误中。',
+  'settings.assistantBillingCredential': '计费凭据',
+  'settings.assistantSelectBillingCredential': '选择计费凭据',
+  'settings.assistantBillingHint': '生成建议会消耗此凭据的额度，遵循它的模型授权和预算限制。仅发送输入的筛选意图，不发送请求记录；请勿输入敏感信息。',
+  'settings.assistantNoBillingCredential': '没有可用于此模型的有效凭据，请先配置模型授权。',
+  'settings.assistantExecutionNotEnabled': '尚未启用模型执行。选择计费凭据并保存后，才能生成建议。',
   'connection.baseUrl': '上游 API 地址（Base URL）',
   'connection.capabilitiesSection': '可选能力与用量契约',
   'connection.capabilitiesHint': '仅在使用图片、视频或供应商特有的用量协议时配置。收起不会丢失已填写内容；校验失败会自动展开。',
@@ -468,6 +473,11 @@ const zh = {
 
 const en = {
   'secret.show': 'Show', 'secret.hide': 'Hide', 'secret.showField': 'Show {{field}}', 'secret.hideField': 'Hide {{field}}', 'secret.value': 'Secret value', 'secret.invalidJson': 'Enter valid JSON. Secret contents are not shown in errors.',
+  'settings.assistantBillingCredential': 'Billing credential',
+  'settings.assistantSelectBillingCredential': 'Choose a billing credential',
+  'settings.assistantBillingHint': 'Suggestions consume this credential’s balance and follow its model grants and budget. Only your filter intent is sent, never request records. Do not enter sensitive information.',
+  'settings.assistantNoBillingCredential': 'No active credential can use this model. Configure its model grant first.',
+  'settings.assistantExecutionNotEnabled': 'Model execution is not enabled. Choose a billing credential and save to generate suggestions.',
   'connection.baseUrl': 'Upstream API address (Base URL)',
   'connection.capabilitiesSection': 'Optional capabilities and usage contracts',
   'connection.capabilitiesHint': 'Configure only for images, video, or provider-specific usage contracts. Collapsing preserves your values; validation errors reveal the relevant section.',

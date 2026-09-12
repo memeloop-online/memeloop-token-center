@@ -45,6 +45,7 @@ pub(crate) use archive_spool::{ArchiveSpoolIdentity, ArchiveSpoolTask};
 mod billing;
 mod constants;
 mod credentials;
+mod filter_assistant;
 mod generation;
 mod groups;
 mod migrations;
