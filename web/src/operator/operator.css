@@ -442,6 +442,9 @@
   display: grid;
   gap: 3px;
   justify-items: end;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .provider-availability-state .monitoring-routing-status > small {
@@ -516,7 +519,7 @@
   font-family: Georgia, serif;
   font-size: 20px;
   margin: 5px 0 0;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .provider-recent-attempts {
@@ -570,6 +573,8 @@
   font-size: inherit;
   font-weight: inherit;
   padding: 3px 7px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 @media (width <= 760px) {
@@ -578,6 +583,12 @@
   .provider-availability-state { justify-items: start; }
   .provider-availability-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .provider-recent-attempts time { min-width: 0; }
+  .provider-availability-heading > div { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+  .provider-availability-model-heading { flex-direction: column; }
+  .provider-availability-model-heading .provider-availability-state { justify-items: start; }
+  .provider-attempt-link { min-height: 44px; min-width: 44px; }
+  .provider-recent-attempts > li { border-bottom: 1px solid color-mix(in srgb, currentColor 25%, transparent); gap: 6px 10px; padding-block: 10px; }
+  .provider-recent-attempts time { flex-basis: 100%; }
 }
 
 .account-meta {
