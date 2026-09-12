@@ -680,7 +680,7 @@ pub(super) async fn proxy(
     let primary = route_plan.primary_route();
     // Freeze before reservation and archive work: later candidates/reloads may
     // change account transport settings, never replenish the request budget.
-    let attempt_budget = routing::RequestAttemptBudget::from_primary(primary)?;
+    let attempt_budget = routing::RequestAttemptBudget::from_primary(primary, request_id)?;
     let upstream_account_id = Some(primary.account_id);
     let model_route_id = Some(primary.route_id);
     let price = state.db.model_price(&model, &key.currency).await?;
