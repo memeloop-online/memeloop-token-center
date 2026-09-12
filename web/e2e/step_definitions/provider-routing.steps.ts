@@ -170,8 +170,30 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   await assertContains(providerAccount, '1 条路由');
   await providerAccount.locator('.upstream-health-details > summary').click();
   await providerAccount.locator('.upstream-secondary-actions > summary').click();
+  // The shared seed includes a routed 429. Do not make this UI assertion
+  // depend on whether its real-time breaker cooldown has already elapsed.
+  const healthPath = `/internal/v1/upstreams/${seed.upstreamId}/health`;
+  await page.route((url) => url.pathname === healthPath, async (route) => {
+    assert.equal(route.request().method(), 'POST');
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        account_id: seed.upstreamId,
+        status: 'unhealthy',
+        error_code: 'rate_limited',
+        source: 'routing_state',
+        checked_at: Date.UTC(2026, 0, 1),
+        retry_at: Date.UTC(2026, 0, 1, 0, 1),
+      }),
+    });
+  });
   await providerAccount.getByRole('button', { name: '主动健康检查' }).click();
-  await assertContains(providerAccount, '连接正常');
+  const manualHealth = providerAccount.locator('.provider-manual-health');
+  await assertContains(manualHealth, '上游限流中');
+  await assertContains(manualHealth, '最早重试时间');
+  await assertContains(manualHealth, '未发送额外探测请求');
+  await assertNoCount(manualHealth.locator('.status.ok'));
   const disabledProvider = page.waitForResponse((response) => {
     const url = new URL(response.url());
     return response.request().method() === 'PATCH'
@@ -182,7 +204,7 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   assert.equal((await disabledProvider).status(), 200);
   await page.locator('[data-resource-list-status-filter]').getByRole('button', { name: /显示非正常状态/ }).click();
   await assertContains(providerAccount, '已停用');
-  await assertNotContains(providerAccount, '连接正常');
+  await assertNotContains(providerAccount, '上游限流中');
   await providerAccount.locator('.upstream-danger-zone:not([open]) > summary').click();
   await providerAccount.getByRole('button', { name: '启用', exact: true }).click();
   await assertContains(providerAccount, '正常');
