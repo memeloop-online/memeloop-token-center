@@ -28,7 +28,16 @@
       "exposure": "private-only",
       "authentication": "service credential with metrics:read",
       "in_openapi": true,
-      "exact_paths": ["/metrics", "/version"]
+      "exact_paths": ["/version"]
+    },
+    {
+      "name": "authenticated-observability",
+      "source_role": "observability",
+      "runtime_roles": ["gateway", "control", "all"],
+      "exposure": "authenticated",
+      "authentication": "service credential with metrics:read",
+      "in_openapi": true,
+      "exact_paths": ["/metrics"]
     },
     {
       "name": "control-operator-shell",

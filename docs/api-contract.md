@@ -8,7 +8,7 @@ This guide records endpoint invariants that need prose as well as schemas.
 | Role | Routes | Credential |
 | --- | --- | --- |
 | gateway | `/v1/*`, `/self/v1/*`, `/portal` | Active `mtc_…` client credential |
-| control | `/internal/v1/*`, `/operator`, `/metrics`, `/version` | Bootstrap or persisted `mts_…` service credential |
+| control | `/internal/v1/*`, `/operator`, `/version` | Bootstrap or persisted `mts_…` service credential |
 | gateway, control, all | `/metrics` | Service credential with `metrics:read` |
 | every HTTP role | `/livez`, `/readyz`, deprecated `/healthz`, `/ui-assets/*` | none |
 
