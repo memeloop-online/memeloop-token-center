@@ -414,6 +414,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "bounded latest request per logical session",
         sql: include_str!("../../../migrations/common/0077_request_session_latest.sql"),
     },
+    Migration {
+        version: 78,
+        name: "native OAuth import cohorts",
+        sql: include_str!("../../../migrations/common/0078_native_oauth_import_cohorts.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -813,6 +818,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 77,
         name: "bounded latest request per logical session",
         sql: include_str!("../../../migrations/common/0077_request_session_latest.sql"),
+    },
+    Migration {
+        version: 78,
+        name: "native OAuth import cohorts",
+        sql: include_str!("../../../migrations/common/0078_native_oauth_import_cohorts.sql"),
     },
 ];
 

@@ -1,6 +1,7 @@
 mod accounts;
 mod imports;
 mod model_catalog;
+mod native_oauth_imports;
 mod oauth;
 mod routes;
 
@@ -9,6 +10,9 @@ pub use imports::{NativeCodexUpgradeReport, NativeCodexUpgradeTarget};
 pub use model_catalog::{
     AggregatedUpstreamModelCatalogView, AggregatedUpstreamModelView, DiscoveredUpstreamModel,
     ReplaceModelCatalogResult, UpstreamModelCatalogView, UpstreamModelView,
+};
+pub use native_oauth_imports::{
+    NativeOAuthImportAccountInput, NativeOAuthImportApproval, NativeOAuthImportCohortResult,
 };
 pub use oauth::ReauthorizeUpstreamAccountInput;
 pub use routes::{CreateModelRouteInput, UpdateModelRouteInput};

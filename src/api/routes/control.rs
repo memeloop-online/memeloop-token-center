@@ -132,6 +132,14 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(apply_native_codex_upgrade),
         )
         .route(
+            "/internal/v1/native-oauth-imports/capabilities",
+            get(native_oauth_import_capabilities),
+        )
+        .route(
+            "/internal/v1/native-oauth-imports/kimi-cohort",
+            post(import_native_kimi_oauth_cohort),
+        )
+        .route(
             "/internal/v1/imports/session-archive/quarantine",
             get(list_archive_quarantine),
         )

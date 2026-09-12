@@ -120,7 +120,8 @@ pub use oauth_sessions::{BeginOAuthLoginSession, OAuthLoginClaim, OAuthLoginSess
 pub use providers::{
     AggregatedUpstreamModelCatalogView, AggregatedUpstreamModelView, CreateModelRouteInput,
     CreateUpstreamAccountInput, DiscoveredUpstreamModel, NativeCodexUpgradeReport,
-    NativeCodexUpgradeTarget, ReauthorizeUpstreamAccountInput, ReplaceModelCatalogResult,
+    NativeCodexUpgradeTarget, NativeOAuthImportAccountInput, NativeOAuthImportApproval,
+    NativeOAuthImportCohortResult, ReauthorizeUpstreamAccountInput, ReplaceModelCatalogResult,
     UpdateModelRouteInput, UpdateUpstreamAccountInput, UpstreamModelCatalogView, UpstreamModelView,
 };
 pub use requests::{

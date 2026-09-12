@@ -68,6 +68,14 @@ impl Database {
             .fetch_one(&mut *tx)
             .await?
             .try_get("id")?;
+        if input.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER {
+            super::native_oauth_imports::lock_native_oauth_import_tenant(
+                self.backend,
+                &mut tx,
+                &tenant_id,
+            )
+            .await?;
+        }
         if let Some(session_id) = input.oauth_session_id {
             let existing = sqlx::query(
                 "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation WHERE a.oauth_session_id = $1",
@@ -138,6 +146,8 @@ impl Database {
             proxy_fingerprint: None,
             can_update_transport_proxy: input.driver == crate::oauth::codex_device::PROVIDER_DRIVER
                 && auth_kind == "oauth",
+            import_source_identity_hash: None,
+            import_source_document_sha256: None,
             can_refresh: auth_kind == "oauth"
                 && input.oauth_session_id.is_some()
                 && input.oauth_refresh_url.is_some()
@@ -450,7 +460,7 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         let deleted = sqlx::query(
-            "DELETE FROM upstream_accounts WHERE id = $1 AND tenant_id = $2 AND status = 'disabled' AND updated_at = $3 AND NOT EXISTS (SELECT 1 FROM model_routes r WHERE r.tenant_id = $2 AND (r.upstream_account_id = $1 OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = $1))) AND NOT EXISTS (SELECT 1 FROM upstream_account_imports imported WHERE imported.tenant_id = $2 AND imported.upstream_account_id = $1)",
+            "DELETE FROM upstream_accounts WHERE id = $1 AND tenant_id = $2 AND status = 'disabled' AND updated_at = $3 AND NOT EXISTS (SELECT 1 FROM model_routes r WHERE r.tenant_id = $2 AND (r.upstream_account_id = $1 OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = $1))) AND NOT EXISTS (SELECT 1 FROM upstream_account_imports imported WHERE imported.tenant_id = $2 AND imported.upstream_account_id = $1) AND NOT EXISTS (SELECT 1 FROM native_oauth_import_receipts imported WHERE imported.tenant_id = $2 AND imported.upstream_account_id = $1)",
         )
         .bind(account_id.to_string())
         .bind(tenant_id)
@@ -544,6 +554,8 @@ impl Database {
                    a.name, a.driver, a.auth_kind, a.config_json, a.status,
                    a.credential_generation, a.oauth_session_id, a.oauth_driver,
                    a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at,
+                   receipt.source_identity_hash AS import_source_identity_hash,
+                   receipt.source_document_sha256 AS import_source_document_sha256,
                    COALESCE(route_counts.route_count, 0) AS route_count
             FROM page a
             JOIN tenants t ON t.id = a.tenant_id
@@ -551,6 +563,9 @@ impl Database {
               ON c.upstream_account_id = a.id
              AND c.generation = a.credential_generation
              AND c.revoked_at IS NULL
+            LEFT JOIN native_oauth_import_receipts receipt
+              ON receipt.tenant_id = a.tenant_id
+             AND receipt.upstream_account_id = a.id
             LEFT JOIN page_route_counts route_counts
               ON route_counts.tenant_id = a.tenant_id
              AND route_counts.upstream_account_id = a.id
@@ -611,6 +626,8 @@ impl Database {
                    a.credential_generation, a.oauth_session_id, a.oauth_driver,
                    a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at,
                    c.credential_ciphertext,
+                   receipt.source_identity_hash AS import_source_identity_hash,
+                   receipt.source_document_sha256 AS import_source_document_sha256,
                    COALESCE(route_counts.route_count, 0) AS route_count
             FROM page a
             JOIN tenants t ON t.id = a.tenant_id
@@ -618,6 +635,9 @@ impl Database {
               ON c.upstream_account_id = a.id
              AND c.generation = a.credential_generation
              AND c.revoked_at IS NULL
+            LEFT JOIN native_oauth_import_receipts receipt
+              ON receipt.tenant_id = a.tenant_id
+             AND receipt.upstream_account_id = a.id
             LEFT JOIN page_route_counts route_counts
               ON route_counts.tenant_id = a.tenant_id
              AND route_counts.upstream_account_id = a.id
@@ -691,7 +711,7 @@ where
     E: Executor<'e, Database = Any>,
 {
     let row = sqlx::query(
-        "SELECT (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = $1 AND (r.upstream_account_id = $2 OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = $2))) AS model_route_count, (SELECT COUNT(*) FROM request_records history WHERE history.tenant_id = $1 AND history.upstream_account_id = $2) AS request_history_count, (SELECT COUNT(*) FROM generation_jobs history WHERE history.tenant_id = $1 AND history.upstream_account_id = $2) AS generation_history_count, (SELECT COUNT(*) FROM upstream_account_imports imported WHERE imported.tenant_id = $1 AND imported.upstream_account_id = $2) AS import_count",
+        "SELECT (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = $1 AND (r.upstream_account_id = $2 OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = $2))) AS model_route_count, (SELECT COUNT(*) FROM request_records history WHERE history.tenant_id = $1 AND history.upstream_account_id = $2) AS request_history_count, (SELECT COUNT(*) FROM generation_jobs history WHERE history.tenant_id = $1 AND history.upstream_account_id = $2) AS generation_history_count, ((SELECT COUNT(*) FROM upstream_account_imports imported WHERE imported.tenant_id = $1 AND imported.upstream_account_id = $2) + (SELECT COUNT(*) FROM native_oauth_import_receipts imported WHERE imported.tenant_id = $1 AND imported.upstream_account_id = $2)) AS import_count",
     )
     .bind(tenant_id)
     .bind(account_id.to_string())
@@ -755,6 +775,14 @@ pub(super) fn upstream_account_view(
         proxy_label: None,
         proxy_fingerprint: None,
         can_update_transport_proxy,
+        import_source_identity_hash: row
+            .try_get::<Option<String>, _>("import_source_identity_hash")
+            .ok()
+            .flatten(),
+        import_source_document_sha256: row
+            .try_get::<Option<String>, _>("import_source_document_sha256")
+            .ok()
+            .flatten(),
         can_refresh,
         can_rotate,
         can_reauthorize,
