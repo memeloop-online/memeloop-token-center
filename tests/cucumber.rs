@@ -934,7 +934,9 @@ async fn generation_succeeds(world: &mut TokenCenterWorld) {
     panic!("generation did not complete: {}", world.response);
 }
 
-#[then("the ambiguous Seedance submission fails closed without a second upstream POST")]
+#[then(
+    "the ambiguous Seedance submission stays quarantined without a second upstream POST or refund"
+)]
 async fn seedance_ambiguous_submission_fails_closed(world: &mut TokenCenterWorld) {
     let job_id = world.generation_job_id.expect("generation job id");
     for _ in 0..40 {
@@ -951,9 +953,20 @@ async fn seedance_ambiguous_submission_fails_closed(world: &mut TokenCenterWorld
             .json::<Value>()
             .await
             .expect("ambiguous generation status JSON");
-        if value["status"] == "failed" {
-            assert_eq!(value["error_code"], "submission_outcome_unknown");
-            assert_eq!(value["billed_units"], 0);
+        if value["error_code"] == "shutdown_delivery_unknown"
+            && world
+                .state
+                .as_ref()
+                .expect("test state")
+                .db
+                .generation_quarantine("default", job_id)
+                .await
+                .expect("durable quarantine")
+                .lease_expires_at
+                .is_none()
+        {
+            assert_eq!(value["status"], "submitting");
+            assert_eq!(value["billed_units"], Value::Null);
             assert_eq!(value["cost"], "0");
             assert_eq!(value["result"], Value::Null);
             assert_eq!(value["assets"], json!([]));
@@ -967,7 +980,18 @@ async fn seedance_ambiguous_submission_fails_closed(world: &mut TokenCenterWorld
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
-    assert_eq!(world.response["error_code"], "submission_outcome_unknown");
+    assert_eq!(world.response["error_code"], "shutdown_delivery_unknown");
+    let key = world
+        .client
+        .get(format!("{}/self/v1/key", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("key after ambiguous delivery")
+        .json::<Value>()
+        .await
+        .expect("key JSON after ambiguous delivery");
+    assert_eq!(key["available_balance"], "9.5");
     let requests = world
         .mock
         .as_ref()
@@ -1120,10 +1144,21 @@ async fn malicious_seedance_job_id_is_rejected(world: &mut TokenCenterWorld) {
             .json::<Value>()
             .await
             .expect("malicious id generation JSON");
-        if value["status"] == "failed" {
-            assert_eq!(value["error_code"], "submission_outcome_unknown");
+        if value["error_code"] == "shutdown_delivery_unknown"
+            && world
+                .state
+                .as_ref()
+                .expect("test state")
+                .db
+                .generation_quarantine("default", job_id)
+                .await
+                .expect("durable quarantine")
+                .lease_expires_at
+                .is_none()
+        {
+            assert_eq!(value["status"], "submitting");
             assert_eq!(value["upstream_job_id"], Value::Null);
-            assert_eq!(value["billed_units"], 0);
+            assert_eq!(value["billed_units"], Value::Null);
             assert_eq!(value["cost"], "0");
             assert_eq!(value["assets"], json!([]));
             assert_eq!(value["result"], Value::Null);
@@ -1139,6 +1174,17 @@ async fn malicious_seedance_job_id_is_rejected(world: &mut TokenCenterWorld) {
                 .expect("stored malicious id generation");
             assert_eq!(stored.upstream_job_id, None);
             assert!(!format!("{stored:?}").contains("invalid-upstream-id-secret"));
+            let key = world
+                .client
+                .get(format!("{}/self/v1/key", world.service_url))
+                .bearer_auth(&world.current_key)
+                .send()
+                .await
+                .expect("key after invalid provider ACK")
+                .json::<Value>()
+                .await
+                .expect("key JSON after invalid provider ACK");
+            assert_eq!(key["available_balance"], "9.5");
             let posts = world
                 .mock
                 .as_ref()
