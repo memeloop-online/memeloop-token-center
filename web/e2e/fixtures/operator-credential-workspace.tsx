@@ -3,8 +3,13 @@ import { createRoot } from 'react-dom/client';
 
 import { I18nProvider } from '../../src/i18n';
 import { CredentialsPage, ServiceCredentialsPage } from '../../src/operator/pages/ManagementPages';
+import keyCreateSchema from '../../../schemas/key-create.schema.json';
+import keyPolicySchema from '../../../schemas/key-policy.schema.json';
+import '../../src/styles.css';
+import '../../src/theme.css';
+import '../../src/operator/operator.css';
 
-type Scenario = 'all-tenants' | 'route-failure' | 'scope-race' | 'scope-lock' | 'client-recovery' | 'service-plaintext' | 'service-scope-aba';
+type Scenario = 'all-tenants' | 'route-failure' | 'scope-race' | 'scope-lock' | 'client-recovery' | 'service-plaintext' | 'service-scope-aba' | 'client-form';
 
 interface RecordedRequest {
   method: string;
@@ -13,6 +18,7 @@ interface RecordedRequest {
   credentials?: RequestCredentials;
   referrerPolicy?: ReferrerPolicy;
   hasSignal: boolean;
+  body?: string;
 }
 
 interface FixtureState {
@@ -137,11 +143,12 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     credentials: init?.credentials,
     referrerPolicy: init?.referrerPolicy,
     hasSignal: Boolean(init?.signal),
+    ...(scenario === 'client-form' && typeof init?.body === 'string' ? { body: init.body } : {}),
   });
   if (url.pathname === '/internal/v1/schemas') {
     return json({
-      key_create: { type: 'object', properties: {} },
-      key_policy: { type: 'object', properties: {} },
+      key_create: scenario === 'client-form' ? keyCreateSchema : { type: 'object', properties: {} },
+      key_policy: scenario === 'client-form' ? keyPolicySchema : { type: 'object', properties: {} },
       service_token: { type: 'object', properties: {} },
     });
   }
@@ -162,6 +169,13 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   }]);
   if (url.pathname === '/internal/v1/keys/key-recovery/credential-recovery/copy' && method === 'POST') {
     return json({ key_id: 'key-recovery', credential_generation: 1, key: 'mts_client_recovered' });
+  }
+  if (scenario === 'client-form') {
+    if (url.pathname === '/internal/v1/route-groups') return json([{ id: '00000000-0000-4000-8000-000000000002', name: 'Research group', member_ids: [], member_count: 0, created_at: 1, updated_at: 1 }]);
+    if (url.pathname === '/internal/v1/model-routes') return json([{ id: '00000000-0000-4000-8000-000000000001', public_model: 'Research model', enabled: true, tenant_external_id: 'tenant-a' }]);
+    if (url.pathname === '/internal/v1/keys' && method === 'POST') return json({ key_id: 'key-created', key: 'mts_fixture_created' });
+    if (url.pathname === '/internal/v1/keys/key-form/policy' && method === 'PUT') return json({});
+    if (url.pathname === '/internal/v1/keys') return json([credential('Editable client', 'tenant-a', 'key-form')]);
   }
   if (url.pathname.endsWith('credential-groups') || url.pathname.endsWith('route-groups')) return json([]);
   if (url.pathname === '/internal/v1/model-routes') {
@@ -197,6 +211,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
 
 function Fixture() {
   const [tenant, setTenant] = useState(initialTenant);
+  if (scenario === 'client-form') return <main style={{ maxWidth: 760, margin: '0 auto', padding: 12 }}><CredentialsPage token="mts_fixture" tenant={tenant} /></main>;
   if (scenario === 'service-plaintext' || scenario === 'service-scope-aba') {
     return <>
       {scenario === 'service-scope-aba' && <button type="button" onClick={() => setTenant((current) => current === 'tenant-a' ? 'tenant-b' : 'tenant-a')}>Switch tenant</button>}
