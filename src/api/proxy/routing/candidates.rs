@@ -1,5 +1,31 @@
 use super::*;
 
+pub(in crate::api::proxy) fn retain_pinned_text_candidates(
+    state: &AppState,
+    pinned_route: Option<Uuid>,
+    candidates: &mut Vec<AuthorizedUpstreamCandidate>,
+) -> Result<(), AppError> {
+    let Some(route_id) = pinned_route else {
+        return Ok(());
+    };
+    candidates.retain(|candidate| {
+        candidate.route_id == route_id
+            && state
+                .providers
+                .get(&candidate.driver)
+                .is_some_and(|provider| {
+                    provider
+                        .modalities
+                        .iter()
+                        .any(|modality| modality == "text")
+                })
+    });
+    if candidates.is_empty() {
+        return Err(AppError::Forbidden);
+    }
+    Ok(())
+}
+
 pub(in crate::api::proxy) fn candidate_reservation_bounds(
     planned: &PlannedProxyRoute,
     original_body_length: usize,

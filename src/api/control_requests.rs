@@ -441,7 +441,7 @@ pub(super) async fn plan_filter_with_assistant(
     headers: HeaderMap,
     Json(body): Json<FilterAssistantPlanBody>,
 ) -> Result<impl IntoResponse, AppError> {
-    let service = require_service(&headers, &state, "requests:read").await?;
+    let service = require_service(&headers, &state, "filter_assistant:execute").await?;
     let tenant = required_filter_tenant(&service, body.tenant_external_id)?;
     validate_assistant_prompt(&body.prompt)?;
     let settings = load_filter_assistant_settings(&state, &tenant)
