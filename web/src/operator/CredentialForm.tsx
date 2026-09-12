@@ -34,13 +34,37 @@ export const credentialCreateUiSchema: UiSchema = {
   policy: credentialPolicyUiSchema,
 };
 
+// RJSF normalizes definitions when retrieving a form schema; references to
+// draft-2020 $defs can otherwise survive without their root definition during
+// validation. Inline these three known leaf definitions at the form boundary,
+// preserving the service constraints and nullable budget values unchanged.
+function inlineBudgetDefinitions(policy: RJSFSchema, root: RJSFSchema): RJSFSchema {
+  const decimal = root.$defs?.decimal;
+  if (!decimal || typeof decimal !== 'object') return policy;
+  const properties = { ...policy.properties };
+  for (const name of ['daily_budget', 'weekly_budget', 'lifetime_budget']) {
+    const field = properties[name];
+    if (field && typeof field === 'object' && field.$ref === '#/$defs/decimal') {
+      const { $ref: _reference, ...metadata } = field;
+      properties[name] = { ...decimal, ...metadata };
+    }
+  }
+  return { ...policy, properties };
+}
+
+export function credentialPolicySchema(schema: RJSFSchema): RJSFSchema {
+  return inlineBudgetDefinitions(schema, schema);
+}
+
 // Routing is owned by the named comboboxes and injected into the request.
 // Remove only those root fields; leave policy and future plugin fields intact.
 export function credentialCreateSchema(schema: RJSFSchema): RJSFSchema {
   const routingFields = new Set(['route_ids', 'route_group_ids']);
+  const properties = Object.fromEntries(Object.entries(schema.properties ?? {}).filter(([name]) => !routingFields.has(name)));
+  if (properties.policy && typeof properties.policy === 'object') properties.policy = inlineBudgetDefinitions(properties.policy, schema);
   return {
     ...schema,
-    properties: Object.fromEntries(Object.entries(schema.properties ?? {}).filter(([name]) => !routingFields.has(name))),
+    properties,
     required: schema.required?.filter((name) => !routingFields.has(name)),
   };
 }

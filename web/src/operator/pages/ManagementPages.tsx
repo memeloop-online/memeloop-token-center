@@ -29,7 +29,7 @@ import { UpstreamAvailability } from '../UpstreamAvailability';
 import { UpstreamQuota } from '../UpstreamQuota';
 import { connectionSchema, isPrivateProxyUrl, ProxyInput, UpstreamConnection } from '../UpstreamConnection';
 import { upstreamFormTemplates } from '../UpstreamFormTemplates';
-import { credentialCreateSchema, credentialCreateUiSchema, credentialFormFields, credentialPolicyUiSchema } from '../CredentialForm';
+import { credentialCreateSchema, credentialCreateUiSchema, credentialFormFields, credentialPolicySchema, credentialPolicyUiSchema } from '../CredentialForm';
 import { upstreamAvailabilityPath, type UpstreamAvailabilityWindow } from '../upstreamAvailabilityWindow';
 import { useOperatorResource, type ResourceState } from '../hooks/useOperatorResource';
 import { useInlineEditorFocus } from '../hooks/useInlineEditorFocus';
@@ -836,7 +836,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const credentialGroups = useGroups('credential', token, writeTenant);
   const routeGroups = useGroups('route', token, writeTenant);
   const createFormSchema = useMemo(() => createSchema ? credentialCreateSchema(createSchema as RJSFSchema) : undefined, [createSchema]);
-  const policyFormSchema = policySchema;
+  const policyFormSchema = useMemo(() => policySchema ? credentialPolicySchema(policySchema as RJSFSchema) : undefined, [policySchema]);
   const ownsKeyRequest = (request: { identity: KeyListRequestIdentity; controller: AbortController }) => ownsKeyListRequest(keyRequest.current?.identity, request.identity)
     && scopeGeneration.current === request.identity.scopeGeneration
     && scopeRef.current.token === token && scopeRef.current.tenant === tenant;
