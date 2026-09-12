@@ -165,8 +165,6 @@ fn build_codex_http_client_with_policy(
         .build();
     wreq::Client::builder()
         .connect_timeout(Duration::from_millis(policy.connect_timeout_millis))
-        .read_timeout(Duration::from_millis(policy.read_timeout_millis))
-        .timeout(Duration::from_millis(policy.request_timeout_millis))
         .redirect(wreq::redirect::Policy::none())
         // Responses POSTs are not safe for an HTTP client's implicit retry.
         // Candidate failover remains explicit and pre-delivery in the proxy.

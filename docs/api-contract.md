@@ -68,8 +68,11 @@ prepared inference requests without a service release; changing them never
 changes the fixed destination or encrypted per-account proxy binding.
 The same policy accepts `connect_timeout_millis` (100–60000; default 5000),
 `read_timeout_millis` (1000–1260000; default 600000, maximum inactivity between
-reads), and `request_timeout_millis` (1000–1260000; default 1260000, including
-the response body). Connect and read timeouts cannot exceed the request timeout.
+response-body reads after headers arrive), and `request_timeout_millis`
+(1000–1260000; default 1260000, one absolute budget from send through the
+complete response body). Connect timeout must be lower than the request timeout;
+read timeout cannot exceed the request timeout. Connect and read timeouts apply
+to independent phases and otherwise do not constrain one another.
 Clients are bounded and keyed by account transport revision, proxy fingerprint,
 and timeout values. Each prepared send keeps its client snapshot across its
 permitted connection retries. Updates do not extend the request's original

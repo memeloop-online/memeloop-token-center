@@ -83,6 +83,8 @@ async fn set_policy(fixture: &CodexRouteFixture, policy: Value) {
         json!({"failover_deadline_millis": 999}),
         json!({"retry_503": true}),
         json!({"read_timeout_millis": 2000, "request_timeout_millis": 1000}),
+        json!({"connect_timeout_millis": 1000, "read_timeout_millis": 1000,
+            "request_timeout_millis": 1000}),
     ] {
         let mut rejected = update.clone();
         rejected["expected_updated_at"] = saved["updated_at"].clone();

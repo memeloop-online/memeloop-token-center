@@ -345,13 +345,16 @@ impl ProviderCatalog {
                     "default": 1
                 },
                 "connect_timeout_millis": {
-                    "type": "integer", "minimum": 100, "maximum": 60000, "default": 5000
+                    "type": "integer", "minimum": 100, "maximum": 60000, "default": 5000,
+                    "description": "Pre-delivery connection deadline; must be lower than the total request timeout."
                 },
                 "read_timeout_millis": {
-                    "type": "integer", "minimum": 1000, "maximum": 1260000, "default": 600000
+                    "type": "integer", "minimum": 1000, "maximum": 1260000, "default": 600000,
+                    "description": "Maximum inactivity between response-body reads after headers arrive."
                 },
                 "request_timeout_millis": {
-                    "type": "integer", "minimum": 1000, "maximum": 1260000, "default": 1260000
+                    "type": "integer", "minimum": 1000, "maximum": 1260000, "default": 1260000,
+                    "description": "One absolute budget from send through the complete response body."
                 },
                 "candidate_attempts": {
                     "type": "integer",
