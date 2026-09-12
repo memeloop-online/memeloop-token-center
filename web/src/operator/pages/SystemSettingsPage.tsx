@@ -3,9 +3,9 @@ import { api } from '../../api';
 import { CopyButton } from '../../CopyButton.js';
 import { useI18n } from '../../i18n';
 import { ModelPicker } from '../../ModelPicker';
-import type { FilterAssistantSettings, GroupView, ModelRouteView, UpstreamAccount } from '../../types';
-import { filterAssistantRoutes, routeModelOptions } from '../modelCatalog';
-import { messageOf, queryForTenant } from '../scope/operatorShared';
+import type { FilterAssistantSettings } from '../../types';
+import { assistantRouteCatalog, type ModelPickerProjectionItem, type ModelPickerProjectionPage } from '../modelCatalog';
+import { messageOf } from '../scope/operatorShared';
 
 export interface OperatorAccessSettingsProps {
   credentialInput: string;
@@ -42,6 +42,25 @@ export function OperatorAccessSettings({ credentialInput, credential, authentica
   </article>;
 }
 
+async function loadAssistantRouteCatalog(token: string, tenant: string): Promise<ModelPickerProjectionItem[]> {
+  const data: ModelPickerProjectionItem[] = [];
+  const seenCursors = new Set<string>();
+  let cursor: string | null = null;
+  do {
+    const query = new URLSearchParams({ tenant_external_id: tenant, selection_kind: 'route', limit: '100' });
+    if (cursor) query.set('cursor', cursor);
+    const page = await api<ModelPickerProjectionPage>(`/internal/v1/model-picker-options?${query}`, token);
+    if (page.contract_version !== 'model_picker_projection_v1' || !Array.isArray(page.data)) {
+      throw new Error('Unexpected model-picker catalog contract');
+    }
+    data.push(...page.data);
+    cursor = page.next_cursor;
+    if (cursor && seenCursors.has(cursor)) throw new Error('Repeated model-picker catalog cursor');
+    if (cursor) seenCursors.add(cursor);
+  } while (cursor);
+  return data;
+}
+
 /**
  * Tenant-scoped system policy for the natural-language filter assistant.
  * The API intentionally stores only a stable model-route UUID; it neither
@@ -49,9 +68,7 @@ export function OperatorAccessSettings({ credentialInput, credential, authentica
  */
 export function SystemSettingsPage({ token, tenant }: { token: string; tenant: string; writeTenant?: string }) {
   const { t } = useI18n();
-  const [routes, setRoutes] = useState<ModelRouteView[]>([]);
-  const [upstreams, setUpstreams] = useState<UpstreamAccount[]>([]);
-  const [groups, setGroups] = useState<GroupView[]>([]);
+  const [catalogItems, setCatalogItems] = useState<ModelPickerProjectionItem[]>([]);
   const [settings, setSettings] = useState<FilterAssistantSettings | null>();
   const [selectedRouteId, setSelectedRouteId] = useState('');
   const [loading, setLoading] = useState(false);
@@ -60,25 +77,23 @@ export function SystemSettingsPage({ token, tenant }: { token: string; tenant: s
   const [loadError, setLoadError] = useState('');
   const [message, setMessage] = useState('');
   const loadSequence = useRef(0);
-  const assistantOptions = routeModelOptions(routes, upstreams, groups, t('modelPicker.unknown'), 'route');
+  const { options: assistantOptions, unverifiedRoutes } = assistantRouteCatalog(catalogItems);
+  const selectedRouteIsVerified = !selectedRouteId || assistantOptions.some((option) => option.value === selectedRouteId);
   const selectedRouteHasAvailableCandidate = !selectedRouteId || assistantOptions.some((option) => option.value === selectedRouteId && !option.disabled);
+  const selectedUnverifiedRoute = unverifiedRoutes.find((route) => route.value === selectedRouteId);
 
   const load = useCallback(async () => {
     const request = ++loadSequence.current;
     setError(''); setLoadError(''); setMessage('');
-    if (!token || !tenant) { setRoutes([]); setSettings(undefined); setLoading(false); return; }
+    if (!token || !tenant) { setCatalogItems([]); setSettings(undefined); setLoading(false); return; }
     setLoading(true);
     try {
-      const [nextRoutes, nextSettings, nextUpstreams, nextGroups] = await Promise.all([
-        api<ModelRouteView[]>(`/internal/v1/model-routes${queryForTenant(tenant)}`, token),
+      const [nextCatalogItems, nextSettings] = await Promise.all([
+        loadAssistantRouteCatalog(token, tenant),
         api<FilterAssistantSettings | null>(`/internal/v1/filter-assistant/settings?tenant_external_id=${encodeURIComponent(tenant)}`, token),
-        api<UpstreamAccount[]>(`/internal/v1/upstreams${queryForTenant(tenant)}`, token),
-        api<GroupView[]>(`/internal/v1/provider-groups${queryForTenant(tenant)}`, token),
       ]);
       if (request !== loadSequence.current) return;
-      const enabled = filterAssistantRoutes(nextRoutes);
-      setRoutes(enabled); setSettings(nextSettings); setSelectedRouteId(nextSettings?.model_route_id ?? '');
-      setUpstreams(nextUpstreams); setGroups(nextGroups);
+      setCatalogItems(nextCatalogItems); setSettings(nextSettings); setSelectedRouteId(nextSettings?.model_route_id ?? '');
     } catch (reason) {
       if (request !== loadSequence.current) return;
       const nextError = messageOf(reason, t('common.requestFailed'));
@@ -125,10 +140,12 @@ export function SystemSettingsPage({ token, tenant }: { token: string; tenant: s
           </div>
           {settings && <span className="status ok">{t('settings.configured')}</span>}
         </div>
-        {loading ? <div className="empty" role="status">{t('common.loading')}</div> : loadError ? <div className="settings-empty" role="alert"><b>{t('settings.filterAssistantLoadFailed')}</b><span>{loadError}</span><button type="button" className="secondary" onClick={() => void load()}>{t('common.retry')}</button></div> : routes.length === 0 ? <div className="settings-empty"><b>{t('settings.noEnabledRoute')}</b><span>{t('settings.noEnabledRouteHint')}</span></div> : <form className="system-settings-form" onSubmit={(event) => { event.preventDefault(); void save(); }}>
-          <div><ModelPicker label={t('settings.filterAssistantRoute')} popupLabel={t('settings.filterAssistantRoute')} value={selectedRouteId} onChange={setSelectedRouteId} disabled={saving} options={assistantOptions} describedBy="filter-assistant-route-hint" /><small id="filter-assistant-route-hint">{t('settings.assistantTextHint')}</small>{selectedRouteId && !selectedRouteHasAvailableCandidate && <small className="error-text" role="alert">{t('settings.assistantTextUnavailable')}</small>}</div>
+        {loading ? <div className="empty" role="status">{t('common.loading')}</div> : loadError ? <div className="settings-empty" role="alert"><b>{t('settings.filterAssistantLoadFailed')}</b><span>{loadError}</span><button type="button" className="secondary" onClick={() => void load()}>{t('common.retry')}</button></div> : assistantOptions.length === 0 ? <div className="settings-empty"><b>{t('settings.noEnabledRoute')}</b><span>{t('settings.noEnabledRouteHint')}</span></div> : <form className="system-settings-form" onSubmit={(event) => { event.preventDefault(); void save(); }}>
+          <div><ModelPicker label={t('settings.filterAssistantRoute')} popupLabel={t('settings.filterAssistantRoute')} value={selectedRouteIsVerified ? selectedRouteId : ''} onChange={setSelectedRouteId} disabled={saving} options={assistantOptions} describedBy="filter-assistant-route-hint" /><small id="filter-assistant-route-hint">{t('settings.assistantTextHint')}</small>{selectedRouteId && !selectedUnverifiedRoute && !selectedRouteHasAvailableCandidate && <small className="error-text" role="alert">{t('settings.assistantTextUnavailable')}</small>}</div>
           <button type="submit" disabled={saving || !selectedRouteId || !selectedRouteHasAvailableCandidate}>{saving ? t('common.loading') : t('common.save')}</button>
         </form>}
+        {!loading && !loadError && selectedUnverifiedRoute && <p className="error-text" role="alert">{t('settings.assistantTextSelectedUnverified', { model: selectedUnverifiedRoute.label })}</p>}
+        {!loading && !loadError && unverifiedRoutes.length > 0 && <p className="settings-status-note" role="status">{t('settings.assistantTextUnverified', { count: unverifiedRoutes.length })}</p>}
         {settings === null && !loadError && <p className="settings-status-note">{t('settings.filterAssistantNotConfigured')}</p>}
       </article>
     </>}

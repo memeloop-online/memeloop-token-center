@@ -1,17 +1,30 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import { filterAssistantRoutes, routeModelOptions } from '../src/operator/modelCatalog.js';
+import { assistantRouteCatalog, routeModelOptions, type ModelPickerProjectionItem } from '../src/operator/modelCatalog.js';
 import type { GroupView, ModelRouteView, UpstreamAccount } from '../src/types.js';
 
-test('assistant excludes non-text transports and explicit non-text model purposes even behind aliases', () => {
-  const routes = ['openai', 'anthropic', 'openai-image', 'generation', 'embedding', 'future-unknown'].map((protocol) => ({ id: protocol, protocol, enabled: true, public_model: 'same-model-name' } as ModelRouteView));
-  routes.push({ ...routes[0], id: 'disabled', enabled: false });
-  assert.deepEqual(filterAssistantRoutes(routes).map((route) => route.id), ['openai', 'anthropic']);
-  assert.equal(routes.length, 7, 'traffic catalogs keep the original non-text routes');
-  const models = ['qwen3.7-text-embedding', 'gpt-image-2', 'bge-reranker-v2', 'whisper-1', 'gpt-5.6-sol', 'qwen3.8-max'];
-  const aliased = models.map((upstream_model) => ({ ...routes[0], id: upstream_model, public_model: 'friendly-alias', upstream_model }));
-  assert.deepEqual(filterAssistantRoutes(aliased).map((route) => route.id), ['gpt-5.6-sol', 'qwen3.8-max']);
+test('assistant admits only catalog-proven text sources and never infers capability from model names', () => {
+  const item = (value: string, label: string, upstreamModel: string, modalities: string[], status: ModelPickerProjectionItem['sources'][number]['catalog']['status'] = 'ready', listed = true): ModelPickerProjectionItem => ({
+    selection: { kind: 'route', route_id: value }, value, label,
+    sources: [{
+      route_id: value,
+      provider: { id: 'provider', label: 'Provider', protocols: ['openai'], modalities },
+      provider_groups: [{ id: 'group', label: 'Group' }],
+      account: { id: 'account', label: 'Account' },
+      configuration_availability: { status: 'available', reasons: [] },
+      catalog: { status, model_listed: listed },
+      capabilities: { route_protocol: 'openai', upstream_model: upstreamModel, catalog_model_listed: listed },
+    }],
+  });
+  const catalog = assistantRouteCatalog([
+    item('legal-text-alias', 'image-analysis-assistant', 'legal-text-alias', ['text']),
+    item('known-moderation', 'friendly-helper', 'omni-moderation-latest', ['text', 'embedding', 'image']),
+    item('known-embedding', 'friendly-helper', 'embeddinggemma-300m', ['text', 'embedding', 'image']),
+    item('custom-name', 'custom-chat-name', 'custom-chat-name', ['text'], 'never_observed', false),
+  ]);
+  assert.deepEqual(catalog.options.map((option) => option.value), ['legal-text-alias'], 'a legitimate text alias containing “image” is admitted by evidence, not its name');
+  assert.deepEqual(catalog.unverifiedRoutes.map((route) => route.value), ['known-moderation', 'known-embedding', 'custom-name']);
 });
 
 test('model hierarchy uses actual account membership, excludes removed accounts, and preserves route/public IDs', () => {
@@ -55,7 +68,9 @@ test('filter-assistant choice exposes configuration availability without probing
   assert.match(settings, /selectedRouteHasAvailableCandidate/);
   assert.match(settings, /assistantTextUnavailable/);
   assert.match(settings, /describedBy="filter-assistant-route-hint"/);
-  assert.match(catalog, /credentialExpiresAt|credential_expires_at/);
+  assert.match(catalog, /source\.provider\.modalities\.length === 1/);
+  assert.match(catalog, /source\.catalog\.status === 'ready'/);
+  assert.doesNotMatch(catalog, /embeddings\?|rerank|whisper|transcri/);
   assert.match(catalog, /health: 'unknown'/);
   assert.match(catalog, /disabled: !available/);
   assert.doesNotMatch(settings, /\/health|\/models\/sync|filter-assistant\/plan/);

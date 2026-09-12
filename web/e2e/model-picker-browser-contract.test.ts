@@ -72,10 +72,18 @@ test('filters are non-modal themed popovers and model selection is searchable by
     await filter.getByRole('button', { name: 'Apply filters', exact: true }).click();
     assert.equal(await page.locator('[data-filter-model]').textContent(), 'production-model');
     context.diagnostic('checking settings provider/account autocomplete');
+    assert.match(await page.locator('.system-settings').getByRole('alert').textContent() ?? '', /configured route .friendly-custom-chat. lacks verifiable text-generation capability evidence/i);
+    assert.doesNotMatch(await page.locator('.system-settings .model-picker-trigger').textContent() ?? '', /route-custom/, 'an unverified stored route must not leak a raw route ID into the picker');
     await page.locator('.system-settings .model-picker-trigger').click();
     const settingsCatalog = page.locator('.system-settings .shared-model-popover');
     await settingsCatalog.getByRole('combobox').fill('only');
     assert.equal(await settingsCatalog.getByRole('option').count(), 0, 'non-conversational routes never appear in assistant suggestions');
+    await settingsCatalog.getByRole('combobox').fill('omni-moderation-latest');
+    assert.equal(await settingsCatalog.getByRole('option').count(), 0, 'known moderation models remain excluded without relying on a name pattern');
+    await settingsCatalog.getByRole('combobox').fill('image-analysis-assistant');
+    assert.equal(await settingsCatalog.getByRole('option').count(), 1, 'a catalog-proven text alias is not rejected because its name contains image');
+    await settingsCatalog.getByRole('combobox').fill('friendly-custom-chat');
+    assert.equal(await settingsCatalog.getByRole('option').count(), 0, 'an unobserved custom name is not treated as capability evidence');
     await settingsCatalog.getByRole('combobox').fill('Research account');
     await settingsCatalog.getByRole('option').first().click();
     assert.match(await page.locator('.system-settings .model-picker-trigger').textContent() ?? '', /research-model/);
@@ -89,6 +97,7 @@ test('filters are non-modal themed popovers and model selection is searchable by
     await settingsCatalog.getByRole('combobox').press('Enter');
     await settingsCatalog.waitFor({ state: 'hidden' });
     assert.match(await page.locator('.system-settings .model-picker-trigger').textContent() ?? '', /production-model/, 'Enter skips an unavailable first result and chooses the first available route');
+    assert.match(await page.locator('.system-settings').getByRole('status').last().textContent() ?? '', /5 routes are omitted.+custom model name is not capability evidence/i);
     assert.deepEqual(pageErrors, [], 'model picker interactions must not produce page errors');
   } finally {
     await browser.close();
