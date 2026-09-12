@@ -411,7 +411,10 @@ async fn runtime_management_rejects_scoped_credentials_and_forged_candidate_fiel
             .db
             .create_service_token(
                 crate::db::CreateServiceTokenInput {
-                    name: "runtime-management".into(),
+                    name: format!(
+                        "runtime-management-{}",
+                        tenant.as_deref().unwrap_or("global")
+                    ),
                     scopes: if tenant.is_some() {
                         vec!["plugins:write".into()]
                     } else {
