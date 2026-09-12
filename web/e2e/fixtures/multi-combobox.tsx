@@ -11,7 +11,7 @@ function Fixture() {
   const [query, setQuery] = useState('');
   const [error, setError] = useState(false);
   return <main style={{ padding: 24, maxWidth: 600, margin: '0 auto' }}>
-    <h1>Resource selection</h1>
+    <h1 onMouseDown={(event) => event.preventDefault()}>Resource selection</h1>
     <button onClick={() => setError(true)}>Simulate unavailable search</button>
     <div style={{ overflow: 'hidden', height: 160, padding: 8, marginTop: 40 }}>
       <MultiCombobox label="Workspaces" options={options} value={selected} onChange={setSelected}

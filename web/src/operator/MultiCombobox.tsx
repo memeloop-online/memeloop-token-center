@@ -58,6 +58,15 @@ export function MultiCombobox({
   const expanded = open && !disabled;
   const { anchor, panel, position } = useAnchoredPopover<HTMLDivElement>(expanded, true);
   const rows = useMemo(() => rowsForQuery(options, value, query, allowCreate), [options, value, query, allowCreate]);
+  const openFromControl = () => {
+    if (disabled) return;
+    inputRef.current?.focus();
+    setOpen(true);
+    // Pointer light-dismiss may close the native layer before React receives its
+    // queued toggle event. Reopen the existing panel even when state is still true.
+    const element = panel.current;
+    if (element && !element.matches(':popover-open')) element.showPopover();
+  };
   useEffect(() => { setActiveIndex(-1); }, [options, value]);
   useEffect(() => {
     if (expanded && activeIndex >= 0) panel.current?.querySelector(`#${CSS.escape(`${id}-option-${activeIndex}`)}`)?.scrollIntoView({ block: 'nearest' });
@@ -93,7 +102,7 @@ export function MultiCombobox({
   return <div className={`multi-combobox${disabled ? ' disabled' : ''}`}>
     <label id={`${id}-label`} htmlFor={`${id}-input`}>{label}</label>
     {hint && <small className="field-hint" id={`${id}-hint`}>{hint}</small>}
-    <div ref={anchor} className="multi-combobox-control" onClick={() => inputRef.current?.focus()}>
+    <div ref={anchor} className="multi-combobox-control" onClick={openFromControl}>
       {value.map((item) => <span className={`selection-chip${item.created ? ' pending' : ''}`} key={item.value}>
         <span className="selection-chip-label">{item.label}</span>
         <button type="button" disabled={disabled} aria-label={removeLabel(item.label)} onClick={(event) => {
@@ -123,7 +132,11 @@ export function MultiCombobox({
       />
     </div>
     {expanded && <section ref={panel} className="combobox-popover multi-combobox-popover" popover="auto" tabIndex={-1} style={position}
-      onToggle={(event) => { if (event.target === event.currentTarget && event.newState === 'closed') setOpen(false); }}
+      onToggle={(event) => {
+        // Ignore a queued close from a panel that has since reopened or unmounted.
+        if (event.target === event.currentTarget && panel.current === event.currentTarget
+          && event.newState === 'closed' && !event.currentTarget.matches(':popover-open')) setOpen(false);
+      }}
       onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget) && event.relatedTarget !== inputRef.current) setOpen(false); }}>
       <div className="combobox-options" id={`${id}-listbox`} role="listbox" aria-labelledby={`${id}-label`} aria-busy={loading}>
         {rows.map((item, index) => <button

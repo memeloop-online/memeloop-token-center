@@ -19,6 +19,19 @@ test('multi-select escapes clipping and supports keyboard selection, dismissal a
     const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/multi-combobox.html`);
     const input = page.getByRole('combobox', { name: 'Workspaces' });
+    const menu = page.locator('.multi-combobox-popover');
+    for (let click = 0; click < 3; click += 1) {
+      await input.click();
+      await page.locator('.multi-combobox-popover:popover-open').waitFor();
+      assert.equal(await input.getAttribute('aria-expanded'), 'true');
+    }
+    // An outside pointer click dismisses the native layer without moving focus.
+    await page.getByRole('heading', { name: 'Resource selection' }).click();
+    await menu.waitFor({ state: 'hidden' });
+    assert.equal(await input.evaluate(element => element === document.activeElement), true);
+    await input.click();
+    await page.locator('.multi-combobox-popover:popover-open').waitFor();
+    assert.equal(await input.getAttribute('aria-expanded'), 'true');
     await input.fill('Workspace 2');
     await input.press('ArrowDown');
     await input.press('Enter');
@@ -28,7 +41,6 @@ test('multi-select escapes clipping and supports keyboard selection, dismissal a
     await input.press('Enter');
     assert.equal(await page.getByLabel('Selected count').innerText(), '1', 'closed Enter must not silently select another resource');
     await input.press('ArrowDown');
-    const menu = page.locator('.multi-combobox-popover');
     assert.equal(await menu.evaluate(element => element.matches(':popover-open')), true);
     const bounds = await menu.boundingBox();
     assert.ok(bounds && bounds.x >= 8 && bounds.x + bounds.width <= 382);
