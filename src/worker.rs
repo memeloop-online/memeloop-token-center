@@ -1,6 +1,6 @@
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::{sync::watch, task::JoinSet};
 use uuid::Uuid;
 
 use crate::{
@@ -22,147 +22,238 @@ pub async fn run(state: AppState) {
     drop(shutdown_sender);
 }
 
-/// Runs the worker roles with a shutdown signal that can be shared by the
-/// server supervisor. The archive reaper is its own Tokio task, so a slow
-/// generation provider never delays cleanup claims.
-pub async fn run_until_shutdown(state: AppState, mut shutdown: watch::Receiver<bool>) {
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
+/// Each role owns one bounded, serial lane. Slow provider calls do not block
+/// projections, maintenance, or observing the server shutdown signal.
+pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>) {
     if *shutdown.borrow() {
         return;
     }
+    let (role_stop, role_shutdown) = watch::channel(false);
+    let mut roles = JoinSet::new();
     let worker_id = format!("worker-{}", Uuid::now_v7());
     let projection_owner = Uuid::now_v7();
     let reaper_owner = ArchiveStagingLeaseOwner::new(format!("archive-reaper-{}", Uuid::now_v7()))
         .expect("reaper owner is canonical safe ASCII");
     let reaper = ArchiveReaper::new(state.db.clone(), state.archive.clone(), reaper_owner);
-    let reaper_shutdown = shutdown.clone();
-    let mut reaper_task = AbortTaskOnDrop::new(tokio::spawn(async move {
+    let reaper_shutdown = role_shutdown.clone();
+    roles.spawn(async move {
         reaper.run(reaper_shutdown).await;
-    }));
+        "archive_reaper"
+    });
     let spool_state = state.clone();
-    let spool_shutdown = shutdown.clone();
-    let mut spool_task = AbortTaskOnDrop::new(tokio::spawn(async move {
+    let spool_shutdown = role_shutdown.clone();
+    roles.spawn(async move {
         crate::response_archive_spool::run(spool_state, spool_shutdown).await;
-    }));
-    let mut maintenance = tokio::time::interval(MAINTENANCE_INTERVAL);
-    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut orphaned_reservation_reaper =
-        tokio::time::interval(ORPHANED_RESERVATION_REAPER_INTERVAL);
-    orphaned_reservation_reaper.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut generations = tokio::time::interval(GENERATION_INTERVAL);
-    generations.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut projections = tokio::time::interval(PROJECTION_INTERVAL);
-    projections.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut oauth_refresh = tokio::time::interval(OAUTH_REFRESH_INTERVAL);
-    oauth_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    break;
+        "response_spool"
+    });
+
+    // No spawn-per-tick: generation remains single-flight and OAuth remains serial.
+    macro_rules! periodic {
+        ($name:literal, $period:expr, $operation:expr) => {{
+            let state = state.clone();
+            let shutdown = role_shutdown.clone();
+            roles.spawn(async move {
+                let operation = $operation;
+                run_periodic($period, shutdown.clone(), || operation(&state, &shutdown)).await;
+                $name
+            });
+        }};
+    }
+    periodic!(
+        "maintenance",
+        MAINTENANCE_INTERVAL,
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            if let Err(error) = state.db.maintain_partitions().await {
+                tracing::error!(%error, "worker failed to maintain PostgreSQL partitions");
+            }
+            match state.db.expire_key_provisioning_responses(1_000).await {
+                Ok(expired) if expired > 0 => {
+                    tracing::info!(
+                        expired,
+                        "worker expired encrypted key provisioning responses"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(%error, "worker failed to expire key provisioning responses");
                 }
             }
-            _ = maintenance.tick() => {
-                if let Err(error) = state.db.maintain_partitions().await {
-                    tracing::error!(%error, "worker failed to maintain PostgreSQL partitions");
+            match state.db.delete_expired_rate_windows(100_000).await {
+                Ok(deleted) if deleted > 0 => {
+                    tracing::info!(deleted, "worker deleted expired rate limit windows");
                 }
-                match state.db.expire_key_provisioning_responses(1_000).await {
-                    Ok(expired) if expired > 0 => {
-                        tracing::info!(expired, "worker expired encrypted key provisioning responses");
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::error!(%error, "worker failed to expire key provisioning responses");
-                    }
-                }
-                match state.db.delete_expired_rate_windows(100_000).await {
-                    Ok(deleted) if deleted > 0 => {
-                        tracing::info!(deleted, "worker deleted expired rate limit windows");
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::error!(%error, "worker failed to delete expired rate limit windows");
-                    }
-                }
-                match state.db.delete_expired_budget_rollups(100_000).await {
-                    Ok(deleted) if deleted > 0 => {
-                        tracing::info!(deleted, "worker deleted expired budget rollup detail");
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::error!(%error, "worker failed to delete expired budget rollup detail");
-                    }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(%error, "worker failed to delete expired rate limit windows");
                 }
             }
-            _ = orphaned_reservation_reaper.tick() => {
-                match state.db.release_orphaned_reservations(100).await {
-                    Ok(released) if released > 0 => {
-                        tracing::warn!(released, "worker released orphaned usage reservations");
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::error!(%error, "worker failed to release orphaned usage reservations");
-                    }
+            match state.db.delete_expired_budget_rollups(100_000).await {
+                Ok(deleted) if deleted > 0 => {
+                    tracing::info!(deleted, "worker deleted expired budget rollup detail");
                 }
-            }
-            _ = generations.tick() => {
-                match state.db.expire_preparing_generation_jobs(100).await {
-                    Ok(expired) if expired > 0 => {
-                        tracing::warn!(expired, "worker refunded expired generation archive preparations");
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::error!(%error, "worker failed to expire generation archive preparations");
-                    }
-                }
-                if let Err(error) = generation::process_one(&state, &worker_id).await {
-                    tracing::error!(%error, "worker failed to claim or update a generation job");
-                }
-            }
-            _ = projections.tick() => {
-                process_metered_usage_projection_batch(&state, projection_owner).await;
-                process_conversation_projection_batch(&state, projection_owner).await;
-            }
-            _ = oauth_refresh.tick() => {
-                let refresh_before = crate::db::unix_millis()
-                    .saturating_add(OAUTH_REFRESH_AHEAD_MILLIS);
-                match state.db.list_managed_oauth_refresh_candidates(refresh_before, 20).await {
-                    Ok(accounts) => {
-                        for (account_id, generation) in accounts {
-                            let idempotency_key = format!(
-                                "oauth-worker-{}-generation-{}",
-                                account_id,
-                                generation
-                            );
-                            if let Err(error) = api::refresh_managed_upstream_oauth(
-                                &state,
-                                account_id,
-                                &idempotency_key,
-                            )
-                            .await
-                            {
-                                tracing::warn!(%error, %account_id, "worker failed to refresh managed OAuth credential");
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, "worker failed to list expiring managed OAuth credentials");
-                    }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(%error, "worker failed to delete expired budget rollup detail");
                 }
             }
         }
-    }
+    );
+    periodic!(
+        "orphaned_reservations",
+        ORPHANED_RESERVATION_REAPER_INTERVAL,
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            match state.db.release_orphaned_reservations(100).await {
+                Ok(released) if released > 0 => {
+                    tracing::warn!(released, "worker released orphaned usage reservations");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(%error, "worker failed to release orphaned usage reservations");
+                }
+            }
+        }
+    );
+    periodic!(
+        "generation",
+        GENERATION_INTERVAL,
+        async |state: &AppState, shutdown: &watch::Receiver<bool>| {
+            match state.db.expire_preparing_generation_jobs(100).await {
+                Ok(expired) if expired > 0 => {
+                    tracing::warn!(
+                        expired,
+                        "worker refunded expired generation archive preparations"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(%error, "worker failed to expire generation archive preparations");
+                }
+            }
+            if let Err(error) =
+                generation::process_one_until_shutdown(state, &worker_id, shutdown.clone()).await
+            {
+                tracing::error!(%error, "worker failed to claim or update a generation job");
+            }
+        }
+    );
+    periodic!(
+        "metered_projection",
+        PROJECTION_INTERVAL,
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            process_metered_usage_projection_batch(state, projection_owner).await;
+        }
+    );
+    periodic!(
+        "conversation_projection",
+        PROJECTION_INTERVAL,
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            process_conversation_projection_batch(state, projection_owner).await;
+        }
+    );
+    periodic!(
+        "oauth_refresh",
+        OAUTH_REFRESH_INTERVAL,
+        async |state: &AppState, shutdown: &watch::Receiver<bool>| {
+            let refresh_before =
+                crate::db::unix_millis().saturating_add(OAUTH_REFRESH_AHEAD_MILLIS);
+            match state
+                .db
+                .list_managed_oauth_refresh_candidates(refresh_before, 20)
+                .await
+            {
+                Ok(accounts) => {
+                    for (account_id, generation) in accounts {
+                        if *shutdown.borrow() {
+                            break;
+                        }
+                        let idempotency_key =
+                            format!("oauth-worker-{}-generation-{}", account_id, generation);
+                        if let Err(error) = api::refresh_managed_upstream_oauth(
+                            state,
+                            account_id,
+                            &idempotency_key,
+                        )
+                        .await
+                        {
+                            tracing::warn!(%error, %account_id, "worker failed to refresh managed OAuth credential");
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "worker failed to list expiring managed OAuth credentials");
+                }
+            }
+        }
+    );
+    supervise_roles(roles, role_stop, shutdown, SHUTDOWN_GRACE).await;
+}
 
-    if reaper_task.join().await.is_err() {
-        tracing::error!(
-            error_code = "reaper_task_failed",
-            "archive staging reaper task failed"
-        );
+/// Finish the current operation on shutdown, but never start another tick.
+async fn run_periodic<F, Fut>(
+    period: Duration,
+    mut shutdown: watch::Receiver<bool>,
+    mut operation: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let mut ticks = tokio::time::interval(period);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown) => return,
+            _ = ticks.tick() => operation().await,
+        }
     }
-    if spool_task.join().await.is_err() {
-        tracing::error!(
-            stage = "response_spool_worker",
-            "response archive worker stopped"
-        );
+}
+
+pub(crate) async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn supervise_roles(
+    mut roles: JoinSet<&'static str>,
+    role_stop: watch::Sender<bool>,
+    mut shutdown: watch::Receiver<bool>,
+    grace: Duration,
+) {
+    tokio::select! {
+        biased;
+        _ = wait_for_shutdown(&mut shutdown) => {},
+        result = roles.join_next() => {
+            tracing::error!(?result, "worker role exited unexpectedly; stopping worker roles");
+        }
+    }
+    let _ = role_stop.send(true);
+    // One shared deadline, not one grace period per role. JoinSet aborts on
+    // supervisor cancellation too, so no detached provider/lease loops survive.
+    let deadline = tokio::time::sleep(grace);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut deadline => {
+                tracing::warn!("worker shutdown deadline reached; aborting remaining roles");
+                roles.abort_all();
+                while roles.join_next().await.is_some() {}
+                return;
+            }
+            result = roles.join_next() => match result {
+                None => return,
+                Some(Err(error)) => tracing::error!(%error, "worker role failed during shutdown"),
+                Some(Ok(_)) => {},
+            },
+        }
     }
 }
 
@@ -244,32 +335,9 @@ async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uu
     }
 }
 
-struct AbortTaskOnDrop {
-    handle: Option<JoinHandle<()>>,
-}
-
-impl AbortTaskOnDrop {
-    fn new(handle: JoinHandle<()>) -> Self {
-        Self {
-            handle: Some(handle),
-        }
-    }
-
-    async fn join(&mut self) -> Result<(), tokio::task::JoinError> {
-        self.handle
-            .take()
-            .expect("reaper task is joined once")
-            .await
-    }
-}
-
-impl Drop for AbortTaskOnDrop {
-    fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
-        }
-    }
-}
+#[cfg(test)]
+#[path = "worker/supervision_tests.rs"]
+mod supervision_tests;
 
 #[cfg(test)]
 mod tests {
