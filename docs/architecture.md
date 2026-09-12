@@ -184,9 +184,17 @@ lifecycle without reducing upstream routing concurrency.
 ## Observability and logical conversations
 
 Request records and append-only started/finished events are committed with the
-request lifecycle. Realtime monitoring resumes through PostgreSQL cursors rather
-than process-local fanout. Request lists and statistics use bounded keyset
-pagination, facts and rollups.
+request lifecycle. Metered-unlimited conversation projection additionally emits
+an append-only projected event in the same transaction that makes its session
+semantics queryable. Realtime monitoring resumes through PostgreSQL cursors
+rather than process-local fanout. Request lists and statistics use bounded
+keyset pagination, facts and rollups.
+
+The global event cursor is allocated transactionally: PostgreSQL writers share
+one advisory transaction lock, while SQLite writers begin with `BEGIN
+IMMEDIATE`. Both backends read the latest cursor through the global
+`(event_at, event_id)` index, and the locator and event commit or roll back
+together.
 
 Session construction has two evidence levels:
 

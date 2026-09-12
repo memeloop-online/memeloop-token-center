@@ -146,7 +146,7 @@ impl Database {
         }
         let now = unix_millis();
         let preparation_expires_at = now.saturating_add(GENERATION_PREPARATION_LEASE_MILLIS);
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
 
         if let Some(idempotency) = idempotency {
             match self.backend {
@@ -267,32 +267,23 @@ impl Database {
                 .ok_or(AppError::Internal);
         }
 
-        let event_id = Uuid::now_v7().to_string();
         let tenant_id = input.key.tenant_id.to_string();
         let key_id = input.key.key_id.to_string();
         let request_id = input.job_id.to_string();
-        if claim_request_event_locator(
-            &mut transaction,
-            &event_id,
-            now,
-            &tenant_id,
-            &key_id,
-            &request_id,
+        let event =
+            allocate_request_event_cursor(&mut transaction, now, &tenant_id, &key_id, &request_id)
+                .await?;
+        sqlx::query(
+            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, 'started', 'generation', $6, 0, 0, 0)",
         )
-        .await?
-        {
-            sqlx::query(
-                "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, 'started', 'generation', $6, 0, 0, 0)",
-            )
-            .bind(&event_id)
-            .bind(&tenant_id)
-            .bind(&key_id)
-            .bind(&request_id)
-            .bind(now)
-            .bind(&input.public_model)
-            .execute(&mut *transaction)
-            .await?;
-        }
+        .bind(&event.event_id)
+        .bind(&tenant_id)
+        .bind(&key_id)
+        .bind(&request_id)
+        .bind(event.event_at)
+        .bind(&input.public_model)
+        .execute(&mut *transaction)
+        .await?;
         transaction.commit().await?;
         Ok(CreateGenerationJobResult::Created(GenerationJobView {
             job_id: input.job_id,
@@ -565,7 +556,7 @@ impl Database {
     ) -> Result<GenerationJobView, AppError> {
         validate_generation_preparation_error(error_code)?;
         let now = unix_millis();
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let locked = sqlx::query(
             "UPDATE generation_jobs SET updated_at = updated_at WHERE id = $1 AND key_id = $2 AND status = 'preparing'",
         )
@@ -594,7 +585,7 @@ impl Database {
     /// request CAS was attached. RPM remains charged for the admitted attempt.
     pub async fn expire_preparing_generation_jobs(&self, limit: i64) -> Result<u64, AppError> {
         let now = unix_millis();
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT id FROM generation_jobs WHERE status = 'preparing' AND lease_expires_at <= $1 ORDER BY lease_expires_at, id FOR UPDATE SKIP LOCKED LIMIT $2"
@@ -641,7 +632,7 @@ impl Database {
             validate_generation_job_idempotency(idempotency)?;
         }
         let now = unix_millis();
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let inserted = sqlx::query(
             "INSERT INTO generation_jobs (id, tenant_id, key_id, upstream_account_id, reservation_id, public_model, upstream_model, driver, status, request_object, estimated_units, billing_unit_snapshot, micros_per_unit_snapshot, client_idempotency_key, request_hash, next_attempt_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'queued', $9, $10, $11, $12, $13, $14, $15, $16, $17) ON CONFLICT(key_id, client_idempotency_key) DO NOTHING",
         )
@@ -687,32 +678,23 @@ impl Database {
             }
             return Ok(CreateGenerationJobResult::Replayed(replayed));
         }
-        let event_id = Uuid::now_v7().to_string();
         let tenant_id = input.key.tenant_id.to_string();
         let key_id = input.key.key_id.to_string();
         let request_id = input.job_id.to_string();
-        if claim_request_event_locator(
-            &mut transaction,
-            &event_id,
-            now,
-            &tenant_id,
-            &key_id,
-            &request_id,
+        let event =
+            allocate_request_event_cursor(&mut transaction, now, &tenant_id, &key_id, &request_id)
+                .await?;
+        sqlx::query(
+            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, 'started', 'generation', $6, 0, 0, 0)",
         )
-        .await?
-        {
-            sqlx::query(
-                "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, 'started', 'generation', $6, 0, 0, 0)",
-            )
-            .bind(&event_id)
-            .bind(&tenant_id)
-            .bind(&key_id)
-            .bind(&request_id)
-            .bind(now)
-            .bind(&input.public_model)
-            .execute(&mut *transaction)
-            .await?;
-        }
+        .bind(&event.event_id)
+        .bind(&tenant_id)
+        .bind(&key_id)
+        .bind(&request_id)
+        .bind(event.event_at)
+        .bind(&input.public_model)
+        .execute(&mut *transaction)
+        .await?;
         transaction.commit().await?;
         Ok(CreateGenerationJobResult::Created(GenerationJobView {
             job_id: input.job_id,
@@ -825,7 +807,7 @@ impl Database {
         job_id: Uuid,
     ) -> Result<GenerationJobView, AppError> {
         let now = unix_millis();
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT j.status, j.lease_owner, j.lease_expires_at, j.staged_assets_json, j.created_at, j.tenant_id, j.public_model, r.id AS reservation_id, r.account_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1 AND j.key_id = $2 FOR UPDATE"
@@ -939,32 +921,28 @@ impl Database {
             ));
         }
         aggregate_terminal_generation_job(&mut transaction, &job_id.to_string(), now).await?;
-        let event_id = Uuid::now_v7().to_string();
         let key_id_string = key_id.to_string();
         let request_id = job_id.to_string();
-        if claim_request_event_locator(
+        let event = allocate_request_event_cursor(
             &mut transaction,
-            &event_id,
             now,
             &tenant_id,
             &key_id_string,
             &request_id,
         )
-        .await?
-        {
-            sqlx::query(
-                "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) VALUES ($1, $2, $3, $4, $5, 'finished', 'generation', $6, 499, $7, 0, 0, 0, 'cancelled_by_user')",
-            )
-            .bind(&event_id)
-            .bind(&tenant_id)
-            .bind(&key_id_string)
-            .bind(&request_id)
-            .bind(now)
-            .bind(public_model)
-            .bind(now.saturating_sub(created_at))
-            .execute(&mut *transaction)
-            .await?;
-        }
+        .await?;
+        sqlx::query(
+            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) VALUES ($1, $2, $3, $4, $5, 'finished', 'generation', $6, 499, $7, 0, 0, 0, 'cancelled_by_user')",
+        )
+        .bind(&event.event_id)
+        .bind(&tenant_id)
+        .bind(&key_id_string)
+        .bind(&request_id)
+        .bind(event.event_at)
+        .bind(public_model)
+        .bind(now.saturating_sub(created_at))
+        .execute(&mut *transaction)
+        .await?;
         transaction.commit().await?;
         self.generation_job(key_id, job_id).await
     }
@@ -1390,25 +1368,23 @@ async fn fail_preparing_generation_in_transaction(
         ));
     }
     aggregate_terminal_generation_job(tx, &job_id.to_string(), now).await?;
-    let event_id = Uuid::now_v7().to_string();
     let tenant_id: String = row.try_get("tenant_id")?;
     let key_id = key_id.to_string();
     let request_id = job_id.to_string();
-    if claim_request_event_locator(tx, &event_id, now, &tenant_id, &key_id, &request_id).await? {
-        sqlx::query(
-            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) VALUES ($1, $2, $3, $4, $5, 'finished', 'generation', $6, 502, $7, 0, 0, 0, $8)",
-        )
-        .bind(&event_id)
-        .bind(&tenant_id)
-        .bind(&key_id)
-        .bind(&request_id)
-        .bind(now)
-        .bind(row.try_get::<String, _>("public_model")?)
-        .bind(now.saturating_sub(row.try_get("created_at")?))
-        .bind(error_code)
-        .execute(&mut **tx)
-        .await?;
-    }
+    let event = allocate_request_event_cursor(tx, now, &tenant_id, &key_id, &request_id).await?;
+    sqlx::query(
+        "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) VALUES ($1, $2, $3, $4, $5, 'finished', 'generation', $6, 502, $7, 0, 0, 0, $8)",
+    )
+    .bind(&event.event_id)
+    .bind(&tenant_id)
+    .bind(&key_id)
+    .bind(&request_id)
+    .bind(event.event_at)
+    .bind(row.try_get::<String, _>("public_model")?)
+    .bind(now.saturating_sub(row.try_get("created_at")?))
+    .bind(error_code)
+    .execute(&mut **tx)
+    .await?;
     Ok(true)
 }
 

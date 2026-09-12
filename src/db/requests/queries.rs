@@ -939,11 +939,11 @@ fn enriched_request_events_sql(events: &str) -> String {
     format!(
         r#"WITH events AS MATERIALIZED ({events})
 SELECT e.*, COALESCE(r.created_at, g.created_at) AS created_at,
-       CASE WHEN e.event_kind = 'finished' THEN COALESCE(r.completed_at, g.completed_at) ELSE NULL END AS completed_at,
+       CASE WHEN e.event_kind IN ('finished', 'projected') THEN COALESCE(r.completed_at, g.completed_at) ELSE NULL END AS completed_at,
        COALESCE(r.upstream_account_id, g.upstream_account_id) AS upstream_account_id,
        COALESCE(r.model_route_id, g.model_route_id) AS route_id, r.currency,
-       CASE WHEN e.event_kind = 'finished' THEN r.cached_input_tokens ELSE NULL END AS cached_input_tokens,
-       CASE WHEN e.event_kind = 'finished' THEN r.cache_write_tokens ELSE NULL END AS cache_write_tokens,
+       CASE WHEN e.event_kind IN ('finished', 'projected') THEN r.cached_input_tokens ELSE NULL END AS cached_input_tokens,
+       CASE WHEN e.event_kind IN ('finished', 'projected') THEN r.cache_write_tokens ELSE NULL END AS cache_write_tokens,
        r.conversation_cluster_id AS session_id,
        CASE WHEN r.id IS NULL THEN NULL
             WHEN r.conversation_cluster_id IS NULL THEN 'unlinked'

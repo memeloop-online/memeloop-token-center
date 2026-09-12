@@ -371,6 +371,9 @@ async fn metered_usage_projection_is_exactly_once_and_skips_prepaid_hot_rows() {
     let request_json = serde_json::json!({"input": [{"role": "user", "content": "metered"}]});
     let hints = ConversationHints {
         session_id: Some("metered-projection-session".to_owned()),
+        session_name: Some("Projected session".to_owned()),
+        agent_id: Some("codex-worker".to_owned()),
+        task_kind: Some("background".to_owned()),
         ..ConversationHints::default()
     };
     database
@@ -401,6 +404,15 @@ async fn metered_usage_projection_is_exactly_once_and_skips_prepaid_hot_rows() {
         })
         .await
         .unwrap();
+    assert!(
+        database
+            .request_events_after("metered-projection", 0, None, 500)
+            .await
+            .unwrap()
+            .iter()
+            .all(|event| event.event_kind != "projected"),
+        "the session change event must not be visible before projection commits"
+    );
 
     // Project conversation first to force the cross-queue order in which the
     // session projector has already materialized this fact before the metered
@@ -417,6 +429,39 @@ async fn metered_usage_projection_is_exactly_once_and_skips_prepaid_hot_rows() {
             .await
             .unwrap()
     );
+    assert!(
+        !database
+            .project_claimed_conversation_projection_task(conversation_projector, request_id)
+            .await
+            .unwrap(),
+        "an acknowledged task must not project or publish twice"
+    );
+    let events = database
+        .request_events_after("metered-projection", 0, None, 500)
+        .await
+        .unwrap();
+    let projected = events
+        .iter()
+        .filter(|event| event.event_kind == "projected")
+        .collect::<Vec<_>>();
+    assert_eq!(projected.len(), 1);
+    let projected = projected[0];
+    assert_eq!(projected.request_id, request_id);
+    assert_eq!(projected.status_code, Some(200));
+    let context = projected.session_context.as_ref().unwrap();
+    assert_eq!(context.association, RequestSessionAssociation::Confirmed);
+    assert_eq!(context.session_name.as_deref(), Some("Projected session"));
+    assert_eq!(context.agent_id.as_deref(), Some("codex-worker"));
+    assert_eq!(context.task_kind.as_deref(), Some("background"));
+    let public_event = serde_json::to_value(projected).unwrap();
+    for forbidden in [
+        "request_body",
+        "response_body",
+        "request_object",
+        "response_object",
+    ] {
+        assert!(public_event.get(forbidden).is_none());
+    }
 
     let projector = Uuid::now_v7();
     let tasks = database

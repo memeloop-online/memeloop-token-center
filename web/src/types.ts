@@ -89,7 +89,7 @@ export interface RequestEvent {
   event_id: string;
   request_id: string;
   event_at: number;
-  event_kind: 'started' | 'finished';
+  event_kind: 'started' | 'finished' | 'projected';
   created_at?: number | null;
   completed_at?: number | null;
   upstream_account_id?: string | null;

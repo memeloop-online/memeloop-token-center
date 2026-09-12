@@ -268,15 +268,18 @@ Then('Codex 上报的会话名称、代理层级和任务分类进入真实语�
   await card.getByRole('button', { name: /^打开 / }).click();
   const drawer = page.getByRole('dialog');
   await visible(drawer);
-  const text = await drawer.textContent() ?? '';
-  assert.match(text, /语义执行图.*Codex release dogfood/s);
-  assert.match(text, /codex-root/);
-  assert.match(text, /codex-worker/);
-  assert.match(text, /interactive.*background/s);
-  assert.match(text, /4bf92f3577b34da6a3ce929d0e0e4736/);
-  assert.match(text, /browser-e2e/);
-  assert.match(text, /browser-codex-semantic-session/);
-  assert.match(text, /耗时条形图/);
+  await eventually(async () => {
+    assert.equal(await drawer.locator('.session-event').count(), 4);
+    const text = await drawer.textContent() ?? '';
+    assert.match(text, /语义执行图.*Codex release dogfood/s);
+    assert.match(text, /codex-root/);
+    assert.match(text, /codex-worker/);
+    assert.match(text, /interactive.*background/s);
+    assert.match(text, /4bf92f3577b34da6a3ce929d0e0e4736/);
+    assert.match(text, /browser-e2e/);
+    assert.match(text, /browser-codex-semantic-session/);
+    assert.match(text, /耗时条形图/);
+  }, 5_000, 'projected session semantics did not converge in the open drawer');
   await drawer.getByRole('button', { name: '关闭', exact: true }).click();
 });
 

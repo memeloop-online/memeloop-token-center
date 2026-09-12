@@ -123,8 +123,6 @@ pub use providers::{
     NativeCodexUpgradeTarget, ReauthorizeUpstreamAccountInput, ReplaceModelCatalogResult,
     UpdateModelRouteInput, UpdateUpstreamAccountInput, UpstreamModelCatalogView, UpstreamModelView,
 };
-#[cfg(test)]
-pub(crate) use requests::claim_request_record_locator;
 pub use requests::{
     AttachProxyArchiveResult, ConversationDetailFilter, ConversationListFilter,
     ConversationProjectionTask, FinishProxyRequest, FinishProxyRequestResult, FinishRequest,
@@ -135,7 +133,7 @@ pub use requests::{
 };
 pub(crate) use requests::{
     ConversationObservationInput, MAX_STATS_RANGE_MILLIS, SwitchProxyCandidateInput,
-    attach_conversation_upstream_response_in_transaction, claim_request_event_locator,
+    allocate_request_event_cursor, attach_conversation_upstream_response_in_transaction,
     price_token_usage, proxy_contract_ceiling_micros, record_request_finished_in_transaction,
     record_request_started_in_transaction, reserve_usage_in_transaction, search_prefix,
     settle_token_usage_in_transaction, settle_token_usage_in_transaction_with_charge,
@@ -145,6 +143,10 @@ pub(crate) use requests::{
 pub(crate) use requests::{
     FILTERED_ACTIVITY_SOURCE_FACTS, FILTERED_ACTIVITY_SOURCE_PENDING,
     FILTERED_ACTIVITY_SOURCE_ROLLUPS,
+};
+#[cfg(test)]
+pub(crate) use requests::{
+    RequestEventCursor, claim_request_event_locator, claim_request_record_locator,
 };
 pub use routing::{
     CreateRoutedModelRouteInput, CreateRoutedModelRouteResult, CredentialRoutingView,

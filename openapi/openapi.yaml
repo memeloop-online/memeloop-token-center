@@ -3719,8 +3719,8 @@ paths:
     get:
       tags: [Operator traffic]
       operationId: streamRequestEvents
-      summary: Tail started and finished request events over SSE
-      description: Use the `(after_event_at, after_event_id)` pair as the durable resume cursor. Event names are `request.started` and `request.finished`.
+      summary: Tail request lifecycle events over SSE
+      description: Use the `(after_event_at, after_event_id)` pair as the durable resume cursor. Event names are `request.started`, `request.finished`, and `request.projected`; the last is committed only after asynchronous session semantics are queryable.
       security: [{ serviceBearer: [] }]
       x-required-scope: requests:read
       parameters:

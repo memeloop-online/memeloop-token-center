@@ -29,7 +29,7 @@ test('deferred detail B supersedes A even when A resolves last', async () => {
   assert.deepEqual(accepted, ['B']);
 });
 
-test('scope invalidation aborts and rejects a deferred response', async () => {
+test('scope invalidation aborts and rejects a deferred projected-session response', async () => {
   const gate = new LatestRequestGate();
   const response = deferred<string>();
   const request = gate.begin();
