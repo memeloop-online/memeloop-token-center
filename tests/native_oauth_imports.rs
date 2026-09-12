@@ -137,6 +137,11 @@ async fn native_kimi_cohort_contract_is_atomic_rotatable_and_secret_free() {
     let state = AppState::initialize(Config::for_test(database_url))
         .await
         .unwrap();
+    state
+        .db
+        .create_tenant("native-kimi-cohort", None)
+        .await
+        .unwrap();
     let issued = state
         .db
         .create_service_token(
