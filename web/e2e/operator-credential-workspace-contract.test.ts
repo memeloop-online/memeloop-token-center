@@ -210,6 +210,7 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
       await client.waitForFunction(() => window.credentialFixture.requests.some(request => request.method === 'PUT' && request.path.endsWith('/key-form/policy')));
       const policyRequest = await client.evaluate(() => window.credentialFixture.requests.find(request => request.method === 'PUT' && request.path.endsWith('/key-form/policy'))!);
       assert.equal(JSON.parse(policyRequest.body!).enforcement_mode, editedMode);
+      assert.equal(JSON.parse(policyRequest.body!).daily_budget, null);
 
       const create = client.locator('details.create-resource');
       await create.locator(':scope > summary').click();
