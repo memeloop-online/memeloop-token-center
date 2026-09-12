@@ -22,6 +22,10 @@ use crate::{
     provider::ProviderType,
 };
 
+/// Experimental primitives only; not connected to AppState or management APIs.
+#[cfg(feature = "experimental-plugin-revisions")]
+pub mod lifecycle;
+
 const PLUGIN_FUEL: u64 = 5_000_000;
 const PLUGIN_MEMORY_BYTES: usize = 32 * 1024 * 1024;
 const PLUGIN_TABLE_ELEMENTS: usize = 100_000;
@@ -271,7 +275,7 @@ fn empty_json_object() -> Value {
     serde_json::json!({})
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PluginCapability {
     Log,
@@ -284,6 +288,22 @@ struct LoadedPlugin {
     manifest: PluginManifest,
     component: Option<Component>,
     configuration_validator: Option<crate::schema::CompiledSchema>,
+    identity: PluginPackageIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginInstallProvenance {
+    pub format_version: u8,
+    pub source: String,
+    pub digest: String,
+    pub signature_policy: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginPackageIdentity {
+    pub component_sha256: Option<String>,
+    pub provenance: Option<PluginInstallProvenance>,
 }
 
 #[derive(Clone)]
@@ -408,6 +428,15 @@ pub struct PluginRuntime {
     service_data_cache: Arc<tokio::sync::RwLock<BTreeMap<String, CachedPluginServiceData>>>,
     execution_timeout: Duration,
     fuel: u64,
+    _epoch_task: Option<Arc<EpochTask>>,
+}
+
+struct EpochTask(tokio::task::JoinHandle<()>);
+
+impl Drop for EpochTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[derive(Clone)]
@@ -423,6 +452,21 @@ struct HostState {
     kv: Option<PluginKv>,
     limits: StoreLimits,
     deadline: Instant,
+}
+
+fn read_identity_bytes(path: &Path, maximum: u64) -> Result<Vec<u8>, AppError> {
+    use std::io::Read;
+    let file = fs::File::open(path).map_err(|_| plugin_runtime_failure("package_read"))?;
+    let mut bytes = Vec::new();
+    file.take(maximum + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| plugin_runtime_failure("package_read"))?;
+    if bytes.len() as u64 > maximum {
+        return Err(AppError::BadRequest(
+            "plugin file exceeds size limit".into(),
+        ));
+    }
+    Ok(bytes)
 }
 
 impl PluginRuntime {
@@ -444,13 +488,13 @@ impl PluginRuntime {
         let engine = Engine::new(&engine_config)
             .map_err(|_| plugin_runtime_failure("engine_initialization"))?;
         let epoch_engine = engine.clone();
-        tokio::spawn(async move {
+        let epoch_task = Arc::new(EpochTask(tokio::spawn(async move {
             let mut interval = tokio::time::interval(PLUGIN_EPOCH_TICK);
             loop {
                 interval.tick().await;
                 epoch_engine.increment_epoch();
             }
-        });
+        })));
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(30))
@@ -492,17 +536,39 @@ impl PluginRuntime {
                 }
                 providers.push(provider);
             }
-            let component = manifest
+            let component_bytes = manifest
                 .wasm
                 .as_deref()
                 .map(|wasm| {
                     let wasm_path = safe_child(&directory, wasm)?;
                     require_file_size(&wasm_path, PLUGIN_COMPONENT_BYTES, "plugin component")?;
-                    Component::from_file(&engine, &wasm_path).map_err(|_| {
+                    read_identity_bytes(&wasm_path, PLUGIN_COMPONENT_BYTES)
+                })
+                .transpose()?;
+            use sha2::{Digest, Sha256};
+            let component_sha256 = component_bytes
+                .as_ref()
+                .map(|bytes| format!("sha256:{:x}", Sha256::digest(bytes)));
+            // Compile exactly the bytes that were hashed, never reopen a path.
+            let component = component_bytes
+                .as_ref()
+                .map(|bytes| {
+                    Component::new(&engine, bytes).map_err(|_| {
                         AppError::BadRequest("plugin component cannot be compiled".into())
                     })
                 })
                 .transpose()?;
+            let receipt_path = directory.join(".mtc-oci-install.json");
+            let provenance = if receipt_path.exists() {
+                let path = safe_child(&directory, ".mtc-oci-install.json")?;
+                Some(
+                    serde_json::from_slice(&read_identity_bytes(&path, 16 * 1024)?).map_err(
+                        |_| AppError::BadRequest("invalid plugin install receipt".into()),
+                    )?,
+                )
+            } else {
+                None
+            };
             let configuration_validator = manifest
                 .contributions
                 .configuration
@@ -513,9 +579,15 @@ impl PluginRuntime {
                 manifest,
                 component,
                 configuration_validator,
+                identity: PluginPackageIdentity {
+                    component_sha256,
+                    provenance,
+                },
             });
         }
         validate_loaded_operator_ui_contributions(&plugins)?;
+        // Directory enumeration order must not change policy precedence.
+        plugins.sort_by(|left, right| left.manifest.id.cmp(&right.manifest.id));
 
         Ok(Self {
             engine: Some(engine),
@@ -528,6 +600,7 @@ impl PluginRuntime {
             service_data_cache: Arc::default(),
             execution_timeout: PLUGIN_EXECUTION_TIMEOUT,
             fuel: PLUGIN_FUEL,
+            _epoch_task: Some(epoch_task),
         })
     }
 
@@ -539,6 +612,13 @@ impl PluginRuntime {
         self.plugins
             .iter()
             .map(|plugin| plugin.manifest.clone())
+            .collect()
+    }
+
+    pub fn package_identities(&self) -> BTreeMap<String, PluginPackageIdentity> {
+        self.plugins
+            .iter()
+            .map(|plugin| (plugin.manifest.id.clone(), plugin.identity.clone()))
             .collect()
     }
 
