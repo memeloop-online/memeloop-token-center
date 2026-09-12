@@ -262,6 +262,7 @@ async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_histor
     .fetch_all(&pool)
     .await
     .expect("historical request partitions");
+    assert_session_latest_indexes(&plan_pool, &history_partitions).await;
     let after_plan = explain_candidate_first(&plan_pool, key.tenant_id, "", 6).await;
     let after_buffers = shared_buffers(&after_plan);
     assert_relations_returned_no_rows(&after_plan, &history_partitions);
@@ -634,4 +635,32 @@ fn assert_relations_returned_no_rows(plan: &Value, relation_names: &[String]) {
 
     assert!(!relation_names.is_empty(), "historical partition set");
     visit(plan_root(plan), relation_names);
+}
+
+async fn assert_session_latest_indexes(pool: &PgPool, relation_names: &[String]) {
+    for relation_name in relation_names {
+        let attached = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(DISTINCT parent_index.relname)
+                   FROM pg_inherits attachment
+                   JOIN pg_class parent_index
+                     ON parent_index.oid = attachment.inhparent
+                   JOIN pg_index child_index
+                     ON child_index.indexrelid = attachment.inhrelid
+                  WHERE child_index.indrelid = to_regclass($1)
+                    AND child_index.indisvalid
+                    AND child_index.indisready
+                    AND parent_index.relname IN (
+                        'request_records_session_latest_idx',
+                        'request_records_unlinked_latest_idx'
+                    )",
+        )
+        .bind(relation_name)
+        .fetch_one(pool)
+        .await
+        .expect("inspect latest-session partition index");
+        assert!(
+            attached == 2,
+            "historical partition lacks attached latest-session indexes: {relation_name}"
+        );
+    }
 }
