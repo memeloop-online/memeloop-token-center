@@ -127,11 +127,6 @@ fn validate_condition(condition: &TypedFilterCondition) -> Result<(), AppError> 
                     "filter upper value does not match its field type".into(),
                 ));
             }
-            if filter_integer(&condition.value) > filter_integer(upper) {
-                return Err(AppError::BadRequest(
-                    "filter range lower bound must not exceed upper bound".into(),
-                ));
-            }
         }
         _ if condition.upper.is_some() => {
             return Err(AppError::BadRequest(
@@ -175,6 +170,16 @@ fn validate_condition(condition: &TypedFilterCondition) -> Result<(), AppError> 
     if !allowed {
         return Err(AppError::BadRequest(
             "filter operator is not allowed for this field".into(),
+        ));
+    }
+    // Validate the field/operator matrix before numeric conversion. An
+    // untrusted `model between ...` must be rejected, never panic.
+    if condition.operator == TypedFilterOperator::Between
+        && let Some(upper) = condition.upper.as_ref()
+        && filter_integer(&condition.value) > filter_integer(upper)
+    {
+        return Err(AppError::BadRequest(
+            "filter range lower bound must not exceed upper bound".into(),
         ));
     }
 
@@ -306,6 +311,32 @@ mod tests {
             ..ast
         };
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn non_numeric_between_is_rejected_without_panicking() {
+        for (field, value) in [
+            (
+                TypedFilterField::Model,
+                TypedFilterValue::Model("model-a".into()),
+            ),
+            (
+                TypedFilterField::Status,
+                TypedFilterValue::Status("error".into()),
+            ),
+            (TypedFilterField::KeyId, TypedFilterValue::Uuid(Uuid::nil())),
+        ] {
+            let ast = TypedFilterAst {
+                conditions: vec![TypedFilterCondition {
+                    field,
+                    operator: TypedFilterOperator::Between,
+                    value: value.clone(),
+                    upper: Some(value),
+                }],
+                ..TypedFilterAst::default()
+            };
+            assert!(ast.validate().is_err());
+        }
     }
 
     #[test]
