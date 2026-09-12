@@ -59,8 +59,13 @@ struct Circuit {
     epoch: Arc<()>,
 }
 
+struct Admission {
+    epoch: Arc<()>,
+    failures: u32,
+}
+
 impl Circuit {
-    fn admit(&mut self, now: Instant) -> Option<Arc<()>> {
+    fn admit(&mut self, now: Instant) -> Option<Admission> {
         if let Some(until) = self.open_until {
             if now < until || self.probe_active {
                 return None;
@@ -68,23 +73,28 @@ impl Circuit {
             self.probe_active = true;
             self.epoch = Arc::new(());
         }
-        Some(self.epoch.clone())
+        Some(Admission {
+            epoch: self.epoch.clone(),
+            failures: self.failures,
+        })
     }
 
-    fn complete(&mut self, epoch: &Arc<()>, failed: bool, now: Instant) {
+    fn complete(&mut self, admission: &Admission, failed: bool, now: Instant) {
+        // Successful recovery/reset retires the entire admission generation,
+        // including slow failures admitted before it, even while closed.
+        if !Arc::ptr_eq(&admission.epoch, &self.epoch) {
+            return;
+        }
         if failed {
-            // Closed-state concurrent failures count, but completions admitted
-            // before opening cannot extend or disturb an open/half-open epoch.
-            if self.open_until.is_some() && !Arc::ptr_eq(epoch, &self.epoch) {
-                return;
-            }
+            // Concurrent closed-state failures share a generation and count.
             self.failures = self.failures.saturating_add(1);
             self.probe_active = false;
-            self.epoch = Arc::new(());
             if self.failures >= FAILURE_THRESHOLD {
                 self.open_until = Some(now + COOLDOWN);
+                self.epoch = Arc::new(());
             }
-        } else if Arc::ptr_eq(epoch, &self.epoch) {
+        } else if admission.failures == self.failures {
+            // A success admitted before a newer failure cannot erase it.
             *self = Self::default();
         }
     }
@@ -478,6 +488,35 @@ mod tests {
         circuit.complete(&stale, false, now + COOLDOWN);
         assert!(circuit.admit(now + COOLDOWN).is_none());
         circuit.complete(&probe, false, now + COOLDOWN);
+        assert!(circuit.admit(now + COOLDOWN).is_some());
+    }
+
+    #[test]
+    fn recovered_circuit_ignores_old_failures_but_counts_new_concurrent_failures() {
+        let now = Instant::now();
+        let mut circuit = Circuit::default();
+        let old = (0..FAILURE_THRESHOLD)
+            .map(|_| circuit.admit(now).unwrap())
+            .collect::<Vec<_>>();
+        let success = circuit.admit(now).unwrap();
+        circuit.complete(&success, false, now);
+        for admission in &old {
+            circuit.complete(admission, true, now);
+        }
+        assert_eq!(circuit.failures, 0);
+        let current = (0..FAILURE_THRESHOLD)
+            .map(|_| circuit.admit(now).unwrap())
+            .collect::<Vec<_>>();
+        for admission in &current {
+            circuit.complete(admission, true, now);
+        }
+        assert!(circuit.admit(now).is_none());
+        let probe = circuit.admit(now + COOLDOWN).unwrap();
+        circuit.complete(&probe, false, now + COOLDOWN);
+        for admission in old.iter().chain(&current) {
+            circuit.complete(admission, true, now + COOLDOWN);
+        }
+        assert_eq!(circuit.failures, 0);
         assert!(circuit.admit(now + COOLDOWN).is_some());
     }
 

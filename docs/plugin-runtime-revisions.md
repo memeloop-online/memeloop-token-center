@@ -58,3 +58,34 @@ credential or route permissions. Provider-catalog replacement and management
 authorization need an application-level atomic integration before exposing any
 reload endpoint. No deployment or runtime acceptance is claimed by this
 contract alone.
+
+## Required production integration (not implemented)
+
+Do not enable application reload merely by removing the feature gate. The
+following boundaries must be delivered together before this draft can become a
+production hot-reload feature:
+
+- A separately provisioned, host-authorized grant document and verification
+  keys, mounted independently of candidate packages. The installer must verify
+  the signed artifact against that authority and bind its receipt to the exact
+  installed bytes. Parsing `.mtc-oci-install.json` is not signature verification;
+  constructing grants from `PluginRuntime` identities is never authorization.
+- One application snapshot containing runtime and provider catalog, pinned
+  before configuration lookup and retained through provider dispatch and every
+  hook. Replacing only `AppState.plugins` leaves catalog and request consumers
+  inconsistent. All existing core tenant, route, model and candidate checks must
+  remain authoritative both before and after plugin output is applied.
+- Authenticated, scoped management CAS/rollback operations with an explicit
+  cross-replica publication contract. Required inventory cannot be removed by
+  any management operation. Failed verification or publication must leave the
+  previous snapshot usable; no automatic unverified fallback is permitted.
+- Application-level tests for rejected grants/tampered packages, stale CAS,
+  in-flight snapshot retention, tenant isolation, unauthorized model/account
+  hints, and failure of a required policy. Library-only tests do not establish
+  any of these endpoint or deployment properties.
+
+Circuit admission generations retire on recovery as well as opening. Slow
+completions from retired generations cannot reopen a recovered circuit. Within
+one closed generation concurrent failures still count, and a success admitted
+before a newer failure cannot clear that failure. These ordering contracts are
+tested without sleeps or nondeterministic scheduling.
