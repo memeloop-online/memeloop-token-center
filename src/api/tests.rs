@@ -1733,6 +1733,9 @@ async fn retired_bridge_is_absent_and_native_codex_rejects_raw_credentials() {
         concat!("/internal/v1/imports/", "cpa/subscription-accounts"),
         concat!("/internal/v1/imports/", "cpa/managed-oauth/capabilities"),
         concat!("/internal/v1/imports/", "cpa/managed-oauth"),
+        concat!("/internal/v1/migrations/", "openai-codex/prepare"),
+        concat!("/internal/v1/migrations/", "openai-codex/apply"),
+        concat!("/internal/v1/imports/", "session-archive/quarantine"),
     ] {
         let response = control
             .clone()

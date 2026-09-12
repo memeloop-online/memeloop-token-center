@@ -3,14 +3,13 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use reqwest::header::HeaderValue;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 #[cfg(test)]
 use crate::network::OutboundScope;
 use crate::{error::AppError, network, provider::UpstreamCredential};
 
 pub const TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
-const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 /// Fixed native Codex catalog protocol profile. This is independent from the
 /// MemeLoop package version and is shared by health and catalog discovery.
 pub(crate) const CLIENT_VERSION: &str = "0.146.0";
@@ -19,10 +18,6 @@ pub(crate) const USER_AGENT: &str =
     "codex-tui/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.146.0)";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const NATIVE_ADAPTER_SCHEMA: &str = "openai-codex-oauth-v1";
-/// The one historical envelope shape accepted exclusively by the controlled
-/// account-upgrade operation. It is never accepted by the native transport or
-/// refresh lifecycle.
-const IMPORTED_ADAPTER_SCHEMA: &str = "cpa-codex-oauth-v1";
 const RESPONSE_LIMIT: usize = 1024 * 1024;
 const MAX_EXPIRES_IN_SECONDS: i64 = 365 * 24 * 60 * 60;
 #[cfg(not(test))]
@@ -38,185 +33,9 @@ struct TokenResponse {
     expires_in: i64,
 }
 
-/// Normalize the fixed credential envelope allowed for the retired importer
-/// to the native Codex ABI. An older imported row can already carry the native
-/// schema, but only its exact two-field envelope is accepted. Access/refresh
-/// tokens, expiry, proxy endpoint and proxy authentication remain byte-for-byte
-/// represented. A safe IP-literal `socks5://` proxy is restored to `socks5h://`
-/// because the retired importer collapsed the source's remote-DNS scheme while
-/// storing the credential.
-///
-/// The database migration owns the transaction and CAS guards. Keeping the
-/// conversion here makes it impossible for an API response or a caller-owned
-/// JSON document to observe the plaintext credential while it is upgraded.
-pub(crate) fn upgrade_imported_credential(
-    credential: UpstreamCredential,
-) -> Result<UpstreamCredential, AppError> {
-    let UpstreamCredential::OAuth {
-        access_token,
-        refresh_token,
-        expires_at,
-        header,
-        prefix,
-        adapter_state,
-        proxy_url,
-        proxy_network_scope,
-    } = credential
-    else {
-        return Err(invalid_imported_credential());
-    };
-    let Some(mut state) = adapter_state else {
-        return Err(invalid_imported_credential());
-    };
-    let Some(object) = state.as_object_mut() else {
-        return Err(invalid_imported_credential());
-    };
-    if object.len() != 2
-        || !matches!(
-            object.get("schema").and_then(Value::as_str),
-            Some(IMPORTED_ADAPTER_SCHEMA | NATIVE_ADAPTER_SCHEMA)
-        )
-        || object
-            .get("account_id")
-            .and_then(Value::as_str)
-            .is_none_or(|account_id| super::account_id(account_id, "OpenAI Codex").is_err())
-    {
-        return Err(invalid_imported_credential());
-    }
-    object.insert(
-        "schema".to_owned(),
-        Value::String(NATIVE_ADAPTER_SCHEMA.to_owned()),
-    );
-    let upgraded = UpstreamCredential::OAuth {
-        access_token,
-        refresh_token,
-        expires_at,
-        header,
-        prefix,
-        adapter_state: Some(state),
-        proxy_url,
-        proxy_network_scope,
-    };
-    let (upgraded, _) =
-        restore_remote_dns_proxy(upgraded).map_err(|_| invalid_imported_credential())?;
-    // `i64::MIN` validates the credential shape and encrypted transport
-    // metadata without rejecting an intentionally disabled expired account.
-    upgraded
-        .validate(i64::MIN)
-        .map_err(|_| invalid_imported_credential())?;
-    validate_adapter_state(upgraded.adapter_state()).map_err(|_| invalid_imported_credential())?;
-    Ok(upgraded)
-}
-
-fn invalid_imported_credential() -> AppError {
-    AppError::BadRequest("imported OpenAI Codex account has an invalid credential".into())
-}
-
-pub(crate) fn restore_remote_dns_proxy(
-    credential: UpstreamCredential,
-) -> Result<(UpstreamCredential, bool), AppError> {
-    let UpstreamCredential::OAuth {
-        access_token,
-        refresh_token,
-        expires_at,
-        header,
-        prefix,
-        adapter_state,
-        proxy_url,
-        proxy_network_scope,
-    } = credential
-    else {
-        return Err(AppError::BadRequest(
-            "OpenAI Codex account has an invalid credential".into(),
-        ));
-    };
-    let restored_proxy_url = restore_imported_remote_dns_proxy(proxy_url.clone())?;
-    let changed = restored_proxy_url != proxy_url;
-    Ok((
-        UpstreamCredential::OAuth {
-            access_token,
-            refresh_token,
-            expires_at,
-            header,
-            prefix,
-            adapter_state,
-            proxy_url: restored_proxy_url,
-            proxy_network_scope,
-        },
-        changed,
-    ))
-}
-
-fn restore_imported_remote_dns_proxy(
-    proxy_url: Option<String>,
-) -> Result<Option<String>, AppError> {
-    let Some(proxy_url) = proxy_url else {
-        return Ok(None);
-    };
-    let parsed = url::Url::parse(&proxy_url).map_err(|_| invalid_document())?;
-    if parsed.scheme() == "socks5h" {
-        normalize_private_proxy_url(&proxy_url)?;
-        return Ok(Some(proxy_url));
-    }
-    if parsed.scheme() != "socks5" || !network::has_safe_private_ip_literal_host(&parsed) {
-        return Err(invalid_document());
-    }
-    let suffix = proxy_url
-        .strip_prefix("socks5://")
-        .ok_or_else(invalid_document)?;
-    let restored = format!("socks5h://{suffix}");
-    normalize_private_proxy_url(&restored)?;
-    Ok(Some(restored))
-}
-
 pub(crate) fn validate_native_credential(credential: &UpstreamCredential) -> Result<(), AppError> {
     credential.validate(i64::MIN)?;
     validate_adapter_state(credential.adapter_state())
-}
-
-/// Preserve only the native fixed destination and trusted reservation bounds
-/// when an imported account is upgraded. A legacy configuration cannot smuggle
-/// arbitrary outbound settings into the native driver.
-pub(crate) fn native_config_from_import(config: &Value) -> Result<Value, AppError> {
-    let Some(object) = config.as_object() else {
-        return Err(AppError::BadRequest(
-            "imported OpenAI Codex account has an invalid configuration".into(),
-        ));
-    };
-    if object.len() != 3
-        || object.get("base_url").and_then(Value::as_str) != Some(BASE_URL)
-        || object.get("network_scope").and_then(Value::as_str) != Some("public")
-    {
-        return Err(AppError::BadRequest(
-            "imported OpenAI Codex account has an invalid configuration".into(),
-        ));
-    }
-    let Some(bounds) = object
-        .get("reservation_token_bounds")
-        .and_then(Value::as_object)
-    else {
-        return Err(AppError::BadRequest(
-            "imported OpenAI Codex account has an invalid configuration".into(),
-        ));
-    };
-    if bounds.len() > 10_000
-        || bounds.iter().any(|(model, bound)| {
-            model.is_empty()
-                || model.len() > 500
-                || bound
-                    .as_i64()
-                    .is_none_or(|value| !(1..=1_000_000_000).contains(&value))
-        })
-    {
-        return Err(AppError::BadRequest(
-            "imported OpenAI Codex account has an invalid configuration".into(),
-        ));
-    }
-    Ok(json!({
-        "base_url": BASE_URL,
-        "network_scope": "public",
-        "reservation_token_bounds": bounds,
-    }))
 }
 
 /// Preserve the operator-selected SOCKS DNS semantics. `socks5` may use a
@@ -502,119 +321,6 @@ mod tests {
                 error.to_string(),
                 "invalid request: OpenAI Codex OAuth credential has invalid adapter state"
             );
-        }
-    }
-
-    #[test]
-    fn controlled_upgrade_restores_remote_dns_without_exposing_private_proxy() {
-        for schema in [IMPORTED_ADAPTER_SCHEMA, NATIVE_ADAPTER_SCHEMA] {
-            let imported = UpstreamCredential::OAuth {
-                access_token: "access-secret".to_owned(),
-                refresh_token: Some("refresh-secret".to_owned()),
-                expires_at: Some(4_070_908_800_000),
-                header: "authorization".to_owned(),
-                prefix: "Bearer ".to_owned(),
-                adapter_state: Some(json!({
-                    "schema": schema,
-                    "account_id": "account-123"
-                })),
-                proxy_url: Some("socks5://operator:secret@100.64.0.16:1080".to_owned()),
-                proxy_network_scope: Some(OutboundScope::Private),
-            };
-            let upgraded = upgrade_imported_credential(imported).unwrap();
-            assert_eq!(
-                upgraded.adapter_state(),
-                Some(&json!({"schema": NATIVE_ADAPTER_SCHEMA, "account_id": "account-123"}))
-            );
-            assert_eq!(
-                upgraded.proxy(),
-                Some((
-                    "socks5h://operator:secret@100.64.0.16:1080",
-                    OutboundScope::Private
-                ))
-            );
-            assert!(!format!("{upgraded:?}").contains("operator:secret"));
-            assert!(!format!("{upgraded:?}").contains("access-secret"));
-        }
-    }
-
-    #[test]
-    fn controlled_upgrade_preserves_existing_remote_dns_and_rejects_hostname_proxy() {
-        let build = |proxy_url: &str| UpstreamCredential::OAuth {
-            access_token: "access-secret".to_owned(),
-            refresh_token: Some("refresh-secret".to_owned()),
-            expires_at: Some(4_070_908_800_000),
-            header: "authorization".to_owned(),
-            prefix: "Bearer ".to_owned(),
-            adapter_state: Some(json!({
-                "schema": IMPORTED_ADAPTER_SCHEMA,
-                "account_id": "account-123"
-            })),
-            proxy_url: Some(proxy_url.to_owned()),
-            proxy_network_scope: Some(OutboundScope::Private),
-        };
-
-        let preserved =
-            upgrade_imported_credential(build("socks5h://operator:secret@100.64.0.16:1080"))
-                .unwrap();
-        assert_eq!(
-            preserved.proxy(),
-            Some((
-                "socks5h://operator:secret@100.64.0.16:1080",
-                OutboundScope::Private
-            ))
-        );
-
-        let error = upgrade_imported_credential(build(
-            "socks5://operator:secret@proxy.service.svc.cluster.local:1080",
-        ))
-        .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "invalid request: imported OpenAI Codex account has an invalid credential"
-        );
-    }
-
-    #[test]
-    fn controlled_upgrade_rejects_noncanonical_state_with_a_fixed_redacted_error() {
-        let build = |adapter_state| UpstreamCredential::OAuth {
-            access_token: "access-secret".to_owned(),
-            refresh_token: Some("refresh-secret".to_owned()),
-            expires_at: Some(4_070_908_800_000),
-            header: "authorization".to_owned(),
-            prefix: "Bearer ".to_owned(),
-            adapter_state,
-            proxy_url: Some("socks5h://operator:proxy-secret@100.64.0.16:1080".to_owned()),
-            proxy_network_scope: Some(OutboundScope::Private),
-        };
-        let invalid_states = [
-            None,
-            Some(json!("state-secret")),
-            Some(json!({"account_id": "account-123"})),
-            Some(json!({"schema": "unknown", "account_id": "account-123"})),
-            Some(json!({
-                "schema": NATIVE_ADAPTER_SCHEMA,
-                "account_id": "account-123",
-                "unexpected": "state-secret"
-            })),
-        ];
-
-        for adapter_state in invalid_states {
-            let error = upgrade_imported_credential(build(adapter_state)).unwrap_err();
-            let rendered = format!("{error:?} {error}");
-            assert_eq!(
-                error.to_string(),
-                "invalid request: imported OpenAI Codex account has an invalid credential"
-            );
-            for secret in [
-                "access-secret",
-                "refresh-secret",
-                "proxy-secret",
-                "100.64.0.16",
-                "state-secret",
-            ] {
-                assert!(!rendered.contains(secret));
-            }
         }
     }
 

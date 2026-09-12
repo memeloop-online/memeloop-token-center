@@ -30,7 +30,6 @@ use tower_http::{
 };
 use uuid::Uuid;
 
-mod archive_quarantine;
 mod auth;
 mod billing;
 mod cloud_entitlements;
@@ -61,9 +60,6 @@ mod upstreams;
 mod usage_analysis;
 mod web;
 
-use archive_quarantine::{
-    get_archive_quarantine, list_archive_quarantine, resolve_archive_quarantine,
-};
 use auth::{
     admit_cloud_webhook_before_body, authenticate_control_before_body, authenticate_downstream,
     authenticate_gateway_before_body, authenticated_service, management_tenant,
