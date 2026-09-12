@@ -277,6 +277,7 @@ probes:
     # process-jittered four-to-five-minute schedule, and retry for a bounded
     # three minutes after the first failure. Kubernetes still needs seven
     # seconds for each five-second canary plus dependency-aggregator headroom.
+    # With /readyz, Helm requires >= ceil(s3 readinessDeadlineMillis / 1000) + 2.
     timeoutSeconds: 7
     failureThreshold: 3
   liveness:

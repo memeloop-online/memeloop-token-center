@@ -26,6 +26,11 @@ count as new attempts. Cold startup has no stale success; later failures retain
 the existing bounded grace. Database-healthy `/readyz` remains HTTP 200 with
 `degraded` archive status; Kubernetes `/livez` is unchanged. Consumers timing
 `/readyz` must allow the configured archive deadline plus one second.
+When Kubernetes probes `/readyz`, Helm additionally rejects a probe timeout below
+`ceil(readinessDeadlineMillis / 1000) + 2` seconds, so the dependency check has
+time to report its deliberate degraded result before kubelet's deadline.
+This cross-field requirement does not apply to `/livez` probes. Defaults are
+unchanged; increasing the archive deadline requires explicitly sizing the probe.
 
 ## Release identity
 

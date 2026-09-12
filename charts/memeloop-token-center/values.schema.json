@@ -515,6 +515,7 @@
       "properties": {
         "startup": { "$ref": "#/definitions/probe" },
         "readiness": {
+          "description": "For /readyz, Helm also enforces timeoutSeconds >= ceil(config.s3.readinessDeadlineMillis / 1000) + 2. /livez does not depend on archive deadlines.",
           "allOf": [
             { "$ref": "#/definitions/probe" },
             {

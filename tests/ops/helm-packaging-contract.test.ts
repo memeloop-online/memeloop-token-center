@@ -43,6 +43,8 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       loadBalancer: render('lb', ['--show-only', 'templates/service.yaml', '--set', 'roles.gateway.service.type=LoadBalancer']),
       hostAlias: render('host-alias', ['--show-only', 'templates/deployment.yaml', '--set-string', 'hostAliases[0].ip=10.28.0.22', '--set-string', 'hostAliases[0].hostnames[0]=private-upstream.example.test']),
       recreate: render('recreate', ['--set', 'deploymentStrategy=Recreate']),
+      archiveReadyBoundary: render('archive-ready-boundary', ['--set', 'config.s3.readinessDeadlineMillis=5001', '--set', 'probes.readiness.timeoutSeconds=8']),
+      archiveLive: render('archive-live', ['--set', 'config.s3.readinessDeadlineMillis=30000', '--set', 'probes.readiness.path=/livez']),
     };
     const has = (key: string, needle: string): void => assert.ok(output[key]!.includes(needle), `${key} render lacks ${needle}`);
     const lacks = (key: string, pattern: string | RegExp): void => assert.ok(typeof pattern === 'string' ? !output[key]!.includes(pattern) : !pattern.test(output[key]!), `${key} render contains forbidden ${String(pattern)}`);
@@ -102,6 +104,15 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       const args = ['template', `invalid-${index}`, chart, ...values!.flatMap((value) => ['--set-string', value])];
       const result = spawnSync(helm, args, { cwd: repository, encoding: 'utf8', shell: false });
       assert.notEqual(result.status, 0, `values schema accepted invalid case ${values!.join(',')}`);
+    }
+    for (const values of [
+      ['config.s3.readinessDeadlineMillis=5001', 'probes.readiness.timeoutSeconds=7'],
+      ['config.s3.readinessDeadlineMillis=30000', 'probes.readiness.timeoutSeconds=31'],
+      ['config.s3.connectTimeoutMillis=5000', 'config.s3.requestTimeoutMillis=4999'],
+    ]) {
+      const result = spawnSync(helm, ['template', 'invalid-archive-budget', chart, ...values.flatMap((value) => ['--set', value])], { cwd: repository, encoding: 'utf8', shell: false });
+      assert.notEqual(result.status, 0, `archive cross-field validation accepted ${values.join(',')}`);
+      assert.match(result.stderr, /archive deadline rounded up plus 2 seconds|connectTimeoutMillis must not exceed requestTimeoutMillis/);
     }
     const oldSchema = spawnSync(helm, ['template', 'invalid-old-schema', chart, '--set', 'migration.schemaVersion=58'], { cwd: repository, encoding: 'utf8', shell: false });
     assert.notEqual(oldSchema.status, 0, 'release values schema accepted migration.schemaVersion=58');
