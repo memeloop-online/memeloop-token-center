@@ -916,7 +916,7 @@ async fn authentication_precedes_body_parsing(world: &mut TokenCenterWorld) {
         ),
         (
             "invalid path extractor",
-            "/internal/v1/upstreams/not-a-uuid",
+            "/internal/v1/upstreams/not-a-uuid/quota",
         ),
     ] {
         let response = world
