@@ -35,7 +35,7 @@ impl Database {
         route_id: Uuid,
     ) -> Result<(), AppError> {
         let present = sqlx::query_scalar::<_, i64>(
-            "SELECT 1 FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE r.id = $1 AND t.external_id = $2 AND r.enabled = 1",
+            "SELECT 1 FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE r.id = $1 AND t.external_id = $2 AND r.archived_at IS NULL AND r.enabled = 1 AND r.archived_at IS NULL",
         )
         .bind(route_id.to_string())
         .bind(tenant_external_id)
@@ -76,7 +76,7 @@ impl Database {
         // reads while the final join retains the historical authorization and
         // projection semantics.
         let rows = sqlx::query(
-            "WITH page AS MATERIALIZED (SELECT r.id, r.tenant_id, r.public_model, r.upstream_account_id, r.upstream_model, r.protocol, r.priority, r.enabled, r.created_at, r.updated_at FROM model_routes r WHERE EXISTS (SELECT 1 FROM tenants visible_tenant WHERE visible_tenant.id = r.tenant_id) AND ($1 = '' OR r.tenant_id = (SELECT scoped_tenant.id FROM tenants scoped_tenant WHERE scoped_tenant.external_id = $1)) AND (r.created_at < $2 OR (r.created_at = $2 AND r.id < $3)) ORDER BY r.created_at DESC, r.id DESC LIMIT $4) SELECT r.id, r.tenant_id, t.external_id AS tenant_external_id, r.public_model, r.upstream_account_id, r.upstream_model, r.protocol, r.priority, r.enabled, r.created_at, r.updated_at FROM page r JOIN tenants t ON t.id = r.tenant_id ORDER BY r.created_at DESC, r.id DESC",
+            "WITH page AS MATERIALIZED (SELECT r.id, r.tenant_id, r.public_model, r.upstream_account_id, r.upstream_model, r.protocol, r.priority, r.enabled, r.created_at, r.updated_at FROM model_routes r WHERE r.archived_at IS NULL AND EXISTS (SELECT 1 FROM tenants visible_tenant WHERE visible_tenant.id = r.tenant_id) AND ($1 = '' OR r.tenant_id = (SELECT scoped_tenant.id FROM tenants scoped_tenant WHERE scoped_tenant.external_id = $1)) AND (r.created_at < $2 OR (r.created_at = $2 AND r.id < $3)) ORDER BY r.created_at DESC, r.id DESC LIMIT $4) SELECT r.id, r.tenant_id, t.external_id AS tenant_external_id, r.public_model, r.upstream_account_id, r.upstream_model, r.protocol, r.priority, r.enabled, r.created_at, r.updated_at FROM page r JOIN tenants t ON t.id = r.tenant_id ORDER BY r.created_at DESC, r.id DESC",
         )
         .bind(tenant_external_id.unwrap_or_default())
         .bind(before_created_at)
@@ -194,7 +194,7 @@ impl Database {
         let upstream_model = input.upstream_model.trim();
         let mut tx = self.begin_write_transaction().await?;
         let current = sqlx::query(
-            "SELECT r.id, r.tenant_id, t.external_id AS tenant_external_id, r.public_model, r.upstream_account_id, r.upstream_model, r.protocol, r.priority, r.enabled, r.created_at, r.updated_at FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE r.id = $1 AND t.external_id = $2",
+            "SELECT r.id, r.tenant_id, t.external_id AS tenant_external_id, r.public_model, r.upstream_account_id, r.upstream_model, r.protocol, r.priority, r.enabled, r.created_at, r.updated_at FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE r.id = $1 AND t.external_id = $2 AND r.archived_at IS NULL",
         )
         .bind(route_id.to_string())
         .bind(tenant_external_id)
@@ -230,7 +230,7 @@ impl Database {
             return Err(AppError::Forbidden);
         }
         let duplicate = sqlx::query(
-            "SELECT id FROM model_routes WHERE tenant_id = $1 AND public_model = $2 AND protocol = $3 AND priority = $4 AND id <> $5",
+            "SELECT id FROM model_routes WHERE archived_at IS NULL AND tenant_id = $1 AND public_model = $2 AND protocol = $3 AND priority = $4 AND id <> $5",
         )
         .bind(&tenant_id)
         .bind(public_model)
@@ -305,7 +305,7 @@ impl Database {
     ) -> Result<ModelRouteView, AppError> {
         let mut tx = self.begin_write_transaction().await?;
         let current = sqlx::query(
-            "SELECT r.id, r.tenant_id, t.external_id AS tenant_external_id, r.public_model, r.upstream_account_id, r.upstream_model, r.protocol, r.priority, r.enabled, r.created_at, r.updated_at FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE r.id = $1 AND t.external_id = $2",
+            "SELECT r.id, r.tenant_id, t.external_id AS tenant_external_id, r.public_model, r.upstream_account_id, r.upstream_model, r.protocol, r.priority, r.enabled, r.created_at, r.updated_at FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE r.id = $1 AND t.external_id = $2 AND r.archived_at IS NULL",
         )
         .bind(route_id.to_string())
         .bind(tenant_external_id)
@@ -359,7 +359,7 @@ impl Database {
     ) -> Result<(), AppError> {
         let mut tx = self.begin_write_transaction().await?;
         let tenant_id = sqlx::query(
-            "SELECT r.tenant_id FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE r.id = $1 AND t.external_id = $2",
+            "SELECT r.tenant_id FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE r.id = $1 AND t.external_id = $2 AND r.archived_at IS NULL",
         )
         .bind(route_id.to_string())
         .bind(tenant_external_id)
@@ -476,9 +476,9 @@ impl Database {
         key_material: &[u8],
     ) -> Result<Option<ResolvedUpstream>, AppError> {
         let sql = if upstream_account_id.is_some() {
-            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.updated_at AS transport_revision, a.credential_generation, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at > $5) WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND a.id = $4 AND r.enabled = 1 AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1"
+            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.updated_at AS transport_revision, a.credential_generation, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at > $5) WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND a.id = $4 AND r.enabled = 1 AND r.archived_at IS NULL AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1"
         } else {
-            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.updated_at AS transport_revision, a.credential_generation, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at > $4) WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND r.enabled = 1 AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1"
+            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.updated_at AS transport_revision, a.credential_generation, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at > $4) WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND r.enabled = 1 AND r.archived_at IS NULL AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1"
         };
         let query = sqlx::query(sql)
             .bind(tenant_id.to_string())

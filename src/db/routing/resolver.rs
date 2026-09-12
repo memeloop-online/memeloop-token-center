@@ -206,7 +206,7 @@ impl Database {
                ON candidates.tenant_id = r.tenant_id AND candidates.model_route_id = r.id
              JOIN upstream_accounts a ON a.id = candidates.upstream_account_id AND a.tenant_id = r.tenant_id
              WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3
-               AND r.enabled = 1 AND a.status = 'active'
+               AND r.enabled = 1 AND r.archived_at IS NULL AND a.status = 'active'
                AND (
                  EXISTS (SELECT 1 FROM routing_grants g WHERE g.tenant_id = r.tenant_id AND g.key_id = $4 AND g.model_route_id = r.id)
                  OR EXISTS (
@@ -303,7 +303,7 @@ impl Database {
               AND credential.generation = account.credential_generation
               AND credential.revoked_at IS NULL
               AND (credential.expires_at IS NULL OR credential.expires_at > $6)
-             WHERE route.id = $1 AND route.enabled = 1",
+             WHERE route.id = $1 AND route.enabled = 1 AND route.archived_at IS NULL",
         )
         .bind(candidate.route_id.to_string())
         .bind(candidate.account_id.to_string())
@@ -351,7 +351,7 @@ impl Database {
         let rows = sqlx::query(
             "SELECT DISTINCT r.public_model AS model
              FROM model_routes r
-             WHERE r.tenant_id = $1 AND r.enabled = 1
+             WHERE r.tenant_id = $1 AND r.enabled = 1 AND r.archived_at IS NULL
                AND (
                  EXISTS (SELECT 1 FROM routing_grants g WHERE g.tenant_id = r.tenant_id AND g.key_id = $2 AND g.model_route_id = r.id)
                  OR EXISTS (
@@ -400,7 +400,7 @@ impl Database {
               AND credential.generation = account.credential_generation
               AND credential.revoked_at IS NULL
               AND (credential.expires_at IS NULL OR credential.expires_at > $3)
-             WHERE r.tenant_id = $1 AND r.enabled = 1
+             WHERE r.tenant_id = $1 AND r.enabled = 1 AND r.archived_at IS NULL
                AND (
                  EXISTS (SELECT 1 FROM routing_grants g WHERE g.tenant_id = r.tenant_id AND g.key_id = $2 AND g.model_route_id = r.id)
                  OR EXISTS (
@@ -450,7 +450,7 @@ impl Database {
         let found = sqlx::query(
             "SELECT r.id
              FROM model_routes r
-             WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND r.enabled = 1
+             WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND r.enabled = 1 AND r.archived_at IS NULL
                AND (
                  EXISTS (SELECT 1 FROM routing_grants g WHERE g.tenant_id = r.tenant_id AND g.key_id = $4 AND g.model_route_id = r.id)
                  OR EXISTS (

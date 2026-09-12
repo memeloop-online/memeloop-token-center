@@ -962,7 +962,7 @@ pub(crate) async fn replace_key_routing_grants_in_transaction(
             .map(|model| model.trim().to_owned())
             .collect::<BTreeSet<_>>();
         let rows = if allowed.contains("*") {
-            sqlx::query("SELECT id FROM model_routes WHERE tenant_id = $1 ORDER BY id")
+            sqlx::query("SELECT id FROM model_routes WHERE archived_at IS NULL AND tenant_id = $1 ORDER BY id")
                 .bind(tenant_id)
                 .fetch_all(&mut **tx)
                 .await?
@@ -970,7 +970,7 @@ pub(crate) async fn replace_key_routing_grants_in_transaction(
             Vec::new()
         } else {
             let mut sql =
-                "SELECT id FROM model_routes WHERE tenant_id = $1 AND public_model IN (".to_owned();
+                "SELECT id FROM model_routes WHERE archived_at IS NULL AND tenant_id = $1 AND public_model IN (".to_owned();
             for index in 0..allowed.len() {
                 if index != 0 {
                     sql.push_str(", ");
@@ -1066,7 +1066,9 @@ async fn require_grant_members(
         return Ok(());
     }
     let prefix = match table {
-        "model_routes" => "SELECT COUNT(*) AS found FROM model_routes WHERE tenant_id = ",
+        "model_routes" => {
+            "SELECT COUNT(*) AS found FROM model_routes WHERE archived_at IS NULL AND tenant_id = "
+        }
         "route_groups" => "SELECT COUNT(*) AS found FROM route_groups WHERE tenant_id = ",
         _ => return Err(AppError::Internal),
     };

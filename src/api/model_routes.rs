@@ -381,3 +381,40 @@ pub(super) async fn delete_model_route(
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
+
+pub(super) async fn archive_model_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(route_id): Path<Uuid>,
+    Json(body): Json<DeleteModelRouteQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "routes:write").await?;
+    require_service_tenant(&service, &body.tenant_external_id)?;
+    state
+        .db
+        .archive_model_route(route_id, &body.tenant_external_id, body.expected_updated_at)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ArchivedModelRouteQuery {
+    tenant_external_id: String,
+}
+
+pub(super) async fn get_archived_model_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(route_id): Path<Uuid>,
+    Query(query): Query<ArchivedModelRouteQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "routes:read").await?;
+    require_service_tenant(&service, &query.tenant_external_id)?;
+    Ok(Json(
+        state
+            .db
+            .archived_model_route(route_id, &query.tenant_external_id)
+            .await?,
+    ))
+}
