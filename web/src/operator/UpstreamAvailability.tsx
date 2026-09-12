@@ -4,15 +4,27 @@ import type { OperatorMonitoringSnapshot, UpstreamAccount, UpstreamHealth } from
 import { RoutingStatusBadge } from './MonitoringSnapshot';
 import type { UpstreamAvailabilityWindow } from './upstreamAvailabilityWindow';
 
+export function manualHealthLabel(health: UpstreamHealth) {
+  switch (health.error_code) {
+    case 'quota_exhausted': return 'providers.healthQuotaExhausted';
+    case 'rate_limited': return 'providers.healthRateLimited';
+    case 'upstream_unavailable': return 'providers.healthUnavailable';
+    default: return health.status === 'healthy' ? 'providers.healthy' : 'providers.unhealthy';
+  }
+}
+
 function ManualHealthCheck({ health }: { health?: UpstreamHealth }) {
   const { locale, t } = useI18n();
   return <section className="provider-manual-health" aria-label={t('providers.manualHealthCheck')}>
     <small>{t('providers.manualHealthCheck')}</small>
     {!health ? <span className="muted">{t('providers.manualHealthNotRun')}</span> : <div className="provider-manual-health-result">
-      <span className={`status ${health.status === 'healthy' ? 'ok' : 'bad'}`}>{health.status === 'healthy' ? t('providers.healthy') : t('providers.unhealthy')}</span>
+      <span className={`status ${health.status === 'healthy' ? 'ok' : 'bad'}`}>{t(manualHealthLabel(health))}</span>
       <span>{t('providers.checkedAt', { time: new Date(health.checked_at).toLocaleString(locale) })}</span>
       {health.upstream_status !== undefined && <span>HTTP {formatNumber(health.upstream_status, locale)}</span>}
       {health.latency_ms !== undefined && <span>{formatMilliseconds(health.latency_ms, locale)}</span>}
+      {health.retry_at !== undefined && <span>{t('providers.healthRetryAt', { time: new Date(health.retry_at).toLocaleString(locale) })}</span>}
+      {health.source === 'routing_state' && <span>{t('providers.healthSuppressed')}</span>}
+      {health.status === 'healthy' && <span>{t('providers.healthConnectionOnly')}</span>}
       {health.error_code && <code>{health.error_code}</code>}
     </div>}
   </section>;
