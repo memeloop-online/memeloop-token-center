@@ -53,7 +53,7 @@ function ScopedSlot({ title, messages, load, ...policy }: PluginUiSlotProps) {
             switch (component.kind) {
               case 'text': return <p key={index}>{component.text}</p>;
               case 'metric': return <dl key={index}><dt>{component.label}</dt><dd>{component.value}</dd></dl>;
-              case 'status': return <p key={index}>{component.label}: <span className="pill">{messages.states[component.state]}</span></p>;
+              case 'status': return <p key={index}>{component.label}: <span className="plugin-ui-state">{messages.states[component.state]}</span></p>;
               case 'link': return <a key={index} href={component.href} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer">{component.label}</a>;
             }
           })}</div>}

@@ -3,4 +3,5 @@
 .plugin-ui-components p, .plugin-ui-components dl { margin: 0; }
 .plugin-ui-components dd { margin-inline-start: 0; font-size: 1.25em; font-weight: 600; }
 .plugin-ui-components a { color: inherit; text-decoration: underline; }
+.plugin-ui-state { color: inherit; border: 1px solid currentColor; padding: .1em .35em; }
 .plugin-ui-components a:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }

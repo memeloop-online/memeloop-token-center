@@ -49,7 +49,7 @@ export function parsePluginUiProjection(value: unknown, policy: PluginUiPolicy):
       components.push({ kind: 'text', text: component.text });
     } else if (component.kind === 'metric' && keys(component, ['kind', 'label', 'value']) && boundedText(component.label, 128) && boundedText(component.value, 128)) {
       components.push({ kind: 'metric', label: component.label, value: component.value });
-    } else if (component.kind === 'status' && keys(component, ['kind', 'label', 'state']) && boundedText(component.label, 128) && ['ok', 'warning', 'error', 'unknown'].includes(String(component.state))) {
+    } else if (component.kind === 'status' && keys(component, ['kind', 'label', 'state']) && boundedText(component.label, 128) && typeof component.state === 'string' && ['ok', 'warning', 'error', 'unknown'].includes(component.state)) {
       components.push({ kind: 'status', label: component.label, state: component.state as 'ok' | 'warning' | 'error' | 'unknown' });
     } else if (component.kind === 'link' && keys(component, ['kind', 'label', 'href']) && boundedText(component.label, 128) && safeLink(component.href, policy.allowedLinkOrigins)) {
       components.push({ kind: 'link', label: component.label, href: component.href });
