@@ -22,9 +22,11 @@ use crate::{
 };
 
 const DEFAULT_MODEL_PICKER_LIMIT: i64 = 50;
-const MAX_MODEL_PICKER_SEARCH_BYTES: usize = 500;
+const MAX_MODEL_PICKER_SEARCH_CHARS: usize = 500;
 const MAX_MODEL_PICKER_CURSOR_BYTES: usize = 2_048;
 const MAX_MODEL_PICKER_FILTER_IDS: usize = 100;
+const MAX_MODEL_PICKER_FILTER_BYTES: usize =
+    MAX_MODEL_PICKER_FILTER_IDS * 36 + (MAX_MODEL_PICKER_FILTER_IDS - 1);
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -92,9 +94,9 @@ pub(super) async fn list_model_picker_options(
     let tenant = management_tenant(&service, Some(requested_tenant))?
         .ok_or_else(|| AppError::BadRequest("tenant_external_id is required".into()))?;
     let search = query.q.trim();
-    if search.len() > MAX_MODEL_PICKER_SEARCH_BYTES {
+    if search.chars().count() > MAX_MODEL_PICKER_SEARCH_CHARS {
         return Err(AppError::BadRequest(
-            "model picker search contains too many bytes".into(),
+            "model picker search contains too many characters".into(),
         ));
     }
     if !(1..=MODEL_PICKER_ITEM_LIMIT).contains(&query.limit) {
@@ -183,6 +185,13 @@ fn parse_uuid_filter(value: Option<&str>) -> Result<Vec<Uuid>, AppError> {
     let Some(value) = value.filter(|value| !value.is_empty()) else {
         return Ok(Vec::new());
     };
+    if value.len() > MAX_MODEL_PICKER_FILTER_BYTES
+        || value.split(',').count() > MAX_MODEL_PICKER_FILTER_IDS
+    {
+        return Err(AppError::BadRequest(
+            "model picker candidate filter is too large".into(),
+        ));
+    }
     let mut values = value
         .split(',')
         .map(|value| {
@@ -291,5 +300,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         assert!(parse_uuid_filter(Some(&oversized)).is_err());
+        let repeated = std::iter::repeat_n(first.to_string(), MAX_MODEL_PICKER_FILTER_IDS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(parse_uuid_filter(Some(&repeated)).is_err());
+        assert!(parse_uuid_filter(Some(&"x".repeat(MAX_MODEL_PICKER_FILTER_BYTES + 1))).is_err());
     }
 }

@@ -1585,7 +1585,8 @@ paths:
         Returns one logical route or public-model selection per item and aggregates
         every matching configured upstream into `sources`. Only public provider
         drivers are included. The projection reads persisted configuration, catalog,
-        and passive breaker evidence in one bounded database statement; it never
+        and passive breaker evidence in one bounded projection database statement
+        after service authentication; it never
         probes an upstream, synchronizes a catalog, decrypts credentials, or performs
         provider network I/O. Cursors are bound to the tenant, selection kind, search
         text, candidate filters, and current public provider catalog.
@@ -1593,7 +1594,7 @@ paths:
       x-required-scope: routes:read
       x-required-scopes: [routes:read, providers:read]
       x-projection-contract:
-        database-statements-per-request: 1
+        database-statements-after-authentication: 1
         public-provider-catalog-only: true
         provider-network-io: forbidden
         catalog-sync: forbidden

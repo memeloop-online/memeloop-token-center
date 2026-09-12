@@ -58,6 +58,7 @@ async fn create_route(
     protocol: &str,
     priority: i64,
     account_ids: Vec<Uuid>,
+    included_provider_group_ids: Vec<Uuid>,
 ) -> Uuid {
     state
         .db
@@ -69,7 +70,7 @@ async fn create_route(
             priority,
             enabled: true,
             upstream_account_ids: account_ids,
-            included_provider_group_ids: Vec::new(),
+            included_provider_group_ids,
             excluded_provider_group_ids: Vec::new(),
             route_group_ids: Vec::new(),
             route_group_names: Vec::new(),
@@ -130,7 +131,7 @@ async fn seed_projection(state: &AppState, label: &str) -> ProjectionFixture {
     let other_tenant = format!("picker-other-{label}-{}", Uuid::now_v7());
     let first_account = create_account(state, &tenant, "Alpha account", "http-json").await;
     let second_account = create_account(state, &tenant, "Beta account", "http-json").await;
-    let third_account = create_account(state, &tenant, "Gamma account", "http-json").await;
+    let third_account = create_account(state, &tenant, "Gamma 账号", "http-json").await;
     let fourth_account = create_account(state, &tenant, "Delta account", "http-json").await;
     let hidden_account =
         create_account(state, &tenant, "Hidden retired account", "retired-hidden").await;
@@ -170,6 +171,7 @@ async fn seed_projection(state: &AppState, label: &str) -> ProjectionFixture {
         "openai",
         0,
         vec![first_account, second_account],
+        vec![provider_group.id],
     )
     .await;
     let second_route = create_route(
@@ -180,6 +182,7 @@ async fn seed_projection(state: &AppState, label: &str) -> ProjectionFixture {
         "anthropic",
         1,
         vec![third_account, fourth_account],
+        Vec::new(),
     )
     .await;
     create_route(
@@ -190,6 +193,7 @@ async fn seed_projection(state: &AppState, label: &str) -> ProjectionFixture {
         "openai",
         0,
         vec![hidden_account],
+        Vec::new(),
     )
     .await;
     create_route(
@@ -200,6 +204,7 @@ async fn seed_projection(state: &AppState, label: &str) -> ProjectionFixture {
         "openai",
         0,
         vec![other_account],
+        Vec::new(),
     )
     .await;
 
@@ -362,13 +367,21 @@ async fn exercise_database_projection(state: &AppState, label: &str) {
             .iter()
             .any(|group| group.id == fixture.provider_group.to_string())
     );
+    assert!(model_items[0].sources.iter().all(|source| {
+        source
+            .provider_groups
+            .iter()
+            .filter(|group| group.id == fixture.provider_group.to_string())
+            .count()
+            <= 1
+    }));
 
     let searched = state
         .db
         .model_picker_projection(projection_filter(
             &fixture,
             ModelPickerSelectionKind::Model,
-            "Gamma account",
+            "GAMMA 账号",
             &[],
             &public_provider_ids,
         ))

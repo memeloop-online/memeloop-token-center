@@ -137,7 +137,7 @@ impl Database {
         } else {
             1_i64
         };
-        let query = format!("%{}%", escape_like(filter.query));
+        let query = format!("%{}%", escape_like(&filter.query.to_ascii_lowercase()));
         let rows = sqlx::query(sqlx::AssertSqlSafe(model_picker_sql(self.backend)))
             .bind(filter.tenant_external_id)
             .bind(filter.selection_kind.as_str())
@@ -351,9 +351,12 @@ fn escape_like(value: &str) -> String {
 }
 
 const MODEL_PICKER_POSTGRES_SQL: &str = r#"
-WITH raw_sources AS (
+WITH direct_sources AS (
     SELECT direct.tenant_id, direct.model_route_id, direct.upstream_account_id, direct.upstream_model
       FROM model_route_upstream_accounts direct
+), raw_sources AS (
+    SELECT direct.tenant_id, direct.model_route_id, direct.upstream_account_id, direct.upstream_model
+      FROM direct_sources direct
     UNION
     SELECT included.tenant_id, included.model_route_id, member.upstream_account_id, route.upstream_model
       FROM model_route_included_provider_groups included
@@ -362,6 +365,13 @@ WITH raw_sources AS (
        AND member.provider_group_id = included.provider_group_id
       JOIN model_routes route
         ON route.tenant_id = included.tenant_id AND route.id = included.model_route_id
+     WHERE NOT EXISTS (
+         -- A direct route/account assignment is authoritative over group expansion.
+         SELECT 1 FROM direct_sources direct
+          WHERE direct.tenant_id = included.tenant_id
+            AND direct.model_route_id = included.model_route_id
+            AND direct.upstream_account_id = member.upstream_account_id
+     )
 ), configured_sources AS (
     SELECT raw.tenant_id, raw.model_route_id, raw.upstream_account_id, raw.upstream_model
       FROM raw_sources raw
@@ -406,7 +416,7 @@ WITH raw_sources AS (
            CASE WHEN $2 = 'route' THEN route.id ELSE route.public_model END AS item_identity,
            CASE WHEN $2 = 'route' THEN route.id ELSE route.public_model END AS item_value,
            route.public_model AS item_label,
-           LOWER(route.public_model) AS sort_label
+           LOWER(route.public_model COLLATE "C") AS sort_label
       FROM model_routes route
       JOIN selected_sources source
         ON source.tenant_id = route.tenant_id AND source.model_route_id = route.id
@@ -424,10 +434,10 @@ WITH raw_sources AS (
           WHERE route.enabled = 1
             AND (($2 = 'route' AND route.id = item.item_identity)
                  OR ($2 = 'model' AND route.public_model = item.item_identity))
-            AND (LOWER(route.public_model) LIKE LOWER($3) ESCAPE '\'
-                 OR LOWER(source.upstream_model) LIKE LOWER($3) ESCAPE '\'
-                 OR LOWER(account.name) LIKE LOWER($3) ESCAPE '\'
-                 OR LOWER(account.driver) LIKE LOWER($3) ESCAPE '\'
+            AND (LOWER(route.public_model COLLATE "C") LIKE CAST($3 AS TEXT) COLLATE "C" ESCAPE '\'
+                 OR LOWER(source.upstream_model COLLATE "C") LIKE CAST($3 AS TEXT) COLLATE "C" ESCAPE '\'
+                 OR LOWER(account.name COLLATE "C") LIKE CAST($3 AS TEXT) COLLATE "C" ESCAPE '\'
+                 OR LOWER(account.driver COLLATE "C") LIKE CAST($3 AS TEXT) COLLATE "C" ESCAPE '\'
                  OR EXISTS (
                      SELECT 1 FROM upstream_account_provider_groups membership
                      JOIN provider_groups provider_group
@@ -435,7 +445,7 @@ WITH raw_sources AS (
                       AND provider_group.id = membership.provider_group_id
                     WHERE membership.tenant_id = source.tenant_id
                       AND membership.upstream_account_id = account.id
-                      AND LOWER(provider_group.name) LIKE LOWER($3) ESCAPE '\'
+                      AND LOWER(provider_group.name COLLATE "C") LIKE CAST($3 AS TEXT) COLLATE "C" ESCAPE '\'
                  ))
      )
 ), page AS MATERIALIZED (
@@ -524,9 +534,12 @@ SELECT source.*, provider_group.provider_group_id, provider_group.provider_group
 "#;
 
 const MODEL_PICKER_SQLITE_SQL: &str = r#"
-WITH raw_sources AS (
+WITH direct_sources AS (
     SELECT direct.tenant_id, direct.model_route_id, direct.upstream_account_id, direct.upstream_model
       FROM model_route_upstream_accounts direct
+), raw_sources AS (
+    SELECT direct.tenant_id, direct.model_route_id, direct.upstream_account_id, direct.upstream_model
+      FROM direct_sources direct
     UNION
     SELECT included.tenant_id, included.model_route_id, member.upstream_account_id, route.upstream_model
       FROM model_route_included_provider_groups included
@@ -535,6 +548,13 @@ WITH raw_sources AS (
        AND member.provider_group_id = included.provider_group_id
       JOIN model_routes route
         ON route.tenant_id = included.tenant_id AND route.id = included.model_route_id
+     WHERE NOT EXISTS (
+         -- Keep SQLite and PostgreSQL precedence identical for historical rows.
+         SELECT 1 FROM direct_sources direct
+          WHERE direct.tenant_id = included.tenant_id
+            AND direct.model_route_id = included.model_route_id
+            AND direct.upstream_account_id = member.upstream_account_id
+     )
 ), configured_sources AS (
     SELECT raw.tenant_id, raw.model_route_id, raw.upstream_account_id, raw.upstream_model
       FROM raw_sources raw
