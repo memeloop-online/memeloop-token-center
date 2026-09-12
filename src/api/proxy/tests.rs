@@ -133,6 +133,7 @@ fn pinned_internal_request_envelope_rejects_every_traffic_rewrite() {
             requested_model: "assistant-model".into(),
             model: "assistant-model".into(),
             upstream_account_hint: None,
+            request_rewrite_supplied: true,
         };
         assert!(pinned_request_envelope_changed(
             Some(route_id),
@@ -145,17 +146,34 @@ fn pinned_internal_request_envelope_rejects_every_traffic_rewrite() {
         requested_model: "assistant-model".into(),
         model: "assistant-model".into(),
         upstream_account_hint: Some(Uuid::now_v7()),
+        request_rewrite_supplied: false,
     };
     assert!(!pinned_request_envelope_changed(
         Some(route_id),
         &original,
         &hinted
     ));
+    // The guest API returns parsed JSON, so whitespace and object-order-only
+    // differences compare equal. The host-owned provenance bit must still
+    // reject a plugin which explicitly supplied that exact echo.
+    let exact_echo = AppliedTraffic {
+        request_json: original.clone(),
+        requested_model: "assistant-model".into(),
+        model: "assistant-model".into(),
+        upstream_account_hint: None,
+        request_rewrite_supplied: true,
+    };
+    assert!(pinned_request_envelope_changed(
+        Some(route_id),
+        &original,
+        &exact_echo
+    ));
     let inconsistent_model = AppliedTraffic {
         request_json: original.clone(),
         requested_model: "assistant-model".into(),
         model: "other-model".into(),
         upstream_account_hint: None,
+        request_rewrite_supplied: false,
     };
     assert!(pinned_request_envelope_changed(
         Some(route_id),
@@ -167,6 +185,7 @@ fn pinned_internal_request_envelope_rejects_every_traffic_rewrite() {
         requested_model: "assistant-model".into(),
         model: "assistant-model".into(),
         upstream_account_hint: None,
+        request_rewrite_supplied: true,
     };
     assert!(!pinned_request_envelope_changed(
         None,
