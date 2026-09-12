@@ -3,6 +3,21 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { connectionSchema, isPrivateProxyUrl } from '../src/operator/upstreamConnectionPolicy.js';
 
+test('versioned failover fields retain schema bounds and receive editor labels', () => {
+  const fields = {
+    version: { type: 'integer' as const, enum: [1], default: 1 },
+    candidate_attempts: { type: 'integer' as const, minimum: 1, maximum: 8, default: 3 },
+    failover_deadline_millis: { type: 'integer' as const, minimum: 1000, maximum: 300000, default: 300000 },
+  };
+  const output = connectionSchema({ properties: { transport_policy: { properties: fields, additionalProperties: false } } }, 'Fixed endpoint');
+  const policy = output.properties?.transport_policy as { properties: Record<string, object>; additionalProperties: boolean };
+  assert.equal(policy.additionalProperties, false);
+  for (const [field, title] of Object.entries({ version: 'Policy version', candidate_attempts: 'Candidate attempts', failover_deadline_millis: 'Failover deadline (ms)' })) {
+    assert.deepEqual(policy.properties[field], { ...fields[field as keyof typeof fields], title });
+  }
+  assert.equal('title' in fields.version, false);
+});
+
 test('Codex proxies mirror private backend ranges without narrowing generic hostname schemas', () => {
   for (const [url, valid] of [
     ['socks5h://10.0.0.10:1080', true], ['socks5h://100.64.0.16', true], ['socks5h://[fd00::1]:1080', true],

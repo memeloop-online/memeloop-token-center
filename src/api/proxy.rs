@@ -28,13 +28,12 @@ use lifecycle::{
 };
 use routing::{
     AdmittedProxyRouteInput, CandidatePreparationSummary, CodexRetryTerminal,
-    CodexRetryTerminalGuard, DeferredSharedProbe, NextSendableProxyRouteInput,
-    PROXY_ROUTING_POLICY, PlannedProxyRoute, PreparedProxyRoute, PreparedRouteReadiness,
-    ProxyRequestContext, ProxyRoutePlanInput, ProxySendError, UpstreamAttemptGuard,
-    UpstreamAttemptTerminal, candidate_reservation_bounds, exhausted_candidate_error,
-    materialize_proxy_route, next_planned_proxy_candidate, plan_proxy_route,
-    prepare_admitted_proxy_route, prepared_input_reservation_bound, refresh_route_snapshot,
-    send_proxy_route,
+    CodexRetryTerminalGuard, DeferredSharedProbe, NextSendableProxyRouteInput, PlannedProxyRoute,
+    PreparedProxyRoute, PreparedRouteReadiness, ProxyRequestContext, ProxyRoutePlanInput,
+    ProxySendError, UpstreamAttemptGuard, UpstreamAttemptTerminal, candidate_reservation_bounds,
+    exhausted_candidate_error, materialize_proxy_route, next_planned_proxy_candidate,
+    plan_proxy_route, prepare_admitted_proxy_route, prepared_input_reservation_bound,
+    refresh_route_snapshot, send_proxy_route,
 };
 use upstream_response::UpstreamResponse;
 
@@ -375,7 +374,7 @@ async fn next_sendable_proxy_route(
         let transport_policy = routing::runtime_transport_policy(
             &planned.route.config,
             state.config.upstream_health.shared_probe_attempts,
-        );
+        )?;
         match routing::join_shared_probe(
             state,
             planned.route.account_id,
@@ -679,6 +678,9 @@ pub(super) async fn proxy(
     })
     .await?;
     let primary = route_plan.primary_route();
+    // Freeze before reservation and archive work: later candidates/reloads may
+    // change account transport settings, never replenish the request budget.
+    let attempt_budget = routing::RequestAttemptBudget::from_primary(primary)?;
     let upstream_account_id = Some(primary.account_id);
     let model_route_id = Some(primary.route_id);
     let price = state.db.model_price(&model, &key.currency).await?;
@@ -804,9 +806,10 @@ pub(super) async fn proxy(
     let mut deferred_shared_probes = std::collections::VecDeque::new();
     let mut next_failover_reason = None;
     let (active_route, upstream, upstream_activity, mut codex_retry, mut upstream_attempt) = loop {
-        if outbound_attempts == PROXY_ROUTING_POLICY.max_attempts() {
-            return finish_proxy_unavailable(&buffered_request, "upstream_attempts_exhausted")
-                .await;
+        if let Some(reason) = attempt_budget.terminal_reason(outbound_attempts) {
+            tracing::warn!(%request_id, outbound_attempts, stage = reason,
+                policy_version = attempt_budget.version, "proxy request budget exhausted");
+            return finish_proxy_unavailable(&buffered_request, reason).await;
         }
         let selected = match next_sendable_proxy_route(NextSendableProxyRouteInput {
             request: request_context,
@@ -841,16 +844,25 @@ pub(super) async fn proxy(
         else {
             return finish_proxy_unavailable(&buffered_request, "upstream_unavailable").await;
         };
-        let (result, rate_limit) = match send_proxy_route(
-            &state,
-            &headers,
-            protocol,
-            request_id,
-            &active_route,
-            selected_candidate_rank,
-            outbound_attempt,
-        )
-        .await
+        // Selection may have waited for database admission; do not dispatch
+        // when the original deadline expired during that wait.
+        if let Some(reason) = attempt_budget.terminal_reason(outbound_attempts) {
+            upstream_attempt
+                .complete(UpstreamAttemptTerminal::Inconclusive)
+                .await;
+            return finish_proxy_unavailable(&buffered_request, reason).await;
+        }
+        let (result, rate_limit) = match attempt_budget
+            .send(send_proxy_route(
+                &state,
+                &headers,
+                protocol,
+                request_id,
+                &active_route,
+                selected_candidate_rank,
+                outbound_attempt,
+            ))
+            .await
         {
             Ok(mut result)
                 if active_route.is_codex()
@@ -912,30 +924,28 @@ pub(super) async fn proxy(
                 .complete(UpstreamAttemptTerminal::Failed { kind, reason })
                 .await;
         }
-        let failover_reason = match &result {
-            Ok(result)
-                if result.response.status() == StatusCode::TOO_MANY_REQUESTS
-                    && (!route_candidates.as_slice().is_empty()
-                        || !deferred_shared_probes.is_empty()) =>
-            {
-                Some(UpstreamHealthReason::RateLimited)
-            }
-            Err(ProxySendError::RetryableConnection(_)) => failure.map(|(_, reason)| reason),
-            Err(ProxySendError::CandidateUnavailable | ProxySendError::CredentialUnavailable) => {
-                Some(UpstreamHealthReason::Unavailable)
-            }
-            Ok(_)
-            | Err(
-                ProxySendError::RetryableCodexBadRequest
-                | ProxySendError::CodexBadRequest
-                | ProxySendError::AmbiguousResponse(_)
-                | ProxySendError::NonRetryableTransport
-                | ProxySendError::Credential,
-            ) => None,
-        };
+        let disposition = routing::failover_disposition(
+            result.as_ref().ok().map(|result| result.response.status()),
+            result.as_ref().err(),
+        );
+        let has_standby =
+            !route_candidates.as_slice().is_empty() || !deferred_shared_probes.is_empty();
+        let failover_reason = disposition.reason().filter(|_| has_standby);
+        if !result
+            .as_ref()
+            .is_ok_and(|result| result.response.status().is_success())
+        {
+            tracing::warn!(%request_id, route_id = %active_route.route.route_id,
+                upstream_account_id = %active_route.route.account_id,
+                candidate_rank = selected_candidate_rank, outbound_attempt,
+                policy_version = attempt_budget.version,
+                disposition = disposition.as_str(), has_standby,
+                budget_terminal = attempt_budget.terminal_reason(outbound_attempts),
+                stage = "upstream_failover_decision", "proxy evaluated delivery evidence");
+        }
         if let Some(reason) = failover_reason
             && (!consumed_outbound_attempt
-                || outbound_attempts < PROXY_ROUTING_POLICY.max_attempts())
+                || attempt_budget.terminal_reason(outbound_attempts).is_none())
         {
             next_failover_reason = Some(reason);
             continue;
