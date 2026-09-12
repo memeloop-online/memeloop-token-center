@@ -952,8 +952,9 @@ async fn conversation_and_unlinked_session_detail_preserve_completion_timestamps
     let archive_request_id = Uuid::now_v7();
     let source_started_at = memeloop_token_center::db::unix_millis() + 1_000;
     let source_completed_at = source_started_at + 25;
+    let imported_at = memeloop_token_center::db::unix_millis();
     sqlx::query(
-        "INSERT INTO session_archive_unlinked_requests (tenant_id, source, external_request_id, archive_request_id, key_id, principal_id, conversation_cluster_id, source_started_at, source_completed_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, request_object, response_object, imported_at) VALUES ($1, 'fixture', $2, $3, $4, $5, NULL, $6, $7, 'openai-responses', 'archive-detail-model', 200, 25, 5, 4, 'memory://detail-completion/archive-request', 'memory://detail-completion/archive-response', $6)",
+        "INSERT INTO session_archive_unlinked_requests (tenant_id, source, external_request_id, archive_request_id, key_id, principal_id, conversation_cluster_id, source_started_at, source_completed_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, request_object, response_object, imported_at) VALUES ($1, 'fixture', $2, $3, $4, $5, NULL, $6, $7, 'openai-responses', 'archive-detail-model', 200, 25, 5, 4, 'memory://detail-completion/archive-request', 'memory://detail-completion/archive-response', $8)",
     )
     .bind(fixture.key.tenant_id.to_string())
     .bind(archive_request_id.to_string())
@@ -962,6 +963,7 @@ async fn conversation_and_unlinked_session_detail_preserve_completion_timestamps
     .bind(fixture.key.principal_id.to_string())
     .bind(source_started_at)
     .bind(source_completed_at)
+    .bind(imported_at)
     .execute(&fixture.pool)
     .await
     .expect("insert archive-only detail request");
