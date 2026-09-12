@@ -25,6 +25,9 @@ use uuid::Uuid;
 
 const PEPPER: &[u8] = b"generation test pepper longer than thirty-two bytes";
 
+#[path = "generation_jobs/shutdown.rs"]
+mod shutdown;
+
 async fn fixture() -> (
     tempfile::TempDir,
     Database,

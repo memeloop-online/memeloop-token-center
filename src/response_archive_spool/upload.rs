@@ -109,11 +109,12 @@ async fn upload(state: &AppState, task: &ArchiveSpoolTask) -> Result<(), AppErro
         ArchiveStagingPurpose::Response,
     )
     .await?;
-    let (lost_sender, mut lost_receiver) = tokio::sync::mpsc::channel(1);
     let heartbeat_state = state.clone();
     let heartbeat_task = task.clone();
     let mut heartbeat_attempt = attempt.clone();
-    let _heartbeat = AbortOnDrop(tokio::spawn(async move {
+    // Poll the heartbeat in the upload future itself. Cancelling/joining the
+    // spool role now also drops this lease loop; there is no detached child.
+    let heartbeat = async move {
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
             let renewed = tokio::time::timeout(Duration::from_secs(2), async {
@@ -131,11 +132,10 @@ async fn upload(state: &AppState, task: &ArchiveSpoolTask) -> Result<(), AppErro
             })
             .await;
             if !matches!(renewed, Ok(Ok(true))) {
-                let _ = lost_sender.send(()).await;
                 break;
             }
         }
-    }));
+    };
     let transfer = async {
         let mut writer = state.archive.start_writer(&attempt.object_locator).await?;
         let mut total = 0_i64;
@@ -186,15 +186,7 @@ async fn upload(state: &AppState, task: &ArchiveSpoolTask) -> Result<(), AppErro
     };
     tokio::select! {
         biased;
-        _ = lost_receiver.recv() => Err(AppError::Internal),
+        _ = heartbeat => Err(AppError::Internal),
         result = transfer => result,
-    }
-}
-
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
     }
 }

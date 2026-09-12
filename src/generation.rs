@@ -207,14 +207,36 @@ fn is_asset_archive_limit_error(error: &AppError) -> bool {
     matches!(error, AppError::Upstream(message) if message == ASSET_ARCHIVE_LIMIT_ERROR)
 }
 
+/// Supervised dispatch durably arms a quarantine before the provider POST.
+/// Dropping this future therefore needs no shutdown-time database availability.
+pub async fn process_one_until_shutdown(
+    state: &AppState,
+    worker_id: &str,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<bool, AppError> {
+    tokio::select! {
+        biased;
+        _ = crate::worker::wait_for_shutdown(&mut shutdown) => Ok(false),
+        outcome = process_one_inner(state, worker_id, true) => outcome,
+    }
+}
+
 pub async fn process_one(state: &AppState, worker_id: &str) -> Result<bool, AppError> {
+    process_one_inner(state, worker_id, false).await
+}
+
+async fn process_one_inner(
+    state: &AppState,
+    worker_id: &str,
+    quarantine_on_drop: bool,
+) -> Result<bool, AppError> {
     let Some(job) = state.db.claim_generation_job(worker_id).await? else {
         return Ok(false);
     };
     // An outer error means the lease could no longer be renewed. In that case
     // the in-flight upstream future is dropped and this worker must not settle,
     // reschedule, or otherwise mutate a job that another worker may now own.
-    let outcome = process_claimed_with_lease(state, worker_id, &job).await?;
+    let outcome = process_claimed_with_lease(state, worker_id, &job, quarantine_on_drop).await?;
     if let Err(error) = outcome {
         let next_failure = job.failure_count.saturating_add(1);
         tracing::warn!(job_id = %job.job_id, attempt = job.attempt_count, failure = next_failure, %error, "generation job attempt failed");
@@ -256,8 +278,9 @@ async fn process_claimed_with_lease(
     state: &AppState,
     worker_id: &str,
     job: &GenerationJobWork,
+    quarantine_on_drop: bool,
 ) -> Result<Result<(), AppError>, AppError> {
-    let attempt = process_claimed(state, worker_id, job);
+    let attempt = process_claimed(state, worker_id, job, quarantine_on_drop);
     tokio::pin!(attempt);
     let period = std::time::Duration::from_secs(20);
     let start = tokio::time::Instant::now() + period;
@@ -372,6 +395,7 @@ async fn process_claimed(
     state: &AppState,
     worker_id: &str,
     job: &GenerationJobWork,
+    quarantine_on_drop: bool,
 ) -> Result<(), AppError> {
     if job.status != "cancelling"
         && unix_millis().saturating_sub(job.created_at) > MAX_JOB_AGE_MILLIS
@@ -405,7 +429,7 @@ async fn process_claimed(
         return cancel_upstream_generation(state, worker_id, job, &route, upstream_job_id).await;
     }
     match job.upstream_job_id.as_deref() {
-        None => submit(state, worker_id, job, &route).await,
+        None => submit(state, worker_id, job, &route, quarantine_on_drop).await,
         Some(upstream_job_id) => poll(state, worker_id, job, &route, upstream_job_id).await,
     }
 }
@@ -524,6 +548,7 @@ async fn submit(
     worker_id: &str,
     job: &GenerationJobWork,
     route: &ResolvedUpstream,
+    quarantine_on_drop: bool,
 ) -> Result<(), AppError> {
     let capabilities = generation_driver_capabilities(&route.driver);
     let submission_nonce = if job.status == "submitting" {
@@ -610,11 +635,22 @@ async fn submit(
         .post(format!("{}{}", route.base_url, path))
         .header("idempotency-key", job.job_id.to_string())
         .json(&input);
+    let request = route.credential.apply(request, unix_millis())?;
+    if quarantine_on_drop {
+        // Commit before send, including before its first poll. If shutdown,
+        // abort, or lease loss drops the attempt, no recovery worker may refund
+        // or redispatch this unknown delivery. Normal completion clears the
+        // guard through the existing ACK/retry/terminal database transitions.
+        state
+            .db
+            .arm_generation_shutdown_quarantine(job.job_id, worker_id, submission_nonce)
+            .await?;
+    }
     let _upstream_activity = state
         .metrics
         .active_upstream(&route.driver, "generation_submit");
     let upstream_started = std::time::Instant::now();
-    let response_result = route.credential.apply(request, unix_millis())?.send().await;
+    let response_result = request.send().await;
     state.metrics.observe_upstream(
         &route.driver,
         "generation_submit",

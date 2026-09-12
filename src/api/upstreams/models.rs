@@ -128,24 +128,32 @@ pub(in crate::api) async fn sync_upstream_models(
     let service = require_service(&headers, &state, "providers:write").await?;
     let tenant = account_tenant(&state, &service, account_id, query.tenant_external_id).await?;
     Ok(Json(
-        sync_account_models(&state, account_id, &tenant).await?,
+        sync_account_models(&state, account_id, &tenant, None).await?,
     ))
 }
 
 pub(crate) fn trigger_upstream_model_sync(state: AppState, account_id: Uuid) {
     tokio::spawn(async move {
-        let Ok((account, _)) = state
-            .db
-            .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
-            .await
-        else {
-            return;
-        };
-        let Some(tenant) = account.tenant_external_id.as_deref() else {
-            return;
-        };
-        let _ = sync_account_models(&state, account_id, tenant).await;
+        sync_upstream_models_after_refresh(&state, account_id, None).await;
     });
+}
+
+pub(super) async fn sync_upstream_models_after_refresh(
+    state: &AppState,
+    account_id: Uuid,
+    blocking: Option<&crate::worker::BlockingTasks>,
+) {
+    let Ok((account, _)) = state
+        .db
+        .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
+        .await
+    else {
+        return;
+    };
+    let Some(tenant) = account.tenant_external_id.as_deref() else {
+        return;
+    };
+    let _ = sync_account_models(state, account_id, tenant, blocking).await;
 }
 
 async fn account_tenant(
@@ -172,6 +180,7 @@ async fn sync_account_models(
     state: &AppState,
     account_id: Uuid,
     tenant_external_id: &str,
+    blocking: Option<&crate::worker::BlockingTasks>,
 ) -> Result<UpstreamModelCatalogView, AppError> {
     let (account, credential) = state
         .db
@@ -192,7 +201,7 @@ async fn sync_account_models(
             .upstream_model_catalog(account_id, tenant_external_id, None, 100)
             .await;
     }
-    let discovery = discover_models(state, &account, &credential).await;
+    let discovery = discover_models(state, &account, &credential, blocking).await;
     match discovery {
         Ok((source_kind, models)) => {
             let replaced = state
@@ -240,15 +249,19 @@ async fn discover_models(
     state: &AppState,
     account: &crate::provider::UpstreamAccountView,
     credential: &UpstreamCredential,
+    blocking: Option<&crate::worker::BlockingTasks>,
 ) -> Result<(&'static str, Vec<DiscoveredUpstreamModel>), &'static str> {
     let plugins = state.plugins.clone();
     let driver = account.driver.clone();
     let config = account.config.clone();
-    let plugin_result =
-        tokio::task::spawn_blocking(move || plugins.list_provider_models(&driver, &config))
+    let operation = move || plugins.list_provider_models(&driver, &config);
+    let plugin_result = match blocking {
+        Some(tasks) => tasks.run(operation).await.ok_or("upstream_unavailable")?,
+        None => tokio::task::spawn_blocking(operation)
             .await
-            .map_err(|_| "upstream_unavailable")?
-            .map_err(|_| "upstream_unavailable")?;
+            .map_err(|_| "upstream_unavailable")?,
+    }
+    .map_err(|_| "upstream_unavailable")?;
     if let Some(value) = plugin_result {
         return parse_model_array(&value).map(|models| ("component", models));
     }

@@ -38,7 +38,7 @@ pub(in crate::api) use quota::{
     confirm_quota_reset, get_quota_reset, prepare_quota_reset, reconcile_quota_reset,
 };
 
-pub(crate) use oauth::refresh_managed_upstream_oauth;
+pub(crate) use oauth::refresh_managed_upstream_oauth_for_worker;
 pub(in crate::api) use oauth::{
     disconnect_upstream_oauth, poll_codex_oauth, poll_cursor_oauth, refresh_upstream_oauth,
     start_codex_oauth, start_cursor_oauth, start_provider_adapter_oauth,
