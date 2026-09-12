@@ -41,7 +41,21 @@ let comfySequence = 0;
 let seedanceCreateCount = 0;
 let blockerActive = false;
 const pendingSessionResponses = new Set();
+const pendingSessionWaiters = new Set();
 let sessionFixtureReleased = false;
+
+function sendPendingSessionCount(response) {
+  response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+  response.end(JSON.stringify({ pending: pendingSessionResponses.size }));
+}
+
+function releasePendingSessionWaiters() {
+  for (const waiter of [...pendingSessionWaiters]) {
+    if (pendingSessionResponses.size < waiter.expected) continue;
+    pendingSessionWaiters.delete(waiter);
+    if (!waiter.response.destroyed && !waiter.response.writableEnded) sendPendingSessionCount(waiter.response);
+  }
+}
 
 function sendSessionResponse(response, fail, body) {
   response.writeHead(fail ? 429 : 200, { 'content-type': 'application/json' });
@@ -112,6 +126,22 @@ const upstream = createServer((request, response) => {
     if (request.method === 'POST' && requestUrl.pathname === '/__e2e/session-fixture/release') {
       response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
       response.end(JSON.stringify({ released: releasePendingSessionResponses() }));
+      return;
+    }
+    if (request.method === 'GET' && requestUrl.pathname === '/__e2e/session-fixture/pending') {
+      const expected = Number(requestUrl.searchParams.get('expected'));
+      if (!Number.isInteger(expected) || expected < 1 || expected > 32) {
+        response.writeHead(400, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ error: { message: 'expected must be an integer from 1 to 32' } }));
+        return;
+      }
+      if (pendingSessionResponses.size >= expected) {
+        sendPendingSessionCount(response);
+        return;
+      }
+      const waiter = { expected, response };
+      pendingSessionWaiters.add(waiter);
+      response.once('close', () => pendingSessionWaiters.delete(waiter));
       return;
     }
     if (request.method === 'GET' && requestUrl.pathname === '/__e2e/never-persist-state') {
@@ -219,6 +249,7 @@ const upstream = createServer((request, response) => {
       }
       const pending = { response, fail, body };
       pendingSessionResponses.add(pending);
+      releasePendingSessionWaiters();
       response.once('close', () => pendingSessionResponses.delete(pending));
       return;
     }

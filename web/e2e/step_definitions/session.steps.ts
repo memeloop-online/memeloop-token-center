@@ -1,12 +1,23 @@
 import assert from 'node:assert/strict';
 import { Then, When } from '@cucumber/cucumber';
 import type { Locator, Page } from 'playwright';
-import { eventually, model, releaseSessionFixture, requestJson, runtime, sessionModel, tenant } from '../support/runtime.js';
+import {
+  eventually,
+  model,
+  observeSessionReadyRequests,
+  releaseSessionFixture,
+  requestJson,
+  runtime,
+  sessionModel,
+  tenant,
+  waitForPendingSessionRequests,
+} from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
 import { appPreferenceControls, openAppRoute } from './app-route.support.js';
 
 interface SessionObservation {
   liveRequests: Promise<Response>[];
+  sessionReadyRequests?: Promise<Set<string>>;
   sessionListRequests: string[];
   detailRequests: string[];
   baselineSessionListRequests: number;
@@ -236,20 +247,25 @@ When('连续新请求进入活跃状态并分别完成为成功和错误', async
       max_tokens: 32,
     }),
   });
-  // The dedicated session fixture gates all four concurrent upstream calls.
-  // Keep the full batch pending until the active projection is visible, then
-  // release it so the terminal-state assertions observe every lifecycle event.
-  const calls = [sendCall(0), sendCall(2), ...[1, 3].map(async (index) => {
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    return sendCall(index);
-  })];
+  const sessionReady = observeSessionReadyRequests({
+    credential: seed.serviceCredential,
+    keyId: seed.sessionClientKeyId,
+    requestModel: sessionModel,
+    sessionName: 'Codex release dogfood',
+    expected: 4,
+  });
+  await sessionReady.opened;
+  // The dedicated upstream fixture holds all four calls. Its long-poll signal
+  // proves that the complete batch reached the upstream before it is released;
+  // scheduling delays cannot silently turn this into a two- or three-call batch.
+  const calls = [0, 1, 2, 3].map(sendCall);
   observation.liveRequests = calls;
+  observation.sessionReadyRequests = sessionReady.completed;
   let activeSessionConfirmed = false;
   try {
-    await eventually(async () => {
-      await visible(page.locator('.session-card').first());
-      assert.match(await page.locator('.session-card').first().textContent() ?? '', /活跃/);
-    }, 5_000, 'active session was not visible');
+    await waitForPendingSessionRequests(4);
+    const activeCard = page.locator('.session-card').filter({ hasText: '活跃' }).first();
+    await activeCard.waitFor({ state: 'visible', timeout: 5_000 });
     activeSessionConfirmed = true;
   } finally {
     const released = await releaseSessionFixture();
@@ -259,27 +275,28 @@ When('连续新请求进入活跃状态并分别完成为成功和错误', async
 
 Then('Codex 上报的会话名称、代理层级和任务分类进入真实语义视图', async function (this: DogfoodWorld) {
   const page = this.requirePage();
+  const sessionReadyRequests = observations.get(this)!.sessionReadyRequests;
+  assert.ok(sessionReadyRequests, 'session-ready request observation must start before the live calls');
+  assert.equal((await sessionReadyRequests).size, 4, 'all four durable session semantics must commit');
   const controls = page.locator('.session-controls');
   await controls.getByLabel('会话状态').selectOption('');
   await controls.getByLabel('搜索').fill('Codex release dogfood');
   await controls.getByRole('button', { name: '应用筛选', exact: true }).click();
   const card = page.locator('.session-card').filter({ hasText: 'Codex release dogfood' }).first();
-  await visible(card);
+  await card.waitFor({ state: 'visible', timeout: 5_000 });
   await card.getByRole('button', { name: /^打开 / }).click();
   const drawer = page.getByRole('dialog');
-  await visible(drawer);
-  await eventually(async () => {
-    assert.equal(await drawer.locator('.session-event').count(), 4);
-    const text = await drawer.textContent() ?? '';
-    assert.match(text, /语义执行图.*Codex release dogfood/s);
-    assert.match(text, /codex-root/);
-    assert.match(text, /codex-worker/);
-    assert.match(text, /interactive.*background/s);
-    assert.match(text, /4bf92f3577b34da6a3ce929d0e0e4736/);
-    assert.match(text, /browser-e2e/);
-    assert.match(text, /browser-codex-semantic-session/);
-    assert.match(text, /耗时条形图/);
-  }, 5_000, 'projected session semantics did not converge in the open drawer');
+  await drawer.waitFor({ state: 'visible', timeout: 5_000 });
+  assert.equal(await drawer.locator('.session-event').count(), 4);
+  const text = await drawer.textContent() ?? '';
+  assert.match(text, /语义执行图.*Codex release dogfood/s);
+  assert.match(text, /codex-root/);
+  assert.match(text, /codex-worker/);
+  assert.match(text, /interactive.*background/s);
+  assert.match(text, /4bf92f3577b34da6a3ce929d0e0e4736/);
+  assert.match(text, /browser-e2e/);
+  assert.match(text, /browser-codex-semantic-session/);
+  assert.match(text, /耗时条形图/);
   await drawer.getByRole('button', { name: '关闭', exact: true }).click();
 });
 

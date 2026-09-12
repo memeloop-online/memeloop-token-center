@@ -53,7 +53,7 @@ impl Database {
             input.oauth_session_id.is_some().then_some("present"),
             input.oauth_driver.as_deref(),
         );
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write_transaction().await?;
 
         sqlx::query(
             "INSERT INTO tenants (id, external_id, created_at) VALUES ($1, $2, $3) ON CONFLICT(external_id) DO NOTHING",
@@ -227,7 +227,7 @@ impl Database {
     ) -> Result<UpstreamAccountView, AppError> {
         validate_upstream_account_name(&input.name)?;
         let config_json = serde_json::to_string(&input.config).map_err(|_| AppError::Internal)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write_transaction().await?;
         let current = sqlx::query(
             "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2",
         )
@@ -297,7 +297,7 @@ impl Database {
                 "upstream provider status must be active or disabled".into(),
             ));
         }
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write_transaction().await?;
         let current = sqlx::query(
             "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2",
         )
@@ -382,7 +382,7 @@ impl Database {
         tenant_external_id: &str,
         expected_updated_at: i64,
     ) -> Result<(), AppError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write_transaction().await?;
         let account = sqlx::query(
             "SELECT a.tenant_id, a.status, a.updated_at FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id WHERE a.id = $1 AND t.external_id = $2",
         )
@@ -786,4 +786,97 @@ pub(super) fn validate_upstream_account_name(name: &str) -> Result<(), AppError>
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PEPPER: &[u8] = b"account-write-admission-pepper-32b";
+    const TENANT: &str = "account-write-admission";
+
+    #[tokio::test]
+    async fn sqlite_account_update_reserves_the_writer_before_reading_current_state() {
+        let directory = tempfile::tempdir().expect("account write-admission directory");
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("accounts.db").display()
+        );
+        let writer = Database::connect_with_max(&database_url, 1)
+            .await
+            .expect("connect account fixture writer");
+        writer.migrate().await.expect("migrate account fixture");
+        let account = writer
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: TENANT.to_owned(),
+                    name: "write-admission-upstream".to_owned(),
+                    driver: "http-json".to_owned(),
+                    config: serde_json::json!({"base_url": "http://127.0.0.1:1"}),
+                    credential: UpstreamCredential::None,
+                    oauth_session_id: None,
+                    oauth_driver: None,
+                    oauth_refresh_url: None,
+                },
+                PEPPER,
+            )
+            .await
+            .expect("create account fixture");
+
+        let contender = Database::connect_with_max(&database_url, 1)
+            .await
+            .expect("connect account mutation contender");
+        sqlx::query("PRAGMA busy_timeout = 0")
+            .execute(&contender.pool)
+            .await
+            .expect("disable SQLite busy waiting on the contender");
+
+        let mut blocker = writer
+            .begin_write_transaction()
+            .await
+            .expect("reserve the SQLite writer");
+        let changed =
+            sqlx::query("UPDATE upstream_accounts SET name = $1 WHERE id = $2 AND updated_at = $3")
+                .bind("uncommitted-upstream-name")
+                .bind(account.id.to_string())
+                .bind(account.updated_at)
+                .execute(&mut *blocker)
+                .await
+                .expect("hold an uncommitted account mutation");
+        assert_eq!(changed.rows_affected(), 1);
+
+        let result = contender
+            .update_upstream_account(
+                account.id,
+                TENANT,
+                UpdateUpstreamAccountInput {
+                    name: account.name.clone(),
+                    config: account.config.clone(),
+                    expected_updated_at: account.updated_at,
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AppError::Internal)),
+            "the real no-op mutation must encounter the competing writer at BEGIN IMMEDIATE"
+        );
+
+        blocker
+            .rollback()
+            .await
+            .expect("release the account fixture writer");
+        let unchanged = contender
+            .update_upstream_account(
+                account.id,
+                TENANT,
+                UpdateUpstreamAccountInput {
+                    name: account.name.clone(),
+                    config: account.config.clone(),
+                    expected_updated_at: account.updated_at,
+                },
+            )
+            .await
+            .expect("the same valid no-op mutation succeeds without contention");
+        assert_eq!(unchanged.updated_at, account.updated_at);
+    }
 }

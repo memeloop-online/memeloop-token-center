@@ -4,6 +4,8 @@ import { randomUUID } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium, type Browser } from 'playwright';
+import { streamSse } from '../../src/api.js';
+import type { RequestEvent } from '../../src/types.js';
 
 const bootstrapToken = process.env.MTC_E2E_SERVICE_TOKEN
   ?? `browser-e2e-bootstrap-not-a-real-token-${randomUUID()}`;
@@ -35,6 +37,98 @@ export async function releaseSessionFixture(): Promise<number> {
   const { released } = await response.json() as { released: number };
   assert.ok(Number.isInteger(released) && released >= 0, 'session fixture release count must be a non-negative integer');
   return released;
+}
+
+export async function waitForPendingSessionRequests(expected: number): Promise<void> {
+  const response = await fetch(
+    `http://127.0.0.1:${mockPort}/__e2e/session-fixture/pending?expected=${expected}`,
+    { signal: AbortSignal.timeout(5_000) },
+  );
+  assert.equal(response.status, 200, 'session fixture pending endpoint must be available');
+  const { pending } = await response.json() as { pending: number };
+  assert.ok(pending >= expected, `session fixture observed ${pending} of ${expected} pending requests`);
+}
+
+export interface SessionReadyObservation {
+  opened: Promise<void>;
+  completed: Promise<Set<string>>;
+}
+
+export function observeSessionReadyRequests({
+  credential,
+  keyId,
+  requestModel,
+  sessionName,
+  expected,
+}: {
+  credential: string;
+  keyId: string;
+  requestModel: string;
+  sessionName: string;
+  expected: number;
+}): SessionReadyObservation {
+  const controller = new AbortController();
+  const deadline = AbortSignal.timeout(15_000);
+  const signal = AbortSignal.any([controller.signal, deadline]);
+  const requestIds = new Set<string>();
+  let openedResolve!: () => void;
+  let openedReject!: (reason: unknown) => void;
+  let completedResolve!: (requestIds: Set<string>) => void;
+  let completedReject!: (reason: unknown) => void;
+  let settled = false;
+  const opened = new Promise<void>((resolve, reject) => {
+    openedResolve = resolve;
+    openedReject = reject;
+  });
+  const completed = new Promise<Set<string>>((resolve, reject) => {
+    completedResolve = resolve;
+    completedReject = reject;
+  });
+  // The assertion is awaited in the next Cucumber step. Mark the promise as
+  // observed now so a deadline cannot become an unhandled rejection between steps.
+  void completed.catch(() => undefined);
+
+  const fail = (reason: unknown) => {
+    if (settled) return;
+    settled = true;
+    openedReject(reason);
+    completedReject(reason);
+  };
+  deadline.addEventListener('abort', () => {
+    fail(new Error(`observed ${requestIds.size} of ${expected} session-ready requests before the deadline`));
+  }, { once: true });
+  void streamSse<RequestEvent>(
+    new URL(`/internal/v1/request-events?tenant_external_id=${encodeURIComponent(tenant)}`, baseURL).toString(),
+    credential,
+    signal,
+    ({ id, event: eventName, data: event }) => {
+      assert.equal(id, event.event_id, 'request-event SSE id must match its durable event id');
+      assert.equal(eventName, `request.${event.event_kind}`, 'request-event SSE name must match its event kind');
+      if (event.key_id !== keyId || event.model !== requestModel
+        || !matchesReadySessionEvent(event, sessionName)) return;
+      requestIds.add(event.request_id);
+      if (requestIds.size !== expected || settled) return;
+      settled = true;
+      completedResolve(requestIds);
+      controller.abort();
+    },
+    openedResolve,
+  ).then(() => {
+    fail(new Error(`request-event stream ended after ${requestIds.size} of ${expected} session-ready requests`));
+  }).catch((reason: unknown) => {
+    if (!settled) fail(reason);
+  });
+  return { opened, completed };
+}
+
+function matchesReadySessionEvent(event: RequestEvent, sessionName: string): boolean {
+  // Prepaid requests materialize conversation semantics in the terminal
+  // transaction, so their committed `finished` event is the barrier. Metered
+  // requests enqueue that work and emit `projected` only after the projector
+  // commits. Both paths must expose confirmed semantics before the UI reads.
+  return (event.event_kind === 'finished' || event.event_kind === 'projected')
+    && event.session_context?.association === 'confirmed'
+    && event.session_context.session_name === sessionName;
 }
 
 export interface SeedState {
