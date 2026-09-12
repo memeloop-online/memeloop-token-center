@@ -39,7 +39,7 @@ async fn postgres_operator_page_bounds_history_before_display_joins() {
         let mut native_scans = 0;
         for line in &lines {
             let indent = line.len() - line.trim_start().len();
-            let node = line.trim_start().trim_start_matches("-> ");
+            let node = line.trim_start().trim_start_matches("->").trim_start();
             // EXPLAIN annotations are not plan nodes.
             if !line.contains("->") && indent != 0 {
                 continue;
