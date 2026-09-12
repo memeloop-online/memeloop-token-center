@@ -326,12 +326,13 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   // Successful refresh keeps the workspace and its form state mounted. Open
   // the disclosure only when it is currently collapsed.
   if (!(await onboarding.evaluate((element) => (element as HTMLDetailsElement).open))) {
-    await onboarding.locator('summary').click();
+    await onboarding.locator(':scope > summary').click();
   }
   await onboarding.getByLabel('服务提供商').selectOption('comfyui');
   const comfyForm = onboarding.locator('form');
   await comfyForm.locator('#root_name').fill('Browser UI ComfyUI');
   await comfyForm.locator('#root_config_base_url').fill(mockBaseUrl);
+  await comfyForm.locator('.upstream-advanced > summary').click();
   await comfyForm.locator('#root_config_network_scope').selectOption('public');
   await comfyForm.locator('#root_config_workflow_id').fill('browser-workflow-v1');
   const workflowEditor = comfyForm.getByLabel('工作流模板', { exact: true });
@@ -359,7 +360,7 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await assertVisible(page.locator('.provider-account').filter({ hasText: 'Browser UI ComfyUI' }));
 
   if (!(await onboarding.evaluate((element) => (element as HTMLDetailsElement).open))) {
-    await onboarding.locator('summary').click();
+    await onboarding.locator(':scope > summary').click();
   }
   await onboarding.getByLabel('提供商').selectOption('volcengine-seedance');
   const providerForm = onboarding.locator('form');

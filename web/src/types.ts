@@ -710,6 +710,12 @@ export interface PluginConfiguration {
 }
 
 export interface UpstreamAccount {
+  can_update_transport_proxy?: boolean;
+  has_proxy?: boolean;
+  proxy_scheme?: 'socks5' | 'socks5h' | null;
+  proxy_remote_dns?: boolean;
+  proxy_label?: string | null;
+  proxy_fingerprint?: string | null;
   id: string;
   tenant_id: string;
   tenant_external_id?: string;

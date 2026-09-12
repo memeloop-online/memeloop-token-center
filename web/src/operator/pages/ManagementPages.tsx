@@ -1,7 +1,7 @@
 import { useConfirmDialog } from '../../useConfirmDialog';
 import RjsfForm, { type FormProps } from '@rjsf/core/lib/components/Form.js';
 import type { RJSFSchema } from '@rjsf/utils';
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import { ApiError, api, apiRead } from '../../api';
 import { formatCurrency, formatNumber } from '../../format';
 import { localizeSchema, useI18n } from '../../i18n';
@@ -27,6 +27,8 @@ import {
 import { directCredentialSchema, supportsDirectConnection } from '../providerConnectionMethods';
 import { UpstreamAvailability } from '../UpstreamAvailability';
 import { UpstreamQuota } from '../UpstreamQuota';
+import { connectionSchema, isPrivateProxyUrl, ProxyInput, UpstreamConnection } from '../UpstreamConnection';
+import { upstreamFormTemplates } from '../UpstreamFormTemplates';
 import { upstreamAvailabilityPath, type UpstreamAvailabilityWindow } from '../upstreamAvailabilityWindow';
 import { useOperatorResource, type ResourceState } from '../hooks/useOperatorResource';
 import { loadModelPricePages } from '../pricingLoading';
@@ -69,10 +71,9 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   const provider = directProviders.find((value) => value.id === driver) ?? directProviders[0];
   const schema = useMemo<RJSFSchema | undefined>(() => {
     if (!provider) return undefined;
-    const config = structuredClone(provider.config_schema) as { properties?: Record<string, unknown> };
+    const config = connectionSchema(provider.config_schema as RJSFSchema, t('connection.endpointHint')) as { properties?: Record<string, unknown> };
     if (provider.id === 'http-json' && config.properties) {
       delete config.properties.oauth;
-      delete config.properties.timeout_seconds;
     }
     const credential = directCredentialSchema(provider.credential_schema) as { oneOf?: Array<Record<string, unknown>> } | undefined;
     if (!credential) return undefined;
@@ -99,14 +100,13 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     required: ['name', 'config'],
     properties: {
       name: { type: 'string', minLength: 1, maxLength: 200, title: t('providers.name') },
-      config: { ...structuredClone(editProvider.config_schema), title: 'Connection configuration' },
+      config: { ...connectionSchema(editProvider.config_schema as RJSFSchema, t('connection.endpointHint')), title: 'Connection configuration' },
     },
   } as RJSFSchema, locale) : undefined, [editing, editProvider, locale]);
   const uiSchema = {
     driver: { 'ui:widget': 'hidden' },
     config: {
       oauth: { 'ui:widget': 'hidden' },
-      timeout_seconds: { 'ui:widget': 'hidden' },
       ...(provider?.id === 'comfyui' ? {
         workflow_template: { 'ui:field': 'JsonObject' },
         parameter_schema: { 'ui:field': 'JsonObject' },
@@ -218,8 +218,9 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             {memberships.length > 0 && <div className="table-chip-list provider-group-summary" aria-label={t('groups.provider.title')}>{memberships.map((group) => <span key={group.id}>{group.name}</span>)}</div>}
             {!providerAvailable && <span className="pill">{t('providers.retired')}</span>}
             <small>{value.id}</small>
+            <UpstreamConnection key={`connection\0${token}\0${writeTenant}\0${value.id}`} account={value} token={token} tenant={writeTenant} disabled={!manageable || Boolean(busy)} onChanged={onChanged} />
             {value.credential_expires_at && <small>{t('providers.expires')}: {new Date(value.credential_expires_at).toLocaleString(locale)}</small>}
-            <UpstreamAvailability account={value} snapshot={availabilitySnapshot} window={availabilityWindow} loading={availabilityLoading} manualHealth={currentHealth} onOpenRequest={onOpenRequest} />
+            <details className="upstream-health-details"><summary>{t('providers.recentAvailability')} · {currentHealth ? t(currentHealth.status === 'healthy' ? 'providers.healthy' : 'providers.unhealthy') : t('providers.manualHealthCheck')}</summary><UpstreamAvailability account={value} snapshot={availabilitySnapshot} window={availabilityWindow} loading={availabilityLoading} manualHealth={currentHealth} onOpenRequest={onOpenRequest} /></details>
             <UpstreamQuota key={`${token}\0${tenant}\0${value.id}`} accountId={value.id} accountName={value.name} tenant={value.tenant_external_id ?? tenant} token={token} />
             {currentReadiness && <small className={`status ${currentReadiness.can_delete ? 'ok' : 'pending'}`}>{deletionBlockers.join(' · ')}</small>}
           </div>
@@ -227,22 +228,24 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             <span className={`status ${value.status === 'active' ? 'ok' : 'pending'}`}>{enumLabel(t, 'status', value.status)}</span>
             <span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span>
             <span className="pill">{t('providers.routes', { count: formatNumber(value.route_count, locale) })}</span>
-            <div className="row-actions">
+            <details className="upstream-secondary-actions"><summary>{t('connection.manageAccount')}</summary><div className="row-actions">
               {providerAvailable && <>
                 <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setEditing(value)}>{t('providers.edit')}</button>
                 <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void checkHealth(value)}>{t('providers.runManualHealthCheck')}</button>
                 {value.can_refresh && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void refreshOAuth(value)}>{t('providers.refreshAuthorization')}</button>}
                 {value.can_reauthorize && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setReauthorizing(value)}>{t('providers.reauthorize')}</button>}
-                {value.auth_kind === 'oauth' && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void disconnectOAuth(value)}>{t('providers.disconnect')}</button>}
                 {value.can_rotate && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setRotating(value)}>{t('providers.rotateCredential')}</button>}
               </>}
-              {(value.status === 'active' || providerAvailable) && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void setStatus(value, value.status === 'active' ? 'disabled' : 'active')}>{value.status === 'active' ? t('providers.disable') : t('providers.enable')}</button>}
+            </div></details>
+            <details className="upstream-danger-zone"><summary>{t('connection.dangerZone')}</summary><p>{t('connection.dangerHint')}</p><div className="row-actions">
+              {value.auth_kind === 'oauth' && <button type="button" className="danger" disabled={!manageable || Boolean(busy)} onClick={() => void disconnectOAuth(value)}>{t('providers.disconnect')}</button>}
+              {(value.status === 'active' || providerAvailable) && <button type="button" className="danger" disabled={!manageable || Boolean(busy)} onClick={() => void setStatus(value, value.status === 'active' ? 'disabled' : 'active')}>{value.status === 'active' ? t('providers.disable') : t('providers.enable')}</button>}
               <button type="button" className="danger" title={deletionBlockers.length > 0 ? deletionBlockers.join(' ') : undefined} disabled={!manageable || Boolean(busy)} onClick={() => void remove(value)}>{t('common.remove')}</button>
-            </div>
+            </div></details>
           </div>
         </div>;
       })}</div>
-      {editing && editSchema && <div className="inline-editor"><div className="panel-title"><h3>{t('providers.editFor', { name: editing.name })}</h3><button type="button" className="secondary" onClick={() => setEditing(undefined)}>{t('common.cancel')}</button></div><Form key={`${editing.id}-${locale}`} schema={editSchema} uiSchema={{ config: { oauth: { 'ui:disabled': true } } }} formData={{ name: editing.name, config: editing.config }} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!formData) return; setBusy(`edit-${editing.id}`); try { await api(`/internal/v1/upstreams/${editing.id}`, token, { method: 'PUT', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant, expected_updated_at: editing.updated_at }) }); setEditing(undefined); setMessage(t('providers.updated', { name: editing.name })); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}><button type="submit" disabled={!canManage(editing) || Boolean(busy)}>{t('common.save')}</button></Form></div>}
+      {editing && editSchema && <div className="inline-editor"><div className="panel-title"><h3>{t('providers.editFor', { name: editing.name })}</h3><button type="button" className="secondary" onClick={() => setEditing(undefined)}>{t('common.cancel')}</button></div><Form key={`${editing.id}-${locale}`} schema={editSchema} uiSchema={{ config: { oauth: { 'ui:disabled': true } } }} formData={{ name: editing.name, config: editing.config }} validator={validator} templates={upstreamFormTemplates} onSubmit={async ({ formData }) => { if (!formData) return; setBusy(`edit-${editing.id}`); try { await api(`/internal/v1/upstreams/${editing.id}`, token, { method: 'PUT', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant, expected_updated_at: editing.updated_at }) }); setEditing(undefined); setMessage(t('providers.updated', { name: editing.name })); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}><button type="submit" disabled={!canManage(editing) || Boolean(busy)}>{t('common.save')}</button></Form></div>}
       {rotating && rotateProvider && <div className="inline-editor"><div className="panel-title"><h3>{t('providers.rotateFor', { name: rotating.name })}</h3><button type="button" className="secondary" onClick={() => setRotating(undefined)}>{t('common.cancel')}</button></div><Form key={`${rotating.id}-${locale}`} schema={localizeSchema(rotateProvider.credential_schema as RJSFSchema, locale)} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { setBusy(`rotate-${rotating.id}`); try { await api(`/internal/v1/upstreams/${rotating.id}/credential`, token, { method: 'PUT', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ credential: formData }) }); setRotating(undefined); setMessage(t('providers.rotated', { name: rotating.name })); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}><button type="submit" disabled={!canManage(rotating) || Boolean(busy)}>{t('providers.confirmRotate')}</button></Form></div>}
     </article>
     <details key={reauthorizing?.id ?? 'provider-create'} className="panel create-resource provider-onboarding" open={reauthorizing ? true : undefined}><summary><span><b>{reauthorizing ? t('providers.reauthorizeFor', { name: reauthorizing.name }) : t('providers.add')}</b><small>{t('providers.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">{reauthorizing ? <>
@@ -252,7 +255,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
       <div className="segmented" role="group" aria-label={t('providers.method')}><button type="button" aria-pressed={method === 'direct'} className={method === 'direct' ? 'active' : ''} onClick={() => setMethod('direct')}>{t('providers.direct')}</button><button type="button" aria-pressed={method === 'authorization'} className={method === 'authorization' ? 'active' : ''} onClick={() => setMethod('authorization')}>{t('providers.oauth')}</button></div>
       {method === 'direct' ? <>
         <label>{t('providers.provider')}<select value={provider?.id ?? ''} onChange={(event) => setDriver(event.target.value)}>{directProviders.map((value) => <option key={value.id} value={value.id}>{value.display_name} · {value.source}</option>)}</select></label>
-        {schema ? <Form key={`${provider.id}-${locale}`} schema={schema} uiSchema={uiSchema} fields={schemaFormFields} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!writeTenant) return; try { setError(''); await api('/internal/v1/upstreams', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant }) }); setMessage(t('providers.created')); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!writeTenant || !token}>{t('providers.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
+        {schema ? <Form key={`${provider.id}-${locale}`} schema={schema} uiSchema={uiSchema} fields={schemaFormFields} validator={validator} templates={upstreamFormTemplates} onSubmit={async ({ formData }) => { if (!writeTenant) return; try { setError(''); await api('/internal/v1/upstreams', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant }) }); setMessage(t('providers.created')); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!writeTenant || !token}>{t('providers.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
       </> : <AuthorizationConnection token={token} tenant={writeTenant} providers={providers} onChanged={onChanged} />}</>}</div>
     </details>
   </section></>;
@@ -268,17 +271,25 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
   const [name, setName] = useState(existing?.name ?? (initialProvider ? `${initialProvider.id}-primary` : ''));
   const [session, setSession] = useState<{ login_url?: string; verification_url?: string; user_code?: string; session_token: string; expires_at?: number; poll_after_seconds?: number }>();
   const [manualCode, setManualCode] = useState('');
+  const [proxyUrl, setProxyUrl] = useState('');
+  const [authorizing, setAuthorizing] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
-  const reset = () => { setSession(undefined); setManualCode(''); setMessage(''); setError(''); };
-  useEffect(() => { setSession(undefined); setManualCode(''); setMessage(''); setError(''); }, [tenant]);
+  const reset = () => { setSession(undefined); setManualCode(''); setProxyUrl(''); setMessage(''); setError(''); };
+  useEffect(() => { setSession(undefined); setManualCode(''); setProxyUrl(''); setMessage(''); setError(''); }, [tenant]);
   const start = async (providerConfig?: unknown) => {
-    if (!tenant || !selectedProvider) return;
+    if (!tenant || !selectedProvider || !name.trim() || authorizing || session) return;
+    if (selectedProvider.oauth_adapter?.flow_kind === 'openai_device') {
+      if (!existing && !isPrivateProxyUrl(proxyUrl.trim())) return;
+      if (existing && (existing.has_proxy === false || (existing.has_proxy === true && existing.proxy_scheme !== 'socks5h'))) { setError(t('connection.reauthorizationProxy')); return; }
+    }
+    setAuthorizing(true);
     try {
       const target = existing ? { upstream_account_id: existing.id } : {};
       const flow = selectedProvider.oauth_adapter?.flow_kind;
       if (flow === 'openai_device') {
-        setSession(await api('/internal/v1/oauth/codex/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, ...target }) }));
+        setSession(await api('/internal/v1/oauth/codex/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, ...(!existing ? { proxy_url: proxyUrl.trim() } : {}), ...target }) }));
+        setProxyUrl('');
       } else if (flow === 'claude_manual_pkce') {
         setSession(await api('/internal/v1/oauth/claude/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, ...target }) }));
       } else if (flow === 'github_device_copilot') {
@@ -290,6 +301,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
       }
       setMessage(''); setError('');
     } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
+    finally { setAuthorizing(false); }
   };
   const poll = async () => {
     if (!session) return;
@@ -317,9 +329,11 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
     {error && <div className="notice error" role="alert">{error}</div>}
     {oauthProviders.length === 0 ? <div className="empty">{t('providers.noAdapter')}</div> : <>
     <label>{t('providers.provider')}<select disabled={Boolean(existing)} value={providerChoice} onChange={(event) => { const next = event.target.value; setProviderChoice(next); setName(`${next}-primary`); reset(); }}>{oauthProviders.map((value) => <option key={value.id} value={value.id}>{value.display_name}</option>)}</select></label>
-    <label>{t('providers.name')}<input readOnly={Boolean(existing)} value={name} onChange={(event) => setName(event.target.value)} /></label>
-    {selectedProvider && selectedProvider.source !== 'builtin' && !session ? <Form key={`${selectedProvider.id}-${locale}`} schema={localizeSchema(selectedProvider.config_schema as RJSFSchema, locale)} formData={existing?.config} readonly={Boolean(existing)} validator={validator} templates={schemaFormTemplates} onSubmit={({ formData }) => void start(formData)}><button type="submit" disabled={!tenant}>{t('common.startLogin')}</button></Form> : <div className="button-row"><button type="button" onClick={() => void start()} disabled={!tenant || Boolean(session)}>{t('common.startLogin')}</button>{session && <><a className="button secondary" href={session.verification_url ?? session.login_url} target="_blank" rel="noreferrer">{t('common.openAuthorization')}</a>{selectedProvider?.oauth_adapter?.flow_kind !== 'claude_manual_pkce' && <button type="button" onClick={() => void poll()}>{t('common.checkAuthorization')}</button>}</>}</div>}
+    <label>{t('providers.name')} · {t('connection.required')}<input required maxLength={200} readOnly={Boolean(existing)} disabled={authorizing || Boolean(session)} value={name} onChange={(event) => setName(event.target.value)} /></label>
+    {selectedProvider?.oauth_adapter?.flow_kind === 'openai_device' && !session && <section className="upstream-connection"><h3>{t('connection.title')}</h3><p><b>Base URL</b> · {t('connection.fixed')}</p><code>https://chatgpt.com/backend-api/codex</code><p className="muted">{t('connection.endpointHint')}</p>{!existing ? <ProxyInput value={proxyUrl} onChange={setProxyUrl} disabled={authorizing} /> : <p>{t(existing.has_proxy === undefined ? 'connection.proxyUnknown' : existing.has_proxy ? 'connection.proxyConfigured' : 'connection.proxyMissing')}</p>}</section>}
+    {selectedProvider && selectedProvider.source !== 'builtin' && !session ? <Form key={`${selectedProvider.id}-${locale}`} schema={localizeSchema(selectedProvider.config_schema as RJSFSchema, locale)} formData={existing?.config} readonly={Boolean(existing)} validator={validator} templates={schemaFormTemplates} onSubmit={({ formData }) => void start(formData)}><button type="submit" disabled={!tenant || authorizing}>{t('common.startLogin')}</button></Form> : <div className="button-row"><button type="button" onClick={() => void start()} disabled={!tenant || !name.trim() || authorizing || Boolean(session) || (!existing && selectedProvider?.oauth_adapter?.flow_kind === 'openai_device' && !isPrivateProxyUrl(proxyUrl.trim()))}>{t(authorizing ? 'common.loading' : 'common.startLogin')}</button>{session && <><a className="button secondary" href={session.verification_url ?? session.login_url} target="_blank" rel="noreferrer">{t('common.openAuthorization')}</a>{selectedProvider?.oauth_adapter?.flow_kind !== 'claude_manual_pkce' && <button type="button" onClick={() => void poll()}>{t('common.checkAuthorization')}</button>}</>}</div>}
     {session && selectedProvider?.oauth_adapter?.flow_kind === 'claude_manual_pkce' && <div className="manual-authorization"><label>{t('providers.manualCode')}<input value={manualCode} onChange={(event) => setManualCode(event.target.value)} placeholder={t('providers.manualCodeHint')} /></label><button type="button" disabled={!manualCode.includes('#')} onClick={() => void complete()}>{t('providers.completeAuthorization')}</button></div>}
+    {existing && selectedProvider?.oauth_adapter?.flow_kind === 'openai_device' && !session && <p>{t('connection.reauthorizationProxy')}</p>}
     {session?.user_code && <div className="device-authorization" role="status"><p>{t('providers.codexSecurity')}</p><b>{t('providers.deviceCode')}</b><code>{session.user_code}</code></div>}
     {message && <div className="notice success" role="status">{message}</div>}
     </>}
@@ -501,6 +515,7 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
 }) {
   const { locale, t } = useI18n();
   const knownProtocols = ['openai', 'anthropic', 'generation'];
+  const priorityHintId = useId();
   const includedAccountIds = providerGroups.filter((group) => draft.included_provider_group_ids.includes(group.id)).flatMap((group) => group.member_ids);
   const excludedAccountIds = new Set(providerGroups.filter((group) => draft.excluded_provider_group_ids.includes(group.id)).flatMap((group) => group.member_ids));
   const candidateIds = [...new Set([...draft.upstream_account_ids, ...includedAccountIds])].filter((id) => !excludedAccountIds.has(id));
@@ -520,8 +535,11 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
     ...selections(draft.route_group_ids, routeGroupOptions),
     ...draft.route_group_names.map((name) => ({ value: `new:${name}`, label: name, created: true })),
   ];
-  return <>
-    <label>{t('routes.publicModel')}<input value={draft.public_model} onChange={(event) => onChange({ ...draft, public_model: event.target.value })} /></label>
+  const priorityValid = Number.isInteger(draft.priority) && Math.abs(draft.priority) <= 1000000;
+  return <div className="route-form-sections">
+    <fieldset><legend>{t('routes.identitySection')}</legend><p className="field-hint">{t('routes.identityHint')}</p>
+    <label>{t('routes.publicModel')} · {t('connection.required')}<input required value={draft.public_model} onChange={(event) => onChange({ ...draft, public_model: event.target.value })} /></label>
+    </fieldset><fieldset><legend>{t('routes.upstreamSection')}</legend>
     <MultiCombobox label={t('routes.explicitUpstreams')} options={upstreamOptions} value={selections(draft.upstream_account_ids, upstreamOptions)} onChange={(selected) => {
       const upstream_account_ids = selected.map((item) => item.value);
       const upstream_account_id = upstream_account_ids[0] ?? '';
@@ -532,11 +550,13 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
       <MultiCombobox label={t('routes.excludeProviderGroups')} options={providerGroupOptions} value={selections(draft.excluded_provider_group_ids, providerGroupOptions)} onChange={(selected) => onChange({ ...draft, excluded_provider_group_ids: selected.map((item) => item.value) })} placeholder={t('routes.searchProviderGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('routes.exclusionWins')} />
     </div>
     <label>{t('routes.protocol')}<select aria-invalid={!protocolCompatible} value={draft.protocol} onChange={(event) => onChange({ ...draft, protocol: event.target.value })}>{knownProtocols.map((protocol) => <option disabled={candidateIds.length > 0 && !supportedByAll.includes(protocol)} key={protocol} value={protocol}>{protocol === 'generation' ? t('routes.generation') : protocol === 'anthropic' ? 'Anthropic' : 'OpenAI'}</option>)}</select><small className={`field-hint${protocolCompatible ? '' : ' field-error'}`}>{t(protocolCompatible ? 'routes.protocolCompatibilityHint' : 'routes.protocolIncompatible')}</small></label>
-    <UpstreamModelCombobox token={token} tenant={tenant} upstreams={upstreams} accountIds={draft.upstream_account_ids} includedProviderGroupIds={draft.included_provider_group_ids} excludedProviderGroupIds={draft.excluded_provider_group_ids} syncAccountIds={candidateIds} protocol={draft.protocol} value={draft.upstream_model} onChange={(upstream_model) => onChange({ ...draft, upstream_model, custom_model_confirmed: false })} customModelConfirmed={draft.custom_model_confirmed} onValidityChange={onCatalogValidity} />
-    <label>{t('routes.priority')}<input type="number" min={-1000000} max={1000000} value={draft.priority} onChange={(event) => onChange({ ...draft, priority: Number(event.target.value) })} /></label>
+    <UpstreamModelCombobox token={token} tenant={tenant} upstreams={upstreams} accountIds={draft.upstream_account_ids} includedProviderGroupIds={draft.included_provider_group_ids} excludedProviderGroupIds={draft.excluded_provider_group_ids} syncAccountIds={candidateIds} protocol={draft.protocol} value={draft.upstream_model} onChange={(upstream_model) => onChange({ ...draft, upstream_model, custom_model_confirmed: false })} customModelConfirmed={draft.custom_model_confirmed} onValidityChange={(valid, allowCustom) => onCatalogValidity(valid && protocolCompatible, allowCustom)} />
+    </fieldset><fieldset><legend>{t('routes.accessSection')}</legend><p className="field-hint">{t('routes.accessHint')}</p>
+    <label>{t('routes.priority')}<input type="number" required step={1} aria-invalid={!priorityValid} aria-describedby={priorityHintId} min={-1000000} max={1000000} value={Number.isNaN(draft.priority) ? '' : draft.priority} onChange={(event) => onChange({ ...draft, priority: event.target.valueAsNumber })} /></label><small id={priorityHintId} className={priorityValid ? 'field-hint' : 'field-error'}>{t('routes.priorityHint')}</small>
     <MultiCombobox label={t('routes.routeGroups')} options={routeGroupOptions} value={routeGroupValue} onChange={(selected) => onChange({ ...draft, route_group_ids: selected.filter((item) => !item.created).map((item) => item.value), route_group_names: selected.filter((item) => item.created).map((item) => item.label) })} placeholder={t('routes.searchOrCreateRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} allowCreate createLabel={(name) => t('routes.createRouteGroupNamed', { name })} hint={t('routes.routeGroupsHint')} />
     <MultiCombobox label={t('routes.exactCredentials')} options={credentialOptions} value={selections(draft.granted_credential_ids, credentialOptions)} onChange={(selected) => onChange({ ...draft, granted_credential_ids: selected.map((item) => item.value) })} placeholder={t('routes.searchCredentials')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('routes.exactCredentialsHint')} onQueryChange={onCredentialQuery} />
-  </>;
+    </fieldset>
+  </div>;
 }
 
 function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, providers }: { token: string; tenant: string; writeTenant?: string; upstreams: UpstreamAccount[]; providers: ProviderType[] }) {
@@ -627,8 +647,18 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   const statusFilter = useResourceListStatusFilter('model-routes', tenant, routes, (route) => route.enabled);
   const scopedUpstreams = upstreams.filter((value) => !value.tenant_external_id || value.tenant_external_id === writeTenant);
   const canManage = (route: ModelRouteView) => Boolean(writeTenant) && route.tenant_external_id === writeTenant;
-  const canSubmit = (draft: RouteDraft, catalogValid: boolean) => Boolean(writeTenant && catalogValid && draft.public_model.trim() && draft.upstream_model.trim()
-    && (draft.upstream_account_ids.length > 0 || draft.included_provider_group_ids.length > 0));
+  const canSubmit = (draft: RouteDraft, catalogValid: boolean) => {
+    const included = providerGroups.groups.filter((group) => draft.included_provider_group_ids.includes(group.id)).flatMap((group) => group.member_ids);
+    const excluded = new Set(providerGroups.groups.filter((group) => draft.excluded_provider_group_ids.includes(group.id)).flatMap((group) => group.member_ids));
+    const candidates = [...new Set([...draft.upstream_account_ids, ...included])].filter((id) => !excluded.has(id));
+    const compatible = candidates.every((id) => {
+      const account = scopedUpstreams.find((value) => value.id === id);
+      const provider = providers.find((value) => value.id === account?.driver);
+      return !provider || provider.protocols.includes(draft.protocol);
+    });
+    return Boolean(writeTenant && catalogValid && compatible && candidates.length > 0 && draft.public_model.trim() && draft.upstream_model.trim()
+      && Number.isInteger(draft.priority) && Math.abs(draft.priority) <= 1000000);
+  };
   const beginEdit = (route: ModelRouteView) => {
     setCredentialsRequested(true);
     setEditing(route);

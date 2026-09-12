@@ -161,25 +161,29 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
 
   await openAppRoute(page, 'operator', 'providers');
   const onboarding = page.locator('.provider-onboarding');
-  await onboarding.locator('summary').click();
+  await onboarding.locator(':scope > summary').click();
   await assertVisible(onboarding.getByRole('button', { name: 'API 凭据', exact: true }));
   await assertVisible(onboarding.getByRole('button', { name: '账户授权', exact: true }));
   await assertVisible(page.getByText('Browser mock upstream', { exact: true }));
   const providerAccount = page.locator(`.provider-account[data-upstream-id="${seed.upstreamId}"]`);
   await assertContains(providerAccount, 'API 凭据');
   await assertContains(providerAccount, '1 条路由');
-  await providerAccount.getByRole('button', { name: '健康检查' }).click();
+  await providerAccount.locator('.upstream-health-details > summary').click();
+  await providerAccount.locator('.upstream-secondary-actions > summary').click();
+  await providerAccount.getByRole('button', { name: '主动健康检查' }).click();
   await assertContains(providerAccount, '连接正常');
   const disabledProvider = page.waitForResponse((response) => {
     const url = new URL(response.url());
     return response.request().method() === 'PATCH'
       && url.pathname === `/internal/v1/upstreams/${seed.upstreamId}`;
   });
+  await providerAccount.locator('.upstream-danger-zone > summary').click();
   await providerAccount.getByRole('button', { name: '停用', exact: true }).click();
   assert.equal((await disabledProvider).status(), 200);
   await page.locator('[data-resource-list-status-filter]').getByRole('button', { name: /显示非正常状态/ }).click();
   await assertContains(providerAccount, '已停用');
   await assertNotContains(providerAccount, '连接正常');
+  await providerAccount.locator('.upstream-danger-zone:not([open]) > summary').click();
   await providerAccount.getByRole('button', { name: '启用', exact: true }).click();
   await assertContains(providerAccount, '正常');
   await onboarding.getByRole('button', { name: '账户授权', exact: true }).click();
@@ -222,7 +226,7 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
   const page = this.requirePage();
   await openAppRoute(page, 'operator', 'providers');
   const onboarding = page.locator('.provider-onboarding');
-  await onboarding.locator('summary').click();
+  await onboarding.locator(':scope > summary').click();
   await assertVisible(page.getByRole('heading', { name: '上游服务', exact: true }));
   await assertContains(page.locator('.provider-list'), '连接并管理模型服务。');
   await assertVisible(onboarding.getByRole('button', { name: 'API 凭据', exact: true }));
@@ -236,6 +240,8 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
   await assertContains(onboarding.getByLabel('服务提供商'), 'OpenAI Codex');
   await onboarding.getByLabel('服务提供商').selectOption('openai-codex');
   await onboarding.getByLabel('上游名称').fill('codex-primary');
+  assert.equal(await onboarding.getByRole('button', { name: '开始登录', exact: true }).isDisabled(), true);
+  await onboarding.locator('.upstream-proxy-editor input').fill('socks5h://10.0.0.10:1080');
   await onboarding.getByRole('button', { name: '开始登录', exact: true }).click();
   await assertContains(onboarding.getByRole('status'), '仅当这次登录由你刚刚发起时');
   await assertContains(onboarding.getByRole('status'), 'SAFE-CODE');
