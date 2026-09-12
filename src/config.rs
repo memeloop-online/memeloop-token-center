@@ -159,6 +159,7 @@ pub struct Config {
     pub s3_access_key: Option<String>,
     pub s3_secret_key: Option<String>,
     pub s3_allow_http: bool,
+    #[serde(default)]
     pub s3_timeouts: S3Timeouts,
     pub upstream_openai_url: Option<String>,
     pub upstream_openai_key: Option<String>,
@@ -262,7 +263,8 @@ pub enum ArchiveBackend {
 }
 
 /// Role-independent settings, applied by rolling restart without rebuilding.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct S3Timeouts {
     pub connect_millis: u32,
     pub request_millis: u32,
