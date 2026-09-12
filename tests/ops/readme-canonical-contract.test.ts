@@ -6,12 +6,13 @@ import test from 'node:test';
 import { repository } from './contract-helpers.ts';
 
 const readme = readFileSync(resolve(repository, 'README.md'), 'utf8');
+const contractPath = 'tests/ops/readme-canonical-contract.test.ts';
 
 function trackedTextFiles(): Array<{ path: string; text: string }> {
   const paths = execFileSync('git', ['ls-files', '-z'], { cwd: repository })
     .toString('utf8')
     .split('\0')
-    .filter(Boolean);
+    .filter((path) => Boolean(path) && path !== contractPath);
   return paths.flatMap((path) => {
     const contents = readFileSync(resolve(repository, path));
     return contents.includes(0) ? [] : [{ path, text: contents.toString('utf8') }];
