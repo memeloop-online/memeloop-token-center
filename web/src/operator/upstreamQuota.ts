@@ -46,3 +46,21 @@ export function quotaUsedPercent(window: UpstreamQuotaSnapshot['windows'][number
   if (window.remaining !== null && window.limit !== null && window.limit > 0) return (1 - window.remaining / window.limit) * 100;
   return null;
 }
+
+/** Only translate known normalized codes; never render supplier/error payloads. */
+export function quotaReadErrorMessage(code: string | null | undefined) {
+  switch (code) {
+    case 'credential_invalid': return 'quota.errorCredential';
+    case 'quota_not_authorized': return 'quota.errorSupplierAuthorization';
+    case 'quota_destination_invalid': return 'quota.errorDestination';
+    case 'quota_transport_failed': return 'quota.errorTransport';
+    case 'quota_timeout': return 'quota.errorTimeout';
+    case 'quota_rate_limited': return 'quota.errorRateLimited';
+    case 'quota_busy':
+    case 'quota_refresh_in_progress': return 'quota.errorBusy';
+    case 'quota_response_too_large':
+    case 'quota_invalid_payload': return 'quota.errorPayload';
+    case 'quota_upstream_error': return 'quota.errorSupplier';
+    default: return 'quota.readFailed';
+  }
+}

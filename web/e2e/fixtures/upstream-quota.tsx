@@ -19,7 +19,7 @@ const snapshot: UpstreamQuotaSnapshot = {
     { id: 'secondary', label: 'Weekly window', used_percent: null, remaining: null, limit: null, reset_at: null, period_seconds: 604800, source: 'provider_usage', reset_is_estimated: false, allowed: null, limit_reached: null },
   ],
   reset_capability: { provider_supported: mode === 'unsupported' ? false : true, implementation_available: mode === 'reset' || mode === 'unknown', prepare_available: mode === 'reset' || mode === 'unknown', confirmation_required: mode === 'reset' || mode === 'unknown', retryable: false, available_credits: 2, applicable_credits: 1, reason: null, credit_error_code: null },
-  error_code: null,
+  error_code: mode === 'stale-error' ? 'quota_destination_invalid' : mode === 'rate-limited' ? 'quota_rate_limited' : null,
 };
 declare global { interface Window { quotaReads: number; quotaWrites: number; quotaPrepares: number; quotaConfirms: number; quotaStatuses: number; quotaReconciles: number } }
 window.quotaReads = 0; window.quotaWrites = 0;
@@ -56,6 +56,7 @@ window.fetch = async (_input, init) => {
     if (method === 'GET') window.quotaStatuses += 1;
     return new Response(JSON.stringify(operation));
   }
-  return new Response(JSON.stringify(mode === 'error' ? { error: { message: 'read unavailable' } } : snapshot), { status: mode === 'error' ? 503 : 200 });
+  const denied = mode === 'permission';
+  return new Response(JSON.stringify(mode === 'error' || denied ? { error: { message: 'fixture-sensitive-message-must-not-render' } } : snapshot), { status: denied ? 403 : mode === 'error' ? 503 : 200 });
 };
 createRoot(document.getElementById('root')!).render(<I18nProvider><main className="main"><article className="panel provider-list"><div className="account provider-account"><div className="account-main"><b>Quota account</b><UpstreamQuota accountId="quota-account" tenant="default" token="fixture-only" /></div></div></article></main></I18nProvider>);
