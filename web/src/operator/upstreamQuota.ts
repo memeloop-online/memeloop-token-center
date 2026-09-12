@@ -59,6 +59,11 @@ export function quotaReadErrorMessage(code: string | null | undefined) {
     case 'quota_busy':
     case 'quota_refresh_in_progress': return 'quota.errorBusy';
     case 'quota_response_too_large':
+    case 'quota_too_many_windows':
+    case 'quota_duplicate_window':
+    case 'quota_invalid_credit_payload':
+    case 'quota_too_many_credits':
+    case 'quota_incomplete_credit_payload':
     case 'quota_invalid_payload': return 'quota.errorPayload';
     case 'quota_upstream_error': return 'quota.errorSupplier';
     default: return 'quota.readFailed';

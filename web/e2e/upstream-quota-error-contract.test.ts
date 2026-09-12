@@ -13,6 +13,11 @@ test('normalized quota read failures have distinct safe recovery semantics', () 
     quota_busy: 'quota.errorBusy',
     quota_refresh_in_progress: 'quota.errorBusy',
     quota_response_too_large: 'quota.errorPayload',
+    quota_too_many_windows: 'quota.errorPayload',
+    quota_duplicate_window: 'quota.errorPayload',
+    quota_invalid_credit_payload: 'quota.errorPayload',
+    quota_too_many_credits: 'quota.errorPayload',
+    quota_incomplete_credit_payload: 'quota.errorPayload',
     quota_invalid_payload: 'quota.errorPayload',
     quota_upstream_error: 'quota.errorSupplier',
   };
