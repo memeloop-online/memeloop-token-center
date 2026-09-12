@@ -1,11 +1,16 @@
 import type { GroupView, ModelRouteView, UpstreamAccount } from '../types.js';
 
-/** Only conversational transports can produce the assistant's text output.
- * Keep this separate from traffic filtering, which must retain every protocol.
- * Unknown transports need an explicit capability contract before opting in.
+/** The route API has no model-level modalities yet: openai also covers embeddings.
+ * Exclude explicit non-conversational purpose tokens in either model identity as
+ * well as generation transports. Do not infer a provider or require fresh catalog
+ * probes. Keep traffic filtering untouched; it must retain every protocol.
  */
 export function filterAssistantRoutes(routes: ModelRouteView[]): ModelRouteView[] {
-  return routes.filter((route) => route.enabled && (route.protocol === 'openai' || route.protocol === 'anthropic'));
+  const nonConversational = /(?:^|[^a-z0-9])(?:embeddings?|rerank(?:er)?|images?|videos?|tts|whisper|transcri(?:be|ption)|speech)(?:$|[^a-z0-9])/i;
+  return routes.filter((route) => route.enabled
+    && (route.protocol === 'openai' || route.protocol === 'anthropic')
+    && !nonConversational.test(route.public_model)
+    && !nonConversational.test(route.upstream_model));
 }
 
 export interface RouteModelOption {

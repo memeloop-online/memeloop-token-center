@@ -21,7 +21,7 @@ const routes = [
   { id: 'route-c', public_model: 'retired-model', upstream_model: 'native-c', protocol: 'openai', upstream_account_ids: ['c'], enabled: true },
   { id: 'route-image', public_model: 'image-only', upstream_model: 'native-image', protocol: 'openai-image', upstream_account_ids: ['a'], enabled: true },
   { id: 'route-video', public_model: 'video-only', upstream_model: 'native-video', protocol: 'generation', upstream_account_ids: ['a'], enabled: true },
-  { id: 'route-embedding', public_model: 'embedding-only', upstream_model: 'native-embedding', protocol: 'embedding', upstream_account_ids: ['a'], enabled: true },
+  { id: 'route-embedding', public_model: 'embedding-only', upstream_model: 'qwen3.7-text-embedding', protocol: 'openai', upstream_account_ids: ['a'], enabled: true },
 ] as ModelRouteView[];
 const groups = [
   { id: 'group-d', name: 'Archive pool', member_ids: ['d'] },

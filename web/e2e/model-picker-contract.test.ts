@@ -4,11 +4,14 @@ import test from 'node:test';
 import { filterAssistantRoutes, routeModelOptions } from '../src/operator/modelCatalog.js';
 import type { GroupView, ModelRouteView, UpstreamAccount } from '../src/types.js';
 
-test('assistant selects enabled conversational transports without guessing from model names', () => {
+test('assistant excludes non-text transports and explicit non-text model purposes even behind aliases', () => {
   const routes = ['openai', 'anthropic', 'openai-image', 'generation', 'embedding', 'future-unknown'].map((protocol) => ({ id: protocol, protocol, enabled: true, public_model: 'same-model-name' } as ModelRouteView));
   routes.push({ ...routes[0], id: 'disabled', enabled: false });
   assert.deepEqual(filterAssistantRoutes(routes).map((route) => route.id), ['openai', 'anthropic']);
   assert.equal(routes.length, 7, 'traffic catalogs keep the original non-text routes');
+  const models = ['qwen3.7-text-embedding', 'gpt-image-2', 'bge-reranker-v2', 'whisper-1', 'gpt-5.6-sol', 'qwen3.8-max'];
+  const aliased = models.map((upstream_model) => ({ ...routes[0], id: upstream_model, public_model: 'friendly-alias', upstream_model }));
+  assert.deepEqual(filterAssistantRoutes(aliased).map((route) => route.id), ['gpt-5.6-sol', 'qwen3.8-max']);
 });
 
 test('model hierarchy uses actual account membership, excludes removed accounts, and preserves route/public IDs', () => {
