@@ -404,6 +404,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "audited upstream transport proxy rotation",
         sql: include_str!("../../../migrations/common/0075_upstream_transport_proxy_audit.sql"),
     },
+    Migration {
+        version: 76,
+        name: "global request event cursor index",
+        sql: include_str!("../../../migrations/sqlite/0076_request_event_global_cursor.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -793,6 +798,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 75,
         name: "audited upstream transport proxy rotation",
         sql: include_str!("../../../migrations/common/0075_upstream_transport_proxy_audit.sql"),
+    },
+    Migration {
+        version: 76,
+        name: "global request event cursor index",
+        sql: include_str!("../../../migrations/postgres/0076_request_event_global_cursor.sql"),
     },
 ];
 

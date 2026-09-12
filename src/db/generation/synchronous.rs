@@ -204,7 +204,7 @@ impl Database {
     ) -> Result<StartSynchronousImageResult, AppError> {
         let now = unix_millis();
         let Some(idempotency) = input.idempotency else {
-            let mut transaction = self.pool.begin().await?;
+            let mut transaction = self.begin_write_transaction().await?;
             let reservation = reserve_usage_in_transaction(
                 &mut transaction,
                 input.key,
@@ -237,7 +237,7 @@ impl Database {
         let lease_expires_at = now.saturating_add(SYNCHRONOUS_IMAGE_IDEMPOTENCY_LEASE_MILLIS);
         let key_id = input.key.key_id.to_string();
         let request_id = input.request_id.to_string();
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let inserted = sqlx::query(
             "INSERT INTO synchronous_image_idempotency (key_id, idempotency_key, request_hash, request_id, status, created_at, lease_expires_at) VALUES ($1, $2, $3, $4, 'pending', $5, $6) ON CONFLICT(key_id, idempotency_key) DO NOTHING",
         )
@@ -594,7 +594,7 @@ impl Database {
         let key_id = input.key_id.to_string();
         let request_id = input.request_id.to_string();
         let reservation_id = input.reservation.id.to_string();
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         if let Some(idempotency_key) = input.idempotency_key {
             let owner = sqlx::query(
                 "UPDATE synchronous_image_idempotency SET lease_expires_at = lease_expires_at WHERE key_id = $1 AND idempotency_key = $2 AND request_id = $3 AND reservation_id = $4 AND status = 'pending'",

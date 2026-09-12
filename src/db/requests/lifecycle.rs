@@ -931,30 +931,21 @@ impl Database {
         .bind(&model_route_id)
         .execute(&mut *transaction)
         .await?;
-        let event_id = Uuid::now_v7().to_string();
-        if claim_request_event_locator(
-            &mut transaction,
-            &event_id,
-            now,
-            &tenant_id,
-            &key_id,
-            &request_id,
+        let event =
+            allocate_request_event_cursor(&mut transaction, now, &tenant_id, &key_id, &request_id)
+                .await?;
+        sqlx::query(
+            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, 'started', $6, $7, 0, 0, 0)",
         )
-        .await?
-        {
-            sqlx::query(
-                "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, 'started', $6, $7, 0, 0, 0)",
-            )
-            .bind(&event_id)
-            .bind(&tenant_id)
-            .bind(&key_id)
-            .bind(&request_id)
-            .bind(now)
-            .bind(&request.protocol)
-            .bind(&request.model)
-            .execute(&mut *transaction)
-            .await?;
-        }
+        .bind(&event.event_id)
+        .bind(&tenant_id)
+        .bind(&key_id)
+        .bind(&request_id)
+        .bind(event.event_at)
+        .bind(&request.protocol)
+        .bind(&request.model)
+        .execute(&mut *transaction)
+        .await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -1005,6 +996,120 @@ pub(crate) async fn claim_request_record_locator(
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RequestEventCursor {
+    pub event_id: String,
+    pub event_at: i64,
+}
+
+const REQUEST_EVENT_CURSOR_LOCK_NAMESPACE: i32 = 0x4d54_4345;
+const REQUEST_EVENT_CURSOR_LOCK_KEY: i32 = 1;
+const UUID_V7_RANDOM_B_MASK: u64 = (1_u64 << 62) - 1;
+
+pub(crate) async fn allocate_request_event_cursor(
+    transaction: &mut Transaction<'_, Any>,
+    now: i64,
+    tenant_id: &str,
+    key_id: &str,
+    request_id: &str,
+) -> Result<RequestEventCursor, AppError> {
+    if transaction.as_mut().backend_name() == "PostgreSQL" {
+        // One fixed namespace/key pair serializes the global SSE cursor until
+        // the caller commits. It is deliberately independent of tenant data.
+        sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+            .bind(REQUEST_EVENT_CURSOR_LOCK_NAMESPACE)
+            .bind(REQUEST_EVENT_CURSOR_LOCK_KEY)
+            .execute(&mut **transaction)
+            .await?;
+    }
+
+    let last = sqlx::query(
+        "SELECT event_at, event_id FROM request_events ORDER BY event_at DESC, event_id DESC LIMIT 1",
+    )
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let cursor = match last {
+        None => RequestEventCursor {
+            event_id: fresh_v7_at(now)?,
+            event_at: now,
+        },
+        Some(last) => {
+            let last_at: i64 = last.try_get("event_at")?;
+            let last_id: String = last.try_get("event_id")?;
+            if now > last_at {
+                RequestEventCursor {
+                    event_id: fresh_v7_at(now)?,
+                    event_at: now,
+                }
+            } else if let Some(event_id) = increment_v7_random_b(&last_id, last_at) {
+                RequestEventCursor {
+                    event_id,
+                    event_at: last_at,
+                }
+            } else {
+                let event_at = last_at.checked_add(1).ok_or(AppError::Internal)?;
+                RequestEventCursor {
+                    event_id: fresh_v7_at(event_at)?,
+                    event_at,
+                }
+            }
+        }
+    };
+
+    let claimed = sqlx::query(
+        "INSERT INTO request_event_locators (id, created_at, tenant_id, key_id, request_id) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(&cursor.event_id)
+    .bind(cursor.event_at)
+    .bind(tenant_id)
+    .bind(key_id)
+    .bind(request_id)
+    .execute(&mut **transaction)
+    .await?;
+    if claimed.rows_affected() != 1 {
+        return Err(AppError::Internal);
+    }
+    Ok(cursor)
+}
+
+fn fresh_v7_at(event_at: i64) -> Result<String, AppError> {
+    let millis = u64::try_from(event_at).map_err(|_| AppError::Internal)?;
+    if millis > 0x0000_ffff_ffff_ffff {
+        return Err(AppError::Internal);
+    }
+    let timestamp = millis.to_be_bytes();
+    let mut bytes = *Uuid::now_v7().as_bytes();
+    bytes[..6].copy_from_slice(&timestamp[2..]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(Uuid::from_bytes(bytes).to_string())
+}
+
+fn increment_v7_random_b(last_id: &str, last_at: i64) -> Option<String> {
+    let last = Uuid::parse_str(last_id).ok()?;
+    if last.to_string() != last_id
+        || last.get_version_num() != 7
+        || last.get_variant() != uuid::Variant::RFC4122
+    {
+        return None;
+    }
+    let mut bytes = *last.as_bytes();
+    let encoded_millis = u64::from_be_bytes([
+        0, 0, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+    ]);
+    if encoded_millis != u64::try_from(last_at).ok()? {
+        return None;
+    }
+    let random_b = u64::from_be_bytes(bytes[8..].try_into().ok()?) & UUID_V7_RANDOM_B_MASK;
+    let next = random_b.checked_add(1)?;
+    if next > UUID_V7_RANDOM_B_MASK {
+        return None;
+    }
+    bytes[8..].copy_from_slice(&(next | (0b10_u64 << 62)).to_be_bytes());
+    Some(Uuid::from_bytes(bytes).to_string())
+}
+
+#[cfg(test)]
 pub(crate) async fn claim_request_event_locator(
     transaction: &mut Transaction<'_, Any>,
     id: &str,
@@ -1078,30 +1183,20 @@ pub(crate) async fn record_request_started_in_transaction(
     .bind(&model_route_id)
     .execute(&mut **transaction)
     .await?;
-    let event_id = Uuid::now_v7().to_string();
-    if claim_request_event_locator(
-        transaction,
-        &event_id,
-        now,
-        &tenant_id,
-        &key_id,
-        &request_id,
+    let event =
+        allocate_request_event_cursor(transaction, now, &tenant_id, &key_id, &request_id).await?;
+    sqlx::query(
+        "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, 'started', $6, $7, 0, 0, 0)",
     )
-    .await?
-    {
-        sqlx::query(
-            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, 'started', $6, $7, 0, 0, 0)",
-        )
-        .bind(&event_id)
-        .bind(&tenant_id)
-        .bind(&key_id)
-        .bind(&request_id)
-        .bind(now)
-        .bind(&request.protocol)
-        .bind(&request.model)
-        .execute(&mut **transaction)
-        .await?;
-    }
+    .bind(&event.event_id)
+    .bind(&tenant_id)
+    .bind(&key_id)
+    .bind(&request_id)
+    .bind(event.event_at)
+    .bind(&request.protocol)
+    .bind(&request.model)
+    .execute(&mut **transaction)
+    .await?;
     Ok(())
 }
 
@@ -1294,26 +1389,19 @@ pub(crate) async fn record_request_finished_in_transaction(
         .execute(&mut **tx)
         .await?;
     }
-    let event_id = Uuid::now_v7().to_string();
-    if claim_request_event_locator(
-        tx,
-        &event_id,
-        completed_at,
-        &tenant_id,
-        &key_id,
-        &request_id,
+    let event =
+        allocate_request_event_cursor(tx, completed_at, &tenant_id, &key_id, &request_id).await?;
+    let inserted = sqlx::query(
+        "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT $1, tenant_id, key_id, id, $2, 'finished', protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_records WHERE id = $3 AND created_at = $4",
     )
-    .await?
-    {
-        sqlx::query(
-            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT $1, tenant_id, key_id, id, $2, 'finished', protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_records WHERE id = $3 AND created_at = $4",
-        )
-        .bind(&event_id)
-        .bind(completed_at)
-        .bind(&request_id)
-        .bind(created_at)
-        .execute(&mut **tx)
-        .await?;
+    .bind(&event.event_id)
+    .bind(event.event_at)
+    .bind(&request_id)
+    .bind(created_at)
+    .execute(&mut **tx)
+    .await?;
+    if inserted.rows_affected() != 1 {
+        return Err(AppError::Internal);
     }
     Ok(true)
 }

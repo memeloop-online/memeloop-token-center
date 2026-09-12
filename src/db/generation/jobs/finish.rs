@@ -281,26 +281,20 @@ impl Database {
         let tenant_id: String = job.try_get("tenant_id")?;
         let key_id = key_id.to_string();
         let request_id = input.job_id.to_string();
-        let event_id = Uuid::now_v7().to_string();
-        if claim_request_event_locator(
-            &mut transaction,
-            &event_id,
-            now,
-            &tenant_id,
-            &key_id,
-            &request_id,
+        let event =
+            allocate_request_event_cursor(&mut transaction, now, &tenant_id, &key_id, &request_id)
+                .await?;
+        let inserted = sqlx::query(
+            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT $1, tenant_id, key_id, id, $2, 'finished', 'generation', public_model, CASE WHEN status = 'succeeded' THEN 200 WHEN status = 'cancelled' THEN 499 ELSE 502 END, $3 - created_at, 0, 0, cost_micros, error_code FROM generation_jobs WHERE id = $4",
         )
-        .await?
-        {
-            sqlx::query(
-                "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT $1, tenant_id, key_id, id, $2, 'finished', 'generation', public_model, CASE WHEN status = 'succeeded' THEN 200 WHEN status = 'cancelled' THEN 499 ELSE 502 END, $3 - created_at, 0, 0, cost_micros, error_code FROM generation_jobs WHERE id = $4",
-            )
-            .bind(&event_id)
-            .bind(now)
-            .bind(now)
-            .bind(&request_id)
-            .execute(&mut *transaction)
-            .await?;
+        .bind(&event.event_id)
+        .bind(event.event_at)
+        .bind(now)
+        .bind(&request_id)
+        .execute(&mut *transaction)
+        .await?;
+        if inserted.rows_affected() != 1 {
+            return Err(AppError::Internal);
         }
         transaction.commit().await?;
         Ok(cost_micros)

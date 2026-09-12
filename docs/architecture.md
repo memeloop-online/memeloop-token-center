@@ -190,6 +190,12 @@ semantics queryable. Realtime monitoring resumes through PostgreSQL cursors
 rather than process-local fanout. Request lists and statistics use bounded
 keyset pagination, facts and rollups.
 
+The global event cursor is allocated transactionally: PostgreSQL writers share
+one advisory transaction lock, while SQLite writers begin with `BEGIN
+IMMEDIATE`. Both backends read the latest cursor through the global
+`(event_at, event_id)` index, and the locator and event commit or roll back
+together.
+
 Session construction has two evidence levels:
 
 - explicit session, turn, verified parent, branch, compaction, subagent and
