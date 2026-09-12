@@ -163,7 +163,7 @@ test("generation quarantine has dedicated tenant-bound reconciliation authority"
   assert.ok(operation.parameters.some((parameter: Obj) => parameter.$ref === "#/components/parameters/RequiredIdempotencyKey"));
   const body = operation.requestBody.content["application/json"].schema;
   assert.equal(body.additionalProperties, false);
-  assert.deepEqual(body.properties.action.enum, ["confirmed_not_submitted", "confirmed_submitted"]);
+  assert.deepEqual(body.properties.action.enum, ["confirmed_submitted"]);
   for (const field of ["expected_revision", "tenant_external_id", "evidence_digest"]) assert.ok(body.required.includes(field));
   for (const field of ["request_object", "credential", "submission_nonce"]) assert.ok(!(field in document.components.schemas.GenerationQuarantine.properties));
 });

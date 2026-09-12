@@ -2176,9 +2176,12 @@ paths:
         Requires a persistent service credential bound to the requested tenant with
         generations:reconcile. Bootstrap, global, broad generations:write, client keys,
         cross-tenant access, active leases, stale revisions, unknown actions and duplicate
-        decisions are rejected. confirmed_not_submitted clears quarantine to queued;
-        confirmed_submitted requires a provider submission ID and resumes normal running
-        processing. Neither action directly contacts a provider or settles/refunds credit.
+        decisions are rejected. Only confirmed_submitted is supported: it requires a
+        provider submission ID and resumes normal running processing. Unknown and
+        confirmed_not_submitted assertions are rejected and leave credit reserved.
+        An expired lease alone cannot prove the old process cannot resume its POST;
+        safe release requires a future server-verifiable dispatch-stop protocol.
+        This API never directly contacts a provider or settles/refunds credit.
         Confirmed delivery starts a bounded 24-hour polling window at confirmation time;
         the original admission timestamp is preserved. The normal timeout policy resumes
         at that deadline. Replaying a resolution never extends the window.
@@ -2204,20 +2207,13 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [tenant_external_id, expected_revision, action, evidence_digest]
+              required: [tenant_external_id, expected_revision, action, evidence_digest, upstream_job_id]
               properties:
                 tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
                 expected_revision: { type: string, pattern: '^[0-9a-f]{64}$' }
-                action: { type: string, enum: [confirmed_not_submitted, confirmed_submitted] }
+                action: { type: string, enum: [confirmed_submitted] }
                 evidence_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
                 upstream_job_id: { type: string, minLength: 1, maxLength: 256, pattern: '^[A-Za-z0-9_.:-]+$' }
-              oneOf:
-                - properties:
-                    action: { const: confirmed_not_submitted }
-                  not: { required: [upstream_job_id] }
-                - required: [upstream_job_id]
-                  properties:
-                    action: { const: confirmed_submitted }
       responses:
         '200':
           description: Immutable reconciliation receipt, including exact idempotent replay.
@@ -7965,11 +7961,11 @@ components:
         resolution_id: { type: string, format: uuid }
         job_id: { type: string, format: uuid }
         tenant_external_id: { type: string }
-        action: { type: string, enum: [confirmed_not_submitted, confirmed_submitted] }
+        action: { type: string, enum: [confirmed_submitted] }
         upstream_job_id: { type: [string, 'null'] }
         evidence_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
         resolved_by_service_id: { type: string, format: uuid }
-        resulting_status: { type: string, enum: [queued, running] }
+        resulting_status: { type: string, enum: [running] }
         delivery_confirmed_at: { type: [integer, 'null'], format: int64 }
         reconciliation_deadline_at: { type: [integer, 'null'], format: int64 }
         created_at: { type: integer, format: int64 }

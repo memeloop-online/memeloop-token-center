@@ -259,7 +259,7 @@ async fn submitted_resolution_is_atomic_audited_and_exactly_replayable() {
 }
 
 #[tokio::test]
-async fn not_submitted_resolution_only_requeues_and_does_not_refund_or_dispatch() {
+async fn not_submitted_assertion_cannot_release_quarantine_or_reserved_credit() {
     let f = ReconcileFixture::new().await;
     f.expire().await;
     let body = f.body("confirmed_not_submitted").await;
@@ -273,13 +273,19 @@ async fn not_submitted_resolution_only_requeues_and_does_not_refund_or_dispatch(
         )
         .await
         .0,
-        StatusCode::OK
+        StatusCode::BAD_REQUEST
     );
     let row = sqlx::query("SELECT status, error_code, submission_nonce, upstream_job_id, attempt_count FROM generation_jobs WHERE id = $1")
         .bind(f.job.to_string()).fetch_one(&f.pool).await.unwrap();
-    assert_eq!(row.get::<String, _>("status"), "queued");
-    assert!(row.get::<Option<String>, _>("error_code").is_none());
-    assert!(row.get::<Option<String>, _>("submission_nonce").is_none());
+    assert_eq!(row.get::<String, _>("status"), "submitting");
+    assert_eq!(
+        row.get::<Option<String>, _>("error_code").as_deref(),
+        Some("shutdown_delivery_unknown")
+    );
+    assert_eq!(
+        row.get::<Option<String>, _>("submission_nonce").as_deref(),
+        Some(f.nonce.to_string().as_str())
+    );
     assert!(row.get::<Option<String>, _>("upstream_job_id").is_none());
     assert_eq!(row.get::<i64, _>("attempt_count"), 1);
     f.assert_reserved().await;
@@ -420,11 +426,12 @@ async fn concurrent_conflicting_decisions_have_one_durable_winner() {
     let f = ReconcileFixture::new().await;
     f.expire().await;
     let submitted = f.body("confirmed_submitted").await;
-    let not_submitted = f.body("confirmed_not_submitted").await;
+    let mut conflicting = submitted.clone();
+    conflicting["upstream_job_id"] = json!("other-provider-confirmation");
     let path = f.resolution_path();
     let (a, b) = tokio::join!(
         f.request("POST", &path, &f.token, &["race-a"], Some(submitted)),
-        f.request("POST", &path, &f.token, &["race-b"], Some(not_submitted)),
+        f.request("POST", &path, &f.token, &["race-b"], Some(conflicting)),
     );
     let mut statuses = [a.0.as_u16(), b.0.as_u16()];
     statuses.sort_unstable();
@@ -600,25 +607,25 @@ async fn postgres_quarantine_reconciliation_serializes_conflicting_decisions() {
     let digest_a = "aa".repeat(32);
     let digest_b = "bb".repeat(32);
     let evidence = "cc".repeat(32);
-    let decision = |submitted: bool| ResolveGenerationQuarantine {
+    let decision = |first: bool| ResolveGenerationQuarantine {
         tenant_external_id: &tenant,
         job_id: job,
         actor_service_id: actor.service_id,
-        idempotency_hash: if submitted { &digest_a } else { &digest_b },
+        idempotency_hash: if first { &digest_a } else { &digest_b },
         expected_revision: &revision,
-        action: if submitted {
-            "confirmed_submitted"
+        action: "confirmed_submitted",
+        upstream_job_id: Some(if first {
+            "postgres-provider-id-a"
         } else {
-            "confirmed_not_submitted"
-        },
-        upstream_job_id: submitted.then_some("postgres-provider-id"),
+            "postgres-provider-id-b"
+        }),
         evidence_digest: &evidence,
     };
     let (a, b) = tokio::join!(
         f.database.resolve_generation_quarantine(decision(true)),
         f.database.resolve_generation_quarantine(decision(false))
     );
-    let submitted_won = a.is_ok();
+    let first_won = a.is_ok();
     let winner = match (a, b) {
         (Ok(result), Err(AppError::Conflict(_))) | (Err(AppError::Conflict(_)), Ok(result)) => {
             result
@@ -627,7 +634,7 @@ async fn postgres_quarantine_reconciliation_serializes_conflicting_decisions() {
     };
     assert_eq!(
         f.database
-            .resolve_generation_quarantine(decision(submitted_won))
+            .resolve_generation_quarantine(decision(first_won))
             .await
             .unwrap(),
         winner
@@ -644,4 +651,12 @@ async fn postgres_quarantine_reconciliation_serializes_conflicting_decisions() {
         f.database.key_view(&f.key).await.unwrap().available_balance,
         "9.75"
     );
+    // This CI database is shared with later integration-test binaries, whose
+    // real global queue claims must not pick up this fixture's resumed job.
+    sqlx::query("UPDATE generation_jobs SET next_attempt_at = $1 WHERE id = $2")
+        .bind(i64::MAX)
+        .bind(job.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
 }

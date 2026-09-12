@@ -141,12 +141,8 @@ impl Database {
             ));
         }
         let nonce: String = row.try_get("submission_nonce")?;
-        let status = if input.action == "confirmed_not_submitted" {
-            "queued"
-        } else {
-            "running"
-        };
-        let delivery_confirmed_at = (input.action == "confirmed_submitted").then_some(now);
+        let status = "running";
+        let delivery_confirmed_at = Some(now);
         let reconciliation_deadline_at =
             delivery_confirmed_at.map(|time| time.saturating_add(24 * 60 * 60 * 1_000));
         let result = GenerationQuarantineResolution {
@@ -229,10 +225,12 @@ fn validate_resolution(input: &ResolveGenerationQuarantine<'_>) -> Result<(), Ap
         ));
     }
     match (input.action, input.upstream_job_id) {
-        ("confirmed_not_submitted", None) => Ok(()),
         ("confirmed_submitted", Some(id)) if !id.is_empty() && id.len() <= 256
             && !matches!(id, "." | "..")
             && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':')) => Ok(()),
-        _ => Err(AppError::BadRequest("choose confirmed_not_submitted without an upstream ID or confirmed_submitted with a valid upstream ID".into())),
+        // An expired lease does not prove the old process cannot resume its
+        // external POST. Until there is a verifiable dispatch-stop protocol,
+        // no operator assertion may release this quarantine into a fresh POST.
+        _ => Err(AppError::BadRequest("only confirmed_submitted with a valid upstream ID is supported; unknown or not-submitted delivery must remain quarantined".into())),
     }
 }

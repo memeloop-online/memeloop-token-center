@@ -13,15 +13,13 @@ CREATE TABLE generation_quarantine_resolutions (
     idempotency_hash TEXT NOT NULL,
     request_digest TEXT NOT NULL,
     expected_revision TEXT NOT NULL,
-    action TEXT NOT NULL CHECK (action IN ('confirmed_not_submitted', 'confirmed_submitted')),
+    action TEXT NOT NULL CHECK (action = 'confirmed_submitted'),
     evidence_digest TEXT NOT NULL,
-    upstream_job_id TEXT,
+    upstream_job_id TEXT NOT NULL,
     result_json TEXT NOT NULL,
     created_at BIGINT NOT NULL,
     UNIQUE(job_id, submission_nonce),
-    UNIQUE(tenant_id, actor_service_id, idempotency_hash),
-    CHECK ((action = 'confirmed_not_submitted' AND upstream_job_id IS NULL)
-        OR (action = 'confirmed_submitted' AND upstream_job_id IS NOT NULL))
+    UNIQUE(tenant_id, actor_service_id, idempotency_hash)
 );
 
 CREATE INDEX generation_quarantine_pending
