@@ -518,6 +518,7 @@ async fn fuel_exhaustion_and_guest_traps_fail_closed() {
     }
 }
 
+#[cfg(feature = "experimental-plugin-revisions")]
 #[tokio::test]
 async fn revision_policy_failures_open_only_their_own_circuit() {
     use memeloop_token_center::plugin::lifecycle::{
@@ -528,16 +529,20 @@ async fn revision_policy_failures_open_only_their_own_circuit() {
     let plugins = directory.path().join("plugins");
     fs::create_dir(&plugins).unwrap();
     write_policy_package(&plugins, "trap-policy", "unreachable");
+    fs::write(plugins.join("trap-policy/.mtc-oci-install.json"), serde_json::to_vec(&json!({
+        "format_version": 1, "source": "registry.example/plugins/policy", "digest": format!("sha256:{}", "a".repeat(64)), "signature_policy": "cosign-public-key"
+    })).unwrap()).unwrap();
     let runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await).unwrap();
     let manifest = runtime.manifests().remove(0);
     let grant = PluginGrant {
         version: manifest.version.clone(),
         capabilities: manifest.capabilities.clone(),
         manifest_digest: manifest_digest(&manifest).unwrap(),
+        identity: runtime.package_identities().remove(&manifest.id).unwrap(),
     };
     let revisions = RuntimeRevisions::new(
         runtime.clone(),
-        BTreeMap::from([(manifest.id.clone(), grant)]),
+        BTreeMap::from([(manifest.id.clone(), vec![grant])]),
     )
     .unwrap();
     let pinned = revisions.pin().unwrap();
@@ -553,6 +558,18 @@ async fn revision_policy_failures_open_only_their_own_circuit() {
         .unwrap();
     assert!(!decision.allow);
     assert!(format!("{decision:?}").contains("policy_circuit_open"));
+    assert!(revisions.replace(1, PluginRuntime::default()).is_err());
+    fs::write(
+        plugins.join("trap-policy/plugin.wasm"),
+        component_from_core_wat(&core_wat_with_post_auth("nop\nunreachable")),
+    )
+    .unwrap();
+    let tampered = PluginRuntime::load(plugins.to_str(), database(directory.path()).await).unwrap();
+    assert!(
+        revisions.replace(1, tampered).is_err(),
+        "unchanged manifest and receipt cannot approve different executable bytes"
+    );
+    assert_eq!(revisions.pin().unwrap().receipt.revision, 1);
     assert!(RuntimeRevisions::new(runtime, BTreeMap::new()).is_err());
 }
 
