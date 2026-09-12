@@ -88,8 +88,8 @@ impl PluginRuntime {
         // At most one retry: continuously changing policy fails closed rather
         // than spinning or returning a known-invalidated read.
         for _ in 0..2 {
-            let (epoch, read_started) = {
-                let cache = self.configuration_cache.read().await;
+            let (epoch, read_generation, read_started) = {
+                let mut cache = self.configuration_cache.write().await;
                 let started = now();
                 if let Some(cached) = cache.entries.get(&tenant_id)
                     && started.saturating_duration_since(cached.loaded_at)
@@ -97,7 +97,11 @@ impl PluginRuntime {
                 {
                     return Ok(cached.snapshot.clone());
                 }
-                (cache.epoch.clone(), started)
+                cache.read_generation = cache
+                    .read_generation
+                    .checked_add(1)
+                    .ok_or(AppError::Internal)?;
+                (cache.epoch.clone(), cache.read_generation, started)
             };
             let layers = tokio::time::timeout(PLUGIN_CONFIGURATION_CACHE_TTL, read())
                 .await
@@ -155,7 +159,13 @@ impl PluginRuntime {
                     .insert(plugin.manifest.id.clone(), revision);
             }
             if self
-                .cache_snapshot(&epoch, read_started, snapshot.clone(), &now)
+                .cache_snapshot(
+                    &epoch,
+                    read_generation,
+                    read_started,
+                    snapshot.clone(),
+                    &now,
+                )
                 .await
             {
                 return Ok(snapshot);
@@ -169,6 +179,7 @@ impl PluginRuntime {
     pub(super) async fn cache_snapshot<C: Fn() -> Instant>(
         &self,
         epoch: &Arc<()>,
+        read_generation: u64,
         read_started: Instant,
         snapshot: ResolvedTrafficSnapshot,
         now: C,
@@ -211,7 +222,7 @@ impl PluginRuntime {
         // A late older read must not replace a newer already-published read.
         if cache
             .get(&snapshot.tenant_id)
-            .is_some_and(|entry| entry.loaded_at > read_started)
+            .is_some_and(|entry| entry.read_generation > read_generation)
         {
             return false;
         }
@@ -238,6 +249,7 @@ impl PluginRuntime {
             snapshot.tenant_id,
             CachedPluginConfigurations {
                 loaded_at: read_started,
+                read_generation,
                 snapshot,
                 estimated_bytes,
             },
@@ -277,6 +289,10 @@ mod tests {
                 manifest,
                 component: None,
                 configuration_validator: Some(validator),
+                identity: super::super::PluginPackageIdentity {
+                    component_sha256: None,
+                    provenance: None,
+                },
             }]),
             ..PluginRuntime::default()
         }
@@ -383,6 +399,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(refreshed.revisions["policy"].version, 2);
+    }
+
+    #[tokio::test]
+    async fn identical_instants_use_monotonic_read_order() {
+        let runtime = runtime();
+        let tenant = Uuid::from_u128(1);
+        let instant = Instant::now();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let mut gates = Some((started_tx, release_rx));
+        let old = runtime.resolve_snapshot_with(
+            tenant,
+            || {
+                let (started, release) = gates.take().expect("retry should hit newer cached read");
+                async move {
+                    started.send(()).unwrap();
+                    release.await.unwrap();
+                    Ok(vec![row(1, None)])
+                }
+            },
+            || instant,
+        );
+        let newer = async {
+            started_rx.await.unwrap();
+            let resolved = runtime
+                .resolve_snapshot_with(tenant, || async { Ok(vec![row(2, None)]) }, || instant)
+                .await
+                .unwrap();
+            assert_eq!(resolved.revisions["policy"].version, 2);
+            release_tx.send(()).unwrap();
+        };
+        let (resolved, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(old, newer)
+        })
+        .await
+        .unwrap();
+        assert_eq!(resolved.unwrap().revisions["policy"].version, 2);
+        let cache = runtime.configuration_cache.read().await;
+        assert_eq!(cache.read_generation, 2);
+        assert_eq!(cache.entries[&tenant].read_generation, 2);
     }
 
     #[tokio::test]

@@ -25,8 +25,10 @@ the five-second timeout. Tenant invalidation conservatively fences all ongoing
 reads, while retaining unaffected cached entries.
 
 Cache TTL starts **before** the database read, not when that read completes.
-Expired reads are rejected rather than receiving a new TTL on refill. Older
-in-flight reads cannot replace a cache entry published by a later-started read.
+Expired reads are rejected rather than receiving a new TTL on refill. Reads
+receive a checked, monotonic generation under the cache lock; older in-flight
+reads cannot replace a cache entry with a later generation even when their
+monotonic clock timestamps are identical. Generation exhaustion fails closed.
 The entry-count and byte budgets include revision metadata and remain bounded.
 
 Other processes have independent cache epochs. An API update invalidates only
