@@ -125,7 +125,7 @@ use upstreams::*;
 use web::{operator_index, portal_index, web_asset};
 
 pub(crate) use upstreams::{
-    refresh_managed_upstream_oauth, trigger_copilot_remint_on_auth_failure,
+    refresh_managed_upstream_oauth_for_worker, trigger_copilot_remint_on_auth_failure,
 };
 
 use crate::{

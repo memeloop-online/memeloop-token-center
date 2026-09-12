@@ -1,14 +1,14 @@
-use std::{net::SocketAddr, process::ExitCode, time::Duration};
+use std::{net::SocketAddr, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 use memeloop_token_center::{
     AppState, api,
     config::{Config, RuntimeRole},
     db::Database,
-    worker,
+    worker::{self, wait_for_server_shutdown},
 };
 use tokio::{net::TcpListener, sync::watch};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 #[global_allocator]
@@ -116,37 +116,65 @@ async fn run() -> Result<(), &'static str> {
                 (None, None)
             };
             info!(%address, ?role, "token center listening");
+            let mut worker_failed = false;
             let result = memeloop_token_center::server::serve(
                 listener,
                 api::router_for_role(state, role),
-                shutdown_signal(),
+                async {
+                    worker_failed =
+                        wait_for_server_shutdown(shutdown_signal(), &mut worker_task).await;
+                },
             )
             .await;
             if let Some(sender) = worker_shutdown {
                 let _ = sender.send(true);
             }
-            if let Some(task) = worker_task.as_mut() {
-                match tokio::time::timeout(Duration::from_secs(30), &mut *task).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(_)) => error!(
-                        error_code = "worker_task_failed",
-                        "background worker stopped unexpectedly"
-                    ),
-                    Err(_) => {
-                        warn!(
-                            error_code = "worker_shutdown_timeout",
-                            "background worker did not stop before the shutdown deadline"
-                        );
-                        task.abort();
-                        let _ = task.await;
-                    }
-                }
+            // The worker owns its deadline and joins all roles. A second
+            // timeout here could interrupt its abort-and-join cleanup.
+            if let Some(task) = worker_task {
+                worker_failed |= task.await.is_err();
+            }
+            if worker_failed {
+                return Err("worker_task_failed");
             }
             result.map_err(|_| "http_server_failed")?;
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn worker_failure_stops_server_without_an_external_signal() {
+        for panic in [false, true] {
+            let mut task = Some(tokio::spawn(async move {
+                assert!(!panic, "injected worker failure");
+            }));
+            assert!(wait_for_server_shutdown(std::future::pending(), &mut task).await);
+            assert!(task.is_none());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn external_shutdown_preserves_worker_owned_cleanup_deadline() {
+        let (stop, mut shutdown) = watch::channel(false);
+        let (joined, observed) = tokio::sync::oneshot::channel();
+        let mut task = Some(tokio::spawn(async move {
+            shutdown.changed().await.unwrap();
+            // Deliberately exceeds the removed outer timeout. Main must
+            // preserve the worker's deadline and its final join boundary.
+            tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+            joined.send(()).unwrap();
+        }));
+        assert!(!wait_for_server_shutdown(async {}, &mut task).await);
+        stop.send(true).unwrap();
+        task.unwrap().await.unwrap();
+        observed.await.unwrap();
+    }
 }
 
 async fn shutdown_signal() {

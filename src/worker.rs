@@ -24,6 +24,28 @@ pub async fn run(state: AppState) {
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
+/// Connect the worker lifetime to the HTTP server's shutdown signal. Any
+/// unsolicited worker exit is fatal, including an apparently successful exit.
+pub async fn wait_for_server_shutdown(
+    signal: impl Future<Output = ()>,
+    worker: &mut Option<tokio::task::JoinHandle<()>>,
+) -> bool {
+    tokio::select! {
+        _ = signal => false,
+        outcome = async {
+            match worker.as_mut() {
+                Some(task) => task.await,
+                None => std::future::pending().await,
+            }
+        } => {
+            tracing::error!(?outcome, "background worker exited; stopping HTTP service");
+            // The handle has been joined and must not be polled again.
+            worker.take();
+            true
+        }
+    }
+}
+
 /// Each role owns one bounded, serial lane. Slow provider calls do not block
 /// projections, maintenance, or observing the server shutdown signal.
 pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>) {
@@ -170,7 +192,7 @@ pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>
                         }
                         let idempotency_key =
                             format!("oauth-worker-{}-generation-{}", account_id, generation);
-                        if let Err(error) = api::refresh_managed_upstream_oauth(
+                        if let Err(error) = api::refresh_managed_upstream_oauth_for_worker(
                             state,
                             account_id,
                             &idempotency_key,
@@ -227,13 +249,14 @@ async fn supervise_roles(
     mut shutdown: watch::Receiver<bool>,
     grace: Duration,
 ) {
-    tokio::select! {
+    let mut failed = tokio::select! {
         biased;
-        _ = wait_for_shutdown(&mut shutdown) => {},
+        _ = wait_for_shutdown(&mut shutdown) => false,
         result = roles.join_next() => {
             tracing::error!(?result, "worker role exited unexpectedly; stopping worker roles");
+            true
         }
-    }
+    };
     let _ = role_stop.send(true);
     // One shared deadline, not one grace period per role. JoinSet aborts on
     // supervisor cancellation too, so no detached provider/lease loops survive.
@@ -246,15 +269,19 @@ async fn supervise_roles(
                 tracing::warn!("worker shutdown deadline reached; aborting remaining roles");
                 roles.abort_all();
                 while roles.join_next().await.is_some() {}
-                return;
+                break;
             }
             result = roles.join_next() => match result {
-                None => return,
-                Some(Err(error)) => tracing::error!(%error, "worker role failed during shutdown"),
+                None => break,
+                Some(Err(error)) => {
+                    tracing::error!(%error, "worker role failed during shutdown");
+                    failed = true;
+                },
                 Some(Ok(_)) => {},
             },
         }
     }
+    assert!(!failed, "background worker role failed");
 }
 
 async fn process_metered_usage_projection_batch(state: &AppState, lease_owner: Uuid) {
