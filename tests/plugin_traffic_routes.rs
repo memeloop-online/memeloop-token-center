@@ -912,6 +912,13 @@ async fn malicious_denial_reason_is_absent_from_logs_and_http_response() {
     assert!(!logs.contains(CANARY), "{logs}");
     assert!(logs.contains("gateway-policy"), "{logs}");
     assert!(logs.contains("policy_denied_invalid_metadata"), "{logs}");
+    assert_eq!(
+        logs.matches("plugin_execution_observed").count(),
+        1,
+        "{logs}"
+    );
+    assert!(logs.contains("post_auth"), "{logs}");
+    assert!(logs.contains("returned"), "{logs}");
     assert!(logs.len() < 4_096, "guest reason amplified log output");
 }
 
@@ -971,6 +978,7 @@ async fn log_capability_emits_only_bounded_host_owned_fields() {
         "/v1/chat/completions",
         json!({"model": "requested-model", "messages": []}),
     )
+    .with_subscriber(dispatch)
     .await;
 
     assert_eq!(response.0, StatusCode::FORBIDDEN);
@@ -980,6 +988,31 @@ async fn log_capability_emits_only_bounded_host_owned_fields() {
     assert!(!logs.contains(CANARY), "{logs}");
     assert!(logs.contains("gateway-policy"), "{logs}");
     assert!(logs.contains("plugin_log_emitted"), "{logs}");
+    assert!(logs.contains("plugin_invocation"), "{logs}");
+    assert_eq!(
+        logs.matches("plugin_execution_observed").count(),
+        1,
+        "{logs}"
+    );
+    // The guest event's inherited span and the caller observation must carry
+    // the same host invocation UUID, across the blocking-task boundary.
+    let observation = logs
+        .lines()
+        .find(|line| line.contains("plugin_execution_observed"))
+        .unwrap();
+    let id = observation
+        .split("invocation_id=")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    uuid::Uuid::parse_str(id).expect("host invocation ID");
+    let guest = logs
+        .lines()
+        .find(|line| line.contains("plugin_invocation") && line.contains("plugin_log_emitted"))
+        .unwrap();
+    assert!(guest.contains(id), "{logs}");
     assert!(logs.len() < 4_096, "guest message amplified log output");
 }
 
