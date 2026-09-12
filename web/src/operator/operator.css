@@ -376,11 +376,12 @@
 }
 
 .provider-account small {
-  color: #52686f;
+  color: var(--picker-muted);
   display: block;
   font-family: monospace;
-  font-size: 9px;
-  margin-top: 7px;
+  font-size: 12px;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
 }
 
 .provider-account { flex-direction: column; }

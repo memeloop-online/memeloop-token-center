@@ -1,0 +1,16 @@
+.token-pricing-scroll { max-width: 100%; overflow-x: auto; }
+.token-pricing-scroll:focus-visible, .price-provenance summary:focus-visible { outline: 2px solid var(--accent, #219b8a); outline-offset: -2px; }
+.token-pricing-table { min-width: 960px; font-variant-numeric: tabular-nums; }
+.token-pricing-table th, .token-pricing-table td { vertical-align: top; padding: 12px; }
+.token-pricing-table th:first-child, .token-pricing-table td:first-child { position: sticky; left: 0; z-index: 1; background: var(--picker-surface); min-width: 140px; max-width: 240px; box-shadow: 1px 0 var(--picker-border); }
+.token-pricing-table td:first-child code { white-space: normal; overflow-wrap: anywhere; }
+.token-pricing-table th:nth-child(n+4):nth-child(-n+7), .token-pricing-table td:nth-child(n+4):nth-child(-n+7) { text-align: right; white-space: nowrap; }
+.token-pricing-table td small { display: block; color: var(--picker-muted); }
+.token-pricing-table td:last-child { min-width: 150px; }
+.price-provenance { min-width: 130px; max-width: 260px; }
+.price-provenance summary { cursor: pointer; min-height: 44px; padding: 8px 0; color: var(--picker-text); }
+.price-provenance > div { display: grid; gap: 6px; padding: 8px; border: 1px solid var(--picker-border); }
+.price-provenance code { white-space: normal; overflow-wrap: anywhere; font-size: 12px; }
+@media (max-width: 600px) {
+  .token-pricing-table th:first-child, .token-pricing-table td:first-child { min-width: 120px; max-width: 150px; }
+}
