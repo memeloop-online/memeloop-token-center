@@ -268,7 +268,11 @@ async fn supervise_roles(
             _ = &mut deadline => {
                 tracing::warn!("worker shutdown deadline reached; aborting remaining roles");
                 roles.abort_all();
-                while roles.join_next().await.is_some() {}
+                while let Some(result) = roles.join_next().await {
+                    if let Err(error) = result {
+                        failed |= error.is_panic();
+                    }
+                }
                 break;
             }
             result = roles.join_next() => match result {
