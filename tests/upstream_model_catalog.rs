@@ -70,6 +70,109 @@ async fn request_as(
 }
 
 #[tokio::test]
+async fn aggregate_distinguishes_terminal_unsupported_from_unknown_network_and_auth_failures() {
+    let (state, _directory) = state("catalog-discovery-capability").await;
+    let tenant = "discovery-capability-tenant";
+    let mut accounts = Vec::new();
+    for driver in ["comfyui", "volcengine-seedance", "http-json", "http-json"] {
+        let account = state
+            .db
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: tenant.into(),
+                    name: format!("capability-{}", accounts.len()),
+                    driver: driver.into(),
+                    config: json!({"base_url": "https://example.com"}),
+                    credential: UpstreamCredential::None,
+                    oauth_session_id: None,
+                    oauth_driver: None,
+                    oauth_refresh_url: None,
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        accounts.push(account);
+    }
+    let ids = accounts
+        .iter()
+        .map(|account| account.id)
+        .collect::<Vec<_>>();
+    let read = format!(
+        "/internal/v1/upstream-models?tenant_external_id={tenant}&account_ids={}",
+        ids.iter()
+            .map(Uuid::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let (status, unknown) = request(&state, "GET", &read).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(unknown["eligible_account_count"], 4);
+    assert_eq!(unknown["unknown_account_count"], 4);
+    assert_eq!(unknown["unsupported_account_count"], 0);
+    // Real builtin discovery rejects these before any provider network call;
+    // the test does not fabricate a successful catalog or model snapshot.
+    for account in &accounts[..2] {
+        let (status, discovery) = request(
+            &state,
+            "POST",
+            &format!(
+                "/internal/v1/upstreams/{}/models/sync?tenant_external_id={tenant}",
+                account.id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(discovery["status"], "error");
+        assert_eq!(discovery["error_code"], "unsupported");
+    }
+    for (account, error) in accounts[2..]
+        .iter()
+        .zip(["connection_failed", "authentication_failed"])
+    {
+        let lease = Uuid::now_v7();
+        assert!(
+            state
+                .db
+                .claim_upstream_model_catalog_sync(account.id, tenant, 1, lease)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            state
+                .db
+                .record_upstream_model_catalog_failure(account.id, tenant, 1, lease, error)
+                .await
+                .unwrap(),
+            ReplaceModelCatalogResult::Replaced
+        );
+    }
+    let (status, mixed) = request(&state, "GET", &read).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(mixed["eligible_account_count"], 4);
+    assert_eq!(mixed["unknown_account_count"], 4);
+    assert_eq!(mixed["unsupported_account_count"], 2);
+    assert_eq!(mixed["stale_account_count"], 0);
+    assert_eq!(mixed["data"], json!([]));
+    state
+        .db
+        .rotate_upstream_credential(
+            accounts[0].id,
+            UpstreamCredential::None,
+            "catalog-capability-generation-change",
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let (_, rotated) = request(&state, "GET", &read).await;
+    assert_eq!(rotated["unknown_account_count"], 4);
+    assert_eq!(
+        rotated["unsupported_account_count"], 1,
+        "old-generation unsupported evidence cannot authorize custom routing"
+    );
+}
+
+#[tokio::test]
 async fn openai_catalog_sync_is_authenticated_bounded_and_failure_preserves_snapshot() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

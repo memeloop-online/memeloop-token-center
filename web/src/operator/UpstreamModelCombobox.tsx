@@ -20,6 +20,7 @@ interface AggregateCatalog {
   data: CatalogModel[];
   eligible_account_count: number;
   unknown_account_count: number;
+  unsupported_account_count?: number;
   stale_account_count: number;
 }
 
@@ -81,7 +82,7 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
   const loading = syncLoading || catalogPending;
   const error = scopedResult?.error || syncError;
   const customAllowed = accountIds.length > 0 && includedProviderGroupIds.length === 0 && excludedProviderGroupIds.length === 0;
-  const evidenceVerified = catalogEvidenceVerified(catalog, customAllowed ? new Set(accountIds).size : undefined);
+  const evidenceVerified = catalogEvidenceVerified(catalog, customAllowed ? new Set(accountIds).size : undefined, protocol === 'generation' && customAllowed);
   const catalogVerified = evidenceVerified && !loading && !error;
   const catalogUnresolved = Boolean(catalog) && !evidenceVerified;
   const hasExplicitCodexOAuth = upstreams.some((account) => accountIds.includes(account.id)

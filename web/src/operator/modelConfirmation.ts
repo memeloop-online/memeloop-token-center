@@ -4,12 +4,16 @@ export interface ModelConfirmation { scope: string; confirmed: boolean }
 export function catalogEvidenceVerified(catalog: {
   eligible_account_count: number;
   unknown_account_count: number;
+  unsupported_account_count?: number;
   stale_account_count: number;
-} | undefined, explicitCandidateCount?: number) {
+} | undefined, explicitCandidateCount?: number, allowUnsupportedDiscovery = false) {
   if (!catalog) return false;
-  const { eligible_account_count: eligible, unknown_account_count: unknown, stale_account_count: stale } = catalog;
-  return Number.isSafeInteger(eligible) && eligible > 0 && unknown === 0
-    && Number.isSafeInteger(stale) && stale >= 0 && stale <= eligible
+  const { eligible_account_count: eligible, unknown_account_count: unknown, stale_account_count: stale, unsupported_account_count: unsupported = 0 } = catalog;
+  return Number.isSafeInteger(eligible) && eligible > 0
+    && Number.isSafeInteger(unknown) && unknown >= 0 && unknown <= eligible
+    && Number.isSafeInteger(unsupported) && unsupported >= 0 && unsupported <= unknown
+    && (unknown === 0 || (allowUnsupportedDiscovery && unknown === unsupported))
+    && Number.isSafeInteger(stale) && stale >= 0 && stale <= eligible - unknown
     && (explicitCandidateCount === undefined || eligible === explicitCandidateCount);
 }
 
