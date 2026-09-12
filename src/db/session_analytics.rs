@@ -811,22 +811,32 @@ impl Database {
             sqlx::query(
                 r#"SELECT id, created_at, protocol, model, status_code, duration_ms,
                           input_tokens, cached_input_tokens, cache_write_tokens, output_tokens,
-                          cost_micros, currency, error_code,
+                          cost_micros, currency, error_code, archive_state,
                           source_kind, provenance_kind, archive_source, external_request_id
                      FROM (
-                         SELECT id, created_at, protocol, model, status_code, duration_ms,
-                                input_tokens, cached_input_tokens, cache_write_tokens, output_tokens,
-                                cost_micros, currency, error_code,
+                         SELECT r.id, r.created_at, r.protocol, r.model, r.status_code, r.duration_ms,
+                                r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens,
+                                r.cost_micros, r.currency, r.error_code,
+                                CASE WHEN r.request_object LIKE 'gap://%' THEN 'gap'
+                                     ELSE COALESCE(spool.state, CASE WHEN r.completed_at IS NULL THEN 'capturing' WHEN r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END)
+                                END AS archive_state,
                                 'live' AS source_kind, 'native' AS provenance_kind,
                                 NULL AS archive_source, NULL AS external_request_id
-                           FROM request_records
-                          WHERE key_id = $1 AND conversation_cluster_id IS NULL
+                           FROM request_records r
+                           LEFT JOIN response_archive_spools spool
+                             ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id
+                            AND spool.reservation_id = r.reservation_id
+                          WHERE r.key_id = $1 AND r.conversation_cluster_id IS NULL
                          UNION ALL
                          SELECT archive_request_id, source_started_at, protocol, model,
                                 status_code, duration_ms, input_tokens,
                                 CAST(0 AS BIGINT) AS cached_input_tokens,
                                 CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens,
-                                CAST(0 AS BIGINT), NULL AS currency, error_code, 'session_archive',
+                                CAST(0 AS BIGINT), NULL AS currency, error_code,
+                                CASE WHEN request_object IS NULL OR request_object LIKE 'gap://%'
+                                           OR response_object IS NULL OR response_object LIKE 'gap://%'
+                                     THEN 'gap' ELSE 'bound' END AS archive_state,
+                                'session_archive',
                                 'archive_unlinked', source, external_request_id
                            FROM session_archive_unlinked_requests
                           WHERE key_id = $1 AND conversation_cluster_id IS NULL
@@ -844,22 +854,32 @@ impl Database {
             sqlx::query(
                 r#"SELECT id, created_at, protocol, model, status_code, duration_ms,
                           input_tokens, cached_input_tokens, cache_write_tokens, output_tokens,
-                          cost_micros, currency, error_code,
+                          cost_micros, currency, error_code, archive_state,
                           source_kind, provenance_kind, archive_source, external_request_id
                      FROM (
-                         SELECT id, created_at, protocol, model, status_code, duration_ms,
-                                input_tokens, cached_input_tokens, cache_write_tokens, output_tokens,
-                                cost_micros, currency, error_code,
+                         SELECT r.id, r.created_at, r.protocol, r.model, r.status_code, r.duration_ms,
+                                r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens,
+                                r.cost_micros, r.currency, r.error_code,
+                                CASE WHEN r.request_object LIKE 'gap://%' THEN 'gap'
+                                     ELSE COALESCE(spool.state, CASE WHEN r.completed_at IS NULL THEN 'capturing' WHEN r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END)
+                                END AS archive_state,
                                 'live' AS source_kind, 'native' AS provenance_kind,
                                 NULL AS archive_source, NULL AS external_request_id
-                           FROM request_records
-                          WHERE key_id = $1 AND conversation_cluster_id IS NULL
+                           FROM request_records r
+                           LEFT JOIN response_archive_spools spool
+                             ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id
+                            AND spool.reservation_id = r.reservation_id
+                          WHERE r.key_id = $1 AND r.conversation_cluster_id IS NULL
                          UNION ALL
                          SELECT archive_request_id, source_started_at, protocol, model,
                                 status_code, duration_ms, input_tokens,
                                 CAST(0 AS BIGINT) AS cached_input_tokens,
                                 CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens,
-                                CAST(0 AS BIGINT), NULL AS currency, error_code, 'session_archive',
+                                CAST(0 AS BIGINT), NULL AS currency, error_code,
+                                CASE WHEN request_object IS NULL OR request_object LIKE 'gap://%'
+                                           OR response_object IS NULL OR response_object LIKE 'gap://%'
+                                     THEN 'gap' ELSE 'bound' END AS archive_state,
+                                'session_archive',
                                 'archive_unlinked', source, external_request_id
                            FROM session_archive_unlinked_requests
                           WHERE key_id = $1 AND conversation_cluster_id IS NULL
@@ -941,7 +961,10 @@ impl Database {
                             currency: currency.clone(),
                         },
                         error_code: row.try_get("error_code")?,
-                        archive_state: crate::model::RequestArchiveState::Gap,
+                        archive_state: crate::model::RequestArchiveState::from_storage(
+                            row.try_get::<String, _>("archive_state")?.as_str(),
+                        )
+                        .ok_or(AppError::Internal)?,
                         credential_identity: None,
                         session_context: Some(RequestSessionContext::unlinked(None)),
                     },

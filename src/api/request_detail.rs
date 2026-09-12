@@ -37,8 +37,6 @@ pub(super) async fn request_detail(
             },
         },
     };
-    let request_state = resolved_archive_state(refs.request_archive_state, request.complete);
-    let response_state = resolved_archive_state(refs.response_archive_state, response.complete);
     crate::model::RequestDetail {
         view: refs.view,
         request_body: request.value,
@@ -46,12 +44,12 @@ pub(super) async fn request_detail(
         archive_complete: request.complete && response.complete,
         archive: crate::model::RequestArchiveCompletenessView {
             request: crate::model::RequestArchiveSideView {
-                state: request_state,
+                state: refs.request_archive_state,
                 complete: request.complete,
                 reason: request.reason.or(refs.request_archive_reason),
             },
             response: crate::model::RequestArchiveSideView {
-                state: response_state,
+                state: refs.response_archive_state,
                 complete: response.complete,
                 reason: response.reason.or(refs.response_archive_reason),
             },
@@ -73,19 +71,6 @@ impl ArchiveValue {
             complete: false,
             reason: Some(reason.to_owned()),
         }
-    }
-}
-
-fn resolved_archive_state(
-    projected: crate::model::RequestArchiveState,
-    complete: bool,
-) -> crate::model::RequestArchiveState {
-    if complete {
-        crate::model::RequestArchiveState::Bound
-    } else if projected == crate::model::RequestArchiveState::Bound {
-        crate::model::RequestArchiveState::Gap
-    } else {
-        projected
     }
 }
 

@@ -1165,14 +1165,7 @@ fn request_lifecycle_projection(
 }
 
 fn request_archive_state(value: String) -> Result<RequestArchiveState, AppError> {
-    match value.as_str() {
-        "capturing" => Ok(RequestArchiveState::Capturing),
-        "pending" => Ok(RequestArchiveState::Pending),
-        "uploading" => Ok(RequestArchiveState::Uploading),
-        "bound" => Ok(RequestArchiveState::Bound),
-        "gap" => Ok(RequestArchiveState::Gap),
-        _ => Err(AppError::Internal),
-    }
+    RequestArchiveState::from_storage(&value).ok_or(AppError::Internal)
 }
 
 fn request_session_context_from_row(

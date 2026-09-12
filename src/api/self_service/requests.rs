@@ -172,7 +172,6 @@ pub(in crate::api) async fn request_detail_response(
         detail.archive_complete = false;
         for side in [&mut detail.archive.request, &mut detail.archive.response] {
             side.complete = false;
-            side.state = crate::model::RequestArchiveState::Gap;
             side.reason = Some("archive_detail_response_too_large".to_owned());
         }
         body = serde_json::to_vec(&detail).map_err(|_| AppError::Internal)?;

@@ -548,6 +548,19 @@ pub enum RequestArchiveState {
     Gap,
 }
 
+impl RequestArchiveState {
+    pub(crate) fn from_storage(value: &str) -> Option<Self> {
+        match value {
+            "capturing" => Some(Self::Capturing),
+            "pending" => Some(Self::Pending),
+            "uploading" => Some(Self::Uploading),
+            "bound" => Some(Self::Bound),
+            "gap" => Some(Self::Gap),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct RequestTokenUsageView {
     pub input_tokens: Option<i64>,
