@@ -302,7 +302,6 @@ async fn gateway_and_control_roles_return_404_for_every_opposite_operation_famil
     let control_operations = [
         (Method::GET, "/operator".to_owned()),
         (Method::GET, "/version".to_owned()),
-        (Method::GET, "/metrics".to_owned()),
         (Method::GET, "/internal/v1/keys".to_owned()),
         (Method::POST, "/internal/v1/service-tokens".to_owned()),
         (Method::GET, "/internal/v1/provider-types".to_owned()),

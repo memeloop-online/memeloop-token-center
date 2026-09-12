@@ -10,7 +10,7 @@ import { parse } from "yaml";
 
 const HTTP_METHODS = new Set(["delete", "get", "head", "options", "patch", "post", "put", "trace"]);
 const ROUTE_METHOD = /(?<![A-Za-z0-9_])(delete|get|head|options|patch|post|put|trace)\s*\(/gu;
-const EXPECTED_RUNTIME_ROLES: Record<string, string[]> = { common: ["gateway", "control", "worker", "all"], control: ["control", "all"], gateway: ["gateway", "all"] };
+const EXPECTED_RUNTIME_ROLES: Record<string, string[]> = { common: ["gateway", "control", "worker", "all"], control: ["control", "all"], gateway: ["gateway", "all"], observability: ["gateway", "control", "all"] };
 type Obj = Record<string, any>;
 
 export class ContractFailure extends Error {}
@@ -96,10 +96,19 @@ function duplicateKeys(items: Obj[], fields: string[]): string[] {
   return [...duplicates].sort();
 }
 
+function observabilityGuardRanges(body: string, functionName: string): Array<[number, number]> {
+  if (functionName !== "router_for_role") return [];
+  const guard = /if\s+matches!\(\s*role\s*,\s*RuntimeRole::Gateway\s*\|\s*RuntimeRole::Control\s*\|\s*RuntimeRole::All\s*\)\s*\{/gu;
+  return [...body.matchAll(guard)].map((match) => {
+    const opening = body.lastIndexOf("{", (match.index ?? 0) + match[0].length);
+    return [opening, balancedSlice(body, opening, "{", "}")[1]];
+  });
+}
+
 export function sourceRoutes(source: string): Obj[] {
   const routes: Obj[] = [];
   for (const [role, functionName] of [["common", "router_for_role"], ["control", "control_router"], ["gateway", "gateway_router"]] as const) {
-    const body = functionBody(source, functionName); const mask = codeMask(body); failOnUnparsedRouterComposition(body, functionName, mask); const guards = controlGuardRanges(body, functionName);
+    const body = functionBody(source, functionName); const mask = codeMask(body); failOnUnparsedRouterComposition(body, functionName, mask); const guards = controlGuardRanges(body, functionName); const observabilityGuards = observabilityGuardRanges(body, functionName);
     for (let cursor = 0;;) {
       const marker = body.indexOf(".route", cursor); if (marker < 0) break;
       if (!mask[marker]) { cursor = marker + 6; continue; }
@@ -107,7 +116,7 @@ export function sourceRoutes(source: string): Obj[] {
       if (body[opening] !== "(") { cursor = opening; continue; }
       const [argumentsText, end] = balancedSlice(body, opening, "(", ")"); const pathMatch = /^\s*"([^"\\]+)"\s*,/u.exec(argumentsText);
       if (pathMatch === null) throw new ContractFailure(`${functionName} contains a .route call without a literal path`);
-      const path = pathMatch[1]!; const effectiveRole = role === "common" && guards.some(([start, finish]) => start < marker && marker < finish) ? "control" : role;
+      const path = pathMatch[1]!; const effectiveRole = role === "common" && guards.some(([start, finish]) => start < marker && marker < finish) ? "control" : role === "common" && observabilityGuards.some(([start, finish]) => start < marker && marker < finish) ? "observability" : role;
       const handler = argumentsText.slice(pathMatch[0].length); const handlerMask = codeMask(handler); const methods = [...new Set([...handler.matchAll(ROUTE_METHOD)].filter((match) => handlerMask[match.index ?? 0]).map((match) => match[1]!))].sort();
       if (methods.length === 0) throw new ContractFailure(`source route ${path} has no recognized HTTP method`);
       routes.push(...methods.map((method) => ({ method, path, source_role: effectiveRole }))); cursor = end;
