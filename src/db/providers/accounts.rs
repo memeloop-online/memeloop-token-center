@@ -626,6 +626,8 @@ impl Database {
                    a.credential_generation, a.oauth_session_id, a.oauth_driver,
                    a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at,
                    c.credential_ciphertext,
+                   receipt.source_identity_hash AS import_source_identity_hash,
+                   receipt.source_document_sha256 AS import_source_document_sha256,
                    COALESCE(route_counts.route_count, 0) AS route_count
             FROM page a
             JOIN tenants t ON t.id = a.tenant_id
@@ -633,6 +635,9 @@ impl Database {
               ON c.upstream_account_id = a.id
              AND c.generation = a.credential_generation
              AND c.revoked_at IS NULL
+            LEFT JOIN native_oauth_import_receipts receipt
+              ON receipt.tenant_id = a.tenant_id
+             AND receipt.upstream_account_id = a.id
             LEFT JOIN page_route_counts route_counts
               ON route_counts.tenant_id = a.tenant_id
              AND route_counts.upstream_account_id = a.id

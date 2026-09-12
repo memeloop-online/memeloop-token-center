@@ -49,10 +49,7 @@ async fn call(
 }
 
 fn digest(value: &Value) -> String {
-    format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(value).unwrap())
-    )
+    format!("{:x}", Sha256::digest(serde_json::to_vec(value).unwrap()))
 }
 
 fn account(identity: char, path: &str, secret: &str, expiry: &str) -> Value {
@@ -145,13 +142,50 @@ async fn native_kimi_cohort_contract_is_atomic_rotatable_and_secret_free() {
         .create_service_token(
             CreateServiceTokenInput {
                 name: "native OAuth import fixture".into(),
-                scopes: vec!["upstreams:import:write".into()],
+                scopes: vec!["upstreams:import:write".into(), "providers:read".into()],
                 tenant_external_id: None,
             },
             state.config.key_pepper.as_bytes(),
         )
         .await
         .unwrap();
+    let tenant_scoped = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "tenant-scoped native import fixture".into(),
+                scopes: vec!["upstreams:import:write".into()],
+                tenant_external_id: Some("native-kimi-cohort".into()),
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let wrong_scope = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "wrong-scope native import fixture".into(),
+                scopes: vec!["providers:write".into()],
+                tenant_external_id: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        call(&state, "GET", CAPABILITIES, &tenant_scoped.token, None)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        call(&state, "GET", CAPABILITIES, &wrong_scope.token, None)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
 
     let (status, capabilities, _) = call(&state, "GET", CAPABILITIES, &issued.token, None).await;
     assert_eq!(status, StatusCode::OK);
@@ -163,15 +197,46 @@ async fn native_kimi_cohort_contract_is_atomic_rotatable_and_secret_free() {
 
     let tenant = "native-kimi-cohort";
     let mut accounts = vec![
-        account('e', "auth/second.json", "fixture-second", "2099-01-01T00:00:00Z"),
-        account('d', "auth/first.json", "fixture-first", "2099-01-01T00:00:00Z"),
+        account(
+            'e',
+            "auth/second.json",
+            "fixture-second",
+            "2099-01-01T00:00:00Z",
+        ),
+        account(
+            'd',
+            "auth/first.json",
+            "fixture-first",
+            "2099-01-01T00:00:00Z",
+        ),
     ];
     let create = cohort_request(tenant, accounts.clone());
+    let mut unknown = create.clone();
+    unknown["unexpected"] = json!(true);
+    assert_eq!(
+        call(&state, "POST", COHORT, &issued.token, Some(&unknown))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
     let (status, created, bytes) = call(&state, "POST", COHORT, &issued.token, Some(&create)).await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(created["disposition"], "created");
     assert_eq!(created["accounts"][0]["name"], "Kimi OAuth 2");
     assert_eq!(created["accounts"][1]["name"], "Kimi OAuth 1");
+    assert!(
+        created["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|account| {
+                account["driver"] == "kimi-oauth"
+                    && account["auth_kind"] == "oauth"
+                    && account["status"] == "active"
+                    && account["credential_generation"] == 1
+                    && account["route_count"] == 0
+            })
+    );
     assert_eq!(
         created["accounts"][0]["import_source_identity_hash"],
         "e".repeat(64)
@@ -185,6 +250,20 @@ async fn native_kimi_cohort_contract_is_atomic_rotatable_and_secret_free() {
     ] {
         assert!(!response.contains(forbidden));
     }
+    let (status, inventory, _) = call(
+        &state,
+        "GET",
+        "/internal/v1/upstreams?tenant_external_id=native-kimi-cohort",
+        &issued.token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(inventory.as_array().unwrap().len(), 2);
+    assert!(inventory.as_array().unwrap().iter().all(|account| {
+        account["import_source_identity_hash"].is_string()
+            && account["import_source_document_sha256"].is_string()
+    }));
 
     bind_current(&mut accounts, &created);
     let replay = cohort_request(tenant, accounts.clone());
@@ -206,7 +285,9 @@ async fn native_kimi_cohort_contract_is_atomic_rotatable_and_secret_free() {
     assert_eq!(rotated["accounts"][1]["credential_generation"], 2);
     let stale = cohort_request(tenant, stale);
     assert_eq!(
-        call(&state, "POST", COHORT, &issued.token, Some(&stale)).await.0,
+        call(&state, "POST", COHORT, &issued.token, Some(&stale))
+            .await
+            .0,
         StatusCode::CONFLICT
     );
 
@@ -224,7 +305,9 @@ async fn native_kimi_cohort_contract_is_atomic_rotatable_and_secret_free() {
     bind_current(&mut accounts, &rotated);
     let disabled = cohort_request(tenant, accounts);
     assert_eq!(
-        call(&state, "POST", COHORT, &issued.token, Some(&disabled)).await.0,
+        call(&state, "POST", COHORT, &issued.token, Some(&disabled))
+            .await
+            .0,
         StatusCode::CONFLICT
     );
 
@@ -237,7 +320,9 @@ async fn native_kimi_cohort_contract_is_atomic_rotatable_and_secret_free() {
         ],
     );
     assert_eq!(
-        call(&state, "POST", COHORT, &issued.token, Some(&expired)).await.0,
+        call(&state, "POST", COHORT, &issued.token, Some(&expired))
+            .await
+            .0,
         StatusCode::BAD_REQUEST
     );
     assert!(
@@ -293,16 +378,17 @@ async fn native_kimi_cohort_contract_is_atomic_rotatable_and_secret_free() {
         ],
     );
     assert_eq!(
-        call(&state, "POST", COHORT, &issued.token, Some(&foreign)).await.0,
+        call(&state, "POST", COHORT, &issued.token, Some(&foreign))
+            .await
+            .0,
         StatusCode::CONFLICT
     );
-    assert_eq!(
-        state
-            .db
-            .list_upstream_accounts(foreign_tenant)
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
+    let foreign_inventory = state
+        .db
+        .list_upstream_accounts(foreign_tenant)
+        .await
+        .unwrap();
+    assert_eq!(foreign_inventory.len(), 1);
+    assert_eq!(foreign_inventory[0].import_source_identity_hash, None);
+    assert_eq!(foreign_inventory[0].import_source_document_sha256, None);
 }

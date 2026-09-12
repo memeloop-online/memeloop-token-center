@@ -5486,7 +5486,7 @@ components:
       required: [kind, relative_path]
       properties:
         kind: { const: auth_file }
-        relative_path: { type: string, minLength: 1, maxLength: 512, pattern: '^(?!/)(?!.*(?:^|/)\.\.?/)(?!.*\\)[^\x00-\x1f\x7f]+$' }
+        relative_path: { type: string, minLength: 1, maxLength: 512, pattern: '^(?!/)(?!.*//)(?!.*(?:^|/)\.{1,2}(?:/|$))(?!.*\\)(?!.*\/$)[^\x00-\x1f\x7f]+$' }
     NativeKimiOAuthDocument:
       type: object
       additionalProperties: false

@@ -55,9 +55,7 @@ pub(crate) fn credential_from_native_import(
 ) -> Result<UpstreamCredential, AppError> {
     let source: NativeImportDocument =
         serde_json::from_value(payload.clone()).map_err(|_| invalid())?;
-    if source.kind != "kimi"
-        || source.disabled
-        || !source.token_type.eq_ignore_ascii_case("bearer")
+    if source.kind != "kimi" || source.disabled || !source.token_type.eq_ignore_ascii_case("bearer")
     {
         return Err(invalid());
     }
@@ -65,7 +63,11 @@ pub(crate) fn credential_from_native_import(
     super::required_secret(&source.refresh_token, "Kimi")?;
     optional_text(source.scope.as_deref())?;
     optional_text(source.device_id.as_deref())?;
-    if let Some(last_refresh) = source.last_refresh.as_deref().filter(|value| !value.is_empty()) {
+    if let Some(last_refresh) = source
+        .last_refresh
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
         rfc3339_millis(last_refresh)?;
     }
     let expires_at = source

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::Component};
+use std::collections::BTreeMap;
 
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -124,7 +124,7 @@ pub(in crate::api) async fn import_native_kimi_oauth_cohort(
     if body.approval.expected_current_cohort_sha256 != expected_digest
         || body.approval.new_cohort_sha256 != new_digest
     {
-        return Err(AppError::Conflict(
+        return Err(AppError::BadRequest(
             "native Kimi OAuth cohort approval does not match the request".into(),
         ));
     }
@@ -154,7 +154,7 @@ pub(in crate::api) async fn import_native_kimi_oauth_cohort(
             ));
         }
         if account.source_document_sha256 != format!("{:x}", Sha256::digest(&document_bytes)) {
-            return Err(AppError::Conflict(
+            return Err(AppError::BadRequest(
                 "native Kimi OAuth source document digest does not match".into(),
             ));
         }
@@ -181,8 +181,7 @@ pub(in crate::api) async fn import_native_kimi_oauth_cohort(
                 .expected_current_account_id
                 .map(|account_id| account_id.to_string()),
             expected_current_document_sha256: account.expected_current_document_sha256,
-            expected_current_credential_generation: account
-                .expected_current_credential_generation,
+            expected_current_credential_generation: account.expected_current_credential_generation,
             account_name: format!("Kimi OAuth {ordinal}"),
             config: crate::oauth::managed::kimi::native_import_config(),
             credential,
@@ -194,9 +193,7 @@ pub(in crate::api) async fn import_native_kimi_oauth_cohort(
         .import_native_kimi_oauth_cohort(
             inputs,
             NativeOAuthImportApproval {
-                expected_current_cohort_sha256: body
-                    .approval
-                    .expected_current_cohort_sha256,
+                expected_current_cohort_sha256: body.approval.expected_current_cohort_sha256,
                 new_cohort_sha256: body.approval.new_cohort_sha256,
             },
             state.config.key_pepper.as_bytes(),
@@ -209,10 +206,13 @@ pub(in crate::api) async fn import_native_kimi_oauth_cohort(
         account_ids = ?result.accounts.iter().map(|account| account.id).collect::<Vec<_>>(),
         "applied native Kimi OAuth cohort import"
     );
-    Ok((status, Json(json!({
-        "disposition": disposition,
-        "accounts": result.accounts,
-    }))))
+    Ok((
+        status,
+        Json(json!({
+            "disposition": disposition,
+            "accounts": result.accounts,
+        })),
+    ))
 }
 
 fn validate_outer_contract(body: &NativeKimiCohortRequest) -> Result<(), AppError> {
@@ -221,6 +221,7 @@ fn validate_outer_contract(body: &NativeKimiCohortRequest) -> Result<(), AppErro
         || body.approval.contract != APPROVAL_CONTRACT
         || body.accounts.len() != 2
         || body.tenant_external_id.trim().is_empty()
+        || body.tenant_external_id.trim() != body.tenant_external_id
         || body.tenant_external_id.len() > 200
         || body.tenant_external_id.chars().any(char::is_control)
     {
@@ -269,9 +270,9 @@ fn valid_relative_path(value: &str) -> bool {
         && value.len() <= 512
         && !value.contains('\\')
         && !value.chars().any(char::is_control)
-        && std::path::Path::new(value)
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
+        && value
+            .split('/')
+            .all(|component| !component.is_empty() && !matches!(component, "." | ".."))
 }
 
 fn validate_lower_hex_digest(value: &str, label: &str) -> Result<(), AppError> {
