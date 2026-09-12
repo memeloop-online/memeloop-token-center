@@ -1,7 +1,7 @@
 .request-session-cell {
   min-width: 10rem;
-  width: 20rem;
-  max-width: 20rem;
+  width: 14rem;
+  max-width: 14rem;
   overflow: hidden;
   white-space: normal;
 }
@@ -29,6 +29,64 @@
   overflow-wrap: anywhere;
   white-space: normal;
   width: 100%;
+}
+
+/* Secondary agent identifiers should not set every live row's height. Native
+   disclosure preserves the complete value for keyboard and touch users. */
+.request-session-metadata {
+  margin-top: 0.25rem;
+  text-align: left;
+}
+
+.request-session-metadata > summary {
+  color: inherit;
+  cursor: pointer;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  padding-block: 0.15rem;
+  white-space: normal;
+}
+
+.request-session-metadata > summary:focus-visible,
+.request-table-scroll:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
+.request-table .request-time-cell {
+  min-width: 10.5rem;
+  max-width: 11.5rem;
+  white-space: normal;
+}
+
+.request-table .request-id-control.compact {
+  max-width: 11rem;
+}
+
+.request-completed-cell {
+  min-width: 9rem;
+  max-width: 10rem;
+  white-space: normal;
+}
+
+.request-model-cell {
+  min-width: 10rem;
+  max-width: 12rem;
+  white-space: normal;
+}
+
+.request-model-cell code,
+.request-upstream-cell code,
+.request-route-cell code {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.request-upstream-cell,
+.request-route-cell {
+  min-width: 11rem;
+  max-width: 14rem;
+  white-space: normal;
 }
 
 .request-session-unlinked {
@@ -133,7 +191,8 @@
 
 @media (max-width: 599px) {
   .request-id-control > .copy-control button,
-  .request-diagnostic-session {
+  .request-diagnostic-session,
+  .request-session-metadata > summary {
     min-height: 44px;
     min-width: 44px;
   }

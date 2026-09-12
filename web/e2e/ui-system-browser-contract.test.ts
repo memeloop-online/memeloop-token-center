@@ -102,6 +102,25 @@ test('shared surfaces contain long content and retain keyboard actions across lo
             assert.ok(child.left >= sessionCell.left && child.right <= sessionCell.right, `${label}: session child inside its table cell`);
           }
           assert.match(sessionCell.children.at(-1)?.text ?? '', /agent_agent_agent_/, `${label}: full agent metadata retained for copying`);
+          const metadata = page.locator('.request-session-metadata').first();
+          const metadataToggle = metadata.locator('summary');
+          const collapsedHeight = await page.locator('tbody tr').first().evaluate(row => row.getBoundingClientRect().height);
+          assert.equal(await metadata.evaluate(element => (element as HTMLDetailsElement).open), false, `${label}: secondary metadata starts collapsed`);
+          assert.equal(await metadata.locator('small').isVisible(), false, `${label}: long agent identifier does not expand every row`);
+          await metadataToggle.focus();
+          assert.equal(await metadataToggle.evaluate(element => getComputedStyle(element).outlineStyle !== 'none'), true, `${label}: metadata focus visible`);
+          await page.keyboard.press('Enter');
+          assert.equal(await metadata.locator('small').isVisible(), true, `${label}: keyboard reveals metadata`);
+          assert.match(await metadata.locator('small').textContent() ?? '', /agent_agent_agent_/, `${label}: full metadata available without hover`);
+          const expandedHeight = await page.locator('tbody tr').first().evaluate(row => row.getBoundingClientRect().height);
+          assert.ok(expandedHeight > collapsedHeight, `${label}: collapse actually reduces row height`);
+          await page.keyboard.press('Enter');
+          assert.equal(await metadata.locator('small').isVisible(), false, `${label}: keyboard collapses metadata`);
+          const scrollRegion = page.getByRole('region', { name: locale === 'en' ? 'Request records (scroll horizontally)' : '请求记录（可横向滚动）' });
+          await scrollRegion.focus();
+          assert.equal(await scrollRegion.evaluate(element => document.activeElement === element), true, `${label}: horizontal table has an accessible keyboard entry`);
+          assert.equal(await scrollRegion.evaluate(element => getComputedStyle(element).outlineStyle !== 'none'), true, `${label}: table focus visible`);
+          if (width <= 390) assert.ok(await metadataToggle.evaluate(element => element.getBoundingClientRect().height >= 44), `${label}: metadata touch target`);
           if (theme === 'light') assert.equal(await action.evaluate(element => getComputedStyle(element).color), 'rgb(8, 121, 110)', `${label}: accessible light-theme link token`);
           if (width <= 390) assert.ok(await page.locator('.request-diagnostics .copy-control button').first().evaluate(element => element.getBoundingClientRect().height >= 44), `${label}: copy target`);
         }
