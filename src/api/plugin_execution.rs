@@ -142,11 +142,12 @@ where
         Ok(Ok(permit)) => permit,
     };
     let span = tracing::info_span!("plugin_invocation", invocation_id = %observation.invocation_id, phase = phase.as_str());
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let task = tokio::task::spawn_blocking(move || {
         // A timed-out/cancelled caller cannot release capacity still occupied
         // by blocking Wasm. The runtime's own fuel/epoch limits remain in force.
         let _permit = permit;
-        span.in_scope(work)
+        tracing::dispatcher::with_default(&dispatch, || span.in_scope(work))
     });
     match tokio::time::timeout(execution_timeout, task).await {
         Err(_) => {
