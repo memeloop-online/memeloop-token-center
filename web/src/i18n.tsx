@@ -5,6 +5,7 @@ type Variables = Record<string, string | number>;
 
 const zh = {
   'secret.show': '显示', 'secret.hide': '隐藏', 'secret.showField': '显示{{field}}', 'secret.hideField': '隐藏{{field}}', 'secret.value': '敏感值', 'secret.invalidJson': '请输入有效 JSON；敏感内容不会显示在错误中。',
+  'settings.assistantMoreCredentials': '加载更多凭据',
   'settings.assistantBillingCredential': '计费凭据',
   'settings.assistantSelectBillingCredential': '选择计费凭据',
   'settings.assistantBillingHint': '生成建议会消耗此凭据的额度，遵循它的模型授权和预算限制。仅发送输入的筛选意图，不发送请求记录；请勿输入敏感信息。',
@@ -473,6 +474,7 @@ const zh = {
 
 const en = {
   'secret.show': 'Show', 'secret.hide': 'Hide', 'secret.showField': 'Show {{field}}', 'secret.hideField': 'Hide {{field}}', 'secret.value': 'Secret value', 'secret.invalidJson': 'Enter valid JSON. Secret contents are not shown in errors.',
+  'settings.assistantMoreCredentials': 'Load more credentials',
   'settings.assistantBillingCredential': 'Billing credential',
   'settings.assistantSelectBillingCredential': 'Choose a billing credential',
   'settings.assistantBillingHint': 'Suggestions consume this credential’s balance and follow its model grants and budget. Only your filter intent is sent, never request records. Do not enter sensitive information.',
