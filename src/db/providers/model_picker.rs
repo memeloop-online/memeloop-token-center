@@ -413,7 +413,7 @@ WITH direct_sources AS (
        )
 ), logical_items AS (
     SELECT DISTINCT
-           CASE WHEN $2 = 'route' THEN route.id ELSE route.public_model END AS item_identity,
+           (CASE WHEN $2 = 'route' THEN route.id ELSE route.public_model END) COLLATE "C" AS item_identity,
            CASE WHEN $2 = 'route' THEN route.id ELSE route.public_model END AS item_value,
            route.public_model AS item_label,
            LOWER(route.public_model COLLATE "C") AS sort_label

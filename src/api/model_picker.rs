@@ -86,7 +86,10 @@ pub(super) async fn list_model_picker_options(
         return Err(AppError::Forbidden);
     }
     let requested_tenant = query.tenant_external_id.trim().to_owned();
-    if requested_tenant.is_empty() || requested_tenant.len() > 200 {
+    if requested_tenant.is_empty()
+        || requested_tenant.len() > 200
+        || requested_tenant.contains('\0')
+    {
         return Err(AppError::BadRequest(
             "tenant_external_id must contain 1 to 200 characters".into(),
         ));
@@ -94,7 +97,7 @@ pub(super) async fn list_model_picker_options(
     let tenant = management_tenant(&service, Some(requested_tenant))?
         .ok_or_else(|| AppError::BadRequest("tenant_external_id is required".into()))?;
     let search = query.q.trim();
-    if search.chars().count() > MAX_MODEL_PICKER_SEARCH_CHARS {
+    if search.chars().count() > MAX_MODEL_PICKER_SEARCH_CHARS || search.contains('\0') {
         return Err(AppError::BadRequest(
             "model picker search contains too many characters".into(),
         ));
@@ -246,6 +249,8 @@ fn decode_cursor(
         || cursor.selection_kind != selection_kind
         || cursor.scope_sha256 != expected_scope_sha256
         || cursor.sort_label.len() > 200
+        || cursor.sort_label.contains('\0')
+        || cursor.identity.contains('\0')
         || !valid_identity
     {
         return Err(AppError::BadRequest("invalid model picker cursor".into()));
@@ -287,6 +292,18 @@ mod tests {
             decode_cursor(Some(&encoded), "different", ModelPickerSelectionKind::Route).is_err()
         );
         assert!(decode_cursor(Some(&encoded), &digest, ModelPickerSelectionKind::Model).is_err());
+
+        let nul_cursor = encode_cursor(ModelPickerCursor {
+            version: 1,
+            selection_kind: ModelPickerSelectionKind::Model,
+            scope_sha256: digest.clone(),
+            sort_label: "model\0suffix".to_owned(),
+            identity: "model\0suffix".to_owned(),
+        })
+        .unwrap();
+        assert!(
+            decode_cursor(Some(&nul_cursor), &digest, ModelPickerSelectionKind::Model).is_err()
+        );
     }
 
     #[test]

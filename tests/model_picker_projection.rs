@@ -311,6 +311,21 @@ fn projection_filter<'a>(
 
 async fn exercise_database_projection(state: &AppState, label: &str, database_url: &str) {
     let fixture = seed_projection(state, label).await;
+    let (nul_status, _) = request(
+        state,
+        RuntimeRole::Control,
+        "test-service-token",
+        &format!(
+            "/internal/v1/model-picker-options?tenant_external_id={}&selection_kind=model&q=%00",
+            fixture.tenant
+        ),
+    )
+    .await;
+    assert_eq!(
+        nul_status,
+        StatusCode::BAD_REQUEST,
+        "NUL search input must be rejected consistently before SQLite/PostgreSQL projection"
+    );
     let inspection = AnyPool::connect(database_url)
         .await
         .expect("connect model picker fixture inspection pool");
@@ -494,6 +509,47 @@ async fn exercise_database_projection(state: &AppState, label: &str, database_ur
         source.account.id != fixture.first_account.to_string()
             && source.account.id != fixture.second_account.to_string()
     }));
+
+    create_route(
+        state,
+        &fixture.tenant,
+        RouteFixtureInput {
+            public_model: "Case-Variant",
+            upstream_model: "Case-Variant",
+            protocol: "openai",
+            priority: 0,
+            account_ids: vec![fixture.first_account],
+            included_provider_group_ids: Vec::new(),
+        },
+    )
+    .await;
+    create_route(
+        state,
+        &fixture.tenant,
+        RouteFixtureInput {
+            public_model: "case-variant",
+            upstream_model: "case-variant",
+            protocol: "openai",
+            priority: 0,
+            account_ids: vec![fixture.first_account],
+            included_provider_group_ids: Vec::new(),
+        },
+    )
+    .await;
+    let case_variants = state
+        .db
+        .model_picker_projection(projection_filter(
+            &fixture,
+            ModelPickerSelectionKind::Model,
+            "case-variant",
+            &[],
+            &public_provider_ids,
+        ))
+        .await
+        .expect("case-variant identity ordering");
+    assert_eq!(case_variants.len(), 2);
+    assert_eq!(case_variants[0].value, "Case-Variant");
+    assert_eq!(case_variants[1].value, "case-variant");
 }
 
 #[tokio::test]
