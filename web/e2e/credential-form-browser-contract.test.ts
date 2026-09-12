@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
@@ -16,8 +16,14 @@ test('credential mode remains editable without raw routing arrays or mobile over
   const browser = await chromium.launch({ headless: true });
   try {
     const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+    page.setDefaultTimeout(5_000);
+    page.on('pageerror', (error) => context.diagnostic(error.message));
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/credential-form.html`);
+    await page.locator('.rjsf').waitFor();
+    const artifacts = fileURLToPath(new URL('./e2e-artifacts/upstream-availability', import.meta.url));
+    mkdirSync(artifacts, { recursive: true });
+    await page.screenshot({ path: `${artifacts}/credential-form-mobile.png`, fullPage: true });
     const mode = page.getByRole('combobox', { name: 'Metering and limit mode' });
     await mode.waitFor();
     assert.equal(await mode.inputValue(), 'prepaid');
@@ -27,7 +33,7 @@ test('credential mode remains editable without raw routing arrays or mobile over
     await page.getByLabel('Extension field').fill('retained');
     await mode.selectOption('metered_unlimited');
     await page.getByRole('button', { name: 'Create fixture' }).click();
-    await page.waitForFunction(() => Boolean(document.querySelector('output')?.textContent));
+    await page.waitForFunction(() => Boolean(document.querySelector('output')?.textContent), undefined, { timeout: 5_000 });
     const submitted = JSON.parse(await page.locator('output').innerText());
     assert.equal(submitted.policy.enforcement_mode, 'metered_unlimited');
     assert.equal(submitted.extension, 'retained');
@@ -40,6 +46,6 @@ test('credential mode remains editable without raw routing arrays or mobile over
     }
     await mode.selectOption('prepaid');
     await page.getByRole('button', { name: 'Create fixture' }).click();
-    await page.waitForFunction(() => JSON.parse(document.querySelector('output')!.textContent!).policy.enforcement_mode === 'prepaid');
+    await page.waitForFunction(() => JSON.parse(document.querySelector('output')!.textContent!).policy.enforcement_mode === 'prepaid', undefined, { timeout: 5_000 });
   } finally { await browser.close(); await server.close(); }
 });
