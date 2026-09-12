@@ -4,6 +4,9 @@ export type Locale = 'zh-CN' | 'en';
 type Variables = Record<string, string | number>;
 
 const zh = {
+  'schema.Connect timeout (ms)': '连接超时（毫秒）',
+  'schema.Read inactivity timeout (ms)': '读取无数据超时（毫秒）',
+  'schema.Total request timeout (ms)': '请求总超时（毫秒）',
   'connection.baseUrl': '上游 API 地址（Base URL）',
   'connection.capabilitiesSection': '可选能力与用量契约',
   'connection.capabilitiesHint': '仅在使用图片、视频或供应商特有的用量协议时配置。收起不会丢失已填写内容；校验失败会自动展开。',
@@ -453,6 +456,9 @@ const zh = {
 } as const;
 
 const en = {
+  'schema.Connect timeout (ms)': 'Connect timeout (ms)',
+  'schema.Read inactivity timeout (ms)': 'Read inactivity timeout (ms)',
+  'schema.Total request timeout (ms)': 'Total request timeout (ms)',
   'connection.baseUrl': 'Upstream API address (Base URL)',
   'connection.capabilitiesSection': 'Optional capabilities and usage contracts',
   'connection.capabilitiesHint': 'Configure only for images, video, or provider-specific usage contracts. Collapsing preserves your values; validation errors reveal the relevant section.',

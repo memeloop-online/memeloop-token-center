@@ -1055,7 +1055,16 @@ pub(super) async fn proxy(
                 tracing::warn!(%request_id, stage = error_code, "Codex upstream response failed");
                 let result = finish_proxy_failure(&buffered_request, error_code).await;
                 upstream_attempt
-                    .complete(UpstreamAttemptTerminal::invalid_response())
+                    .complete(
+                        if matches!(
+                            error_code,
+                            "upstream_read_timeout" | "upstream_request_timeout"
+                        ) {
+                            UpstreamAttemptTerminal::Inconclusive
+                        } else {
+                            UpstreamAttemptTerminal::invalid_response()
+                        },
+                    )
                     .await;
                 codex_retry.complete(CodexRetryTerminal::Failed);
                 return result;

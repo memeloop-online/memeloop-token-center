@@ -642,7 +642,7 @@ pub(super) async fn admit_event_stream_response(
                 "upstream_invalid_content_type",
             ));
         };
-        let chunk = next.map_err(|_| ResponseAdmissionError::Ambiguous("upstream_stream"))?;
+        let chunk = next.map_err(ResponseAdmissionError::Ambiguous)?;
         let mut accepted_at = None;
         for (index, byte) in chunk.iter().enumerate() {
             if inspected.len() == MAX_RESPONSES_SSE_EVENT_BYTES {
@@ -764,7 +764,7 @@ pub(super) async fn buffer_response(
             .await
             .map_err(|_| "upstream_timeout")?;
         let Some(next) = next else { break };
-        let chunk = next.map_err(|_| "upstream_stream")?;
+        let chunk = next?;
         total = total.saturating_add(chunk.len());
         if total > MAX_PROXY_RESPONSE_BODY {
             return Err("upstream_response_too_large");

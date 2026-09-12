@@ -353,8 +353,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             break;
                         }
                     }
-                    Err(_) => {
-                        transport_error = Some("upstream_stream");
+                    Err(error_code) => {
+                        transport_error = Some(error_code);
                         drop(archive_sender.take());
                         let _ = tokio::time::timeout(
                             MAX_DOWNSTREAM_SEND_WAIT,
