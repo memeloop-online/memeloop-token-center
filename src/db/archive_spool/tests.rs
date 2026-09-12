@@ -19,8 +19,12 @@ async fn fixture() -> (tempfile::TempDir, Database, ArchiveSpoolIdentity) {
         tenant_id: Uuid::new_v4(),
         reservation_id: Uuid::new_v4(),
     };
+    let key_id = Uuid::new_v4();
     sqlx::query("INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, input_tokens, output_tokens, cost_micros, request_object, reservation_id) VALUES ($1, $2, $3, 1, 'responses', 'test', 0, 0, 0, 'gap://test/request', $4)")
-        .bind(id.request_id.to_string()).bind(id.tenant_id.to_string()).bind(Uuid::new_v4().to_string()).bind(id.reservation_id.to_string()).execute(&db.pool).await.unwrap();
+        .bind(id.request_id.to_string()).bind(id.tenant_id.to_string()).bind(key_id.to_string()).bind(id.reservation_id.to_string()).execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO request_record_locators (id, created_at, tenant_id, key_id) VALUES ($1, 1, $2, $3)")
+        .bind(id.request_id.to_string()).bind(id.tenant_id.to_string()).bind(key_id.to_string())
+        .execute(&db.pool).await.unwrap();
     (dir, db, id)
 }
 
@@ -29,6 +33,67 @@ async fn budget(db: &Database) -> i64 {
         .fetch_one(&db.pool)
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn terminal_gap_event_is_atomic_idempotent_and_preserves_snapshot_facts() {
+    let (_dir, db, id) = fixture().await;
+    assert!(db.begin_response_archive_spool(id).await.unwrap());
+    terminal(&db, id).await;
+    sqlx::query("UPDATE request_records SET status_code = 503, duration_ms = 9, input_tokens = 45, output_tokens = 67, cost_micros = 123, currency = 'USD', error_code = 'upstream_error' WHERE id = $1")
+        .bind(id.request_id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER abort_archive_gap_event BEFORE INSERT ON request_events WHEN NEW.event_kind = 'archive_gap' BEGIN SELECT RAISE(ABORT, 'fixture event failure'); END",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert!(
+        db.fail_response_archive_spool(id, "upload_failed")
+            .await
+            .is_err()
+    );
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM response_archive_spools WHERE request_id = $1")
+            .bind(id.request_id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "capturing");
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'archive_gap'",
+    )
+    .bind(id.request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(event_count, 0);
+
+    sqlx::query("DROP TRIGGER abort_archive_gap_event")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    db.fail_response_archive_spool(id, "upload_failed")
+        .await
+        .unwrap();
+    db.fail_response_archive_spool(id, "capture_failed")
+        .await
+        .unwrap();
+    let events = db.all_request_events_after(0, None, 10).await.unwrap();
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event.request_id, id.request_id);
+    assert_eq!(event.event_kind, "archive_gap");
+    assert_eq!(event.archive_state, crate::model::RequestArchiveState::Gap);
+    assert_eq!(event.status_code, Some(503));
+    assert_eq!(event.input_tokens, Some(45));
+    assert_eq!(event.output_tokens, Some(67));
+    assert_eq!(event.billing.cost.as_deref(), Some("0.000123"));
+    assert_eq!(event.billing.currency.as_deref(), Some("USD"));
+    assert_eq!(event.error_code.as_deref(), Some("upstream_error"));
 }
 
 async fn terminal(db: &Database, id: ArchiveSpoolIdentity) {
@@ -458,6 +523,19 @@ async fn binding_is_atomic_with_staging_and_preserves_terminal_facts() {
             .await
             .unwrap()
     );
+    let events = db.all_request_events_after(0, None, 10).await.unwrap();
+    let bound_events = events
+        .iter()
+        .filter(|event| event.event_kind == "archive_bound")
+        .collect::<Vec<_>>();
+    assert_eq!(bound_events.len(), 1);
+    assert_eq!(
+        bound_events[0].archive_state,
+        crate::model::RequestArchiveState::Bound
+    );
+    assert_eq!(bound_events[0].input_tokens, Some(45));
+    assert_eq!(bound_events[0].output_tokens, Some(67));
+    assert_eq!(bound_events[0].billing.cost.as_deref(), Some("0.000123"));
     // Simulate lost completion ACK and worker error handling: neither retry
     // nor producer failure may release the bound object or change its locator.
     db.retry_response_archive_spool(&task, "upload_failed")
@@ -466,6 +544,14 @@ async fn binding_is_atomic_with_staging_and_preserves_terminal_facts() {
     db.fail_response_archive_spool(id, "capture_failed")
         .await
         .unwrap();
+    let bound_event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'archive_bound'",
+    )
+    .bind(id.request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(bound_event_count, 1);
     let row = sqlx::query("SELECT response_object, status_code, cost_micros, input_tokens, output_tokens, completed_at FROM request_records WHERE id = $1")
         .bind(id.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
     assert_eq!(row.get::<String, _>("response_object"), locator);

@@ -7019,7 +7019,7 @@ components:
       oneOf:
         - { type: object, additionalProperties: false, required: [type, value], properties: { type: { const: text }, value: { type: string, minLength: 1, maxLength: 200 } } }
         - { type: object, additionalProperties: false, required: [type, value], properties: { type: { const: model }, value: { type: string, minLength: 1, maxLength: 200 } } }
-        - { type: object, additionalProperties: false, required: [type, value], properties: { type: { const: protocol }, value: { type: string, minLength: 1, maxLength: 128, description: Exact historical protocol value. } } }
+        - { type: object, additionalProperties: false, required: [type, value], properties: { type: { const: protocol }, value: { type: string, minLength: 1, maxLength: 200, description: Exact historical protocol value. } } }
         - { type: object, additionalProperties: false, required: [type, value], properties: { type: { const: status }, value: { type: string, enum: [success, error, pending] } } }
         - { type: object, additionalProperties: false, required: [type, value], properties: { type: { const: uuid }, value: { type: string, format: uuid } } }
         - { type: object, additionalProperties: false, required: [type, value], properties: { type: { const: integer }, value: { type: integer, format: int64 } } }
@@ -7175,7 +7175,7 @@ components:
             event_at: { type: integer, format: int64 }
             event_kind:
               type: string
-              enum: [started, finished, archive_bound, archive_gap]
+              enum: [started, finished, projected, archive_bound, archive_gap]
             key_id: { type: string, format: uuid }
     RequestProvenance:
       type: object

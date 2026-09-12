@@ -211,13 +211,16 @@ async fn request_projection_preserves_source_truth_scope_and_cross_source_cursor
 
     let archive_id = Uuid::now_v7();
     let archive_completed_at = now - 15;
-    sqlx::query("INSERT INTO session_archive_correlations (tenant_id, source, external_request_id, disposition, key_id, principal_id, record_digest, proof_digest, identity_proof_kind, identity_proof_digest, source_model, source_started_at, correlated_at) VALUES ($1, 'fixture', $2, 'unlinked', $3, $4, 'record', 'proof', 'credential', 'identity', 'projection-archive', $5, $6)")
+    sqlx::query("INSERT INTO session_archive_correlations (tenant_id, source, external_request_id, disposition, key_id, principal_id, record_digest, proof_digest, identity_proof_kind, identity_proof_digest, source_model, source_started_at, correlated_at) VALUES ($1, 'fixture', $2, 'unlinked', $3, $4, $7, $8, 'credential', $9, 'projection-archive', $5, $6)")
         .bind(key.tenant_id.to_string())
         .bind(archive_id.to_string())
         .bind(key.key_id.to_string())
         .bind(key.principal_id.to_string())
         .bind(now - 20)
         .bind(now)
+        .bind("a".repeat(64))
+        .bind("b".repeat(64))
+        .bind("c".repeat(64))
         .execute(&inspection)
         .await
         .unwrap();
@@ -272,6 +275,7 @@ async fn request_projection_preserves_source_truth_scope_and_cross_source_cursor
         .iter()
         .find(|row| row.request_id == archive_id)
         .unwrap();
+    assert!(archived.completed_at.is_none());
     assert_eq!(archived.source_completed_at, Some(archive_completed_at));
     assert!(archived.input_tokens.is_none());
     assert!(archived.output_tokens.is_none());
@@ -366,6 +370,18 @@ async fn request_projection_preserves_source_truth_scope_and_cross_source_cursor
     assert_eq!(status, StatusCode::OK);
     assert_eq!(historical.as_array().unwrap().len(), 1);
     assert_eq!(historical[0]["request_id"], archive_id.to_string());
+    let (status, archive_detail) = get_json(
+        &state,
+        &format!("/internal/v1/requests/{archive_id}"),
+        &service.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(archive_detail["completed_at"].is_null());
+    assert_eq!(archive_detail["source_completed_at"], archive_completed_at);
+    assert_eq!(archive_detail["archive"]["request"]["complete"], true);
+    assert_eq!(archive_detail["archive"]["response"]["complete"], true);
+    assert_eq!(archive_detail["billing"]["billable"], false);
 
     let (status, first_page) = get_json(
         &state,
