@@ -21,12 +21,12 @@ request, account, key, model and currency.
 - The response contains no prompt, response body, archive locator, reservation
   ID, upstream credential or customer contact information. Responses are
   `Cache-Control: no-store`.
-- This feed covers prepaid terminal snapshots published after migration 80.
+- This feed covers prepaid terminal snapshots published after migration 81.
   It does not bulk-backfill historical terminal traffic or include the separate
   metered-unlimited projection. Cloud should enable this on fresh prepaid
   accounts, or explicitly establish a cutover. A successful replay of an older
   terminal request can publish its snapshot at a new sequence.
-- Deploy all gateway/control/worker binaries with migration 80 before enabling
+- Deploy all gateway/control/worker binaries with migration 81 before enabling
   the Cloud consumer. An old writer does not publish feed rows; mixed versions
   are not a supported reconciliation cutover.
 

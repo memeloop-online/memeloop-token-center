@@ -427,9 +427,9 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         ),
     },
     Migration {
-        version: 80,
+        version: 81,
         name: "immutable account settlement feed",
-        sql: include_str!("../../../migrations/common/0080_account_settlement_feed.sql"),
+        sql: include_str!("../../../migrations/common/0081_account_settlement_feed.sql"),
     },
 ];
 
@@ -844,9 +844,9 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         ),
     },
     Migration {
-        version: 80,
+        version: 81,
         name: "immutable account settlement feed",
-        sql: include_str!("../../../migrations/common/0080_account_settlement_feed.sql"),
+        sql: include_str!("../../../migrations/common/0081_account_settlement_feed.sql"),
     },
 ];
 
