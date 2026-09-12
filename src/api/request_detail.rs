@@ -46,12 +46,12 @@ pub(super) async fn request_detail(
             request: crate::model::RequestArchiveSideView {
                 state: refs.request_archive_state,
                 complete: request.complete,
-                reason: request.reason.or(refs.request_archive_reason),
+                reason: refs.request_archive_reason.or(request.reason),
             },
             response: crate::model::RequestArchiveSideView {
                 state: refs.response_archive_state,
                 complete: response.complete,
-                reason: response.reason.or(refs.response_archive_reason),
+                reason: refs.response_archive_reason.or(response.reason),
             },
         },
         provenance: refs.provenance,
