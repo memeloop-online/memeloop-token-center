@@ -4,7 +4,7 @@ import { CopyButton } from '../../CopyButton.js';
 import { useI18n } from '../../i18n';
 import { ModelPicker } from '../../ModelPicker';
 import type { FilterAssistantSettings, GroupView, ModelRouteView, UpstreamAccount } from '../../types';
-import { routeModelOptions } from '../modelCatalog';
+import { filterAssistantRoutes, routeModelOptions } from '../modelCatalog';
 import { messageOf, queryForTenant } from '../scope/operatorShared';
 
 export interface OperatorAccessSettingsProps {
@@ -76,7 +76,7 @@ export function SystemSettingsPage({ token, tenant }: { token: string; tenant: s
         api<GroupView[]>(`/internal/v1/provider-groups${queryForTenant(tenant)}`, token),
       ]);
       if (request !== loadSequence.current) return;
-      const enabled = nextRoutes.filter((route) => route.enabled);
+      const enabled = filterAssistantRoutes(nextRoutes);
       setRoutes(enabled); setSettings(nextSettings); setSelectedRouteId(nextSettings?.model_route_id ?? '');
       setUpstreams(nextUpstreams); setGroups(nextGroups);
     } catch (reason) {
@@ -126,7 +126,7 @@ export function SystemSettingsPage({ token, tenant }: { token: string; tenant: s
           {settings && <span className="status ok">{t('settings.configured')}</span>}
         </div>
         {loading ? <div className="empty" role="status">{t('common.loading')}</div> : loadError ? <div className="settings-empty" role="alert"><b>{t('settings.filterAssistantLoadFailed')}</b><span>{loadError}</span><button type="button" className="secondary" onClick={() => void load()}>{t('common.retry')}</button></div> : routes.length === 0 ? <div className="settings-empty"><b>{t('settings.noEnabledRoute')}</b><span>{t('settings.noEnabledRouteHint')}</span></div> : <form className="system-settings-form" onSubmit={(event) => { event.preventDefault(); void save(); }}>
-          <div><ModelPicker label={t('settings.filterAssistantRoute')} popupLabel={t('settings.filterAssistantRoute')} value={selectedRouteId} onChange={setSelectedRouteId} disabled={saving} options={assistantOptions} describedBy="filter-assistant-route-hint" /><small id="filter-assistant-route-hint">{t('settings.filterAssistantRouteHint')}</small>{selectedRouteId && !selectedRouteHasAvailableCandidate && <small className="error-text" role="alert">{t('settings.filterAssistantRouteUnavailable')}</small>}</div>
+          <div><ModelPicker label={t('settings.filterAssistantRoute')} popupLabel={t('settings.filterAssistantRoute')} value={selectedRouteId} onChange={setSelectedRouteId} disabled={saving} options={assistantOptions} describedBy="filter-assistant-route-hint" /><small id="filter-assistant-route-hint">{t('settings.assistantTextHint')}</small>{selectedRouteId && !selectedRouteHasAvailableCandidate && <small className="error-text" role="alert">{t('settings.assistantTextUnavailable')}</small>}</div>
           <button type="submit" disabled={saving || !selectedRouteId || !selectedRouteHasAvailableCandidate}>{saving ? t('common.loading') : t('common.save')}</button>
         </form>}
         {settings === null && !loadError && <p className="settings-status-note">{t('settings.filterAssistantNotConfigured')}</p>}

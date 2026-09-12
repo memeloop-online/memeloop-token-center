@@ -1,8 +1,15 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import { routeModelOptions } from '../src/operator/modelCatalog.js';
+import { filterAssistantRoutes, routeModelOptions } from '../src/operator/modelCatalog.js';
 import type { GroupView, ModelRouteView, UpstreamAccount } from '../src/types.js';
+
+test('assistant selects enabled conversational transports without guessing from model names', () => {
+  const routes = ['openai', 'anthropic', 'openai-image', 'generation', 'embedding', 'future-unknown'].map((protocol) => ({ id: protocol, protocol, enabled: true, public_model: 'same-model-name' } as ModelRouteView));
+  routes.push({ ...routes[0], id: 'disabled', enabled: false });
+  assert.deepEqual(filterAssistantRoutes(routes).map((route) => route.id), ['openai', 'anthropic']);
+  assert.equal(routes.length, 7, 'traffic catalogs keep the original non-text routes');
+});
 
 test('model hierarchy uses actual account membership, excludes removed accounts, and preserves route/public IDs', () => {
   const route = { id: 'route-1', public_model: 'not-a-provider/model', upstream_model: 'native-model', protocol: 'openai', included_provider_group_ids: ['group-1'], excluded_provider_group_ids: ['group-2'] } as ModelRouteView;
@@ -43,7 +50,7 @@ test('filter-assistant choice exposes configuration availability without probing
   const settings = await readFile(new URL('../src/operator/pages/SystemSettingsPage.tsx', import.meta.url), 'utf8');
   const catalog = await readFile(new URL('../src/operator/modelCatalog.ts', import.meta.url), 'utf8');
   assert.match(settings, /selectedRouteHasAvailableCandidate/);
-  assert.match(settings, /filterAssistantRouteUnavailable/);
+  assert.match(settings, /assistantTextUnavailable/);
   assert.match(settings, /describedBy="filter-assistant-route-hint"/);
   assert.match(catalog, /credentialExpiresAt|credential_expires_at/);
   assert.match(catalog, /health: 'unknown'/);

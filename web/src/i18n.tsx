@@ -4,6 +4,8 @@ export type Locale = 'zh-CN' | 'en';
 type Variables = Record<string, string | number>;
 
 const zh = {
+  'settings.assistantTextHint': '仅展示支持文本对话的模型路由。按提供商组、提供商和账号浏览或搜索；选择模型不会发起上游探测。',
+  'settings.assistantTextUnavailable': '当前路由不支持文本对话或没有可用账号，请选择其他模型。',
   'connection.baseUrl': '上游 API 地址（Base URL）',
   'connection.capabilitiesSection': '可选能力与用量契约',
   'connection.capabilitiesHint': '仅在使用图片、视频或供应商特有的用量协议时配置。收起不会丢失已填写内容；校验失败会自动展开。',
@@ -222,6 +224,8 @@ const zh = {
   'quota.limitReached': '已达额度上限', 'quota.notAllowed': '此窗口不允许请求',
   'quota.resetCreditsUnavailable': '重置次数暂不可用。',
   'quota.resetAvailable': '重置需二次确认，将消耗上游重置次数。',
+  'quota.resetDiscoveryPending': '尚未读取额度，重置能力未确认。请先点击“查看额度”；展开此处不会读取或重置额度。',
+  'quota.resetDiscoveryFailed': '额度读取失败，暂时无法确认重置能力。请检查账号连接后手动重试“查看额度”；没有执行任何重置。',
   'quota.resetAction': '重置上游额度',
   'quota.resetConfirm': '账号：{{account}}（{{id}}）。此操作将消耗 1 次上游重置额度；受影响窗口由供应商决定（supplier_defined），并非清除本地冷却。确认有效期至 {{expiry}}。取消不会消耗次数。是否继续？',
   'quota.resetOperationError': '操作结果尚未确认。请检查已有操作状态，不要重复发起。',
@@ -453,6 +457,8 @@ const zh = {
 } as const;
 
 const en = {
+  'settings.assistantTextHint': 'Only conversational model routes are shown. Browse or search by provider group, provider and account. Choosing a model never probes an upstream.',
+  'settings.assistantTextUnavailable': 'This route cannot generate conversational text or has no available account. Choose another model.',
   'connection.baseUrl': 'Upstream API address (Base URL)',
   'connection.capabilitiesSection': 'Optional capabilities and usage contracts',
   'connection.capabilitiesHint': 'Configure only for images, video, or provider-specific usage contracts. Collapsing preserves your values; validation errors reveal the relevant section.',
@@ -667,6 +673,8 @@ const en = {
   'quota.limitReached': 'Quota limit reached', 'quota.notAllowed': 'Requests not allowed in this window',
   'quota.resetCreditsUnavailable': 'Reset credit details are currently unavailable.',
   'quota.resetAvailable': 'Reset requires confirmation and consumes an upstream reset credit.',
+  'quota.resetDiscoveryPending': 'Quota has not been read, so reset support is unknown. Select View quota first. Opening this section does not read or reset quota.',
+  'quota.resetDiscoveryFailed': 'Quota could not be read, so reset support remains unknown. Check the account connection, then retry View quota manually. No reset was performed.',
   'quota.resetAction': 'Reset upstream quota',
   'quota.resetConfirm': 'Account: {{account}} ({{id}}). This consumes 1 upstream reset credit. Affected windows are supplier-defined (supplier_defined); this is not a local cooldown clear. Confirmation expires {{expiry}}. Cancelling consumes no credits. Continue?',
   'quota.resetOperationError': 'The operation result is not confirmed. Check the existing operation; do not start another reset.',

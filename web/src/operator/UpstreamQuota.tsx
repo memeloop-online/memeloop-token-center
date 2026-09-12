@@ -50,6 +50,28 @@ export function UpstreamQuotaDetails({ snapshot }: { snapshot: UpstreamQuotaSnap
   </div>;
 }
 
+/** Capability discovery must remain visible even when the first read fails.
+ * An absent snapshot is unknown, never evidence that a supplier supports reset.
+ * Expanding this disclosure performs no network or quota operation.
+ */
+export function UpstreamQuotaResetSection({ accountId, accountName, tenant, token, snapshot, readFailed = false }: {
+  accountId: string; accountName: string; tenant: string; token: string;
+  snapshot?: UpstreamQuotaSnapshot; readFailed?: boolean;
+}) {
+  const { t } = useI18n();
+  const capability = snapshot?.reset_capability;
+  if (capability && (capability.provider_supported !== true || !capability.implementation_available)) return null;
+  return <details className="upstream-danger-zone">
+    <summary>{t('quota.resetAction')}</summary>
+    <p>{t('quota.resetWarning')}</p>
+    {snapshot ? <UpstreamQuotaReset accountId={accountId} accountName={accountName} tenant={tenant} token={token} snapshot={snapshot} /> : <>
+      <b>{t('quota.resetCapability')}</b>
+      <p role="status">{t(readFailed ? 'quota.resetDiscoveryFailed' : 'quota.resetDiscoveryPending')}</p>
+      <button type="button" className="danger" disabled>{t('quota.resetAction')}</button>
+    </>}
+  </details>;
+}
+
 /** User-triggered read: never starts one upstream request per card on page load. */
 export function UpstreamQuota({ accountId, accountName = accountId, tenant, token }: { accountId: string; accountName?: string; tenant: string; token: string }) {
   const { t } = useI18n();
@@ -87,6 +109,6 @@ export function UpstreamQuota({ accountId, accountName = accountId, tenant, toke
     {!snapshot && busy && <div className="upstream-quota-loading" role="status"><span>{t('common.loading')}</span><div className="upstream-quota-skeleton" aria-hidden="true"><i /><i /></div></div>}
     {!snapshot && !busy && !error && <p>{t(tenant ? 'quota.notLoaded' : 'quota.selectTenant')}</p>}
     {snapshot && <UpstreamQuotaDetails snapshot={snapshot} />}
-    {snapshot && snapshot.reset_capability.provider_supported === true && snapshot.reset_capability.implementation_available && <details className="upstream-danger-zone"><summary>{t('quota.resetAction')}</summary><p>{t('quota.resetWarning')}</p><UpstreamQuotaReset key={scope} accountId={accountId} accountName={accountName} tenant={tenant} token={token} snapshot={snapshot} /></details>}
+    <UpstreamQuotaResetSection key={scope} accountId={accountId} accountName={accountName} tenant={tenant} token={token} snapshot={snapshot} readFailed={error} />
   </section>;
 }

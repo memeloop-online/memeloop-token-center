@@ -1,5 +1,13 @@
 import type { GroupView, ModelRouteView, UpstreamAccount } from '../types.js';
 
+/** Only conversational transports can produce the assistant's text output.
+ * Keep this separate from traffic filtering, which must retain every protocol.
+ * Unknown transports need an explicit capability contract before opting in.
+ */
+export function filterAssistantRoutes(routes: ModelRouteView[]): ModelRouteView[] {
+  return routes.filter((route) => route.enabled && (route.protocol === 'openai' || route.protocol === 'anthropic'));
+}
+
 export interface RouteModelOption {
   key: string; value: string; label: string; providerGroup?: string; provider: string; upstream: string; description: string;
   availability: 'available' | 'unavailable' | 'unknown';
