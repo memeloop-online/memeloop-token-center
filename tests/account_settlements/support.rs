@@ -1,4 +1,4 @@
-use super::helpers::{create_text_settlement, service_token};
+use super::helpers::{create_text_settlement, create_text_settlement_with_id, service_token};
 use memeloop_token_center::{
     AppState,
     config::Config,
@@ -119,13 +119,15 @@ impl Fixture {
             )
             .await
             .expect("store text price");
-        let text_request_id = create_text_settlement(
+        let text_request_id = Uuid::now_v7();
+        create_text_settlement_with_id(
             &state,
             &target,
             &text_price,
             &text_model,
             "target-request-body-sentinel",
             "target-response-body-sentinel",
+            text_request_id,
         )
         .await;
         let other_text_request_id = create_text_settlement(
@@ -156,7 +158,7 @@ impl Fixture {
             .reserve_usage(&target, &generation_reservation_price, 0, 1)
             .await
             .expect("reserve generation usage");
-        let generation_request_id = Uuid::now_v7();
+        let generation_request_id = text_request_id;
         state
             .db
             .create_generation_job(CreateGenerationJobInput {

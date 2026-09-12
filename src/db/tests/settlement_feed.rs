@@ -319,7 +319,12 @@ async fn settlement_feed_publishes_after_split_settlement_and_late_completion() 
     assert_eq!(account_sequence(&fixture).await, 1);
     let published = fixture
         .database
-        .list_account_settlements(fixture.account_id, 1, None, Some(request_id))
+        .list_account_settlements(
+            fixture.account_id,
+            1,
+            None,
+            Some((AccountSettlementKind::Text, request_id)),
+        )
         .await
         .unwrap();
     assert_eq!(published.items.len(), 1);

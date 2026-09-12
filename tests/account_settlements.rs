@@ -92,13 +92,16 @@ async fn sqlite_account_settlement_feed_is_scoped_paged_and_exact() {
     assert!(second["next_cursor"].is_null());
     assert_sanitized(&second);
 
-    for (request_id, expected_kind) in [
-        (fixture.text_request_id, "text"),
-        (fixture.generation_request_id, "generation"),
+    // Text requests and generation jobs use separate stores, so their UUIDs can
+    // overlap. Exact lookups must retain the kind discriminator.
+    assert_eq!(fixture.text_request_id, fixture.generation_request_id);
+    for (request_kind, request_id) in [
+        ("text", fixture.text_request_id),
+        ("generation", fixture.generation_request_id),
     ] {
         let (status, headers, exact) = get_json(
             &fixture.state,
-            &format!("{target_path}?request_id={request_id}"),
+            &format!("{target_path}?request_kind={request_kind}&request_id={request_id}"),
             &fixture.target_token,
         )
         .await;
@@ -111,14 +114,17 @@ async fn sqlite_account_settlement_feed_is_scoped_paged_and_exact() {
         );
         assert_eq!(exact["items"].as_array().unwrap().len(), 1);
         assert_eq!(exact["items"][0]["request_id"], request_id.to_string());
-        assert_eq!(exact["items"][0]["kind"], expected_kind);
+        assert_eq!(exact["items"][0]["kind"], request_kind);
         assert!(exact["next_cursor"].is_null());
         assert_sanitized(&exact);
     }
 
     let (status, _, cross_account_exact) = get_json(
         &fixture.state,
-        &format!("{target_path}?request_id={}", fixture.other_text_request_id),
+        &format!(
+            "{target_path}?request_kind=text&request_id={}",
+            fixture.other_text_request_id
+        ),
         &fixture.target_token,
     )
     .await;
@@ -153,9 +159,11 @@ async fn sqlite_account_settlement_feed_is_scoped_paged_and_exact() {
         format!("{target_path}?after_id={after_id}"),
         format!("{target_path}?after_sequence=-1&after_id={after_id}"),
         format!(
-            "{target_path}?request_id={}&after_sequence=0&after_id={after_id}",
+            "{target_path}?request_kind=text&request_id={}&after_sequence=0&after_id={after_id}",
             fixture.text_request_id
         ),
+        format!("{target_path}?request_id={}", fixture.text_request_id),
+        format!("{target_path}?request_kind=text"),
     ];
     for path in invalid_paths {
         let (status, _, body) = get_json(&fixture.state, &path, &fixture.target_token).await;

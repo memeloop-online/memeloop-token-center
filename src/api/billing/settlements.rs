@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::model::AccountSettlementKind;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -7,6 +8,7 @@ pub(in crate::api) struct SettlementQuery {
     limit: i64,
     after_sequence: Option<i64>,
     after_id: Option<Uuid>,
+    request_kind: Option<AccountSettlementKind>,
     request_id: Option<Uuid>,
 }
 
@@ -30,9 +32,18 @@ pub(in crate::api) async fn list_account_settlements(
             "limit must be between 1 and 500".into(),
         ));
     }
-    if query.request_id.is_some() && (query.after_sequence.is_some() || query.after_id.is_some()) {
+    let exact = match (query.request_kind, query.request_id) {
+        (Some(kind), Some(id)) => Some((kind, id)),
+        (None, None) => None,
+        _ => {
+            return Err(AppError::BadRequest(
+                "request_kind and request_id must be supplied together".into(),
+            ));
+        }
+    };
+    if exact.is_some() && (query.after_sequence.is_some() || query.after_id.is_some()) {
         return Err(AppError::BadRequest(
-            "request_id cannot be combined with an after cursor".into(),
+            "exact settlement lookup cannot be combined with an after cursor".into(),
         ));
     }
     let after = match (query.after_sequence, query.after_id) {
@@ -51,7 +62,7 @@ pub(in crate::api) async fn list_account_settlements(
     };
     let page = state
         .db
-        .list_account_settlements(account_id, query.limit, after, query.request_id)
+        .list_account_settlements(account_id, query.limit, after, exact)
         .await?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(page)))
 }

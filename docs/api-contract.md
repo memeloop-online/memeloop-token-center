@@ -221,8 +221,10 @@ replay keeps the original snapshot. A split settle/finish repair publishes only
 when the terminal snapshot is complete. Read pages using the final item's paired
 `after_sequence` and `after_id`; the pair must identify an existing account row.
 `next_cursor` is null when the current page has no further rows; polling consumers
-retain the final item's cursor for their next poll. An exact `request_id` lookup
-is mutually exclusive with cursor parameters. Unknown parameters are rejected.
+retain the final item's cursor for their next poll. An exact lookup must pair
+`request_kind` (`text` or `generation`) with `request_id`; UUIDs are not globally
+unique across those request stores. The exact pair is mutually exclusive with
+cursor parameters. Unknown parameters are rejected.
 
 ## History and conversations
 

@@ -6,9 +6,9 @@ impl Database {
         account_id: Uuid,
         limit: i64,
         after: Option<(i64, Uuid)>,
-        request_id: Option<Uuid>,
+        exact: Option<(AccountSettlementKind, Uuid)>,
     ) -> Result<AccountSettlementPage, AppError> {
-        if !(1..=500).contains(&limit) || (request_id.is_some() && after.is_some()) {
+        if !(1..=500).contains(&limit) || (exact.is_some() && after.is_some()) {
             return Err(AppError::BadRequest("invalid settlement query".into()));
         }
         if let Some((sequence, id)) = after {
@@ -30,30 +30,33 @@ impl Database {
         let (after_sequence, after_id) = after
             .map(|(sequence, id)| (sequence, id.to_string()))
             .unwrap_or_else(|| (-1, "00000000-0000-0000-0000-000000000000".to_owned()));
-        let exact_request_id = request_id.map(|id| id.to_string()).unwrap_or_default();
-        let fetch_limit = if request_id.is_some() {
+        let (exact_kind, exact_request_id) = exact
+            .map(|(kind, id)| (settlement_kind_name(kind), id.to_string()))
+            .unwrap_or(("", String::new()));
+        let fetch_limit = if exact.is_some() {
             2
         } else {
-            limit.clamp(1, 500).saturating_add(1)
+            limit.saturating_add(1)
         };
         let rows = sqlx::query(
-            "SELECT settlement_id, settlement_sequence, request_id, request_kind, account_id, key_id, model, cost_micros, currency, settled_at, completed_at, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens FROM account_settlement_feed WHERE account_id = $1 AND (settlement_sequence > $2 OR (settlement_sequence = $2 AND settlement_id > $3)) AND ($4 = '' OR request_id = $4) ORDER BY settlement_sequence ASC, settlement_id ASC LIMIT $5",
+            "SELECT settlement_id, settlement_sequence, request_id, request_kind, account_id, key_id, model, cost_micros, currency, settled_at, completed_at, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens FROM account_settlement_feed WHERE account_id = $1 AND (settlement_sequence > $2 OR (settlement_sequence = $2 AND settlement_id > $3)) AND ($4 = '' OR (request_kind = $4 AND request_id = $5)) ORDER BY settlement_sequence ASC, settlement_id ASC LIMIT $6",
         )
         .bind(account_id.to_string())
         .bind(after_sequence)
         .bind(after_id)
+        .bind(exact_kind)
         .bind(exact_request_id)
         .bind(fetch_limit)
         .fetch_all(&self.pool)
         .await?;
-        if request_id.is_some() && rows.len() > 1 {
+        if exact.is_some() && rows.len() > 1 {
             return Err(AppError::Internal);
         }
         let mut items = rows
             .iter()
             .map(account_settlement_from_row)
             .collect::<Result<Vec<_>, _>>()?;
-        let has_more = request_id.is_none() && items.len() > limit as usize;
+        let has_more = exact.is_none() && items.len() > limit as usize;
         if has_more {
             items.truncate(limit as usize);
         }
@@ -65,6 +68,13 @@ impl Database {
             }
         });
         Ok(AccountSettlementPage { items, next_cursor })
+    }
+}
+
+fn settlement_kind_name(kind: AccountSettlementKind) -> &'static str {
+    match kind {
+        AccountSettlementKind::Text => "text",
+        AccountSettlementKind::Generation => "generation",
     }
 }
 

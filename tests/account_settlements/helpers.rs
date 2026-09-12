@@ -41,12 +41,32 @@ pub(super) async fn create_text_settlement(
     request_object: &str,
     response_object: &str,
 ) -> Uuid {
+    create_text_settlement_with_id(
+        state,
+        key,
+        price,
+        model,
+        request_object,
+        response_object,
+        Uuid::now_v7(),
+    )
+    .await
+}
+
+pub(super) async fn create_text_settlement_with_id(
+    state: &AppState,
+    key: &AuthenticatedKey,
+    price: &ModelPrice,
+    model: &str,
+    request_object: &str,
+    response_object: &str,
+    request_id: Uuid,
+) -> Uuid {
     let reservation = state
         .db
         .reserve_usage(key, price, 2, 1)
         .await
         .expect("reserve text usage");
-    let request_id = Uuid::now_v7();
     state
         .db
         .record_request_started(NewRequest {

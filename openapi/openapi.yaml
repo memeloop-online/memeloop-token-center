@@ -2939,8 +2939,9 @@ paths:
         Requires both `credits:read` and `requests:read`. Results are ordered by the
         immutable account-local `(settlement_sequence, settlement_id)` ascending key.
         Use the final row's `settlement_sequence` and `settlement_id` as the paired,
-        exclusive `after_sequence` and `after_id` cursor. `request_id` selects its
-        single settlement and cannot be combined with either cursor parameter. Every
+        exclusive `after_sequence` and `after_id` cursor. The paired `request_kind`
+        and `request_id` select one settlement and cannot be combined with either
+        cursor parameter. Every
         page remains bound to the path account, and a tenant-scoped service credential
         may inspect only an account in its own tenant. The cursor pair must identify
         an existing settlement in that account. Unknown query parameters are rejected.
@@ -2956,6 +2957,7 @@ paths:
         - $ref: '#/components/parameters/SettlementListLimit500'
         - $ref: '#/components/parameters/AfterSettlementSequence'
         - $ref: '#/components/parameters/AfterSettlementId'
+        - $ref: '#/components/parameters/SettlementRequestKind'
         - $ref: '#/components/parameters/SettlementRequestId'
       responses:
         '200':
@@ -4712,8 +4714,14 @@ components:
       name: request_id
       in: query
       required: false
-      description: Restrict the account settlement list to this request or generation UUID. Cannot be combined with `after_sequence` or `after_id`.
+      description: Request or generation UUID for an exact settlement lookup. Must be paired with `request_kind`; the pair cannot be combined with `after_sequence` or `after_id`.
       schema: { type: string, format: uuid }
+    SettlementRequestKind:
+      name: request_kind
+      in: query
+      required: false
+      description: Request type for an exact settlement lookup. Must be paired with `request_id`; the pair cannot be combined with `after_sequence` or `after_id`.
+      schema: { $ref: '#/components/schemas/AccountSettlementKind' }
     RequestPageEnvelope:
       name: paged
       in: query

@@ -125,10 +125,11 @@ test("account settlements require both scopes and expose an immutable sequence c
   assert.deepEqual(operation.security, [{ serviceBearer: [] }]);
   assert.equal(operation["x-required-scope"], "credits:read");
   assert.deepEqual(operation["x-required-scopes"], ["credits:read", "requests:read"]);
-  assert.deepEqual(operation.parameters.map((parameter: Obj) => parameter.$ref), ["#/components/parameters/AccountId", "#/components/parameters/SettlementListLimit500", "#/components/parameters/AfterSettlementSequence", "#/components/parameters/AfterSettlementId", "#/components/parameters/SettlementRequestId"]);
+  assert.deepEqual(operation.parameters.map((parameter: Obj) => parameter.$ref), ["#/components/parameters/AccountId", "#/components/parameters/SettlementListLimit500", "#/components/parameters/AfterSettlementSequence", "#/components/parameters/AfterSettlementId", "#/components/parameters/SettlementRequestKind", "#/components/parameters/SettlementRequestId"]);
   assert.deepEqual(document.components.parameters.SettlementListLimit500.schema, { type: "integer", format: "int64", minimum: 1, maximum: 500, default: 100 });
   assert.deepEqual(document.components.parameters.AfterSettlementSequence.schema, { type: "integer", format: "int64", minimum: 1 });
   assert.deepEqual(document.components.parameters.AfterSettlementId.schema, { type: "string", format: "uuid" });
+  assert.deepEqual(document.components.parameters.SettlementRequestKind.schema, { $ref: "#/components/schemas/AccountSettlementKind" });
   assert.deepEqual(document.components.parameters.SettlementRequestId.schema, { type: "string", format: "uuid" });
   assert.equal(operation.responses["200"].headers["Cache-Control"].schema.const, "no-store");
   assert.equal(operation.responses["200"].content["application/json"].schema.$ref, "#/components/schemas/AccountSettlementPage");
