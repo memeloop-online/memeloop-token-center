@@ -20,7 +20,7 @@ async fn fixture() -> (tempfile::TempDir, Database, ArchiveSpoolIdentity) {
         reservation_id: Uuid::new_v4(),
     };
     let key_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, input_tokens, output_tokens, cost_micros, request_object, reservation_id) VALUES ($1, $2, $3, 1, 'responses', 'test', 0, 0, 0, 'gap://test/request', $4)")
+    sqlx::query("INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, input_tokens, output_tokens, cost_micros, request_object, reservation_id) VALUES ($1, $2, $3, 1, 'responses', 'test', 0, 0, 0, 'inline-json:{}', $4)")
         .bind(id.request_id.to_string()).bind(id.tenant_id.to_string()).bind(key_id.to_string()).bind(id.reservation_id.to_string()).execute(&db.pool).await.unwrap();
     sqlx::query("INSERT INTO request_record_locators (id, created_at, tenant_id, key_id) VALUES ($1, 1, $2, $3)")
         .bind(id.request_id.to_string()).bind(id.tenant_id.to_string()).bind(key_id.to_string())

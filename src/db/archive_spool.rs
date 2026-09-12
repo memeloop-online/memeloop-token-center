@@ -618,7 +618,7 @@ async fn emit_response_archive_transition_event_in_transaction(
     debug_assert!(matches!(event_kind, "archive_bound" | "archive_gap"));
     let request_id = request_id.to_string();
     let owner = sqlx::query(
-        "SELECT r.tenant_id, r.key_id FROM request_records r JOIN response_archive_spools s ON s.request_id = r.id AND s.tenant_id = r.tenant_id AND s.reservation_id = r.reservation_id WHERE r.id = $1",
+        "SELECT r.tenant_id, locator.key_id FROM request_records r JOIN request_record_locators locator ON locator.id = r.id AND locator.tenant_id = r.tenant_id JOIN response_archive_spools s ON s.request_id = r.id AND s.tenant_id = r.tenant_id AND s.reservation_id = r.reservation_id WHERE r.id = $1",
     )
     .bind(&request_id)
     .fetch_optional(&mut **tx)
