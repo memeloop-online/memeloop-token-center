@@ -907,7 +907,7 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
             let raw_output_tokens: i64 = row.try_get("output_tokens")?;
             let cost_micros: i64 = row.try_get("cost_micros")?;
             let completed_at = row.try_get("completed_at")?;
-            let (usage, billing, currency) = request_detail_accounting_projection(
+            let (usage, billing, currency) = super::request_detail_accounting_projection(
                 billable,
                 completed_at,
                 [

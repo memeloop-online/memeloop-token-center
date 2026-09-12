@@ -902,18 +902,19 @@ impl Database {
                 let raw_output_tokens: i64 = row.try_get("output_tokens")?;
                 let cost_micros: i64 = row.try_get("cost_micros")?;
                 let completed_at = row.try_get("completed_at")?;
-                let (usage, billing, currency) = request_detail_accounting_projection(
-                    billable,
-                    completed_at,
-                    [
-                        raw_input_tokens,
-                        raw_cached_input_tokens,
-                        raw_cache_write_tokens,
-                        raw_output_tokens,
-                    ],
-                    cost_micros,
-                    row.try_get("currency")?,
-                );
+                let (usage, billing, currency) =
+                    super::requests::request_detail_accounting_projection(
+                        billable,
+                        completed_at,
+                        [
+                            raw_input_tokens,
+                            raw_cached_input_tokens,
+                            raw_cache_write_tokens,
+                            raw_output_tokens,
+                        ],
+                        cost_micros,
+                        row.try_get("currency")?,
+                    );
                 Ok(ConversationRequestView {
                     request: RequestView {
                         request_id: parse_uuid(row.try_get("id")?)?,
