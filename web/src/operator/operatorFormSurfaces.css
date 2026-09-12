@@ -6,6 +6,14 @@
 .create-resource-body.form-panel, .inline-editor.form-panel, .provider-list > .inline-editor { color: var(--picker-text); min-width: 0; }
 .create-resource-body.form-panel { padding: clamp(16px, 2.5vw, 28px); }
 .form-panel :is(.rjsf, .form-group, fieldset, .schema-array-control) { min-width: 0; max-width: 100%; }
+.form-panel :is(.schema-array-items, .schema-array-item, .schema-array-actions, .operator-form-section-fields),
+.create-resource > summary > span:first-child { min-width: 0; }
+.form-panel .schema-array-actions { flex-wrap: wrap; }
+.form-panel :is(fieldset, .schema-array, .schema-array-items, .operator-form-section-fields) { box-sizing: border-box; width: 100%; }
+.form-panel fieldset { margin-inline: 0; }
+.form-panel :is(legend, .schema-array legend) { max-width: 100%; white-space: normal; }
+.schema-unsupported { border: 1px solid var(--picker-border); border-radius: 7px; background: var(--picker-surface); color: var(--picker-text); min-width: 0; max-width: 100%; padding: 12px; overflow-wrap: anywhere; }
+.schema-unsupported p { color: var(--picker-muted); font-size: 12px; line-height: 1.6; margin: 6px 0 0; }
 .form-panel :is(legend, label, .field-description, .schema-errors) { overflow-wrap: anywhere; }
 .credential-enforcement-field { min-width: 0; }
 .form-panel :is(input, select, textarea):not([type='checkbox'], [type='radio'], [type='hidden']),

@@ -4,6 +4,7 @@ import Form from '@rjsf/core/lib/components/Form.js';
 import { I18nProvider } from '../../src/i18n';
 import { safeValidator } from '../../src/safeValidator';
 import { upstreamFormTemplates } from '../../src/operator/UpstreamFormTemplates';
+import { schemaFormTemplates } from '../../src/SchemaTemplates';
 import { useInlineEditorFocus } from '../../src/operator/hooks/useInlineEditorFocus';
 import '../../src/styles.css';
 import '../../src/theme.css';
@@ -44,4 +45,13 @@ createRoot(document.getElementById('root')!).render(<I18nProvider><main style={{
   <h1>Upstream connection</h1>
   <div className="form-panel"><Form schema={schema} formData={{ name: 'Research workspace', config: { base_url: 'https://provider.example.invalid/v1', timeout_seconds: 0 } }} validator={safeValidator} templates={upstreamFormTemplates} onSubmit={() => {}}><button type="submit">Save fixture</button></Form></div>
   <FocusLifecycle />
+  <div className="form-panel" data-layout-contract>
+    <Form schema={{ type: 'object', properties: {
+      future: { title: 'Future setting', default: 'schema-default-must-not-render', examples: ['schema-example-must-not-render'] },
+      entries: { type: 'array', title: 'LongUnbrokenPluginArrayTitle'.repeat(12), items: { type: 'string' } },
+    } }} formData={{ future: 'existing-value-must-not-render', entries: ['editable'] }} validator={safeValidator} templates={schemaFormTemplates}
+      onSubmit={({ formData }) => { Object.assign(window, { formLayoutSubmission: formData }); }}>
+      <button type="submit">Save extended fields</button>
+    </Form>
+  </div>
 </main></I18nProvider>);
