@@ -6,8 +6,8 @@ use memeloop_token_center::{
     AppState, api,
     config::{Config, RuntimeRole},
     db::{
-        CreateKeyInput, CreateModelRouteInput, CreateServiceTokenInput, CreateUpstreamAccountInput,
-        NewRequest,
+        CreateGroupInput, CreateKeyInput, CreateModelRouteInput, CreateServiceTokenInput,
+        CreateUpstreamAccountInput, GroupKind, NewRequest, ReplaceGroupMembersInput,
     },
     model::KeyPolicy,
     provider::{ModelRouteView, UpstreamCredential},
@@ -513,4 +513,41 @@ async fn route_mutations_are_scoped_optimistic_idempotent_and_history_safe() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    let group = state
+        .db
+        .create_group(
+            GroupKind::Route,
+            CreateGroupInput {
+                tenant_external_id: "route-tenant-a".into(),
+                name: "Retired routes".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let reassociation = state
+        .db
+        .replace_group_members(
+            GroupKind::Route,
+            group.id,
+            ReplaceGroupMembersInput {
+                tenant_external_id: "route-tenant-a".into(),
+                member_ids: vec![historical_route.id],
+                expected_updated_at: group.updated_at,
+            },
+        )
+        .await;
+    assert!(matches!(
+        reassociation,
+        Err(memeloop_token_center::error::AppError::NotFound)
+    ));
+    state
+        .db
+        .delete_group(
+            GroupKind::Route,
+            group.id,
+            "route-tenant-a",
+            group.updated_at,
+        )
+        .await
+        .unwrap();
 }
