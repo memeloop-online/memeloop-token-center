@@ -348,6 +348,20 @@ fn builtin_codex_routes_openai_with_required_trusted_limits_only() {
             .pointer("/properties/transport_policy/properties/shared_probe_attempts/minimum"),
         Some(&json!(0))
     );
+    for (field, bound, expected) in [
+        ("version", "enum", json!([1])),
+        ("candidate_attempts", "minimum", json!(1)),
+        ("candidate_attempts", "maximum", json!(8)),
+        ("failover_deadline_millis", "minimum", json!(1000)),
+        ("failover_deadline_millis", "maximum", json!(300000)),
+    ] {
+        assert_eq!(
+            codex.config_schema.pointer(&format!(
+                "/properties/transport_policy/properties/{field}/{bound}"
+            )),
+            Some(&expected)
+        );
+    }
     assert!(
         catalog
             .get(crate::oauth::managed::kimi::PROVIDER_DRIVER)

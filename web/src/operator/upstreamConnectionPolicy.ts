@@ -26,7 +26,7 @@ export function connectionSchema(schema: RJSFSchema, endpointHint: string): RJSF
   const policy = result.properties?.transport_policy;
   if (policy && typeof policy === 'object') {
     policy.title = 'Runtime retry policy';
-    for (const [name, title] of Object.entries({ connect_attempts: 'Connect attempts', connect_retry_delay_millis: 'Connect retry delay (ms)', shared_probe_attempts: 'Shared probe attempts' })) {
+    for (const [name, title] of Object.entries({ version: 'Policy version', candidate_attempts: 'Candidate attempts', failover_deadline_millis: 'Failover deadline (ms)', connect_attempts: 'Connect attempts', connect_retry_delay_millis: 'Connect retry delay (ms)', shared_probe_attempts: 'Shared probe attempts' })) {
       const field = policy.properties?.[name];
       if (field && typeof field === 'object') field.title = title;
     }

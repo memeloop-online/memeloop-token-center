@@ -9,7 +9,12 @@ half-open recovery attempts. External quota reset does not reset gateway health.
 Native Codex account `config.transport_policy` uses one typed, fail-closed parser
 for validation and execution. Unsupported fields, versions and out-of-range
 values reject configuration. Missing `version` means version 1 for compatibility.
-Changes use the existing authorized account-update CAS and audit flow.
+Changes use the existing authorized `PUT /internal/v1/upstreams/{account_id}`
+account-update CAS; the provider catalog schema declares these fields for both
+API validation and the schema-driven editor. Read them back through the authorized
+upstream list API. Accepted changes emit a secret-free structured audit event
+with actor/account/tenant IDs, expected/accepted revisions and bounded policy
+values. This is a log event, not a new transactional audit table.
 
 | Version 1 field | Default | Allowed |
 | --- | --- | --- |
