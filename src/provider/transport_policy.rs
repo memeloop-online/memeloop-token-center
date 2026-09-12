@@ -12,6 +12,9 @@ pub(crate) struct CodexTransportPolicy {
     pub candidate_attempts: usize,
     /// Absolute selection/send budget, not the successful stream lifetime.
     pub failover_deadline_millis: u64,
+    pub connect_timeout_millis: u64,
+    pub read_timeout_millis: u64,
+    pub request_timeout_millis: u64,
 }
 
 impl Default for CodexTransportPolicy {
@@ -23,6 +26,9 @@ impl Default for CodexTransportPolicy {
             shared_probe_attempts: None,
             candidate_attempts: super::types::PROXY_ROUTING_POLICY.max_attempts(),
             failover_deadline_millis: 300_000,
+            connect_timeout_millis: 5_000,
+            read_timeout_millis: 600_000,
+            request_timeout_millis: 1_260_000,
         }
     }
 }
@@ -43,6 +49,11 @@ impl CodexTransportPolicy {
             })
             || !(1..=8).contains(&policy.candidate_attempts)
             || !(1_000..=300_000).contains(&policy.failover_deadline_millis)
+            || !(100..=60_000).contains(&policy.connect_timeout_millis)
+            || !(1_000..=1_260_000).contains(&policy.read_timeout_millis)
+            || !(1_000..=1_260_000).contains(&policy.request_timeout_millis)
+            || policy.connect_timeout_millis > policy.request_timeout_millis
+            || policy.read_timeout_millis > policy.request_timeout_millis
             || value.is_some_and(|value| value.get("shared_probe_attempts") == Some(&Value::Null))
         {
             return Err("invalid_transport_policy");
@@ -72,6 +83,9 @@ mod tests {
         assert_eq!(policy.candidate_attempts, 8);
         assert_eq!(policy.failover_deadline_millis, 1000);
         assert_eq!(policy.shared_probe_attempts, Some(0));
+        assert_eq!(policy.connect_timeout_millis, 5_000);
+        assert_eq!(policy.read_timeout_millis, 600_000);
+        assert_eq!(policy.request_timeout_millis, 1_260_000);
     }
 
     #[test]
@@ -92,6 +106,12 @@ mod tests {
             json!({"account_hint": "untrusted"}),
             json!({"retry_503": true}),
             json!({"plugin": "untrusted"}),
+            json!({"connect_timeout_millis": 99}),
+            json!({"connect_timeout_millis": 60001}),
+            json!({"read_timeout_millis": 999}),
+            json!({"request_timeout_millis": 1260001}),
+            json!({"read_timeout_millis": 2000, "request_timeout_millis": 1000}),
+            json!({"connect_timeout_millis": 2000, "read_timeout_millis": 1000, "request_timeout_millis": 1000}),
         ] {
             assert!(
                 CodexTransportPolicy::parse(Some(&invalid)).is_err(),

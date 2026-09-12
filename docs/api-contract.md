@@ -66,6 +66,14 @@ upstream update CAS. Its bounded `connect_attempts`,
 `connect_retry_delay_millis`, and `shared_probe_attempts` fields apply to newly
 prepared inference requests without a service release; changing them never
 changes the fixed destination or encrypted per-account proxy binding.
+The same policy accepts `connect_timeout_millis` (100–60000; default 5000),
+`read_timeout_millis` (1000–1260000; default 600000, maximum inactivity between
+reads), and `request_timeout_millis` (1000–1260000; default 1260000, including
+the response body). Connect and read timeouts cannot exceed the request timeout.
+Clients are bounded and keyed by account transport revision, proxy fingerprint,
+and timeout values. Each prepared send keeps its client snapshot across its
+permitted connection retries. Updates do not extend the request's original
+candidate/failover budget or permit replay after ambiguous delivery or HTTP 503.
 
 `GET /internal/v1/upstreams/{account_id}/deletion-readiness` reports the exact
 lifecycle, direct-or-multi-candidate route, immutable history, and import

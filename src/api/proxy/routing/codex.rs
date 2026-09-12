@@ -92,6 +92,10 @@ pub(super) async fn send_proxy_route(
     )
     .await
     .map_err(|_| ProxySendError::CandidateUnavailable)?;
+    let client = state
+        .codex_clients
+        .snapshot(&route.route)
+        .map_err(|_| ProxySendError::CandidateUnavailable)?;
     let target_url = network::upstream_api_url(&outbound_base_url, codex_transport::RESPONSES_PATH);
     let session_id = route
         .codex_session_id
@@ -120,6 +124,7 @@ pub(super) async fn send_proxy_route(
                 outbound_attempt,
                 transport_policy,
             },
+            &client,
         )
         .await
         {
@@ -216,6 +221,7 @@ async fn send_codex_attempt(
     route: &PreparedProxyRoute,
     session_id: &str,
     context: CodexAttemptContext,
+    client: &wreq::Client,
 ) -> Result<(wreq::Response, crate::metrics::ActivityGuard), ProxySendError> {
     let CodexAttemptContext {
         request_id,
@@ -224,7 +230,7 @@ async fn send_codex_attempt(
         transport_policy,
     } = context;
     for connect_attempt in 1..=transport_policy.connect_attempts {
-        match send_codex_attempt_once(state, headers, target_url, route, session_id).await {
+        match send_codex_attempt_once(state, headers, target_url, route, session_id, client).await {
             Err(ProxySendError::RetryableConnection(failure_stage))
                 if connect_attempt < transport_policy.connect_attempts =>
             {
@@ -273,6 +279,7 @@ async fn send_codex_attempt_once(
     target_url: &str,
     route: &PreparedProxyRoute,
     session_id: &str,
+    client: &wreq::Client,
 ) -> Result<(wreq::Response, crate::metrics::ActivityGuard), ProxySendError> {
     #[cfg(test)]
     if TEST_PRE_DELIVERY_CONNECT_FAILURES
@@ -285,10 +292,7 @@ async fn send_codex_attempt_once(
     {
         return Err(ProxySendError::RetryableConnection("test_injected"));
     }
-    let mut request = state
-        .codex_http
-        .post(target_url)
-        .body(route.forwarded_body.clone());
+    let mut request = client.post(target_url).body(route.forwarded_body.clone());
     if let Some((proxy_url, _)) = route.route.credential.proxy() {
         let proxy =
             wreq::Proxy::all(proxy_url).map_err(|_| ProxySendError::CandidateUnavailable)?;

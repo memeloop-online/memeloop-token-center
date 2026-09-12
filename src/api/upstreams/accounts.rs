@@ -402,6 +402,9 @@ pub(in crate::api) async fn update_upstream(
             connect_attempts = policy.connect_attempts,
             connect_retry_delay_millis = policy.connect_retry_delay_millis,
             shared_probe_attempts = ?policy.shared_probe_attempts,
+            connect_timeout_millis = policy.connect_timeout_millis,
+            read_timeout_millis = policy.read_timeout_millis,
+            request_timeout_millis = policy.request_timeout_millis,
             stage = "upstream_transport_policy_update_accepted",
             "authorized upstream transport policy update accepted");
     }

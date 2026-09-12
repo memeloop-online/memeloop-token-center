@@ -2,6 +2,7 @@ pub mod api;
 pub mod archive;
 pub mod archive_reaper;
 pub mod archive_staging;
+mod codex_clients;
 pub mod config;
 pub mod conversation;
 pub mod crypto;
@@ -56,7 +57,7 @@ pub struct AppState {
     pub db: Database,
     pub archive: ArchiveStore,
     pub http: reqwest::Client,
-    pub(crate) codex_http: wreq::Client,
+    pub(crate) codex_clients: Arc<codex_clients::CodexClients>,
     pub providers: ProviderCatalog,
     pub plugins: PluginRuntime,
     pub metrics: metrics::Metrics,
@@ -139,12 +140,19 @@ impl AppState {
                 PROXY_ARCHIVE_STREAM_CONCURRENCY,
             )),
             http: build_http_client().map_err(|_| InitializationError::HttpClient)?,
-            codex_http: build_codex_http_client().map_err(|_| InitializationError::HttpClient)?,
+            codex_clients: Arc::new(codex_clients::CodexClients::default()),
         })
     }
 }
 
+#[cfg(test)]
 fn build_codex_http_client() -> Result<wreq::Client, wreq::Error> {
+    build_codex_http_client_with_policy(provider::CodexTransportPolicy::default())
+}
+
+fn build_codex_http_client_with_policy(
+    policy: provider::CodexTransportPolicy,
+) -> Result<wreq::Client, wreq::Error> {
     use wreq_util::{Emulation, Platform, Profile};
 
     let emulation = Emulation::builder()
@@ -156,15 +164,16 @@ fn build_codex_http_client() -> Result<wreq::Client, wreq::Error> {
         .headers(false)
         .build();
     wreq::Client::builder()
-        .connect_timeout(HTTP_CONNECT_TIMEOUT)
-        .read_timeout(HTTP_READ_TIMEOUT)
-        .timeout(HTTP_REQUEST_TIMEOUT)
+        .connect_timeout(Duration::from_millis(policy.connect_timeout_millis))
+        .read_timeout(Duration::from_millis(policy.read_timeout_millis))
+        .timeout(Duration::from_millis(policy.request_timeout_millis))
         .redirect(wreq::redirect::Policy::none())
         // Responses POSTs are not safe for an HTTP client's implicit retry.
         // Candidate failover remains explicit and pre-delivery in the proxy.
         .retry(wreq::retry::Policy::never())
         .no_proxy()
-        .pool_max_idle_per_host(64)
+        // The cache owns at most 64 account clients; bound each idle pool too.
+        .pool_max_idle_per_host(8)
         .pool_idle_timeout(Duration::from_secs(90))
         .emulation(emulation)
         .build()

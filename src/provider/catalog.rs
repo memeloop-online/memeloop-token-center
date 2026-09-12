@@ -344,6 +344,15 @@ impl ProviderCatalog {
                     "enum": [1],
                     "default": 1
                 },
+                "connect_timeout_millis": {
+                    "type": "integer", "minimum": 100, "maximum": 60000, "default": 5000
+                },
+                "read_timeout_millis": {
+                    "type": "integer", "minimum": 1000, "maximum": 1260000, "default": 600000
+                },
+                "request_timeout_millis": {
+                    "type": "integer", "minimum": 1000, "maximum": 1260000, "default": 1260000
+                },
                 "candidate_attempts": {
                     "type": "integer",
                     "minimum": 1,
