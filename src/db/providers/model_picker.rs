@@ -472,6 +472,7 @@ WITH direct_sources AS (
                 WHERE eligible.tenant_id = route.tenant_id
                   AND eligible.model_route_id = route.id
                   AND eligible.upstream_account_id = account.id
+                  AND eligible.upstream_model = source.upstream_model
            ) THEN 1 ELSE 0 END AS route_candidate_eligible,
            catalog.status AS catalog_state, catalog.last_attempt_at AS catalog_observed_at,
            catalog.last_success_at AS catalog_last_success_at, catalog.expires_at AS catalog_expires_at,
@@ -648,6 +649,7 @@ WITH direct_sources AS (
                 WHERE eligible.tenant_id = route.tenant_id
                   AND eligible.model_route_id = route.id
                   AND eligible.upstream_account_id = account.id
+                  AND eligible.upstream_model = source.upstream_model
            ) THEN 1 ELSE 0 END AS route_candidate_eligible,
            catalog.status AS catalog_state, catalog.last_attempt_at AS catalog_observed_at,
            catalog.last_success_at AS catalog_last_success_at, catalog.expires_at AS catalog_expires_at,

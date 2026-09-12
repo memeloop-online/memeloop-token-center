@@ -14,19 +14,20 @@ use memeloop_token_center::{
     provider::UpstreamCredential,
 };
 use serde_json::{Value, json};
+use sqlx::AnyPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-async fn sqlite_state(label: &str) -> (AppState, tempfile::TempDir) {
+async fn sqlite_state(label: &str) -> (AppState, tempfile::TempDir, String) {
     let directory = tempfile::tempdir().expect("model picker temporary directory");
     let database_url = format!(
         "sqlite://{}?mode=rwc",
         directory.path().join(format!("{label}.db")).display()
     );
-    let state = AppState::initialize(Config::for_test(database_url))
+    let state = AppState::initialize(Config::for_test(database_url.clone()))
         .await
         .expect("initialize model picker state");
-    (state, directory)
+    (state, directory, database_url)
 }
 
 async fn create_account(state: &AppState, tenant: &str, name: &str, driver: &str) -> Uuid {
@@ -308,8 +309,23 @@ fn projection_filter<'a>(
     }
 }
 
-async fn exercise_database_projection(state: &AppState, label: &str) {
+async fn exercise_database_projection(state: &AppState, label: &str, database_url: &str) {
     let fixture = seed_projection(state, label).await;
+    let inspection = AnyPool::connect(database_url)
+        .await
+        .expect("connect model picker fixture inspection pool");
+    sqlx::query(
+        "UPDATE model_route_upstream_accounts
+            SET upstream_model = $1, catalog_policy = 'required'
+          WHERE model_route_id = $2 AND upstream_account_id = $3",
+    )
+    .bind("historical-direct-model")
+    .bind(fixture.first_route.to_string())
+    .bind(fixture.first_account.to_string())
+    .execute(&inspection)
+    .await
+    .expect("stage historical direct/group model disagreement");
+    inspection.close().await;
     let public_provider_ids = vec!["http-json".to_owned()];
     let route_items = state
         .db
@@ -365,6 +381,27 @@ async fn exercise_database_projection(state: &AppState, label: &str) {
     assert_eq!(catalogs[&fixture.second_account.to_string()], "partial");
     assert_eq!(catalogs[&fixture.third_account.to_string()], "error");
     assert_eq!(catalogs[&fixture.fourth_account.to_string()], "stale");
+    let historical_direct_source = model_items[0]
+        .sources
+        .iter()
+        .find(|source| source.account.id == fixture.first_account.to_string())
+        .expect("historical direct source");
+    assert_eq!(
+        historical_direct_source.capabilities.upstream_model, "historical-direct-model",
+        "direct assignment wins over group expansion for the same route/account"
+    );
+    assert_eq!(
+        historical_direct_source.configuration_availability.status,
+        "unavailable"
+    );
+    assert!(
+        historical_direct_source
+            .configuration_availability
+            .reasons
+            .iter()
+            .any(|reason| reason == "route_candidate_ineligible"),
+        "eligibility for the group's different upstream model must not leak to the direct source"
+    );
     assert!(
         model_items[0]
             .sources
@@ -461,8 +498,8 @@ async fn exercise_database_projection(state: &AppState, label: &str) {
 
 #[tokio::test]
 async fn sqlite_projection_preserves_identity_aggregation_and_evidence() {
-    let (state, _directory) = sqlite_state("projection").await;
-    exercise_database_projection(&state, "sqlite").await;
+    let (state, _directory, database_url) = sqlite_state("projection").await;
+    exercise_database_projection(&state, "sqlite", &database_url).await;
 }
 
 #[tokio::test]
@@ -471,10 +508,10 @@ async fn postgres_projection_matches_sqlite_contract() {
         eprintln!("MTC_TEST_POSTGRES_URL is unset; skipping PostgreSQL model picker contract");
         return;
     };
-    let state = AppState::initialize(Config::for_test(database_url))
+    let state = AppState::initialize(Config::for_test(database_url.clone()))
         .await
         .expect("initialize PostgreSQL model picker state");
-    exercise_database_projection(&state, "postgres").await;
+    exercise_database_projection(&state, "postgres", &database_url).await;
 }
 
 async fn request(
@@ -508,7 +545,7 @@ async fn request(
 
 #[tokio::test]
 async fn operator_api_enforces_scopes_tenant_cursor_and_control_role() {
-    let (state, _directory) = sqlite_state("api").await;
+    let (state, _directory, _database_url) = sqlite_state("api").await;
     let fixture = seed_projection(&state, "api").await;
     let allowed = state
         .db
