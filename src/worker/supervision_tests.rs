@@ -7,6 +7,54 @@ use super::*;
 
 struct OnDrop(Arc<AtomicUsize>);
 
+#[tokio::test]
+async fn deadline_joins_started_blocking_calls_after_cancelling_their_async_role() {
+    let (stop, shutdown) = watch::channel(false);
+    let (role_stop, mut role_shutdown) = watch::channel(false);
+    let registry = BlockingTasks::new();
+    let caller_registry = registry.clone();
+    let closed_registry = registry.clone();
+    let (started, observed) = tokio::sync::oneshot::channel();
+    let (release, blocked) = std::sync::mpsc::channel();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let guard = OnDrop(dropped.clone());
+    let mut roles = JoinSet::new();
+    roles.spawn(async move {
+        caller_registry
+            .run(move || {
+                let _guard = guard;
+                started.send(()).unwrap();
+                blocked.recv().unwrap();
+            })
+            .await;
+        "oauth"
+    });
+    let supervisor = tokio::spawn(supervise_roles(
+        roles,
+        role_stop,
+        shutdown,
+        Duration::ZERO,
+        registry,
+    ));
+    observed.await.unwrap();
+    stop.send(true).unwrap();
+    wait_for_shutdown(&mut role_shutdown).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !supervisor.is_finished(),
+        "running blocking call must remain owned"
+    );
+    assert!(
+        closed_registry
+            .run(|| panic!("shutdown must reject new blocking calls"))
+            .await
+            .is_none()
+    );
+    release.send(()).unwrap();
+    supervisor.await.unwrap();
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+}
+
 impl Drop for OnDrop {
     fn drop(&mut self) {
         self.0.fetch_add(1, Ordering::SeqCst);
@@ -51,6 +99,7 @@ async fn stalled_provider_roles_do_not_block_other_lanes_or_spawn_more_work() {
         role_stop,
         external_shutdown,
         Duration::from_secs(30),
+        BlockingTasks::new(),
     ));
     for _ in 0..3 {
         observed.recv().await.unwrap();
@@ -102,6 +151,7 @@ async fn unexpected_role_exit_stops_and_joins_siblings() {
         role_stop,
         external_shutdown,
         Duration::from_secs(30),
+        BlockingTasks::new(),
     )));
     assert!(wait_for_server_shutdown(std::future::pending(), &mut supervisor).await);
     assert!(supervisor.is_none());
@@ -137,6 +187,7 @@ async fn cancelling_supervisor_aborts_owned_roles() {
         role_stop,
         external_shutdown,
         Duration::from_secs(30),
+        BlockingTasks::new(),
     ));
     ready.await.unwrap();
     supervisor.abort();

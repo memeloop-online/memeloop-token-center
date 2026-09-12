@@ -1,4 +1,8 @@
-use std::{future::Future, time::Duration};
+use std::{
+    future::Future,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use tokio::{sync::watch, task::JoinSet};
 use uuid::Uuid;
@@ -23,6 +27,46 @@ pub async fn run(state: AppState) {
 }
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
+/// Blocking component calls cannot be cancelled once started. Keep ownership
+/// separate from their async callers so deadline cancellation never detaches
+/// them. Plugin execution already has fuel, epoch and host-call deadlines.
+#[derive(Clone)]
+pub(crate) struct BlockingTasks(Arc<Mutex<Option<JoinSet<()>>>>);
+
+impl BlockingTasks {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(Some(JoinSet::new()))))
+    }
+
+    pub(crate) async fn run<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        {
+            let mut registry = self.0.lock().expect("blocking task registry poisoned");
+            let tasks = registry.as_mut()?;
+            while let Some(result) = tasks.try_join_next() {
+                if let Err(error) = result {
+                    tracing::error!(%error, "worker component task failed");
+                }
+            }
+            tasks.spawn_blocking(move || {
+                let _ = send.send(operation());
+            });
+        }
+        receive.await.ok()
+    }
+
+    fn close(&self) -> JoinSet<()> {
+        self.0
+            .lock()
+            .expect("blocking task registry poisoned")
+            .take()
+            .unwrap_or_default()
+    }
+}
 
 /// Connect the worker lifetime to the HTTP server's shutdown signal. Any
 /// unsolicited worker exit is fatal, including an apparently successful exit.
@@ -54,6 +98,8 @@ pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>
     }
     let (role_stop, role_shutdown) = watch::channel(false);
     let mut roles = JoinSet::new();
+    let blocking_tasks = BlockingTasks::new();
+    let oauth_blocking = blocking_tasks.clone();
     let worker_id = format!("worker-{}", Uuid::now_v7());
     let projection_owner = Uuid::now_v7();
     let reaper_owner = ArchiveStagingLeaseOwner::new(format!("archive-reaper-{}", Uuid::now_v7()))
@@ -196,6 +242,7 @@ pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>
                             state,
                             account_id,
                             &idempotency_key,
+                            &oauth_blocking,
                         )
                         .await
                         {
@@ -209,7 +256,7 @@ pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>
             }
         }
     );
-    supervise_roles(roles, role_stop, shutdown, SHUTDOWN_GRACE).await;
+    supervise_roles(roles, role_stop, shutdown, SHUTDOWN_GRACE, blocking_tasks).await;
 }
 
 /// Finish the current operation on shutdown, but never start another tick.
@@ -248,6 +295,7 @@ async fn supervise_roles(
     role_stop: watch::Sender<bool>,
     mut shutdown: watch::Receiver<bool>,
     grace: Duration,
+    blocking_tasks: BlockingTasks,
 ) {
     let mut failed = tokio::select! {
         biased;
@@ -257,6 +305,9 @@ async fn supervise_roles(
             true
         }
     };
+    // No new blocking calls may start during drain. Calls already running
+    // retain their independent plugin execution deadline and remain joinable.
+    let mut blocking = blocking_tasks.close();
     let _ = role_stop.send(true);
     // One shared deadline, not one grace period per role. JoinSet aborts on
     // supervisor cancellation too, so no detached provider/lease loops survive.
@@ -283,6 +334,12 @@ async fn supervise_roles(
                 },
                 Some(Ok(_)) => {},
             },
+        }
+    }
+    blocking.abort_all(); // Cancels queued calls, not already-running calls.
+    while let Some(result) = blocking.join_next().await {
+        if let Err(error) = result {
+            failed |= error.is_panic();
         }
     }
     assert!(!failed, "background worker role failed");
