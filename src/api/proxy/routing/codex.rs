@@ -8,17 +8,13 @@ mod retry;
 use retry::{AttemptControl, CodexRetryState, observe_bad_request_disposition};
 pub(in crate::api::proxy) use retry::{CodexRetryTerminal, CodexRetryTerminalGuard};
 
-const DEFAULT_PRE_DELIVERY_CONNECT_ATTEMPTS: usize = 2;
-const MAX_PRE_DELIVERY_CONNECT_ATTEMPTS: usize = 4;
-const DEFAULT_PRE_DELIVERY_CONNECT_RETRY_DELAY_MILLIS: u64 = 150;
-const MAX_PRE_DELIVERY_CONNECT_RETRY_DELAY_MILLIS: u64 = 2_000;
-
 #[derive(Clone, Copy, Debug)]
 pub(in crate::api::proxy) struct CodexRuntimeTransportPolicy {
     pub(in crate::api::proxy) connect_attempts: usize,
     pub(in crate::api::proxy) connect_retry_delay: std::time::Duration,
     pub(in crate::api::proxy) shared_probe_attempts: u32,
     pub(in crate::api::proxy) source: &'static str,
+    pub(in crate::api::proxy) version: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -32,35 +28,22 @@ struct CodexAttemptContext {
 pub(in crate::api::proxy) fn runtime_transport_policy(
     config: &Value,
     default_shared_probe_attempts: u32,
-) -> CodexRuntimeTransportPolicy {
-    let policy = config.get("transport_policy").and_then(Value::as_object);
-    let connect_attempts = policy
-        .and_then(|policy| policy.get("connect_attempts"))
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .filter(|value| (1..=MAX_PRE_DELIVERY_CONNECT_ATTEMPTS).contains(value))
-        .unwrap_or(DEFAULT_PRE_DELIVERY_CONNECT_ATTEMPTS);
-    let connect_retry_delay_millis = policy
-        .and_then(|policy| policy.get("connect_retry_delay_millis"))
-        .and_then(Value::as_u64)
-        .filter(|value| *value <= MAX_PRE_DELIVERY_CONNECT_RETRY_DELAY_MILLIS)
-        .unwrap_or(DEFAULT_PRE_DELIVERY_CONNECT_RETRY_DELAY_MILLIS);
-    let shared_probe_attempts = policy
-        .and_then(|policy| policy.get("shared_probe_attempts"))
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .filter(|value| *value <= crate::config::MAX_UPSTREAM_SHARED_PROBE_ATTEMPTS)
-        .unwrap_or(default_shared_probe_attempts);
-    CodexRuntimeTransportPolicy {
-        connect_attempts,
-        connect_retry_delay: std::time::Duration::from_millis(connect_retry_delay_millis),
-        shared_probe_attempts,
-        source: if policy.is_some() {
+) -> Result<CodexRuntimeTransportPolicy, AppError> {
+    let policy = crate::provider::CodexTransportPolicy::parse(config.get("transport_policy"))
+        .map_err(|_| AppError::BadRequest("invalid Codex transport policy".into()))?;
+    Ok(CodexRuntimeTransportPolicy {
+        connect_attempts: policy.connect_attempts,
+        connect_retry_delay: std::time::Duration::from_millis(policy.connect_retry_delay_millis),
+        shared_probe_attempts: policy
+            .shared_probe_attempts
+            .unwrap_or(default_shared_probe_attempts),
+        version: policy.version,
+        source: if config.get("transport_policy").is_some() {
             "account_config"
         } else {
             "default"
         },
-    }
+    })
 }
 
 #[cfg(test)]
@@ -122,7 +105,8 @@ pub(super) async fn send_proxy_route(
     let transport_policy = runtime_transport_policy(
         &route.route.config,
         state.config.upstream_health.shared_probe_attempts,
-    );
+    )
+    .map_err(|_| ProxySendError::CandidateUnavailable)?;
     loop {
         let (response, upstream_activity) = match send_codex_attempt(
             state,
@@ -252,6 +236,7 @@ async fn send_codex_attempt(
                     connect_attempt,
                     connect_attempt_limit = transport_policy.connect_attempts,
                     transport_policy_source = transport_policy.source,
+                    transport_policy_version = transport_policy.version,
                     failure_kind = "connection",
                     failure_stage,
                     stage = "codex_pre_delivery_connect_retry",
@@ -268,6 +253,7 @@ async fn send_codex_attempt(
                     connect_attempt,
                     connect_attempt_limit = transport_policy.connect_attempts,
                     transport_policy_source = transport_policy.source,
+                    transport_policy_version = transport_policy.version,
                     failure_kind = "connection",
                     failure_stage,
                     stage = "codex_pre_delivery_connect_exhausted",

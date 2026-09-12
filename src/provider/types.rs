@@ -6,9 +6,9 @@ use uuid::Uuid;
 
 use super::UpstreamCredential;
 
-/// One validated policy owns both the request attempt budget and the bounded
-/// resolver look-ahead. Keeping these values together prevents the database
-/// and HTTP layers from silently applying different routing limits.
+/// Default request attempt budget and hard resolver look-ahead limit.
+/// Native Codex can snapshot a bounded versioned request policy; it never
+/// changes the database's authorization or candidate-set safety limit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RoutingAttemptPolicy {
     max_attempts: NonZeroUsize,

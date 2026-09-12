@@ -8,6 +8,7 @@ mod codex;
 mod http;
 mod kimi;
 mod outcome;
+mod policy;
 mod probe;
 mod readiness;
 
@@ -27,7 +28,8 @@ pub(super) use codex::quota::classify_rate_limit;
 #[cfg(test)]
 pub(super) use codex::with_test_pre_delivery_connect_failures;
 pub(super) use codex::{CodexRetryTerminal, CodexRetryTerminalGuard, runtime_transport_policy};
-pub(super) use outcome::classify_attempt_failure;
+pub(super) use outcome::{classify_attempt_failure, failover_disposition};
+pub(super) use policy::RequestAttemptBudget;
 pub(super) use probe::{
     SharedProbePermit, UpstreamAttemptGuard, UpstreamAttemptTerminal, join_shared_probe,
 };
