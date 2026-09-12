@@ -47,6 +47,7 @@ test('request popover stays non-modal across themes, locales and widths; models 
           assert.ok(surface.left >= 0 && surface.right <= width);
           assert.equal(surface.overflow, false);
           await page.keyboard.press('Escape');
+          await panel.waitFor({ state: 'detached' });
           assert.equal(await panel.count(), 0);
           assert.equal(await trigger.evaluate((element) => document.activeElement === element), true);
           await trigger.click();
