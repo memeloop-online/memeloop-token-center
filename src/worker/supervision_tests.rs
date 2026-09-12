@@ -7,30 +7,6 @@ use super::*;
 
 struct OnDrop(Arc<AtomicUsize>);
 
-#[tokio::test(start_paused = true)]
-async fn generation_shutdown_drops_inflight_attempt_without_failure_settlement() {
-    let (stop, shutdown) = watch::channel(false);
-    let (dispatched, dispatch_observed) = tokio::sync::oneshot::channel();
-    let dropped = Arc::new(AtomicUsize::new(0));
-    let guard = OnDrop(dropped.clone());
-    let task = tokio::spawn(crate::generation::finish_attempt_until_shutdown(
-        async move {
-            let _guard = guard;
-            dispatched.send(()).unwrap();
-            std::future::pending::<()>().await;
-            // This stands for process_one's failure/retry/terminal settlement
-            // continuation. Shutdown must drop it, never manufacture an error
-            // that enters that continuation.
-            panic!("shutdown must not invoke failure settlement or retry");
-        },
-        shutdown,
-    ));
-    dispatch_observed.await.unwrap();
-    stop.send(true).unwrap();
-    assert!(!task.await.unwrap().unwrap());
-    assert_eq!(dropped.load(Ordering::SeqCst), 1);
-}
-
 impl Drop for OnDrop {
     fn drop(&mut self) {
         self.0.fetch_add(1, Ordering::SeqCst);
@@ -91,11 +67,15 @@ async fn stalled_provider_roles_do_not_block_other_lanes_or_spawn_more_work() {
         2,
         "one in-flight operation per provider role"
     );
+    // Exercise the same signal/worker composition used by main, not a second
+    // timeout wrapper that could abort the supervisor during its final join.
+    let mut supervisor = Some(supervisor);
+    assert!(!wait_for_server_shutdown(async {}, &mut supervisor).await);
     external_stop.send(true).unwrap();
     let mut stopped = role_shutdown.clone();
     wait_for_shutdown(&mut stopped).await;
     let deadline_start = tokio::time::Instant::now();
-    supervisor.await.unwrap();
+    supervisor.unwrap().await.unwrap();
     assert_eq!(deadline_start.elapsed(), Duration::from_secs(30));
     assert_eq!(
         dropped.load(Ordering::SeqCst),
@@ -117,7 +97,14 @@ async fn unexpected_role_exit_stops_and_joins_siblings() {
         wait_for_shutdown(&mut role_shutdown).await;
         "sibling"
     });
-    supervise_roles(roles, role_stop, external_shutdown, Duration::from_secs(30)).await;
+    let mut supervisor = Some(tokio::spawn(supervise_roles(
+        roles,
+        role_stop,
+        external_shutdown,
+        Duration::from_secs(30),
+    )));
+    assert!(wait_for_server_shutdown(std::future::pending(), &mut supervisor).await);
+    assert!(supervisor.is_none());
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
 }
 

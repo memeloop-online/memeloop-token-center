@@ -134,18 +134,22 @@ pub(in crate::api) async fn sync_upstream_models(
 
 pub(crate) fn trigger_upstream_model_sync(state: AppState, account_id: Uuid) {
     tokio::spawn(async move {
-        let Ok((account, _)) = state
-            .db
-            .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
-            .await
-        else {
-            return;
-        };
-        let Some(tenant) = account.tenant_external_id.as_deref() else {
-            return;
-        };
-        let _ = sync_account_models(&state, account_id, tenant).await;
+        sync_upstream_models_after_refresh(&state, account_id).await;
     });
+}
+
+pub(super) async fn sync_upstream_models_after_refresh(state: &AppState, account_id: Uuid) {
+    let Ok((account, _)) = state
+        .db
+        .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
+        .await
+    else {
+        return;
+    };
+    let Some(tenant) = account.tenant_external_id.as_deref() else {
+        return;
+    };
+    let _ = sync_account_models(state, account_id, tenant).await;
 }
 
 async fn account_tenant(

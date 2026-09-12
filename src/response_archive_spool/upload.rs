@@ -233,7 +233,9 @@ async fn upload(
     let heartbeat_state = state.clone();
     let heartbeat_task = task.clone();
     let mut heartbeat_attempt = attempt.clone();
-    let _heartbeat = AbortOnDrop(tokio::spawn(async move {
+    // Poll the heartbeat in the upload future itself. Cancelling/joining the
+    // spool role now also drops this lease loop; there is no detached child.
+    let heartbeat = async move {
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
             let renewed = tokio::time::timeout(Duration::from_secs(2), async {
@@ -251,11 +253,10 @@ async fn upload(
             })
             .await;
             if !matches!(renewed, Ok(Ok(true))) {
-                let _ = lost_sender.send(()).await;
                 break;
             }
         }
-    }));
+    };
     let transfer = async {
         *phase = "object_start";
         let mut writer = state.archive.start_writer(&attempt.object_locator).await?;
