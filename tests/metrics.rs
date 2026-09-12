@@ -7,6 +7,7 @@ use memeloop_token_center::{
     AppState, api,
     config::{Config, RuntimeRole},
     db::CreateServiceTokenInput,
+    metrics::{UpstreamHealthEvent, UpstreamHealthReason},
 };
 use serde_json::Value;
 use tower::ServiceExt;
@@ -166,7 +167,7 @@ async fn health_version_and_metrics_contract_is_operational() {
 }
 
 #[tokio::test]
-async fn public_gateway_role_does_not_register_operational_metadata_routes() {
+async fn gateway_exposes_authenticated_failover_metrics_without_control_diagnostics() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let database_url = format!(
         "sqlite://{}?mode=rwc",
@@ -175,13 +176,24 @@ async fn public_gateway_role_does_not_register_operational_metadata_routes() {
     let state = AppState::initialize(Config::for_test(database_url))
         .await
         .expect("application state");
+    state.metrics.observe_upstream_health(
+        UpstreamHealthEvent::Failover,
+        UpstreamHealthReason::RateLimited,
+    );
     let application = api::router_for_role(state, RuntimeRole::Gateway);
 
     assert_eq!(get(&application, "/readyz").await.status(), StatusCode::OK);
     assert_eq!(
-        get_authorized(&application, "/metrics").await.status(),
-        StatusCode::NOT_FOUND
+        get(&application, "/metrics").await.status(),
+        StatusCode::UNAUTHORIZED
     );
+    let response = get_authorized(&application, "/metrics").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let metrics = body_text(response).await;
+    assert!(metrics.contains(
+        "memeloop_token_center_upstream_candidate_health_events_total{event=\"failover\",reason=\"rate_limited\"} 1"
+    ));
+    assert!(!metrics.contains("test-service-token"));
     assert_eq!(
         get(&application, "/version").await.status(),
         StatusCode::NOT_FOUND
@@ -378,9 +390,12 @@ async fn operational_metadata_requires_the_metrics_scope() {
         )
         .await
         .expect("scoped service credential");
-    let application = api::router_for_role(state, RuntimeRole::Control);
-
-    for path in ["/metrics", "/version"] {
+    for (role, path) in [
+        (RuntimeRole::Control, "/metrics"),
+        (RuntimeRole::Control, "/version"),
+        (RuntimeRole::Gateway, "/metrics"),
+    ] {
+        let application = api::router_for_role(state.clone(), role);
         let response = application
             .clone()
             .oneshot(
