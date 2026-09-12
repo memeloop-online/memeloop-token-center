@@ -43,6 +43,7 @@ mod groups;
 mod health;
 mod kimi_transport;
 mod limits;
+mod model_picker;
 mod model_routes;
 mod monitoring_snapshot;
 mod plugins;
@@ -95,6 +96,7 @@ use health::{
     version,
 };
 use limits::*;
+use model_picker::list_model_picker_options;
 use model_routes::{
     create_model_route, delete_model_route, list_model_routes, retire_model_route_upstreams,
     set_model_route_enabled, update_model_route,

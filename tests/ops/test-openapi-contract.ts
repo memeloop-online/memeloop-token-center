@@ -51,6 +51,11 @@ test("lifetime apostrophe is not parsed as a character literal", () => assert.eq
 test("unknown merged router fails closed", () => assert.throws(() => sourceRoutes(sourceWith(".merge(helper_router())")), /unparsed Router/u));
 
 test("asset and image semantics are complete", () => validateProductContracts(cloneDocument()));
+test("model picker projection fails closed on network side effects", () => {
+  const document = cloneDocument(); const operation = document.paths["/internal/v1/model-picker-options"].get;
+  operation["x-projection-contract"]["provider-network-io"] = "allowed";
+  assert.throws(() => validateProductContracts(document), /model picker projection gained side effects/u);
+});
 test("plugin operator data is a scoped typed-JSON proxy contract", () => {
   const document = cloneDocument(); const operation = document.paths["/internal/v1/plugins/{plugin_id}/data/{endpoint_id}"].get;
   assert.deepEqual(operation.security, [{ serviceBearer: [] }]);
