@@ -294,9 +294,15 @@ async fn delivered_post_errors_never_retry_refund_or_lose_reconciliation() {
             .unwrap();
         sqlx::query("UPDATE upstream_accounts SET driver = 'volcengine-seedance', config_json = $1 WHERE id = (SELECT upstream_account_id FROM generation_jobs WHERE id = $2)")
             .bind(json!({"base_url": format!("http://{address}")}).to_string()).bind(f.job.to_string()).execute(&f.pool).await.unwrap();
-        // Exhaustion must not turn even the first ambiguous response into a refund.
-        sqlx::query("UPDATE generation_jobs SET driver = 'volcengine-seedance', request_object = $1, failure_count = 100 WHERE id = $2")
-            .bind(locator).bind(f.job.to_string()).execute(&f.pool).await.unwrap();
+        // Exercise the ordinary retry branch for a lost response, and the
+        // exhaustion branch for the other ambiguous outcomes. Neither is safe.
+        let prior_failure_count: i64 = if matches!(mode, SubmitResponse::Lost) {
+            0
+        } else {
+            100
+        };
+        sqlx::query("UPDATE generation_jobs SET driver = 'volcengine-seedance', request_object = $1, failure_count = $3 WHERE id = $2")
+            .bind(locator).bind(f.job.to_string()).bind(prior_failure_count).execute(&f.pool).await.unwrap();
         if matches!(mode, SubmitResponse::AckStorageFailure) {
             sqlx::query("CREATE TRIGGER reject_submit_ack BEFORE UPDATE OF upstream_job_id ON generation_jobs WHEN NEW.upstream_job_id IS NOT NULL BEGIN SELECT RAISE(ABORT, 'test ACK persistence unavailable'); END")
                 .execute(&f.pool).await.unwrap();
@@ -336,7 +342,7 @@ async fn delivered_post_errors_never_retry_refund_or_lose_reconciliation() {
             );
             assert!(row.get::<Option<String>, _>("submission_nonce").is_some());
             assert!(row.get::<Option<String>, _>("lease_owner").is_none());
-            assert_eq!(row.get::<i64, _>("failure_count"), 100);
+            assert_eq!(row.get::<i64, _>("failure_count"), prior_failure_count);
             sqlx::query("UPDATE generation_jobs SET next_attempt_at = 0, lease_expires_at = 0, created_at = 0 WHERE id = $1")
                 .bind(f.job.to_string()).execute(&f.pool).await.unwrap();
             // Reopen the durable DB, rather than relying on an in-memory guard.
