@@ -3847,6 +3847,60 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
+  /internal/v1/usage-analysis/trends:
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorUsageAnalysisTrends
+      summary: Read the bounded summary and time-series usage projection
+      description: |
+        Uses the same tenant scope, filters, inclusive range, bucket selection, and metric
+        aggregation as the complete usage-analysis resource. The response is restricted to
+        summary and time-series data and executes one business aggregation statement; it does
+        not load dimension, session, generation-breakdown, or heatmap projections.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/FromCreatedAt'
+        - $ref: '#/components/parameters/ToCreatedAt'
+        - name: granularity
+          in: query
+          required: false
+          schema: { type: string, enum: [auto, hour, day], default: auto }
+        - $ref: '#/components/parameters/KeyFilter'
+        - $ref: '#/components/parameters/ModelFilter'
+        - name: protocol
+          in: query
+          required: false
+          description: Exact canonical protocol family.
+          schema: { type: string, enum: [openai, anthropic, openai-image, generation] }
+        - name: status
+          in: query
+          required: false
+          description: Terminal logical status; pending traffic is intentionally absent from usage rollups.
+          schema: { type: string, enum: [success, error] }
+        - $ref: '#/components/parameters/ErrorCodeFilter'
+        - name: upstream_account_id
+          in: query
+          required: false
+          description: One stable upstream UUID, or `unassigned` for terminal activity recorded without an upstream.
+          schema:
+            oneOf:
+              - { type: string, format: uuid }
+              - { type: string, const: unassigned }
+        - $ref: '#/components/parameters/RouteFilter'
+        - $ref: '#/components/parameters/KeyAliasFilter'
+        - $ref: '#/components/parameters/PrincipalFilter'
+      responses:
+        '200':
+          description: Currency-safe summary and UTC time buckets.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UsageAnalysisTrends' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
   /internal/v1/request-events:
     get:
       tags: [Operator traffic]
@@ -7773,6 +7827,21 @@ components:
             sentinel. Missing coordinates mean zero activity and are filled by
             the client.
           items: { $ref: '#/components/schemas/UsageAnalysisHeatmapBucket' }
+    UsageAnalysisTrends:
+      type: object
+      additionalProperties: false
+      required: [from_created_at, to_created_at, granularity, time_zone, p95_is_approximate, p95_method, summary, time_series]
+      properties:
+        from_created_at: { type: integer, format: int64, minimum: 0 }
+        to_created_at: { type: integer, format: int64, minimum: 0 }
+        granularity: { type: string, enum: [hour, day] }
+        time_zone: { type: string, const: UTC }
+        p95_is_approximate: { type: boolean, const: true }
+        p95_method: { type: string, const: fixed_histogram_upper_bound_capped_60000ms }
+        summary: { $ref: '#/components/schemas/UsageAnalysisMetrics' }
+        time_series:
+          type: array
+          items: { $ref: '#/components/schemas/UsageAnalysisTimeBucket' }
     SelfUsageAnalysis:
       type: object
       additionalProperties: false
