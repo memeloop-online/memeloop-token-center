@@ -19,3 +19,11 @@ pub(crate) async fn process_one_for_test(state: &crate::AppState) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) async fn observed_claim_for_test(
+    db: &crate::db::Database,
+    owner: uuid::Uuid,
+) -> Result<Option<crate::db::ArchiveSpoolTask>, crate::error::AppError> {
+    upload::observe_claim(db.claim_response_archive_spool_if(owner, || true)).await
+}

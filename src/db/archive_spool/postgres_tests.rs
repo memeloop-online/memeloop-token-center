@@ -342,6 +342,71 @@ async fn postgres_seal_cancelled_inside_commit_remains_recoverable_after_reconne
 }
 
 #[tokio::test]
+async fn postgres_slow_budget_lock_claims_once_without_cancelling_transaction() {
+    let Some(fixture) = PgFixture::new().await else {
+        return;
+    };
+    fixture.capture().await;
+    assert!(
+        fixture
+            .db
+            .seal_response_archive_spool(fixture.id, 1, 1)
+            .await
+            .unwrap()
+    );
+    fixture.terminal().await;
+    let mut blocker = fixture.db.pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1 FOR UPDATE",
+    )
+    .fetch_one(&mut *blocker)
+    .await
+    .unwrap();
+    let first_db = fixture.db.clone();
+    let first = tokio::spawn(async move {
+        crate::response_archive_spool::observed_claim_for_test(&first_db, Uuid::new_v4()).await
+    });
+    let second_db = fixture.db.clone();
+    let second = tokio::spawn(async move {
+        crate::response_archive_spool::observed_claim_for_test(&second_db, Uuid::new_v4()).await
+    });
+    // Observe actual server-side row-lock waits, not elapsed sleeps or an
+    // assumed query schedule. Neither claimant can UPDATE before release.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND query LIKE '%response_archive_spool_budget%' AND wait_event_type = 'Lock'")
+                .bind(&fixture.schema).fetch_one(&fixture.admin).await.unwrap();
+            if waiting == 2 { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("both claims must wait on the real budget lock");
+    // Advance only the worker's clock across the removed 2s deadline. The
+    // server lock stays held until this test explicitly commits its owner.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::time::resume();
+    tokio::task::yield_now().await;
+    assert!(!first.is_finished());
+    assert!(!second.is_finished());
+    blocker.commit().await.unwrap();
+    let (first, second) = tokio::join!(first, second);
+    let tasks = [first.unwrap().unwrap(), second.unwrap().unwrap()];
+    assert_eq!(tasks.iter().filter(|task| task.is_some()).count(), 1);
+    let row = sqlx::query("SELECT state, attempts, lease_token FROM response_archive_spools")
+        .fetch_one(&fixture.db.pool)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<String, _>("state"), "uploading");
+    assert_eq!(row.get::<i64, _>("attempts"), 1);
+    let winner = tasks.into_iter().flatten().next().unwrap();
+    assert_eq!(
+        row.get::<String, _>("lease_token"),
+        winner.lease_token.to_string()
+    );
+    fixture.finish().await;
+}
+
+#[tokio::test]
 async fn postgres_claim_cancelled_inside_commit_is_reclaimed_with_new_fence() {
     let Some(fixture) = PgFixture::new().await else {
         return;

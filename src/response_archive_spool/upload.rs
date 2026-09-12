@@ -61,6 +61,15 @@ async fn process_one_until_shutdown(
     owner: Uuid,
     shutdown: Option<&watch::Receiver<bool>>,
 ) -> bool {
+    process_one_with_admission(state, owner, shutdown, || !shutdown.is_some_and(stopping)).await
+}
+
+pub(super) async fn process_one_with_admission(
+    state: &AppState,
+    owner: Uuid,
+    shutdown: Option<&watch::Receiver<bool>>,
+    admit: impl FnOnce() -> bool,
+) -> bool {
     // Stop at a committed transaction boundary instead of cancelling a live
     // SQL future. The latter can race SQLx's asynchronous rollback with the
     // next pooled BEGIN and generate transaction-state protocol notices.
@@ -85,20 +94,13 @@ async fn process_one_until_shutdown(
     else {
         return false;
     };
-    let task = match observe_claim(state.db.claim_response_archive_spool(owner)).await {
+    let task = match observe_claim(state.db.claim_response_archive_spool_if(owner, admit)).await {
         Ok(Some(task)) => task,
         Ok(None) | Err(_) => return false,
     };
-    if shutdown.is_some_and(stopping) {
-        // No object I/O has started. Leave the committed lease fenced; normal
-        // lease expiry recovers it, even if the process exits immediately.
-        tracing::info!(
-            stage = "response_spool_claim",
-            outcome = "shutdown_after_commit",
-            "response archive claim preserved for lease recovery"
-        );
-        return false;
-    }
+    // Admission happened inside the claim transaction. Complete this one
+    // bounded attempt even if shutdown arrived during COMMIT; never consume a
+    // retry merely to abandon a freshly committed claim without object I/O.
     let success = matches!(
         tokio::time::timeout(UPLOAD_TIMEOUT, upload(state, &task)).await,
         Ok(Ok(()))
@@ -119,7 +121,7 @@ async fn process_one_until_shutdown(
     true
 }
 
-async fn observe_claim<T>(
+pub(super) async fn observe_claim<T>(
     claim: impl Future<Output = Result<Option<T>, AppError>>,
 ) -> Result<Option<T>, AppError> {
     let started = tokio::time::Instant::now();
