@@ -161,7 +161,7 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
 
   await openAppRoute(page, 'operator', 'providers');
   const onboarding = page.locator('.provider-onboarding');
-  await onboarding.locator('summary').click();
+  await onboarding.locator(':scope > summary').click();
   await assertVisible(onboarding.getByRole('button', { name: 'API 凭据', exact: true }));
   await assertVisible(onboarding.getByRole('button', { name: '账户授权', exact: true }));
   await assertVisible(page.getByText('Browser mock upstream', { exact: true }));
@@ -226,7 +226,7 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
   const page = this.requirePage();
   await openAppRoute(page, 'operator', 'providers');
   const onboarding = page.locator('.provider-onboarding');
-  await onboarding.locator('summary').click();
+  await onboarding.locator(':scope > summary').click();
   await assertVisible(page.getByRole('heading', { name: '上游服务', exact: true }));
   await assertContains(page.locator('.provider-list'), '连接并管理模型服务。');
   await assertVisible(onboarding.getByRole('button', { name: 'API 凭据', exact: true }));
