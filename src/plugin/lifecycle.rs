@@ -421,6 +421,49 @@ mod tests {
     }
 
     #[test]
+    fn approved_upgrade_roundtrip_preserves_required_policy_inventory() {
+        let manifest: super::super::PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "policy", "version": "1.0.0", "wit_version": "0.2.0", "wasm": null,
+            "contributions": {"traffic_policy": true}
+        }))
+        .unwrap();
+        let mut upgrade = manifest.clone();
+        upgrade.version = "2.0.0".into();
+        let mut disabled = upgrade.clone();
+        disabled.contributions.traffic_policy = false;
+        let approved = |manifest: &super::super::PluginManifest| PluginGrant {
+            version: manifest.version.clone(),
+            capabilities: vec![],
+            manifest_digest: manifest_digest(manifest).unwrap(),
+            identity: identity(),
+        };
+        let candidate = |manifest| PluginRuntime {
+            plugins: Arc::new(vec![super::super::LoadedPlugin {
+                manifest,
+                component: None,
+                configuration_validator: None,
+                identity: identity(),
+            }]),
+            ..PluginRuntime::default()
+        };
+        let grants = BTreeMap::from([(
+            "policy".into(),
+            vec![approved(&manifest), approved(&upgrade), approved(&disabled)],
+        )]);
+        let manager = RuntimeRevisions::new(candidate(manifest), grants).unwrap();
+        assert!(manager.replace(1, PluginRuntime::default()).is_err());
+        assert!(
+            manager.replace(1, candidate(disabled)).is_err(),
+            "approval of bytes is not disable authority"
+        );
+        let mut forged = candidate(upgrade.clone());
+        Arc::make_mut(&mut forged.plugins)[0].identity.provenance = None;
+        assert!(manager.replace(1, forged).is_err());
+        assert_eq!(manager.replace(1, candidate(upgrade)).unwrap().revision, 2);
+        assert_eq!(manager.rollback(2).unwrap().revision, 3);
+    }
+
+    #[test]
     fn stale_success_cannot_clear_new_failures_or_steal_half_open_probe() {
         let now = Instant::now();
         let mut circuit = Circuit::default();
