@@ -31,7 +31,7 @@ test('focused source modules retain their extracted boundaries', () => {
   excludes('src/api/proxy.rs', 'tokio::spawn(async move');
 
   const proxy = read('src/api/proxy.rs').split('\n');
-  const start = proxy.findIndex((line) => line.startsWith('pub(super) async fn proxy('));
+  const start = proxy.findIndex((line) => line.startsWith('pub(in crate::api) async fn proxy_with_identity('));
   const end = proxy.findIndex((line) => line.startsWith('fn trusted_input_token_overhead_ceiling('));
   assert.ok(start >= 0 && end >= start && end - start <= 550, `proxy entrypoint spans ${end - start} lines; expected at most 550`);
 
