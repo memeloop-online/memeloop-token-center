@@ -5,13 +5,14 @@ import type { UpstreamAccount } from '../types';
 import { isPrivateProxyUrl } from './upstreamConnectionPolicy';
 export { connectionSchema, isPrivateProxyUrl } from './upstreamConnectionPolicy';
 import './upstreamConnection.css';
+import { SecretInput } from '../SecretInput';
 
 export function ProxyInput({ value, onChange, disabled = false }: { value: string; onChange: (value: string) => void; disabled?: boolean }) {
   const { t } = useI18n();
   const id = useId();
   const invalid = Boolean(value && !isPrivateProxyUrl(value.trim()));
   return <div className="upstream-proxy-editor">
-    <label>{t('connection.proxyUrl')} · {t('connection.required')}<input type="password" required aria-invalid={invalid} aria-describedby={`${id}-hint${invalid ? ` ${id}-error` : ''}`} autoComplete="new-password" spellCheck={false} disabled={disabled} value={value} onChange={(event) => onChange(event.target.value)} placeholder="socks5h://10.0.0.10:1080" /></label>
+    <label htmlFor={id}>{t('connection.proxyUrl')} · {t('connection.required')}</label><SecretInput id={id} label={t('connection.proxyUrl')} required aria-invalid={invalid} aria-describedby={`${id}-hint${invalid ? ` ${id}-error` : ''}`} autoComplete="new-password" disabled={disabled} value={value} onChange={(event) => onChange(event.target.value)} placeholder="socks5h://10.0.0.10:1080" />
     <p id={`${id}-hint`}>{t('connection.proxyHint')}</p>
     {invalid && <p id={`${id}-error`} role="alert">{t('connection.proxyInvalid')}</p>}
   </div>;

@@ -4,6 +4,7 @@ export type Locale = 'zh-CN' | 'en';
 type Variables = Record<string, string | number>;
 
 const zh = {
+  'secret.show': '显示', 'secret.hide': '隐藏', 'secret.showField': '显示{{field}}', 'secret.hideField': '隐藏{{field}}', 'secret.value': '敏感值', 'secret.invalidJson': '请输入有效 JSON；敏感内容不会显示在错误中。',
   'connection.baseUrl': '上游 API 地址（Base URL）',
   'connection.capabilitiesSection': '可选能力与用量契约',
   'connection.capabilitiesHint': '仅在使用图片、视频或供应商特有的用量协议时配置。收起不会丢失已填写内容；校验失败会自动展开。',
@@ -453,6 +454,7 @@ const zh = {
 } as const;
 
 const en = {
+  'secret.show': 'Show', 'secret.hide': 'Hide', 'secret.showField': 'Show {{field}}', 'secret.hideField': 'Hide {{field}}', 'secret.value': 'Secret value', 'secret.invalidJson': 'Enter valid JSON. Secret contents are not shown in errors.',
   'connection.baseUrl': 'Upstream API address (Base URL)',
   'connection.capabilitiesSection': 'Optional capabilities and usage contracts',
   'connection.capabilitiesHint': 'Configure only for images, video, or provider-specific usage contracts. Collapsing preserves your values; validation errors reveal the relevant section.',

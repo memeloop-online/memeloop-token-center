@@ -8,6 +8,7 @@ import { localizeSchema, useI18n } from '../../i18n';
 import { LimitSnapshot } from '../../LimitSnapshot';
 import { ModelPicker } from '../../ModelPicker';
 import { schemaFormFields, schemaFormTemplates } from '../../SchemaTemplates';
+import { SecureSchemaField, withoutSecretDefaults } from '../../SecureSchemaField';
 import { safeValidator as validator } from '../../safeValidator';
 import type {
   ConfigurationSchemas, CredentialRoutingView, GenerationPriceView, GroupView, KeyLimitSnapshot, KeyListCursor, KeyView,
@@ -36,9 +37,12 @@ import { useInlineEditorFocus } from '../hooks/useInlineEditorFocus';
 import { loadModelPricePages } from '../pricingLoading';
 import { enumLabel, messageOf, OneTimeSecret, queryForTenant, WriteScopeNotice } from '../scope/operatorShared';
 
-function Form(props: FormProps) {
-  return <RjsfForm {...props} noHtml5Validate onError={() => { /* Validation is rendered inline. */ }} />;
+export function OperatorSchemaForm(props: FormProps) {
+  const schema = useMemo(() => withoutSecretDefaults(props.schema), [props.schema]);
+  return <RjsfForm {...props} schema={schema} fields={{ ...props.fields, SchemaField: SecureSchemaField }} noHtml5Validate onError={() => { /* Validation is rendered inline; never log form data. */ }} />;
 }
+
+const Form = OperatorSchemaForm;
 
 const secretResponseRequestPolicy = {
   cache: 'no-store',
