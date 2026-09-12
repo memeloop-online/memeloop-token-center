@@ -632,6 +632,7 @@ pub(super) async fn proxy(
         .metrics
         .memory_usage(crate::metrics::MemoryComponent::RequestBuffer, body.len());
     let key = authenticate_downstream(&headers, &state).await?;
+    let state = state.pin_application_plugins().await?;
     let proxy_lifecycle_permit = state
         .proxy_lifecycle_permits
         .clone()

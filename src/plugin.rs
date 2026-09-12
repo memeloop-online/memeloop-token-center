@@ -22,8 +22,11 @@ use crate::{
     provider::ProviderType,
 };
 
+#[cfg(feature = "experimental-plugin-revisions")]
+pub mod application;
 mod configuration;
-/// Experimental primitives only; not connected to AppState or management APIs.
+/// Experimental lifecycle primitives; application integration is separately
+/// host-opted-in through `application` and never enabled by the production binary.
 #[cfg(feature = "experimental-plugin-revisions")]
 pub mod lifecycle;
 pub use configuration::{
@@ -304,7 +307,7 @@ pub struct PluginInstallProvenance {
     pub signature_policy: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PluginPackageIdentity {
     pub component_sha256: Option<String>,
     pub provenance: Option<PluginInstallProvenance>,

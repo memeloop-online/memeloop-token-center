@@ -323,7 +323,22 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route(
             "/internal/v1/integrations/memeloop-cloud/principals/ensure",
             post(ensure_memeloop_cloud_principal),
+        );
+    #[cfg(feature = "experimental-plugin-revisions")]
+    let authenticated = authenticated
+        .route(
+            "/internal/v1/plugin-runtime/candidates",
+            post(super::super::plugins::stage_application_plugin),
         )
+        .route(
+            "/internal/v1/plugin-runtime/publish",
+            post(super::super::plugins::publish_application_plugin),
+        )
+        .route(
+            "/internal/v1/plugin-runtime/rollback",
+            post(super::super::plugins::rollback_application_plugin),
+        );
+    let authenticated = authenticated
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             authenticate_control_before_body,

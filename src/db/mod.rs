@@ -50,6 +50,8 @@ mod monitoring_snapshot;
 mod oauth_sessions;
 mod plugin_configurations;
 mod plugin_kv;
+#[cfg(feature = "experimental-plugin-revisions")]
+mod plugin_revisions;
 mod providers;
 mod requests;
 mod rotation;

@@ -17,6 +17,70 @@ use crate::{
     },
 };
 
+#[cfg(feature = "experimental-plugin-revisions")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct StageApplicationPluginRequest {
+    inventory_id: String,
+}
+
+#[cfg(feature = "experimental-plugin-revisions")]
+async fn application_authority(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<std::sync::Arc<crate::plugin::application::ApplicationPlugins>, AppError> {
+    let service = require_service(headers, state, "plugins:write").await?;
+    super::require_global_service(&service)?;
+    state.application_plugins.clone().ok_or(AppError::NotFound)
+}
+
+#[cfg(feature = "experimental-plugin-revisions")]
+fn runtime_operation_key(headers: &HeaderMap) -> Result<&str, AppError> {
+    headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| AppError::BadRequest("Idempotency-Key is required".into()))
+}
+
+#[cfg(feature = "experimental-plugin-revisions")]
+pub(in crate::api) async fn stage_application_plugin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<StageApplicationPluginRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let authority = application_authority(&state, &headers).await?;
+    authority.stage(&body.inventory_id).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[cfg(feature = "experimental-plugin-revisions")]
+pub(in crate::api) async fn publish_application_plugin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::plugin::application::PublishApplicationPlugin>,
+) -> Result<impl IntoResponse, AppError> {
+    let authority = application_authority(&state, &headers).await?;
+    Ok(Json(
+        authority
+            .publish(body, runtime_operation_key(&headers)?)
+            .await?,
+    ))
+}
+
+#[cfg(feature = "experimental-plugin-revisions")]
+pub(in crate::api) async fn rollback_application_plugin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::plugin::application::RollbackApplicationPlugin>,
+) -> Result<impl IntoResponse, AppError> {
+    let authority = application_authority(&state, &headers).await?;
+    Ok(Json(
+        authority
+            .rollback(body, runtime_operation_key(&headers)?)
+            .await?,
+    ))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(in crate::api) struct PluginConfigurationQuery {
