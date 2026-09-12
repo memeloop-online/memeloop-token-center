@@ -57,6 +57,7 @@ struct ModelPickerPage {
 #[serde(deny_unknown_fields)]
 struct ModelPickerCursor {
     version: u8,
+    selection_kind: ModelPickerSelectionKind,
     scope_sha256: String,
     sort_label: String,
     identity: String,
@@ -159,6 +160,7 @@ pub(super) async fn list_model_picker_options(
         let last = data.last().ok_or(AppError::Internal)?;
         Some(encode_cursor(ModelPickerCursor {
             version: 1,
+            selection_kind: query.selection_kind,
             scope_sha256,
             sort_label: last.sort_label.clone(),
             identity: last.sort_identity.clone(),
@@ -232,6 +234,7 @@ fn decode_cursor(
         }
     };
     if cursor.version != 1
+        || cursor.selection_kind != selection_kind
         || cursor.scope_sha256 != expected_scope_sha256
         || cursor.sort_label.len() > 200
         || !valid_identity
@@ -261,6 +264,7 @@ mod tests {
         let route = Uuid::now_v7();
         let encoded = encode_cursor(ModelPickerCursor {
             version: 1,
+            selection_kind: ModelPickerSelectionKind::Route,
             scope_sha256: digest.clone(),
             sort_label: "model".to_owned(),
             identity: route.to_string(),
