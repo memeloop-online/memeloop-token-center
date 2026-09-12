@@ -19,7 +19,7 @@ test('group repeated account names by stable identity without losing or recomput
   assert.deepEqual(monitoringAccountGroups([]), []);
 });
 
-test('model headings are unique while Copilot, Cursor and Kimi keep their own account facts', () => {
+test('model headings are unique while all synthetic account facts including duplicate pairs survive', () => {
   const rows = ['Copilot', 'Cursor', 'Kimi'].map((name, index) => ({
     upstream_account_id: `account-${index}`, upstream_name: name, model: 'shared-model',
     metrics: { requests: index + 1, successful_requests: index, failed_requests: 1,
@@ -30,8 +30,9 @@ test('model headings are unique while Copilot, Cursor and Kimi keep their own ac
   const secondModel = { ...rows[0], model: 'other-model' };
   const groups = monitoringModelGroups([...rows, rows[0], secondModel]);
   assert.deepEqual(groups.map((group) => group.model), ['shared-model', 'other-model']);
-  assert.deepEqual(groups[0].accounts.map((row) => row.upstream_name), ['Copilot', 'Cursor', 'Kimi']);
+  assert.deepEqual(groups[0].accounts.map((row) => row.upstream_name), ['Copilot', 'Cursor', 'Kimi', 'Copilot']);
   rows.forEach((row, index) => assert.equal(groups[0].accounts[index], row, 'metrics remain exact server facts, not summed costs or averaged percentiles'));
   assert.equal(groups[1].accounts[0], secondModel);
+  assert.equal(groups[0].accounts[3], rows[0], 'duplicate pairs are not silently discarded');
   assert.deepEqual(monitoringModelGroups([]), []);
 });

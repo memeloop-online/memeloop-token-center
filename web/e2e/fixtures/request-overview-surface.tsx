@@ -4,6 +4,7 @@ import { I18nProvider } from '../../src/i18n';
 import { MonitoringSnapshot } from '../../src/operator/MonitoringSnapshot';
 import { TypedFilterBuilder, emptyTypedFilterAst } from '../../src/operator/TypedFilterBuilder';
 import type { OperatorMonitoringSnapshot } from '../../src/types';
+import { requestOverviewFacts } from './request-overview-facts';
 import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/styles/metrics.css';
@@ -16,10 +17,7 @@ const snapshot: OperatorMonitoringSnapshot = {
   from_created_at: 0, to_created_at: 1000, granularity: 'hour',
   latency_is_approximate: true, latency_method: 'fixed_histogram_upper_bound_capped_60000ms', summary,
   freshness: { latest_terminal_created_at: null, age_millis: null }, health,
-  top_upstream_models: ['Copilot', 'Cursor', 'Kimi'].map((name, index) => ({
-    upstream_account_id: `account-${index}`, upstream_name: name, model: 'shared-model',
-    metrics: { ...summary, p95_duration_ms: 420 + index }, health, terminal_outcomes: [],
-  })),
+  top_upstream_models: requestOverviewFacts,
 };
 
 // The fixture has no service credential and never forwards application fetches.
