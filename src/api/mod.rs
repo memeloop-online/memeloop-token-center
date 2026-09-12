@@ -38,6 +38,7 @@ mod cloud_principals;
 mod control_requests;
 mod credentials;
 mod diagnostics;
+mod filter_assistant;
 mod generation;
 mod groups;
 mod health;
@@ -77,8 +78,8 @@ use cloud_entitlements::{
 use cloud_principals::ensure_memeloop_cloud_principal;
 use control_requests::{
     ManagementTenantQuery, cancel_internal_generation, configuration_schemas,
-    get_filter_assistant_settings, get_filter_presets, internal_generation,
-    internal_generation_asset, internal_generations, internal_request_asset,
+    filter_assistant_billing_choices, get_filter_assistant_settings, get_filter_presets,
+    internal_generation, internal_generation_asset, internal_generations, internal_request_asset,
     internal_request_detail, internal_request_events, internal_requests, internal_stats,
     list_tenants, plan_filter_with_assistant, plugin_manifests, provider_types,
     put_filter_assistant_settings, put_filter_preset, typed_internal_requests,

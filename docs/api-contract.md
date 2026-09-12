@@ -215,8 +215,17 @@ tenant/key scoped, limits pages to 100 rows, and uses a look-ahead keyset cursor
 Saved and recent filters are per service identity and tenant. The filter assistant
 returns the same validated AST for an explicit browser preview; it cannot execute
 model-generated SQL. A tenant administrator selects an enabled MTC model-route
-reference at `/internal/v1/filter-assistant/settings`; only that UUID and update
-time are stored or returned, never a credential secret.
+reference and billing credential at `/internal/v1/filter-assistant/settings`.
+Both references are revalidated before each request; normal proxy grants,
+reservation, budgets, timeouts and accounting apply. Settings updates use
+`expected_updated_at` and commit an audit receipt atomically. No credential
+secret is restored or returned. Settings without a billing reference do not
+invoke a model. Only the bounded user intent, current time and fixed AST schema
+are sent; request records and upstream configuration are excluded. Invalid,
+oversized or incomplete model output cannot become an applied filter.
+Invoking the model requires the dedicated `filter_assistant:execute` service
+scope; request readers do not inherit authority to spend the configured billing
+credential or disclose filter intent to its upstream provider.
 
 Conversation APIs remain credential-scoped. They expose explicit session and
 execution declarations, structured parent relations, bounded inferred edges and

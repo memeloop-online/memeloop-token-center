@@ -3410,7 +3410,7 @@ paths:
       tags: [Operator traffic]
       operationId: getFilterAssistantSettings
       summary: Read the tenant's filter-assistant model-route reference
-      description: The response contains only a stable model route UUID; it never returns an upstream or MTC credential secret.
+      description: The response contains stable model route and billing credential references; it never returns a credential secret. A missing billing reference means model execution is not enabled.
       security: [{ serviceBearer: [] }]
       x-required-scope: requests:read
       parameters: [{ $ref: '#/components/parameters/TenantFilter' }]
@@ -3430,7 +3430,7 @@ paths:
       tags: [Operator traffic]
       operationId: putFilterAssistantSettings
       summary: Set the tenant's approved filter-assistant model route
-      description: Requires a global provider-write operator credential. The route must be enabled in the selected tenant and only its UUID is persisted.
+      description: Requires a global operator with providers:write and keys:write. The enabled text route and active billing credential must share a tenant and an eligible route grant. Updates compare expected_updated_at and create a transactional audit receipt.
       security: [{ serviceBearer: [] }]
       x-required-scope: providers:write
       requestBody:
@@ -3449,6 +3449,58 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /internal/v1/filter-assistant/billing-choices:
+    get:
+      tags: [Operator traffic]
+      operationId: getFilterAssistantBillingChoices
+      summary: List eligible billing credential references for a text route
+      description: Checks a bounded keyset page of 100 tenant credentials against current route grants and availability. Returns only identity labels and UUIDs, never secrets, and never probes an upstream. Empty data can still have a next cursor when no credential on that page is eligible.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:read
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+        - name: model_route_id
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+        - name: before_created_at
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: before_id
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Eligible billing identities.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, next_cursor]
+                properties:
+                  data:
+                    type: array
+                    maxItems: 100
+                    items:
+                      type: object
+                      additionalProperties: false
+                      required: [key_id, alias, principal]
+                      properties:
+                        key_id: { type: string, format: uuid }
+                        alias: { type: string }
+                        principal: { type: string }
+                  next_cursor:
+                    type: [object, 'null']
+                    additionalProperties: false
+                    required: [before_created_at, before_id]
+                    properties:
+                      before_created_at: { type: integer, format: int64 }
+                      before_id: { type: string, format: uuid }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
   /internal/v1/filter-assistant/plan:
     post:
       tags: [Operator traffic]
@@ -3458,9 +3510,14 @@ paths:
         The assistant output is constrained to `TypedFilterAst` and is validated by the
         same server-side allow-list as manual filters. It is a preview only: clients must
         explicitly apply it through the typed request query endpoint. Raw SQL is neither
-        accepted nor returned.
+        accepted nor returned. The configured route is invoked through normal proxy
+        accounting using the explicit billing credential. Only the bounded intent and
+        fixed schema are sent. Missing billing configuration, revoked grants, exhausted
+        budgets and invalid model output fail without applying a filter. Callers need
+        the dedicated `filter_assistant:execute` scope because this operation incurs
+        billable upstream execution; `requests:read` alone is deliberately insufficient.
       security: [{ serviceBearer: [] }]
-      x-required-scope: requests:read
+      x-required-scope: filter_assistant:execute
       requestBody:
         required: true
         content:
@@ -3476,6 +3533,9 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '424': { $ref: '#/components/responses/UnpricedModel' }
+        '429': { $ref: '#/components/responses/UsageRejected' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
 
   /internal/v1/sessions:
     get:
@@ -5362,6 +5422,7 @@ components:
         status: { $ref: '#/components/schemas/CredentialStatus' }
     ServiceScope:
       type: string
+      description: Exact service capability. filter_assistant:execute authorizes billable filter-assistant model execution independently of requests:read.
       enum:
         - keys:read
         - keys:write
@@ -5369,6 +5430,7 @@ components:
         - credits:write
         - entitlements:read
         - entitlements:write
+        - filter_assistant:execute
         - generations:write
         - requests:read
         - providers:read
@@ -7296,13 +7358,16 @@ components:
           format: uuid
           description: Stable enabled MTC model-route reference; no credential material is returned.
         updated_at: { type: integer, format: int64 }
+        billing_key_id: { type: [string, 'null'], format: uuid }
     PutFilterAssistantSettingsRequest:
       type: object
       additionalProperties: false
-      required: [tenant_external_id, model_route_id]
+      required: [tenant_external_id, model_route_id, billing_key_id, expected_updated_at]
       properties:
         tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
         model_route_id: { type: string, format: uuid }
+        billing_key_id: { type: string, format: uuid }
+        expected_updated_at: { type: [integer, 'null'], format: int64 }
     FilterAssistantPlanRequest:
       type: object
       additionalProperties: false

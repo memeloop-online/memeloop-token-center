@@ -49,6 +49,9 @@ const PLUGIN_SERVICE_DATA_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PLUGIN_SERVICE_DATA_TIMEOUT_MILLIS: u64 = 10_000;
 const MAX_PLUGIN_SERVICE_DATA_BODY_BYTES: usize = 1024 * 1024;
 const SUPPORTED_WIT_REQUIREMENT: &str = ">=0.2.0, <0.3.0";
+// These plugin_kv namespaces contain core-owned policy or its immutable
+// receipt. Guest components must never acquire them through their manifest ID.
+const CORE_PLUGIN_KV_NAMESPACES: &[&str] = &["typed-filter", "filter-assistant-audit"];
 const CORE_OPERATOR_ROUTES: &[&str] = &[
     "overview",
     "requests",
@@ -1823,6 +1826,12 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), AppError> {
             "plugin id must contain lowercase ASCII letters, digits, or hyphens".into(),
         ));
     }
+    if CORE_PLUGIN_KV_NAMESPACES.contains(&manifest.id.as_str()) {
+        return Err(AppError::BadRequest(format!(
+            "plugin id {} is reserved for core storage",
+            manifest.id
+        )));
+    }
     if semver::Version::parse(&manifest.version).is_err()
         || !semver::VersionReq::parse(SUPPORTED_WIT_REQUIREMENT)
             .map_err(|_| AppError::Internal)?
@@ -2461,6 +2470,23 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn core_policy_kv_namespaces_cannot_be_claimed_by_plugins() {
+        let schema = serde_json::json!({"type": "object"});
+        for reserved in CORE_PLUGIN_KV_NAMESPACES {
+            let mut manifest = configurable_manifest(schema.clone(), serde_json::json!({}));
+            manifest.id = (*reserved).to_owned();
+            assert!(
+                matches!(validate_manifest(&manifest), Err(AppError::BadRequest(message)) if message.contains("reserved for core storage")),
+                "core namespace {reserved} must not be a valid plugin identity"
+            );
+        }
+
+        let mut ordinary = configurable_manifest(schema, serde_json::json!({}));
+        ordinary.id = "typed-filter-extension".to_owned();
+        assert!(validate_manifest(&ordinary).is_ok());
     }
 
     #[test]
