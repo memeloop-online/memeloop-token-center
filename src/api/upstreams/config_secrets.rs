@@ -1,7 +1,9 @@
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 
-use super::config_secret_graph::{has_secret, secret_cycle};
+use super::config_secret_graph::{
+    SecretReachability, has_secret, secret_cycle, secret_reachability,
+};
 use crate::{AppState, error::AppError, provider::UpstreamAccountView};
 
 fn invalid() -> AppError {
@@ -9,7 +11,8 @@ fn invalid() -> AppError {
 }
 
 fn paths(schema: &Value) -> Result<Vec<Vec<String>>, AppError> {
-    if !has_secret(schema, schema, false)? {
+    let reachability = secret_reachability(schema)?;
+    if !reachability.contains(schema) {
         return Ok(Vec::new());
     }
     fn visit(
@@ -19,7 +22,14 @@ fn paths(schema: &Value) -> Result<Vec<Vec<String>>, AppError> {
         output: &mut Vec<Vec<String>>,
         ancestors: &mut HashSet<usize>,
         budget: &mut usize,
+        reachability: &SecretReachability,
     ) -> Result<(), AppError> {
+        // Non-secret SCCs may have exponentially many simple paths. Their
+        // contents cannot contribute an omission path, so prune them once
+        // using the same linear reachability analysis as cycle detection.
+        if !reachability.contains(node) {
+            return Ok(());
+        }
         *budget = budget.checked_sub(1).ok_or_else(invalid)?;
         if ancestors.len() >= 256 {
             return Err(super::config_secret_graph::invalid());
@@ -39,19 +49,19 @@ fn paths(schema: &Value) -> Result<Vec<Vec<String>>, AppError> {
                 .strip_prefix('#')
                 .and_then(|pointer| root.pointer(pointer))
                 .ok_or_else(invalid)?;
-            visit(root, target, path, output, ancestors, budget)?;
+            visit(root, target, path, output, ancestors, budget, reachability)?;
         }
         for keyword in ["allOf", "oneOf", "anyOf"] {
             if let Some(parts) = node.get(keyword).and_then(Value::as_array) {
                 for part in parts {
-                    visit(root, part, path, output, ancestors, budget)?;
+                    visit(root, part, path, output, ancestors, budget, reachability)?;
                 }
             }
         }
         if let Some(properties) = node.get("properties").and_then(Value::as_object) {
             for (key, child) in properties {
                 path.push(key.clone());
-                visit(root, child, path, output, ancestors, budget)?;
+                visit(root, child, path, output, ancestors, budget, reachability)?;
                 path.pop();
             }
         }
@@ -59,7 +69,15 @@ fn paths(schema: &Value) -> Result<Vec<Vec<String>>, AppError> {
         // reconstruct indices from a partially redacted array.
         if let Some(items) = node.get("items") {
             let mut nested = Vec::new();
-            visit(root, items, &mut Vec::new(), &mut nested, ancestors, budget)?;
+            visit(
+                root,
+                items,
+                &mut Vec::new(),
+                &mut nested,
+                ancestors,
+                budget,
+                reachability,
+            )?;
             if !nested.is_empty() {
                 output.push(path.clone());
             }
@@ -75,6 +93,7 @@ fn paths(schema: &Value) -> Result<Vec<Vec<String>>, AppError> {
         &mut output,
         &mut HashSet::new(),
         &mut 20_480,
+        &reachability,
     )?;
     output.sort();
     output.dedup();
@@ -190,6 +209,38 @@ pub(super) fn public_account(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn dense_public_recursive_schemas_do_not_exhaust_secret_path_budget() {
+        for width in [8, 32, 64] {
+            let mut definitions = serde_json::Map::new();
+            for index in 0..width {
+                definitions.insert(
+                    format!("node{index}"),
+                    json!({"allOf": (0..width).map(|target| json!({"$ref": format!("#/$defs/node{target}")})).collect::<Vec<_>>()}),
+                );
+            }
+            let schema = json!({"$defs": definitions, "properties": {
+                "public": {"$ref": "#/$defs/node0"},
+                "secret": {"writeOnly": true}
+            }});
+            validate_create(&schema).unwrap();
+            assert_eq!(paths(&schema).unwrap(), vec![vec!["secret".to_string()]]);
+            let current = json!({"public": {"nested": "kept"}, "secret": "synthetic-old"});
+            let mut public = current.clone();
+            redact(&schema, &mut public).unwrap();
+            assert_eq!(public, json!({"public": {"nested": "kept"}}));
+            let mut incoming = json!({"public": {"nested": "updated"}});
+            preserve(&schema, &current, &mut incoming).unwrap();
+            assert_eq!(
+                incoming,
+                json!({"public": {"nested": "updated"}, "secret": "synthetic-old"})
+            );
+            incoming["secret"] = json!("synthetic-new");
+            preserve(&schema, &current, &mut incoming).unwrap();
+            assert_eq!(incoming["secret"], "synthetic-new");
+        }
+    }
 
     #[test]
     fn dynamic_and_conditional_secret_configs_are_fully_redacted_and_updates_rejected() {

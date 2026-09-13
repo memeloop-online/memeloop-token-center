@@ -83,7 +83,20 @@ pub(super) fn secret_cycle(root: &Value) -> Result<bool, AppError> {
 // Build reverse reachability once, rather than searching from every DFS
 // back-edge. Each edge is visited at most three times, even for dense SCCs.
 // The work count provides a deterministic complexity contract in tests.
-fn secret_cycle_with_work(root: &Value) -> Result<(bool, usize), AppError> {
+pub(super) struct SecretReachability {
+    graph: HashMap<usize, Vec<usize>>,
+    reaches_secret: HashSet<usize>,
+    work: usize,
+}
+
+impl SecretReachability {
+    pub(super) fn contains(&self, node: &Value) -> bool {
+        self.reaches_secret
+            .contains(&(node as *const Value as usize))
+    }
+}
+
+pub(super) fn secret_reachability(root: &Value) -> Result<SecretReachability, AppError> {
     let identity = |node: &Value| node as *const Value as usize;
     let mut pending = vec![root];
     let mut graph = HashMap::<usize, Vec<usize>>::new();
@@ -120,7 +133,20 @@ fn secret_cycle_with_work(root: &Value) -> Result<(bool, usize), AppError> {
             }
         }
     }
-    let mut pending = vec![(identity(root), false)];
+    Ok(SecretReachability {
+        graph,
+        reaches_secret,
+        work,
+    })
+}
+
+fn secret_cycle_with_work(root: &Value) -> Result<(bool, usize), AppError> {
+    let SecretReachability {
+        graph,
+        reaches_secret,
+        mut work,
+    } = secret_reachability(root)?;
+    let mut pending = vec![(root as *const Value as usize, false)];
     let mut ancestors = HashSet::new();
     let mut finished = HashSet::new();
     while let Some((identity, exiting)) = pending.pop() {
