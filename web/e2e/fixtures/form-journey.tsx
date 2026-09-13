@@ -22,6 +22,10 @@ window.fetch = async (input, init) => {
   const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
   if (method !== 'GET') {
     window.formJourneyWrites++;
+    if (workflows && new URLSearchParams(location.search).has('provider-workflow') && method === 'POST' && path === '/internal/v1/upstreams') {
+      if (window.failNextFormWrite) { window.failNextFormWrite = false; return new Response(JSON.stringify({ error: { message: '模拟创建失败，草稿仍在' } }), { status: 400 }); }
+      return new Response(JSON.stringify({ ...account, id: 'account-created', name: '已创建测试上游' }), { status: 201 });
+    }
     if (!workflows || !['/internal/v1/model-routes', '/internal/v1/model-routes/route-existing'].includes(path) || !['POST', 'PUT'].includes(method)) throw new Error('Mutation outside the explicit local workflow fixture');
     if (window.failNextFormWrite) { window.failNextFormWrite = false; return new Response(JSON.stringify({ error: { message: '模拟保存失败，草稿仍在' } }), { status: 400 }); }
     const data = JSON.parse(String(init?.body ?? '{}'));

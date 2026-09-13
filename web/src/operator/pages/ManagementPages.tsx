@@ -83,6 +83,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   const [editing, setEditing] = useState<UpstreamAccount>();
   const [reauthorizing, setReauthorizing] = useState<UpstreamAccount>();
   const [providerWorkspaceOpen, setProviderWorkspaceOpen] = useState(false);
+  const [providerCreateGeneration, setProviderCreateGeneration] = useState(0);
   const providerSuccess = useRef<HTMLDivElement>(null);
   const [busy, setBusy] = useState('');
   const { container: providerList, rememberTrigger } = useInlineEditorFocus(editing?.id, Boolean(busy), `${token}\0${tenant}\0${writeTenant}`);
@@ -285,7 +286,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
       <div className="segmented" role="group" aria-label={t('providers.method')}><button type="button" aria-pressed={method === 'direct'} className={method === 'direct' ? 'active' : ''} onClick={() => setMethod('direct')}>{t('providers.direct')}</button><button type="button" aria-pressed={method === 'authorization'} className={method === 'authorization' ? 'active' : ''} onClick={() => setMethod('authorization')}>{t('providers.oauth')}</button></div>
       {method === 'direct' ? <>
         <ModelPicker label={t('providers.provider')} value={provider?.id ?? ''} onChange={setDriver} options={directProviders.map(value => ({ key: value.id, value: value.id, label: value.display_name, provider: value.display_name, upstream: '', capabilities: value.protocols }))} />
-        {schema ? <Form key={`${provider.id}-${locale}`} schema={schema} uiSchema={uiSchema} fields={schemaFormFields} validator={validator} widgets={fluentFormWidgets} templates={upstreamFormTemplates} onSubmit={async ({ formData }) => { if (!writeTenant) return; try { setError(''); await api('/internal/v1/upstreams', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant }) }); setProviderWorkspaceOpen(false); setMessage(t('providers.created')); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!writeTenant || !token}>{t('providers.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
+        {schema ? <Form key={`${provider.id}-${locale}-${providerCreateGeneration}`} schema={schema} uiSchema={uiSchema} fields={schemaFormFields} validator={validator} widgets={fluentFormWidgets} templates={upstreamFormTemplates} onSubmit={async ({ formData }) => { if (!writeTenant) return; try { setError(''); await api('/internal/v1/upstreams', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant }) }); setProviderCreateGeneration(generation => generation + 1); setProviderWorkspaceOpen(false); setMessage(t('providers.created')); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!writeTenant || !token}>{t('providers.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
       </> : <AuthorizationConnection token={token} tenant={writeTenant} providers={providers} onChanged={onChanged} />}</>}
     </CreateJourney>
   </section></>;
@@ -867,6 +868,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const editingRouting = workspace?.kind === 'routing' ? workspace.keyId : undefined;
   const setEditingRouting = (keyId?: string) => activateEditor('routing', keyId);
   const [routingDraft, setRoutingDraft] = useState<CredentialRoutingView>();
+  const routingSaveLock = useRef<symbol | undefined>(undefined);
   useLayoutEffect(() => {
     if (!workspace || workspace.kind === 'create' || activeEditorRegion.current?.contains(document.activeElement)) return;
     const fields = activeEditorRegion.current?.querySelectorAll<HTMLElement>('input:not([type="hidden"]), select, button');
@@ -985,7 +987,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   };
   useEffect(() => {
     secretRequest.current?.abort(); secretRequest.current = undefined; secretOperation.current = undefined; secretRef.current = undefined;
-    scopeGeneration.current += 1; setValues([]); setRoutes([]); setEditingPolicy(undefined); setEditingRouting(undefined); setRoutingDraft(undefined);
+    routingSaveLock.current = undefined; scopeGeneration.current += 1; setValues([]); setRoutes([]); setEditingPolicy(undefined); setEditingRouting(undefined); setRoutingDraft(undefined);
     setRenaming(undefined); setAliasDraft(''); setLimitSnapshots({}); setGranting(undefined); setGrant({ amount: '', source: '' }); setBusy('');
     setNewRouteIds([]); setNewRouteGroupIds([]); setGroupFilter('all'); setSearch(''); setNextCursor(undefined); setKeyListState('initial-loading'); setKeyError(''); setRouteError(''); setSecret(undefined); setMessage(''); setError(''); void load();
     return () => { keyRequest.current?.controller.abort(); routeRequest.current?.controller.abort(); secretRequest.current?.abort(); };
@@ -1114,22 +1116,28 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
       const routing = await api<CredentialRoutingView>(`/internal/v1/keys/${value.key_id}/routing${queryForTenant(operationTenant)}`, operationToken);
       if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || editorGeneration.current !== generation) return;
       setRoutingDraft(routing);
-    } catch (reason) { if (scopeRef.current.token === operationToken && scopeRef.current.tenant === operationTenant) setError(messageOf(reason, t('common.requestFailed'))); }
+    } catch (reason) { if (scopeRef.current.token === operationToken && scopeRef.current.tenant === operationTenant && editorGeneration.current === generation) setError(messageOf(reason, t('common.requestFailed'))); }
   };
   const saveRouting = async (value: KeyView, draft: CredentialRoutingView) => {
+    if (busy || routingSaveLock.current || !canManage(value)) return;
+    const operation = Symbol('credential-routing-save');
+    routingSaveLock.current = operation;
     const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant;
     const generation = editorGeneration.current;
     setBusy('edit-routing'); setError('');
     try {
       const saved = await api<CredentialRoutingView>(`/internal/v1/keys/${value.key_id}/routing`, operationToken, { method: 'PUT', body: JSON.stringify({ tenant_external_id: operationWriteTenant, route_ids: draft.route_ids, route_group_ids: draft.route_group_ids, expected_grant_revision: draft.grant_revision }) });
       if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || scopeRef.current.writeTenant !== operationWriteTenant || editorGeneration.current !== generation) return;
-      setRoutingDraft(saved); setEditingRouting(undefined); setMessage(t('credentials.routingSaved')); setError('');
+      setRoutingDraft(saved); setBusy(''); setEditingRouting(undefined); setMessage(t('credentials.routingSaved')); setError('');
     } catch (reason) {
-      if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || scopeRef.current.writeTenant !== operationWriteTenant) return;
+      if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || scopeRef.current.writeTenant !== operationWriteTenant || editorGeneration.current !== generation) return;
       if (reason instanceof ApiError && reason.status === 409) {
         setError(formJourneyCopy(locale).concurrentDraftPreserved);
       } else setError(messageOf(reason, t('common.requestFailed')));
-    } finally { if (scopeRef.current.token === operationToken && scopeRef.current.tenant === operationTenant && scopeRef.current.writeTenant === operationWriteTenant) setBusy(''); }
+    } finally {
+      if (routingSaveLock.current === operation) routingSaveLock.current = undefined;
+      if (scopeRef.current.token === operationToken && scopeRef.current.tenant === operationTenant && scopeRef.current.writeTenant === operationWriteTenant && editorGeneration.current === generation) setBusy('');
+    }
   };
   const saveCredentialConfiguration = async (value: KeyView, suffix: 'alias' | 'policy', body: unknown, success: string) => {
     if (busy) return;
@@ -1152,7 +1160,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
             <MultiCombobox label={t('credentials.exactRoutes')} options={routeOptions} value={selections(routingDraft.route_ids, routeOptions)} onChange={(selected) => setRoutingDraft({ ...routingDraft, route_ids: selected.map((item) => item.value) })} placeholder={t('credentials.searchRoutes')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} />
             <MultiCombobox label={t('credentials.routeGroups')} options={routeGroupOptions} value={selections(routingDraft.route_group_ids, routeGroupOptions)} onChange={(selected) => setRoutingDraft({ ...routingDraft, route_group_ids: selected.map((item) => item.value) })} placeholder={t('credentials.searchRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('credentials.existingGroupsOnly')} />
             {routingDraft.effective_route_ids.length > 0 && <small className="field-hint">{t('credentials.effectiveRoutes', { count: formatNumber(routingDraft.effective_route_ids.length, locale) })}</small>}
-            <Button appearance="primary" type="button" disabled={!canWrite} onClick={() => void saveRouting(value, routingDraft)}>{t('common.save')}</Button>
+            <Button appearance="primary" type="button" disabled={!canWrite || Boolean(busy)} onClick={() => void saveRouting(value, routingDraft)}>{t('common.save')}</Button>
           </div>}
           {granting === value.key_id && value.account_id && <div className="inline-editor form-panel"><h3>{t('credentials.grantFor', { alias: value.alias })}</h3><label>{t('credentials.grantAmount')} ({value.currency})<input inputMode="decimal" value={grant.amount} onChange={(event) => setGrant({ ...grant, amount: event.target.value })} /></label><label>{t('credentials.grantSource')}<input value={grant.source} onChange={(event) => setGrant({ ...grant, source: event.target.value })} /></label><Button appearance="primary" type="button" disabled={!canWrite || Boolean(busy) || !isPositiveDecimal(grant.amount) || !grant.source.trim()} onClick={async () => { const amount = grant.amount.trim(); const source = grant.source.trim(); if (!await confirm(`${t('credentials.grantFor', { alias: value.alias })}\n${t('credentials.grantAmount')}: ${amount} ${value.currency}\n${t('credentials.grantSource')}: ${source}`)) return; setBusy(`grant-${value.key_id}`); try { await api(`/internal/v1/accounts/${value.account_id}/grants`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ amount, source }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setGranting(undefined); setGrant({ amount: '', source: '' }); setMessage(t('credentials.granted')); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setBusy(''); } }}>{t('credentials.confirmGrant')}</Button></div>}
     {workspace?.kind === 'routing' && !routingDraft && <p role="status">{t('common.loading')}</p>}

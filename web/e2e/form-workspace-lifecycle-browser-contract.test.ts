@@ -94,6 +94,54 @@ test('AppShell workspaces retain failed drafts, return after success, and priori
     await submit.click(); await page.locator('.credential-secret-priority').waitFor();
     assert.equal(await page.locator('.create-journey').getAttribute('data-open'), 'false');
     assert.equal(await page.locator('.credential-secret-priority').evaluate(element => document.activeElement === element), true);
+    // Closing and failed creation preserve a direct-provider draft. Only a
+    // successful create replaces its form instance and clears the API secret.
+    await page.goto(`${origin}/e2e/fixtures/form-journey.html?workflows&provider-workflow`);
+    const providerWorkspace = page.locator('.create-journey');
+    const providerToggle = providerWorkspace.locator('[data-workspace-toggle]');
+    await providerToggle.click();
+    const providerName = providerWorkspace.locator('#root_name');
+    const apiKey = providerWorkspace.locator('#root_credential_api_key');
+    await providerName.fill('保留的新增上游');
+    await providerWorkspace.locator('#root_config_base_url').fill('https://fixture.invalid');
+    await apiKey.fill('fixture-only-api-secret');
+    await providerToggle.click(); await providerToggle.click();
+    assert.equal(await providerName.inputValue(), '保留的新增上游');
+    assert.equal(await apiKey.inputValue(), 'fixture-only-api-secret');
+    await page.evaluate(() => { window.failNextFormWrite = true; });
+    const createProvider = providerWorkspace.getByRole('button', { name: '添加上游', exact: true });
+    await createProvider.click();
+    await providerWorkspace.getByRole('alert').waitFor();
+    assert.equal(await providerName.inputValue(), '保留的新增上游');
+    assert.equal(await apiKey.inputValue(), 'fixture-only-api-secret');
+    await createProvider.click();
+    await page.waitForFunction(() => document.querySelector('.create-journey')?.getAttribute('data-open') === 'false');
+    await providerToggle.click();
+    assert.equal(await providerName.inputValue(), '');
+    assert.equal(await apiKey.inputValue(), '', 'the successful API secret cannot be resubmitted from the next create form');
+    assert.equal(await page.evaluate(() => window.formJourneyWrites), 2);
+    // Deferred in-memory routing responses exercise same-tick double submits
+    // and a late error after closing an editor, without external writes.
+    await page.goto(`${origin}/e2e/fixtures/operator-credential-workspace.html?scenario=client-form&routing-lifecycle`);
+    await page.getByRole('button', { name: '更多操作', exact: true }).click();
+    await page.getByRole('menuitem', { name: '路由权限', exact: true }).click();
+    await page.waitForFunction(() => window.credentialFixture.requests.some(request => request.path.includes('/key-form/routing')));
+    await page.evaluate(() => window.credentialFixture.releaseRoutingResponse(200));
+    const saveRouting = page.locator('.routing-editor').getByRole('button', { name: '保存', exact: true });
+    await saveRouting.waitFor();
+    await saveRouting.evaluate(button => { (button as HTMLButtonElement).click(); (button as HTMLButtonElement).click(); });
+    await page.waitForFunction(() => window.credentialFixture.requests.some(request => request.method === 'PUT'));
+    assert.equal(await saveRouting.isEnabled(), false);
+    assert.equal(await page.evaluate(() => window.credentialFixture.requests.filter(request => request.method === 'PUT').length), 1);
+    await page.evaluate(() => window.credentialFixture.releaseRoutingResponse(200));
+    await page.waitForFunction(() => document.querySelector('.create-journey')?.getAttribute('data-open') === 'false');
+    await page.getByRole('button', { name: '更多操作', exact: true }).click();
+    await page.getByRole('menuitem', { name: '路由权限', exact: true }).click();
+    await page.waitForFunction(() => window.credentialFixture.requests.filter(request => request.method === 'GET' && request.path.includes('/key-form/routing')).length === 2);
+    await page.locator('.create-journey [data-workspace-toggle]').click();
+    await page.evaluate(() => window.credentialFixture.releaseRoutingResponse(409));
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    assert.equal(await page.getByText('late routing conflict must stay hidden', { exact: true }).count(), 0);
     assert.deepEqual(productionWrites, []);
     assert.deepEqual(errors, []);
   } finally { await browser.close(); await server.close(); }

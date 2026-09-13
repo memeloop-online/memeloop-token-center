@@ -24,6 +24,7 @@ declare global {
         body?: string;
       }>;
       releaseIssue: (token: string) => void;
+      releaseRoutingResponse: (status: number) => void;
       releaseCredentialScopeA: () => void;
       releaseCredentialCursor: () => void;
       createdObjectUrls: string[];

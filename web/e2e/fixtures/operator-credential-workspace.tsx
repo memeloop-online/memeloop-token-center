@@ -26,6 +26,7 @@ interface FixtureState {
   calls: string[];
   requests: RecordedRequest[];
   releaseIssue: (token: string) => void;
+  releaseRoutingResponse: (status: number) => void;
   releaseCredentialScopeA: () => void;
   releaseCredentialCursor: () => void;
   createdObjectUrls: string[];
@@ -41,6 +42,8 @@ const scenario = (parameters.get('scenario') ?? 'all-tenants') as Scenario;
 const initialTenant = scenario === 'all-tenants' ? '' : 'tenant-a';
 
 const pendingIssues: Array<(response: Response) => void> = [];
+const pendingRouting: Array<(response: Response) => void> = [];
+const routingResponse = { key_id: 'key-form', route_ids: [], route_group_ids: [], effective_route_ids: [], grant_revision: 1, updated_at: 1 };
 const pendingCredentialScopeA: Array<(response: Response) => void> = [];
 const pendingCredentialCursor: Array<(response: Response) => void> = [];
 window.credentialFixture = {
@@ -48,6 +51,11 @@ window.credentialFixture = {
   requests: [],
   createdObjectUrls: [],
   revokedObjectUrls: [],
+  releaseRoutingResponse(status) {
+    const resolve = pendingRouting.shift();
+    if (!resolve) throw new Error('no pending routing fixture response');
+    resolve(json(status === 200 ? routingResponse : { error: { message: 'late routing conflict must stay hidden' } }, status));
+  },
   releaseIssue(token) {
     const resolve = pendingIssues.shift();
     if (!resolve) throw new Error('no pending service credential issuance');
@@ -161,6 +169,9 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       key_policy: scenario === 'client-form' ? keyPolicySchema : { type: 'object', properties: {} },
       service_token: { type: 'object', properties: {} },
     });
+  }
+  if (parameters.has('routing-lifecycle') && url.pathname === '/internal/v1/keys/key-form/routing') {
+    return new Promise<Response>(resolve => pendingRouting.push(resolve));
   }
   if (url.pathname === '/internal/v1/service-tokens' && method === 'POST') {
     // Deliberately ignore AbortSignal so the component, rather than the mock,
