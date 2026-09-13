@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { PluginUiSlot } from '../../src/plugins/PluginUiSlot';
 import '../../src/styles.css';
 import '../../src/theme.css';
+import '../../src/plugins/pluginUiSlot.css';
 
 const messages = { loading: 'Loading', unavailable: 'Plugin unavailable', empty: 'No data', states: { ok: 'Healthy', warning: 'Warning', error: 'Error', unknown: 'Unknown' } };
 function Fixture() {

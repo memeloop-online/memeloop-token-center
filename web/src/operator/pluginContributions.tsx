@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { ApiError, api } from '../api.js';
+import { PluginUiSlot } from '../plugins/PluginUiSlot.js';
 import { pluginRouteKey, type PluginRouteKey } from '../app/routes.js';
 import type {
   PluginManifest,
@@ -16,6 +17,8 @@ import type {
  */
 export interface RegisteredPluginContribution {
   pluginId: string;
+  manifestRevision?: string;
+  allowedLinkOrigins?: readonly string[];
   contribution: PluginOperatorUiContribution;
   route: PluginRouteKey | null;
 }
@@ -41,7 +44,7 @@ export interface OperatorPluginRegistry {
 const token = /^[a-z0-9-]{1,64}$/;
 const coreCategories = new Set(['monitoring', 'traffic', 'identity', 'system']);
 const supportedIcons = new Set<PluginOperatorUiContribution['icon']>(['activity', 'chart', 'database', 'heart', 'plug', 'shield']);
-const supportedPresentations = new Set<NonNullable<PluginOperatorUiContribution['presentation']>>(['health_intelligence_v1']);
+const supportedPresentations = new Set<NonNullable<PluginOperatorUiContribution['presentation']>>(['health_intelligence_v1', 'projection_v1']);
 const healthSourceIds = new Set(['codexradar', 'deepswe', 'aixhan']);
 const healthSourceStatuses = new Set(['ok', 'stale', 'error']);
 
@@ -65,12 +68,16 @@ export function registerOperatorPluginContributions(manifests: PluginManifest[])
   const sidebar: Array<RegisteredPluginContribution & { route: PluginRouteKey; category: NonNullable<PluginOperatorUiContribution['category']> }> = [];
   for (const manifest of manifests) {
     if (!token.test(manifest.id)) continue;
+    const projectionPolicy = {
+      manifestRevision: JSON.stringify(manifest),
+      allowedLinkOrigins: (manifest.capabilities ?? []).flatMap((capability) => capability.kind === 'http' ? capability.allowed_origins : []),
+    };
     const endpoints = new Set((manifest.contributions.service_data ?? []).map((endpoint) => endpoint.id).filter((id) => token.test(id)));
     for (const contribution of manifest.contributions.operator_ui ?? []) {
       if (!validContribution(contribution) || !endpoints.has(contribution.data_endpoint)) continue;
       if (contribution.slot === 'operator.overview.card') {
         if (contribution.route || contribution.category) continue;
-        overviewCards.push({ pluginId: manifest.id, contribution, route: null });
+        overviewCards.push({ pluginId: manifest.id, ...projectionPolicy, contribution, route: null });
         continue;
       }
       if (contribution.slot !== 'operator.sidebar.tab' || !token.test(contribution.route ?? '')) continue;
@@ -78,7 +85,7 @@ export function registerOperatorPluginContributions(manifests: PluginManifest[])
       if (!category || !token.test(category.id)) continue;
       if (!coreCategories.has(category.id) && !safeLabel(category.label)) continue;
       const route = pluginRouteKey(manifest.id, contribution.route!);
-      sidebar.push({ pluginId: manifest.id, contribution, route, category });
+      sidebar.push({ pluginId: manifest.id, ...projectionPolicy, contribution, route, category });
     }
   }
 
@@ -243,7 +250,30 @@ function HealthIntelligencePanel({ snapshot, compact }: { snapshot: HealthIntell
   </section>;
 }
 
-function TypedPluginData({ registered, token: credential, tenant, compact = false }: {
+function TypedPluginData(props: {
+  registered: RegisteredPluginContribution;
+  token: string;
+  tenant: string;
+  compact?: boolean;
+}) {
+  const { registered, token: credential, tenant } = props;
+  if (registered.contribution.presentation === 'projection_v1') {
+    return <PluginUiSlot
+      pluginId={registered.pluginId} slotId={registered.contribution.id}
+      title={registered.contribution.label}
+      scopeKey={JSON.stringify([credential, tenant, registered.manifestRevision, registered.contribution.data_endpoint])}
+      allowedLinkOrigins={registered.allowedLinkOrigins ?? []}
+      messages={{ loading: 'Loading plugin data…', unavailable: 'Plugin data is currently unavailable.', empty: 'No current signals.', states: { ok: 'Healthy', warning: 'Warning', error: 'Error', unknown: 'Unknown' } }}
+      load={async (signal) => {
+        const response = await api<PluginServiceDataResponse>(serviceDataPath(registered.pluginId, registered.contribution.data_endpoint, tenant), credential, { signal });
+        return response.data;
+      }}
+    />;
+  }
+  return <LegacyTypedPluginData key={JSON.stringify([credential, tenant, registered.manifestRevision, registered.contribution.data_endpoint])} {...props} />;
+}
+
+function LegacyTypedPluginData({ registered, token: credential, tenant, compact = false }: {
   registered: RegisteredPluginContribution;
   token: string;
   tenant: string;

@@ -678,7 +678,7 @@ export interface PluginManifest {
 export type PluginOperatorUiSlot = 'operator.sidebar.tab' | 'operator.overview.card';
 export type PluginOperatorUiIcon = 'activity' | 'chart' | 'database' | 'heart' | 'plug' | 'shield';
 /** Closed core-owned data presentation; this is never a plugin browser-code entrypoint. */
-export type PluginOperatorUiPresentation = 'health_intelligence_v1';
+export type PluginOperatorUiPresentation = 'health_intelligence_v1' | 'projection_v1';
 
 export interface PluginOperatorUiContribution {
   id: string;
