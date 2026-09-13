@@ -238,6 +238,8 @@ jobs:
             install --yes --no-install-recommends postgresql-client sqlite3
       - name: Verify memory harness seed contract
         run: node --test tests/load/test-benchmark-memory.ts
+      - name: Verify durable archive RSS harness contract
+        run: node --test tests/load/test-durable-archive-memory.ts
       - name: Start MinIO and create integration-test bucket
         run: |
           # Rust/Wasmtime debug artifacts can leave a hosted runner below

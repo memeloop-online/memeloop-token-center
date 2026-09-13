@@ -615,6 +615,7 @@ async fn execute_component_primary(
     let Some((prepared, component_context)) = active_route.component_request.take() else {
         return finish_proxy_failure(&request, "provider_candidate_invalid").await;
     };
+    active_route.release_request_buffers();
     execute_component_provider(
         request,
         &active_route.route.driver,
@@ -650,11 +651,12 @@ pub(super) async fn proxy(
     let original_request_json: Value = serde_json::from_slice(&body)
         .map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))?;
     let conversation_hints = conversation_hints(&headers, &original_request_json);
-    let applied = apply_traffic_policy(
+    let applied = super::traffic::apply_traffic_policy_with_memory(
         &state,
         &key,
         TrafficPolicyProtocols::same(protocol.name()),
         original_request_json.clone(),
+        memory.clone(),
     )
     .await?;
     let request_json = applied.request_json;
@@ -735,7 +737,6 @@ pub(super) async fn proxy(
     );
     let request_body_length = body.len();
     drop(body);
-    memory.release(request_body_length, 1);
     let client_name = client_name(&headers);
     let conversation = matches!(
         protocol,
@@ -808,7 +809,7 @@ pub(super) async fn proxy(
     let mut candidate_rank = 0_usize;
     let mut deferred_shared_probes = std::collections::VecDeque::new();
     let mut next_failover_reason = None;
-    let (active_route, upstream, upstream_activity, mut codex_retry, mut upstream_attempt) = loop {
+    let (mut active_route, upstream, upstream_activity, mut codex_retry, mut upstream_attempt) = loop {
         if let Some(reason) = attempt_budget.terminal_reason(outbound_attempts) {
             tracing::warn!(%request_id, outbound_attempts, stage = reason,
                 policy_version = attempt_budget.version, "proxy request budget exhausted");
@@ -1012,8 +1013,14 @@ pub(super) async fn proxy(
             }
         }
     };
+    let strict_openai_chat_usage = requires_strict_openai_chat_usage(
+        protocol,
+        &active_route.route.driver,
+        &active_route.route.config,
+        &request_json,
+    );
     drop(request_json);
-    buffered_request.memory.release(request_body_length, 1);
+    active_route.release_request_buffers();
     let is_codex_route = active_route.is_codex();
     let codex_downstream_stream = active_route.codex_downstream_stream;
     let upstream_account_id = Some(active_route.route.account_id);
@@ -1102,12 +1109,6 @@ pub(super) async fn proxy(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
-    let strict_openai_chat_usage = requires_strict_openai_chat_usage(
-        protocol,
-        &active_route.route.driver,
-        &active_route.route.config,
-        &request_json,
-    );
     // An opted-in Chat usage stream has a terminal SSE usage contract. A
     // successful JSON envelope cannot prove that contract and must never be
     // forwarded or settled as a compatible buffered response.
@@ -1370,7 +1371,9 @@ async fn execute_component_provider(
             return finish_component_provider_failure(&request, "provider_normalize").await;
         }
     };
-    if !request.memory.response_capture_fits(normalized.body.len()) {
+    if !request.memory.response_capture_fits(normalized.body.len())
+        || !request.memory.response_json_fits(&normalized.body)
+    {
         drop(normalized);
         return finish_component_provider_failure(&request, "upstream_response_memory_capacity")
             .await;
@@ -1610,8 +1613,9 @@ async fn finish_buffered_request(
         .map_err(|_| AppError::Internal)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum BoundedUpstreamError {
+    ContentEncoding,
     MemoryCapacity,
     Timeout,
     ResponseTooLarge,
@@ -1621,6 +1625,7 @@ enum BoundedUpstreamError {
 impl BoundedUpstreamError {
     fn code(self) -> &'static str {
         match self {
+            Self::ContentEncoding => "upstream_invalid_content_encoding",
             Self::MemoryCapacity => "upstream_response_memory_capacity",
             Self::Timeout => "upstream_timeout",
             Self::ResponseTooLarge => "upstream_response_too_large",
@@ -1636,6 +1641,14 @@ async fn read_bounded_upstream(
     started: Instant,
     reserve_adapter_maximum: bool,
 ) -> Result<Vec<u8>, BoundedUpstreamError> {
+    if response
+        .headers()
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
+    {
+        return Err(BoundedUpstreamError::ContentEncoding);
+    }
     if response
         .content_length()
         .is_some_and(|length| length > maximum as u64)

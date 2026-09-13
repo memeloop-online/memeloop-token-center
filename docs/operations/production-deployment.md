@@ -80,18 +80,39 @@ must not retain partial response buffers while competing to grow them. Stream
 ownership extends through background completion and downstream body release.
 
 Startup accepts budgets from 256 MiB through 2 GiB and rejects a budget below
-three times `responsesBodyMaxBytes`. Retained request facts are additionally
+twelve times `responsesBodyMaxBytes` plus 1 MiB, accounting for retained request facts
+and the response-progress partition. Retained request facts are additionally
 limited to one quarter of the shared budget, reserving progress headroom for
 one maximum-sized response without withholding 192 MiB from every dispatch.
 The default
 gateway resource request is 256 MiB and its limit is 512 MiB. For custom budgets,
 set the Pod limit to at least the budget plus 256 MiB for runtime, networking,
 database and buffers outside capture accounting; adjust resource requests to
-match the deployment's sustained working set. The default 256 MiB budget meets
-the configuration floor for a 64 MiB request ceiling; actual JSON complexity
+match the deployment's sustained working set. A 64 MiB request ceiling therefore
+requires more than 768 MiB of logical budget (the startup minimum includes an
+extra 1 MiB for rounding); use a 1 GiB budget and at least a 1280 MiB Pod limit. That profile
+is distinct from the default 512 MiB release-memory gate. Actual JSON complexity
 still consumes capacity and can cause admission rejection. These are deterministic admission
 bounds and deployment sizing margins, not a claim that Rust allocator RSS
 exactly equals the logical counters.
+
+Scrape `memeloop_token_center_proxy_memory_bytes{pool,measure}` for actual
+reserved bytes and limits. Its only pools are `lifecycle` and
+`retained_request`; its only measures are `used` and `limit`. Alert when either
+pool exceeds 90% for five minutes:
+
+```promql
+memeloop_token_center_proxy_memory_bytes{measure="used"}
+  / ignoring(measure)
+memeloop_token_center_proxy_memory_bytes{measure="limit"} > 0.9
+```
+
+Also alert on sustained admission rejection using
+`sum by (instance) (rate(memeloop_token_center_gateway_body_rejections_total{reason="capacity_exhausted"}[5m])) > 0`
+for five minutes. Check retained work and upstream latency before increasing
+concurrency; changing the logical budget requires the matching Pod memory limit.
+Neither payload bytes, object locators, model names nor credentials are metric
+labels.
 
 Before enabling an HPA, keep the maximum application connection demand,
 including rollout surge, migration connections and an operational reserve,

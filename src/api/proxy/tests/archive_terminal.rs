@@ -1,6 +1,32 @@
 use super::*;
 
 #[tokio::test]
+async fn encoded_buffered_upstream_is_rejected_once_without_replay() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(successful_chat_response().insert_header("content-encoding", "gzip"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = resilient_route_fixture("encoded-buffered", &[(upstream.uri(), 0)]).await;
+    let response = send_resilient_chat(&fixture, None, false).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].error_code.as_deref(),
+        Some("upstream_invalid_content_encoding")
+    );
+    upstream.verify().await;
+}
+
+#[tokio::test]
 async fn request_archive_failure_after_dispatch_does_not_skip_response_or_repeat_settlement() {
     let fixture = codex_route_fixture("request-capture-gap").await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();

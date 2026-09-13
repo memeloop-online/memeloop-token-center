@@ -83,6 +83,16 @@ pub(super) fn translate(
         return Ok(response.into());
     }
     let mut parts = UpstreamResponse::from(response).into_parts();
+    if parts
+        .headers
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
+    {
+        return Err(ProxySendError::AmbiguousResponse(
+            "upstream_invalid_content_encoding",
+        ));
+    }
     let media_type = parts
         .headers
         .get(header::CONTENT_TYPE)

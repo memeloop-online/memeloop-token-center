@@ -122,3 +122,14 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
 {{- end }}
 {{- end -}}
+{{/* Parse supported Kubernetes memory quantities for the hard workload budget gate. */}}
+{{- define "memeloop-token-center.memoryBytes" -}}
+{{- $value := toString . -}}
+{{- if not (regexMatch "^[0-9]+(\\.[0-9]+)?(Ki|Mi|Gi|Ti|k|M|G|T)?$" $value) -}}
+{{- fail "memory limit must be numeric bytes or a Ki/Mi/Gi/Ti/k/M/G/T quantity" -}}
+{{- end -}}
+{{- $suffix := regexFind "[A-Za-z]+$" $value -}}
+{{- $amount := float64 (trimSuffix $suffix $value) -}}
+{{- $scale := dict "" 1 "Ki" 1024 "Mi" 1048576 "Gi" 1073741824 "Ti" 1099511627776 "k" 1000 "M" 1000000 "G" 1000000000 "T" 1000000000000 -}}
+{{- printf "%d" (int64 (mulf $amount (index $scale $suffix))) -}}
+{{- end -}}

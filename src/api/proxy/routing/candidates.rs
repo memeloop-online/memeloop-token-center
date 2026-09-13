@@ -186,7 +186,7 @@ mod tests {
                 upstream_model: "component-model".into(),
                 credential: UpstreamCredential::None,
             },
-            forwarded_body: b"{}".to_vec(),
+            forwarded_body: Bytes::from_static(b"{}"),
             upstream_stream: false,
             codex_downstream_stream: false,
             codex_store_disabled: false,

@@ -35,6 +35,27 @@ encrypted format and remain readable across this release.
 
 ### Rolling rollback of request spooling
 
+Before admitting traffic to the new gateway, run this read-only shared-budget
+gate. The default 16 MiB request deployment requires at least 192 MiB free in
+the 256 MiB durable spool budget, leaving room for a request capture and a
+maximum buffered response with encrypted chunk/row overhead:
+
+```sql
+SELECT cipher_bytes AS occupied_cipher_bytes,
+       268435456 - cipher_bytes AS free_cipher_bytes,
+       CASE WHEN cipher_bytes <= 67108864 THEN 1 ELSE 0 END
+           AS ready_for_request_spool_rollout
+FROM response_archive_spool_budget
+WHERE singleton = 1;
+```
+
+Stop rollout if the row is missing or the gate is zero. Let existing workers
+drain and reclaim the backlog, then repeat the same read-only check. A new
+request subcounter is not reserved capacity: old response workers can still
+consume the shared total. Larger configured request ceilings require reviewing
+the combined encrypted request/response headroom before rollout; do not weaken
+this gate or delete captures to make an upgrade proceed.
+
 Schema 80 retains `response_archive_spool_budget.cipher_bytes` as the combined
 request/response total understood by schema-79 binaries. Its new
 `request_cipher_bytes` subcounter tracks the request portion; request mutations

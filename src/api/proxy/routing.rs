@@ -6,7 +6,7 @@ mod candidates;
 mod clock;
 mod codex;
 mod http;
-mod kimi;
+pub(super) mod kimi;
 mod outcome;
 mod policy;
 mod probe;
@@ -40,7 +40,7 @@ pub(super) use readiness::{
 
 pub(super) struct PreparedProxyRoute {
     pub(super) route: ResolvedUpstream,
-    forwarded_body: Vec<u8>,
+    forwarded_body: Bytes,
     pub(super) upstream_stream: bool,
     pub(super) codex_downstream_stream: bool,
     pub(super) codex_store_disabled: bool,
@@ -70,14 +70,18 @@ impl PlannedProxyRoute {
         &self,
         original_body_length: usize,
     ) -> Result<usize, AppError> {
-        let forwarded_length = serde_json::to_vec(&self.forwarded_json)
-            .map_err(|_| AppError::Internal)?
-            .len();
+        let forwarded_length =
+            crate::gateway_body::memory::json_encoded_length(&self.forwarded_json)?;
         Ok(original_body_length.max(forwarded_length))
     }
 }
 
 impl PreparedProxyRoute {
+    pub(super) fn release_request_buffers(&mut self) {
+        self.forwarded_body = Bytes::new();
+        self.kimi_response = None;
+    }
+
     pub(super) fn is_codex(&self) -> bool {
         codex_transport::is_driver(&self.route.driver)
     }
@@ -122,6 +126,9 @@ pub(super) fn plan_proxy_route(
         )));
     }
     route.credential.validate(preparation_now)?;
+    let _planning_memory = state.proxy_memory_budget.temporary(
+        crate::gateway_body::memory::json_encoded_length(request_json)?.saturating_mul(3),
+    )?;
     let is_codex = codex_transport::is_driver(&route.driver);
     if is_codex {
         codex::validate_route(&route, protocol)?;
@@ -200,6 +207,14 @@ pub(super) async fn materialize_proxy_route(
     state: &AppState,
     planned: PlannedProxyRoute,
 ) -> Result<PreparedProxyRoute, AppError> {
+    let encoded_length = crate::gateway_body::memory::json_encoded_length(&planned.forwarded_json)?;
+    // Allocate temporary serialization/adapter work before cloning any payload.
+    let temporary_bytes = if planned.component_context.is_some() {
+        64 * 1024 * 1024 + encoded_length.saturating_mul(6)
+    } else {
+        encoded_length.saturating_mul(2)
+    };
+    let _temporary_memory = state.proxy_memory_budget.temporary(temporary_bytes)?;
     let component_request = if let Some(context) = planned.component_context {
         let prepared = prepare_component_provider(
             state,
@@ -207,17 +222,19 @@ pub(super) async fn materialize_proxy_route(
             context.clone(),
             planned.route.config.clone(),
             planned.forwarded_json.clone(),
+            _temporary_memory.clone(),
         )
         .await?;
         Some((prepared, context))
     } else {
         None
     };
-    let forwarded_body =
-        serde_json::to_vec(&planned.forwarded_json).map_err(|_| AppError::Internal)?;
+    let mut forwarded_body = Vec::with_capacity(encoded_length);
+    serde_json::to_writer(&mut forwarded_body, &planned.forwarded_json)
+        .map_err(|_| AppError::Internal)?;
     Ok(PreparedProxyRoute {
         route: planned.route,
-        forwarded_body,
+        forwarded_body: Bytes::from(forwarded_body),
         upstream_stream: planned.upstream_stream,
         codex_downstream_stream: planned.codex_downstream_stream,
         codex_store_disabled: planned.codex_store_disabled,

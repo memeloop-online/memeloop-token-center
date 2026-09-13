@@ -652,7 +652,11 @@ pub struct DatabaseRuntimeMetrics {
 pub struct RuntimeMetrics {
     pub database: Option<DatabaseRuntimeMetrics>,
     pub request_event_streams: usize,
-    pub gateway_body_rejections: [[u64; 2]; 4],
+    pub gateway_body_rejections: [[u64; 3]; 4],
+    pub proxy_memory_used_bytes: usize,
+    pub proxy_memory_limit_bytes: usize,
+    pub retained_request_memory_used_bytes: usize,
+    pub retained_request_memory_limit_bytes: usize,
     pub gateway_body_reads: usize,
     pub proxy_lifecycles: usize,
     pub proxy_archive_streams: usize,
@@ -898,6 +902,29 @@ fn render_runtime(output: &mut String, runtime: &RuntimeMetrics) {
         "# HELP memeloop_token_center_gateway_body_rejections_total Rejected gateway request bodies by fixed route class and reason.\n",
     );
     output.push_str("# TYPE memeloop_token_center_gateway_body_rejections_total counter\n");
+    output.push_str("# HELP memeloop_token_center_proxy_memory_bytes Actual weighted memory admission permits by fixed pool and measure.\n");
+    output.push_str("# TYPE memeloop_token_center_proxy_memory_bytes gauge\n");
+    for (pool, used, limit) in [
+        (
+            "lifecycle",
+            runtime.proxy_memory_used_bytes,
+            runtime.proxy_memory_limit_bytes,
+        ),
+        (
+            "retained_request",
+            runtime.retained_request_memory_used_bytes,
+            runtime.retained_request_memory_limit_bytes,
+        ),
+    ] {
+        let _ = writeln!(
+            output,
+            "memeloop_token_center_proxy_memory_bytes{{pool=\"{pool}\",measure=\"used\"}} {used}"
+        );
+        let _ = writeln!(
+            output,
+            "memeloop_token_center_proxy_memory_bytes{{pool=\"{pool}\",measure=\"limit\"}} {limit}"
+        );
+    }
     for route_class in crate::gateway_body::GatewayBodyRouteClass::ALL {
         for reason in crate::gateway_body::GatewayBodyRejectionReason::ALL {
             let value = runtime.gateway_body_rejections[route_class.index()][reason.index()];
@@ -1293,5 +1320,29 @@ mod tests {
         assert!(metrics.try_begin_profile(ProfileKind::Heap).is_none());
         drop(first);
         assert!(metrics.try_begin_profile(ProfileKind::Heap).is_some());
+    }
+
+    #[test]
+    fn memory_admission_gauges_report_fixed_pools_without_dynamic_labels() {
+        let rendered = Metrics::default().render(&RuntimeMetrics {
+            proxy_memory_used_bytes: 65536,
+            proxy_memory_limit_bytes: 268435456,
+            retained_request_memory_used_bytes: 65536,
+            retained_request_memory_limit_bytes: 67108864,
+            ..RuntimeMetrics::default()
+        });
+        let gauges: Vec<_> = rendered
+            .lines()
+            .filter(|line| line.starts_with("memeloop_token_center_proxy_memory_bytes{"))
+            .collect();
+        assert_eq!(
+            gauges,
+            [
+                "memeloop_token_center_proxy_memory_bytes{pool=\"lifecycle\",measure=\"used\"} 65536",
+                "memeloop_token_center_proxy_memory_bytes{pool=\"lifecycle\",measure=\"limit\"} 268435456",
+                "memeloop_token_center_proxy_memory_bytes{pool=\"retained_request\",measure=\"used\"} 65536",
+                "memeloop_token_center_proxy_memory_bytes{pool=\"retained_request\",measure=\"limit\"} 67108864",
+            ]
+        );
     }
 }

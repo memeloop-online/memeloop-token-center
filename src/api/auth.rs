@@ -79,6 +79,9 @@ pub(super) async fn authenticate_control_before_body(
                     "request body was not received before the deadline",
                 ));
             }
+            Err(crate::gateway_body::GatewayBodyAdmissionError::UnsupportedEncoding) => {
+                return Ok(StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response());
+            }
             Err(crate::gateway_body::GatewayBodyAdmissionError::Rejected(_)) => {
                 return Ok(control_body_rejection(
                     StatusCode::PAYLOAD_TOO_LARGE,
@@ -184,7 +187,18 @@ fn gateway_body_admission_rejection(
     error: crate::gateway_body::GatewayBodyAdmissionError,
 ) -> Response {
     match error {
+        crate::gateway_body::GatewayBodyAdmissionError::UnsupportedEncoding => {
+            StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response()
+        }
         crate::gateway_body::GatewayBodyAdmissionError::CapacityExhausted => {
+            state
+                .gateway_body_rejections
+                .observe(crate::gateway_body::GatewayBodyRejection {
+                    route_class: crate::gateway_body::GatewayBodyRouteClass::Other,
+                    declared_content_length: None,
+                    limit_bytes: 0,
+                    reason: crate::gateway_body::GatewayBodyRejectionReason::CapacityExhausted,
+                });
             gateway_body_capacity_rejection()
         }
         crate::gateway_body::GatewayBodyAdmissionError::Timeout => (
@@ -243,8 +257,15 @@ where
 {
     let (parts, body) = response.into_parts();
     let stream = futures_util::stream::unfold(
-        (body.into_data_stream(), permit),
-        |(mut body, permit)| async move { body.next().await.map(|item| (item, (body, permit))) },
+        (body.into_data_stream(), Some(permit)),
+        |(mut body, mut permit)| async move {
+            body.next().await.map(|item| {
+                if item.is_err() {
+                    drop(permit.take());
+                }
+                (item, (body, permit))
+            })
+        },
     );
     Response::from_parts(parts, Body::from_stream(stream))
 }
@@ -277,6 +298,9 @@ pub(super) async fn admit_cloud_webhook_before_body(
                 "request_body_timeout",
                 "request body was not received before the deadline",
             ));
+        }
+        Err(crate::gateway_body::GatewayBodyAdmissionError::UnsupportedEncoding) => {
+            return Ok(StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response());
         }
         Err(crate::gateway_body::GatewayBodyAdmissionError::Rejected(_)) => {
             return Ok(control_body_rejection(
@@ -338,7 +362,7 @@ mod response_body_guard_tests {
         let response = hold_response_body_permit(Response::new(body), permit);
         let mut body = response.into_body().into_data_stream();
         assert!(body.next().await.unwrap().is_err());
-        assert_eq!(failed.available_permits(), 0);
+        assert_eq!(failed.available_permits(), 1);
         drop(body);
         assert_eq!(failed.available_permits(), 1);
     }

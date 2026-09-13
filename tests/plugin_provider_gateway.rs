@@ -318,6 +318,14 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
 
     let first = call_component_provider(&state, &issued.key).await;
     assert_eq!(first.0, StatusCode::OK, "{}", first.1);
+    // The real component response expands its tiny upstream body. Its adapter
+    // maximum, not the upstream Content-Length, must cover normalization.
+    assert!(
+        serde_json::to_vec(&first.1).unwrap().len()
+            > serde_json::to_vec(&json!({"vendor_answer":"non-openai-shape"}))
+                .unwrap()
+                .len()
+    );
     assert_eq!(
         first.1["choices"][0]["message"]["content"],
         "normalized by component"

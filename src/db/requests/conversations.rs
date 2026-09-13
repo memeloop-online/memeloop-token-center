@@ -93,7 +93,13 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
         upstream_response_id,
         observed_at,
     } = input;
-    let request_json = serde_json::to_string(request_json).map_err(|_| AppError::Internal)?;
+    // Exact-capacity serialization keeps the retained request envelope bounded
+    // while the terminal transaction also owns the response ciphertext.
+    let mut encoded_request = Vec::with_capacity(crate::gateway_body::memory::json_encoded_length(
+        request_json,
+    )?);
+    serde_json::to_writer(&mut encoded_request, request_json).map_err(|_| AppError::Internal)?;
+    let request_json = String::from_utf8(encoded_request).map_err(|_| AppError::Internal)?;
     let hints_json = serde_json::to_string(hints).map_err(|_| AppError::Internal)?;
     sqlx::query(
         "INSERT INTO conversation_projection_outbox (request_id, tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT(request_id) DO NOTHING",

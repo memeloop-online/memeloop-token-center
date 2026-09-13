@@ -19,7 +19,7 @@ pub(crate) const GATEWAY_BODY_READ_DEADLINE: Duration = Duration::from_secs(60);
 const MAX_DEFAULT_BODY: usize = 4 * 1024 * 1024;
 const MAX_IMAGE_BODY: usize = 16 * 1024 * 1024;
 pub(crate) const GATEWAY_BODY_ROUTE_CLASS_COUNT: usize = 4;
-pub(crate) const GATEWAY_BODY_REJECTION_REASON_COUNT: usize = 2;
+pub(crate) const GATEWAY_BODY_REJECTION_REASON_COUNT: usize = 3;
 
 /// Fixed route classes prevent request paths from becoming metric labels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,18 +58,21 @@ impl GatewayBodyRouteClass {
 pub(crate) enum GatewayBodyRejectionReason {
     DeclaredContentLengthExceedsLimit,
     BodyReadRejected,
+    CapacityExhausted,
 }
 
 impl GatewayBodyRejectionReason {
     pub(crate) const ALL: [Self; GATEWAY_BODY_REJECTION_REASON_COUNT] = [
         Self::DeclaredContentLengthExceedsLimit,
         Self::BodyReadRejected,
+        Self::CapacityExhausted,
     ];
 
     pub(crate) const fn index(self) -> usize {
         match self {
             Self::DeclaredContentLengthExceedsLimit => 0,
             Self::BodyReadRejected => 1,
+            Self::CapacityExhausted => 2,
         }
     }
 
@@ -77,6 +80,7 @@ impl GatewayBodyRejectionReason {
         match self {
             Self::DeclaredContentLengthExceedsLimit => "declared_content_length_exceeds_limit",
             Self::BodyReadRejected => "body_read_rejected",
+            Self::CapacityExhausted => "capacity_exhausted",
         }
     }
 }
@@ -120,6 +124,7 @@ impl GatewayBodyRejectionMetrics {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GatewayBodyAdmissionError {
     CapacityExhausted,
+    UnsupportedEncoding,
     Timeout,
     Rejected(GatewayBodyRejection),
 }
@@ -221,7 +226,24 @@ async fn admit_request_body_for_route(
         ));
     }
     let (mut parts, body) = request.into_parts();
+    if parts
+        .headers
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
+    {
+        return Err(GatewayBodyAdmissionError::UnsupportedEncoding);
+    }
     if let Some(reservation) = reservation {
+        let read_maximum = declared_content_length
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or(maximum)
+            .min(maximum);
+        // Cover transport-owned frames as well as our retained buffer before
+        // polling the body even once. Unknown length reserves the route max.
+        if !reservation.try_grow(read_maximum, memory::REQUEST_MEMORY_WEIGHT) {
+            return Err(GatewayBodyAdmissionError::CapacityExhausted);
+        }
         let read = async {
             let mut stream = body.into_data_stream();
             let mut retained = bytes::BytesMut::new();
@@ -234,18 +256,13 @@ async fn admit_request_body_for_route(
                         GatewayBodyRejectionReason::BodyReadRejected,
                     )
                 })?;
-                if retained.len().saturating_add(chunk.len()) > maximum {
+                if retained.len().saturating_add(chunk.len()) > read_maximum {
                     return Err(rejected_body(
                         route_class,
                         declared_content_length,
                         maximum,
                         GatewayBodyRejectionReason::BodyReadRejected,
                     ));
-                }
-                // Reserve before growing our retained allocation; unknown or
-                // dishonest Content-Length never bypasses the weighted budget.
-                if !reservation.try_grow(chunk.len(), memory::REQUEST_MEMORY_WEIGHT) {
-                    return Err(GatewayBodyAdmissionError::CapacityExhausted);
                 }
                 retained.extend_from_slice(&chunk);
             }
@@ -254,6 +271,10 @@ async fn admit_request_body_for_route(
         let bytes = tokio::time::timeout(deadline, read)
             .await
             .map_err(|_| GatewayBodyAdmissionError::Timeout)??;
+        reservation.release(
+            read_maximum.saturating_sub(bytes.len()),
+            memory::REQUEST_MEMORY_WEIGHT,
+        );
         parts.extensions.insert(reservation);
         return Ok(Request::from_parts(parts, Body::from(bytes)));
     }
@@ -346,6 +367,7 @@ mod tests {
         let request = Request::builder()
             .method("POST")
             .uri("/v1/responses")
+            .header(header::CONTENT_LENGTH, 16 * 1024)
             .body(Body::from(vec![b'x'; 16 * 1024]))
             .unwrap();
         let admitted = admit_gateway_request_body_with_memory(

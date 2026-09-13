@@ -748,6 +748,14 @@ pub(super) async fn buffer_response(
     memory: &crate::gateway_body::memory::ProxyMemoryReservation,
     started: std::time::Instant,
 ) -> Result<BufferedCodexResponse, &'static str> {
+    if response
+        .headers()
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
+    {
+        return Err("upstream_invalid_content_encoding");
+    }
     if !is_event_stream(&response) {
         return Err("upstream_invalid_content_type");
     }

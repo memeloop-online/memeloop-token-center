@@ -90,6 +90,62 @@ fn policy_wat(body: &str) -> String {
     format!("{prefix};; BEGIN POST-AUTH BODY\n{body}\n;; END POST-AUTH BODY{suffix}")
 }
 
+#[tokio::test]
+async fn small_text_input_can_expand_to_sixteen_mib_in_a_real_traffic_hook() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(successful_hint_response("expanded"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let mut fixture = hint_routing_fixture(
+        "large-rewrite-memory",
+        upstream.uri(),
+        upstream.uri(),
+        false,
+    )
+    .await;
+    let prefix = format!(
+        "{{\"model\":\"{}\",\"messages\":[{{\"role\":\"user\",\"content\":\"",
+        fixture.model
+    );
+    let suffix = "\"}],\"stream\":false}";
+    let length = 16 * 1024 * 1024;
+    let pointer = 64 * 1024;
+    let start = stores_for_string(pointer, &prefix);
+    let end = stores_for_string(pointer + length - suffix.len(), suffix);
+    let body = format!(
+        r#"
+        i32.const 256 memory.grow drop
+        i32.const {pointer} i32.const 120 i32.const {length} memory.fill
+        {start}
+        {end}
+        i32.const 256 i32.const 0 i32.store
+        i32.const 260 i32.const 1 i32.store
+        i32.const 264 i32.const 0 i32.store
+        i32.const 276 i32.const 0 i32.store
+        i32.const 288 i32.const 0 i32.store
+        i32.const 300 i32.const 1 i32.store
+        i32.const 304 i32.const {pointer} i32.store
+        i32.const 308 i32.const {length} i32.store
+        i32.const 256
+    "#
+    );
+    write_policy_package(fixture._directory.path(), &body, json!([]));
+    fixture.state = AppState::initialize((*fixture.state.config).clone())
+        .await
+        .unwrap();
+    let (status, response) = call_hint_routing_fixture(&fixture).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let received = upstream.received_requests().await.unwrap();
+    let rewritten: Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert_eq!(
+        rewritten["messages"][0]["content"].as_str().unwrap().len(),
+        length - prefix.len() - suffix.len()
+    );
+    upstream.verify().await;
+}
+
 fn write_policy_package(root: &Path, body: &str, capabilities: Value) {
     fs::write(
         root.join("plugin.json"),

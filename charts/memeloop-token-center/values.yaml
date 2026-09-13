@@ -118,7 +118,7 @@ config:
   # credential RPM/TPM/concurrency policies remain the only sources of 429.
   proxyLifecycleConcurrency: 64
   # Weighted text-body/JSON/ciphertext admission. Keep pod memory at least
-  # this budget + 256Mi; raising body max also requires budget >= max * 3.
+  # this budget + 256Mi; raising body max also requires budget >= max * 12 + 1Mi.
   proxyMemoryBudgetBytes: 268435456
   # Gateway request bodies are admitted independently of proxy lifecycles.
   # Saturation returns 503 before reading the body; supported range is 1..8192.
