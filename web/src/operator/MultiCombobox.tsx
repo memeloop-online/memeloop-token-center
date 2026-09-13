@@ -88,10 +88,13 @@ export function MultiCombobox({
     } else if (event.key === 'ArrowUp') {
       event.preventDefault(); setOpen(true); setActiveIndex((current) => current < 0 ? rows.length - 1 : Math.max(current - 1, 0));
     } else if (event.key === 'Enter' && expanded) {
+      // Enter belongs to the open picker even when a search has no matches.
+      // Do not let an empty result accidentally submit an enclosing editor.
+      event.preventDefault();
       // React may not have committed the input/open state before a fast keyboard user presses Enter.
       const currentRows = rowsForQuery(options, value, event.currentTarget.value, allowCreate);
       const item = currentRows[activeIndex >= 0 ? activeIndex : 0];
-      if (item) { event.preventDefault(); choose(item); }
+      if (item) choose(item);
     } else if (event.key === 'Escape') {
       if (expanded) { event.preventDefault(); event.stopPropagation(); setOpen(false); }
     } else if (event.key === 'Backspace' && !query && value.length > 0) {
@@ -107,6 +110,9 @@ export function MultiCombobox({
         <span className="selection-chip-label">{item.label}</span>
         <button type="button" disabled={disabled} aria-label={removeLabel(item.label)} onClick={(event) => {
           event.stopPropagation(); onChange(value.filter((selectedItem) => selectedItem.value !== item.value));
+          // The chip button unmounts after removal; retain a useful keyboard
+          // position instead of dropping focus onto the document body.
+          inputRef.current?.focus();
         }}>×</button>
       </span>)}
       <input
