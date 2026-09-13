@@ -26,6 +26,7 @@ struct CodexAttemptContext {
     candidate_rank: usize,
     outbound_attempt: usize,
     transport_policy: CodexRuntimeTransportPolicy,
+    deadline: CodexRequestDeadline,
 }
 
 #[derive(Clone, Copy)]
@@ -142,9 +143,9 @@ pub(super) async fn send_proxy_route(
                 candidate_rank,
                 outbound_attempt,
                 transport_policy,
+                deadline,
             },
             &client,
-            deadline,
         )
         .await
         {
@@ -241,13 +242,13 @@ async fn send_codex_attempt(
     session_id: &str,
     context: CodexAttemptContext,
     client: &wreq::Client,
-    deadline: CodexRequestDeadline,
 ) -> Result<(UpstreamResponse, crate::metrics::ActivityGuard), ProxySendError> {
     let CodexAttemptContext {
         request_id,
         candidate_rank,
         outbound_attempt,
         transport_policy,
+        deadline,
     } = context;
     for connect_attempt in 1..=transport_policy.connect_attempts {
         match send_codex_attempt_once(
