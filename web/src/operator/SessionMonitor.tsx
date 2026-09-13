@@ -313,6 +313,13 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
 
   useEffect(() => {
     scopeGeneration.current += 1;
+    // A filter/scope transition starts an authoritative first-page read. Drop
+    // events queued for the previous projection before issuing that snapshot;
+    // otherwise the next unrelated revision drains both batches and can make
+    // an old same-session event look as if it belonged to the new event.
+    // Events arriving after this synchronous boundary receive a new revision
+    // and are processed against the in-flight snapshot normally.
+    eventKeyIds.current.clear();
     if (refreshTimer.current !== undefined) window.clearTimeout(refreshTimer.current);
     refreshTimer.current = undefined;
     refreshDirty.current = false;

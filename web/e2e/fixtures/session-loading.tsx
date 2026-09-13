@@ -75,7 +75,7 @@ window.fetch = async (input) => {
 function Fixture() {
   const [revision, setRevision] = useState(0);
   const keys = useRef(new Set<string>());
-  const emit = (keyId: string, sessionId: string, requestId = 'new-fixture-request',
+  const queue = (keyId: string, sessionId: string, requestId = 'new-fixture-request',
     eventKind: RequestEventKind = 'finished', archiveState: RequestArchiveState = 'pending') => {
     enqueueSessionEventIdentity(keys.current, {
       key_id: keyId,
@@ -85,9 +85,14 @@ function Fixture() {
       archive_state: archiveState,
       session_context: { association: 'confirmed', session_id: sessionId },
     });
+  };
+  const emit = (keyId: string, sessionId: string, requestId = 'new-fixture-request',
+    eventKind: RequestEventKind = 'finished', archiveState: RequestArchiveState = 'pending') => {
+    queue(keyId, sessionId, requestId, eventKind, archiveState);
     setRevision((value) => value + 1);
   };
   return <I18nProvider><main className="main">
+    <button onClick={() => queue('fixture-key', 'fixture-session', 'queued-before-scope-change')}>Queue stale session event</button>
     <button onClick={() => emit('fixture-key', 'fixture-session')}>Simulate session event</button>
     <button onClick={() => emit('other-key', 'fixture-session')}>Simulate other credential event</button>
     <button onClick={() => emit('fixture-key', 'other-session')}>Simulate other session event</button>
