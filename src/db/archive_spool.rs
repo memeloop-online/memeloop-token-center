@@ -387,8 +387,11 @@ impl Database {
         let purpose = BufferedArchivePurpose::Response;
         let (mut tx, now) = self.spool_transaction().await?;
         // A lost seal ACK must not destroy a complete, recoverable pending spool.
-        let changed = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET state = 'gap', last_error_code = $1, updated_at = $2, expires_at = $3, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $4 AND tenant_id = $5 AND reservation_id = $6 AND state = 'capturing'")))
-            .bind(reason_code(reason)).bind(now).bind(now + CAPTURE_TTL).bind(identity.request_id.to_string())
+        // The audit row and terminal reason remain retained, but incomplete
+        // ciphertext can never be uploaded. Make it immediately eligible for
+        // the existing expiry-indexed GC so it cannot pin global capacity.
+        let changed = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET state = 'gap', last_error_code = $1, updated_at = $2, expires_at = $2, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $3 AND tenant_id = $4 AND reservation_id = $5 AND state = 'capturing'")))
+            .bind(reason_code(reason)).bind(now).bind(identity.request_id.to_string())
             .bind(identity.tenant_id.to_string()).bind(identity.reservation_id.to_string()).execute(&mut *tx).await?;
         if changed.rows_affected() == 1 {
             emit_response_archive_transition_event_in_transaction(
@@ -609,7 +612,10 @@ impl Database {
         let attempts: i64 = row.try_get("attempts")?;
         let backoff = 5_000_i64 * (1_i64 << attempts.clamp(0, 10) as u32);
         let terminal = attempts >= 10;
-        sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET state = $1, next_attempt_at = $2, updated_at = $3, last_error_code = $4, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $5")))
+        // Terminal retry exhaustion has the same irreversible payload state
+        // as producer capture failure: retain audit facts, but let GC reclaim
+        // ciphertext through the existing expiry index immediately.
+        sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET state = $1, next_attempt_at = $2, updated_at = $3, expires_at = CASE WHEN $1 = 'gap' THEN $3 ELSE expires_at END, last_error_code = $4, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $5")))
             .bind(if attempts >= 10 { "gap" } else { "pending" }).bind(now + backoff).bind(now).bind(reason_code(reason)).bind(task.identity.request_id.to_string()).execute(&mut *tx).await?;
         if terminal {
             emit_response_archive_transition_event_in_transaction(
