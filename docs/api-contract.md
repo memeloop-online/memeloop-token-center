@@ -130,11 +130,15 @@ stored in that audit projection or returned.
 `GET /internal/v1/upstreams/{account_id}/quota?tenant_external_id=...` requires
 `providers:read` and an explicit authorized tenant. It returns the sanitized
 `upstream_quota_v1` contract: provider/status, nullable observation and freshness
-deadlines (epoch milliseconds), stale marker, plan, all applicable windows,
-supplier credits, reset capability and closed product error codes. Window reset
-times are epoch milliseconds; relative supplier offsets are marked estimated.
-Unknown values stay null, never zero/unlimited. Supplier reset support is
-distinct from MTC implementation availability and available/applicable credits.
+deadlines (epoch milliseconds), explicit unobserved/fresh/stale state, plan and
+workspace, all applicable windows, supplier credits, reset-credit provenance,
+reset capability and closed product error codes. Window reset times are epoch
+milliseconds; relative supplier offsets are marked estimated. Amount units stay
+null unless the supplier contract declares one. Unknown values stay null, never
+zero/unlimited. Capabilities declare which metadata is implemented and that a
+quota read neither refreshes credentials nor consumes a reset credit. Supplier
+reset support is distinct from MTC implementation availability and fresh
+available/applicable-credit evidence.
 This GET performs no reset, token refresh, probe or model invocation. Only
 server-held credentials reach fixed native supplier GET endpoints; no upstream
 body, email, account header, token or proxy secret is returned. The 30-second
