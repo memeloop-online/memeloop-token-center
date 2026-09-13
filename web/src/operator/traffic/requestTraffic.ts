@@ -177,6 +177,9 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
     output_tokens: event.output_tokens,
     cost: event.cost,
     error_code: event.error_code,
+    archive_state: event.event_kind === 'archive_bound' || event.event_kind === 'archive_gap'
+      ? event.archive_state
+      : previous?.archive_state ?? event.archive_state,
     session_context: event.session_context ?? previous?.session_context,
   };
 }

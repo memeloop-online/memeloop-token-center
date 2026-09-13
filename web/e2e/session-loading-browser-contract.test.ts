@@ -95,11 +95,27 @@ test('session events refresh only the exact selected credential and session deta
     assert.equal(await page.evaluate(() => window.sessionDetailReads), 1,
       'another session on the same credential must not refresh the selected detail');
 
-    await page.getByRole('button', { name: 'Simulate session event', exact: true }).click();
+    await page.getByRole('button', { name: 'Simulate archive bound event', exact: true }).click();
     await page.waitForFunction(() => window.sessionListReads === 4);
     await page.evaluate(() => window.resolveSessionList(true));
     await page.waitForFunction(() => window.sessionDetailReads === 2);
     assert.equal(await page.evaluate(() => window.sessionDetailReads), 2,
+      'archive_bound refreshes the exact selected request although its HTTP status stays 200');
+
+    await page.getByRole('button', { name: 'Simulate session event', exact: true }).click();
+    await page.waitForFunction(() => window.sessionListReads === 5);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await page.waitForFunction(() => window.sessionDetailReads === 3);
+    assert.equal(await page.evaluate(() => window.sessionDetailReads), 3,
       'the exact selected credential and session event refreshes its detail once');
+
+    await page.locator('.session-card').filter({ hasText: 'Unlinked requests' }).getByRole('button').click();
+    await page.waitForFunction(() => window.sessionDetailReads === 4);
+    await page.getByRole('button', { name: 'Simulate confirmed projection', exact: true }).click();
+    await page.waitForFunction(() => window.sessionListReads === 6);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await page.waitForFunction(() => window.sessionDetailReads === 5);
+    assert.equal(await page.evaluate(() => window.sessionDetailReads), 5,
+      'a confirmed projection refreshes the old same-credential unlinked detail');
   } finally { await browser.close(); await server.close(); }
 });
