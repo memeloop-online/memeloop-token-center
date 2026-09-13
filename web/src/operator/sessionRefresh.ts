@@ -103,7 +103,11 @@ export function sessionEventsRequireDetailRefresh(
     if (!recorded) return true;
     if (event.event_kind === 'started') return false;
     if (event.event_kind === 'archive_bound' || event.event_kind === 'archive_gap') {
-      return recorded.archive_state !== event.archive_state;
+      // Request and response spools transition independently. Their combined
+      // archive_state can remain `pending` after the first side binds or gaps,
+      // so the transition event itself is the convergence signal. The SSE
+      // cursor deduplicates replay and each purpose emits only on transition.
+      return true;
     }
     if (event.event_kind === 'projected') {
       if (selected.session_id === `unlinked:${selected.key_id}`) return true;

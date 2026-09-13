@@ -41,6 +41,47 @@ test('archive events converge archive state without changing the terminal HTTP s
   assert.equal(bound?.archive_state, 'bound');
   const replayedFinished = requestViewFromEvent(event, { ...recorded, archive_state: 'bound' });
   assert.equal(replayedFinished?.archive_state, 'bound', 'an older lifecycle event must not regress a bound snapshot');
+  const cachedOneSideBound = requestViewFromEvent(
+    { ...event, event_kind: 'archive_bound', archive_state: 'pending' },
+    { ...recorded, archive_state: 'bound' },
+  );
+  assert.equal(cachedOneSideBound?.archive_state, 'bound', 'a cached one-side event must not regress a terminal REST snapshot');
+  const gapDominatesCachedBound = requestViewFromEvent(
+    { ...event, event_kind: 'archive_gap', archive_state: 'gap' },
+    { ...recorded, archive_state: 'bound' },
+  );
+  assert.equal(gapDominatesCachedBound?.archive_state, 'gap');
+  const boundCannotHideGap = requestViewFromEvent(
+    { ...event, event_kind: 'archive_bound', archive_state: 'bound' },
+    { ...recorded, archive_state: 'gap' },
+  );
+  assert.equal(boundCannotHideGap?.archive_state, 'gap', 'gap dominates when terminal event order is unavailable');
+});
+
+test('confirmed session ownership never regresses to an old unlinked event', () => {
+  const oldUnlinked = requestViewFromEvent({
+    ...event,
+    session_context: {
+      session_id: null, association: 'unlinked', session_name: null,
+      task_kind: null, agent_id: null, semantics_source: null,
+    },
+  }, recorded);
+  assert.deepEqual(oldUnlinked?.session_context, recorded.session_context);
+
+  const unlinkedSnapshot: RequestView = {
+    ...recorded,
+    session_context: {
+      session_id: null, association: 'unlinked', session_name: null,
+      task_kind: null, agent_id: null, semantics_source: null,
+    },
+  };
+  const confirmedProjection = requestViewFromEvent({
+    ...event,
+    event_kind: 'projected',
+    session_context: recorded.session_context,
+  }, unlinkedSnapshot);
+  assert.deepEqual(confirmedProjection?.session_context, recorded.session_context,
+    'a confirmed projection advances an unlinked snapshot');
 });
 
 test('missing cache telemetry remains absent instead of becoming zero', () => {

@@ -91,7 +91,7 @@ function Fixture() {
     <button onClick={() => emit('fixture-key', 'fixture-session')}>Simulate session event</button>
     <button onClick={() => emit('other-key', 'fixture-session')}>Simulate other credential event</button>
     <button onClick={() => emit('fixture-key', 'other-session')}>Simulate other session event</button>
-    <button onClick={() => emit('fixture-key', 'fixture-session', 'archived-fixture-request', 'archive_bound', 'bound')}>Simulate archive bound event</button>
+    <button onClick={() => emit('fixture-key', 'fixture-session', 'archived-fixture-request', 'archive_bound', 'pending')}>Simulate archive bound event</button>
     <button onClick={() => emit('fixture-key', 'confirmed-session', 'projected-fixture-request', 'projected')}>Simulate confirmed projection</button>
     <SessionMonitor token="fixture-only" tenant="default" revision={revision} eventKeyIds={keys} streamState="live" onSelectRequest={async () => {}} />
   </main></I18nProvider>;

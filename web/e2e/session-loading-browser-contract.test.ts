@@ -100,7 +100,7 @@ test('session events refresh only the exact selected credential and session deta
     await page.evaluate(() => window.resolveSessionList(true));
     await page.waitForFunction(() => window.sessionDetailReads === 2);
     assert.equal(await page.evaluate(() => window.sessionDetailReads), 2,
-      'archive_bound refreshes the exact selected request although its HTTP status stays 200');
+      'archive_bound refreshes the exact selected request although HTTP status and combined archive state stay unchanged');
 
     await page.getByRole('button', { name: 'Simulate session event', exact: true }).click();
     await page.waitForFunction(() => window.sessionListReads === 5);
@@ -109,7 +109,7 @@ test('session events refresh only the exact selected credential and session deta
     assert.equal(await page.evaluate(() => window.sessionDetailReads), 3,
       'the exact selected credential and session event refreshes its detail once');
 
-    await page.locator('.session-card').filter({ hasText: 'Unlinked requests' }).getByRole('button').click();
+    await page.getByRole('button', { name: 'Open Unlinked requests', exact: true }).click();
     await page.waitForFunction(() => window.sessionDetailReads === 4);
     await page.getByRole('button', { name: 'Simulate confirmed projection', exact: true }).click();
     await page.waitForFunction(() => window.sessionListReads === 6);

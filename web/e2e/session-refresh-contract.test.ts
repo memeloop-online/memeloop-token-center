@@ -95,7 +95,20 @@ test('archive transitions refresh an exact selected request even when HTTP statu
   assert.equal(sessionEventsRequireDetailRefresh(batch, selected, {
     session_id: selected.session_id,
     requests: [{ request_id: 'request-a', status_code: 200, archive_state: 'bound' }],
-  }), false, 'an already-bound detail must not refetch on replay');
+  }), true, 'the event can describe one spool while combined state already reflects the other spool');
+
+  for (const eventKind of ['archive_bound', 'archive_gap'] as const) {
+    const oneSideTransition = new Set<string>();
+    enqueueSessionEventIdentity(oneSideTransition, {
+      key_id: 'key-a', request_id: 'request-a', event_kind: eventKind, status_code: 200,
+      archive_state: 'pending',
+      session_context: { association: 'confirmed', session_id: 'session-a' },
+    });
+    assert.equal(sessionEventsRequireDetailRefresh(
+      drainSessionEventIdentities(oneSideTransition), selected,
+      { session_id: selected.session_id, requests: [{ request_id: 'request-a', status_code: 200, archive_state: 'pending' }] },
+    ), true, `${eventKind} must refresh even while the combined archive state remains pending`);
+  }
 });
 
 test('an active session beyond the first fifty cannot survive a terminal refresh as a ghost', () => {
