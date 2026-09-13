@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { inputPlan, memoryVerdict, outputPlan, permitEvidence, planHash, requestPath, responsesInputPlan, responsesOutputPlan } from "../../ops/benchmark-durable-archive-memory.ts";
+import { allocatorEvidence, inputPlan, memoryVerdict, outputPlan, permitEvidence, planHash, requestPath, responsesInputPlan, responsesOutputPlan } from "../../ops/benchmark-durable-archive-memory.ts";
 
 test("request and response plans have exact wire sizes and valid JSON", () => {
   for (const plan of [inputPlan(1024), outputPlan(2048), responsesInputPlan(1024), responsesOutputPlan(2048)]) {
@@ -39,6 +39,20 @@ test("RSS acceptance requires real peak cap AND retained-memory recovery", () =>
 
 test("missing permit telemetry never masquerades as returned permits", () => {
   assert.throws(() => permitEvidence(""), /required permit gauge absent/u);
+});
+
+test("allocator evidence preserves every jemalloc state", () => {
+  const metrics = ["allocated", "active", "resident", "mapped", "retained"]
+    .map((state, index) => `memeloop_token_center_allocator_bytes{state="${state}"} ${(index + 1) * 1024}`)
+    .join("\n");
+  assert.deepEqual(allocatorEvidence(metrics), {
+    allocated: 1024,
+    active: 2048,
+    resident: 3072,
+    mapped: 4096,
+    retained: 5120,
+  });
+  assert.throws(() => allocatorEvidence(metrics.replace(/^.*retained.*$/mu, "")), /required allocator gauge absent: retained/u);
 });
 
 test("CI reuses its exact optimized binary and retains kernel RSS evidence", () => {

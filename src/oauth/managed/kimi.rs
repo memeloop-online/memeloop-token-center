@@ -4,7 +4,9 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{error::AppError, network, provider::UpstreamCredential};
+use crate::{
+    error::AppError, network, oauth::OAuthRefreshRequestGuard, provider::UpstreamCredential,
+};
 
 pub const PROVIDER_DRIVER: &str = "kimi-oauth";
 pub const BASE_URL: &str = "https://api.kimi.com/coding";
@@ -186,8 +188,16 @@ pub async fn refresh(
     http: &reqwest::Client,
     credential: &UpstreamCredential,
     allow_test_loopback: bool,
+    request_guard: &dyn OAuthRefreshRequestGuard,
 ) -> Result<UpstreamCredential, AppError> {
-    refresh_at(http, credential, allow_test_loopback, TOKEN_ENDPOINT).await
+    refresh_at(
+        http,
+        credential,
+        allow_test_loopback,
+        TOKEN_ENDPOINT,
+        request_guard,
+    )
+    .await
 }
 
 async fn refresh_at(
@@ -195,6 +205,7 @@ async fn refresh_at(
     credential: &UpstreamCredential,
     allow_test_loopback: bool,
     endpoint: &str,
+    request_guard: &dyn OAuthRefreshRequestGuard,
 ) -> Result<UpstreamCredential, AppError> {
     validate_credential(credential)?;
     let UpstreamCredential::OAuth {
@@ -220,15 +231,16 @@ async fn refresh_at(
         .append_pair("grant_type", "refresh_token")
         .append_pair("refresh_token", refresh_token)
         .finish();
+    let request = apply_headers(client.post(endpoint), credential)?
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(form)
+        .timeout(TIMEOUT)
+        .build()
+        .map_err(|_| failed())?;
+    request_guard.mark_request_started().await?;
     let operation = async {
-        let response = apply_headers(client.post(endpoint), credential)?
-            .header("Accept", "application/json")
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(form)
-            .timeout(TIMEOUT)
-            .send()
-            .await
-            .map_err(|_| failed())?;
+        let response = client.execute(request).await.map_err(|_| failed())?;
         if response.status() != reqwest::StatusCode::OK {
             return Err(failed());
         }
@@ -387,6 +399,7 @@ mod tests {
                 &credential,
                 true,
                 &format!("{}/token", server.uri()),
+                &crate::oauth::TEST_OAUTH_REFRESH_REQUEST_GUARD,
             )
             .await
             .unwrap();
@@ -436,6 +449,7 @@ mod tests {
                 &credential,
                 true,
                 &format!("{}/token", server.uri()),
+                &crate::oauth::TEST_OAUTH_REFRESH_REQUEST_GUARD,
             )
             .await
             .unwrap_err()

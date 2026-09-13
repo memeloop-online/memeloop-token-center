@@ -390,6 +390,25 @@ async fn assert_subagent_relation_contract(state: &AppState, database_url: &str,
         .create_key(create("Subagent credential B"), PEPPER)
         .await
         .expect("create subagent credential B");
+    let issued_foreign = state
+        .db
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: format!("{tenant}-foreign"),
+                principal_external_id: "shared-principal".into(),
+                alias: "Foreign tenant credential".into(),
+                currency: "USD".into(),
+                policy: KeyPolicy {
+                    allowed_models: vec!["*".into()],
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            PEPPER,
+        )
+        .await
+        .expect("create foreign-tenant credential");
     let key_a = state
         .db
         .authenticate_key(&issued_a.key, PEPPER)
@@ -400,9 +419,15 @@ async fn assert_subagent_relation_contract(state: &AppState, database_url: &str,
         .authenticate_key(&issued_b.key, PEPPER)
         .await
         .expect("authenticate subagent credential B");
+    let foreign_key = state
+        .db
+        .authenticate_key(&issued_foreign.key, PEPPER)
+        .await
+        .expect("authenticate foreign-tenant credential");
     assert_eq!(key_a.tenant_id, key_b.tenant_id);
     assert_eq!(key_a.principal_id, key_b.principal_id);
     assert_ne!(key_a.key_id, key_b.key_id);
+    assert_ne!(key_a.tenant_id, foreign_key.tenant_id);
 
     let (root_request, root_cluster) = observe_request(
         state,
@@ -415,6 +440,11 @@ async fn assert_subagent_relation_contract(state: &AppState, database_url: &str,
         "Codex",
     )
     .await;
+    state
+        .db
+        .attach_conversation_upstream_response(root_request, "root-response")
+        .await
+        .expect("attach root upstream response id");
     let (header_child, header_cluster) = observe_request(
         state,
         &key_a,
@@ -440,8 +470,21 @@ async fn assert_subagent_relation_contract(state: &AppState, database_url: &str,
         "Codex",
     )
     .await;
+    let (response_child, response_cluster) = observe_request(
+        state,
+        &key_a,
+        &json!({"input": "response-id-marked child"}),
+        &ConversationHints {
+            parent_turn_id: Some("root-response".into()),
+            subagent: true,
+            ..ConversationHints::default()
+        },
+        "Codex",
+    )
+    .await;
     assert_eq!(header_cluster, root_cluster);
     assert_eq!(body_cluster, root_cluster);
+    assert_eq!(response_cluster, root_cluster);
 
     // A limit-one walk proves that relation edges remain attached to their
     // target page instead of disappearing at a pagination boundary.
@@ -488,10 +531,10 @@ async fn assert_subagent_relation_contract(state: &AppState, database_url: &str,
     }
     assert_eq!(
         seen_requests,
-        HashSet::from([root_request, header_child, body_child])
+        HashSet::from([root_request, header_child, body_child, response_child])
     );
     seen_subagent_edges.sort_unstable();
-    let mut expected_children = vec![header_child, body_child];
+    let mut expected_children = vec![header_child, body_child, response_child];
     expected_children.sort_unstable();
     assert_eq!(seen_subagent_edges, expected_children);
 
@@ -561,6 +604,40 @@ async fn assert_subagent_relation_contract(state: &AppState, database_url: &str,
     .await;
     assert_ne!(explicit_key_a_cluster, explicit_key_b_cluster);
 
+    // Direct ancestry outranks an unrelated explicit-session candidate. This
+    // also fixes the lookup priority as separate point queries replace the
+    // former combined OR selector.
+    let (_, parent_priority_cluster) = observe_request(
+        state,
+        &key_a,
+        &json!({"input": "direct parent must outrank session membership"}),
+        &ConversationHints {
+            session_id: Some("shared-explicit-session".into()),
+            parent_turn_id: Some("root-turn".into()),
+            ..ConversationHints::default()
+        },
+        "PriorityClient",
+    )
+    .await;
+    assert_eq!(parent_priority_cluster, root_cluster);
+    assert_ne!(parent_priority_cluster, explicit_key_a_cluster);
+
+    // Neither structured hint may cross the stable-key or tenant boundary.
+    let (_, foreign_cluster) = observe_request(
+        state,
+        &foreign_key,
+        &json!({"input": "foreign tenant child"}),
+        &ConversationHints {
+            session_id: Some("shared-explicit-session".into()),
+            parent_turn_id: Some("root-turn".into()),
+            ..ConversationHints::default()
+        },
+        "ForeignTenantClient",
+    )
+    .await;
+    assert_ne!(foreign_cluster, root_cluster);
+    assert_ne!(foreign_cluster, explicit_key_a_cluster);
+
     // A parent timestamp later than its child is also unavailable.
     let (future_parent_request, _) = observe_request(
         state,
@@ -610,7 +687,7 @@ async fn assert_subagent_relation_contract(state: &AppState, database_url: &str,
     .fetch_one(&pool)
     .await
     .expect("count key B subagent edges");
-    assert_eq!(subagent_edges_for_a, 2);
+    assert_eq!(subagent_edges_for_a, 3);
     assert_eq!(subagent_edges_for_b, 0);
     pool.close().await;
 }

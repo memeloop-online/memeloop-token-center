@@ -1,6 +1,7 @@
 use futures_util::StreamExt;
+use uuid::Uuid;
 
-use crate::error::AppError;
+use crate::{db::Database, error::AppError};
 
 mod adapter;
 pub mod claude;
@@ -23,6 +24,53 @@ pub(crate) use endpoint::{oauth_adapter_endpoint_scope, validate_oauth_adapter_e
 
 const MAX_OAUTH_RESPONSE_BYTES: usize = 1024 * 1024;
 
+#[async_trait::async_trait]
+pub trait OAuthRefreshRequestGuard: Send + Sync {
+    /// Persist any caller-owned one-way boundary required before dispatching a
+    /// refresh-token request.
+    async fn mark_request_started(&self) -> Result<(), AppError>;
+}
+
+pub(crate) struct DurableOAuthRefreshRequestGuard<'a> {
+    database: &'a Database,
+    account_id: Uuid,
+    idempotency_key: &'a str,
+}
+
+impl<'a> DurableOAuthRefreshRequestGuard<'a> {
+    pub(crate) fn new(database: &'a Database, account_id: Uuid, idempotency_key: &'a str) -> Self {
+        Self {
+            database,
+            account_id,
+            idempotency_key,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl OAuthRefreshRequestGuard for DurableOAuthRefreshRequestGuard<'_> {
+    async fn mark_request_started(&self) -> Result<(), AppError> {
+        self.database
+            .mark_upstream_oauth_refresh_request_started(self.account_id, self.idempotency_key)
+            .await
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestOAuthRefreshRequestGuard;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl OAuthRefreshRequestGuard for TestOAuthRefreshRequestGuard {
+    async fn mark_request_started(&self) -> Result<(), AppError> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) static TEST_OAUTH_REFRESH_REQUEST_GUARD: TestOAuthRefreshRequestGuard =
+    TestOAuthRefreshRequestGuard;
+
 async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, AppError> {
     if response
         .content_length()
@@ -44,14 +92,11 @@ async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, AppError> 
 
 #[cfg(test)]
 use crate::{
-    db::Database,
     network::OutboundScope,
     provider::{ManagedOAuthAdapterBackend, ProviderCatalog, UpstreamCredential},
 };
 #[cfg(test)]
 use serde_json::json;
-#[cfg(test)]
-use uuid::Uuid;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,6 +488,7 @@ mod tests {
             &credential,
             crate::db::unix_millis(),
             OutboundScope::Public,
+            &TEST_OAUTH_REFRESH_REQUEST_GUARD,
         )
         .await
         .unwrap_err();
