@@ -19,9 +19,10 @@ export function ProxyInput({ value, onChange, disabled = false }: { value: strin
   </div>;
 }
 
-export function UpstreamConnection({ account, token, tenant, disabled, onChanged, onEditingChange }: {
+export function UpstreamConnection({ account, token, tenant, disabled, onChanged, onEditingChange, onSaved }: {
   account: UpstreamAccount; token: string; tenant: string; disabled: boolean; onChanged: () => Promise<void>;
   onEditingChange?: (editing: boolean) => void;
+  onSaved?: (account: UpstreamAccount) => void;
 }) {
   const { t } = useI18n();
   const [editing, setEditing] = useState(false);
@@ -41,12 +42,14 @@ export function UpstreamConnection({ account, token, tenant, disabled, onChanged
     if (!valid || busy || disabled || !canEditProxy) return;
     setBusy(true); setError(false); setSaved(false);
     try {
-      await api(`/internal/v1/upstreams/${encodeURIComponent(account.id)}/transport-proxy`, token, {
+      const updated = await api<UpstreamAccount>(`/internal/v1/upstreams/${encodeURIComponent(account.id)}/transport-proxy`, token, {
         method: 'PUT', headers: { 'Idempotency-Key': crypto.randomUUID() },
         body: JSON.stringify({ tenant_external_id: tenant, proxy_url: proxy.trim(), expected_updated_at: account.updated_at, expected_credential_generation: account.credential_generation }),
       });
-      setProxy(''); setEditing(false); setSaved(true);
+      onSaved?.(updated);
+      setProxy(''); setSaved(true);
       await onChanged();
+      setEditing(false);
     } catch { setError(true); }
     finally { setBusy(false); }
   }

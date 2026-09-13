@@ -86,6 +86,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   const [providerWorkspaceOpen, setProviderWorkspaceOpen] = useState(false);
   const [providerCreateGeneration, setProviderCreateGeneration] = useState(0);
   const [proxyEditorOpen, setProxyEditorOpen] = useState(false);
+  const [providerEditDraft, setProviderEditDraft] = useState<Record<string, unknown>>();
   const providerSuccess = useRef<HTMLDivElement>(null);
   const [busy, setBusy] = useState('');
   const { container: providerList, rememberTrigger } = useInlineEditorFocus(editing?.id, Boolean(busy), `${token}\0${tenant}\0${writeTenant}`);
@@ -143,7 +144,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     },
   };
   useEffect(() => {
-    setMethod('direct'); setDriver(''); setRotating(undefined); setEditing(undefined); setReauthorizing(undefined); setProviderWorkspaceOpen(false);
+    setProviderEditDraft(undefined); setMethod('direct'); setDriver(''); setRotating(undefined); setEditing(undefined); setReauthorizing(undefined); setProviderWorkspaceOpen(false);
     setBusy(''); setHealth({}); setDeletionReadiness({}); setMessage(''); setError('');
   }, [token, tenant, writeTenant]);
 
@@ -231,7 +232,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   }
 
   const providerEditors = <>
-      {editing && editSchema && <div className="inline-editor"><Form key={`${editing.id}-${locale}`} schema={editSchema} formContext={{ providerEdit: true }} uiSchema={{ config: { oauth: { 'ui:disabled': true }, ...(editing.driver === 'openai-codex' && editing.auth_kind === 'oauth' ? { base_url: { 'ui:widget': 'hidden' } } : {}) } }} formData={{ name: editing.name, config: editing.config }} validator={validator} widgets={fluentFormWidgets} templates={upstreamFormTemplates} onSubmit={async ({ formData }) => { if (!formData || proxyEditorOpen) return; setBusy(`edit-${editing.id}`); try { await api(`/internal/v1/upstreams/${editing.id}`, token, { method: 'PUT', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant, expected_updated_at: editing.updated_at }) }); setEditing(undefined); setProviderWorkspaceOpen(false); setMessage(t('providers.updated', { name: editing.name })); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}><Button appearance="primary" type="submit" disabled={!canManage(editing) || Boolean(busy) || proxyEditorOpen}>{t('common.save')}</Button></Form></div>}
+      {editing && editSchema && <div className="inline-editor"><Form key={`${editing.id}-${locale}`} schema={editSchema} formContext={{ providerEdit: true }} uiSchema={{ config: { oauth: { 'ui:disabled': true }, ...(editing.driver === 'openai-codex' && editing.auth_kind === 'oauth' ? { base_url: { 'ui:widget': 'hidden' } } : {}) } }} formData={providerEditDraft ?? { name: editing.name, config: editing.config }} onChange={({ formData }) => setProviderEditDraft(formData)} validator={validator} widgets={fluentFormWidgets} templates={upstreamFormTemplates} onSubmit={async ({ formData }) => { if (!formData || proxyEditorOpen) return; setBusy(`edit-${editing.id}`); try { await api(`/internal/v1/upstreams/${editing.id}`, token, { method: 'PUT', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant, expected_updated_at: editing.updated_at }) }); setEditing(undefined); setProviderWorkspaceOpen(false); setMessage(t('providers.updated', { name: editing.name })); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}><Button appearance="primary" type="submit" disabled={!canManage(editing) || Boolean(busy) || proxyEditorOpen}>{t('common.save')}</Button></Form></div>}
       {rotating && rotateProvider && <div className="inline-editor"><Form key={`${rotating.id}-${locale}`} schema={localizeSchema(rotateProvider.credential_schema as RJSFSchema, locale)} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { setBusy(`rotate-${rotating.id}`); try { await api(`/internal/v1/upstreams/${rotating.id}/credential`, token, { method: 'PUT', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ credential: formData }) }); setRotating(undefined); setProviderWorkspaceOpen(false); setMessage(t('providers.rotated', { name: rotating.name })); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}><button type="submit" disabled={!canManage(rotating) || Boolean(busy)}>{t('providers.confirmRotate')}</button></Form></div>}
   </>;
   return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} /><section ref={providerList} className="provider-layout">
@@ -263,7 +264,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             <span className="pill">{t('providers.routes', { count: formatNumber(value.route_count, locale) })}</span>
             <details className="upstream-secondary-actions"><summary>{t('connection.manageAccount')}</summary><div className="row-actions">
               {providerAvailable && <>
-                <button type="button" className="secondary" data-inline-edit-trigger={value.id} disabled={!manageable || Boolean(busy)} onClick={(event) => { rememberTrigger(value.id, event.currentTarget); setEditing(value); }}>{t('providers.edit')}</button>
+                <button type="button" className="secondary" data-inline-edit-trigger={value.id} disabled={!manageable || Boolean(busy)} onClick={(event) => { rememberTrigger(value.id, event.currentTarget); setProviderEditDraft(undefined); setEditing(value); }}>{t('providers.edit')}</button>
                 <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void checkHealth(value)}>{t('providers.runManualHealthCheck')}</button>
                 {value.can_refresh && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void refreshOAuth(value)}>{t('providers.refreshAuthorization')}</button>}
                 {value.can_reauthorize && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setReauthorizing(value)}>{t('providers.reauthorize')}</button>}
@@ -281,7 +282,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     </article>
     <CreateJourney className={editing ? 'provider-edit-workspace' : ''} title={editing ? t('providers.editFor', { name: editing.name }) : rotating ? t('providers.rotateFor', { name: rotating.name }) : reauthorizing ? t('providers.reauthorizeFor', { name: reauthorizing.name }) : t('providers.add')} description={t('providers.description')} open={providerWorkspaceOpen || Boolean(editing || rotating || reauthorizing)} busy={Boolean(busy) || proxyEditorOpen} onOpenChange={(open) => { if (proxyEditorOpen) return; setProviderWorkspaceOpen(open); if (!open) { setEditing(undefined); setRotating(undefined); setReauthorizing(undefined); } }}>
       {error && <div className="notice error" role="alert">{error}</div>}
-      {editing && <UpstreamConnection key={editing.id} account={editing} token={token} tenant={writeTenant} disabled={!canManage(editing) || Boolean(busy)} onChanged={onChanged} onEditingChange={setProxyEditorOpen} />}
+      {editing && <UpstreamConnection key={editing.id} account={editing} token={token} tenant={writeTenant} disabled={!canManage(editing) || Boolean(busy)} onChanged={onChanged} onEditingChange={setProxyEditorOpen} onSaved={updated => setEditing(current => current?.id === updated.id ? { ...updated, name: current.name, config: current.config } : current)} />}
       {editing && proxyEditorOpen && <p role="status">{t('connection.finishProxyFirst')}</p>}
       {editing || rotating ? providerEditors : reauthorizing ? <>
       <AuthorizationConnection key={`reauthorize-${reauthorizing.id}`} token={token} tenant={writeTenant} providers={providers} existing={reauthorizing} onChanged={async () => { setReauthorizing(undefined); setMessage(t('providers.reauthorized', { name: reauthorizing.name })); await onChanged(); }} />

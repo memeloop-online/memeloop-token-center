@@ -26,6 +26,19 @@ window.fetch = async (input, init) => {
       if (window.failNextFormWrite) { window.failNextFormWrite = false; return new Response(JSON.stringify({ error: { message: '模拟创建失败，草稿仍在' } }), { status: 400 }); }
       return new Response(JSON.stringify({ ...account, id: 'account-created', name: '已创建测试上游' }), { status: 201 });
     }
+    if (workflows && new URLSearchParams(location.search).has('proxy-workflow') && method === 'PUT' &&
+      (path === '/internal/v1/upstreams/account-native/transport-proxy' || path === '/internal/v1/upstreams/account-native')) {
+      const data = JSON.parse(String(init?.body ?? '{}'));
+      if (data.expected_updated_at !== account.updated_at) return new Response(JSON.stringify({ error: { message: 'fixture revision conflict' } }), { status: 409 });
+      if (path.endsWith('/transport-proxy')) {
+        if (data.expected_credential_generation !== account.credential_generation) throw new Error('fixture credential revision mismatch');
+        account.credential_generation++;
+      } else {
+        account.name = data.name;
+      }
+      account.updated_at++;
+      return new Response(JSON.stringify(account));
+    }
     if (!workflows || !['/internal/v1/model-routes', '/internal/v1/model-routes/route-existing'].includes(path) || !['POST', 'PUT'].includes(method)) throw new Error('Mutation outside the explicit local workflow fixture');
     if (window.failNextFormWrite) { window.failNextFormWrite = false; return new Response(JSON.stringify({ error: { message: '模拟保存失败，草稿仍在' } }), { status: 400 }); }
     const data = JSON.parse(String(init?.body ?? '{}'));
