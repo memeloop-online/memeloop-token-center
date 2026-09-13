@@ -649,8 +649,7 @@ mod tests {
             let failure =
                 canary_operation::<()>(&progress, &metrics, stage, async { Err(injected_error()) })
                     .await
-                    .err()
-                    .expect("injected failure");
+                    .expect_err("injected failure");
             assert_eq!(failure.stage.as_str(), stage.as_str());
             assert_eq!(failure.error_class, "transport_or_service");
             assert!(
@@ -717,8 +716,7 @@ mod tests {
             } else {
                 let failure = result
                     .expect("not a timeout")
-                    .err()
-                    .expect("operation failure");
+                    .expect_err("operation failure");
                 assert_eq!(failure.stage.as_str(), stage.as_str());
             }
             assert_eq!(progress.current().as_str(), stage.as_str());
