@@ -38,6 +38,10 @@ test('create and rotate keep provider secrets masked across keyboard, mobile and
           const form = page.getByRole('region', { name, exact: true });
           const inputs = form.locator('.schema-secret-field input');
           assert.ok(await inputs.count() >= 2, `${variant}: secret strings and opaque/ref fields rendered`);
+          if (variant !== 'api') {
+            await form.locator('button[type=submit]').click();
+            assert.equal(await inputs.first().getAttribute('aria-invalid'), 'true', 'RJSF raw validation errors reach the secret input');
+          }
           for (const input of await inputs.all()) {
             assert.equal(await input.getAttribute('type'), 'password');
             assert.equal(await input.inputValue() === '', true, 'existing/default secret must not be prefilled');
@@ -71,11 +75,23 @@ test('create and rotate keep provider secrets masked across keyboard, mobile and
           }
           await form.locator('button[type=submit]').click();
         }
-        assert.equal(await page.getByRole('region', { name: 'Edit connection', exact: true }).locator('.secret-input').count(), 0, 'ordinary editing does not fetch/prefill stored credentials');
+        const edit = page.getByRole('region', { name: 'Edit connection', exact: true });
+        const editSecret = edit.locator('.secret-input input');
+        assert.equal(await editSecret.inputValue() === '', true, 'existing.config and reference defaults never prefill an editor');
+        await edit.locator('button[type=submit]').click();
+        assert.equal(await edit.getByRole('status', { name: 'Edit outcome' }).textContent(), 'unchanged');
+        await editSecret.fill('synthetic-replacement');
+        const reveal = editSecret.locator('..').getByRole('button');
+        await reveal.focus(); await page.keyboard.press('Enter');
+        assert.equal(await editSecret.getAttribute('type'), 'text');
+        await page.keyboard.press('Escape');
+        assert.equal(await editSecret.getAttribute('type'), 'password');
+        await edit.locator('button[type=submit]').click();
+        assert.equal(await edit.getByRole('status', { name: 'Edit outcome' }).textContent(), 'replaced');
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
         await page.screenshot({ path: `${artifacts}/${variant}-${locale}-${theme}-${width}.png`, fullPage: true, mask: [page.locator('input')] });
       }
-      assert.match(await page.getByRole('status').textContent() ?? '', /4$/);
+      assert.match(await page.getByRole('status', { name: 'Synthetic submissions', exact: true }).textContent() ?? '', /4$/);
       assert.deepEqual(failures, []);
       await page.close();
     }

@@ -24,13 +24,15 @@ const credential: RJSFSchema = variant === 'oauth' ? {
 } : variant === 'plugin' ? {
   type: 'object', required: ['password', 'client_secret'], properties: {
     password: { type: 'string', format: 'password', title: 'Password' },
-    client_secret: { $ref: '#/$defs/secret' },
+    client_secret: { $ref: '#/$defs/secret', default: 'must-not-prefill-ref-site' },
+    allof_secret: { allOf: [{ $ref: '#/$defs/secret' }, { default: 'must-not-prefill-allof-sibling' }], title: 'Combined secret' },
   },
 } : {
-  oneOf: [{ title: 'API key', type: 'object', required: ['value'], properties: {
+  oneOf: [{ title: 'API key', type: 'object', additionalProperties: false, required: ['type', 'value'], properties: {
+    type: { type: 'string', const: 'api_key', default: 'api_key' },
     value: { ...secret, title: 'Credential value' },
     proxy_url: { type: ['string', 'null'], writeOnly: true, title: 'Proxy URL' },
-  } }, { title: 'No authentication', type: 'object', properties: {} }],
+  } }, { title: 'No authentication', type: 'object', additionalProperties: false, required: ['type'], properties: { type: { type: 'string', const: 'none' } } }],
 };
 const definitions: RJSFSchema['$defs'] = { secret: { ...secret, title: 'Client secret' } };
 
@@ -38,9 +40,10 @@ function Fixture() {
   const [submitted, setSubmitted] = useState(0);
   const [proxy, setProxy] = useState('');
   const [generation, setGeneration] = useState(0);
+  const [editOutcome, setEditOutcome] = useState('pending');
   return <main className="main">
     <button type="button" onClick={() => setGeneration((value) => value + 1)}>Reopen forms</button>
-    <p role="status">Successful synthetic submissions: {submitted}</p>
+    <p role="status" aria-label="Synthetic submissions">Successful synthetic submissions: {submitted}</p>
     <section className="panel" aria-label="Create credential">
       <h1>Create credential</h1>
       <OperatorSchemaForm key={`create-${generation}`} schema={{ type: 'object', $defs: definitions, required: ['credential'], properties: { credential } }} validator={safeValidator} templates={upstreamFormTemplates} onSubmit={() => setSubmitted((count) => count + 1)}><button type="submit">Create fixture</button></OperatorSchemaForm>
@@ -51,7 +54,8 @@ function Fixture() {
     </section>
     <section className="panel" aria-label="Edit connection">
       <h2>Edit connection</h2>
-      <OperatorSchemaForm schema={{ type: 'object', properties: { name: { type: 'string' }, config: { type: 'object', properties: { base_url: { type: 'string' } } } } }} formData={{ name: 'Existing account', config: { base_url: 'https://provider.example' } }} validator={safeValidator} templates={upstreamFormTemplates}><span /></OperatorSchemaForm>
+      <OperatorSchemaForm key={`edit-${generation}`} schema={{ type: 'object', $defs: definitions, properties: { name: { type: 'string' }, config: { type: 'object', required: ['client_secret'], properties: { base_url: { type: 'string' }, client_secret: { $ref: '#/$defs/secret', default: 'must-not-prefill-edit' } } } } }} formData={{ name: 'Existing account', config: { base_url: 'https://provider.example', client_secret: 'must-not-prefill-existing-config' } }} validator={safeValidator} templates={upstreamFormTemplates} onSubmit={({ formData }) => setEditOutcome(Object.hasOwn(formData.config, 'client_secret') ? formData.config.client_secret === 'synthetic-replacement' ? 'replaced' : 'unsafe' : 'unchanged')}><button type="submit">Save fixture</button></OperatorSchemaForm>
+      <p role="status" aria-label="Edit outcome">{editOutcome}</p>
     </section>
     <section className="panel" aria-label="Account proxy"><ProxyInput value={proxy} onChange={setProxy} /></section>
   </main>;

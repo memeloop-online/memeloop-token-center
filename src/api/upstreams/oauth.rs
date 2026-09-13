@@ -200,7 +200,11 @@ pub(in crate::api) async fn poll_codex_oauth(
                 account.attach_proxy_metadata(&credential, state.config.key_pepper.as_bytes())?;
             }
             super::restrict_transport_proxy_capability(&service, &mut account);
-            Ok((StatusCode::OK, Json(account)).into_response())
+            Ok((
+                StatusCode::OK,
+                Json(super::config_secrets::public_account(&state, account)?),
+            )
+                .into_response())
         }
         CodexDevicePollResult::Ready { lease_owner, login } => {
             let ready = *login;
@@ -312,7 +316,7 @@ pub(in crate::api) async fn poll_codex_oauth(
                 } else {
                     StatusCode::CREATED
                 },
-                Json(account),
+                Json(super::config_secrets::public_account(&state, account)?),
             )
                 .into_response())
         }
@@ -515,7 +519,11 @@ pub(in crate::api) async fn poll_cursor_oauth(
                 .db
                 .upstream_account_for_reauthorization(account_id, &tenant_external_id)
                 .await?;
-            Ok((StatusCode::OK, Json(account)).into_response())
+            Ok((
+                StatusCode::OK,
+                Json(super::config_secrets::public_account(&state, account)?),
+            )
+                .into_response())
         }
         CursorPollResult::Ready { lease_owner, login } => {
             let ready = *login;
@@ -606,7 +614,11 @@ pub(in crate::api) async fn poll_cursor_oauth(
                 )
                 .await?;
             super::trigger_upstream_model_sync(state.clone(), account.id);
-            Ok((status, Json(account)).into_response())
+            Ok((
+                status,
+                Json(super::config_secrets::public_account(&state, account)?),
+            )
+                .into_response())
         }
     }
 }
@@ -627,7 +639,9 @@ pub(in crate::api) async fn refresh_upstream_oauth(
     }
     let mut account = refresh_managed_upstream_oauth(&state, account_id, idempotency_key).await?;
     super::restrict_transport_proxy_capability(&service, &mut account);
-    Ok(Json(account))
+    Ok(Json(super::config_secrets::public_account(
+        &state, account,
+    )?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -679,7 +693,7 @@ pub(in crate::api) async fn disconnect_upstream_oauth(
         })
     };
     Ok(Json(json!({
-        "account": account,
+        "account": super::config_secrets::public_account(&state, account)?,
         "provider_revocation": provider_revocation
     })))
 }

@@ -1,5 +1,6 @@
 mod accounts;
 mod availability;
+mod config_secrets;
 mod health;
 mod models;
 mod native_codex_upgrade;

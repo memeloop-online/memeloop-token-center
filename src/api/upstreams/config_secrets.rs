@@ -1,0 +1,177 @@
+use serde_json::{Map, Value};
+
+use crate::{AppState, error::AppError, provider::UpstreamAccountView};
+
+fn invalid() -> AppError {
+    AppError::BadRequest("secret configuration requires an explicit non-empty replacement".into())
+}
+
+fn paths(schema: &Value) -> Result<Vec<Vec<String>>, AppError> {
+    fn visit(
+        root: &Value,
+        node: &Value,
+        path: &mut Vec<String>,
+        output: &mut Vec<Vec<String>>,
+        depth: usize,
+    ) -> Result<(), AppError> {
+        if depth > 32 {
+            return Err(invalid());
+        }
+        if node.get("writeOnly").and_then(Value::as_bool) == Some(true)
+            || node.get("format").and_then(Value::as_str) == Some("password")
+        {
+            output.push(path.clone());
+            return Ok(());
+        }
+        if let Some(reference) = node.get("$ref").and_then(Value::as_str) {
+            let target = reference
+                .strip_prefix('#')
+                .and_then(|pointer| root.pointer(pointer))
+                .ok_or_else(invalid)?;
+            visit(root, target, path, output, depth + 1)?;
+        }
+        for keyword in ["allOf", "oneOf", "anyOf"] {
+            if let Some(parts) = node.get(keyword).and_then(Value::as_array) {
+                for part in parts {
+                    visit(root, part, path, output, depth + 1)?;
+                }
+            }
+        }
+        if let Some(properties) = node.get("properties").and_then(Value::as_object) {
+            for (key, child) in properties {
+                path.push(key.clone());
+                visit(root, child, path, output, depth + 1)?;
+                path.pop();
+            }
+        }
+        // An array containing secrets is opaque as a whole: never expose or
+        // reconstruct indices from a partially redacted array.
+        if let Some(items) = node.get("items") {
+            let mut nested = Vec::new();
+            visit(root, items, &mut Vec::new(), &mut nested, depth + 1)?;
+            if !nested.is_empty() {
+                output.push(path.clone());
+            }
+        }
+        Ok(())
+    }
+    let mut output = Vec::new();
+    visit(schema, schema, &mut Vec::new(), &mut output, 0)?;
+    output.sort();
+    output.dedup();
+    Ok(output)
+}
+
+/// Only schema-owned secret paths are inherited. Ordinary and unknown fields
+/// retain the existing full-replacement semantics. The caller keeps its CAS.
+pub(super) fn preserve(
+    schema: &Value,
+    current: &Value,
+    incoming: &mut Value,
+) -> Result<(), AppError> {
+    fn replace(
+        current: Option<&Value>,
+        incoming: &mut Value,
+        path: &[String],
+    ) -> Result<(), AppError> {
+        let Some((key, tail)) = path.split_first() else {
+            let empty = incoming.is_null()
+                || incoming.as_str().is_some_and(|v| v.trim().is_empty())
+                || incoming.as_object().is_some_and(Map::is_empty)
+                || incoming.as_array().is_some_and(Vec::is_empty);
+            return if empty { Err(invalid()) } else { Ok(()) };
+        };
+        let old = current.and_then(|value| value.get(key));
+        let object = incoming.as_object_mut().ok_or_else(invalid)?;
+        if !object.contains_key(key) {
+            if tail.is_empty() {
+                if let Some(old) = old {
+                    object.insert(key.clone(), old.clone());
+                }
+                return Ok(());
+            }
+            if old.is_none() {
+                return Ok(());
+            }
+            object.insert(key.clone(), Value::Object(Map::new()));
+        }
+        replace(old, object.get_mut(key).ok_or_else(invalid)?, tail)
+    }
+    for path in paths(schema)? {
+        replace(Some(current), incoming, &path)?;
+    }
+    Ok(())
+}
+
+fn redact(schema: &Value, value: &mut Value) -> Result<(), AppError> {
+    fn remove(value: &mut Value, path: &[String]) {
+        let Some((first, tail)) = path.split_first() else {
+            *value = Value::Null;
+            return;
+        };
+        if tail.is_empty() {
+            if let Some(object) = value.as_object_mut() {
+                object.remove(first);
+            }
+        } else if let Some(child) = value.get_mut(first) {
+            remove(child, tail);
+        }
+    }
+    for path in paths(schema)? {
+        remove(value, &path);
+    }
+    Ok(())
+}
+
+pub(super) fn redact_account(
+    state: &AppState,
+    account: &mut UpstreamAccountView,
+) -> Result<(), AppError> {
+    let Some(provider) = state.providers.get(&account.driver) else {
+        // An unavailable plugin cannot supply trustworthy annotations.
+        account.config = Value::Object(Map::new());
+        return Ok(());
+    };
+    redact(&provider.config_schema, &mut account.config)
+}
+
+pub(super) fn public_account(
+    state: &AppState,
+    mut account: UpstreamAccountView,
+) -> Result<UpstreamAccountView, AppError> {
+    redact_account(state, &mut account)?;
+    Ok(account)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn nested_ref_allof_preservation_and_redaction_are_fail_closed() {
+        let schema = json!({"$defs":{"secret":{"type":"string","writeOnly":true}},"properties":{
+            "nested":{"properties":{"token":{"allOf":[{"$ref":"#/$defs/secret"}]}}},
+            "plain":{"type":"string"}
+        }});
+        let current = json!({"nested":{"token":"synthetic-old","unknown":"must-not-inherit"},"plain":"old","unknown":"old"});
+        let mut next = json!({"plain":"new"});
+        preserve(&schema, &current, &mut next).unwrap();
+        assert_eq!(
+            next,
+            json!({"plain":"new","nested":{"token":"synthetic-old"}})
+        );
+        let mut replacement = json!({"nested":{"token":"synthetic-new"}});
+        preserve(&schema, &current, &mut replacement).unwrap();
+        assert_eq!(replacement["nested"]["token"], "synthetic-new");
+        for bad in [
+            json!({"nested":null}),
+            json!({"nested":{"token":null}}),
+            json!({"nested":{"token":""}}),
+        ] {
+            assert!(preserve(&schema, &current, &mut bad.clone()).is_err());
+        }
+        redact(&schema, &mut next).unwrap();
+        assert_eq!(next, json!({"plain":"new","nested":{}}));
+    }
+}
