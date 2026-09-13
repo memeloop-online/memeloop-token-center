@@ -530,6 +530,7 @@ mod tests {
                 Some(())
             }
         }));
+        tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(10)).await;
         tokio::time::timeout(Duration::from_secs(1), entering)
             .await
