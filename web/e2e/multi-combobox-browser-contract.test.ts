@@ -114,6 +114,11 @@ test('multi-select escapes clipping and supports keyboard selection, dismissal a
       }
       assert.equal(await menu.getAttribute('aria-modal'), null);
       await page.screenshot({ path: `${artifacts}/${theme}-${width}.png`, fullPage: true });
+      await input.press('Escape');
+      await menu.waitFor({ state: 'hidden' });
+      assert.equal(await input.getAttribute('aria-expanded'), 'false');
+      assert.equal(await input.getAttribute('aria-controls'), null);
+      assert.equal(await input.getAttribute('aria-activedescendant'), null, 'closing clears the previously active option reference');
     }
   } finally { await browser.close(); await server.close(); }
 });
