@@ -285,7 +285,7 @@ async fn provider_adapter_reauthorization_restores_only_the_current_secret_confi
                     proxy_url: None,
                     proxy_network_scope: None,
                 },
-                oauth_session_id: None,
+                oauth_session_id: Some(Uuid::now_v7()),
                 oauth_driver: Some("provider_adapter".into()),
                 oauth_refresh_url: Some(adapter.refresh_url),
             },
@@ -321,9 +321,14 @@ async fn provider_adapter_reauthorization_restores_only_the_current_secret_confi
         start(public_config.clone()),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    let started_diagnostic = started.to_string();
+    assert!(!started_diagnostic.contains("synthetic-"));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "sanitized response: {started_diagnostic}"
+    );
     assert!(started["session_token"].is_string());
-    assert!(!started.to_string().contains("synthetic-current-secret"));
 
     for tampered in [
         json!({
@@ -339,8 +344,13 @@ async fn provider_adapter_reauthorization_restores_only_the_current_secret_confi
             start(tampered),
         )
         .await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert!(!rejected.to_string().contains("synthetic-"));
+        let rejected_diagnostic = rejected.to_string();
+        assert!(!rejected_diagnostic.contains("synthetic-"));
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "sanitized response: {rejected_diagnostic}"
+        );
     }
     let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_login_sessions")
         .fetch_one(&pool)
