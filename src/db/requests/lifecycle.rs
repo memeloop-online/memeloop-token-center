@@ -976,6 +976,7 @@ impl Database {
                         client_name: conversation.client_name,
                         observed_at: now,
                         attach_request_record: true,
+                        content_materialized: false,
                     },
                 )
                 .await?;
