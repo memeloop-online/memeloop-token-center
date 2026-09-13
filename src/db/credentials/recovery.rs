@@ -183,7 +183,7 @@ impl Database {
                     key_id,
                     generation,
                     actor_service_id,
-                    "integrity_failed",
+                    "unavailable",
                     now,
                 )
                 .await?;

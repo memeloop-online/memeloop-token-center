@@ -384,7 +384,7 @@ fn service_token_view(row: AnyRow) -> Result<ServiceTokenView, AppError> {
         status: row.try_get("status")?,
         credential_generation: row.try_get("credential_generation")?,
         fingerprint: row.try_get("fingerprint")?,
-        credential_copy_available: row.try_get::<bool, _>("credential_copy_available")?
+        credential_copy_available: row.try_get::<i64, _>("credential_copy_available")? != 0
             && row.try_get::<String, _>("status")? == "active",
         scopes: serde_json::from_str(&scopes_json).map_err(|_| AppError::Internal)?,
         tenant_external_id: row.try_get("tenant_external_id")?,
