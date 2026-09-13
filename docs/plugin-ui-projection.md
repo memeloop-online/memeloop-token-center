@@ -1,65 +1,47 @@
-# Plugin UI projection v1 (integration gate)
+# Plugin UI projection v1
 
-The new `PluginUiSlot` is an opt-in, core-owned renderer. It is deliberately not
-mounted by production pages yet. The existing typed-data endpoint is not by itself
-evidence that arbitrary plugin output is safe to expose through this contract.
+Installed contributions opt in with `renderer: "typed_data_v1"` and
+`presentation: "projection_v1"`. Existing `operator.overview.card` and
+`operator.sidebar.tab` registrations render through `PluginUiSlot` inside the
+real Operator page. Health-intelligence and generic JSON presentations remain
+compatible. No second navigation registry or data endpoint is introduced.
 
-## Server adapter required before mounting
+## Data contract
 
-The authenticated service-data handler may wrap a v1 projection in its existing
-response envelope. Its adapter must enforce the following in order:
+The existing authenticated
+`/internal/v1/plugins/{plugin_id}/data/{endpoint_id}` route checks `plugins:read`,
+the endpoint's required scope and management tenant before reading service data.
+It retains the existing bounded fetch, endpoint schema, cache and fallback rules.
+Projection feeds additionally validate the bundled projection schema, installed
+plugin/contribution identity and link origins against the manifest's approved
+HTTP capabilities. Invalid projections produce a generic upstream error.
+Responses are private/no-store, with authorization rechecked on each read.
 
-1. Resolve the current principal and tenant from authenticated context. Require
-   the registered plugin, contribution, endpoint, and read capability; do not
-   trust tenant/principal identifiers supplied by plugin output.
-2. Execute only the registered endpoint under existing runtime budgets. Bound
-   serialized projection responses to 256 KiB **before** JSON parsing, including
-   on the browser loader. Apply a 10-second maximum read deadline.
-3. Validate `schemas/plugin-ui-projection.schema.json`, exact requested plugin
-   and slot identity, and HTTPS link origins against a core-owned exact-origin
-   allowlist. Reject userinfo, whitespace, backslashes, malformed URLs, and
-   control/bidi characters. No wildcard origins, arbitrary fetch URLs, HTML,
-   Markdown, CSS, scripts, frames, action handlers, or asset downloads exist.
-4. Project only fields the authenticated principal may read. Remove components
-   with unauthorized data before serialization; omit denied slots altogether.
-   There is no client-supplied permission field. Neither hidden DOM nor browser
-   validation is authorization. Validate the final projected response again.
-5. Audit request identity, plugin/slot/version, decision, bounded reason code,
-   duration, and correlation ID. Never log component values, tokens, or raw
-   plugin errors. Audit failures must follow the host's existing audit policy.
-6. Use private/no-store responses or cache keys including tenant, principal,
-   authorization revision, plugin revision, slot and locale. Recheck authorization
-   on every read. Never share authorization-sensitive results across tenants.
+`slot_id` is the contribution's `id`, not its placement name. A feed contains:
 
-## Frontend integration
+```json
+{"schema_version":1,"plugin_id":"dashboard","slot_id":"summary","components":[{"kind":"metric","label":"Requests","value":"42"}]}
+```
 
-Pass `load(signal)` from core code using an authenticated, fixed registered route;
-the plugin never provides this callback or a request URL. The callback unwraps
-only the validated projection. Supply localized `title`, loading/error/empty and
-status messages, and a core-owned `allowedLinkOrigins` array (empty by default).
-Metric values and plugin labels are bounded plain strings prepared by the server
-for the requested locale, not browser-executed format expressions.
+Components may be text, metric, status or HTTPS link, with at most 32 per slot.
+The browser renders bounded plain text and local components. Link origins come
+from the installed manifest, never from the projection itself. The authenticated
+loader unwraps only `response.data`; it does not execute a guest URL or script.
 
-`scopeKey` must change on tenant, principal, credential/authorization revision,
-or plugin revision. Scope and link-policy changes synchronously unmount old data,
-abort in-flight loads and ignore late results. No raw credential belongs in the
-projection, DOM, audit, or a shared cache. Revocations must invalidate the host's
-scope key; the slot does not independently discover authorization changes.
+## Scope and rendering
 
-Slots load once when visible, not when a catalog is listed. Each has a 10-second
-deadline and independent error UI; exceptions and invalid responses do not take
-down siblings. The host must bound registered slots per page and concurrency;
-this module is not a global scheduling system. Unmounting aborts pending reads.
+Credential, tenant, manifest revision and endpoint changes synchronously replace
+the renderer boundary. Pending reads are aborted; late results cannot restore the
+previous scope. Slots fetch on visibility and have a 10-second read deadline with
+independent loading/error states. A denied tenant never retains prior-tenant data.
+The existing server caps registered contributions and response body size.
+This adds no installation, live revision activation or production toggle.
 
-The closed 32-component grammar creates no remote executable or remote asset
-surface. React renders text as text; links open with noopener/noreferrer and no
-referrer. Semantic headings, descriptions, status text, visible keyboard focus,
-inherited theme colors and wrapping accommodate mobile and assistive technology.
-The browser contracts exercise the renderer independently of requests/overview.
+## Verification
 
-## Remaining integration acceptance
-
-Do not enable a production contribution until server tests prove cross-tenant
-denial, field redaction, payload/deadline bounds, allowlist enforcement, audit
-redaction, and revocation/cache behavior. Add endpoint/OpenAPI wiring only with
-the service-data owner; this foundation does not claim those server checks exist.
+CI runs backend projection shape/identity/link-grant checks, existing service-data
+authorization tests, registry page/card checks, isolated mobile-theme renderer
+checks and a real Operator plugin-route browser test. The latter follows the
+actual remembered service credential, manifest registry, authenticated data route
+and tenant selector, then checks a denied-tenant transition. No live supplier,
+production or OAuth requests are used. Local checks are formatting/diff only.
