@@ -386,7 +386,7 @@ async fn rejected_capture_never_publishes_a_complete_prefix() {
     assert_eq!(locator, format!("gap://{}/response", identity.request_id));
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn late_begin_ack_is_fenced_as_gap_and_cannot_leave_a_capturing_spool() {
     let (_dir, state, pool, identity) = fixture().await;
     let (entering, release) = pause_next_begin_ack_for_test(&state);
@@ -405,8 +405,13 @@ async fn late_begin_ack_is_fenced_as_gap_and_cannot_leave_a_capturing_spool() {
             .unwrap();
     assert_eq!(state_before_timeout, "capturing");
 
+    // Freeze time only after the real SQLite transaction committed and the
+    // acknowledgement seam stopped the task from completing. No database I/O
+    // runs while Tokio is allowed to auto-advance the clock.
+    tokio::time::pause();
     tokio::time::advance(ACK_TIMEOUT).await;
     assert!(begin.await.unwrap().is_none());
+    tokio::time::resume();
     release.send(()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
