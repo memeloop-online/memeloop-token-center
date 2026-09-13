@@ -173,7 +173,7 @@ async fn dynamic_and_conditional_account_config_responses_fail_closed() {
         state.providers.extend([provider]).unwrap();
         let settings = if index == 0 { json!({"entry":{"token":"synthetic-dynamic"}}) } else { json!({"mode":"private","token":"synthetic-conditional"}) };
         let config = json!({"base_url":mock.uri(),"settings":settings});
-        let (status, created) = request(&state,"POST","/internal/v1/upstreams",json!({"tenant_external_id":"dynamic-secret-test","name":"fixture","driver":driver,"config":config,"credential":{"type":"api_key","value":"synthetic-credential"}})).await;
+        let (status, created) = request(&state,"POST","/internal/v1/upstreams",json!({"tenant_external_id":"dynamic-secret-test","name":format!("fixture-{index}"),"driver":driver,"config":config,"credential":{"type":"api_key","value":"synthetic-credential"}})).await;
         assert_eq!(status,StatusCode::CREATED);
         assert_eq!(created["config"],json!({}));
         let id = created["id"].as_str().unwrap();
@@ -189,6 +189,7 @@ async fn dynamic_and_conditional_account_config_responses_fail_closed() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed.as_array().unwrap().len(), 2);
     assert!(
         listed
             .as_array()
