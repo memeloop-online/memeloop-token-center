@@ -328,7 +328,8 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   if (!(await onboarding.getAttribute('data-open') === 'true')) {
     await onboarding.locator('[data-workspace-toggle]').click();
   }
-  await onboarding.getByLabel('服务提供商').selectOption('comfyui');
+  await onboarding.getByLabel('服务提供商').click();
+  await onboarding.getByRole('option', { name: /^ComfyUI/ }).click();
   const comfyForm = onboarding.locator('form');
   await comfyForm.locator('#root_name').fill('Browser UI ComfyUI');
   await comfyForm.locator('#root_config_base_url').fill(mockBaseUrl);
@@ -362,7 +363,8 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   if (!(await onboarding.getAttribute('data-open') === 'true')) {
     await onboarding.locator('[data-workspace-toggle]').click();
   }
-  await onboarding.getByLabel('提供商').selectOption('volcengine-seedance');
+  await onboarding.getByLabel('服务提供商').click();
+  await onboarding.getByRole('option', { name: /^Volcengine Seedance/ }).click();
   const providerForm = onboarding.locator('form');
   await providerForm.locator('#root_name').fill('Browser UI Seedance');
   await providerForm.locator('#root_config_base_url').fill(mockBaseUrl);

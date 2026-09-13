@@ -228,11 +228,14 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
   const page = this.requirePage();
   await openAppRoute(page, 'operator', 'providers');
   const onboarding = page.locator('.create-journey');
-  await onboarding.locator('[data-workspace-toggle]').click();
   await assertVisible(page.getByRole('heading', { name: '上游服务', exact: true }));
+  await onboarding.locator('[data-workspace-toggle]').click();
+  await assertVisible(onboarding.getByRole('heading', { name: '新增上游', exact: true }));
   await assertContains(onboarding, '连接并管理模型服务。');
   await assertVisible(onboarding.getByRole('button', { name: 'API 凭据', exact: true }));
-  await assertContains(onboarding.getByLabel('服务提供商'), 'Browser dual method');
+  await onboarding.getByLabel('服务提供商').click();
+  await assertVisible(onboarding.getByRole('option', { name: /Browser dual method/ }));
+  await page.keyboard.press('Escape');
   await onboarding.getByRole('button', { name: '账户授权', exact: true }).click();
   await assertVisible(onboarding.getByLabel('服务提供商'));
   await assertContains(onboarding.getByLabel('服务提供商'), 'Browser dual method');
@@ -259,7 +262,7 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
 
   await appPreferenceControls(page).getByRole('button', { name: 'English', exact: true }).click();
   await assertAttribute(page.locator('html'), 'lang', 'en');
-  await assertVisible(page.getByRole('heading', { name: 'Upstream services', exact: true }));
+  await assertVisible(onboarding.getByRole('heading', { name: 'Add upstream', exact: true }));
   await assertContains(onboarding, 'Connect and manage model services.');
   await assertVisible(onboarding.getByRole('button', { name: 'API credential', exact: true }));
   await assertVisible(onboarding.getByRole('button', { name: 'Account authorization', exact: true }));
