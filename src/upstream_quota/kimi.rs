@@ -4,29 +4,34 @@ use super::*;
 const USAGE_URL: &str = "https://api.kimi.com/coding/v1/usages";
 
 pub(super) async fn read(
-    state: &AppState,
+    _state: &AppState,
     credential: &UpstreamCredential,
     mut snapshot: QuotaSnapshot,
 ) -> Result<QuotaSnapshot, &'static str> {
     credential
         .validate(unix_millis())
         .map_err(|_| "credential_invalid")?;
-    let proxy = credential.proxy().ok_or("quota_proxy_required")?;
-    let parsed = reqwest::Url::parse(proxy.0).map_err(|_| "quota_destination_invalid")?;
-    if parsed.scheme() != "socks5h" {
-        return Err("quota_proxy_required");
-    }
-    let http = crate::network::client_for_config_url(
-        &state.http,
-        USAGE_URL,
-        &json!({"network_scope":"public"}),
-        Some(proxy),
-        false,
-    )
-    .await
-    .map_err(|_| "quota_destination_invalid")?;
+    let http = crate::network::client_for_kimi_quota(credential.proxy())
+        .map_err(|_| "quota_proxy_required")?;
+    let payload = get_usage(&http, credential, USAGE_URL).await?;
+    let now = unix_millis();
+    snapshot.windows = windows(&payload, now)?;
+    snapshot.status = "ready";
+    snapshot.freshness = "fresh";
+    snapshot.observed_at = Some(now);
+    snapshot.stale_after = Some(now + FRESH_MS);
+    Ok(snapshot)
+}
+
+// Production caller supplies only USAGE_URL. URL injection remains private to
+// this module so contract tests can use a local mock without a supplier probe.
+async fn get_usage(
+    http: &reqwest::Client,
+    credential: &UpstreamCredential,
+    url: &str,
+) -> Result<Value, &'static str> {
     let request = crate::oauth::managed::kimi::apply_headers(
-        http.get(USAGE_URL)
+        http.get(url)
             .header(reqwest::header::ACCEPT, "application/json")
             .timeout(Duration::from_secs(6)),
         credential,
@@ -38,14 +43,7 @@ pub(super) async fn read(
         .send()
         .await
         .map_err(|_| "quota_transport_failed")?;
-    let payload = decode_response(response).await?;
-    let now = unix_millis();
-    snapshot.windows = windows(&payload, now)?;
-    snapshot.status = "ready";
-    snapshot.freshness = "fresh";
-    snapshot.observed_at = Some(now);
-    snapshot.stale_after = Some(now + FRESH_MS);
-    Ok(snapshot)
+    decode_response(response).await
 }
 
 fn amount(value: &Value) -> Option<f64> {
@@ -53,6 +51,25 @@ fn amount(value: &Value) -> Option<f64> {
         .as_f64()
         .or_else(|| value.as_str()?.parse().ok())
         .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn integer(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str()?.parse::<i64>().ok())
+        .filter(|value| *value >= 0)
+}
+
+fn absolute_millis(value: &Value) -> Option<i64> {
+    normalize::timestamp(value).or_else(|| {
+        let value = integer(value)?;
+        // Contemporary epoch milliseconds are >= 10^12; seconds remain < 10^11.
+        if value >= 100_000_000_000 {
+            Some(value)
+        } else {
+            value.checked_mul(1000)
+        }
+    })
 }
 
 fn label(value: &Value) -> Option<String> {
@@ -88,24 +105,17 @@ fn row(id: String, item: &Value, now: i64) -> Result<QuotaWindow, &'static str> 
         .filter(|value| value.is_finite());
     let absolute = ["reset_at", "resetAt", "reset_time", "resetTime"]
         .iter()
-        .find_map(|key| {
-            normalize::timestamp(&detail[*key]).or_else(|| {
-                detail[*key]
-                    .as_i64()
-                    .filter(|value| *value >= 0)
-                    .and_then(|value| value.checked_mul(1000))
-            })
-        });
+        .find_map(|key| absolute_millis(&detail[*key]));
     let relative = ["reset_in", "resetIn", "ttl"].iter().find_map(|key| {
-        detail[*key]
-            .as_i64()
-            .filter(|value| *value >= 0)
+        integer(&detail[*key])
             .and_then(|value| value.checked_mul(1000))
             .and_then(|value| now.checked_add(value))
     });
-    let window = item.get("window").unwrap_or(item);
-    let unit = window["timeUnit"]
-        .as_str()
+    let window = &item["window"];
+    let metadata = [window, item, detail];
+    let unit = metadata
+        .iter()
+        .find_map(|value| value["timeUnit"].as_str())
         .unwrap_or("")
         .to_ascii_uppercase();
     let multiplier = match unit.trim_start_matches("TIME_UNIT_") {
@@ -116,8 +126,9 @@ fn row(id: String, item: &Value, now: i64) -> Result<QuotaWindow, &'static str> 
         "WEEK" | "WEEKS" => Some(604800),
         _ => None,
     };
-    let period_seconds = window["duration"]
-        .as_i64()
+    let period_seconds = metadata
+        .iter()
+        .find_map(|value| integer(&value["duration"]))
         .filter(|value| *value > 0)
         .zip(multiplier)
         .and_then(|(duration, multiplier)| duration.checked_mul(multiplier));
@@ -164,6 +175,98 @@ fn windows(payload: &Value, now: i64) -> Result<Vec<QuotaWindow>, &'static str> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_usage_mock_is_one_get_and_sanitizes_supplier_errors() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method, path},
+        };
+        let server = MockServer::start().await;
+        let credential = crate::oauth::managed::kimi::credential_from_native_import(&json!({
+            "type":"kimi", "access_token":"fixture-access", "refresh_token":"fixture-refresh",
+            "token_type":"bearer", "device_id":"fixture-device"
+        }))
+        .unwrap();
+        Mock::given(method("GET"))
+            .and(path("/coding/v1/usages"))
+            .and(header("authorization", "Bearer fixture-access"))
+            .and(header("x-msh-device-id", "fixture-device"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("supplier-secret"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let http = crate::build_no_retry_http_client(None, &[]).unwrap();
+        assert_eq!(
+            get_usage(
+                &http,
+                &credential,
+                &format!("{}/coding/v1/usages", server.uri())
+            )
+            .await
+            .unwrap_err(),
+            "quota_rate_limited"
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method.as_str(), "GET");
+    }
+
+    #[test]
+    fn timestamps_and_window_metadata_preserve_exact_milliseconds() {
+        for reset in [
+            json!(1_800_000_123_i64),
+            json!("1800000123"),
+            json!(1_800_000_123_000_i64),
+            json!("1800000123000"),
+        ] {
+            let rows = windows(
+                &json!({"limits":[{"window":{}, "duration":"5",
+                "detail":{"limit":10,"used":3,"resetAt":reset,"timeUnit":"TIME_UNIT_HOUR"}}]}),
+                1000,
+            )
+            .unwrap();
+            assert_eq!(rows[0].reset_at, Some(1_800_000_123_000));
+            assert_eq!(rows[0].period_seconds, Some(18000));
+            assert!(!rows[0].reset_is_estimated);
+        }
+        for seconds in [json!(123), json!("123")] {
+            let rows = windows(&json!({"usage":{"resetIn":seconds,"used":0}}), 1001).unwrap();
+            assert_eq!(rows[0].reset_at, Some(124001));
+            assert!(rows[0].reset_is_estimated);
+        }
+        let rows = windows(
+            &json!({"limits":[{"window":{"duration":2,"timeUnit":"HOUR"},
+            "duration":9,"timeUnit":"DAY","detail":{"duration":10,"timeUnit":"WEEK"}}]}),
+            0,
+        )
+        .unwrap();
+        assert_eq!(rows[0].period_seconds, Some(7200));
+    }
+
+    #[test]
+    fn proxy_contract_rejects_direct_local_dns_and_public_endpoints_without_io() {
+        use crate::network::{OutboundScope, client_for_kimi_quota};
+        assert!(client_for_kimi_quota(None).is_err());
+        for proxy in [
+            "socks5://10.0.0.1:1080",
+            "socks5h://proxy.invalid:1080",
+            "socks5h://8.8.8.8:1080",
+            "socks5h://127.0.0.1:1080",
+        ] {
+            assert!(client_for_kimi_quota(Some((proxy, OutboundScope::Private))).is_err());
+        }
+        assert!(
+            client_for_kimi_quota(Some(("socks5h://10.0.0.1:1080", OutboundScope::Public)))
+                .is_err()
+        );
+        // Client construction cannot connect or resolve; an unreachable private
+        // proxy is valid configuration. No real request is sent in this test.
+        assert!(
+            client_for_kimi_quota(Some(("socks5h://10.0.0.1:1080", OutboundScope::Private)))
+                .is_ok()
+        );
+    }
 
     #[test]
     fn explicit_amounts_do_not_invent_missing_values_or_health() {

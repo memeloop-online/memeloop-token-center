@@ -449,6 +449,27 @@ pub(crate) async fn client_for_codex_oauth_url(
     crate::build_no_retry_http_client(Some(proxy_url), &[]).map_err(|_| AppError::Internal)
 }
 
+/// Fixed Kimi quota endpoint transport. Synchronous validation is intentional:
+/// neither provider DNS nor proxy DNS can run here. The only accepted proxy
+/// identity is a private IP literal and socks5h resolves the supplier remotely.
+pub(crate) fn client_for_kimi_quota(
+    proxy: Option<(&str, OutboundScope)>,
+) -> Result<reqwest::Client, AppError> {
+    let (proxy_url, scope) = proxy.ok_or_else(|| {
+        AppError::BadRequest("Kimi quota requires an account remote-DNS proxy".into())
+    })?;
+    let parsed = checked_proxy_url(proxy_url)?;
+    if scope != OutboundScope::Private
+        || parsed.scheme() != "socks5h"
+        || !has_safe_private_ip_literal_host(&parsed)
+    {
+        return Err(AppError::BadRequest(
+            "Kimi quota requires a private IP-literal socks5h proxy".into(),
+        ));
+    }
+    crate::build_no_retry_http_client(Some(proxy_url), &[]).map_err(|_| AppError::Internal)
+}
+
 async fn codex_client_for_url(
     shared_test_client: &reqwest::Client,
     value: &str,

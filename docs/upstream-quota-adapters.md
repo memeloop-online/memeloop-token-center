@@ -3,7 +3,10 @@
 The read endpoint is on demand, not a worker poll. Cache freshness is 30 seconds,
 failed reads are backed off 10 seconds, stale evidence expires after 5 minutes.
 At most four accounts refresh concurrently, one refresh per account generation,
-128 cache entries, 8 seconds per refresh, and 1 MiB per response. Reads do not
+128 cache entries, 8 seconds per refresh, and 1 MiB per response. Cache identity
+includes tenant UUID, authorized canonical external tenant ID, account ID,
+credential generation and account update time; renames cannot reuse stale labels.
+Reads do not
 refresh OAuth credentials, synchronize models, or execute quota reset workflows.
 Existing Codex conclusive quota evidence may clear an exhausted-account cooldown;
 it is not a supplier mutation or a generic assertion that the account is healthy.
@@ -23,10 +26,16 @@ not routing health. Kimi never supplies inferred `allowed` or `limit_reached`.
 Missing or unrecognized Kimi duration units remain unknown. All timestamps are
 milliseconds. Reset-credit rows intentionally exclude supplier credit IDs.
 
-Both adapters require the account's private socks5h transport. Codex uses the
-dedicated remote-DNS-only client. Kimi uses the existing validated private proxy
-client (which still performs target classification DNS before proxied transport).
+Both adapters require the account's private IP-literal socks5h transport. Both
+use dedicated remote-DNS-only clients; supplier names are resolved by the proxy,
+not the application. Kimi transport construction uses synchronous validation,
+disables retries/redirects/environment proxy inheritance, and performs no DNS.
 No direct-provider fallback is available. No proxy address is serialized.
+
+Kimi absolute numeric reset timestamps below 100 billion are epoch seconds;
+larger values are epoch milliseconds. Relative durations always use seconds.
+Integer JSON numbers and integer strings use identical parsing. Window duration
+and units fall back in order from window metadata to item metadata to detail.
 
 ## Reference and differences
 

@@ -23,7 +23,26 @@ const FRESH_MS: i64 = 30_000;
 const STALE_MS: i64 = 300_000;
 const MAX_ENTRIES: usize = 128;
 const BODY_LIMIT: usize = 1024 * 1024;
-type CacheKey = (Uuid, i64, i64);
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct CacheKey {
+    account: Uuid,
+    tenant: Uuid,
+    external_tenant: String,
+    generation: i64,
+    updated_at: i64,
+}
+
+impl CacheKey {
+    fn new(account: &UpstreamAccountView, tenant: &str) -> Self {
+        Self {
+            account: account.id,
+            tenant: account.tenant_id,
+            external_tenant: tenant.to_owned(),
+            generation: account.credential_generation,
+            updated_at: account.updated_at,
+        }
+    }
+}
 
 #[derive(Clone, Serialize)]
 pub(crate) struct QuotaSnapshot {
@@ -148,7 +167,7 @@ impl QuotaSnapshot {
                 reason: if codex {
                     "quota_refresh_required"
                 } else {
-                    "quota_adapter_not_implemented"
+                    "quota_reset_not_supported"
                 },
                 credit_error_code: None,
             },
@@ -195,18 +214,16 @@ impl QuotaCache {
         if !QuotaCapabilities::for_provider(&account.driver).read {
             return empty(None);
         }
-        let key = (
-            account.id,
-            account.credential_generation,
-            account.updated_at,
-        );
+        // Tenant is the authorized endpoint's canonical external ID. Include it
+        // even though account IDs are global: rename must not reuse old labels.
+        let key = CacheKey::new(account, tenant);
         let entry = {
             let mut entries = self.entries.lock().await;
             if !entries.contains_key(&key) && entries.len() >= MAX_ENTRIES {
                 let evict = entries
                     .iter()
                     .find(|(_, entry)| Arc::strong_count(entry) == 1)
-                    .map(|(key, _)| *key);
+                    .map(|(key, _)| key.clone());
                 if let Some(evict) = evict {
                     entries.remove(&evict);
                 } else {
@@ -503,6 +520,77 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{header, method, path},
     };
+
+    #[test]
+    fn cache_identity_separates_tenant_rename_and_credential_generation() {
+        let mut account: UpstreamAccountView = serde_json::from_value(json!({
+            "id":Uuid::from_u128(1), "tenant_id":Uuid::from_u128(2), "name":"fixture",
+            "driver":"kimi-oauth", "auth_kind":"oauth", "connection_method":"native_oauth",
+            "credential_generation":1, "status":"active", "config":{}, "can_refresh":true,
+            "can_rotate":false, "can_reauthorize":true, "route_count":0, "created_at":0, "updated_at":10
+        })).unwrap();
+        let key = CacheKey::new(&account, "before-rename");
+        let renamed = CacheKey::new(&account, "after-rename");
+        account.credential_generation += 1;
+        let rotated = CacheKey::new(&account, "before-rename");
+        account.tenant_id = Uuid::from_u128(3);
+        let other_tenant = CacheKey::new(&account, "before-rename");
+        let entries = HashMap::from([
+            (key.clone(), 1),
+            (renamed.clone(), 2),
+            (rotated.clone(), 3),
+            (other_tenant.clone(), 4),
+        ]);
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries.get(&key), Some(&1));
+        assert_eq!(entries.get(&renamed), Some(&2));
+        assert_eq!(entries.get(&rotated), Some(&3));
+        assert_eq!(entries.get(&other_tenant), Some(&4));
+        let mut previous = QuotaSnapshot::empty(&account, "after-rename", None);
+        previous.observed_at = Some(1000);
+        previous.status = "ready";
+        let fallback = stale_or_error(
+            Some(previous.clone()),
+            QuotaSnapshot::empty(&account, "after-rename", Some("quota_timeout")),
+            1001,
+        );
+        assert_eq!(fallback.tenant_external_id, "after-rename");
+        assert_eq!(fallback.freshness, "stale");
+        assert_eq!(fallback.error_code, Some("quota_timeout"));
+        assert_eq!(
+            fallback.reset_capability.reason,
+            "quota_reset_not_supported"
+        );
+        let expired = stale_or_error(
+            Some(previous),
+            QuotaSnapshot::empty(&account, "after-rename", Some("quota_timeout")),
+            STALE_MS + 1001,
+        );
+        assert!(expired.observed_at.is_none());
+        assert_eq!(expired.status, "error");
+    }
+
+    #[tokio::test]
+    async fn cancellation_releases_quota_permit_and_singleflight() {
+        let cache = Arc::new(QuotaCache::default());
+        let entry = Arc::new(Entry::default());
+        let (ready, waiting) = tokio::sync::oneshot::channel();
+        let task_cache = cache.clone();
+        let task_entry = entry.clone();
+        let task = tokio::spawn(async move {
+            let _flight = task_entry.flight.lock().await;
+            let _permit = task_cache.permits.acquire().await.unwrap();
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        waiting.await.unwrap();
+        assert!(entry.flight.try_lock().is_err());
+        assert_eq!(cache.permits.available_permits(), 3);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(entry.flight.try_lock().is_ok());
+        assert_eq!(cache.permits.available_permits(), 4);
+    }
 
     #[tokio::test]
     async fn quota_transport_only_gets_and_does_not_publish_error_bodies() {
