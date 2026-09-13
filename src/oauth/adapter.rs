@@ -6,13 +6,14 @@ use crate::{
     },
 };
 
-use super::managed;
+use super::{OAuthRefreshRequestGuard, managed};
 
 pub async fn refresh_managed_oauth_credential(
     http: &reqwest::Client,
     adapter: &ResolvedManagedOAuthAdapter,
     credential: &UpstreamCredential,
     allow_test_loopback: bool,
+    request_guard: &dyn OAuthRefreshRequestGuard,
 ) -> Result<UpstreamCredential, AppError> {
     if !matches!(credential, UpstreamCredential::OAuth { .. })
         || !credential.has_oauth_refresh_state()
@@ -23,10 +24,10 @@ pub async fn refresh_managed_oauth_credential(
     }
     match adapter.backend() {
         ManagedOAuthAdapterBackend::Kimi => {
-            managed::kimi::refresh(http, credential, allow_test_loopback).await
+            managed::kimi::refresh(http, credential, allow_test_loopback, request_guard).await
         }
         ManagedOAuthAdapterBackend::Codex => {
-            managed::codex::refresh(http, credential, allow_test_loopback).await
+            managed::codex::refresh(http, credential, allow_test_loopback, request_guard).await
         }
     }
 }

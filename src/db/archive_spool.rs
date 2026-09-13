@@ -1,5 +1,4 @@
-//! Bounded encrypted spool. Normal mutations serialize against the budget row.
-//! GC uses bounded spool-first transactions with a NOWAIT budget lock; uploads
+//! Bounded encrypted spool. Mutations and GC serialize budget-first; uploads
 //! read bounded snapshot batches. No transaction encompasses object-storage I/O.
 use crate::response_archive_spool::BufferedArchivePurpose;
 
@@ -699,7 +698,10 @@ impl Database {
         &self,
         purpose: BufferedArchivePurpose,
     ) -> Result<Option<bool>, AppError> {
-        let mut tx = self.begin_write_transaction().await?;
+        // Use the producer lock order and the connection's bounded lock
+        // timeout. PostgreSQL's lock queue prevents sustained admissions from
+        // starving GC; each transaction still deletes at most 64 chunks/1 MiB.
+        let (mut tx, _) = self.spool_transaction().await?;
         let row = match self.backend {
             DatabaseBackend::PostgreSql => {
                 // Each indexed class contributes its oldest unlocked row, and
@@ -824,16 +826,7 @@ impl Database {
         sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET state = $1, cleaned_at = $2, cipher_bytes = cipher_bytes - $3, updated_at = $4, expires_at = CASE WHEN $5 = 1 THEN expires_at ELSE $4 END, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $6")))
             .bind(if bound { "bound" } else { "gap" }).bind(cleaned.then_some(now))
             .bind(released).bind(now).bind(i64::from(bound)).bind(&id).execute(&mut *tx).await?;
-        // GC locks a bounded candidate set first, then tries the global lock
-        // WITHOUT waiting. Producers use global -> spool order. NOWAIT is
-        // essential: if one is waiting for a candidate, abort GC and let that
-        // producer progress rather than creating a lock-order deadlock. The
-        // entire bounded deletion rolls back, so a later pass can safely resume.
-        if matches!(self.backend, DatabaseBackend::PostgreSql) {
-            let _: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1 FOR UPDATE NOWAIT")))
-                .fetch_one(&mut *tx).await?;
-        }
-        // The shared budget is held only for this decrement and commit.
+        // The shared budget and this bounded spool mutation commit atomically.
         sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes - $1 WHERE singleton = 1")))
             .bind(released).execute(&mut *tx).await?;
         if !matches!(previous_state.as_str(), "bound" | "gap") {
@@ -853,8 +846,8 @@ impl Database {
 
     pub(super) async fn spool_transaction(&self) -> Result<(Transaction<'_, Any>, i64), AppError> {
         let mut tx = self.begin_write_transaction().await?;
-        // First for normal mutations. GC uses spool -> budget NOWAIT, never
-        // waits on the reversed order, and rolls its bounded work back on busy.
+        // First for every spool mutation, including GC, so no transaction ever
+        // waits while holding the reverse side of the lock order.
         let lock = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1 FOR UPDATE"

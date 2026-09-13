@@ -432,6 +432,16 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../../migrations/common/0080_request_archive_spool.sql"),
     },
     Migration {
+        version: 81,
+        name: "durable OAuth refresh dispatch boundary",
+        sql: include_str!("../../../migrations/common/0081_oauth_refresh_request_started.sql"),
+    },
+    Migration {
+        version: 82,
+        name: "bounded conversation candidate lookups",
+        sql: include_str!("../../../migrations/common/0082_conversation_candidate_indexes.sql"),
+    },
+    Migration {
         version: 83,
         name: "global application plugin revision authority",
         sql: include_str!("../../../migrations/common/0083_application_plugin_revisions.sql"),
@@ -852,6 +862,16 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 80,
         name: "durable request archive spool",
         sql: include_str!("../../../migrations/common/0080_request_archive_spool.sql"),
+    },
+    Migration {
+        version: 81,
+        name: "durable OAuth refresh dispatch boundary",
+        sql: include_str!("../../../migrations/common/0081_oauth_refresh_request_started.sql"),
+    },
+    Migration {
+        version: 82,
+        name: "bounded conversation candidate lookups",
+        sql: include_str!("../../../migrations/common/0082_conversation_candidate_indexes.sql"),
     },
     Migration {
         version: 83,
