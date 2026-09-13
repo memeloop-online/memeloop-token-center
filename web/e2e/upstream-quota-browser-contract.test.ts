@@ -103,7 +103,7 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     assert.equal(await reset.count(), 0);
     // Read failures are mock-only; no reset/prepare/reconcile calls are made.
     for (const [mode, message] of [
-      ['stale-error', 'Quota destination validation failed. Check this account’s endpoint, proxy and DNS configuration.'],
+      ['stale-error', 'Quota connection configuration validation failed. Check this account’s network proxy and destination access policy configuration.'],
       ['rate-limited', 'The supplier rate-limited quota reading. Retry manually later; this does not mean quota is exhausted.'],
       ['permission', 'Your current credential cannot read upstream quota for this tenant. Check your sign-in and read permissions.'],
     ]) {

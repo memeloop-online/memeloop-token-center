@@ -1,6 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { quotaReadErrorMessage } from '../src/operator/upstreamQuota.js';
+import { translationCatalogs } from '../src/i18n.js';
+
+test('destination diagnostics direct both locales to account proxy and access policy, not endpoint or DNS edits', () => {
+  const key = quotaReadErrorMessage('quota_destination_invalid');
+  assert.equal(translationCatalogs['zh-CN'][key], '额度读取连接配置校验失败。请检查此账号的网络代理与目标访问策略配置。');
+  assert.equal(translationCatalogs.en[key], 'Quota connection configuration validation failed. Check this account’s network proxy and destination access policy configuration.');
+  for (const locale of ['zh-CN', 'en'] as const) {
+    assert.doesNotMatch(translationCatalogs[locale][key], /endpoint|DNS|端点|域名解析/i);
+  }
+});
 
 test('normalized quota read failures have distinct safe recovery semantics', () => {
   const expected = {
