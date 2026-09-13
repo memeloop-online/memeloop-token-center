@@ -6,6 +6,63 @@ fn invalid() -> AppError {
     AppError::BadRequest("secret configuration requires an explicit non-empty replacement".into())
 }
 
+/// Dynamic keys and conditional branches cannot safely be reconstructed from
+/// an omitted editor field. Refuse their update and redact the entire config.
+fn dynamic_secret(
+    root: &Value,
+    node: &Value,
+    depth: usize,
+    looking_for_secret: bool,
+) -> Result<bool, AppError> {
+    if depth > 32 {
+        return Err(invalid());
+    }
+    if looking_for_secret
+        && (node.get("writeOnly").and_then(Value::as_bool) == Some(true)
+            || node.get("format").and_then(Value::as_str) == Some("password"))
+    {
+        return Ok(true);
+    }
+    if let Some(reference) = node.get("$ref").and_then(Value::as_str) {
+        let target = reference
+            .strip_prefix('#')
+            .and_then(|pointer| root.pointer(pointer))
+            .ok_or_else(invalid)?;
+        if dynamic_secret(root, target, depth + 1, looking_for_secret)? {
+            return Ok(true);
+        }
+    }
+    if let Some(items) = node.as_array() {
+        for child in items {
+            if dynamic_secret(root, child, depth + 1, looking_for_secret)? {
+                return Ok(true);
+            }
+        }
+    }
+    if let Some(object) = node.as_object() {
+        for (key, child) in object {
+            if ["default", "examples", "const", "enum", "$ref"].contains(&key.as_str()) {
+                continue;
+            }
+            let dynamic = [
+                "additionalProperties",
+                "patternProperties",
+                "if",
+                "then",
+                "else",
+                "dependentSchemas",
+                "contains",
+                "prefixItems",
+            ]
+            .contains(&key.as_str());
+            if dynamic_secret(root, child, depth + 1, looking_for_secret || dynamic)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn paths(schema: &Value) -> Result<Vec<Vec<String>>, AppError> {
     fn visit(
         root: &Value,
@@ -69,6 +126,11 @@ pub(super) fn preserve(
     current: &Value,
     incoming: &mut Value,
 ) -> Result<(), AppError> {
+    if dynamic_secret(schema, schema, 0, false)? {
+        return Err(AppError::BadRequest(
+            "dynamic secret configuration cannot be edited through a partial account update".into(),
+        ));
+    }
     fn replace(
         current: Option<&Value>,
         incoming: &mut Value,
@@ -104,6 +166,10 @@ pub(super) fn preserve(
 }
 
 fn redact(schema: &Value, value: &mut Value) -> Result<(), AppError> {
+    if dynamic_secret(schema, schema, 0, false)? {
+        *value = Value::Object(Map::new());
+        return Ok(());
+    }
     fn remove(value: &mut Value, path: &[String]) {
         let Some((first, tail)) = path.split_first() else {
             *value = Value::Null;
@@ -147,6 +213,33 @@ pub(super) fn public_account(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn dynamic_and_conditional_secret_configs_are_fully_redacted_and_updates_rejected() {
+        for schema in [
+            json!({"type":"object","additionalProperties":{"properties":{"token":{"writeOnly":true}}}}),
+            json!({"type":"object","if":{"properties":{"mode":{"const":"private"}}},"then":{"properties":{"token":{"writeOnly":true}}}}),
+            json!({"$defs":{"s":{"writeOnly":true}},"additionalProperties":{"$ref":"#/$defs/s"}}),
+        ] {
+            let current = json!({"mode":"private","token":"synthetic-secret","dynamic":{"token":"synthetic-secret"}});
+            let mut public = current.clone();
+            redact(&schema, &mut public).unwrap();
+            assert_eq!(public, json!({}));
+            assert!(preserve(&schema, &current, &mut json!({"mode":"public"})).is_err());
+        }
+    }
+
+    #[test]
+    fn nested_secret_arrays_are_opaque_and_preserved_only_when_omitted() {
+        let schema = json!({"properties":{"rows":{"type":"array","items":{"properties":{"token":{"writeOnly":true}}}}}});
+        let current = json!({"rows":[{"token":"synthetic-secret"}]});
+        let mut next = json!({});
+        preserve(&schema, &current, &mut next).unwrap();
+        assert_eq!(next, current);
+        redact(&schema, &mut next).unwrap();
+        assert_eq!(next, json!({}));
+        assert!(preserve(&schema, &current, &mut json!({"rows":[]})).is_err());
+    }
 
     #[test]
     fn nested_ref_allof_preservation_and_redaction_are_fail_closed() {

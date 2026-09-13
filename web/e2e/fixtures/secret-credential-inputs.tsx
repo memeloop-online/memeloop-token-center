@@ -19,13 +19,18 @@ const credential: RJSFSchema = variant === 'oauth' ? {
   type: 'object', required: ['access_token', 'refresh_token', 'adapter_state'], properties: {
     access_token: { ...secret, title: 'Access token' },
     refresh_token: { ...secret, title: 'Refresh token' },
-    adapter_state: { type: 'object', writeOnly: true, title: 'Adapter state', default: { forbidden: true } },
+    adapter_state: { type: 'object', writeOnly: true, title: 'Adapter state', required: ['synthetic'], properties: { synthetic: { type: 'boolean' } }, default: { forbidden: true } },
   },
 } : variant === 'plugin' ? {
   type: 'object', required: ['password', 'client_secret'], properties: {
     password: { type: 'string', format: 'password', title: 'Password' },
     client_secret: { $ref: '#/$defs/secret', default: 'must-not-prefill-ref-site' },
     allof_secret: { allOf: [{ $ref: '#/$defs/secret' }, { default: 'must-not-prefill-allof-sibling' }], title: 'Combined secret' },
+  },
+} : variant === 'array' ? {
+  type: 'object', properties: {
+    access_token: { ...secret, title: 'Access token' },
+    secret_rows: { type: 'array', minItems: 1, items: { type: 'object', properties: { secret: { ...secret } } }, default: [{ secret: 'must-not-prefill-array' }] },
   },
 } : {
   oneOf: [{ title: 'API key', type: 'object', additionalProperties: false, required: ['type', 'value'], properties: {

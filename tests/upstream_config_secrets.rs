@@ -52,13 +52,14 @@ async fn account_secret_config_is_write_only_preserved_and_compare_and_swap_fenc
         "$defs":{"secret":{"type":"string","minLength":1,"writeOnly":true}},
         "properties":{
             "base_url":{"type":"string"},
+            "rows":{"type":"array","items":{"type":"object","properties":{"token":{"$ref":"#/$defs/secret"}}}},
             "nested":{"type":"object","additionalProperties":false,"required":["token"],"properties":{
                 "token":{"allOf":[{"$ref":"#/$defs/secret"}]},"label":{"type":"string"}
             }}
         }
     });
     state.providers.extend([provider]).unwrap();
-    let config = json!({"base_url":mock.uri(),"nested":{"token":"synthetic-old","label":"before"}});
+    let config = json!({"base_url":mock.uri(),"nested":{"token":"synthetic-old","label":"before"},"rows":[{"token":"synthetic-array"}]});
     let (status, created) = request(&state,"POST","/internal/v1/upstreams",json!({
         "tenant_external_id":"secret-config-test","name":"fixture","driver":"secret-config-fixture",
         "config":config,"credential":{"type":"api_key","value":"synthetic-credential"}
@@ -87,6 +88,7 @@ async fn account_secret_config_is_write_only_preserved_and_compare_and_swap_fenc
         .unwrap()
         .0;
     assert!(stored.config["nested"]["token"] == "synthetic-old");
+    assert!(stored.config["rows"][0]["token"] == "synthetic-array");
     for invalid in [Value::Null, json!(""), json!({})] {
         let (status, _) = request(
             &state,
@@ -148,4 +150,50 @@ async fn account_secret_config_is_write_only_preserved_and_compare_and_swap_fenc
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(!listed.to_string().contains("synthetic-"));
+}
+
+#[tokio::test]
+async fn dynamic_and_conditional_account_config_responses_fail_closed() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut state = AppState::initialize(Config::for_test(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("dynamic-secrets.db").display()
+    )))
+    .await
+    .unwrap();
+    let mock = wiremock::MockServer::start().await;
+    for (index, shape) in [
+        json!({"type":"object","additionalProperties":{"type":"object","properties":{"token":{"type":"string","writeOnly":true}}}}),
+        json!({"type":"object","if":{"properties":{"mode":{"const":"private"}}},"then":{"properties":{"token":{"type":"string","writeOnly":true}}}}),
+    ].into_iter().enumerate() {
+        let mut provider = state.providers.get("http-json").unwrap().clone();
+        provider.id = format!("dynamic-secret-{index}");
+        provider.config_schema = json!({"type":"object","properties":{"base_url":{"type":"string"},"settings":shape}});
+        let driver = provider.id.clone();
+        state.providers.extend([provider]).unwrap();
+        let settings = if index == 0 { json!({"entry":{"token":"synthetic-dynamic"}}) } else { json!({"mode":"private","token":"synthetic-conditional"}) };
+        let config = json!({"base_url":mock.uri(),"settings":settings});
+        let (status, created) = request(&state,"POST","/internal/v1/upstreams",json!({"tenant_external_id":"dynamic-secret-test","name":"fixture","driver":driver,"config":config,"credential":{"type":"api_key","value":"synthetic-credential"}})).await;
+        assert_eq!(status,StatusCode::CREATED);
+        assert_eq!(created["config"],json!({}));
+        let id = created["id"].as_str().unwrap();
+        let (status, rejected) = request(&state,"PUT",&format!("/internal/v1/upstreams/{id}"),json!({"tenant_external_id":"dynamic-secret-test","name":"edited","expected_updated_at":created["updated_at"],"config":config})).await;
+        assert_eq!(status,StatusCode::BAD_REQUEST);
+        assert!(!rejected.to_string().contains("synthetic-"));
+    }
+    let (status, listed) = request(
+        &state,
+        "GET",
+        "/internal/v1/upstreams?tenant_external_id=dynamic-secret-test",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|account| account["config"] == json!({}))
+    );
 }

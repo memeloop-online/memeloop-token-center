@@ -5,6 +5,7 @@ function isSecretSchema(node: Record<string, unknown>, root: RJSFSchema, seen = 
   seen.add(node);
   if (node.writeOnly === true || node.format === 'password') return true;
   if (node.items && containsSecret(node.items, root, new Set(seen))) return true;
+  if (['additionalProperties', 'patternProperties', 'if', 'then', 'else', 'dependentSchemas'].some((key) => containsSecret(node[key], root, new Set(seen)))) return true;
   if (typeof node.$ref === 'string' && node.$ref.startsWith('#/')) {
     let target: unknown = root;
     for (const part of node.$ref.slice(2).split('/')) target = target && typeof target === 'object' ? (target as Record<string, unknown>)[part.replace(/~1/g, '/').replace(/~0/g, '~')] : undefined;
@@ -21,14 +22,17 @@ function containsSecret(value: unknown, root: RJSFSchema, seen = new Set<unknown
 }
 
 function withoutSecretDefaults(schema: RJSFSchema): RJSFSchema {
-  const visit = (value: unknown, inherited = false): unknown => {
+  const visit = (value: unknown, inherited = false, schemaNode = true): unknown => {
     if (Array.isArray(value)) return value.map((item) => visit(item, inherited));
     if (!value || typeof value !== 'object') return value;
     const node = value as Record<string, unknown>;
+    if (!schemaNode) return Object.fromEntries(Object.entries(node).map(([key, child]) => [key, visit(child, inherited)]));
     const secret = inherited || isSecretSchema(node, schema);
-    return Object.fromEntries(Object.entries(node)
+    const result = Object.fromEntries(Object.entries(node)
       .filter(([key]) => !secret || (key !== 'default' && key !== 'examples'))
-      .map(([key, child]) => [key, ['default', 'examples', 'const', 'enum'].includes(key) ? child : visit(child, secret)]));
+      .map(([key, child]) => [key, ['default', 'examples', 'const', 'enum'].includes(key) ? child : visit(child, secret, !['properties', '$defs', 'definitions', 'patternProperties', 'dependentSchemas'].includes(key))]));
+    if (secret) result.writeOnly = true;
+    return result;
   };
   return visit(schema) as RJSFSchema;
 }

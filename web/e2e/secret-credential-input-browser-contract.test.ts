@@ -18,7 +18,7 @@ test('create and rotate keep provider secrets masked across keyboard, mobile and
   const artifacts = fileURLToPath(new URL('../e2e-artifacts/ui-system/secret-inputs/', import.meta.url));
   await mkdir(artifacts, { recursive: true });
   try {
-    for (const variant of ['api', 'oauth', 'plugin']) for (const locale of ['en', 'zh-CN']) {
+    for (const variant of ['api', 'oauth', 'plugin', 'array']) for (const locale of ['en', 'zh-CN']) {
       const page = await browser.newPage();
       const failures: string[] = [];
       page.on('pageerror', () => failures.push('runtime error'));
@@ -38,19 +38,28 @@ test('create and rotate keep provider secrets masked across keyboard, mobile and
           const form = page.getByRole('region', { name, exact: true });
           const inputs = form.locator('.schema-secret-field input');
           assert.ok(await inputs.count() >= 2, `${variant}: secret strings and opaque/ref fields rendered`);
-          if (variant !== 'api') {
+          if (variant === 'oauth' || variant === 'plugin') {
+            // Materialize the containing object so validation targets the
+            // missing secret leaf, not the missing parent object itself.
+            await inputs.nth(1).fill('synthetic-temporary');
             await form.locator('button[type=submit]').click();
             assert.equal(await inputs.first().getAttribute('aria-invalid'), 'true', 'RJSF raw validation errors reach the secret input');
+            await inputs.nth(1).fill('');
           }
           for (const input of await inputs.all()) {
             assert.equal(await input.getAttribute('type'), 'password');
             assert.equal(await input.inputValue() === '', true, `${variant}/${locale}/${theme}/${name}/${await input.getAttribute('id')}: existing/default secret must not be prefilled`);
             assert.equal(await input.getAttribute('autocomplete'), 'new-password');
-            const synthetic = (await input.getAttribute('id'))?.endsWith('adapter_state') ? '{"synthetic":true}' : 'synthetic-only';
+            const fieldId = await input.getAttribute('id');
+            const synthetic = fieldId?.endsWith('adapter_state') ? '{"synthetic":true}' : fieldId?.endsWith('secret_rows') ? '[{"secret":"synthetic-only"}]' : 'synthetic-only';
             if ((await input.getAttribute('id'))?.endsWith('adapter_state')) {
               await input.fill('synthetic-invalid-json');
               assert.equal(await input.getAttribute('aria-invalid'), 'true');
               assert.equal(await form.innerText().then((text) => text.includes('synthetic-invalid-json')), false, 'JSON validation never echoes opaque state');
+              await input.fill('{"synthetic":"wrong-type"}');
+              await form.locator('button[type=submit]').click();
+              assert.equal(await input.getAttribute('aria-invalid'), 'true', 'opaque child errors are not silently valid');
+              assert.equal((await input.getAttribute('aria-describedby'))?.includes(`${fieldId}-secret-error`), true);
             }
             await input.fill(synthetic);
             const toggle = input.locator('..').getByRole('button');

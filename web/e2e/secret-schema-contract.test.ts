@@ -21,3 +21,17 @@ test('resolved refs, allOf siblings and existing config never prefill secret fie
   assert.equal(safeValidator.isValid(edit.schema, edit.formData, edit.schema), true);
   assert.equal(JSON.stringify(edit).includes('synthetic-'), false);
 });
+
+test('nested secret arrays and dynamic or conditional secrets are opaque and unprefilled', () => {
+  for (const shape of [
+    { type: 'array', minItems: 1, items: { type: 'object', properties: { token: { type: 'string', writeOnly: true } } } },
+    { type: 'object', additionalProperties: { type: 'object', properties: { token: { type: 'string', writeOnly: true } } } },
+    { type: 'object', if: { properties: { mode: { const: 'private' } } }, then: { properties: { token: { type: 'string', writeOnly: true } } } },
+  ]) {
+    const schema = { type: 'object', properties: { config: shape } } as RJSFSchema;
+    const edit = prepareSecretForm(schema, safeValidator, { config: shape.type === 'array' ? [{ token: 'synthetic-stored' }] : { mode: 'private', token: 'synthetic-stored', dynamic: { token: 'synthetic-stored' } } });
+    assert.deepEqual(edit.formData, {});
+    assert.equal((edit.schema.properties?.config as RJSFSchema).writeOnly, true);
+    assert.equal(JSON.stringify(edit).includes('synthetic-stored'), false);
+  }
+});
