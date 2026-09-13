@@ -100,7 +100,7 @@ impl Database {
         // reads stay bounded by the public page limit even while a pool is
         // serving concurrent list requests.
         let rows = sqlx::query(
-            "WITH page AS MATERIALIZED (SELECT p.id, p.name, p.status, p.credential_generation, p.created_at, p.updated_at FROM service_principals p WHERE (p.created_at < $1 OR (p.created_at = $1 AND p.id < $2)) AND EXISTS (SELECT 1 FROM service_credentials c WHERE c.service_principal_id = p.id AND c.generation = p.credential_generation) ORDER BY p.created_at DESC, p.id DESC LIMIT $3) SELECT p.id, p.name, p.status, p.credential_generation, p.created_at, p.updated_at, c.fingerprint, c.secret_plaintext IS NOT NULL AS credential_copy_available, c.scopes_json, c.tenant_external_id FROM page p JOIN service_credentials c ON c.service_principal_id = p.id AND c.generation = p.credential_generation ORDER BY p.created_at DESC, p.id DESC",
+            "WITH page AS MATERIALIZED (SELECT p.id, p.name, p.status, p.credential_generation, p.created_at, p.updated_at FROM service_principals p WHERE (p.created_at < $1 OR (p.created_at = $1 AND p.id < $2)) AND EXISTS (SELECT 1 FROM service_credentials c WHERE c.service_principal_id = p.id AND c.generation = p.credential_generation) ORDER BY p.created_at DESC, p.id DESC LIMIT $3) SELECT p.id, p.name, p.status, p.credential_generation, p.created_at, p.updated_at, c.fingerprint, CASE WHEN c.secret_plaintext IS NOT NULL THEN 1 ELSE 0 END AS credential_copy_available, c.scopes_json, c.tenant_external_id FROM page p JOIN service_credentials c ON c.service_principal_id = p.id AND c.generation = p.credential_generation ORDER BY p.created_at DESC, p.id DESC",
         )
         .bind(before_created_at)
         .bind(before_id)
