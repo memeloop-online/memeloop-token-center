@@ -47,6 +47,8 @@ fn memory_store() -> ArchiveStore {
         inner: Arc::new(InMemory::new()),
         readiness: Arc::new(tokio::sync::Mutex::new(ReadinessCache::default())),
         readiness_path: path::archive_path("readiness/archive-tests.bin").expect("readiness path"),
+        readiness_deadline: Duration::from_secs(5),
+        readiness_metrics: Arc::default(),
     }
 }
 

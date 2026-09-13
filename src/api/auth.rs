@@ -79,6 +79,9 @@ pub(super) async fn authenticate_control_before_body(
                     "request body was not received before the deadline",
                 ));
             }
+            Err(crate::gateway_body::GatewayBodyAdmissionError::UnsupportedEncoding) => {
+                return Ok(StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response());
+            }
             Err(crate::gateway_body::GatewayBodyAdmissionError::Rejected(_)) => {
                 return Ok(control_body_rejection(
                     StatusCode::PAYLOAD_TOO_LARGE,
@@ -149,12 +152,13 @@ pub(super) async fn authenticate_gateway_before_body(
     };
     if request.method() == axum::http::Method::POST {
         let request_id = safe_gateway_request_id(request.headers());
-        request = match crate::gateway_body::admit_gateway_request_body(
+        request = match crate::gateway_body::admit_gateway_request_body_with_memory(
             request,
             crate::gateway_body::GATEWAY_BODY_READ_DEADLINE,
             state.gateway_body_read_permits.clone(),
             state.responses_body_read_permits.clone(),
             state.config.responses_body_max_bytes as usize,
+            Some(&state.proxy_memory_budget),
         )
         .await
         {
@@ -162,7 +166,15 @@ pub(super) async fn authenticate_gateway_before_body(
             Err(error) => return Ok(gateway_body_admission_rejection(&state, &request_id, error)),
         };
     }
+    let memory = request
+        .extensions()
+        .get::<std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>>()
+        .cloned();
     let response = next.run(request).await;
+    let response = match memory {
+        Some(permit) => hold_response_body_permit(response, permit),
+        None => response,
+    };
     Ok(match image_lifecycle_permit {
         Some(permit) => hold_response_body_permit(response, permit),
         None => response,
@@ -175,7 +187,13 @@ fn gateway_body_admission_rejection(
     error: crate::gateway_body::GatewayBodyAdmissionError,
 ) -> Response {
     match error {
+        crate::gateway_body::GatewayBodyAdmissionError::UnsupportedEncoding => {
+            StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response()
+        }
         crate::gateway_body::GatewayBodyAdmissionError::CapacityExhausted => {
+            state
+                .metrics
+                .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Ingress);
             gateway_body_capacity_rejection()
         }
         crate::gateway_body::GatewayBodyAdmissionError::Timeout => (
@@ -234,8 +252,15 @@ where
 {
     let (parts, body) = response.into_parts();
     let stream = futures_util::stream::unfold(
-        (body.into_data_stream(), permit),
-        |(mut body, permit)| async move { body.next().await.map(|item| (item, (body, permit))) },
+        (body.into_data_stream(), Some(permit)),
+        |(mut body, mut permit)| async move {
+            body.next().await.map(|item| {
+                if item.is_err() {
+                    drop(permit.take());
+                }
+                (item, (body, permit))
+            })
+        },
     );
     Response::from_parts(parts, Body::from_stream(stream))
 }
@@ -268,6 +293,9 @@ pub(super) async fn admit_cloud_webhook_before_body(
                 "request_body_timeout",
                 "request body was not received before the deadline",
             ));
+        }
+        Err(crate::gateway_body::GatewayBodyAdmissionError::UnsupportedEncoding) => {
+            return Ok(StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response());
         }
         Err(crate::gateway_body::GatewayBodyAdmissionError::Rejected(_)) => {
             return Ok(control_body_rejection(
@@ -329,7 +357,7 @@ mod response_body_guard_tests {
         let response = hold_response_body_permit(Response::new(body), permit);
         let mut body = response.into_body().into_data_stream();
         assert!(body.next().await.unwrap().is_err());
-        assert_eq!(failed.available_permits(), 0);
+        assert_eq!(failed.available_permits(), 1);
         drop(body);
         assert_eq!(failed.available_permits(), 1);
     }
@@ -391,7 +419,7 @@ pub(super) async fn require_service_any(
     Ok(service)
 }
 
-async fn authenticated_service(
+pub(super) async fn authenticated_service(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Result<AuthenticatedService, AppError> {

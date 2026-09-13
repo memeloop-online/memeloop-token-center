@@ -274,18 +274,33 @@ impl Database {
         let (before_created_at, before_id) = before
             .map(|(created_at, id)| (created_at, id.to_string()))
             .unwrap_or_else(|| (i64::MAX, "ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned()));
-        let key_id = key_id.map(|id| id.to_string()).unwrap_or_default();
-        let rows = sqlx::query(
-            "SELECT k.id, k.account_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, k.alias, k.currency, k.status, k.credential_generation, (SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1) AS fingerprint, CASE WHEN k.status = 'active' AND EXISTS (SELECT 1 FROM key_credential_recovery_secrets recovery JOIN key_credentials credential ON credential.id = recovery.credential_id WHERE recovery.key_id = k.id AND recovery.credential_generation = k.credential_generation AND credential.key_id = k.id AND credential.generation = k.credential_generation AND credential.revoked_at IS NULL) THEN 1 ELSE 0 END AS credential_recovery_available, k.created_at, k.updated_at, k.policy_json, a.available_micros, a.reserved_micros FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN credit_accounts a ON a.id = k.account_id WHERE ($1 = '' OR t.external_id = $1) AND ($2 = '' OR p.external_id = $2) AND ($3 = '' OR k.id = $3) AND (k.created_at < $4 OR (k.created_at = $4 AND k.id < $5)) ORDER BY k.created_at DESC, k.id DESC LIMIT $6",
-        )
-        .bind(tenant_external_id.unwrap_or_default())
-        .bind(principal_external_id.unwrap_or_default())
-        .bind(key_id)
-        .bind(before_created_at)
-        .bind(before_id)
-        .bind(limit.clamp(1, 500))
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = if let Some(key_id) = key_id {
+            // Keep exact UUID resolution on the primary-key path. The
+            // surrounding tenant/principal predicates still enforce the
+            // caller's management scope, and cursor semantics remain intact.
+            sqlx::query(
+                "SELECT k.id, k.account_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, k.alias, k.currency, k.status, k.credential_generation, (SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1) AS fingerprint, CASE WHEN k.status = 'active' AND EXISTS (SELECT 1 FROM key_credential_recovery_secrets recovery JOIN key_credentials credential ON credential.id = recovery.credential_id WHERE recovery.key_id = k.id AND recovery.credential_generation = k.credential_generation AND credential.key_id = k.id AND credential.generation = k.credential_generation AND credential.revoked_at IS NULL) THEN 1 ELSE 0 END AS credential_recovery_available, k.created_at, k.updated_at, k.policy_json, a.available_micros, a.reserved_micros FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN credit_accounts a ON a.id = k.account_id WHERE k.id = $1 AND ($2 = '' OR t.external_id = $2) AND ($3 = '' OR p.external_id = $3) AND (k.created_at < $4 OR (k.created_at = $4 AND k.id < $5)) ORDER BY k.created_at DESC, k.id DESC LIMIT $6",
+            )
+            .bind(key_id.to_string())
+            .bind(tenant_external_id.unwrap_or_default())
+            .bind(principal_external_id.unwrap_or_default())
+            .bind(before_created_at)
+            .bind(&before_id)
+            .bind(limit.clamp(1, 500))
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT k.id, k.account_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, k.alias, k.currency, k.status, k.credential_generation, (SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1) AS fingerprint, CASE WHEN k.status = 'active' AND EXISTS (SELECT 1 FROM key_credential_recovery_secrets recovery JOIN key_credentials credential ON credential.id = recovery.credential_id WHERE recovery.key_id = k.id AND recovery.credential_generation = k.credential_generation AND credential.key_id = k.id AND credential.generation = k.credential_generation AND credential.revoked_at IS NULL) THEN 1 ELSE 0 END AS credential_recovery_available, k.created_at, k.updated_at, k.policy_json, a.available_micros, a.reserved_micros FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN credit_accounts a ON a.id = k.account_id WHERE ($1 = '' OR t.external_id = $1) AND ($2 = '' OR p.external_id = $2) AND (k.created_at < $3 OR (k.created_at = $3 AND k.id < $4)) ORDER BY k.created_at DESC, k.id DESC LIMIT $5",
+            )
+            .bind(tenant_external_id.unwrap_or_default())
+            .bind(principal_external_id.unwrap_or_default())
+            .bind(before_created_at)
+            .bind(&before_id)
+            .bind(limit.clamp(1, 500))
+            .fetch_all(&self.pool)
+            .await?
+        };
         rows.into_iter().map(managed_key_view).collect()
     }
     pub async fn set_key_status(&self, key_id: Uuid, status: &str) -> Result<String, AppError> {
@@ -1320,8 +1335,34 @@ mod tests {
             .await
             .unwrap();
         assert!(listed[0].credential_recovery_available);
+        let scope_denied_actor = Uuid::now_v7();
+        assert!(matches!(
+            database
+                .copy_key_credential(
+                    issued.key_id,
+                    pepper,
+                    Some(scope_denied_actor),
+                    Some("credential-recovery"),
+                    false,
+                )
+                .await,
+            Err(AppError::Forbidden)
+        ));
+        let tenant_denied_actor = Uuid::now_v7();
+        assert!(matches!(
+            database
+                .copy_key_credential(
+                    issued.key_id,
+                    pepper,
+                    Some(tenant_denied_actor),
+                    Some("another-tenant"),
+                    true,
+                )
+                .await,
+            Err(AppError::Forbidden)
+        ));
         let copied = database
-            .copy_key_credential(issued.key_id, pepper, None)
+            .copy_key_credential(issued.key_id, pepper, None, None, true)
             .await
             .unwrap();
         assert_eq!(copied.key, issued.key);
@@ -1362,6 +1403,35 @@ mod tests {
                 .unwrap()
                 .is_none()
         }));
+        let access_audit = sqlx::query(
+            "SELECT tenant_id, outcome, actor_service_id FROM key_credential_recovery_access_audit WHERE key_id = $1 ORDER BY created_at, id",
+        )
+        .bind(issued.key_id.to_string())
+        .fetch_all(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(access_audit.len(), 3);
+        let mut outcomes = access_audit
+            .iter()
+            .map(|row| row.try_get::<String, _>("outcome").unwrap())
+            .collect::<Vec<_>>();
+        outcomes.sort();
+        assert_eq!(outcomes, ["retrieved", "scope_denied", "tenant_denied"]);
+        assert!(
+            access_audit
+                .iter()
+                .all(|row| { !row.try_get::<String, _>("tenant_id").unwrap().is_empty() })
+        );
+        assert_eq!(
+            access_audit
+                .iter()
+                .filter(|row| row
+                    .try_get::<Option<String>, _>("actor_service_id")
+                    .unwrap()
+                    .is_none())
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1399,7 +1469,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             database
-                .copy_key_credential(issued.key_id, pepper, None)
+                .copy_key_credential(issued.key_id, pepper, None, None, true)
                 .await,
             Err(AppError::NotFound)
         ));
@@ -1419,7 +1489,7 @@ mod tests {
             .await
             .unwrap();
         let copied = database
-            .copy_key_credential(issued.key_id, pepper, None)
+            .copy_key_credential(issued.key_id, pepper, None, None, true)
             .await
             .unwrap();
         assert_eq!(copied.key, issued.key);
@@ -1431,7 +1501,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             database
-                .copy_key_credential(issued.key_id, pepper, None)
+                .copy_key_credential(issued.key_id, pepper, None, None, true)
                 .await,
             Err(AppError::Forbidden)
         ));
@@ -1445,6 +1515,18 @@ mod tests {
         .try_get("count")
         .unwrap();
         assert_eq!(remaining, 0);
+        let mut access_outcomes = sqlx::query(
+            "SELECT outcome FROM key_credential_recovery_access_audit WHERE key_id = $1",
+        )
+        .bind(issued.key_id.to_string())
+        .fetch_all(&database.pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.try_get::<String, _>("outcome").unwrap())
+        .collect::<Vec<_>>();
+        access_outcomes.sort();
+        assert_eq!(access_outcomes, ["inactive", "retrieved", "unavailable"]);
     }
 
     #[tokio::test]
@@ -1511,7 +1593,7 @@ mod tests {
         assert_eq!(authenticated.policy.requests_per_minute, 60);
         assert_eq!(
             database
-                .copy_key_credential(issued.key_id, pepper, None)
+                .copy_key_credential(issued.key_id, pepper, None, None, true)
                 .await
                 .unwrap()
                 .key,

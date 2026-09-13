@@ -69,8 +69,11 @@ pub(in crate::api) async fn create_upstream(
         )
         .await?;
     super::restrict_transport_proxy_capability(&service, &mut account);
-    super::trigger_upstream_model_sync(state, account.id);
-    Ok((StatusCode::CREATED, Json(account)))
+    super::trigger_upstream_model_sync(state.clone(), account.id);
+    Ok((
+        StatusCode::CREATED,
+        Json(super::config_secrets::public_account(&state, account)?),
+    ))
 }
 
 pub(super) fn validate_provider_schema(
@@ -128,7 +131,11 @@ pub(super) fn validate_provider_config_schema(
         .providers
         .get(driver)
         .ok_or_else(|| AppError::BadRequest(format!("unknown provider driver: {driver}")))?;
-    crate::schema::validate_instance(&provider.config_schema, config)
+    crate::schema::validate_instance(&provider.config_schema, config)?;
+    // Shared by direct creation, OAuth start/ready/reauthorization and account
+    // edits. No lifecycle may write an unsupported secret cycle or discover
+    // that configuration analysis failed only after its account mutation.
+    super::config_secrets::validate_create(&provider.config_schema)
 }
 
 pub(super) async fn validate_upstream_destination(
@@ -299,6 +306,7 @@ pub(in crate::api) async fn list_upstreams(
         .await?;
     for account in &mut values {
         super::restrict_transport_proxy_capability(&service, account);
+        super::config_secrets::redact_account(&state, account)?;
     }
     Ok(Json(values))
 }
@@ -354,7 +362,7 @@ pub(in crate::api) async fn update_upstream(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(account_id): Path<Uuid>,
-    Json(body): Json<UpdateUpstreamRequest>,
+    Json(mut body): Json<UpdateUpstreamRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "providers:write").await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
@@ -367,10 +375,25 @@ pub(in crate::api) async fn update_upstream(
         .db
         .upstream_account_with_current_credential(account_id, state.config.key_pepper.as_bytes())
         .await?;
+    let provider = state
+        .providers
+        .get(&driver)
+        .ok_or_else(|| AppError::BadRequest("unknown provider driver".into()))?;
+    super::config_secrets::preserve(&provider.config_schema, &current.config, &mut body.config)?;
     validate_provider_config_schema(&state, &driver, &body.config)?;
     validate_upstream_destination(&driver, &body.config, &service, &state).await?;
     let should_sync_models = driver != crate::oauth::codex_device::PROVIDER_DRIVER
         || codex_model_sync_config(&current.config) != codex_model_sync_config(&body.config);
+    let policy_change = if driver == crate::oauth::codex_device::PROVIDER_DRIVER
+        && current.config.get("transport_policy") != body.config.get("transport_policy")
+    {
+        Some(
+            crate::provider::CodexTransportPolicy::parse(body.config.get("transport_policy"))
+                .map_err(|_| AppError::BadRequest("invalid Codex transport policy".into()))?,
+        )
+    } else {
+        None
+    };
     let mut account = state
         .db
         .update_upstream_account(
@@ -383,13 +406,27 @@ pub(in crate::api) async fn update_upstream(
             },
         )
         .await?;
+    if let Some(policy) = policy_change {
+        tracing::info!(%account_id, tenant_id = %account.tenant_id,
+            actor_service_id = ?service.service_id,
+            expected_revision = body.expected_updated_at, accepted_revision = account.updated_at,
+            policy_version = policy.version, candidate_attempts = policy.candidate_attempts,
+            failover_deadline_millis = policy.failover_deadline_millis,
+            connect_attempts = policy.connect_attempts,
+            connect_retry_delay_millis = policy.connect_retry_delay_millis,
+            shared_probe_attempts = ?policy.shared_probe_attempts,
+            stage = "upstream_transport_policy_update_accepted",
+            "authorized upstream transport policy update accepted");
+    }
     account.attach_proxy_metadata(&current_credential, state.config.key_pepper.as_bytes())?;
     account.can_update_transport_proxy &= credential_active;
     super::restrict_transport_proxy_capability(&service, &mut account);
     if should_sync_models {
-        super::trigger_upstream_model_sync(state, account_id);
+        super::trigger_upstream_model_sync(state.clone(), account_id);
     }
-    Ok(Json(account))
+    Ok(Json(super::config_secrets::public_account(
+        &state, account,
+    )?))
 }
 
 fn codex_model_sync_config(config: &Value) -> Value {
@@ -471,9 +508,11 @@ pub(in crate::api) async fn set_upstream_status(
     account.can_update_transport_proxy &= credential_active;
     super::restrict_transport_proxy_capability(&service, &mut account);
     if should_sync {
-        super::trigger_upstream_model_sync(state, account_id);
+        super::trigger_upstream_model_sync(state.clone(), account_id);
     }
-    Ok(Json(account))
+    Ok(Json(super::config_secrets::public_account(
+        &state, account,
+    )?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -569,9 +608,11 @@ pub(in crate::api) async fn rotate_upstream_credential(
     account.attach_proxy_metadata(&response_credential, state.config.key_pepper.as_bytes())?;
     super::restrict_transport_proxy_capability(&service, &mut account);
     if changed {
-        super::trigger_upstream_model_sync(state, account_id);
+        super::trigger_upstream_model_sync(state.clone(), account_id);
     }
-    Ok(Json(account))
+    Ok(Json(super::config_secrets::public_account(
+        &state, account,
+    )?))
 }
 
 #[derive(Deserialize)]
@@ -627,9 +668,11 @@ pub(in crate::api) async fn rotate_codex_transport_proxy(
         )
         .await?;
     if changed && account.status == "active" {
-        super::trigger_upstream_model_sync(state, account_id);
+        super::trigger_upstream_model_sync(state.clone(), account_id);
     }
-    Ok(Json(account))
+    Ok(Json(super::config_secrets::public_account(
+        &state, account,
+    )?))
 }
 
 fn require_proxied_rotation_kind(

@@ -10,7 +10,7 @@ import { parse } from "yaml";
 
 const HTTP_METHODS = new Set(["delete", "get", "head", "options", "patch", "post", "put", "trace"]);
 const ROUTE_METHOD = /(?<![A-Za-z0-9_])(delete|get|head|options|patch|post|put|trace)\s*\(/gu;
-const EXPECTED_RUNTIME_ROLES: Record<string, string[]> = { common: ["gateway", "control", "worker", "all"], control: ["control", "all"], gateway: ["gateway", "all"] };
+const EXPECTED_RUNTIME_ROLES: Record<string, string[]> = { common: ["gateway", "control", "worker", "all"], control: ["control", "all"], gateway: ["gateway", "all"], observability: ["gateway", "control", "all"] };
 type Obj = Record<string, any>;
 
 export class ContractFailure extends Error {}
@@ -96,10 +96,19 @@ function duplicateKeys(items: Obj[], fields: string[]): string[] {
   return [...duplicates].sort();
 }
 
+function observabilityGuardRanges(body: string, functionName: string): Array<[number, number]> {
+  if (functionName !== "router_for_role") return [];
+  const guard = /if\s+matches!\(\s*role\s*,\s*RuntimeRole::Gateway\s*\|\s*RuntimeRole::Control\s*\|\s*RuntimeRole::All\s*\)\s*\{/gu;
+  return [...body.matchAll(guard)].map((match) => {
+    const opening = body.lastIndexOf("{", (match.index ?? 0) + match[0].length);
+    return [opening, balancedSlice(body, opening, "{", "}")[1]];
+  });
+}
+
 export function sourceRoutes(source: string): Obj[] {
   const routes: Obj[] = [];
   for (const [role, functionName] of [["common", "router_for_role"], ["control", "control_router"], ["gateway", "gateway_router"]] as const) {
-    const body = functionBody(source, functionName); const mask = codeMask(body); failOnUnparsedRouterComposition(body, functionName, mask); const guards = controlGuardRanges(body, functionName);
+    const body = functionBody(source, functionName); const mask = codeMask(body); failOnUnparsedRouterComposition(body, functionName, mask); const guards = controlGuardRanges(body, functionName); const observabilityGuards = observabilityGuardRanges(body, functionName);
     for (let cursor = 0;;) {
       const marker = body.indexOf(".route", cursor); if (marker < 0) break;
       if (!mask[marker]) { cursor = marker + 6; continue; }
@@ -107,7 +116,7 @@ export function sourceRoutes(source: string): Obj[] {
       if (body[opening] !== "(") { cursor = opening; continue; }
       const [argumentsText, end] = balancedSlice(body, opening, "(", ")"); const pathMatch = /^\s*"([^"\\]+)"\s*,/u.exec(argumentsText);
       if (pathMatch === null) throw new ContractFailure(`${functionName} contains a .route call without a literal path`);
-      const path = pathMatch[1]!; const effectiveRole = role === "common" && guards.some(([start, finish]) => start < marker && marker < finish) ? "control" : role;
+      const path = pathMatch[1]!; const effectiveRole = role === "common" && guards.some(([start, finish]) => start < marker && marker < finish) ? "control" : role === "common" && observabilityGuards.some(([start, finish]) => start < marker && marker < finish) ? "observability" : role;
       const handler = argumentsText.slice(pathMatch[0].length); const handlerMask = codeMask(handler); const methods = [...new Set([...handler.matchAll(ROUTE_METHOD)].filter((match) => handlerMask[match.index ?? 0]).map((match) => match[1]!))].sort();
       if (methods.length === 0) throw new ContractFailure(`source route ${path} has no recognized HTTP method`);
       routes.push(...methods.map((method) => ({ method, path, source_role: effectiveRole }))); cursor = end;
@@ -166,6 +175,7 @@ function validateGroupContracts(document: Obj): void {
 
 export function validateProductContracts(document: Obj): void {
   validateGroupContracts(document); const schemas = document.components?.schemas ?? {};
+  const picker = operationAt(document, "get", "/internal/v1/model-picker-options"); if (!isDeepStrictEqual(picker.security, [{ serviceBearer: [] }]) || picker["x-required-scope"] !== "routes:read" || !setEqual(picker["x-required-scopes"] ?? [], ["routes:read", "providers:read"])) throw new ContractFailure("model picker lost operator-only dual-scope authentication"); if (!setEqual(parameterReferences(picker), ["#/components/parameters/RequiredTenant"])) throw new ContractFailure("model picker lost explicit tenant isolation"); if (!isDeepStrictEqual(picker["x-projection-contract"], { "database-statements-after-authentication": 1, "public-provider-catalog-only": true, "provider-network-io": "forbidden", "catalog-sync": "forbidden", "active-health-probe": "forbidden", "credential-decryption": "forbidden" })) throw new ContractFailure("model picker projection gained side effects or unbounded database access"); if (picker.responses?.["200"]?.headers?.["Cache-Control"]?.schema?.const !== "no-store" || picker.responses?.["200"]?.content?.["application/json"]?.schema?.$ref !== "#/components/schemas/ModelPickerPage") throw new ContractFailure("model picker response lost its bounded no-store page contract"); const pickerSchemas = [schemas.ModelPickerPage, schemas.ModelPickerItem, schemas.ModelPickerSource]; if (pickerSchemas.some((schema: Obj) => schema?.additionalProperties !== false)) throw new ContractFailure("model picker response schemas must remain closed"); if (schemas.ModelPickerPage?.properties?.data?.maxItems !== 100 || schemas.ModelPickerItem?.properties?.sources?.maxItems !== 100 || schemas.ModelPickerSource?.properties?.provider_groups?.maxItems !== 20) throw new ContractFailure("model picker projection bounds changed"); if (!setEqual(schemas.ModelPickerCatalogEvidence?.properties?.status?.enum ?? [], ["never_observed", "loading", "ready", "stale", "partial", "error"])) throw new ContractFailure("model picker catalog evidence states changed"); if (!setEqual(schemas.ModelPickerHealthEvidence?.properties?.status?.enum ?? [], ["unknown", "healthy", "degraded", "unhealthy"])) throw new ContractFailure("model picker passive health evidence states changed");
   const responsesNegotiation = operationAt(document, "get", "/v1/responses"); if (!isDeepStrictEqual(responsesNegotiation.security, [{ clientBearer: [] }])) throw new ContractFailure("GET /v1/responses negotiation must retain client credential security"); if (!isDeepStrictEqual(responsesNegotiation.responses?.["426"], { $ref: "#/components/responses/ResponsesWebSocketUpgradeRequired" })) throw new ContractFailure("GET /v1/responses must retain the explicit 426 negotiation response"); if (!isDeepStrictEqual(responsesNegotiation["x-transport-negotiation"], { lifecycle: "temporary-until-native-websocket", "fallback-operation": "POST /v1/responses", "native-websocket-planned": true })) throw new ContractFailure("Responses transport negotiation must remain temporary and preserve native WebSocket direction"); const negotiationResponse = document.components?.responses?.ResponsesWebSocketUpgradeRequired; if (negotiationResponse?.headers?.Upgrade?.schema?.const !== "websocket") throw new ContractFailure("Responses 426 negotiation must advertise the WebSocket protocol token"); if (!(schemas.ErrorResponse?.properties?.error?.properties?.code?.enum ?? []).includes("websocket_upgrade_required")) throw new ContractFailure("Responses 426 negotiation lost its stable error code");
   for (const [method, path, security, scope] of [["patch", "/internal/v1/keys/{key_id}/alias", [{ serviceBearer: [] }], "keys:write"], ["get", "/internal/v1/keys/{key_id}/limits", [{ serviceBearer: [] }], "keys:read"], ["get", "/self/v1/key/limits", [{ clientBearer: [] }], undefined]] as const) { const operation = operationAt(document, method, path); if (!isDeepStrictEqual(operation.security, security)) throw new ContractFailure(`${method.toUpperCase()} ${path} credential security changed`); if (operation["x-required-scope"] !== scope) throw new ContractFailure(`${method.toUpperCase()} ${path} credential scope changed`); const schema = operation.responses?.["200"]?.content?.["application/json"]?.schema; if (path.endsWith("/limits") && schema?.$ref !== "#/components/schemas/ClientCredentialLimitSnapshot") throw new ContractFailure(`${method.toUpperCase()} ${path} limit snapshot schema changed`); }
   if (document.paths?.["/internal/v1/keys/{key_id}/legacy-credentials"] !== undefined) throw new ContractFailure("retired credential attachment path must not remain in OpenAPI");

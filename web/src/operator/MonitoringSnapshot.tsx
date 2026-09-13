@@ -2,7 +2,7 @@ import { Metric, NumberMetric } from '../components';
 import { formatCurrency, formatElapsedTime, formatMilliseconds, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
 import type { MonitoringHealth, OperatorMonitoringSnapshot, UsageAnalysisCost } from '../types';
-import { monitoringAccountGroups } from './monitoringAccountGroups';
+import { monitoringModelGroups } from './monitoringAccountGroups';
 
 function CostLines({ costs }: { costs: UsageAnalysisCost[] }) {
   const { locale } = useI18n();
@@ -72,13 +72,13 @@ export function MonitoringSnapshot({ snapshot }: { snapshot: OperatorMonitoringS
       <div className="panel-title"><h2>{t('monitoring.topUpstreams')}</h2><span>{t('monitoring.topAccountModelsScope')}</span></div>
       {!snapshot.top_upstream_models.length
         ? <div className="empty">{t('monitoring.noStableUpstreamTraffic')}</div>
-        : <ol className="monitoring-top-list">{monitoringAccountGroups(snapshot.top_upstream_models).map((group) => <li key={group.id} data-upstream-account-id={group.id}>
-          <div className="monitoring-account-heading"><b>{group.name}</b><code title={group.id}>{group.id}</code></div>
-          <ol className="monitoring-account-models">{group.models.map((value) => {
+        : <ul className="monitoring-top-list">{monitoringModelGroups(snapshot.top_upstream_models).map((group) => <li key={group.model} data-upstream-model={group.model}>
+          <div className="monitoring-account-heading"><code>{group.model}</code></div>
+          <ul className="monitoring-account-models">{group.accounts.map((value, index) => {
           const metrics = value.metrics;
-          return <li key={`${value.upstream_account_id}\0${value.model}`}>
+          return <li key={`${value.upstream_account_id}\0${index}`} data-upstream-account-id={value.upstream_account_id}>
             <div className="monitoring-top-heading">
-              <div><code>{value.model}</code></div>
+              <div><b>{value.upstream_name}</b><code title={value.upstream_account_id}>{value.upstream_account_id}</code></div>
               <RoutingStatusBadge health={value.health} />
             </div>
             <MonitoringMetricList metrics={metrics} />
@@ -92,8 +92,8 @@ export function MonitoringSnapshot({ snapshot }: { snapshot: OperatorMonitoringS
               </li>)}
             </ol>
           </li>;
-          })}</ol>
-        </li>)}</ol>}
+          })}</ul>
+        </li>)}</ul>}
     </article>
   </section>;
 }

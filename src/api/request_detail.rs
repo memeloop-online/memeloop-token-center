@@ -13,29 +13,37 @@ pub(super) async fn request_detail(
     state: &AppState,
     refs: crate::model::RequestArchiveRefs,
 ) -> crate::model::RequestDetail {
-    let request = archive_value(state, &refs.request_object).await;
-    let response = match refs.response_object.as_deref() {
-        Some(location) => archive_value(state, location).await,
-        None => match refs.response_json {
-            Some(value) if json_value_structure_is_bounded(&value) => ArchiveValue {
-                value,
-                complete: true,
-                reason: None,
-            },
-            Some(_) => ArchiveValue::gap("archive_payload_invalid"),
-            None if refs.response_archive_state == crate::model::RequestArchiveState::Bound => {
-                ArchiveValue {
-                    value: Value::Null,
+    let request = if archive_is_pending(refs.request_archive_state) {
+        ArchiveValue::pending()
+    } else {
+        archive_value(state, &refs.request_object).await
+    };
+    let response = if archive_is_pending(refs.response_archive_state) {
+        ArchiveValue::pending()
+    } else {
+        match refs.response_object.as_deref() {
+            Some(location) => archive_value(state, location).await,
+            None => match refs.response_json {
+                Some(value) if json_value_structure_is_bounded(&value) => ArchiveValue {
+                    value,
                     complete: true,
                     reason: None,
+                },
+                Some(_) => ArchiveValue::gap("archive_payload_invalid"),
+                None if refs.response_archive_state == crate::model::RequestArchiveState::Bound => {
+                    ArchiveValue {
+                        value: Value::Null,
+                        complete: true,
+                        reason: None,
+                    }
                 }
-            }
-            None => ArchiveValue {
-                value: Value::Null,
-                complete: false,
-                reason: refs.response_archive_reason.clone(),
+                None => ArchiveValue {
+                    value: Value::Null,
+                    complete: false,
+                    reason: refs.response_archive_reason.clone(),
+                },
             },
-        },
+        }
     };
     crate::model::RequestDetail {
         view: refs.view,
@@ -64,7 +72,24 @@ struct ArchiveValue {
     reason: Option<String>,
 }
 
+fn archive_is_pending(state: crate::model::RequestArchiveState) -> bool {
+    matches!(
+        state,
+        crate::model::RequestArchiveState::Capturing
+            | crate::model::RequestArchiveState::Pending
+            | crate::model::RequestArchiveState::Uploading
+    )
+}
+
 impl ArchiveValue {
+    fn pending() -> Self {
+        Self {
+            value: Value::Null,
+            complete: false,
+            reason: None,
+        }
+    }
+
     fn gap(reason: &str) -> Self {
         Self {
             value: Value::Null,

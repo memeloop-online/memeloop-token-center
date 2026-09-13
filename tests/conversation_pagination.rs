@@ -538,6 +538,29 @@ async fn assert_subagent_relation_contract(state: &AppState, database_url: &str,
     .await;
     assert_ne!(cross_key_cluster, root_cluster);
 
+    // Explicit session ids are authoritative only within one stable key.
+    let explicit_hints = ConversationHints {
+        session_id: Some("shared-explicit-session".into()),
+        ..ConversationHints::default()
+    };
+    let (_, explicit_key_a_cluster) = observe_request(
+        state,
+        &key_a,
+        &json!({"input": "explicit session on key A"}),
+        &explicit_hints,
+        "ExplicitSessionClient",
+    )
+    .await;
+    let (_, explicit_key_b_cluster) = observe_request(
+        state,
+        &key_b,
+        &json!({"input": "explicit session on key B"}),
+        &explicit_hints,
+        "ExplicitSessionClient",
+    )
+    .await;
+    assert_ne!(explicit_key_a_cluster, explicit_key_b_cluster);
+
     // A parent timestamp later than its child is also unavailable.
     let (future_parent_request, _) = observe_request(
         state,
@@ -1383,7 +1406,7 @@ async fn explicit_compaction_with_retained_content_links_but_weak_similarity_doe
 }
 
 #[tokio::test]
-async fn out_of_order_compaction_never_uses_a_future_observation_as_its_parent() {
+async fn out_of_order_explicit_session_merges_without_reversing_ancestry() {
     let fixture = Fixture::new("future-compaction").await;
     let session_hints = ConversationHints {
         session_id: Some("archive-thread".into()),
@@ -1443,10 +1466,20 @@ async fn out_of_order_compaction_never_uses_a_future_observation_as_its_parent()
         .await
         .expect("record older compacted observation after future row");
 
-    assert_ne!(
+    assert_eq!(
         compacted_cluster, future_cluster,
-        "an explicit session and compaction overlap must not reverse source-time ancestry"
+        "inverse commit order must not split one explicit session"
     );
+    let session_members: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_observations WHERE cluster_id = $1 AND (request_id = $2 OR request_id = $3)",
+    )
+    .bind(future_cluster.to_string())
+    .bind(future_request.to_string())
+    .bind(compacted_request.to_string())
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count inverse-order explicit session members");
+    assert_eq!(session_members, 2);
     let reversed_edges: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM conversation_edges e JOIN conversation_observations source ON source.id = e.from_observation_id JOIN conversation_observations target ON target.id = e.to_observation_id WHERE source.created_at > target.created_at",
     )

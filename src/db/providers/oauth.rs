@@ -15,6 +15,31 @@ pub struct ReauthorizeUpstreamAccountInput {
 }
 
 impl Database {
+    async fn begin_upstream_oauth_refresh_write_transaction(
+        &self,
+        account_id: Uuid,
+        phase: OAuthRefreshWritePhase,
+    ) -> Result<Transaction<'static, Any>, sqlx::Error> {
+        let transaction = self.begin_write_transaction().await?;
+        #[cfg(not(test))]
+        let _ = (account_id, phase);
+        #[cfg(test)]
+        {
+            let seam = {
+                let seam = self.oauth_refresh_write_phase_seam.lock().await;
+                seam.as_ref()
+                    .filter(|seam| seam.account_id == account_id)
+                    .map(|seam| (seam.entered.clone(), seam.resume.clone()))
+            };
+            if let Some((entered, resume)) = seam
+                && entered.send(phase).is_ok()
+            {
+                let _ = resume.lock().await.recv().await;
+            }
+        }
+        Ok(transaction)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn rotate_codex_transport_proxy(
         &self,
@@ -523,7 +548,12 @@ impl Database {
         let request_hash =
             credential_rotation_request_hash(UPSTREAM_OAUTH_REFRESH_RESOURCE, account_id);
         let expires_at = now.saturating_add(CREDENTIAL_ROTATION_REPLAY_TTL_MILLIS);
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self
+            .begin_upstream_oauth_refresh_write_transaction(
+                account_id,
+                OAuthRefreshWritePhase::Claim,
+            )
+            .await?;
         let replay = claim_credential_rotation(
             &mut tx,
             UPSTREAM_OAUTH_REFRESH_RESOURCE,
@@ -698,7 +728,12 @@ impl Database {
         {
             return Ok(view);
         }
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self
+            .begin_upstream_oauth_refresh_write_transaction(
+                account_id,
+                OAuthRefreshWritePhase::Finalize,
+            )
+            .await?;
         let replay_row = sqlx::query(
             "SELECT resource_kind, resource_id, request_hash, response_ciphertext, expires_at FROM credential_rotation_replays WHERE idempotency_key = $1",
         )
@@ -784,7 +819,12 @@ impl Database {
         request_hash: &str,
         key_material: &[u8],
     ) -> Result<Option<UpstreamAccountView>, AppError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self
+            .begin_upstream_oauth_refresh_write_transaction(
+                account_id,
+                OAuthRefreshWritePhase::Stage,
+            )
+            .await?;
         let replay = sqlx::query(
             "SELECT resource_kind, resource_id, request_hash, response_ciphertext, expires_at FROM credential_rotation_replays WHERE idempotency_key = $1",
         )
@@ -840,7 +880,12 @@ impl Database {
         account_id: Uuid,
         idempotency_key: &str,
     ) -> Result<(), AppError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self
+            .begin_upstream_oauth_refresh_write_transaction(
+                account_id,
+                OAuthRefreshWritePhase::Abort,
+            )
+            .await?;
         sqlx::query(
             "DELETE FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND idempotency_key = $2 AND pending_credential_ciphertext IS NULL",
         )
@@ -1093,4 +1138,305 @@ fn upstream_transport_proxy_request_hash(
     hash.update(expected_updated_at.to_be_bytes());
     hash.update(expected_credential_generation.to_be_bytes());
     format!("{:x}", hash.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode, header},
+    };
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{header as matches_header, method, path},
+    };
+
+    use super::*;
+    use crate::{
+        AppState, api,
+        config::{Config, RuntimeRole},
+    };
+
+    async fn pause_at_refresh_phase(
+        phases: &mut tokio::sync::mpsc::UnboundedReceiver<OAuthRefreshWritePhase>,
+        resume: &tokio::sync::mpsc::UnboundedSender<OAuthRefreshWritePhase>,
+        competing_writer: &Database,
+        expected: OAuthRefreshWritePhase,
+    ) {
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), phases.recv())
+                .await
+                .expect("OAuth refresh phase must reach its deadlock guard"),
+            Some(expected)
+        );
+        let error = match competing_writer.begin_write_transaction().await {
+            Ok(_) => panic!("the refresh phase must hold SQLite's write reservation"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("busy") || error.to_string().contains("locked"),
+            "expected SQLITE_BUSY from competing BEGIN IMMEDIATE: {error}"
+        );
+        resume.send(expected).unwrap();
+    }
+
+    async fn arm_refresh_phase_seam(
+        database: &Database,
+        account_id: Uuid,
+    ) -> (
+        tokio::sync::mpsc::UnboundedReceiver<OAuthRefreshWritePhase>,
+        tokio::sync::mpsc::UnboundedSender<OAuthRefreshWritePhase>,
+    ) {
+        let (entered, phases) = tokio::sync::mpsc::unbounded_channel();
+        let (resume, resumes) = tokio::sync::mpsc::unbounded_channel();
+        *database.oauth_refresh_write_phase_seam.lock().await = Some(OAuthRefreshWritePhaseSeam {
+            account_id,
+            entered,
+            resume: std::sync::Arc::new(tokio::sync::Mutex::new(resumes)),
+        });
+        (phases, resume)
+    }
+
+    #[tokio::test]
+    async fn sqlite_oauth_refresh_waits_for_write_admission_and_replays_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory
+                .path()
+                .join("oauth-refresh-write-admission.db")
+                .display()
+        );
+        let state = AppState::initialize(Config::for_test(database_url.clone()))
+            .await
+            .unwrap();
+        // Keep this as a separate Database, rather than a pool clone, so the
+        // contract covers the control and worker process deployment shape.
+        let competing_writer = Database::connect_with_max(&database_url, 1).await.unwrap();
+        let oauth_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/refresh"))
+            .and(matches_header("authorization", "Bearer refresh-v1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accessToken": "access-v2"
+            })))
+            .expect(1)
+            .mount(&oauth_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/fail"))
+            .and(matches_header("authorization", "Bearer refresh-fail"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&oauth_server)
+            .await;
+
+        let account = state
+            .db
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: "oauth-write-admission".into(),
+                    name: "cursor-refresh".into(),
+                    driver: "http-json".into(),
+                    config: json!({"base_url": "https://api.example.test"}),
+                    credential: UpstreamCredential::OAuth {
+                        access_token: "access-v1".into(),
+                        refresh_token: Some("refresh-v1".into()),
+                        expires_at: Some(4_102_444_800_000),
+                        header: "authorization".into(),
+                        prefix: "Bearer ".into(),
+                        adapter_state: None,
+                        proxy_url: None,
+                        proxy_network_scope: None,
+                    },
+                    oauth_session_id: Some(Uuid::from_u128(1)),
+                    oauth_driver: Some("cursor".into()),
+                    oauth_refresh_url: Some(format!("{}/oauth/refresh", oauth_server.uri())),
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA busy_timeout = 0")
+            .execute(&competing_writer.pool)
+            .await
+            .unwrap();
+        let (mut phases, resume) = arm_refresh_phase_seam(&state.db, account.id).await;
+        let idempotency_key = "oauth-refresh-write-admission";
+        let first_request = Request::post(format!(
+            "/internal/v1/upstreams/{}/oauth/refresh",
+            account.id
+        ))
+        .header(header::AUTHORIZATION, "Bearer test-service-token")
+        .header("idempotency-key", idempotency_key)
+        .body(Body::empty())
+        .unwrap();
+        let refresh_state = state.clone();
+        let refresh_task = tokio::spawn(async move {
+            api::router_for_role(refresh_state, RuntimeRole::Control)
+                .oneshot(first_request)
+                .await
+                .unwrap()
+        });
+        pause_at_refresh_phase(
+            &mut phases,
+            &resume,
+            &competing_writer,
+            OAuthRefreshWritePhase::Claim,
+        )
+        .await;
+        pause_at_refresh_phase(
+            &mut phases,
+            &resume,
+            &competing_writer,
+            OAuthRefreshWritePhase::Stage,
+        )
+        .await;
+        pause_at_refresh_phase(
+            &mut phases,
+            &resume,
+            &competing_writer,
+            OAuthRefreshWritePhase::Finalize,
+        )
+        .await;
+        let first_response = tokio::time::timeout(Duration::from_secs(10), refresh_task)
+            .await
+            .expect("OAuth refresh must complete after all phases release")
+            .unwrap();
+        *state.db.oauth_refresh_write_phase_seam.lock().await = None;
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let first: Value = serde_json::from_slice(
+            &to_bytes(first_response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["credential_generation"], 2);
+
+        let replay_request = Request::post(format!(
+            "/internal/v1/upstreams/{}/oauth/refresh",
+            account.id
+        ))
+        .header(header::AUTHORIZATION, "Bearer test-service-token")
+        .header("idempotency-key", idempotency_key)
+        .body(Body::empty())
+        .unwrap();
+        let replay_response = api::router_for_role(state.clone(), RuntimeRole::Control)
+            .oneshot(replay_request)
+            .await
+            .unwrap();
+        assert_eq!(replay_response.status(), StatusCode::OK);
+        let replay: Value = serde_json::from_slice(
+            &to_bytes(replay_response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replay["credential_generation"], 2);
+
+        let credential_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM upstream_credentials WHERE upstream_account_id = $1",
+        )
+        .bind(account.id.to_string())
+        .fetch_one(&state.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            credential_rows, 2,
+            "refresh installs exactly one generation"
+        );
+        let committed_replays: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM credential_rotation_replays WHERE idempotency_key = $1 AND response_ciphertext IS NOT NULL",
+        )
+        .bind(idempotency_key)
+        .fetch_one(&state.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(committed_replays, 1);
+
+        let failed = state
+            .db
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: "oauth-write-admission".into(),
+                    name: "cursor-refresh-failure".into(),
+                    driver: "http-json".into(),
+                    config: json!({"base_url": "https://api.example.test"}),
+                    credential: UpstreamCredential::OAuth {
+                        access_token: "access-fail".into(),
+                        refresh_token: Some("refresh-fail".into()),
+                        expires_at: Some(4_102_444_800_000),
+                        header: "authorization".into(),
+                        prefix: "Bearer ".into(),
+                        adapter_state: None,
+                        proxy_url: None,
+                        proxy_network_scope: None,
+                    },
+                    oauth_session_id: Some(Uuid::from_u128(2)),
+                    oauth_driver: Some("cursor".into()),
+                    oauth_refresh_url: Some(format!("{}/oauth/fail", oauth_server.uri())),
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (mut failure_phases, failure_resume) =
+            arm_refresh_phase_seam(&state.db, failed.id).await;
+        let failure_request = Request::post(format!(
+            "/internal/v1/upstreams/{}/oauth/refresh",
+            failed.id
+        ))
+        .header(header::AUTHORIZATION, "Bearer test-service-token")
+        .header("idempotency-key", "oauth-refresh-write-admission-failure")
+        .body(Body::empty())
+        .unwrap();
+        let failure_state = state.clone();
+        let failure_task = tokio::spawn(async move {
+            api::router_for_role(failure_state, RuntimeRole::Control)
+                .oneshot(failure_request)
+                .await
+                .unwrap()
+        });
+        pause_at_refresh_phase(
+            &mut failure_phases,
+            &failure_resume,
+            &competing_writer,
+            OAuthRefreshWritePhase::Claim,
+        )
+        .await;
+        pause_at_refresh_phase(
+            &mut failure_phases,
+            &failure_resume,
+            &competing_writer,
+            OAuthRefreshWritePhase::Abort,
+        )
+        .await;
+        let failure_response = tokio::time::timeout(Duration::from_secs(10), failure_task)
+            .await
+            .expect("OAuth refresh abort must complete after its phase releases")
+            .unwrap();
+        *state.db.oauth_refresh_write_phase_seam.lock().await = None;
+        assert_eq!(failure_response.status(), StatusCode::BAD_GATEWAY);
+        let failed_replays: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM credential_rotation_replays WHERE idempotency_key = $1",
+        )
+        .bind("oauth-refresh-write-admission-failure")
+        .fetch_one(&state.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(failed_replays, 0);
+        let failed_leases: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM upstream_oauth_refresh_leases WHERE account_id = $1",
+        )
+        .bind(failed.id.to_string())
+        .fetch_one(&state.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(failed_leases, 0);
+        assert_eq!(oauth_server.received_requests().await.unwrap().len(), 2);
+    }
 }

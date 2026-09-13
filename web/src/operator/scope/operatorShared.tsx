@@ -1,4 +1,4 @@
-import { CopyButton } from '../../CopyButton.js';
+import { useEffect, useRef, useState } from 'react';
 import { useI18n } from '../../i18n';
 
 export type Translate = (key: string, variables?: Record<string, string | number>) => string;
@@ -23,14 +23,102 @@ export function enumLabel(t: Translate, prefix: string, value: string) {
 export function WriteScopeNotice({ tenant }: { tenant: string }) {
   const { t } = useI18n();
   if (tenant) return null;
-  return <div className="scope-context" role="status"><span aria-hidden="true">◎</span><p>{t('operator.selectTenantToWrite')}</p></div>;
+  return <div className="scope-context"><span aria-hidden="true">◎</span><p>{t('operator.selectTenantToWrite')}</p></div>;
 }
 
-export function OneTimeSecret({ value, message }: { value: string; message: string }) {
+export function OneTimeSecret({ value, message, filename = 'token-center-credential.txt', onDismiss, recovered = false, recoveryAvailable = false }: {
+  value: string;
+  message: string;
+  filename?: string;
+  onDismiss?: () => void;
+  /** A recovered value is fetched only after an explicit, authorized action. */
+  recovered?: boolean;
+  /** The initial value may later be recovered only through an authorized action. */
+  recoveryAvailable?: boolean;
+}) {
   const { t } = useI18n();
-  return <div className="one-time" role="status">
-    <b>{message}</b>
-    <code>{value}</code>
-    <CopyButton value={value} label={t('common.copySecret')} />
-  </div>;
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
+  const [saved, setSaved] = useState(false);
+  const objectUrls = useRef(new Set<string>());
+
+  useEffect(() => () => {
+    for (const url of objectUrls.current) URL.revokeObjectURL(url);
+    objectUrls.current.clear();
+  }, []);
+
+  async function copySecret() {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+      } else {
+        // Clipboard API is unavailable in some embedded or non-secure browser
+        // contexts. Keep the fallback entirely local; the server is never
+        // queried for a previous secret.
+        const textarea = document.createElement('textarea');
+        textarea.value = value;
+        textarea.setAttribute('readonly', '');
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        let copied = false;
+        try {
+          textarea.select();
+          copied = document.execCommand('copy');
+        } finally {
+          // execCommand may throw in locked-down or embedded browsers. Never
+          // leave the secret-bearing fallback node behind in the document.
+          textarea.value = '';
+          textarea.remove();
+        }
+        if (!copied) throw new Error('clipboard unavailable');
+      }
+      setCopyState('copied');
+    } catch {
+      setCopyState('failed');
+    }
+  }
+
+  function downloadSecret() {
+    const blob = new Blob([`${value}\n`], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    objectUrls.current.add(url);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    try {
+      link.click();
+    } finally {
+      window.setTimeout(() => {
+        URL.revokeObjectURL(url);
+        objectUrls.current.delete(url);
+      }, 0);
+    }
+    setSaved(true);
+  }
+
+  function dismiss() {
+    const prompt = recovered
+      ? 'common.confirmDismissRecoveredSecret'
+      : recoveryAvailable ? 'common.confirmDismissRecoverableSecret' : 'common.confirmDismissSecret';
+    if (onDismiss && window.confirm(t(prompt))) onDismiss();
+  }
+
+  // Do not make this container a live region: assistive technology must not
+  // announce a credential merely because it was rendered.
+  return <aside className="one-time">
+    <div className="one-time-heading">
+      <div><b>{message}</b><p>{t(recovered ? 'common.recoveredSecretHint' : 'common.secretShownOnce')}</p></div>
+      {onDismiss && <button type="button" className="secondary one-time-close" aria-label={t('common.close')} onClick={dismiss}>×</button>}
+    </div>
+    <code aria-label={t(recovered ? 'common.recoveredSecretValue' : 'common.secretValue')}>{value}</code>
+    <div className="button-row">
+      <button type="button" onClick={() => void copySecret()}>
+        {copyState === 'copied' ? t('common.copied') : t('common.copySecret')}
+      </button>
+      <button type="button" className="secondary" onClick={downloadSecret}>{t('common.downloadSecret')}</button>
+    </div>
+    {copyState === 'failed' && <small className="one-time-error" role="alert">{t('common.copySecretFailed')}</small>}
+    {saved && <small className="one-time-saved" role="status">{t('common.secretSaved')}</small>}
+    <small className="one-time-hint">{t(recovered ? 'common.recoveredSecretCloseHint' : recoveryAvailable ? 'common.recoverableSecretCloseHint' : 'common.secretCloseHint')}</small>
+  </aside>;
 }

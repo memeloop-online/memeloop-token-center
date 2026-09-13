@@ -15,7 +15,7 @@ migration:
   enabled: true
   # Must equal the greatest migration registered by the release binary.
   # The packaging contract rejects drift between this value and migrations/.
-  schemaVersion: 78
+  schemaVersion: 80
   # The hook is the only component that applies schema migrations. Application
   # Deployments always set MTC_RUN_MIGRATIONS_ON_START=false.
   backoffLimit: 4
@@ -41,8 +41,8 @@ roles:
       type: ClusterIP
       port: 8080
     resources:
-      requests: { cpu: 100m, memory: 128Mi }
-      limits: { cpu: "1", memory: 256Mi }
+      requests: { cpu: 100m, memory: 256Mi }
+      limits: { cpu: "1", memory: 512Mi }
     autoscaling:
       # Size this together with config.databaseMaxConnections and the database
       # connection budget before enabling.
@@ -117,6 +117,9 @@ config:
   # Per-gateway active proxy lifecycles. Capacity exhaustion is a service 503;
   # credential RPM/TPM/concurrency policies remain the only sources of 429.
   proxyLifecycleConcurrency: 64
+  # Weighted text-body/JSON/ciphertext admission. Keep pod memory at least
+  # this budget + 256Mi; raising body max also requires budget >= max * 12 + 1Mi.
+  proxyMemoryBudgetBytes: 268435456
   # Gateway request bodies are admitted independently of proxy lifecycles.
   # Saturation returns 503 before reading the body; supported range is 1..8192.
   gatewayBodyReadConcurrency: 1024
@@ -161,6 +164,11 @@ config:
   # create a single-replica, non-durable archive.
   archiveBackend: s3
   s3:
+    # Shared by all roles; configuration changes need a rolling restart, not a build.
+    # connect/readiness: 100..30000; request: 100..120000; connect <= request.
+    connectTimeoutMillis: 5000
+    requestTimeoutMillis: 30000
+    readinessDeadlineMillis: 5000
     bucket: memeloop-token-center
     endpoint: ""
     region: us-east-1
@@ -239,9 +247,9 @@ ingress:
 
 podAnnotations: {}
 podLabels: {}
-# Optional trial-only static name mappings for upstreams whose authoritative
-# DNS is available only outside the cluster resolver. Prefer normal DNS; keep
-# each mapping explicit and narrowly reviewed when this escape hatch is used.
+# Optional static name mappings for upstreams whose authoritative DNS is
+# unavailable through the cluster resolver. Prefer normal DNS; keep each
+# mapping explicit and narrowly reviewed when this escape hatch is used.
 hostAliases: []
 nodeSelector: {}
 tolerations: []
@@ -272,6 +280,7 @@ probes:
     # process-jittered four-to-five-minute schedule, and retry for a bounded
     # three minutes after the first failure. Kubernetes still needs seven
     # seconds for each five-second canary plus dependency-aggregator headroom.
+    # With /readyz, Helm requires >= ceil(s3 readinessDeadlineMillis / 1000) + 2.
     timeoutSeconds: 7
     failureThreshold: 3
   liveness:
@@ -354,6 +363,7 @@ networkPolicy:
     #     ports: [{ protocol: TCP, port: 1080 }]
 
 serviceMonitor:
+  # Scrape each gateway and control/all pod; failover counters are process-local.
   enabled: false
   interval: 30s
   scrapeTimeout: 10s

@@ -244,7 +244,7 @@ impl Database {
         let locator = self.request_record_locator(&request_id).await?;
         if let Some(locator) = locator.filter(|locator| locator.key_id == key_id.to_string()) {
             let row = sqlx::query(
-                "SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, CAST(NULL AS TEXT) AS generation_status, r.duration_ms, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.input_tokens END AS input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cached_input_tokens END AS cached_input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cache_write_tokens END AS cache_write_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.output_tokens END AS output_tokens, CAST(NULL AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cost_micros END AS cost_micros, CASE WHEN r.completed_at IS NULL THEN NULL ELSE NULLIF(r.currency, '') END AS currency, 1 AS billable, r.error_code, COALESCE(spool.state, CASE WHEN r.completed_at IS NULL THEN 'capturing' WHEN r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END) AS archive_state, CASE WHEN COALESCE(spool.state, '') = 'gap' THEN spool.last_error_code WHEN r.completed_at IS NOT NULL AND (r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%') THEN 'archive_object_unavailable' ELSE NULL END AS archive_reason, r.request_object, r.response_object, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source, CAST(NULL AS TEXT) AS tenant_external_id, CAST(NULL AS TEXT) AS credential_key_id, CAST(NULL AS TEXT) AS key_alias, CAST(NULL AS TEXT) AS principal_external_id FROM request_records r LEFT JOIN conversation_observations observation ON observation.request_id = r.id AND observation.key_id = r.key_id AND observation.cluster_id = r.conversation_cluster_id LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id WHERE r.id = $1 AND r.created_at = $2 AND r.key_id = $3",
+                "SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, CAST(NULL AS TEXT) AS generation_status, r.duration_ms, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.input_tokens END AS input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cached_input_tokens END AS cached_input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cache_write_tokens END AS cache_write_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.output_tokens END AS output_tokens, CAST(NULL AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cost_micros END AS cost_micros, CASE WHEN r.completed_at IS NULL THEN NULL ELSE NULLIF(r.currency, '') END AS currency, 1 AS billable, r.error_code, CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, CASE WHEN request_spool.state IN ('capturing', 'pending', 'uploading') OR spool.state IN ('capturing', 'pending', 'uploading') OR r.completed_at IS NULL THEN NULL WHEN request_spool.state = 'gap' THEN COALESCE(request_spool.last_error_code, 'archive_object_unavailable') WHEN spool.state = 'gap' THEN COALESCE(spool.last_error_code, 'archive_object_unavailable') WHEN r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'archive_object_unavailable' ELSE NULL END AS archive_reason, request_spool.state AS request_spool_state, request_spool.last_error_code AS request_spool_reason, spool.state AS response_spool_state, spool.last_error_code AS response_spool_reason, r.request_object, r.response_object, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source, CAST(NULL AS TEXT) AS tenant_external_id, CAST(NULL AS TEXT) AS credential_key_id, CAST(NULL AS TEXT) AS key_alias, CAST(NULL AS TEXT) AS principal_external_id FROM request_records r LEFT JOIN conversation_observations observation ON observation.request_id = r.id AND observation.key_id = r.key_id AND observation.cluster_id = r.conversation_cluster_id LEFT JOIN request_archive_spools request_spool ON request_spool.request_id = r.id AND request_spool.tenant_id = r.tenant_id AND request_spool.reservation_id = r.reservation_id LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id WHERE r.id = $1 AND r.created_at = $2 AND r.key_id = $3",
             )
             .bind(&request_id)
             .bind(locator.created_at)
@@ -277,7 +277,7 @@ impl Database {
         let locator = self.request_record_locator(&request_id_string).await?;
         if let Some(locator) = locator {
             let row = sqlx::query(
-                "SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, CAST(NULL AS TEXT) AS generation_status, r.duration_ms, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.input_tokens END AS input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cached_input_tokens END AS cached_input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cache_write_tokens END AS cache_write_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.output_tokens END AS output_tokens, CAST(NULL AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cost_micros END AS cost_micros, CASE WHEN r.completed_at IS NULL THEN NULL ELSE NULLIF(r.currency, '') END AS currency, 1 AS billable, r.error_code, COALESCE(spool.state, CASE WHEN r.completed_at IS NULL THEN 'capturing' WHEN r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END) AS archive_state, CASE WHEN COALESCE(spool.state, '') = 'gap' THEN spool.last_error_code WHEN r.completed_at IS NOT NULL AND (r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%') THEN 'archive_object_unavailable' ELSE NULL END AS archive_reason, r.request_object, r.response_object, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source, t.external_id AS tenant_external_id, r.key_id AS credential_key_id, k.alias AS key_alias, p.external_id AS principal_external_id FROM request_records r JOIN tenants t ON t.id = r.tenant_id JOIN key_records k ON k.id = r.key_id AND k.tenant_id = r.tenant_id JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id LEFT JOIN conversation_observations observation ON observation.request_id = r.id AND observation.key_id = r.key_id AND observation.cluster_id = r.conversation_cluster_id LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id WHERE r.id = $1 AND r.created_at = $2 AND r.tenant_id = $3 AND t.external_id = $4",
+                "SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, CAST(NULL AS TEXT) AS generation_status, r.duration_ms, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.input_tokens END AS input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cached_input_tokens END AS cached_input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cache_write_tokens END AS cache_write_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.output_tokens END AS output_tokens, CAST(NULL AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cost_micros END AS cost_micros, CASE WHEN r.completed_at IS NULL THEN NULL ELSE NULLIF(r.currency, '') END AS currency, 1 AS billable, r.error_code, CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, CASE WHEN request_spool.state IN ('capturing', 'pending', 'uploading') OR spool.state IN ('capturing', 'pending', 'uploading') OR r.completed_at IS NULL THEN NULL WHEN request_spool.state = 'gap' THEN COALESCE(request_spool.last_error_code, 'archive_object_unavailable') WHEN spool.state = 'gap' THEN COALESCE(spool.last_error_code, 'archive_object_unavailable') WHEN r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'archive_object_unavailable' ELSE NULL END AS archive_reason, request_spool.state AS request_spool_state, request_spool.last_error_code AS request_spool_reason, spool.state AS response_spool_state, spool.last_error_code AS response_spool_reason, r.request_object, r.response_object, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source, t.external_id AS tenant_external_id, r.key_id AS credential_key_id, k.alias AS key_alias, p.external_id AS principal_external_id FROM request_records r JOIN tenants t ON t.id = r.tenant_id JOIN key_records k ON k.id = r.key_id AND k.tenant_id = r.tenant_id JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id LEFT JOIN conversation_observations observation ON observation.request_id = r.id AND observation.key_id = r.key_id AND observation.cluster_id = r.conversation_cluster_id LEFT JOIN request_archive_spools request_spool ON request_spool.request_id = r.id AND request_spool.tenant_id = r.tenant_id AND request_spool.reservation_id = r.reservation_id LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id WHERE r.id = $1 AND r.created_at = $2 AND r.tenant_id = $3 AND t.external_id = $4",
             )
             .bind(&request_id_string)
             .bind(locator.created_at)
@@ -315,7 +315,7 @@ impl Database {
         let request_id = request_id.to_string();
         if let Some(locator) = self.request_record_locator(&request_id).await? {
             let row = sqlx::query(
-                "SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, CAST(NULL AS TEXT) AS generation_status, r.duration_ms, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.input_tokens END AS input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cached_input_tokens END AS cached_input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cache_write_tokens END AS cache_write_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.output_tokens END AS output_tokens, CAST(NULL AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cost_micros END AS cost_micros, CASE WHEN r.completed_at IS NULL THEN NULL ELSE NULLIF(r.currency, '') END AS currency, 1 AS billable, r.error_code, COALESCE(spool.state, CASE WHEN r.completed_at IS NULL THEN 'capturing' WHEN r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END) AS archive_state, CASE WHEN COALESCE(spool.state, '') = 'gap' THEN spool.last_error_code WHEN r.completed_at IS NOT NULL AND (r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%') THEN 'archive_object_unavailable' ELSE NULL END AS archive_reason, r.request_object, r.response_object, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source, t.external_id AS tenant_external_id, r.key_id AS credential_key_id, k.alias AS key_alias, p.external_id AS principal_external_id FROM request_records r JOIN tenants t ON t.id = r.tenant_id JOIN key_records k ON k.id = r.key_id AND k.tenant_id = r.tenant_id JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id LEFT JOIN conversation_observations observation ON observation.request_id = r.id AND observation.key_id = r.key_id AND observation.cluster_id = r.conversation_cluster_id LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id WHERE r.id = $1 AND r.created_at = $2",
+                "SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, CAST(NULL AS TEXT) AS generation_status, r.duration_ms, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.input_tokens END AS input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cached_input_tokens END AS cached_input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cache_write_tokens END AS cache_write_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.output_tokens END AS output_tokens, CAST(NULL AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cost_micros END AS cost_micros, CASE WHEN r.completed_at IS NULL THEN NULL ELSE NULLIF(r.currency, '') END AS currency, 1 AS billable, r.error_code, CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, CASE WHEN request_spool.state IN ('capturing', 'pending', 'uploading') OR spool.state IN ('capturing', 'pending', 'uploading') OR r.completed_at IS NULL THEN NULL WHEN request_spool.state = 'gap' THEN COALESCE(request_spool.last_error_code, 'archive_object_unavailable') WHEN spool.state = 'gap' THEN COALESCE(spool.last_error_code, 'archive_object_unavailable') WHEN r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'archive_object_unavailable' ELSE NULL END AS archive_reason, request_spool.state AS request_spool_state, request_spool.last_error_code AS request_spool_reason, spool.state AS response_spool_state, spool.last_error_code AS response_spool_reason, r.request_object, r.response_object, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source, t.external_id AS tenant_external_id, r.key_id AS credential_key_id, k.alias AS key_alias, p.external_id AS principal_external_id FROM request_records r JOIN tenants t ON t.id = r.tenant_id JOIN key_records k ON k.id = r.key_id AND k.tenant_id = r.tenant_id JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id LEFT JOIN conversation_observations observation ON observation.request_id = r.id AND observation.key_id = r.key_id AND observation.cluster_id = r.conversation_cluster_id LEFT JOIN request_archive_spools request_spool ON request_spool.request_id = r.id AND request_spool.tenant_id = r.tenant_id AND request_spool.reservation_id = r.reservation_id LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id WHERE r.id = $1 AND r.created_at = $2",
             )
             .bind(&request_id)
             .bind(locator.created_at)
@@ -462,40 +462,49 @@ fn build_request_list_query(
     };
     let page_limit = filter.limit.clamp(1, maximum) + i64::from(filter.lookahead);
     let mut query = PortableRequestListQuery::new(
-        "SELECT id, created_at, completed_at, source_completed_at, protocol, model, upstream_account_id, route_id, status_code, generation_status, duration_ms, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, billed_units, billing_unit, cost_micros, currency, billable, error_code, archive_state, archive_reason, session_id, session_association, session_name, task_kind, agent_id, semantics_source, tenant_external_id, credential_key_id, key_alias, principal_external_id FROM (SELECT * FROM (SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, CAST(NULL AS TEXT) AS generation_status, r.duration_ms, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.input_tokens END AS input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cached_input_tokens END AS cached_input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cache_write_tokens END AS cache_write_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.output_tokens END AS output_tokens, CAST(NULL AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cost_micros END AS cost_micros, CASE WHEN r.completed_at IS NULL THEN NULL ELSE NULLIF(r.currency, '') END AS currency, CAST(1 AS BIGINT) AS billable, r.error_code, CASE WHEN r.request_object LIKE 'gap://%' THEN 'gap' ELSE COALESCE(spool.state, CASE WHEN r.completed_at IS NULL THEN 'capturing' WHEN r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END) END AS archive_state, CASE WHEN COALESCE(spool.state, '') = 'gap' THEN spool.last_error_code WHEN r.completed_at IS NOT NULL AND (r.response_object IS NULL OR r.response_object LIKE 'gap://%') THEN 'archive_object_unavailable' ELSE NULL END AS archive_reason, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source",
+        "SELECT id, created_at, completed_at, source_completed_at, protocol, model, upstream_account_id, route_id, status_code, generation_status, duration_ms, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, billed_units, billing_unit, cost_micros, currency, billable, error_code, archive_state, archive_reason, session_id, session_association, session_name, task_kind, agent_id, semantics_source, tenant_external_id, credential_key_id, key_alias, principal_external_id FROM (SELECT * FROM (SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, CAST(NULL AS TEXT) AS generation_status, r.duration_ms, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.input_tokens END AS input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cached_input_tokens END AS cached_input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cache_write_tokens END AS cache_write_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.output_tokens END AS output_tokens, CAST(NULL AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cost_micros END AS cost_micros, CASE WHEN r.completed_at IS NULL THEN NULL ELSE NULLIF(r.currency, '') END AS currency, CAST(1 AS BIGINT) AS billable, r.error_code, CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, CASE WHEN request_spool.state IN ('capturing', 'pending', 'uploading') OR spool.state IN ('capturing', 'pending', 'uploading') OR r.completed_at IS NULL THEN NULL WHEN request_spool.state = 'gap' THEN COALESCE(request_spool.last_error_code, 'archive_object_unavailable') WHEN spool.state = 'gap' THEN COALESCE(spool.last_error_code, 'archive_object_unavailable') WHEN r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'archive_object_unavailable' ELSE NULL END AS archive_reason, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source",
     );
     push_identity_projection(&mut query, scope, "r");
-    query.push(" FROM request_records r");
-    push_operator_identity_joins(&mut query, scope, "r", filter);
-    query.push(" LEFT JOIN conversation_observations observation ON observation.request_id = r.id AND observation.key_id = r.key_id AND observation.cluster_id = r.conversation_cluster_id");
-    query.push(" LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id");
+    query.push(" FROM (SELECT r.* FROM request_records r");
+    push_identity_filter_joins(&mut query, "r", filter);
     query.push(" WHERE 1 = 1");
+    push_identity_eligibility(&mut query, scope, "r");
     push_request_record_filters(&mut query, scope, filter);
     query.push(" ORDER BY r.created_at DESC, r.id DESC LIMIT ");
     query.bind_i64(page_limit);
+    query.push(") r");
+    push_operator_identity_joins(&mut query, scope, "r", &RequestListFilter::default());
+    query.push(" LEFT JOIN conversation_observations observation ON observation.request_id = r.id AND observation.key_id = r.key_id AND observation.cluster_id = r.conversation_cluster_id");
+    query.push(" LEFT JOIN request_archive_spools request_spool ON request_spool.request_id = r.id AND request_spool.tenant_id = r.tenant_id AND request_spool.reservation_id = r.reservation_id LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id");
     query.push(") AS request_page");
 
     if generation_branch_can_match(filter) {
         query.push(" UNION ALL SELECT * FROM (SELECT g.id, g.created_at, g.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, 'generation' AS protocol, g.public_model AS model, g.upstream_account_id, g.model_route_id AS route_id, CAST(NULL AS BIGINT) AS status_code, g.status AS generation_status, CASE WHEN g.completed_at IS NULL THEN NULL ELSE g.completed_at - g.created_at END AS duration_ms, CAST(NULL AS BIGINT) AS input_tokens, CAST(NULL AS BIGINT) AS cached_input_tokens, CAST(NULL AS BIGINT) AS cache_write_tokens, CAST(NULL AS BIGINT) AS output_tokens, facts.billed_units, NULLIF(facts.billing_unit, '') AS billing_unit, facts.cost_micros, NULLIF(facts.currency, '') AS currency, CAST(1 AS BIGINT) AS billable, g.error_code, CASE WHEN g.status IN ('preparing', 'queued') THEN 'pending' WHEN g.status IN ('submitting', 'running', 'cancelling') THEN 'uploading' WHEN g.request_object LIKE 'gap://%' OR (g.status = 'succeeded' AND g.result_json IS NULL) THEN 'gap' ELSE 'bound' END AS archive_state, CASE WHEN g.request_object LIKE 'gap://%' OR (g.status = 'succeeded' AND g.result_json IS NULL) THEN 'archive_object_unavailable' ELSE NULL END AS archive_reason, CAST(NULL AS TEXT) AS session_id, CAST(NULL AS TEXT) AS session_association, CAST(NULL AS TEXT) AS session_name, CAST(NULL AS TEXT) AS task_kind, CAST(NULL AS TEXT) AS agent_id, CAST(NULL AS TEXT) AS semantics_source");
         push_identity_projection(&mut query, scope, "g");
-        query.push(" FROM generation_jobs g LEFT JOIN generation_stats_facts facts ON facts.job_id = g.id AND facts.tenant_id = g.tenant_id AND facts.key_id = g.key_id");
-        push_operator_identity_joins(&mut query, scope, "g", filter);
+        query.push(" FROM (SELECT g.* FROM generation_jobs g LEFT JOIN generation_stats_facts facts ON facts.job_id = g.id AND facts.tenant_id = g.tenant_id AND facts.key_id = g.key_id");
+        push_identity_filter_joins(&mut query, "g", filter);
         query.push(" WHERE 1 = 1");
+        push_identity_eligibility(&mut query, scope, "g");
         push_generation_job_filters(&mut query, scope, filter);
         query.push(" ORDER BY g.created_at DESC, g.id DESC LIMIT ");
         query.bind_i64(page_limit);
+        query.push(") g LEFT JOIN generation_stats_facts facts ON facts.job_id = g.id AND facts.tenant_id = g.tenant_id AND facts.key_id = g.key_id");
+        push_operator_identity_joins(&mut query, scope, "g", &RequestListFilter::default());
         query.push(") AS generation_page");
     }
 
     if archive_branch_can_match(filter) {
         query.push(" UNION ALL SELECT * FROM (SELECT u.archive_request_id AS id, u.source_started_at AS created_at, CAST(NULL AS BIGINT) AS completed_at, u.source_completed_at, u.protocol, u.model, CAST(NULL AS TEXT) AS upstream_account_id, CAST(NULL AS TEXT) AS route_id, u.status_code, CAST(NULL AS TEXT) AS generation_status, u.duration_ms, NULLIF(u.input_tokens, 0) AS input_tokens, CAST(NULL AS BIGINT) AS cached_input_tokens, CAST(NULL AS BIGINT) AS cache_write_tokens, NULLIF(u.output_tokens, 0) AS output_tokens, CAST(NULL AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit, CAST(NULL AS BIGINT) AS cost_micros, CAST(NULL AS TEXT) AS currency, CAST(0 AS BIGINT) AS billable, u.error_code, CASE WHEN u.request_object IS NULL OR u.request_object LIKE 'gap://%' OR u.response_object IS NULL OR u.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, CASE WHEN u.request_object IS NULL OR u.request_object LIKE 'gap://%' OR u.response_object IS NULL OR u.response_object LIKE 'gap://%' THEN 'archive_object_unavailable' ELSE NULL END AS archive_reason, u.conversation_cluster_id AS session_id, 'unlinked' AS session_association, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source");
         push_identity_projection(&mut query, scope, "u");
-        query.push(" FROM session_archive_unlinked_requests u LEFT JOIN conversation_observations observation ON observation.request_id = u.archive_request_id AND observation.key_id = u.key_id AND observation.cluster_id = u.conversation_cluster_id");
-        push_operator_identity_joins(&mut query, scope, "u", filter);
+        query.push(" FROM (SELECT u.* FROM session_archive_unlinked_requests u");
+        push_identity_filter_joins(&mut query, "u", filter);
         query.push(" WHERE 1 = 1");
+        push_identity_eligibility(&mut query, scope, "u");
         push_archive_request_filters(&mut query, scope, filter);
         query.push(" ORDER BY u.source_started_at DESC, u.archive_request_id DESC LIMIT ");
         query.bind_i64(page_limit);
+        query.push(") u LEFT JOIN conversation_observations observation ON observation.request_id = u.archive_request_id AND observation.key_id = u.key_id AND observation.cluster_id = u.conversation_cluster_id");
+        push_operator_identity_joins(&mut query, scope, "u", &RequestListFilter::default());
         query.push(") AS archive_page");
     }
 
@@ -524,9 +533,8 @@ fn push_operator_identity_joins(
     source_alias: &str,
     filter: &RequestListFilter,
 ) {
-    // Tenant isolation is enforced directly on the request/generation source below. These
-    // relations only provide searchable identity metadata; joining them on the default path
-    // prevents PostgreSQL from stopping after the first page in the ordered source index.
+    // Display-only identity joins run after the bounded source page. Filter dependencies
+    // are joined separately inside that page, so they cannot discard matches after LIMIT.
     if scope.includes_operator_identity()
         || filter_uses_key_alias(filter)
         || filter_uses_principal(filter)
@@ -543,6 +551,40 @@ fn push_operator_identity_joins(
     if scope.includes_operator_identity() || filter_uses_principal(filter) {
         query.push(" JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id");
     }
+}
+
+fn push_identity_filter_joins(
+    query: &mut PortableRequestListQuery,
+    source_alias: &str,
+    filter: &RequestListFilter,
+) {
+    // Key scope suppresses display enrichment; the UUID is unused by this join helper.
+    // Keeping ORDER/LIMIT inside the derived source prevents the planner from expanding
+    // every historical request through identity, observation and spool joins first.
+    push_operator_identity_joins(
+        query,
+        RequestListScope::Key(Uuid::nil()),
+        source_alias,
+        filter,
+    );
+}
+
+fn push_identity_eligibility(
+    query: &mut PortableRequestListQuery,
+    scope: RequestListScope<'_>,
+    source_alias: &str,
+) {
+    if !scope.includes_operator_identity() {
+        return;
+    }
+    // Historical imports need not have foreign keys. Preserve the previous inner-join
+    // eligibility before LIMIT, including for orphan rows. A scalar lookup cannot be
+    // flattened into the full-history join that caused the operator query timeout.
+    query.push(" AND (SELECT identity_key.id FROM key_records identity_key JOIN tenants identity_tenant ON identity_tenant.id = identity_key.tenant_id JOIN principals identity_principal ON identity_principal.id = identity_key.principal_id AND identity_principal.tenant_id = identity_key.tenant_id WHERE identity_key.id = ");
+    query.push(source_alias);
+    query.push(".key_id AND identity_key.tenant_id = ");
+    query.push(source_alias);
+    query.push(".tenant_id) IS NOT NULL");
 }
 
 fn push_list_scope_filter(
@@ -1279,9 +1321,7 @@ SELECT e.*, COALESCE(r.created_at, g.created_at) AS created_at,
                  WHEN g.status IN ('submitting', 'running', 'cancelling') THEN 'uploading'
                  WHEN g.request_object LIKE 'gap://%' OR (g.status = 'succeeded' AND g.result_json IS NULL) THEN 'gap'
                  ELSE 'bound' END
-            ELSE CASE WHEN r.request_object LIKE 'gap://%' THEN 'gap'
-                      ELSE COALESCE(spool.state, CASE WHEN r.completed_at IS NULL THEN 'capturing' WHEN r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END)
-                 END
+            ELSE CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END
        END AS archive_state,
        r.conversation_cluster_id AS session_id,
        CASE WHEN r.id IS NULL THEN NULL
@@ -1303,6 +1343,9 @@ SELECT e.*, COALESCE(r.created_at, g.created_at) AS created_at,
    AND g.tenant_id = e.tenant_id AND g.key_id = e.key_id
   LEFT JOIN generation_stats_facts facts
     ON facts.job_id = g.id AND facts.tenant_id = g.tenant_id AND facts.key_id = g.key_id
+  LEFT JOIN request_archive_spools request_spool
+    ON request_spool.request_id = r.id AND request_spool.tenant_id = r.tenant_id
+   AND request_spool.reservation_id = r.reservation_id
   LEFT JOIN response_archive_spools spool
     ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id
    AND spool.reservation_id = r.reservation_id
@@ -1397,45 +1440,29 @@ fn request_event_views(rows: Vec<AnyRow>) -> Result<Vec<RequestEventView>, AppEr
 fn request_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, AppError> {
     let request_object: String = row.try_get("request_object")?;
     let response_object: Option<String> = row.try_get("response_object")?;
+    let view = request_view_from_row(&row)?;
+    let completed_at: Option<i64> = row.try_get("completed_at")?;
+    let projection = |prefix: &str, locator: Option<&str>| -> Result<_, AppError> {
+        let spool_state: Option<String> = row.try_get(format!("{prefix}_spool_state").as_str())?;
+        if let Some(state) = spool_state {
+            let state = request_archive_state(state)?;
+            let reason = if state == RequestArchiveState::Gap {
+                row.try_get::<Option<String>, _>(format!("{prefix}_spool_reason").as_str())?
+                    .or_else(|| Some("archive_object_unavailable".to_owned()))
+            } else {
+                None
+            };
+            Ok((state, reason))
+        } else if locator.is_none() && completed_at.is_none() {
+            Ok((RequestArchiveState::Capturing, None))
+        } else {
+            Ok(locator_archive_projection(locator))
+        }
+    };
     let (request_archive_state, request_archive_reason) =
-        locator_archive_projection(Some(&request_object));
-    let mut view = request_view_from_row(&row)?;
-    let (response_archive_state, response_archive_reason) = if response_object
-        .as_deref()
-        .is_some_and(|value| !value.starts_with("gap://"))
-    {
-        (RequestArchiveState::Bound, None)
-    } else {
-        let state = match view.archive_state {
-            RequestArchiveState::Capturing
-            | RequestArchiveState::Pending
-            | RequestArchiveState::Uploading
-            | RequestArchiveState::Gap => view.archive_state,
-            RequestArchiveState::Bound => RequestArchiveState::Gap,
-        };
-        let reason = (state == RequestArchiveState::Gap)
-            .then(|| row.try_get::<Option<String>, _>("archive_reason"))
-            .transpose()?
-            .flatten()
-            .or_else(|| {
-                (state == RequestArchiveState::Gap).then(|| "archive_object_unavailable".to_owned())
-            });
-        (state, reason)
-    };
-    view.archive_state = if request_archive_state == RequestArchiveState::Gap
-        || response_archive_state == RequestArchiveState::Gap
-    {
-        RequestArchiveState::Gap
-    } else if matches!(
-        response_archive_state,
-        RequestArchiveState::Pending | RequestArchiveState::Uploading
-    ) {
-        response_archive_state
-    } else if request_archive_state == RequestArchiveState::Capturing {
-        RequestArchiveState::Capturing
-    } else {
-        RequestArchiveState::Bound
-    };
+        projection("request", Some(&request_object))?;
+    let (response_archive_state, response_archive_reason) =
+        projection("response", response_object.as_deref())?;
     Ok(RequestArchiveRefs {
         view,
         request_object,
@@ -1708,6 +1735,10 @@ fn cursor_id(filter: &RequestListFilter) -> String {
 #[cfg(test)]
 #[path = "event_contract_tests.rs"]
 mod event_contract_tests;
+
+#[cfg(test)]
+#[path = "list_plan_tests.rs"]
+mod list_plan_tests;
 
 // Retained temporarily as historical context only. Behaviour is covered by
 // database/API integration tests; SQL-string assertions are intentionally not

@@ -85,7 +85,7 @@ const accountWindow: UpstreamAvailabilityWindow = {
 function Fixture() {
   const mode = new URLSearchParams(location.search).get('window');
   const selectedWindow = mode === 'missing' ? undefined : mode === 'foreign' ? { ...accountWindow, tenant_external_id: 'another-tenant' } : accountWindow;
-  return <main className="main">
+  return <main className="main" data-fixture-ready="upstream-availability">
     <div className="hero compact"><div><span className="eyebrow">Fixture</span><h1>Upstream availability</h1></div></div>
     <article className="panel provider-list">
       <div className="account provider-account"><div className="account-main"><b>{observedAccount.name}</b><span>openai · API credential</span><UpstreamAvailability account={observedAccount} snapshot={snapshot} window={selectedWindow} manualHealth={{ account_id: observedAccount.id, status: 'unhealthy', error_code: 'probe_timeout', upstream_status: 504, latency_ms: 1_200, checked_at: now - 1_000 }} onOpenRequest={(requestId) => { window.upstreamAvailabilityFixture.openedRequestId = requestId; }} /></div></div>

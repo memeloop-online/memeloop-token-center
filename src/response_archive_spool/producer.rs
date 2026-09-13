@@ -1,8 +1,151 @@
 use std::future::Future;
 
 use bytes::Bytes;
+use getrandom::fill;
 
 use crate::{AppState, db::ArchiveSpoolIdentity, error::AppError};
+
+/// A replayable buffered capture. Only the response bytes and 12-byte random
+/// nonces are retained; ciphertext is generated in bounded database batches.
+pub(crate) struct BufferedArchive<'a> {
+    identity: ArchiveSpoolIdentity,
+    purpose: super::BufferedArchivePurpose,
+    body: &'a Bytes,
+    pepper: &'a [u8],
+    nonces: Vec<[u8; 12]>,
+}
+
+impl<'a> BufferedArchive<'a> {
+    pub(crate) fn new(
+        identity: ArchiveSpoolIdentity,
+        purpose: super::BufferedArchivePurpose,
+        body: &'a Bytes,
+        pepper: &'a [u8],
+    ) -> Result<Self, AppError> {
+        if body.len() > 64 * 1024 * 1024 {
+            return Err(AppError::Overloaded);
+        }
+        let chunk_count = body.len().div_ceil(super::CHUNK_BYTES);
+        let mut nonces = Vec::with_capacity(chunk_count);
+        for _ in 0..chunk_count {
+            let mut nonce = [0_u8; 12];
+            fill(&mut nonce).map_err(|_| AppError::Internal)?;
+            nonces.push(nonce);
+        }
+        Ok(Self {
+            identity,
+            purpose,
+            body,
+            pepper,
+            nonces,
+        })
+    }
+
+    pub(crate) fn body(&self) -> &'a Bytes {
+        self.body
+    }
+
+    pub(crate) fn identity(&self) -> ArchiveSpoolIdentity {
+        self.identity
+    }
+
+    pub(crate) fn purpose(&self) -> super::BufferedArchivePurpose {
+        self.purpose
+    }
+
+    pub(crate) fn sealed_len(&self, byte_count: usize) -> Option<usize> {
+        super::cipher::sealed_len(byte_count)
+    }
+
+    pub(crate) fn seal(&self, seq: usize) -> Result<String, AppError> {
+        let nonce = self.nonces.get(seq).copied().ok_or(AppError::Internal)?;
+        let start = seq
+            .checked_mul(super::CHUNK_BYTES)
+            .ok_or(AppError::Internal)?;
+        let end = (start + super::CHUNK_BYTES).min(self.body.len());
+        let bytes = self.body.get(start..end).ok_or(AppError::Internal)?;
+        let sealed = super::cipher::seal_for_purpose_with_nonce(
+            self.identity,
+            i64::try_from(seq).map_err(|_| AppError::Internal)?,
+            bytes,
+            self.pepper,
+            self.purpose,
+            nonce,
+        )?;
+        debug_assert_eq!(Some(sealed.len()), self.sealed_len(bytes.len()));
+        Ok(sealed)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn encrypt_buffered(
+    identity: ArchiveSpoolIdentity,
+    purpose: super::BufferedArchivePurpose,
+    body: &Bytes,
+    pepper: &[u8],
+) -> Result<Vec<crate::db::ArchiveSpoolChunk>, AppError> {
+    if body.len() > 64 * 1024 * 1024 {
+        return Err(AppError::Overloaded);
+    }
+    body.chunks(super::CHUNK_BYTES)
+        .enumerate()
+        .map(|(seq, bytes)| {
+            Ok(crate::db::ArchiveSpoolChunk {
+                seq: seq as i64,
+                byte_count: bytes.len() as i64,
+                ciphertext: super::cipher::seal_for_purpose(
+                    identity, seq as i64, bytes, pepper, purpose,
+                )?,
+            })
+        })
+        .collect()
+}
+
+/// Compatibility capture entry point. Production buffered admission/settlement
+/// use the transaction-composing APIs; no buffered SQL is deadline-cancelled.
+#[cfg(test)]
+pub(crate) async fn capture_buffered(
+    state: &AppState,
+    identity: ArchiveSpoolIdentity,
+    purpose: super::BufferedArchivePurpose,
+    body: Bytes,
+) -> bool {
+    let started = tokio::time::Instant::now();
+    let chunks =
+        match encrypt_buffered(identity, purpose, &body, state.config.key_pepper.as_bytes()) {
+            Ok(chunks) => chunks,
+            Err(_) => {
+                tracing::warn!(
+                    phase = "encrypt",
+                    error_code = "capture_failed",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "buffered archive gap"
+                );
+                return false;
+            }
+        };
+    match state
+        .db
+        .capture_buffered_archive_spool(identity, purpose, &chunks)
+        .await
+    {
+        Ok(true) => true,
+        result => {
+            let error_code = if matches!(result, Ok(false)) {
+                "capacity"
+            } else {
+                "capture_failed"
+            };
+            tracing::warn!(
+                phase = "database_ack",
+                error_code,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "buffered archive gap"
+            );
+            false
+        }
+    }
+}
 
 #[cfg(test)]
 static FAIL_NEXT_APPEND: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
@@ -187,6 +330,36 @@ pub(super) async fn mark_gap_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn identity() -> ArchiveSpoolIdentity {
+        ArchiveSpoolIdentity {
+            request_id: uuid::Uuid::nil(),
+            tenant_id: uuid::Uuid::nil(),
+            reservation_id: uuid::Uuid::nil(),
+        }
+    }
+
+    #[test]
+    fn buffered_archive_replays_its_body_but_new_captures_get_fresh_nonces() {
+        let body = Bytes::from_static(b"immutable private response");
+        let first = BufferedArchive::new(
+            identity(),
+            super::super::BufferedArchivePurpose::Response,
+            &body,
+            b"archive-spool-test-pepper",
+        )
+        .unwrap();
+        let second = BufferedArchive::new(
+            identity(),
+            super::super::BufferedArchivePurpose::Response,
+            &body,
+            b"archive-spool-test-pepper",
+        )
+        .unwrap();
+
+        assert_eq!(first.seal(0).unwrap(), first.seal(0).unwrap());
+        assert_ne!(first.seal(0).unwrap(), second.seal(0).unwrap());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn acknowledgement_deadline_fails_closed_without_completion() {

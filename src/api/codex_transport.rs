@@ -387,26 +387,7 @@ pub(super) fn validate_route_config(config: &Value) -> Result<(), AppError> {
 }
 
 fn valid_transport_policy(policy: Option<&Value>) -> bool {
-    let Some(policy) = policy else {
-        return true;
-    };
-    let Some(policy) = policy.as_object() else {
-        return false;
-    };
-    policy.keys().all(|key| {
-        matches!(
-            key.as_str(),
-            "connect_attempts" | "connect_retry_delay_millis" | "shared_probe_attempts"
-        )
-    }) && policy
-        .get("connect_attempts")
-        .is_none_or(|value| value.as_u64().is_some_and(|value| (1..=4).contains(&value)))
-        && policy
-            .get("connect_retry_delay_millis")
-            .is_none_or(|value| value.as_u64().is_some_and(|value| value <= 2_000))
-        && policy
-            .get("shared_probe_attempts")
-            .is_none_or(|value| value.as_u64().is_some_and(|value| value <= 4))
+    crate::provider::CodexTransportPolicy::parse(policy).is_ok()
 }
 
 fn trusted_reservation_token_bound(config: &Value, upstream_model: &str) -> Result<i64, AppError> {
@@ -764,7 +745,17 @@ pub(super) struct BufferedCodexResponse {
 
 pub(super) async fn buffer_response(
     response: UpstreamResponse,
+    memory: &crate::gateway_body::memory::ProxyMemoryReservation,
+    started: std::time::Instant,
 ) -> Result<BufferedCodexResponse, &'static str> {
+    if response
+        .headers()
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
+    {
+        return Err("upstream_invalid_content_encoding");
+    }
     if !is_event_stream(&response) {
         return Err("upstream_invalid_content_type");
     }
@@ -774,9 +765,19 @@ pub(super) async fn buffer_response(
     {
         return Err("upstream_response_too_large");
     }
-    let deadline = tokio::time::Instant::now() + MAX_PROXY_LIFETIME;
+    let maximum = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(MAX_PROXY_RESPONSE_BODY)
+        .min(MAX_PROXY_RESPONSE_BODY);
+    let deadline =
+        tokio::time::Instant::now() + MAX_PROXY_LIFETIME.saturating_sub(started.elapsed());
+    if !memory.reserve_buffered_response(maximum, deadline).await {
+        return Err("upstream_response_memory_capacity");
+    }
     let mut parser = BufferedResponsesParser::default();
     let mut total = 0_usize;
+    let mut memory_scanner = crate::gateway_body::memory::JsonMemoryScanner::default();
     let mut stream = response.bytes_stream();
     loop {
         let next = tokio::time::timeout_at(deadline, stream.next())
@@ -785,8 +786,12 @@ pub(super) async fn buffer_response(
         let Some(next) = next else { break };
         let chunk = next.map_err(|_| "upstream_stream")?;
         total = total.saturating_add(chunk.len());
-        if total > MAX_PROXY_RESPONSE_BODY {
+        if total > maximum {
             return Err("upstream_response_too_large");
+        }
+        let nodes = memory_scanner.observe(&chunk);
+        if !memory.response_estimate_fits(total, nodes) {
+            return Err("upstream_response_memory_capacity");
         }
         parser.push(&chunk)?;
     }
@@ -854,7 +859,9 @@ impl BufferedResponsesParser {
             }
         }
         let usage = canonical_responses_usage(&response).map_err(|_| "upstream_invalid_usage")?;
-        let body = serde_json::to_vec(&response).map_err(|_| "upstream_invalid_response")?;
+        let mut body = serde_json::to_vec(&response).map_err(|_| "upstream_invalid_response")?;
+        drop(response);
+        body.shrink_to_fit();
         if body.len() > MAX_PROXY_RESPONSE_BODY {
             return Err("upstream_response_too_large");
         }

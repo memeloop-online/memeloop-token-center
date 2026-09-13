@@ -311,6 +311,68 @@ When('管理员用键盘创建提供商组和路由组', { timeout: 120_000 }, a
   await assertContains(reloadedProviderGroups, '主力提供商');
   await assertContains(reloadedProviderGroups.locator('.selection-chip'), 'Browser mock upstream');
 
+  const staleCredentialId = '00000000-0000-4000-8000-000000000001';
+  let staleLookupStarted!: () => void;
+  const staleLookupRequest = new Promise<void>((resolve) => { staleLookupStarted = resolve; });
+  let releaseStaleLookup!: () => void;
+  const staleLookupRelease = new Promise<void>((resolve) => { releaseStaleLookup = resolve; });
+  let targetLookupStarted!: () => void;
+  const targetLookupRequest = new Promise<void>((resolve) => { targetLookupStarted = resolve; });
+  let releaseTargetFailure!: () => void;
+  const targetFailureRelease = new Promise<void>((resolve) => { releaseTargetFailure = resolve; });
+  let targetAttempts = 0;
+  await page.route('**/internal/v1/keys?*', async (route) => {
+    const keyId = new URL(route.request().url()).searchParams.get('key_id');
+    if (keyId === staleCredentialId) {
+      staleLookupStarted();
+      await staleLookupRelease;
+      try {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify([{ key_id: staleCredentialId, alias: 'stale form result' }]),
+        });
+      } catch {
+        // Unmounting the owning form aborts the browser request before this
+        // deliberately late response is released.
+      }
+      return;
+    }
+    if (keyId !== seed.clientKeyId) {
+      await route.fallback();
+      return;
+    }
+    targetAttempts += 1;
+    if (targetAttempts === 1) {
+      targetLookupStarted();
+      await targetFailureRelease;
+      await route.fulfill({
+        status: 503,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: { message: '凭据查询暂时不可用' } }),
+      });
+      return;
+    }
+    const response = await route.fetch();
+    await route.fulfill({ response });
+  });
+
+  const existingRoute = page.locator('tbody tr').filter({ hasText: model });
+  await existingRoute.getByRole('button', { name: '编辑', exact: true }).click();
+  const staleEditor = page.locator('.inline-editor');
+  const staleCredentialField = staleEditor.locator('.multi-combobox').filter({
+    has: page.getByRole('combobox', { name: '授权给具体凭据', exact: true }),
+  });
+  const staleInput = staleCredentialField.getByRole('combobox', { name: '授权给具体凭据', exact: true });
+  await staleInput.fill(staleCredentialId);
+  await staleLookupRequest;
+  await assertContains(staleCredentialField.getByRole('status'), '正在查找凭据');
+  const staleRequestFailed = page.waitForEvent('requestfailed', (request) => new URL(request.url()).searchParams.get('key_id') === staleCredentialId);
+  await staleEditor.getByRole('button', { name: '取消', exact: true }).click();
+  releaseStaleLookup();
+  await staleRequestFailed;
+  await assertNoCount(page.getByText('stale form result', { exact: true }));
+
   const routeEditor = page.locator('details.create-resource').filter({ hasText: '创建模型路由' });
   await routeEditor.locator('summary').click();
   await routeEditor.getByLabel('公开模型').fill(groupedModel);
@@ -346,12 +408,27 @@ When('管理员用键盘创建提供商组和路由组', { timeout: 120_000 }, a
   assert.ok(routeGroupListId);
   await assertContains(routeEditor.locator(`#${routeGroupListId}`).getByRole('option'), '创建路由组“默认路由”');
   await routeGroupInput.press('Enter');
-  const exactCredentials = routeEditor.getByRole('combobox', { name: '授权给具体凭据', exact: true });
+  const exactCredentialField = routeEditor.locator('.multi-combobox').filter({
+    has: page.getByRole('combobox', { name: '授权给具体凭据', exact: true }),
+  });
+  const exactCredentials = exactCredentialField.getByRole('combobox', { name: '授权给具体凭据', exact: true });
   await exactCredentials.fill(seed.clientKeyId);
-  const exactCredentialOption = routeEditor.getByRole('option').filter({ hasText: seed.clientKeyId });
-  await eventually(async () => {
-    assert.equal(await exactCredentialOption.count(), 1);
-  }, 30_000, 'exact credential search did not return its stable key');
+  await targetLookupRequest;
+  await assertContains(exactCredentialField.getByRole('status'), '正在查找凭据');
+  await assertNotContains(exactCredentialField, '没有匹配项');
+  releaseTargetFailure();
+  await assertContains(exactCredentialField.getByRole('alert'), '凭据查询暂时不可用');
+  const retriedExactCredential = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return response.request().method() === 'GET'
+      && url.pathname === '/internal/v1/keys'
+      && url.searchParams.get('key_id') === seed.clientKeyId
+      && response.status() === 200;
+  });
+  await exactCredentialField.getByRole('button', { name: '重试', exact: true }).click();
+  await retriedExactCredential;
+  const exactCredentialOption = exactCredentialField.getByRole('option').filter({ hasText: seed.clientKeyId });
+  await assertCount(exactCredentialOption, 1);
   await exactCredentials.press('ArrowDown');
   await eventually(async () => {
     const activeCredentialId = await exactCredentials.getAttribute('aria-activedescendant');

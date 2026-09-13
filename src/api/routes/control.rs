@@ -33,6 +33,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             patch(set_service_token_status),
         )
         .route("/internal/v1/provider-types", get(provider_types))
+        .route(
+            "/internal/v1/model-picker-options",
+            get(list_model_picker_options),
+        )
         .route("/internal/v1/requests/query", post(typed_internal_requests))
         .route(
             "/internal/v1/filter-presets",
@@ -124,32 +128,12 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(reconcile_quota_reset),
         )
         .route(
-            "/internal/v1/migrations/openai-codex/prepare",
-            post(prepare_native_codex_upgrade),
-        )
-        .route(
-            "/internal/v1/migrations/openai-codex/apply",
-            post(apply_native_codex_upgrade),
-        )
-        .route(
             "/internal/v1/native-oauth-imports/capabilities",
             get(native_oauth_import_capabilities),
         )
         .route(
             "/internal/v1/native-oauth-imports/kimi-cohort",
             post(import_native_kimi_oauth_cohort),
-        )
-        .route(
-            "/internal/v1/imports/session-archive/quarantine",
-            get(list_archive_quarantine),
-        )
-        .route(
-            "/internal/v1/imports/session-archive/quarantine/{quarantine_id}",
-            get(get_archive_quarantine),
-        )
-        .route(
-            "/internal/v1/imports/session-archive/quarantine/{quarantine_id}/resolutions",
-            post(resolve_archive_quarantine),
         )
         .route("/internal/v1/requests", get(internal_requests))
         .route(
@@ -177,6 +161,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route(
             "/internal/v1/usage-analysis",
             get(usage_analysis::internal_usage_analysis),
+        )
+        .route(
+            "/internal/v1/usage-analysis/trends",
+            get(usage_analysis::internal_usage_analysis_trends),
         )
         .route("/internal/v1/request-events", get(internal_request_events))
         .route("/internal/v1/sessions", get(internal_sessions))

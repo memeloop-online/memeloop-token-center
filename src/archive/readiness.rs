@@ -2,13 +2,13 @@ use std::{
     future::Future,
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
 use futures_util::StreamExt;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use object_store::{MultipartUpload, ObjectStore, ObjectStoreExt, PutPayload, path::Path};
 
 use super::{ArchiveStore, path::archive_path};
 use crate::error::AppError;
@@ -23,13 +23,20 @@ const READINESS_FAILURE_RETRY: Duration = Duration::from_secs(10);
 // for this bounded window while retrying. The clock starts when failure is
 // observed, not when the preceding four-to-five-minute success cache began.
 // Startup has no prior success and always fails closed immediately.
+// This is a bounded cached gate, not an instantaneous storage signal: with
+// regular probes a new outage is detected after at most the five-minute TTL
+// plus the configured canary deadline; stale success then expires after this
+// fixed grace (plus probe scheduling). Retrying never extends the grace.
 const READINESS_FAILURE_GRACE: Duration = Duration::from_secs(3 * 60);
-// A cross-node S3/MinIO canary performs list, put, get and delete operations.
+// A cross-node S3/MinIO canary performs list, multipart, get and delete operations.
 // Give that bounded sequence enough time to survive ordinary network jitter,
 // while still failing a genuine storage outage before the outer readiness and
 // Kubernetes probe deadlines.
+#[cfg(test)]
 const READINESS_DEADLINE: Duration = Duration::from_secs(5);
 const READINESS_CANARY: &[u8] = b"memeloop-token-center/archive-readiness/v1";
+const CLEANUP_DEADLINE: Duration = Duration::from_secs(5);
+const CANARY_STAGE_COUNT: usize = 11;
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
@@ -41,6 +48,10 @@ enum CanaryStage {
     Read = 4,
     Delete = 5,
     Content = 6,
+    MultipartStart = 7,
+    MultipartPart = 8,
+    MultipartComplete = 9,
+    Abort = 10,
 }
 
 impl CanaryStage {
@@ -52,6 +63,10 @@ impl CanaryStage {
             4 => Self::Read,
             5 => Self::Delete,
             6 => Self::Content,
+            7 => Self::MultipartStart,
+            8 => Self::MultipartPart,
+            9 => Self::MultipartComplete,
+            10 => Self::Abort,
             _ => Self::Start,
         }
     }
@@ -65,6 +80,10 @@ impl CanaryStage {
             Self::Read => "read",
             Self::Delete => "delete",
             Self::Content => "content",
+            Self::MultipartStart => "multipart_start",
+            Self::MultipartPart => "multipart_part",
+            Self::MultipartComplete => "multipart_complete",
+            Self::Abort => "abort",
         }
     }
 }
@@ -89,6 +108,196 @@ impl CanaryProgress {
 struct CanaryFailure {
     stage: CanaryStage,
     timed_out: bool,
+    error_class: &'static str,
+}
+
+// Fixed labels only: never put endpoint, object key or underlying error text in
+// logs/metrics. object_store does not expose portable DNS/connect/TTFB timings.
+#[derive(Default)]
+pub(super) struct ReadinessMetrics {
+    attempts: [[AtomicU64; 3]; CANARY_STAGE_COUNT],
+    operations: [[AtomicU64; 3]; CANARY_STAGE_COUNT],
+    operation_elapsed_millis: [AtomicU64; CANARY_STAGE_COUNT],
+    elapsed_millis: AtomicU64,
+    cache_hits: AtomicU64,
+}
+
+impl ReadinessMetrics {
+    fn observe(&self, stage: CanaryStage, outcome: usize, elapsed: Duration) {
+        self.attempts[stage as usize][outcome].fetch_add(1, Ordering::Relaxed);
+        self.elapsed_millis
+            .fetch_add(elapsed.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn render(&self) -> String {
+        use std::fmt::Write;
+        let mut output =
+            String::from("# TYPE memeloop_token_center_archive_canary_total counter\n");
+        for stage in 0..CANARY_STAGE_COUNT as u8 {
+            for (outcome, label) in ["success", "operation_error", "deadline"]
+                .iter()
+                .enumerate()
+            {
+                let _ = writeln!(
+                    output,
+                    "memeloop_token_center_archive_canary_total{{stage=\"{}\",outcome=\"{label}\"}} {}",
+                    CanaryStage::from_u8(stage).as_str(),
+                    self.attempts[stage as usize][outcome].load(Ordering::Relaxed)
+                );
+            }
+        }
+        output.push_str("# TYPE memeloop_token_center_archive_canary_operation_total counter\n");
+        for stage in 0..CANARY_STAGE_COUNT as u8 {
+            for (outcome, label) in ["success", "operation_error", "cancelled"]
+                .iter()
+                .enumerate()
+            {
+                let _ = writeln!(
+                    output,
+                    "memeloop_token_center_archive_canary_operation_total{{operation=\"{}\",outcome=\"{label}\"}} {}",
+                    CanaryStage::from_u8(stage).as_str(),
+                    self.operations[stage as usize][outcome].load(Ordering::Relaxed)
+                );
+            }
+        }
+        output.push_str("# TYPE memeloop_token_center_archive_canary_operation_duration_seconds_total counter\n");
+        for stage in 0..CANARY_STAGE_COUNT as u8 {
+            let _ = writeln!(
+                output,
+                "memeloop_token_center_archive_canary_operation_duration_seconds_total{{operation=\"{}\"}} {}",
+                CanaryStage::from_u8(stage).as_str(),
+                self.operation_elapsed_millis[stage as usize].load(Ordering::Relaxed) as f64
+                    / 1000.0
+            );
+        }
+        let _ = writeln!(
+            output,
+            "# TYPE memeloop_token_center_archive_canary_duration_seconds_total counter\nmemeloop_token_center_archive_canary_duration_seconds_total {}",
+            self.elapsed_millis.load(Ordering::Relaxed) as f64 / 1000.0
+        );
+        let _ = writeln!(
+            output,
+            "# TYPE memeloop_token_center_archive_canary_cache_hits_total counter\nmemeloop_token_center_archive_canary_cache_hits_total {}",
+            self.cache_hits.load(Ordering::Relaxed)
+        );
+        output
+    }
+}
+
+// A dropped operation may be the overall deadline or caller cancellation.
+// Do not misreport both as a storage error or expose the underlying error text.
+struct OperationObservation<'a> {
+    metrics: &'a ReadinessMetrics,
+    stage: CanaryStage,
+    started: tokio::time::Instant,
+    outcome: usize,
+}
+
+impl Drop for OperationObservation<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed().as_millis() as u64;
+        self.metrics.operations[self.stage as usize][self.outcome].fetch_add(1, Ordering::Relaxed);
+        self.metrics.operation_elapsed_millis[self.stage as usize]
+            .fetch_add(elapsed, Ordering::Relaxed);
+        tracing::info!(
+            operation = self.stage.as_str(),
+            outcome = ["success", "operation_error", "cancelled"][self.outcome],
+            elapsed_ms = elapsed,
+            "archive readiness operation finished"
+        );
+    }
+}
+
+async fn canary_operation<T>(
+    progress: &CanaryProgress,
+    metrics: &ReadinessMetrics,
+    stage: CanaryStage,
+    operation: impl Future<Output = object_store::Result<T>>,
+) -> Result<T, CanaryFailure> {
+    progress.enter(stage);
+    let mut observation = OperationObservation {
+        metrics,
+        stage,
+        started: tokio::time::Instant::now(),
+        outcome: 2,
+    };
+    let result = operation.await;
+    observation.outcome = usize::from(result.is_err());
+    result.map_err(|error| CanaryFailure::storage(stage, error))
+}
+
+// Keep the upload alive across cancellation so failed parts/completion can
+// still be aborted. Unique keys ensure late cleanup cannot delete a new probe.
+struct CanaryCleanup {
+    upload: Option<Box<dyn MultipartUpload>>,
+    store: Arc<dyn ObjectStore>,
+    path: Path,
+    metrics: Arc<ReadinessMetrics>,
+    delete_needed: bool,
+}
+
+impl Drop for CanaryCleanup {
+    fn drop(&mut self) {
+        let upload = self.upload.take();
+        if upload.is_none() && !self.delete_needed {
+            return;
+        }
+        let store = self.store.clone();
+        let path = self.path.clone();
+        let metrics = self.metrics.clone();
+        let delete_needed = self.delete_needed;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let progress = CanaryProgress::new();
+                if let Some(mut upload) = upload {
+                    let _ = tokio::time::timeout(
+                        CLEANUP_DEADLINE,
+                        canary_operation(&progress, &metrics, CanaryStage::Abort, upload.abort()),
+                    )
+                    .await;
+                }
+                // Try delete even when abort failed or timed out: completion
+                // may have reached the server before its response was lost.
+                if delete_needed {
+                    let _ = tokio::time::timeout(
+                        CLEANUP_DEADLINE,
+                        canary_operation(
+                            &progress,
+                            &metrics,
+                            CanaryStage::Delete,
+                            store.delete(&path),
+                        ),
+                    )
+                    .await;
+                }
+            });
+        }
+    }
+}
+
+async fn finish_canary_upload(
+    cleanup: &mut CanaryCleanup,
+    progress: &CanaryProgress,
+) -> Result<(), CanaryFailure> {
+    let upload = cleanup.upload.as_mut().expect("started canary upload");
+    // A single final part may be smaller than S3's minimum non-final part.
+    canary_operation(
+        progress,
+        &cleanup.metrics,
+        CanaryStage::MultipartPart,
+        upload.put_part(PutPayload::from_static(READINESS_CANARY)),
+    )
+    .await?;
+    cleanup.delete_needed = true;
+    canary_operation(
+        progress,
+        &cleanup.metrics,
+        CanaryStage::MultipartComplete,
+        upload.complete(),
+    )
+    .await?;
+    cleanup.upload = None;
+    Ok(())
 }
 
 impl CanaryFailure {
@@ -96,6 +305,7 @@ impl CanaryFailure {
         Self {
             stage,
             timed_out: false,
+            error_class: "operation_error",
         }
     }
 
@@ -103,6 +313,24 @@ impl CanaryFailure {
         Self {
             stage: progress.current(),
             timed_out: true,
+            error_class: "deadline",
+        }
+    }
+
+    fn storage(stage: CanaryStage, error: object_store::Error) -> Self {
+        let error_class = match error {
+            object_store::Error::PermissionDenied { .. } => "permission_denied",
+            object_store::Error::Unauthenticated { .. } => "unauthenticated",
+            object_store::Error::NotFound { .. } => "not_found",
+            // Generic includes transport and service failures; do not infer a
+            // DNS/connect/TTFB cause by parsing possibly secret-bearing text.
+            object_store::Error::Generic { .. } => "transport_or_service",
+            _ => "operation_error",
+        };
+        Self {
+            stage,
+            timed_out: false,
+            error_class,
         }
     }
 }
@@ -150,10 +378,18 @@ fn readiness_failure() -> AppError {
 }
 
 impl ArchiveStore {
+    pub fn readiness_deadline(&self) -> Duration {
+        self.readiness_deadline
+    }
+
+    pub fn readiness_metrics(&self) -> String {
+        self.readiness_metrics.render()
+    }
+
     pub async fn readiness_check(&self) -> Result<(), AppError> {
         let progress = CanaryProgress::new();
         self.readiness_check_with(
-            READINESS_DEADLINE,
+            self.readiness_deadline,
             progress.clone(),
             self.run_readiness_canary(progress),
         )
@@ -172,6 +408,9 @@ impl ArchiveStore {
         let mut cache = self.readiness.lock().await;
         let now = tokio::time::Instant::now();
         if let Some(result) = cache.cached_result(now) {
+            self.readiness_metrics
+                .cache_hits
+                .fetch_add(1, Ordering::Relaxed);
             return result;
         }
 
@@ -179,12 +418,26 @@ impl ArchiveStore {
             .await
             .unwrap_or_else(|_| Err(CanaryFailure::timeout(&progress)));
         let completed_at = tokio::time::Instant::now();
+        let elapsed = completed_at.duration_since(now);
         match check {
             Ok(()) => {
+                self.readiness_metrics
+                    .observe(CanaryStage::Content, 0, elapsed);
+                tracing::info!(
+                    canary_stage = "complete",
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    deadline_ms = deadline.as_millis() as u64,
+                    "archive readiness canary succeeded"
+                );
                 cache.record_success(completed_at);
                 Ok(())
             }
             Err(failure) => {
+                self.readiness_metrics.observe(
+                    failure.stage,
+                    if failure.timed_out { 2 } else { 1 },
+                    elapsed,
+                );
                 let effective = cache.record_failure(completed_at);
                 let age = cache
                     .last_success_at
@@ -193,6 +446,10 @@ impl ArchiveStore {
                 tracing::warn!(
                     canary_stage = failure.stage.as_str(),
                     timed_out = failure.timed_out,
+                    error_class = failure.error_class,
+                    transport_phase = "opaque",
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    deadline_ms = deadline.as_millis() as u64,
                     retaining_stale_success = effective.is_ok(),
                     stale_success_age_ms = age.as_millis() as u64,
                     failure_grace_remaining_ms = cache
@@ -218,53 +475,358 @@ impl ArchiveStore {
         // root turns a health check into a data-volume-dependent query.
         let readiness_prefix =
             archive_path("readiness").map_err(|_| CanaryFailure::operation(CanaryStage::Start))?;
-        progress.enter(CanaryStage::List);
-        let mut objects = self.inner.list(Some(&readiness_prefix));
-        if let Some(first) = objects.next().await {
-            first.map_err(|_| CanaryFailure::operation(CanaryStage::List))?;
-        }
-        progress.enter(CanaryStage::Put);
-        self.inner
-            .put(
-                &self.readiness_path,
-                PutPayload::from_static(READINESS_CANARY),
-            )
-            .await
-            .map_err(|_| CanaryFailure::operation(CanaryStage::Put))?;
-        progress.enter(CanaryStage::Get);
-        let read = self
-            .inner
-            .get(&self.readiness_path)
-            .await
-            .map_err(|_| CanaryFailure::operation(CanaryStage::Get));
-        let read = match read {
-            Ok(read) => {
-                progress.enter(CanaryStage::Read);
-                read.bytes()
-                    .await
-                    .map_err(|_| CanaryFailure::operation(CanaryStage::Read))
-            }
-            Err(error) => Err(error),
+        canary_operation(
+            &progress,
+            &self.readiness_metrics,
+            CanaryStage::List,
+            async {
+                let mut objects = self.inner.list(Some(&readiness_prefix));
+                if let Some(first) = objects.next().await {
+                    first?;
+                }
+                Ok(())
+            },
+        )
+        .await?;
+        let path = self
+            .readiness_path
+            .clone()
+            .join(uuid::Uuid::now_v7().to_string());
+        // If creation reaches S3 but is cancelled before returning its upload
+        // handle, object_store cannot abort the unknown upload ID. Deployment
+        // MUST verify provider-supported incomplete-multipart reclamation
+        // (bucket lifecycle or MinIO global stale-upload cleanup); this gate
+        // cannot verify that provider-specific policy via ObjectStore.
+        let upload = canary_operation(
+            &progress,
+            &self.readiness_metrics,
+            CanaryStage::MultipartStart,
+            self.inner.put_multipart(&path),
+        )
+        .await?;
+        let mut cleanup = CanaryCleanup {
+            upload: Some(upload),
+            store: self.inner.clone(),
+            path,
+            metrics: self.readiness_metrics.clone(),
+            delete_needed: false,
         };
-        progress.enter(CanaryStage::Delete);
-        let delete = self.inner.delete(&self.readiness_path).await;
-        let read = read?;
-        delete.map_err(|_| CanaryFailure::operation(CanaryStage::Delete))?;
+        finish_canary_upload(&mut cleanup, &progress).await?;
+        let read = canary_operation(
+            &progress,
+            &self.readiness_metrics,
+            CanaryStage::Get,
+            self.inner.get(&cleanup.path),
+        )
+        .await?;
+        let read = canary_operation(
+            &progress,
+            &self.readiness_metrics,
+            CanaryStage::Read,
+            read.bytes(),
+        )
+        .await?;
+        progress.enter(CanaryStage::Content);
+        let mut content = OperationObservation {
+            metrics: &self.readiness_metrics,
+            stage: CanaryStage::Content,
+            started: tokio::time::Instant::now(),
+            outcome: 0,
+        };
         if read.as_ref() != READINESS_CANARY {
-            progress.enter(CanaryStage::Content);
+            content.outcome = 1;
             return Err(CanaryFailure::operation(CanaryStage::Content));
         }
+        drop(content);
+        canary_operation(
+            &progress,
+            &self.readiness_metrics,
+            CanaryStage::Delete,
+            self.inner.delete(&cleanup.path),
+        )
+        .await?;
+        cleanup.delete_needed = false;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, atomic::AtomicUsize};
 
+    use futures_util::FutureExt;
     use object_store::memory::InMemory;
+    use object_store::{Extensions, PutResult, UploadPart};
 
     use super::*;
+
+    #[derive(Debug)]
+    struct FaultUpload {
+        failure: &'static str,
+        aborts: Arc<AtomicUsize>,
+    }
+
+    fn injected_error() -> object_store::Error {
+        object_store::Error::Generic {
+            store: "canary-test",
+            source: Box::new(std::io::Error::other(
+                "secret-bearing error must not escape",
+            )),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MultipartUpload for FaultUpload {
+        fn put_part(&mut self, _data: PutPayload) -> UploadPart {
+            let failure = self.failure;
+            async move {
+                match failure {
+                    "part" => Err(injected_error()),
+                    "part_timeout" => std::future::pending().await,
+                    _ => Ok(()),
+                }
+            }
+            .boxed()
+        }
+
+        async fn complete(&mut self) -> object_store::Result<PutResult> {
+            match self.failure {
+                "complete" => Err(injected_error()),
+                "complete_timeout" => std::future::pending().await,
+                _ => Ok(PutResult {
+                    e_tag: None,
+                    version: None,
+                    extensions: Extensions::new(),
+                }),
+            }
+        }
+
+        async fn abort(&mut self) -> object_store::Result<()> {
+            self.aborts.fetch_add(1, Ordering::Relaxed);
+            if self.failure == "abort_timeout" {
+                std::future::pending().await
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_canary_reads_verifies_deletes_and_caches() {
+        let store = memory_store();
+        store.readiness_check().await.expect("multipart ready");
+        store.readiness_check().await.expect("cached ready");
+        assert!(store.inner.list(None).next().await.is_none());
+        let metrics = store.readiness_metrics();
+        for operation in [
+            "multipart_start",
+            "multipart_part",
+            "multipart_complete",
+            "get",
+            "read",
+            "content",
+            "delete",
+        ] {
+            assert!(metrics.contains(&format!(
+                "operation=\"{operation}\",outcome=\"success\"}} 1"
+            )));
+        }
+        assert!(metrics.contains("archive_canary_cache_hits_total 1"));
+        assert!(!metrics.contains("unit-test"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn operation_failures_and_cancellation_report_only_fixed_stages() {
+        let metrics = ReadinessMetrics::default();
+        for stage in [
+            CanaryStage::List,
+            CanaryStage::MultipartStart,
+            CanaryStage::Get,
+            CanaryStage::Read,
+            CanaryStage::Delete,
+        ] {
+            let progress = CanaryProgress::new();
+            let failure =
+                canary_operation::<()>(&progress, &metrics, stage, async { Err(injected_error()) })
+                    .await
+                    .expect_err("injected failure");
+            assert_eq!(failure.stage.as_str(), stage.as_str());
+            assert_eq!(failure.error_class, "transport_or_service");
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(1),
+                    canary_operation::<()>(&progress, &metrics, stage, std::future::pending())
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                CanaryFailure::timeout(&progress).stage.as_str(),
+                stage.as_str()
+            );
+            assert_eq!(
+                metrics.operations[stage as usize][1].load(Ordering::Relaxed),
+                1
+            );
+            assert_eq!(
+                metrics.operations[stage as usize][2].load(Ordering::Relaxed),
+                1
+            );
+        }
+        assert!(!metrics.render().contains("secret-bearing"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn multipart_failure_and_cancellation_abort_and_clean_ambiguous_completion() {
+        for (failure, stage) in [
+            ("part", CanaryStage::MultipartPart),
+            ("complete", CanaryStage::MultipartComplete),
+            ("part_timeout", CanaryStage::MultipartPart),
+            ("complete_timeout", CanaryStage::MultipartComplete),
+        ] {
+            let store = memory_store();
+            let aborts = Arc::new(AtomicUsize::new(0));
+            let path = store.readiness_path.clone().join(failure);
+            // A completed object can exist despite a failed/lost complete response.
+            if failure.starts_with("complete") {
+                store
+                    .inner
+                    .put(&path, PutPayload::from_static(READINESS_CANARY))
+                    .await
+                    .expect("ambiguous object");
+            }
+            let mut cleanup = CanaryCleanup {
+                upload: Some(Box::new(FaultUpload {
+                    failure,
+                    aborts: aborts.clone(),
+                })),
+                store: store.inner.clone(),
+                path: path.clone(),
+                metrics: store.readiness_metrics.clone(),
+                delete_needed: false,
+            };
+            let progress = CanaryProgress::new();
+            let result = tokio::time::timeout(
+                Duration::from_millis(1),
+                finish_canary_upload(&mut cleanup, &progress),
+            )
+            .await;
+            if failure.ends_with("timeout") {
+                assert!(result.is_err());
+            } else {
+                let failure = result
+                    .expect("not a timeout")
+                    .expect_err("operation failure");
+                assert_eq!(failure.stage.as_str(), stage.as_str());
+            }
+            assert_eq!(progress.current().as_str(), stage.as_str());
+            drop(cleanup);
+            tokio::task::yield_now().await;
+            assert_eq!(aborts.load(Ordering::Relaxed), 1);
+            assert!(store.inner.get(&path).await.is_err());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stuck_abort_is_bounded_and_does_not_prevent_delete_or_touch_next_canary() {
+        let store = memory_store();
+        let old_path = store.readiness_path.clone().join("old");
+        let new_path = store.readiness_path.clone().join("new");
+        for path in [&old_path, &new_path] {
+            store
+                .inner
+                .put(path, PutPayload::from_static(READINESS_CANARY))
+                .await
+                .expect("seed object");
+        }
+        let aborts = Arc::new(AtomicUsize::new(0));
+        drop(CanaryCleanup {
+            upload: Some(Box::new(FaultUpload {
+                failure: "abort_timeout",
+                aborts: aborts.clone(),
+            })),
+            store: store.inner.clone(),
+            path: old_path.clone(),
+            metrics: store.readiness_metrics.clone(),
+            delete_needed: true,
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(CLEANUP_DEADLINE).await;
+        tokio::task::yield_now().await;
+        assert_eq!(aborts.load(Ordering::Relaxed), 1);
+        assert!(store.inner.get(&old_path).await.is_err());
+        assert!(store.inner.get(&new_path).await.is_ok());
+        assert!(
+            store
+                .readiness_metrics()
+                .contains("operation=\"abort\",outcome=\"cancelled\"} 1")
+        );
+    }
+
+    #[tokio::test]
+    async fn post_completion_failure_or_cancellation_deletes_without_abort() {
+        let store = memory_store();
+        let path = store.readiness_path.clone().join("completed");
+        store
+            .inner
+            .put(&path, PutPayload::from_static(READINESS_CANARY))
+            .await
+            .expect("completed object");
+        // After successful completion, GET/read/content/delete failure or
+        // cancellation drops this same state, with no upload left to abort.
+        drop(CanaryCleanup {
+            upload: None,
+            store: store.inner.clone(),
+            path: path.clone(),
+            metrics: store.readiness_metrics.clone(),
+            delete_needed: true,
+        });
+        tokio::task::yield_now().await;
+        assert!(store.inner.get(&path).await.is_err());
+        assert_eq!(
+            store.readiness_metrics.operations[CanaryStage::Abort as usize][0]
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            store.readiness_metrics.operations[CanaryStage::Delete as usize][0]
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persistent_multipart_failures_expire_the_fixed_grace_even_on_a_cache_hit() {
+        let store = store_with_success_at_zero(READINESS_REFRESH_JITTER_WINDOW).await;
+        tokio::time::advance(READINESS_REFRESH_BASE + READINESS_REFRESH_JITTER_WINDOW).await;
+        let first_failure_at = tokio::time::Instant::now();
+        for elapsed in 0..=18 {
+            assert!(
+                store
+                    .readiness_check_with(READINESS_DEADLINE, CanaryProgress::new(), async {
+                        Err(CanaryFailure::operation(CanaryStage::MultipartPart))
+                    })
+                    .await
+                    .is_ok()
+            );
+            assert_eq!(
+                store.readiness.lock().await.failure_grace_until,
+                Some(first_failure_at + READINESS_FAILURE_GRACE)
+            );
+            if elapsed < 18 {
+                tokio::time::advance(READINESS_FAILURE_RETRY).await;
+            }
+        }
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(
+            store
+                .readiness_check_with(READINESS_DEADLINE, CanaryProgress::new(), async {
+                    panic!("cached failure must expire grace without another object operation")
+                })
+                .await
+                .is_err()
+        );
+    }
 
     fn memory_store() -> ArchiveStore {
         ArchiveStore {
@@ -273,6 +835,8 @@ mod tests {
                 super::super::ReadinessCache::default(),
             )),
             readiness_path: archive_path("readiness/unit-test.bin").expect("readiness path"),
+            readiness_deadline: READINESS_DEADLINE,
+            readiness_metrics: Arc::default(),
         }
     }
 
@@ -332,9 +896,44 @@ mod tests {
         for value in 0..=u8::MAX {
             assert!(matches!(
                 CanaryStage::from_u8(value).as_str(),
-                "start" | "list" | "put" | "get" | "read" | "delete" | "content"
+                "start"
+                    | "list"
+                    | "put"
+                    | "get"
+                    | "read"
+                    | "delete"
+                    | "content"
+                    | "multipart_start"
+                    | "multipart_part"
+                    | "multipart_complete"
+                    | "abort"
             ));
         }
+    }
+
+    #[test]
+    fn storage_diagnostics_do_not_guess_transport_phase_or_expose_error_text() {
+        let failure = CanaryFailure::storage(
+            CanaryStage::List,
+            object_store::Error::Generic {
+                store: "secret-endpoint",
+                source: std::io::Error::other("secret-url?credential=secret").into(),
+            },
+        );
+        assert_eq!(failure.error_class, "transport_or_service");
+        assert_eq!(failure.stage.as_str(), "list");
+        assert!(
+            !failure.timed_out,
+            "an opaque source is not evidence of a deadline"
+        );
+        let failure = CanaryFailure::storage(
+            CanaryStage::Put,
+            object_store::Error::PermissionDenied {
+                path: "secret-path".into(),
+                source: std::io::Error::other("secret").into(),
+            },
+        );
+        assert_eq!(failure.error_class, "permission_denied");
     }
 
     #[test]
@@ -487,6 +1086,40 @@ mod tests {
     async fn a_startup_canary_timeout_fails_closed_immediately() {
         let store = memory_store();
         assert!(timed_out_canary(&store).await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_deadline_is_observable_and_startup_recovers_after_retry_cache() {
+        let mut store = memory_store();
+        store.readiness_deadline = Duration::from_millis(750);
+        assert_eq!(store.readiness_deadline(), Duration::from_millis(750));
+        let progress = CanaryProgress::new();
+        progress.enter(CanaryStage::List);
+        assert!(
+            store
+                .readiness_check_with(store.readiness_deadline(), progress, std::future::pending())
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .readiness_check_with(store.readiness_deadline(), CanaryProgress::new(), async {
+                    panic!("failure cache must suppress a canary")
+                })
+                .await
+                .is_err()
+        );
+        tokio::time::advance(READINESS_FAILURE_RETRY).await;
+        store
+            .readiness_check()
+            .await
+            .expect("recovered memory canary");
+        let rendered = store.readiness_metrics();
+        assert!(rendered.contains("stage=\"list\",outcome=\"deadline\"} 1"));
+        assert!(rendered.contains("stage=\"content\",outcome=\"success\"} 1"));
+        assert!(rendered.contains("archive_canary_cache_hits_total 1"));
+        assert!(rendered.contains("archive_canary_duration_seconds_total 0.75"));
+        assert!(!rendered.contains("unit-test.bin"));
     }
 
     #[tokio::test(start_paused = true)]

@@ -3,8 +3,6 @@ mod lifecycle;
 mod metered_projection;
 mod pricing_stats;
 mod queries;
-mod session_archive;
-mod session_archive_quarantine;
 mod settlement;
 mod stats;
 
@@ -28,10 +26,6 @@ pub(crate) use lifecycle::{
 pub use metered_projection::MeteredUsageProjectionTask;
 pub use queries::RequestListFilter;
 pub(crate) use queries::{request_detail_accounting_projection, search_prefix};
-pub use session_archive_quarantine::{
-    SessionArchiveQuarantineFilter, SessionArchiveQuarantineRecordView,
-    SessionArchiveQuarantineResolutionInput, SessionArchiveQuarantineResolutionView,
-};
 pub use settlement::normalize_proxy_usage;
 pub(crate) use settlement::{
     price_token_usage, proxy_contract_ceiling_micros, reserve_usage_in_transaction,

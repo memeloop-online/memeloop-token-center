@@ -66,12 +66,14 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         requested_service_tier,
         conversation,
         tenant_id,
+        memory,
         ..
     } = buffered_request;
     tokio::spawn(async move {
         // Streaming responses outlive the handler response. Keep the workload
         // permit inside this task until archive and billing finalization end.
         let _proxy_lifecycle_permit = proxy_lifecycle_permit;
+        let _request_memory = memory;
         let _stream_activity = stream_activity;
         let _upstream_activity = upstream_activity;
         let lifecycle_started = tokio::time::Instant::now();

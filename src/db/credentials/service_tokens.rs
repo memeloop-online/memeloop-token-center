@@ -13,8 +13,6 @@ const SUPPORTED_SERVICE_SCOPES: &[&str] = &[
     "entitlements:read",
     "entitlements:write",
     "generations:write",
-    "imports:session_archive:quarantine:read",
-    "imports:session_archive:quarantine:resolve",
     "keys:read",
     "keys:write",
     "metrics:read",
@@ -516,11 +514,8 @@ mod tests {
         let supported = database
             .create_service_token(
                 CreateServiceTokenInput {
-                    name: "quarantine-operator".to_owned(),
-                    scopes: vec![
-                        "imports:session_archive:quarantine:read".to_owned(),
-                        "imports:session_archive:quarantine:resolve".to_owned(),
-                    ],
+                    name: "bounded-operator".to_owned(),
+                    scopes: vec!["keys:read".to_owned(), "routes:read".to_owned()],
                     tenant_external_id: None,
                 },
                 pepper,

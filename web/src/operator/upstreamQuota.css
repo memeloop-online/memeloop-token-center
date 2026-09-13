@@ -1,14 +1,22 @@
-.upstream-quota { border-top: 1px solid #34484e; margin-top: 18px; padding-top: 14px; font-size: 13px; overflow-wrap: anywhere; }
+@import './operatorFormSurfaces.css';
+.upstream-quota { border-top: 1px solid var(--picker-border); color: var(--picker-text); margin-top: 18px; padding-top: 14px; font-size: 13px; overflow-wrap: anywhere; }
 .upstream-quota-heading, .upstream-quota-window-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
 .upstream-quota-heading h3 { margin: 0; font-size: 15px; }
 .upstream-quota-heading button { font-size: 13px; padding: 7px 10px; }
 .upstream-quota-meta { display: flex; flex-wrap: wrap; gap: 8px 14px; margin: 12px 0; }
 .upstream-quota-windows { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 12px; }
-.upstream-quota-window { min-width: 0; padding: 12px; border: 1px solid #34484e; }
+.upstream-quota-window { background: var(--picker-inset); border-radius: 10px; min-width: 0; padding: 16px; border: 1px solid var(--picker-border); }
 .upstream-quota-window-heading strong { font-size: 20px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .upstream-quota-window meter { display: block; width: 100%; height: 18px; margin: 8px 0; accent-color: #48bfae; }
 .provider-account .upstream-quota span, .provider-account .upstream-quota small { font: inherit; color: inherit; }
 .upstream-quota p { margin: 8px 0; line-height: 1.5; }
 .upstream-quota small { display: block; margin-top: 8px; overflow-wrap: anywhere; }
-.upstream-quota-reset { margin-top: 14px; }
-:root[data-theme='light'] .upstream-quota-window { background: #f6faf8; border-color: #bdced0; }
+.upstream-quota-reset { background: var(--picker-surface); border: 1px solid var(--picker-border); border-radius: 8px; margin-top: 14px; padding: 14px; }
+.upstream-quota .upstream-danger-zone { background: var(--form-danger-surface); border: 1px solid var(--form-danger); border-radius: 8px; margin-top: 14px; padding: 0 14px 12px; }
+.upstream-quota .upstream-danger-zone > summary { color: var(--form-danger); min-height: 44px; padding: 12px 0; }
+.upstream-quota .upstream-danger-zone > p { color: var(--picker-text); }
+.upstream-quota .upstream-quota-loading { color: var(--picker-muted); padding-top: 14px; }
+.upstream-quota-skeleton { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
+.upstream-quota-skeleton i { background: var(--picker-hover); border-radius: 10px; display: block; min-height: 96px; }
+.upstream-quota .upstream-quota-reset-action button { min-height: 42px; }
+@media (max-width: 600px) { .upstream-quota-skeleton { grid-template-columns: 1fr; } .upstream-quota-heading button { min-height: 44px; } }

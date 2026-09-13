@@ -518,6 +518,132 @@ async fn fuel_exhaustion_and_guest_traps_fail_closed() {
     }
 }
 
+#[cfg(feature = "experimental-plugin-revisions")]
+#[tokio::test]
+async fn revision_policy_failures_open_only_their_own_circuit() {
+    use memeloop_token_center::plugin::lifecycle::{
+        PluginGrant, RuntimeRevisions, manifest_digest,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let plugins = directory.path().join("plugins");
+    fs::create_dir(&plugins).unwrap();
+    write_policy_package(&plugins, "trap-policy", "unreachable");
+    fs::write(plugins.join("trap-policy/.mtc-oci-install.json"), serde_json::to_vec(&json!({
+        "format_version": 1, "source": "registry.example/plugins/policy", "digest": format!("sha256:{}", "a".repeat(64)), "signature_policy": "cosign-public-key"
+    })).unwrap()).unwrap();
+    let runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await).unwrap();
+    let manifest = runtime.manifests().remove(0);
+    let grant = PluginGrant {
+        version: manifest.version.clone(),
+        capabilities: manifest.capabilities.clone(),
+        manifest_digest: manifest_digest(&manifest).unwrap(),
+        identity: runtime.package_identities().remove(&manifest.id).unwrap(),
+    };
+    let revisions = RuntimeRevisions::new(
+        runtime.clone(),
+        BTreeMap::from([(manifest.id.clone(), vec![grant])]),
+    )
+    .unwrap();
+    let pinned = revisions.pin().unwrap();
+    for _ in 0..3 {
+        let decision = pinned
+            .apply_traffic_with_config(context(), &json!({"model": "test"}), &BTreeMap::new())
+            .unwrap();
+        assert!(!decision.allow);
+        assert!(format!("{decision:?}").contains("policy_execution_failed"));
+    }
+    let decision = pinned
+        .apply_traffic_with_config(context(), &json!({"model": "test"}), &BTreeMap::new())
+        .unwrap();
+    assert!(!decision.allow);
+    assert!(format!("{decision:?}").contains("policy_circuit_open"));
+    assert!(revisions.replace(1, PluginRuntime::default()).is_err());
+    fs::write(
+        plugins.join("trap-policy/plugin.wasm"),
+        component_from_core_wat(&core_wat_with_post_auth("nop\nunreachable")),
+    )
+    .unwrap();
+    let tampered = PluginRuntime::load(plugins.to_str(), database(directory.path()).await).unwrap();
+    assert!(
+        revisions.replace(1, tampered).is_err(),
+        "unchanged manifest and receipt cannot approve different executable bytes"
+    );
+    assert_eq!(revisions.pin().unwrap().receipt.revision, 1);
+    assert!(RuntimeRevisions::new(runtime, BTreeMap::new()).is_err());
+}
+
+#[tokio::test]
+async fn loader_feature_boundary_preserves_default_directory_policy_precedence() {
+    let directory = tempfile::tempdir().unwrap();
+    let plugins = directory.path().join("plugins");
+    fs::create_dir(&plugins).unwrap();
+    let deny = r#"
+        i32.const 256 i32.const 0 i32.store
+        i32.const 260 i32.const 0 i32.store
+        i32.const 264 i32.const 0 i32.store
+        i32.const 276 i32.const 0 i32.store
+        i32.const 288 i32.const 0 i32.store
+        i32.const 300 i32.const 0 i32.store
+        i32.const 256
+    "#;
+    write_policy_package(&plugins, "z-policy", deny);
+    write_policy_package(&plugins, "a-policy", deny);
+    fs::rename(plugins.join("z-policy"), plugins.join("01-first")).unwrap();
+    fs::rename(plugins.join("a-policy"), plugins.join("02-second")).unwrap();
+    let runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await).unwrap();
+    let expected = if cfg!(feature = "experimental-plugin-revisions") {
+        ["a-policy", "z-policy"]
+    } else {
+        ["z-policy", "a-policy"]
+    };
+    assert_eq!(
+        runtime
+            .manifests()
+            .iter()
+            .map(|manifest| manifest.id.as_str())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    let decision = runtime
+        .apply_traffic(context(), &json!({"model": "test"}))
+        .unwrap();
+    assert!(!decision.allow);
+    assert!(
+        format!("{decision:?}").contains(&format!("denied_by_plugin_id: Some({:?})", expected[0]))
+    );
+}
+
+#[tokio::test]
+async fn loader_feature_boundary_ignores_invalid_receipts_only_by_default() {
+    for receipt in [b"not-json".to_vec(), vec![b'x'; 16 * 1024 + 1]] {
+        let directory = tempfile::tempdir().unwrap();
+        let plugins = directory.path().join("plugins");
+        fs::create_dir(&plugins).unwrap();
+        fs::write(
+            plugins.join("plugin.json"),
+            serde_json::to_vec(&json!({
+                "id": "receipt-policy", "version": "1.0.0", "wit_version": "0.2.0", "wasm": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(plugins.join(".mtc-oci-install.json"), receipt).unwrap();
+        let result = PluginRuntime::load(plugins.to_str(), database(directory.path()).await);
+        if cfg!(feature = "experimental-plugin-revisions") {
+            assert!(
+                result.is_err(),
+                "explicit revision loader validates receipts"
+            );
+        } else {
+            assert!(
+                result.is_ok(),
+                "default loader must not inspect revision receipts"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_traffic_policy_can_explicitly_deny_after_core_authentication() {
     let directory = tempfile::tempdir().unwrap();

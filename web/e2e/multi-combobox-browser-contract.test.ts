@@ -1,0 +1,124 @@
+import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import test from 'node:test';
+import { chromium } from 'playwright';
+import { createServer } from 'vite';
+
+test('multi-select escapes clipping and supports keyboard selection, dismissal and retry', { timeout: 30_000 }, async (context) => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for the multi-select contract');
+    context.skip('Chromium is not installed'); return;
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/multi-combobox.html`);
+    const input = page.getByRole('combobox', { name: 'Workspaces' });
+    const menu = page.locator('.multi-combobox-popover');
+    for (let click = 0; click < 3; click += 1) {
+      await input.click();
+      await page.locator('.multi-combobox-popover:popover-open').waitFor();
+      assert.equal(await input.getAttribute('aria-expanded'), 'true');
+    }
+    // An outside pointer click dismisses the native layer without moving focus.
+    await page.getByRole('heading', { name: 'Resource selection' }).click();
+    await menu.waitFor({ state: 'hidden' });
+    assert.equal(await input.evaluate(element => element === document.activeElement), true);
+    await input.click();
+    await page.locator('.multi-combobox-popover:popover-open').waitFor();
+    assert.equal(await input.getAttribute('aria-expanded'), 'true');
+    await input.fill('Workspace 2');
+    await input.press('ArrowDown');
+    await input.press('Enter');
+    assert.equal(await page.getByLabel('Selected count').innerText(), '1');
+    assert.equal(await page.getByLabel('Search query').innerText(), 'empty');
+    await input.press('Escape');
+    await input.press('Enter');
+    assert.equal(await page.getByLabel('Selected count').innerText(), '1', 'closed Enter must not silently select another resource');
+    await input.press('ArrowDown');
+    assert.equal(await menu.evaluate(element => element.matches(':popover-open')), true);
+    const bounds = await menu.boundingBox();
+    assert.ok(bounds && bounds.x >= 8 && bounds.x + bounds.width <= 382);
+    const last = page.getByRole('option').last();
+    await last.click();
+    assert.equal(await page.getByLabel('Selected count').innerText(), '2', 'option outside the clipping container remains clickable');
+    await input.press('Tab');
+    assert.equal(await page.getByRole('button', { name: 'Continue', exact: true }).evaluate(element => element === document.activeElement), true);
+    await page.getByRole('button', { name: 'Simulate unavailable search' }).click();
+    await input.focus();
+    await input.press('Tab');
+    const retry = page.getByRole('button', { name: 'Retry search' });
+    assert.equal(await retry.evaluate(element => element === document.activeElement), true);
+    await retry.press('Enter');
+    await page.getByRole('alert').waitFor({ state: 'detached' });
+    const artifacts = fileURLToPath(new URL('../e2e-artifacts/ui-system/multi-combobox/', import.meta.url));
+    await mkdir(artifacts, { recursive: true });
+    for (const theme of ['dark', 'light']) for (const width of [320, 390, 768, 1440]) {
+      await page.setViewportSize({ width, height: 900 });
+      // Every capture starts from identical component state, without the
+      // deliberately clipped host used by the earlier top-layer regression.
+      await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/multi-combobox.html?matrix=1`);
+      await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
+      for (const query of ['Workspace 1', 'Workspace 2']) {
+        await input.fill(query);
+        await input.press('ArrowDown');
+        await input.press('Enter');
+      }
+      assert.equal(await page.getByLabel('Selected count').innerText(), '2');
+      await input.fill('no-such-workspace');
+      await page.getByText('No matching workspaces', { exact: true }).waitFor();
+      const before = await page.getByLabel('Submission count').innerText();
+      await input.press('Enter');
+      assert.equal(await page.getByLabel('Submission count').innerText(), before, 'empty open picker must not submit the editor');
+      assert.equal(await input.evaluate(element => element === document.activeElement), true);
+      await input.press('Escape');
+      await menu.waitFor({ state: 'hidden' });
+      assert.equal(await input.getAttribute('aria-controls'), null);
+      assert.equal(await input.getAttribute('aria-activedescendant'), null);
+      // A closed picker still allows the enclosing form's ordinary Enter action.
+      await input.press('Enter');
+      assert.equal(await page.getByLabel('Submission count').innerText(), String(Number(before) + 1));
+      const remove = page.getByRole('button', { name: /^Remove Workspace/ }).first();
+      await remove.focus();
+      await remove.press('Enter');
+      assert.equal(await input.evaluate(element => element === document.activeElement), true, 'removing the focused chip returns focus to the picker');
+      await input.fill('Workspace');
+      await input.press('ArrowDown');
+      await input.press('Enter');
+      assert.equal(await page.getByLabel('Selected count').innerText(), '2');
+      await input.focus();
+      await input.press('ArrowDown');
+      const relationships = await input.evaluate(element => {
+        const list = document.getElementById(element.getAttribute('aria-controls') ?? '');
+        const active = document.getElementById(element.getAttribute('aria-activedescendant') ?? '');
+        return {
+          listbox: list?.getAttribute('role'),
+          option: active?.getAttribute('role'),
+          selected: active?.getAttribute('aria-selected'),
+          contained: Boolean(list && active && list.contains(active)),
+        };
+      });
+      assert.deepEqual(relationships, { listbox: 'listbox', option: 'option', selected: 'true', contained: true });
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+      for (const surface of [page.locator('.multi-combobox'), menu]) {
+        assert.equal(await surface.evaluate(element => {
+          const bounds = element.getBoundingClientRect();
+          return element.scrollWidth <= element.clientWidth && bounds.left >= 0 && bounds.right <= innerWidth;
+        }), true, `${theme}/${width}: picker surface is independently contained`);
+      }
+      assert.equal(await menu.getAttribute('aria-modal'), null);
+      await page.screenshot({ path: `${artifacts}/${theme}-${width}.png`, fullPage: true });
+      await input.press('Escape');
+      await menu.waitFor({ state: 'hidden' });
+      assert.equal(await input.getAttribute('aria-expanded'), 'false');
+      assert.equal(await input.getAttribute('aria-controls'), null);
+      assert.equal(await input.getAttribute('aria-activedescendant'), null, 'closing clears the previously active option reference');
+    }
+  } finally { await browser.close(); await server.close(); }
+});

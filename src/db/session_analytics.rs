@@ -817,12 +817,13 @@ impl Database {
                          SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.status_code, r.duration_ms,
                                 r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens,
                                 r.cost_micros, r.currency, r.error_code,
-                                CASE WHEN r.request_object LIKE 'gap://%' THEN 'gap'
-                                     ELSE COALESCE(spool.state, CASE WHEN r.completed_at IS NULL THEN 'capturing' WHEN r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END)
-                                END AS archive_state,
+                                CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state,
                                 'live' AS source_kind, 'native' AS provenance_kind,
                                 NULL AS archive_source, NULL AS external_request_id
                            FROM request_records r
+                           LEFT JOIN request_archive_spools request_spool
+                             ON request_spool.request_id = r.id AND request_spool.tenant_id = r.tenant_id
+                            AND request_spool.reservation_id = r.reservation_id
                            LEFT JOIN response_archive_spools spool
                              ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id
                             AND spool.reservation_id = r.reservation_id
@@ -860,12 +861,13 @@ impl Database {
                          SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.status_code, r.duration_ms,
                                 r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens,
                                 r.cost_micros, r.currency, r.error_code,
-                                CASE WHEN r.request_object LIKE 'gap://%' THEN 'gap'
-                                     ELSE COALESCE(spool.state, CASE WHEN r.completed_at IS NULL THEN 'capturing' WHEN r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END)
-                                END AS archive_state,
+                                CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state,
                                 'live' AS source_kind, 'native' AS provenance_kind,
                                 NULL AS archive_source, NULL AS external_request_id
                            FROM request_records r
+                           LEFT JOIN request_archive_spools request_spool
+                             ON request_spool.request_id = r.id AND request_spool.tenant_id = r.tenant_id
+                            AND request_spool.reservation_id = r.reservation_id
                            LEFT JOIN response_archive_spools spool
                              ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id
                             AND spool.reservation_id = r.reservation_id

@@ -206,11 +206,16 @@ pub(in crate::api) async fn import_native_kimi_oauth_cohort(
         account_ids = ?result.accounts.iter().map(|account| account.id).collect::<Vec<_>>(),
         "applied native Kimi OAuth cohort import"
     );
+    let accounts = result
+        .accounts
+        .into_iter()
+        .map(|account| super::config_secrets::public_account(&state, account))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok((
         status,
         Json(json!({
             "disposition": disposition,
-            "accounts": result.accounts,
+            "accounts": accounts,
         })),
     ))
 }

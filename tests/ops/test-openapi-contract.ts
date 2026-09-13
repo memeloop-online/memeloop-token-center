@@ -44,6 +44,11 @@ test("source directory is combined in stable relative path order", () => {
 test("comments are ignored and control guard is classified", () => {
   const routes = sourceRoutes(sourceWith()); assert.ok(!routes.some((route) => route.path === "/ghost")); assert.equal(routes.find((route) => route.path === "/metrics")?.source_role, "control"); assert.equal(routes.length, 4);
 });
+test("gateway metrics guard excludes worker and preserves control classification", () => {
+  const routes = sourceRoutes(sourceWith("", "", 'if matches!(role, RuntimeRole::Gateway | RuntimeRole::Control | RuntimeRole::All) { application = application.route("/gateway-metrics", get(metrics)); }'));
+  assert.equal(routes.find((route) => route.path === "/gateway-metrics")?.source_role, "observability");
+  assert.equal(routes.find((route) => route.path === "/metrics")?.source_role, "control");
+});
 test("route_service fails closed", () => assert.throws(() => sourceRoutes(sourceWith("", '.route_service("/opaque", service)')), /route_service/u));
 test("handler comments do not add methods", () => assert.deepEqual(sourceRoutes(sourceWith("", '.route("/v1/comment", post(handler) \/\* get(fake) \*\/)')).filter((route) => route.path === "/v1/comment").map((route) => route.method), ["post"]));
 test("fallback fails closed", () => assert.throws(() => sourceRoutes(sourceWith("", ".fallback(handler)")), /fallback/u));
@@ -51,6 +56,11 @@ test("lifetime apostrophe is not parsed as a character literal", () => assert.eq
 test("unknown merged router fails closed", () => assert.throws(() => sourceRoutes(sourceWith(".merge(helper_router())")), /unparsed Router/u));
 
 test("asset and image semantics are complete", () => validateProductContracts(cloneDocument()));
+test("model picker projection fails closed on network side effects", () => {
+  const document = cloneDocument(); const operation = document.paths["/internal/v1/model-picker-options"].get;
+  operation["x-projection-contract"]["provider-network-io"] = "allowed";
+  assert.throws(() => validateProductContracts(document), /model picker projection gained side effects/u);
+});
 test("plugin operator data is a scoped typed-JSON proxy contract", () => {
   const document = cloneDocument(); const operation = document.paths["/internal/v1/plugins/{plugin_id}/data/{endpoint_id}"].get;
   assert.deepEqual(operation.security, [{ serviceBearer: [] }]);
@@ -79,6 +89,23 @@ test("usage analysis contract is currency safe and canonical", () => {
   const document = cloneDocument(); const operation = document.paths["/internal/v1/usage-analysis"].get; assert.equal(operation["x-required-scope"], "requests:read"); const parameters = Object.fromEntries(operation.parameters.filter((item: Obj) => "name" in item).map((item: Obj) => [item.name, item]));
   assert.deepEqual(parameters.granularity.schema.enum, ["auto", "hour", "day"]); assert.deepEqual(parameters.protocol.schema.enum, ["openai", "anthropic", "openai-image", "generation"]); assert.deepEqual(parameters.status.schema.enum, ["success", "error"]); assert.deepEqual(parameters.upstream_account_id.schema.oneOf, [{ type: "string", format: "uuid" }, { type: "string", const: "unassigned" }]); assert.deepEqual(document.components.parameters.UpstreamAccountFilter.schema, { type: "string", format: "uuid" });
   const metrics = document.components.schemas.UsageAnalysisMetrics; for (const field of ["requests", "success", "failed", "cached_input_tokens", "cache_write_tokens", "generation_units", "costs"]) assert.ok(metrics.required.includes(field)); assert.equal(metrics.properties.costs.type, "array"); assert.equal(metrics.properties.costs.items.$ref, "#/components/schemas/UsageAnalysisCost"); const hour = document.components.schemas.UsageAnalysisHeatmapBucket.allOf[0].properties.hour_of_week; assert.deepEqual([hour.minimum, hour.maximum], [0, 167]);
+});
+
+test("overview usage trends is an exact minimal projection of the full query contract", () => {
+  const document = cloneDocument();
+  const full = document.paths["/internal/v1/usage-analysis"].get;
+  const trends = document.paths["/internal/v1/usage-analysis/trends"].get;
+  assert.deepEqual(trends.security, full.security);
+  assert.equal(trends["x-required-scope"], full["x-required-scope"]);
+  assert.deepEqual(trends.parameters, full.parameters);
+  assert.equal(trends.responses["200"].content["application/json"].schema.$ref, "#/components/schemas/UsageAnalysisTrends");
+  const schema = document.components.schemas.UsageAnalysisTrends;
+  const expected = ["from_created_at", "to_created_at", "granularity", "time_zone", "p95_is_approximate", "p95_method", "summary", "time_series"];
+  assert.deepEqual(schema.required, expected);
+  assert.deepEqual(Object.keys(schema.properties), expected);
+  assert.equal(schema.additionalProperties, false);
+  assert.equal(schema.properties.summary.$ref, "#/components/schemas/UsageAnalysisMetrics");
+  assert.equal(schema.properties.time_series.items.$ref, "#/components/schemas/UsageAnalysisTimeBucket");
 });
 
 test("operator monitoring snapshot has explicit scope/window and bounded terminal drilldowns", () => {
@@ -133,10 +160,28 @@ test("native Kimi cohort import advertises the atomic v2 fail-closed contract", 
   const upstream = document.components.schemas.UpstreamProvider; for (const field of ["import_source_identity_hash", "import_source_document_sha256"]) assert.ok(upstream.required.includes(field));
 });
 
-test("session archive quarantine is persistent global operator only", () => {
-  const document = cloneDocument(); const base = "/internal/v1/imports/session-archive/quarantine"; const operations = [[document.paths[base].get, "imports:session_archive:quarantine:read"], [document.paths[`${base}/{quarantine_id}`].get, "imports:session_archive:quarantine:read"], [document.paths[`${base}/{quarantine_id}/resolutions`].post, "imports:session_archive:quarantine:resolve"]] as const;
-  for (const [operation, scope] of operations) { assert.deepEqual(operation.security, [{ serviceBearer: [] }]); assert.equal(operation["x-required-scope"], scope); assert.equal(operation["x-global-service-only"], true); assert.equal(operation["x-persistent-service-only"], true); }
-  const scopes: string[] = document.components.schemas.ServiceScope.enum; assert.ok(scopes.includes("imports:session_archive:quarantine:read")); assert.ok(scopes.includes("imports:session_archive:quarantine:resolve")); const required: string[] = document.components.schemas.ResolveSessionArchiveQuarantineRequest.required; assert.ok(required.includes("expected_record_digest") && required.includes("evidence_digest")); const properties = document.components.schemas.SessionArchiveQuarantineRecord.properties; for (const field of ["identity_claim_digest", "proof_digest", "request_object", "response_object"]) assert.ok(!(field in properties));
+test("retired migration and archive-import surfaces are absent from the public contract", () => {
+  const document = cloneDocument();
+  const retiredPaths = [
+    "/internal/v1/migrations/" + "openai-codex/prepare",
+    "/internal/v1/migrations/" + "openai-codex/apply",
+    "/internal/v1/imports/" + "session-archive/quarantine",
+    "/internal/v1/imports/" + "session-archive/quarantine/{quarantine_id}",
+    "/internal/v1/imports/" + "session-archive/quarantine/{quarantine_id}/resolutions",
+  ];
+  for (const path of retiredPaths) assert.ok(!(path in document.paths));
+  for (const schema of [
+    "NativeCodex" + "UpgradeTarget",
+    "NativeCodex" + "UpgradePrepareRequest",
+    "NativeCodex" + "UpgradePlan",
+    "NativeCodex" + "UpgradeApplyRequest",
+    "NativeCodex" + "UpgradeResult",
+    "SessionArchive" + "QuarantineRecord",
+    "ResolveSessionArchive" + "QuarantineRequest",
+    "SessionArchive" + "QuarantineResolution",
+  ]) assert.ok(!(schema in document.components.schemas));
+  const scopes: string[] = document.components.schemas.ServiceScope.enum;
+  assert.ok(!scopes.some((scope) => scope.startsWith("imports:session_archive:" + "quarantine:")));
 });
 
 test("ContractFailure remains a distinct error type", () => assert.ok(new ContractFailure("x") instanceof Error));

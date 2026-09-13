@@ -419,6 +419,18 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "native OAuth import cohorts",
         sql: include_str!("../../../migrations/common/0078_native_oauth_import_cohorts.sql"),
     },
+    Migration {
+        version: 79,
+        name: "bounded client credential recovery access",
+        sql: include_str!(
+            "../../../migrations/common/0079_key_credential_recovery_access_limits.sql"
+        ),
+    },
+    Migration {
+        version: 80,
+        name: "durable request archive spool",
+        sql: include_str!("../../../migrations/common/0080_request_archive_spool.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -823,6 +835,18 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 78,
         name: "native OAuth import cohorts",
         sql: include_str!("../../../migrations/common/0078_native_oauth_import_cohorts.sql"),
+    },
+    Migration {
+        version: 79,
+        name: "bounded client credential recovery access",
+        sql: include_str!(
+            "../../../migrations/common/0079_key_credential_recovery_access_limits.sql"
+        ),
+    },
+    Migration {
+        version: 80,
+        name: "durable request archive spool",
+        sql: include_str!("../../../migrations/common/0080_request_archive_spool.sql"),
     },
 ];
 

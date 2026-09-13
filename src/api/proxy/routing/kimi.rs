@@ -74,7 +74,7 @@ impl StreamState {
     }
 }
 
-pub(super) fn translate(
+pub(in crate::api::proxy) fn translate(
     response: reqwest::Response,
     context: responses::Context,
     streaming: bool,
@@ -83,6 +83,16 @@ pub(super) fn translate(
         return Ok(response.into());
     }
     let mut parts = UpstreamResponse::from(response).into_parts();
+    if parts
+        .headers
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
+    {
+        return Err(ProxySendError::AmbiguousResponse(
+            "upstream_invalid_content_encoding",
+        ));
+    }
     let media_type = parts
         .headers
         .get(header::CONTENT_TYPE)
@@ -162,8 +172,14 @@ pub(super) fn translate(
                 }
                 body.extend_from_slice(&chunk);
             }
+            body.shrink_to_fit();
+            if !crate::gateway_body::memory::bounded_json_fits(&body, MAX_PROXY_RESPONSE_BODY * 3) {
+                return Err(());
+            }
             let value = crate::api::sse::parse_unique_json(&body).map_err(|_| ())?;
+            drop(body);
             let response = responses::buffered(&context, &value)?;
+            drop(value);
             serde_json::to_vec(&response)
                 .map(Bytes::from)
                 .map_err(|_| ())

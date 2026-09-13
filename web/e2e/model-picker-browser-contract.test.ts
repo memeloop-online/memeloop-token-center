@@ -33,7 +33,7 @@ test('filters are non-modal themed popovers and model selection is searchable by
         await trigger.click();
         const filter = page.locator('.typed-filter-dialog');
         await filter.waitFor({ state: 'visible' });
-        assert.equal(await filter.getAttribute('aria-modal'), 'false');
+        assert.equal(await filter.getAttribute('aria-modal'), null);
         const bounds = await filter.boundingBox();
         assert.ok(bounds && bounds.x >= 0 && bounds.x + bounds.width <= width);
         const color = await filter.evaluate((element) => getComputedStyle(element).backgroundColor);

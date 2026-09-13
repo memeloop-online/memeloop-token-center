@@ -6,10 +6,12 @@ mod candidates;
 mod clock;
 mod codex;
 mod http;
-mod kimi;
+pub(super) mod kimi;
 mod outcome;
+mod policy;
 mod probe;
 mod readiness;
+mod route_types;
 
 pub(super) use crate::provider::PROXY_ROUTING_POLICY;
 pub(super) use admission::{
@@ -27,7 +29,8 @@ pub(super) use codex::quota::classify_rate_limit;
 #[cfg(test)]
 pub(super) use codex::with_test_pre_delivery_connect_failures;
 pub(super) use codex::{CodexRetryTerminal, CodexRetryTerminalGuard, runtime_transport_policy};
-pub(super) use outcome::classify_attempt_failure;
+pub(super) use outcome::{classify_attempt_failure, failover_disposition};
+pub(super) use policy::RequestAttemptBudget;
 pub(super) use probe::{
     SharedProbePermit, UpstreamAttemptGuard, UpstreamAttemptTerminal, join_shared_probe,
 };
@@ -35,67 +38,10 @@ pub(super) use readiness::{
     CandidateCompatibility, PreparedRouteReadiness, candidate_compatibility,
     credential_application_error, refresh_route_snapshot,
 };
-
-pub(super) struct PreparedProxyRoute {
-    pub(super) route: ResolvedUpstream,
-    forwarded_body: Vec<u8>,
-    pub(super) upstream_stream: bool,
-    pub(super) codex_downstream_stream: bool,
-    pub(super) codex_store_disabled: bool,
-    codex_session_id: Option<String>,
-    pub(super) component_request: Option<(PreparedProviderRequest, RequestContext)>,
-    kimi_response: Option<crate::api::kimi_transport::responses::Context>,
-}
-
-pub(super) struct PlannedProxyRoute {
-    pub(super) route: ResolvedUpstream,
-    forwarded_json: Value,
-    pub(super) output_token_ceiling: i64,
-    upstream_stream: bool,
-    codex_downstream_stream: bool,
-    codex_store_disabled: bool,
-    codex_session_id: Option<String>,
-    component_context: Option<RequestContext>,
-    kimi_response: Option<crate::api::kimi_transport::responses::Context>,
-}
-
-impl PlannedProxyRoute {
-    pub(super) fn is_component(&self) -> bool {
-        self.component_context.is_some()
-    }
-
-    pub(super) fn request_body_ceiling(
-        &self,
-        original_body_length: usize,
-    ) -> Result<usize, AppError> {
-        let forwarded_length = serde_json::to_vec(&self.forwarded_json)
-            .map_err(|_| AppError::Internal)?
-            .len();
-        Ok(original_body_length.max(forwarded_length))
-    }
-}
-
-impl PreparedProxyRoute {
-    pub(super) fn is_codex(&self) -> bool {
-        codex_transport::is_driver(&self.route.driver)
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct ProxyRequestContext<'a> {
-    pub(super) state: &'a AppState,
-    pub(super) key: &'a AuthenticatedKey,
-    pub(super) model: &'a str,
-    pub(super) protocol: Protocol,
-    pub(super) request_id: Uuid,
-    pub(super) request_json: &'a Value,
-}
-
-pub(super) struct ProxyRoutePlanInput<'a> {
-    pub(super) request: ProxyRequestContext<'a>,
-    pub(super) route: ResolvedUpstream,
-    pub(super) preparation_now: i64,
-}
+pub(super) use route_types::{
+    PlannedProxyRoute, PreparedProxyRoute, ProxyRequestContext, ProxyRoutePlanInput,
+    ProxyRouteResponse, ProxySendError,
+};
 
 pub(super) fn plan_proxy_route(
     input: ProxyRoutePlanInput<'_>,
@@ -120,6 +66,16 @@ pub(super) fn plan_proxy_route(
         )));
     }
     route.credential.validate(preparation_now)?;
+    let _planning_memory = state
+        .proxy_memory_budget
+        .temporary(
+            crate::gateway_body::memory::json_encoded_length(request_json)?.saturating_mul(3),
+        )
+        .map_err(|error| {
+            state
+                .metrics
+                .observe_proxy_memory_error(crate::metrics::ProxyMemoryRejectionStage::Route, error)
+        })?;
     let is_codex = codex_transport::is_driver(&route.driver);
     if is_codex {
         codex::validate_route(&route, protocol)?;
@@ -198,6 +154,21 @@ pub(super) async fn materialize_proxy_route(
     state: &AppState,
     planned: PlannedProxyRoute,
 ) -> Result<PreparedProxyRoute, AppError> {
+    let encoded_length = crate::gateway_body::memory::json_encoded_length(&planned.forwarded_json)?;
+    // Allocate temporary serialization/adapter work before cloning any payload.
+    let temporary_bytes = if planned.component_context.is_some() {
+        64 * 1024 * 1024 + encoded_length.saturating_mul(6)
+    } else {
+        encoded_length.saturating_mul(2)
+    };
+    let _temporary_memory = state
+        .proxy_memory_budget
+        .temporary(temporary_bytes)
+        .map_err(|error| {
+            state
+                .metrics
+                .observe_proxy_memory_error(crate::metrics::ProxyMemoryRejectionStage::Route, error)
+        })?;
     let component_request = if let Some(context) = planned.component_context {
         let prepared = prepare_component_provider(
             state,
@@ -205,17 +176,19 @@ pub(super) async fn materialize_proxy_route(
             context.clone(),
             planned.route.config.clone(),
             planned.forwarded_json.clone(),
+            _temporary_memory.clone(),
         )
         .await?;
         Some((prepared, context))
     } else {
         None
     };
-    let forwarded_body =
-        serde_json::to_vec(&planned.forwarded_json).map_err(|_| AppError::Internal)?;
+    let mut forwarded_body = Vec::with_capacity(encoded_length);
+    serde_json::to_writer(&mut forwarded_body, &planned.forwarded_json)
+        .map_err(|_| AppError::Internal)?;
     Ok(PreparedProxyRoute {
         route: planned.route,
-        forwarded_body,
+        forwarded_body: Bytes::from(forwarded_body),
         upstream_stream: planned.upstream_stream,
         codex_downstream_stream: planned.codex_downstream_stream,
         codex_store_disabled: planned.codex_store_disabled,
@@ -223,24 +196,6 @@ pub(super) async fn materialize_proxy_route(
         component_request,
         kimi_response: planned.kimi_response,
     })
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub(super) enum ProxySendError {
-    RetryableConnection(&'static str),
-    RetryableCodexBadRequest,
-    CodexBadRequest,
-    CandidateUnavailable,
-    AmbiguousResponse(&'static str),
-    NonRetryableTransport,
-    CredentialUnavailable,
-    Credential,
-}
-
-pub(super) struct ProxyRouteResponse {
-    pub(super) response: UpstreamResponse,
-    pub(super) upstream_activity: crate::metrics::ActivityGuard,
-    pub(super) codex_retry: CodexRetryTerminalGuard,
 }
 
 pub(super) async fn send_proxy_route(

@@ -5,13 +5,14 @@ import type { UpstreamAccount } from '../types';
 import { isPrivateProxyUrl } from './upstreamConnectionPolicy';
 export { connectionSchema, isPrivateProxyUrl } from './upstreamConnectionPolicy';
 import './upstreamConnection.css';
+import { SecretInput } from '../SecretInput';
 
 export function ProxyInput({ value, onChange, disabled = false }: { value: string; onChange: (value: string) => void; disabled?: boolean }) {
   const { t } = useI18n();
   const id = useId();
   const invalid = Boolean(value && !isPrivateProxyUrl(value.trim()));
   return <div className="upstream-proxy-editor">
-    <label>{t('connection.proxyUrl')} · {t('connection.required')}<input type="password" required aria-invalid={invalid} aria-describedby={`${id}-hint${invalid ? ` ${id}-error` : ''}`} autoComplete="new-password" spellCheck={false} disabled={disabled} value={value} onChange={(event) => onChange(event.target.value)} placeholder="socks5h://10.0.0.10:1080" /></label>
+    <label htmlFor={id}>{t('connection.proxyUrl')} · {t('connection.required')}</label><SecretInput id={id} label={t('connection.proxyUrl')} required aria-invalid={invalid} aria-describedby={`${id}-hint${invalid ? ` ${id}-error` : ''}`} autoComplete="new-password" disabled={disabled} value={value} onChange={(event) => onChange(event.target.value)} placeholder="socks5h://10.0.0.10:1080" />
     <p id={`${id}-hint`}>{t('connection.proxyHint')}</p>
     {invalid && <p id={`${id}-error`} role="alert">{t('connection.proxyInvalid')}</p>}
   </div>;
@@ -46,7 +47,7 @@ export function UpstreamConnection({ account, token, tenant, disabled, onChanged
   return <section className="upstream-connection" aria-label={t('connection.title')}>
     <h3>{t('connection.title')}</h3>
     <dl>
-      <div><dt>Base URL</dt><dd><code>{typeof account.config.base_url === 'string' ? account.config.base_url : '—'}</code>{codex && <span className="pill">{t('connection.fixed')}</span>}</dd></div>
+      <div><dt>{t('connection.baseUrl')}</dt><dd><code>{typeof account.config.base_url === 'string' ? account.config.base_url : '—'}</code>{codex && <span className="pill">{t('connection.fixed')}</span>}</dd></div>
       <div><dt>{t('connection.proxy')}</dt><dd><span className={`status ${account.has_proxy && account.proxy_scheme ? 'ok' : 'pending'}`}>{t(account.has_proxy === undefined ? 'connection.proxyUnknown' : account.has_proxy ? proxyState : codex ? proxyState : 'connection.directEgress')}</span>{account.proxy_scheme && <code>{account.proxy_scheme}</code>}{account.has_proxy && account.proxy_scheme && <span>{t(account.proxy_remote_dns ? 'connection.remoteDns' : 'connection.localDns')}</span>}</dd></div>
       {account.proxy_fingerprint && <div><dt>{t('connection.proxyFingerprint')}</dt><dd><code>{account.proxy_fingerprint}</code></dd></div>}
     </dl>
