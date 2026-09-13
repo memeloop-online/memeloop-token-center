@@ -15,7 +15,7 @@ mod upstream_response;
 
 #[cfg(test)]
 use crate::db::UpstreamFailureKind;
-use crate::response_archive_spool::{BufferedArchivePurpose, encrypt_buffered};
+use crate::response_archive_spool::BufferedArchive;
 use crate::{
     db::{SwitchProxyCandidateInput, UpstreamAttemptAdmission},
     metrics::{UpstreamHealthEvent, UpstreamHealthReason},
@@ -1555,18 +1555,18 @@ async fn finish_buffered_request(
         body.len().saturating_mul(3),
     );
     let response_capture_permit = request.state.proxy_memory_budget.reservation();
-    let response_chunks = if request.memory.has_buffered_response()
+    let response_archive = if request.memory.has_buffered_response()
         || response_capture_permit.try_grow(
             body.len(),
             crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
         ) {
-        encrypt_buffered(
+        BufferedArchive::new(
             crate::db::ArchiveSpoolIdentity {
                 request_id,
                 tenant_id: request.tenant_id,
                 reservation_id: request.reservation.id,
             },
-            BufferedArchivePurpose::Response,
+            crate::response_archive_spool::BufferedArchivePurpose::Response,
             &body,
             request.state.config.key_pepper.as_bytes(),
         )
@@ -1599,12 +1599,12 @@ async fn finish_buffered_request(
         response_object: &stored_response,
         conversation,
     };
-    let result = match response_chunks {
-        Ok(chunks) => {
+    let result = match response_archive {
+        Ok(archive) => {
             lifecycle::finish_buffered_proxy_request_with_retry(
                 &request.state.db,
                 terminal,
-                &chunks,
+                &archive,
             )
             .await
         }

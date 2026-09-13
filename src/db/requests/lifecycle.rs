@@ -162,9 +162,9 @@ impl Database {
             reservation_id,
         };
         let purpose = crate::response_archive_spool::BufferedArchivePurpose::Request;
-        let encrypted = archive
+        let buffered_archive = archive
             .map(|(body, pepper)| {
-                crate::response_archive_spool::encrypt_buffered(identity, purpose, body, pepper)
+                crate::response_archive_spool::BufferedArchive::new(identity, purpose, body, pepper)
                     .map_err(|_| AppError::Overloaded)
             })
             .transpose()?;
@@ -207,16 +207,10 @@ impl Database {
             transaction.rollback().await?;
             return Err(error);
         }
-        if let Some(chunks) = encrypted {
+        if let Some(archive) = buffered_archive {
             let capture_started = std::time::Instant::now();
             if !self
-                .capture_buffered_archive_spool_in_transaction(
-                    &mut transaction,
-                    now,
-                    identity,
-                    purpose,
-                    &chunks,
-                )
+                .capture_buffered_archive_body_in_transaction(&mut transaction, now, &archive)
                 .await
                 .map_err(|_| AppError::Overloaded)?
             {
@@ -674,9 +668,9 @@ impl Database {
     pub(crate) async fn finish_proxy_request_with_buffered_archive(
         &self,
         input: FinishProxyRequest<'_>,
-        chunks: &[ArchiveSpoolChunk],
+        archive: &crate::response_archive_spool::BufferedArchive<'_>,
     ) -> Result<FinishProxyRequestResult, AppError> {
-        self.finish_proxy_request_inner(input, None, Some(chunks))
+        self.finish_proxy_request_inner(input, None, Some(archive))
             .await
     }
 
@@ -684,8 +678,19 @@ impl Database {
         &self,
         input: FinishProxyRequest<'_>,
         response_archive_lease: Option<&ArchiveStagingWriteLease>,
-        buffered_archive: Option<&[ArchiveSpoolChunk]>,
+        buffered_archive: Option<&crate::response_archive_spool::BufferedArchive<'_>>,
     ) -> Result<FinishProxyRequestResult, AppError> {
+        if let Some(archive) = buffered_archive
+            && (archive.identity().request_id != input.request_id
+                || archive.identity().tenant_id != input.tenant_id
+                || archive.identity().reservation_id != input.reservation.id
+                || archive.purpose()
+                    != crate::response_archive_spool::BufferedArchivePurpose::Response)
+        {
+            return Err(AppError::BadRequest(
+                "buffered response archive does not match its request owner".into(),
+            ));
+        }
         if let Some(lease) = response_archive_lease
             && (lease.key.owner != ArchiveStagingOwner::ProxyRequest(input.request_id)
                 || lease.key.purpose != ArchiveStagingPurpose::Response)
@@ -773,21 +778,10 @@ impl Database {
             return Ok(result);
         }
 
-        if let Some(chunks) = buffered_archive {
+        if let Some(archive) = buffered_archive {
             let capture_started = std::time::Instant::now();
-            let identity = ArchiveSpoolIdentity {
-                request_id: input.request_id,
-                tenant_id: input.tenant_id,
-                reservation_id: input.reservation.id,
-            };
             if !self
-                .capture_buffered_archive_spool_in_transaction(
-                    &mut transaction,
-                    now,
-                    identity,
-                    crate::response_archive_spool::BufferedArchivePurpose::Response,
-                    chunks,
-                )
+                .capture_buffered_archive_body_in_transaction(&mut transaction, now, archive)
                 .await?
             {
                 tracing::warn!(

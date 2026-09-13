@@ -4,8 +4,10 @@ mod cipher;
 mod producer;
 mod upload;
 
+pub(crate) use producer::BufferedArchive;
 #[cfg(test)]
 pub(crate) use producer::capture_buffered;
+#[cfg(test)]
 pub(crate) use producer::encrypt_buffered;
 #[cfg(test)]
 pub(crate) use producer::fail_next_append_for_test;

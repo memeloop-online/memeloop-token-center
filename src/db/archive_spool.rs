@@ -167,6 +167,93 @@ impl Database {
         Ok(true)
     }
 
+    /// Captures a large body without retaining its amplified ciphertext in
+    /// memory. Per-chunk nonces live in `archive`, so a transaction retry after
+    /// an unknown COMMIT acknowledgement regenerates identical ciphertext.
+    pub(super) async fn capture_buffered_archive_body_in_transaction(
+        &self,
+        tx: &mut Transaction<'_, Any>,
+        now: i64,
+        archive: &crate::response_archive_spool::BufferedArchive<'_>,
+    ) -> Result<bool, AppError> {
+        const INSERT_BATCH_CHUNKS: usize = 16;
+
+        let identity = archive.identity();
+        let purpose = archive.purpose();
+        let body = archive.body();
+        let chunk_count = body
+            .len()
+            .div_ceil(crate::response_archive_spool::CHUNK_BYTES);
+        if chunk_count > CHUNK_LIMIT as usize || body.len() > PLAIN_LIMIT as usize {
+            return Ok(false);
+        }
+        let mut accounted = SPOOL_OVERHEAD;
+        for bytes in body.chunks(crate::response_archive_spool::CHUNK_BYTES) {
+            let cipher_bytes = archive.sealed_len(bytes.len()).ok_or(AppError::Internal)?;
+            accounted = accounted
+                .checked_add(cipher_bytes as i64 + CHUNK_OVERHEAD)
+                .ok_or(AppError::Internal)?;
+        }
+        if accounted > CIPHER_LIMIT {
+            return Ok(false);
+        }
+        let byte_count = i64::try_from(body.len()).map_err(|_| AppError::Internal)?;
+        let valid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND completed_at IS NULL")
+            .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
+            .bind(identity.reservation_id.to_string()).fetch_one(&mut **tx).await?;
+        if valid != 1 {
+            return Err(AppError::Internal);
+        }
+        if let Some(row) = spool_row(tx, identity, purpose).await? {
+            if row.try_get::<String, _>("state")? != "pending"
+                || row.try_get::<i64, _>("chunk_count")? != chunk_count as i64
+                || row.try_get::<i64, _>("byte_count")? != byte_count
+                || row.try_get::<i64, _>("expires_at")? <= now
+            {
+                return Err(AppError::Internal);
+            }
+            for (seq, bytes) in body
+                .chunks(crate::response_archive_spool::CHUNK_BYTES)
+                .enumerate()
+            {
+                let ciphertext = archive.seal(seq)?;
+                let same: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT COUNT(*) FROM response_archive_spool_chunks WHERE request_id = $1 AND seq = $2 AND ciphertext = $3 AND byte_count = $4")))
+                    .bind(identity.request_id.to_string()).bind(seq as i64).bind(&ciphertext)
+                    .bind(bytes.len() as i64).fetch_one(&mut **tx).await?;
+                if same != 1 {
+                    return Err(AppError::Internal);
+                }
+            }
+            return Ok(true);
+        }
+        let budget = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1 WHERE singleton = 1 AND cipher_bytes <= $2")))
+            .bind(accounted).bind(CIPHER_LIMIT - accounted).execute(&mut **tx).await?;
+        if budget.rows_affected() != 1 {
+            return Ok(false);
+        }
+        sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "INSERT INTO response_archive_spools (request_id, tenant_id, reservation_id, state, chunk_count, byte_count, cipher_bytes, next_attempt_at, created_at, updated_at, expires_at) VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $7, $7, $8)")))
+            .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.reservation_id.to_string())
+            .bind(chunk_count as i64).bind(byte_count).bind(accounted).bind(now).bind(now + RETENTION).execute(&mut **tx).await?;
+        let mut first_seq = 0;
+        while first_seq < chunk_count {
+            let end_seq = (first_seq + INSERT_BATCH_CHUNKS).min(chunk_count);
+            let chunks = (first_seq..end_seq)
+                .map(|seq| {
+                    let start = seq * crate::response_archive_spool::CHUNK_BYTES;
+                    let end = (start + crate::response_archive_spool::CHUNK_BYTES).min(body.len());
+                    Ok(ArchiveSpoolChunk {
+                        seq: seq as i64,
+                        ciphertext: archive.seal(seq)?,
+                        byte_count: (end - start) as i64,
+                    })
+                })
+                .collect::<Result<Vec<_>, AppError>>()?;
+            insert_spool_chunks(tx, purpose, identity, &chunks).await?;
+            first_seq = end_seq;
+        }
+        Ok(true)
+    }
+
     pub(crate) async fn begin_response_archive_spool(
         &self,
         identity: ArchiveSpoolIdentity,
@@ -821,6 +908,43 @@ async fn emit_response_archive_transition_event_in_transaction(
     if inserted.rows_affected() != 1 {
         return Err(AppError::Internal);
     }
+    Ok(())
+}
+
+async fn insert_spool_chunks(
+    tx: &mut Transaction<'_, Any>,
+    purpose: BufferedArchivePurpose,
+    identity: ArchiveSpoolIdentity,
+    chunks: &[ArchiveSpoolChunk],
+) -> Result<(), AppError> {
+    let values = (0..chunks.len())
+        .map(|index| {
+            let base = index * 4;
+            format!(
+                "(${}, ${}, ${}, ${})",
+                base + 1,
+                base + 2,
+                base + 3,
+                base + 4
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let statement = spool_sql(
+        purpose,
+        &format!(
+            "INSERT INTO response_archive_spool_chunks (request_id, seq, ciphertext, byte_count) VALUES {values}"
+        ),
+    );
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(statement));
+    for chunk in chunks {
+        query = query
+            .bind(identity.request_id.to_string())
+            .bind(chunk.seq)
+            .bind(&chunk.ciphertext)
+            .bind(chunk.byte_count);
+    }
+    query.execute(&mut **tx).await?;
     Ok(())
 }
 

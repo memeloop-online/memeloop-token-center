@@ -4,13 +4,13 @@ use crate::{db::Database, proxy_lifecycle::ProxyArchiveAttempt};
 pub(super) async fn finish_buffered_proxy_request_with_retry(
     database: &Database,
     input: FinishProxyRequest<'_>,
-    chunks: &[crate::db::ArchiveSpoolChunk],
+    archive: &crate::response_archive_spool::BufferedArchive<'_>,
 ) -> Result<FinishProxyRequestResult, AppError> {
     // Keep the same identity and ciphertext across unknown COMMIT ACKs. Do not
     // cancel in-flight SQL or replay upstream work to repair archive delivery.
     for millis in [10, 50, 200] {
         match database
-            .finish_proxy_request_with_buffered_archive(input.clone(), chunks)
+            .finish_proxy_request_with_buffered_archive(input.clone(), archive)
             .await
         {
             Ok(result) => return Ok(result),
@@ -19,7 +19,7 @@ pub(super) async fn finish_buffered_proxy_request_with_retry(
         }
     }
     database
-        .finish_proxy_request_with_buffered_archive(input, chunks)
+        .finish_proxy_request_with_buffered_archive(input, archive)
         .await
 }
 
