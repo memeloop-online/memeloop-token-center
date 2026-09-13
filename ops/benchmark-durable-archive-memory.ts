@@ -387,6 +387,11 @@ export async function run(binary: string, output: string): Promise<boolean> {
       const before = upstreamCalls;
       current = outputPlan(512); underdeclaredResponse = true;
       const result = await send(base, key, inputPlan(512)).result;
+      report.malformed_upstream_observation = {
+        status: result.status,
+        response_bytes: result.bytes,
+        upstream_calls: upstreamCalls - before,
+      };
       assert(result.status === 502 && upstreamCalls - before === 1, "malformed upstream framing must fail once without replaying upstream");
       underdeclaredResponse = false;
       return result;

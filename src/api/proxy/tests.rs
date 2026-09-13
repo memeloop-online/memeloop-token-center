@@ -50,6 +50,19 @@ fn buffered_usage_capture_only_accepts_plausible_json_content_types() {
 }
 
 #[test]
+fn buffered_chat_success_requires_a_complete_json_object() {
+    assert!(validate_buffered_chat_success(br#"{"choices":[]}"#).is_ok());
+    assert_eq!(
+        validate_buffered_chat_success(br#"{"choices":"#),
+        Err("upstream_invalid_response")
+    );
+    assert_eq!(
+        validate_buffered_chat_success(br#"{"error":{"message":"private"}}"#),
+        Err("upstream_failed_response")
+    );
+}
+
+#[test]
 fn trusted_input_overhead_is_limited_to_reviewed_openai_compatible_http_drivers() {
     assert_eq!(
         trusted_input_token_overhead_ceiling(

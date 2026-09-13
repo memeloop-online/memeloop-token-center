@@ -480,9 +480,12 @@ async fn finish_non_sse_proxy_response(
             return result;
         }
     };
-    if matches!(protocol, Protocol::OpenAiResponses)
-        && let Err(error_code) = validate_buffered_responses_success(&response_body)
-    {
+    let validation = match protocol {
+        Protocol::OpenAiChat => validate_buffered_chat_success(&response_body),
+        Protocol::OpenAiResponses => validate_buffered_responses_success(&response_body),
+        _ => Ok(()),
+    };
+    if let Err(error_code) = validation {
         let result = finish_proxy_failure(buffered_request, error_code).await;
         upstream_attempt
             .complete(UpstreamAttemptTerminal::invalid_response())
@@ -1205,6 +1208,17 @@ fn validate_buffered_responses_success(body: &[u8]) -> Result<(), &'static str> 
         }
         Some(_) => Err("upstream_invalid_response"),
     }
+}
+
+fn validate_buffered_chat_success(body: &[u8]) -> Result<(), &'static str> {
+    let value: Value = serde_json::from_slice(body).map_err(|_| "upstream_invalid_response")?;
+    if !value.is_object() {
+        return Err("upstream_invalid_response");
+    }
+    if value.get("error").is_some_and(|error| !error.is_null()) {
+        return Err("upstream_failed_response");
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
