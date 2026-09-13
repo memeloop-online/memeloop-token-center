@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { chromium } from 'playwright';
-import { createServer } from 'vite';
+import { createIsolatedFixtureServer as createServer } from './support/isolated-vite-server.js';
 
 const webRoot = fileURLToPath(new URL('..', import.meta.url));
 
@@ -71,8 +71,9 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     await allTenants.goto(fixture('all-tenants'));
     await allTenants.getByText('All tenant client', { exact: true }).waitFor();
     await allTenants.getByText('Tenant: tenant-visible', { exact: false }).waitFor();
-    assert.equal(await allTenants.getByRole('button', { name: 'Rename', exact: true }).isDisabled(), true);
-    const limits = allTenants.getByRole('button', { name: 'Current limit state', exact: true });
+    await allTenants.getByRole('button', { name: 'More actions', exact: true }).click();
+    assert.equal(await allTenants.getByRole('menuitem', { name: 'Rename', exact: true }).isDisabled(), true);
+    const limits = allTenants.getByRole('menuitem', { name: 'Current limit state', exact: true });
     assert.equal(await limits.isDisabled(), false, 'stable key ID permits a read-only limit lookup without selecting a tenant');
     await limits.click();
     await allTenants.waitForFunction(() => window.credentialFixture.calls.some((call) => call.endsWith('/keys/key-all/limits')));
@@ -195,8 +196,9 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
       await client.goto(fixture('client-form'));
       const english = locale === 'en';
       const modeLabel = english ? 'Metering and limit mode' : '计量与限额模式';
-      await client.getByText('Editable client', { exact: true }).waitFor();
-      await client.getByRole('button', { name: english ? 'Policy and limits' : '权限与限流', exact: true }).click();
+      await client.getByText(english ? 'Research workspace' : '研发工作区', { exact: true }).waitFor();
+      await client.getByRole('button', { name: english ? 'More actions' : '更多操作', exact: true }).click();
+      await client.getByRole('menuitem', { name: english ? 'Policy and limits' : '权限与限流', exact: true }).click();
       const edit = client.locator('.inline-editor.form-panel');
       const editMode = edit.getByRole('combobox', { name: modeLabel, exact: true });
       await edit.locator('#root_max_concurrency').focus();
@@ -212,8 +214,8 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
       assert.equal(JSON.parse(policyRequest.body!).enforcement_mode, editedMode);
       assert.equal(JSON.parse(policyRequest.body!).daily_budget, null);
 
-      const create = client.locator('details.create-resource');
-      await create.locator(':scope > summary').click();
+      const create = client.locator('.create-journey');
+      await create.locator(':scope > .journey-heading [data-workspace-toggle]').click();
       const routes = create.getByRole('combobox', { name: english ? 'Specific routes' : '具体路由', exact: true });
       const groups = create.getByRole('combobox', { name: english ? 'Route groups' : '路由组', exact: true });
       await routes.fill('Research model');
@@ -228,6 +230,7 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
       assert.equal(await create.getByText('Unsupported field schema', { exact: false }).count(), 0);
       await create.locator('#root_principal_external_id').fill('fixture-principal');
       await create.locator('#root_alias').fill('Created client');
+      await create.getByRole('button', { name: english ? 'Usage and budget' : '用量与预算', exact: true }).click();
       const createMode = create.getByRole('combobox', { name: modeLabel, exact: true });
       await create.locator('#root_policy_max_concurrency').focus();
       await client.keyboard.press('Tab');

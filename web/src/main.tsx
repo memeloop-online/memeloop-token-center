@@ -5,6 +5,7 @@ import { useAppLocation } from './app/useAppLocation';
 import { SelfPortal, type SelfPortalRoute } from './self/SelfPortal';
 import type { OperatorRouteKey } from './operator/scope/operatorRoutes';
 import { I18nProvider, useI18n } from './i18n';
+import { MtcFluentProvider } from './design-system/MtcFluentProvider';
 import type { PluginNavigationSection } from './operator/pluginContributions';
 import './styles.css';
 import './theme.css';
@@ -34,7 +35,7 @@ function Application() {
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <I18nProvider>
-      <Application />
+      <MtcFluentProvider><Application /></MtcFluentProvider>
     </I18nProvider>
   </StrictMode>,
 );
