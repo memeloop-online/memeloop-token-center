@@ -322,17 +322,17 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
 
   await connectOperator(this, 'light', seed.globalServiceCredential, 'visible');
   await openAppRoute(page, 'operator', 'providers');
-  const onboarding = page.locator('.provider-onboarding');
+  const onboarding = page.locator('.create-journey');
   // Successful refresh keeps the workspace and its form state mounted. Open
   // the disclosure only when it is currently collapsed.
-  if (!(await onboarding.evaluate((element) => (element as HTMLDetailsElement).open))) {
-    await onboarding.locator(':scope > summary').click();
+  if (!(await onboarding.getAttribute('data-open') === 'true')) {
+    await onboarding.locator('[data-workspace-toggle]').click();
   }
   await onboarding.getByLabel('服务提供商').selectOption('comfyui');
   const comfyForm = onboarding.locator('form');
   await comfyForm.locator('#root_name').fill('Browser UI ComfyUI');
   await comfyForm.locator('#root_config_base_url').fill(mockBaseUrl);
-  await comfyForm.locator('.upstream-advanced > summary').click();
+  await comfyForm.getByRole('button', { name: '3. 高级网络与重试策略', exact: true }).click();
   await comfyForm.locator('#root_config_network_scope').selectOption('public');
   await comfyForm.locator('#root_config_workflow_id').fill('browser-workflow-v1');
   const workflowEditor = comfyForm.getByLabel('工作流模板', { exact: true });
@@ -359,8 +359,8 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   assert.match(comfyUpstream.id, uuidPattern);
   await assertVisible(page.locator('.provider-account').filter({ hasText: 'Browser UI ComfyUI' }));
 
-  if (!(await onboarding.evaluate((element) => (element as HTMLDetailsElement).open))) {
-    await onboarding.locator(':scope > summary').click();
+  if (!(await onboarding.getAttribute('data-open') === 'true')) {
+    await onboarding.locator('[data-workspace-toggle]').click();
   }
   await onboarding.getByLabel('提供商').selectOption('volcengine-seedance');
   const providerForm = onboarding.locator('form');
@@ -393,8 +393,8 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await assertVisible(page.locator('.provider-account').filter({ hasText: 'Browser UI Seedance' }));
 
   await openAppRoute(page, 'operator', 'routes');
-  const routeForm = page.locator('details.create-resource').filter({ hasText: '创建模型路由' });
-  await routeForm.locator('summary').click();
+  const routeForm = page.locator('.create-journey');
+  await routeForm.locator('[data-workspace-toggle]').click();
   await routeForm.getByLabel('公开模型').fill(imageModel);
   await routeForm.getByLabel('协议').selectOption('generation');
   const imageUpstreamPicker = routeForm.getByRole('combobox', { name: '具体提供商', exact: true });
@@ -449,7 +449,7 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   // must not survive a candidate change, even when the original scope returns.
   assert.equal(imageAllowsCustom, true, 'the unlisted workflow fixture must exercise persisted custom consent');
   await page.getByRole('row').filter({ hasText: imageModel }).getByRole('button', { name: '编辑', exact: true }).click();
-  const imageEditor = page.locator('.inline-editor');
+  const imageEditor = page.locator('.create-journey');
   const editConfirmation = imageEditor.getByRole('checkbox', { name: /我确认将.*用于全部明确选择的上游，允许目录未验证的账号参与路由/ });
   await eventually(async () => assert.equal(await editConfirmation.isChecked(), true), 10_000);
   const editSave = imageEditor.getByRole('button', { name: '保存', exact: true });
@@ -470,6 +470,7 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   assert.deepEqual(editResponse.request().postDataJSON().upstream_account_ids, [comfyUpstream.id]);
   await assertContains(page.getByRole('status'), '路由已更新');
 
+  await routeForm.locator('[data-workspace-toggle]').click();
   await routeForm.getByLabel('公开模型').fill(videoModel);
   await routeForm.getByLabel('协议').selectOption('generation');
   const upstreamPicker = routeForm.getByRole('combobox', { name: '具体提供商', exact: true });
@@ -540,11 +541,12 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await assertContains(page.getByRole('status'), '价格已保存');
 
   await openAppRoute(page, 'operator', 'credentials');
-  const credentialPanel = page.locator('details.create-resource').filter({ hasText: '创建客户端凭据' });
-  await credentialPanel.locator('summary').click();
+  const credentialPanel = page.locator('.create-journey');
+  await credentialPanel.locator('[data-workspace-toggle]').click();
   const credentialForm = credentialPanel.locator('form');
   await credentialForm.locator('#root_principal_external_id').fill('browser-multimodal-user');
   await credentialForm.locator('#root_alias').fill('Browser multimodal credential');
+  await credentialPanel.getByRole('button', { name: '用量与预算', exact: true }).click();
   await credentialForm.locator('#root_currency').selectOption('USD');
   await credentialForm.locator('#root_initial_balance').fill('10');
   await assertNoCount(credentialForm.locator('#root_policy_allowed_models'));

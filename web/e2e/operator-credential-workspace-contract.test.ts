@@ -88,11 +88,18 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
 
     const recovery = await browser.newPage();
     await recovery.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await recovery.addInitScript(() => {
+      Object.defineProperty(navigator, 'clipboard', { value: { writeText: async (value: string) => {
+        document.documentElement.dataset.copiedFixtureCredential = String(value === 'mts_client_recovered');
+      } } });
+    });
     await recovery.goto(fixture('client-recovery'));
     await recovery.getByText('Recoverable client', { exact: true }).waitFor();
-    await recovery.getByRole('button', { name: 'Recover and copy credential', exact: true }).click();
-    await recovery.getByRole('button', { name: 'Confirm and continue', exact: true }).click();
-    await recovery.getByText('mts_client_recovered', { exact: true }).waitFor();
+    await recovery.getByRole('button', { name: 'Copy credential', exact: true }).click();
+    await recovery.getByRole('status').filter({ hasText: 'Copied Recoverable client credential.' }).waitFor();
+    assert.equal(await recovery.getByRole('dialog').count(), 0, 'copy does not add a recovery confirmation');
+    assert.equal(await recovery.locator('html').getAttribute('data-copied-fixture-credential'), 'true', 'copy uses the original value, not the credential ID');
+    assert.equal(await recovery.getByText('mts_client_recovered', { exact: true }).count(), 0, 'successful clipboard copying does not expose a secret panel');
     const recoveryRequest = await recovery.evaluate(() => window.credentialFixture.requests.find((request) => request.path.endsWith('/credential-recovery/copy')));
     assert.deepEqual(recoveryRequest, {
       method: 'POST',
