@@ -728,8 +728,12 @@ impl Database {
         let key_id = input.reservation.key_id.to_string();
         let reservation_id = input.reservation.id.to_string();
         let mut content_materialized = false;
-        let (mut transaction, now, reservation_row, trusted_reservation) = loop {
-            let mut transaction = if buffered_archive.is_some() {
+        let mut preparation_complete = input.conversation.is_none();
+        let (mut transaction, now, created_at, reservation_row, trusted_reservation) = loop {
+            // Preparing immutable content must not hold either shared lock:
+            // spool_transaction takes the global archive budget row, and the
+            // final observation takes the explicit-session advisory lock.
+            let mut transaction = if buffered_archive.is_some() && preparation_complete {
                 self.spool_transaction().await?.0
             } else {
                 self.begin_write_transaction().await?
@@ -872,39 +876,87 @@ impl Database {
                 {
                     return Err(AppError::NotFound);
                 }
+                let owner = sqlx::query(
+                    "SELECT q.error_code, q.input_tokens, q.output_tokens, q.service_tier, k.principal_id, k.account_id FROM request_records q JOIN key_records k ON k.id = q.key_id AND k.tenant_id = q.tenant_id WHERE q.id = $1 AND q.created_at = $2 AND q.tenant_id = $3 AND q.key_id = $4",
+                )
+                .bind(&request_id)
+                .bind(created_at)
+                .bind(&tenant_id)
+                .bind(&key_id)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or(AppError::NotFound)?;
+                if owner.try_get::<String, _>("principal_id")?
+                    != conversation.key.principal_id.to_string()
+                    || owner.try_get::<String, _>("account_id")?
+                        != conversation.key.account_id.to_string()
+                    || conversation.key.account_id != trusted_reservation.account_id
+                {
+                    return Err(AppError::NotFound);
+                }
+                // Prepared deliveries have a persisted per-direction contract.
+                // Keep the historical total-only fallback for requests which
+                // never passed delivery preparation (including early errors).
+                let delivery_state: Option<String> = owner.try_get("error_code")?;
+                if matches!(
+                    delivery_state.as_deref(),
+                    Some("delivery_prepared" | "delivery_started")
+                ) && (owner.try_get::<i64, _>("input_tokens")? != input.input_token_ceiling
+                    || owner.try_get::<i64, _>("output_tokens")? != input.output_token_ceiling
+                    || owner
+                        .try_get::<Option<String>, _>("service_tier")?
+                        .as_deref()
+                        != Some(input.requested_service_tier.unwrap_or("default")))
+                {
+                    return Err(AppError::Conflict(
+                        "request prepared delivery contract mismatch".into(),
+                    ));
+                }
                 let reservation_status: String = reservation_row.try_get("status")?;
                 if !matches!(reservation_status.as_str(), "reserved" | "settled") {
                     return Err(AppError::Conflict(
                         "request reservation is not finishable".into(),
                     ));
                 }
-                if !content_materialized
-                    && trusted_reservation.enforcement_mode != EnforcementMode::MeteredUnlimited
-                {
+                if !preparation_complete {
                     // Only a validated, still-pending terminal owner may prepare
                     // immutable content. AlreadyFinished and forged replays must
                     // never create tenant content. Commit its unique-key locks
                     // before acquiring the session lock, including during rolling
                     // upgrades with older session-before-content writers.
-                    let atoms = extract_atoms(conversation.request_json);
-                    let nodes = build_prefix(&atoms);
-                    materialize_conversation_content_in_transaction(
-                        &mut transaction,
-                        &tenant_id,
-                        &atoms,
-                        &nodes,
-                        now,
-                    )
-                    .await?;
-                    transaction.commit().await?;
-                    content_materialized = true;
+                    if trusted_reservation.enforcement_mode != EnforcementMode::MeteredUnlimited {
+                        let atoms = extract_atoms(conversation.request_json);
+                        let nodes = build_prefix(&atoms);
+                        materialize_conversation_content_in_transaction(
+                            &mut transaction,
+                            &tenant_id,
+                            &atoms,
+                            &nodes,
+                            now,
+                        )
+                        .await?;
+                        content_materialized = true;
+                    }
+                    preparation_complete = true;
                     // Reclaim and revalidate the owner in the final transaction.
                     // A concurrent winner leaves only deduplicated, invisible
                     // content, never an observation or a second ledger charge.
-                    continue;
+                    // Buffered metered-unlimited finishes do not materialize
+                    // content, but must still restart to acquire the budget
+                    // before the request row, preserving the old lock order.
+                    if content_materialized || buffered_archive.is_some() {
+                        transaction.commit().await?;
+                        continue;
+                    }
                 }
             }
-            break (transaction, now, reservation_row, trusted_reservation);
+            break (
+                transaction,
+                now,
+                created_at,
+                reservation_row,
+                trusted_reservation,
+            );
         };
 
         if let ProxyRequestUpstreamAttribution::LastDispatched(assignment) = upstream_attribution {

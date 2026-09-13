@@ -1,6 +1,171 @@
 use super::super::*;
 
 #[tokio::test]
+async fn buffered_conversation_content_wait_does_not_hold_archive_budget() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let database = Database::connect_with_max(&database_url, 8).await.unwrap();
+    database.migrate().await.unwrap();
+    let unique = Uuid::now_v7();
+    let pepper = b"buffered conversation budget lock pepper";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: format!("buffered-conversation-{unique}"),
+                principal_external_id: "member".to_owned(),
+                alias: "buffered-conversation".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let model = format!("buffered-conversation-{unique}");
+    let price = database
+        .upsert_model_price(&model, "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let request_id = Uuid::now_v7();
+    let reservation = database
+        .start_proxy_request(StartProxyRequest {
+            request_id,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 10,
+            output_token_ceiling: 10,
+            protocol: "openai",
+            model: &model,
+            request_object: "objects/blake3/buffered-conversation-request",
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+    let request_json = serde_json::json!({"messages": [{
+        "role": "user", "content": format!("buffered-content-{unique}")
+    }]});
+    let atom = extract_atoms(&request_json).remove(0);
+    let mut blocker = database.begin_write_transaction().await.unwrap();
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO semantic_atoms (tenant_id, content_hash, instance_hash, role, kind, content_json, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(&atom.content_hash)
+    .bind(&atom.instance_hash)
+    .bind(&atom.role)
+    .bind(&atom.kind)
+    .bind(serde_json::to_string(&atom.content).unwrap())
+    .bind(unix_millis())
+    .execute(&mut *blocker)
+    .await
+    .unwrap();
+    let finish_database = database.clone();
+    let mut finish = tokio::spawn(async move {
+        use crate::response_archive_spool::{BufferedArchive, BufferedArchivePurpose};
+        let body = bytes::Bytes::from_static(b"buffered response");
+        let archive = BufferedArchive::new(
+            ArchiveSpoolIdentity {
+                request_id,
+                tenant_id: key.tenant_id,
+                reservation_id: reservation.id,
+            },
+            BufferedArchivePurpose::Response,
+            &body,
+            pepper,
+        )
+        .unwrap();
+        let hints = ConversationHints {
+            session_id: Some(format!("buffered-session-{unique}")),
+            ..ConversationHints::default()
+        };
+        finish_database
+            .finish_proxy_request_with_buffered_archive_and_upstream_attribution(
+                FinishProxyRequest {
+                    request_id,
+                    tenant_id: key.tenant_id,
+                    reservation: &reservation,
+                    input_token_ceiling: 10,
+                    output_token_ceiling: 10,
+                    requested_service_tier: None,
+                    status_code: 200,
+                    duration_ms: 1,
+                    usage: TokenUsage::default(),
+                    charge_contract_ceiling: false,
+                    error_code: None,
+                    response_object: "objects/blake3/buffered-conversation-response",
+                    conversation: Some(ProxyConversationInput {
+                        key: &key,
+                        request_json: &request_json,
+                        hints: &hints,
+                        client_name: None,
+                        upstream_response_id: None,
+                    }),
+                },
+                &archive,
+                ProxyRequestUpstreamAttribution::KeepSelected,
+            )
+            .await
+    });
+    let waiting = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND state = 'active' AND wait_event_type = 'Lock' AND query LIKE 'INSERT INTO semantic_atoms%' AND $1 = ANY(pg_blocking_pids(pid))",
+            )
+            .bind(blocker_pid)
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    // Keep the content blocker open while another archive operation takes the
+    // global budget. Preparation must hold neither this row nor the session.
+    let budget = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        database.spool_transaction(),
+    )
+    .await;
+    let budget_available = match budget {
+        Ok(Ok((transaction, _))) => {
+            transaction.rollback().await.unwrap();
+            true
+        }
+        _ => false,
+    };
+    blocker.rollback().await.unwrap();
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(15), &mut finish).await;
+    if terminal.is_err() {
+        finish.abort();
+        let _ = finish.await;
+    }
+    waiting.expect("buffered finish must reach the immutable-content lock barrier");
+    assert!(
+        budget_available,
+        "content preparation must release the archive budget"
+    );
+    assert!(matches!(
+        terminal.unwrap().unwrap().unwrap(),
+        FinishProxyRequestResult::Finished { .. }
+    ));
+}
+
+#[tokio::test]
 async fn lifecycle_deadline_converges_pending_proxy_request_idempotently() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(
@@ -412,10 +577,14 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
             upstream_response_id: Some("resp-atomic"),
         }),
     };
+    database
+        .prepare_proxy_delivery(request_id, key.tenant_id, &reservation, 100, 100, None)
+        .await
+        .unwrap();
     // Preparation must be gated by all terminal owner checks, not merely a
     // caller-provided tenant/key. Invalid pending-owner attempts cannot leave
     // hidden immutable content behind even though the final transaction fails.
-    for invalid_owner in 0..7 {
+    for invalid_owner in 0..11 {
         let mut forged_reservation = reservation.clone();
         let mut forged_key = key.clone();
         let mut invalid = finish();
@@ -439,6 +608,19 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
                 invalid.conversation.as_mut().unwrap().key = &forged_key;
             }
             6 => invalid.request_id = Uuid::now_v7(),
+            7 => {
+                invalid.input_token_ceiling += 1;
+                invalid.output_token_ceiling -= 1;
+            }
+            8 => invalid.requested_service_tier = Some("priority"),
+            9 => {
+                forged_key.principal_id = Uuid::now_v7();
+                invalid.conversation.as_mut().unwrap().key = &forged_key;
+            }
+            10 => {
+                forged_key.account_id = Uuid::now_v7();
+                invalid.conversation.as_mut().unwrap().key = &forged_key;
+            }
             _ => unreachable!(),
         }
         assert!(database.finish_proxy_request(invalid).await.is_err());
