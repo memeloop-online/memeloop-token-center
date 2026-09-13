@@ -53,12 +53,45 @@ but admission always applies the configured lower value before JSON parsing.
 It also needs one of the independent
 `MTC_RESPONSES_BODY_READ_CONCURRENCY` permits (Helm
 `config.responsesBodyReadConcurrency`), which defaults to four and is capped
-at eight. Thus the default large-body buffer budget is at most 64 MiB per
-gateway process, rather than 1024 × 16 MiB. Capacity exhaustion remains a
+at eight. Thus simultaneous default raw-body reads account for at most 64 MiB
+per gateway process, rather than 1024 × 16 MiB. This is not a process-memory
+bound: parsed JSON, execution copies and encrypted archive chunks require
+additional capacity. Capacity exhaustion remains a
 503; a body above its configured size is a 413. A 413 writes only the
 request-id middleware UUID, a fixed route class/reason, declared content
 length and configured limit to structured logs—never credentials, request
 content, model names or raw paths.
+
+`MTC_PROXY_MEMORY_BUDGET_BYTES` (Helm `config.proxyMemoryBudgetBytes`) adds
+process-wide weighted lifecycle admission, defaulting to 256 MiB in 64 KiB
+units. Capacity is acquired before retaining request bytes and before expanding
+JSON or encrypted captures; it is released with the owning lifecycle. The
+accounting includes raw bytes, parsed JSON and necessary copies, and the
+base64/encrypted batch peak. Structural JSON expansion is charged separately,
+so a body-size limit alone is not treated as a heap-size estimate. A request
+which cannot acquire capacity receives 503 with `Retry-After` before upstream
+dispatch, without changing the 16 MiB configured request ceiling.
+
+Buffered upstream responses acquire their complete weighted allowance before
+reading: a trustworthy Content-Length bounds that allowance; unknown length
+requires the configured maximum. Waiting applies backpressure and uses the
+remaining lifecycle deadline; it never resends upstream work. Pending capacity
+must not retain partial response buffers while competing to grow them. Stream
+ownership extends through background completion and downstream body release.
+
+Startup accepts budgets from 256 MiB through 2 GiB and rejects a budget below
+three times `responsesBodyMaxBytes`. Retained request facts are additionally
+limited to one quarter of the shared budget, reserving progress headroom for
+one maximum-sized response without withholding 192 MiB from every dispatch.
+The default
+gateway resource request is 256 MiB and its limit is 512 MiB. For custom budgets,
+set the Pod limit to at least the budget plus 256 MiB for runtime, networking,
+database and buffers outside capture accounting; adjust resource requests to
+match the deployment's sustained working set. The default 256 MiB budget meets
+the configuration floor for a 64 MiB request ceiling; actual JSON complexity
+still consumes capacity and can cause admission rejection. These are deterministic admission
+bounds and deployment sizing margins, not a claim that Rust allocator RSS
+exactly equals the logical counters.
 
 Before enabling an HPA, keep the maximum application connection demand,
 including rollout surge, migration connections and an operational reserve,
@@ -145,8 +178,12 @@ Production S3-compatible storage must use HTTPS, server-side encryption,
 versioning or object lock as required by policy, replication and least-privilege
 bucket credentials.
 
-Configure an `AbortIncompleteMultipartUpload` lifecycle rule for abandoned
-multipart sessions. Do not apply an ordinary object-expiration TTL to active
+Verify provider-supported reclamation of abandoned multipart sessions: an
+`AbortIncompleteMultipartUpload` bucket lifecycle rule where supported, or
+provider-wide stale-upload cleanup such as MinIO's global mechanism. Do not
+assume every S3-compatible provider implements that lifecycle rule, or infer a
+strict cleanup deadline solely from expiration and scan-interval settings.
+Do not apply an ordinary object-expiration TTL to active
 archive prefixes: successfully bound request, response, result and asset
 objects remain there for their full retention period.
 

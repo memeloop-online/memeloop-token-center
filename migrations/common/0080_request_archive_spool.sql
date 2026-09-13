@@ -1,4 +1,7 @@
 -- Request and response spools share response_archive_spool_budget.
+-- cipher_bytes remains the v79-compatible total. Old response workers update
+-- only that total; request workers atomically update both counters.
+ALTER TABLE response_archive_spool_budget ADD COLUMN request_cipher_bytes BIGINT NOT NULL DEFAULT 0 CHECK (request_cipher_bytes >= 0 AND request_cipher_bytes <= cipher_bytes);
 CREATE TABLE request_archive_spools (
     request_id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL,

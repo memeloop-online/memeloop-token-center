@@ -1,6 +1,100 @@
 use super::*;
 
 #[tokio::test]
+async fn bounded_multirow_capture_rolls_back_across_batch_boundary() {
+    let (_dir, db, id) = fixture().await;
+    let chunks: Vec<_> = (0..257)
+        .map(|seq| ArchiveSpoolChunk {
+            seq,
+            byte_count: 1,
+            ciphertext: "opaque".into(),
+        })
+        .collect();
+    sqlx::query("CREATE TRIGGER reject_second_batch BEFORE INSERT ON request_archive_spool_chunks WHEN NEW.seq = 128 BEGIN SELECT RAISE(ABORT, 'second batch'); END").execute(&db.pool).await.unwrap();
+    assert!(
+        db.capture_buffered_archive_spool(id, BufferedArchivePurpose::Request, &chunks)
+            .await
+            .is_err()
+    );
+    let row = sqlx::query("SELECT cipher_bytes, request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(row.get::<i64, _>("cipher_bytes"), 0);
+    assert_eq!(row.get::<i64, _>("request_cipher_bytes"), 0);
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_archive_spool_chunks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+    sqlx::query("DROP TRIGGER reject_second_batch")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        db.capture_buffered_archive_spool(id, BufferedArchivePurpose::Request, &chunks)
+            .await
+            .unwrap()
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_archive_spool_chunks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 257);
+}
+
+#[tokio::test]
+async fn v79_response_budget_mutations_preserve_v80_request_subcounter() {
+    let (_dir, db, id) = fixture().await;
+    let chunks = [ArchiveSpoolChunk {
+        seq: 0,
+        byte_count: 1,
+        ciphertext: "opaque".into(),
+    }];
+    assert!(
+        db.capture_buffered_archive_spool(id, BufferedArchivePurpose::Request, &chunks)
+            .await
+            .unwrap()
+    );
+    let request_bytes = budget(&db).await;
+    // These streaming response methods execute the unchanged v79 SQL, which
+    // knows only cipher_bytes and must coexist with request accounting.
+    assert!(db.begin_response_archive_spool(id).await.unwrap());
+    assert!(
+        db.append_response_archive_spool(id, 0, 1, "opaque")
+            .await
+            .unwrap()
+    );
+    assert!(db.seal_response_archive_spool(id, 1, 1).await.unwrap());
+    let row = sqlx::query("SELECT cipher_bytes, request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(row.get::<i64, _>("cipher_bytes"), request_bytes * 2);
+    assert_eq!(row.get::<i64, _>("request_cipher_bytes"), request_bytes);
+    sqlx::query("UPDATE response_archive_spools SET expires_at = 0")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 1);
+    let row = sqlx::query("SELECT cipher_bytes, request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(row.get::<i64, _>("cipher_bytes"), request_bytes);
+    assert_eq!(row.get::<i64, _>("request_cipher_bytes"), request_bytes);
+    // Legacy workers cannot incorrectly erase request charges: the database
+    // check fails closed even though old binaries do not know the subcounter.
+    assert!(
+        sqlx::query("UPDATE response_archive_spool_budget SET cipher_bytes = 0")
+            .execute(&db.pool)
+            .await
+            .is_err()
+    );
+    sqlx::query("UPDATE request_archive_spools SET expires_at = 0")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 1);
+    let row = sqlx::query("SELECT cipher_bytes, request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(row.get::<i64, _>("cipher_bytes"), 0);
+    assert_eq!(row.get::<i64, _>("request_cipher_bytes"), 0);
+    let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_archive_spools WHERE cleaned_at IS NULL AND state IN ('capturing', 'pending', 'uploading')").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(active, 0);
+}
+
+#[tokio::test]
 async fn durable_admission_rolls_back_reservation_record_event_and_spool_together() {
     use crate::db::{CreateKeyInput, StartProxyRequest};
     let (_dir, db, _) = fixture().await;

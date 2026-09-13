@@ -162,8 +162,14 @@ pub(super) fn translate(
                 }
                 body.extend_from_slice(&chunk);
             }
+            body.shrink_to_fit();
+            if !crate::gateway_body::memory::bounded_json_fits(&body, MAX_PROXY_RESPONSE_BODY * 3) {
+                return Err(());
+            }
             let value = crate::api::sse::parse_unique_json(&body).map_err(|_| ())?;
+            drop(body);
             let response = responses::buffered(&context, &value)?;
+            drop(value);
             serde_json::to_vec(&response)
                 .map(Bytes::from)
                 .map_err(|_| ())

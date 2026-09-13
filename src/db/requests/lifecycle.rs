@@ -153,6 +153,21 @@ impl Database {
         if archive.is_some_and(|(body, _)| body.len() > 64 * 1024 * 1024) {
             return Err(AppError::Overloaded);
         }
+        // A stable reservation UUID supplies the authenticated encryption owner
+        // before any transaction or global budget lock is acquired.
+        let reservation_id = Uuid::now_v7();
+        let identity = ArchiveSpoolIdentity {
+            request_id: input.request_id,
+            tenant_id: input.key.tenant_id,
+            reservation_id,
+        };
+        let purpose = crate::response_archive_spool::BufferedArchivePurpose::Request;
+        let encrypted = archive
+            .map(|(body, pepper)| {
+                crate::response_archive_spool::encrypt_buffered(identity, purpose, body, pepper)
+                    .map_err(|_| AppError::Overloaded)
+            })
+            .transpose()?;
         // Always acquire the spool budget before request/account locks, matching
         // the archive worker's budget -> request lock order.
         let (mut transaction, now) = if archive.is_some() {
@@ -162,13 +177,14 @@ impl Database {
         } else {
             (self.begin_write_transaction().await?, unix_millis())
         };
-        let reservation = reserve_usage_in_transaction(
+        let reservation = super::settlement::reserve_usage_with_id_in_transaction(
             &mut transaction,
             input.key,
             input.price,
             input.input_token_ceiling,
             input.output_token_ceiling,
             now,
+            reservation_id,
         )
         .await?;
         if let Err(error) = record_request_started_in_transaction(
@@ -191,17 +207,8 @@ impl Database {
             transaction.rollback().await?;
             return Err(error);
         }
-        if let Some((body, pepper)) = archive {
+        if let Some(chunks) = encrypted {
             let capture_started = std::time::Instant::now();
-            let identity = ArchiveSpoolIdentity {
-                request_id: input.request_id,
-                tenant_id: input.key.tenant_id,
-                reservation_id: reservation.id,
-            };
-            let purpose = crate::response_archive_spool::BufferedArchivePurpose::Request;
-            let chunks =
-                crate::response_archive_spool::encrypt_buffered(identity, purpose, body, pepper)
-                    .map_err(|_| AppError::Overloaded)?;
             if !self
                 .capture_buffered_archive_spool_in_transaction(
                     &mut transaction,

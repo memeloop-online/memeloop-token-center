@@ -42,18 +42,24 @@ where
 
 pub(super) async fn proxy_openai_chat(
     State(state): State<AppState>,
+    axum::Extension(memory): axum::Extension<
+        std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    >,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    super::proxy::proxy(state, headers, body, Protocol::OpenAiChat).await
+    super::proxy::proxy(state, headers, body, Protocol::OpenAiChat, memory).await
 }
 
 pub(super) async fn proxy_openai_responses(
     State(state): State<AppState>,
+    axum::Extension(memory): axum::Extension<
+        std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    >,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    super::proxy::proxy(state, headers, body, Protocol::OpenAiResponses).await
+    super::proxy::proxy(state, headers, body, Protocol::OpenAiResponses, memory).await
 }
 
 /// Temporary transport negotiation for clients that probe the Responses
@@ -79,26 +85,35 @@ pub(super) async fn negotiate_openai_responses_websocket() -> Response {
 
 pub(super) async fn proxy_openai_embeddings(
     State(state): State<AppState>,
+    axum::Extension(memory): axum::Extension<
+        std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    >,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    super::proxy::proxy(state, headers, body, Protocol::OpenAiEmbeddings).await
+    super::proxy::proxy(state, headers, body, Protocol::OpenAiEmbeddings, memory).await
 }
 
 pub(super) async fn proxy_anthropic(
     State(state): State<AppState>,
+    axum::Extension(memory): axum::Extension<
+        std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    >,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    super::proxy::proxy(state, headers, body, Protocol::AnthropicMessages).await
+    super::proxy::proxy(state, headers, body, Protocol::AnthropicMessages, memory).await
 }
 
 pub(super) async fn proxy_anthropic_count_tokens(
     State(state): State<AppState>,
+    axum::Extension(memory): axum::Extension<
+        std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    >,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    super::proxy::proxy(state, headers, body, Protocol::AnthropicCountTokens).await
+    super::proxy::proxy(state, headers, body, Protocol::AnthropicCountTokens, memory).await
 }
 
 #[derive(Clone, Copy)]

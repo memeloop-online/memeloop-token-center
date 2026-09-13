@@ -460,7 +460,15 @@ async fn finish_non_sse_proxy_response(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json")
         .to_owned();
-    let response_body = match read_bounded_upstream(upstream, MAX_PROXY_RESPONSE_BODY).await {
+    let response_body = match read_bounded_upstream(
+        upstream,
+        MAX_PROXY_RESPONSE_BODY,
+        &buffered_request.memory,
+        buffered_request.started,
+        false,
+    )
+    .await
+    {
         Ok(body) => Bytes::from(body),
         Err(error) => {
             let result = finish_proxy_failure(buffered_request, error.code()).await;
@@ -624,6 +632,7 @@ pub(super) async fn proxy(
     headers: HeaderMap,
     body: Bytes,
     protocol: Protocol,
+    memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 ) -> Result<Response, AppError> {
     let _request_buffer = state
         .metrics
@@ -635,6 +644,9 @@ pub(super) async fn proxy(
         .try_acquire_owned()
         .map_err(|_| AppError::Overloaded)?;
     let request_id = Uuid::now_v7();
+    if !memory.try_reserve_json(&body) {
+        return Err(AppError::Overloaded);
+    }
     let original_request_json: Value = serde_json::from_slice(&body)
         .map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))?;
     let conversation_hints = conversation_hints(&headers, &original_request_json);
@@ -717,6 +729,13 @@ pub(super) async fn proxy(
         }
     };
     drop(request_capture_memory);
+    memory.release(
+        body.len(),
+        crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+    );
+    let request_body_length = body.len();
+    drop(body);
+    memory.release(request_body_length, 1);
     let client_name = client_name(&headers);
     let conversation = matches!(
         protocol,
@@ -730,7 +749,7 @@ pub(super) async fn proxy(
     });
 
     let started = Instant::now();
-    let buffered_request = BufferedRequest {
+    let mut buffered_request = BufferedRequest {
         state: &state,
         reservation,
         request_id,
@@ -741,9 +760,27 @@ pub(super) async fn proxy(
         conversation,
         protocol,
         tenant_id: key.tenant_id,
+        memory,
     };
     // Admission ACK includes reservation, request record, and encrypted sealed
     // request spool in one transaction. No upstream work starts before it.
+    if !buffered_request.memory.try_finalize_request() {
+        let mut response = finish_buffered_request(
+            &buffered_request,
+            StatusCode::SERVICE_UNAVAILABLE,
+            Bytes::from_static(
+                b"{\"error\":{\"message\":\"gateway memory capacity unavailable\"}}",
+            ),
+            "application/json",
+            TokenUsage::default(),
+            Some("proxy_memory_capacity".to_owned()),
+        )
+        .await?;
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        return Ok(response);
+    }
     let AuthorizedProxyRoutes {
         primary,
         remaining_candidates,
@@ -752,8 +789,14 @@ pub(super) async fn proxy(
         output_choice_count,
     } = route_plan;
     if primary.is_component() {
-        return execute_component_primary(buffered_request, &key, &price, primary, body.len())
-            .await;
+        return execute_component_primary(
+            buffered_request,
+            &key,
+            &price,
+            primary,
+            request_body_length,
+        )
+        .await;
     }
     let mut planned_candidate = Some(primary);
     let mut route_candidates = remaining_candidates;
@@ -777,7 +820,7 @@ pub(super) async fn proxy(
             reservation: &mut buffered_request.reservation,
             input_token_ceiling: &mut buffered_request.input_token_ceiling,
             output_token_ceiling: &mut buffered_request.output_token_ceiling,
-            original_body_length: body.len(),
+            original_body_length: request_body_length,
             output_choice_count,
             assigned_route: &mut assigned_route,
             planned_candidate: &mut planned_candidate,
@@ -969,6 +1012,8 @@ pub(super) async fn proxy(
             }
         }
     };
+    drop(request_json);
+    buffered_request.memory.release(request_body_length, 1);
     let is_codex_route = active_route.is_codex();
     let codex_downstream_stream = active_route.codex_downstream_stream;
     let upstream_account_id = Some(active_route.route.account_id);
@@ -1009,7 +1054,13 @@ pub(super) async fn proxy(
     }
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
     if is_codex_route && !codex_downstream_stream {
-        let buffered = match codex_transport::buffer_response(upstream).await {
+        let buffered = match codex_transport::buffer_response(
+            upstream,
+            &buffered_request.memory,
+            buffered_request.started,
+        )
+        .await
+        {
             Ok(buffered) => buffered,
             Err(error_code) => {
                 tracing::warn!(%request_id, stage = error_code, "Codex upstream response failed");
@@ -1166,6 +1217,7 @@ struct BufferedRequest<'a> {
     conversation: Option<ProxyConversation>,
     protocol: Protocol,
     tenant_id: Uuid,
+    memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1287,14 +1339,22 @@ async fn execute_component_provider(
     else {
         return finish_component_provider_failure(&request, "provider_configuration").await;
     };
-    let upstream_body = match read_bounded_upstream(upstream.into(), maximum).await {
+    let upstream_body = match read_bounded_upstream(
+        upstream.into(),
+        maximum.min(MAX_PROXY_RESPONSE_BODY),
+        &request.memory,
+        request.started,
+        true,
+    )
+    .await
+    {
         Ok(body) => body,
         Err(error) => {
             tracing::warn!(request_id = %request.request_id, stage = "component_response", "component provider request failed");
             return finish_component_provider_failure(&request, error.code()).await;
         }
     };
-    let normalized = match normalize_component_provider(
+    let mut normalized = match normalize_component_provider(
         request.state,
         driver,
         context,
@@ -1310,6 +1370,12 @@ async fn execute_component_provider(
             return finish_component_provider_failure(&request, "provider_normalize").await;
         }
     };
+    if !request.memory.response_capture_fits(normalized.body.len()) {
+        drop(normalized);
+        return finish_component_provider_failure(&request, "upstream_response_memory_capacity")
+            .await;
+    }
+    normalized.body.shrink_to_fit();
     let status = match StatusCode::from_u16(normalized.status) {
         Ok(status) => status,
         Err(_) => {
@@ -1463,16 +1529,25 @@ async fn finish_buffered_request(
         crate::metrics::MemoryComponent::StreamCapture,
         body.len().saturating_mul(3),
     );
-    let response_chunks = encrypt_buffered(
-        crate::db::ArchiveSpoolIdentity {
-            request_id,
-            tenant_id: request.tenant_id,
-            reservation_id: request.reservation.id,
-        },
-        BufferedArchivePurpose::Response,
-        &body,
-        request.state.config.key_pepper.as_bytes(),
-    );
+    let response_capture_permit = request.state.proxy_memory_budget.reservation();
+    let response_chunks = if request.memory.has_buffered_response()
+        || response_capture_permit.try_grow(
+            body.len(),
+            crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+        ) {
+        encrypt_buffered(
+            crate::db::ArchiveSpoolIdentity {
+                request_id,
+                tenant_id: request.tenant_id,
+                reservation_id: request.reservation.id,
+            },
+            BufferedArchivePurpose::Response,
+            &body,
+            request.state.config.key_pepper.as_bytes(),
+        )
+    } else {
+        Err(AppError::Overloaded)
+    };
     let stored_response = format!("gap://{request_id}/response");
     let conversation = request
         .conversation
@@ -1519,6 +1594,7 @@ async fn finish_buffered_request(
         }
     };
     drop(response_capture_memory);
+    drop(response_capture_permit);
     if result.is_err() {
         tracing::error!(%request_id, stage = "buffered_terminal_transaction", "proxy request finalization failed");
     }
@@ -1536,6 +1612,8 @@ async fn finish_buffered_request(
 
 #[derive(Clone, Copy)]
 enum BoundedUpstreamError {
+    MemoryCapacity,
+    Timeout,
     ResponseTooLarge,
     Stream,
 }
@@ -1543,6 +1621,8 @@ enum BoundedUpstreamError {
 impl BoundedUpstreamError {
     fn code(self) -> &'static str {
         match self {
+            Self::MemoryCapacity => "upstream_response_memory_capacity",
+            Self::Timeout => "upstream_timeout",
             Self::ResponseTooLarge => "upstream_response_too_large",
             Self::Stream => "upstream_stream",
         }
@@ -1552,6 +1632,9 @@ impl BoundedUpstreamError {
 async fn read_bounded_upstream(
     response: UpstreamResponse,
     maximum: usize,
+    memory: &crate::gateway_body::memory::ProxyMemoryReservation,
+    started: Instant,
+    reserve_adapter_maximum: bool,
 ) -> Result<Vec<u8>, BoundedUpstreamError> {
     if response
         .content_length()
@@ -1559,9 +1642,31 @@ async fn read_bounded_upstream(
     {
         return Err(BoundedUpstreamError::ResponseTooLarge);
     }
+    let declared_maximum = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(maximum)
+        .min(maximum);
+    let deadline =
+        tokio::time::Instant::now() + MAX_PROXY_LIFETIME.saturating_sub(started.elapsed());
+    let reservation_maximum = if reserve_adapter_maximum {
+        maximum
+    } else {
+        declared_maximum
+    };
+    if !memory
+        .reserve_buffered_response(reservation_maximum, deadline)
+        .await
+    {
+        return Err(BoundedUpstreamError::MemoryCapacity);
+    }
+    let maximum = declared_maximum;
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = tokio::time::timeout_at(deadline, stream.next())
+        .await
+        .map_err(|_| BoundedUpstreamError::Timeout)?
+    {
         // Never retain or display reqwest's error: its URL can contain
         // credential-bearing upstream configuration.
         let chunk = chunk.map_err(|_| BoundedUpstreamError::Stream)?;
@@ -1569,6 +1674,10 @@ async fn read_bounded_upstream(
             return Err(BoundedUpstreamError::ResponseTooLarge);
         }
         body.extend_from_slice(&chunk);
+    }
+    body.shrink_to_fit();
+    if !memory.response_json_fits(&body) {
+        return Err(BoundedUpstreamError::MemoryCapacity);
     }
     Ok(body)
 }

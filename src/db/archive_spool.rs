@@ -124,7 +124,7 @@ impl Database {
             }
             return Ok(true);
         }
-        let budget = sqlx::query("UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1 WHERE singleton = 1 AND cipher_bytes <= $2")
+        let budget = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1 WHERE singleton = 1 AND cipher_bytes <= $2")))
             .bind(accounted).bind(CIPHER_LIMIT - accounted).execute(&mut **tx).await?;
         if budget.rows_affected() != 1 {
             return Ok(false);
@@ -132,9 +132,37 @@ impl Database {
         sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "INSERT INTO response_archive_spools (request_id, tenant_id, reservation_id, state, chunk_count, byte_count, cipher_bytes, next_attempt_at, created_at, updated_at, expires_at) VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $7, $7, $8)")))
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.reservation_id.to_string())
             .bind(chunks.len() as i64).bind(bytes).bind(accounted).bind(now).bind(now + RETENTION).execute(&mut **tx).await?;
-        for chunk in chunks {
-            sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "INSERT INTO response_archive_spool_chunks (request_id, seq, ciphertext, byte_count) VALUES ($1, $2, $3, $4)")))
-                .bind(identity.request_id.to_string()).bind(chunk.seq).bind(&chunk.ciphertext).bind(chunk.byte_count).execute(&mut **tx).await?;
+        // 512 binds per statement remains below SQLite's conservative 999
+        // limit, while avoiding one database round trip per 64KiB chunk.
+        for batch in chunks.chunks(128) {
+            let values = (0..batch.len())
+                .map(|index| {
+                    let base = index * 4;
+                    format!(
+                        "(${}, ${}, ${}, ${})",
+                        base + 1,
+                        base + 2,
+                        base + 3,
+                        base + 4
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let statement = spool_sql(
+                purpose,
+                &format!(
+                    "INSERT INTO response_archive_spool_chunks (request_id, seq, ciphertext, byte_count) VALUES {values}"
+                ),
+            );
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(statement));
+            for chunk in batch {
+                query = query
+                    .bind(identity.request_id.to_string())
+                    .bind(chunk.seq)
+                    .bind(&chunk.ciphertext)
+                    .bind(chunk.byte_count);
+            }
+            query.execute(&mut **tx).await?;
         }
         Ok(true)
     }
@@ -841,6 +869,8 @@ fn spool_sql(purpose: BufferedArchivePurpose, sql: &str) -> String {
     match purpose {
         BufferedArchivePurpose::Response => sql.to_owned(),
         BufferedArchivePurpose::Request => sql
+            .replace("UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1", "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1, request_cipher_bytes = request_cipher_bytes + $1")
+            .replace("UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes - $1", "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes - $1, request_cipher_bytes = request_cipher_bytes - $1")
             .replace("response_archive_spools", "request_archive_spools")
             .replace(
                 "response_archive_spool_chunks",

@@ -149,12 +149,13 @@ pub(super) async fn authenticate_gateway_before_body(
     };
     if request.method() == axum::http::Method::POST {
         let request_id = safe_gateway_request_id(request.headers());
-        request = match crate::gateway_body::admit_gateway_request_body(
+        request = match crate::gateway_body::admit_gateway_request_body_with_memory(
             request,
             crate::gateway_body::GATEWAY_BODY_READ_DEADLINE,
             state.gateway_body_read_permits.clone(),
             state.responses_body_read_permits.clone(),
             state.config.responses_body_max_bytes as usize,
+            Some(&state.proxy_memory_budget),
         )
         .await
         {
@@ -162,7 +163,15 @@ pub(super) async fn authenticate_gateway_before_body(
             Err(error) => return Ok(gateway_body_admission_rejection(&state, &request_id, error)),
         };
     }
+    let memory = request
+        .extensions()
+        .get::<std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>>()
+        .cloned();
     let response = next.run(request).await;
+    let response = match memory {
+        Some(permit) => hold_response_body_permit(response, permit),
+        None => response,
+    };
     Ok(match image_lifecycle_permit {
         Some(permit) => hold_response_body_permit(response, permit),
         None => response,

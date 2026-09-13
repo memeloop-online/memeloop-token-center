@@ -6,6 +6,185 @@ use sqlx::{AnyPool, any::AnyPoolOptions};
 use tokio::task::JoinHandle;
 
 use super::*;
+#[tokio::test]
+async fn postgres_durable_admission_rollback_ha_and_archive_bind() {
+    use crate::db::{CreateKeyInput, StartProxyRequest};
+    let Some(fixture) = PgFixture::new_with_schema(true).await else {
+        return;
+    };
+    let db = &fixture.db;
+    let pepper = b"durable-admission-test-pepper-over-32-bytes";
+    let issued = db
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "durable-admission".into(),
+                principal_external_id: "member".into(),
+                alias: "durable-admission".into(),
+                currency: "USD".into(),
+                policy: crate::model::KeyPolicy::default(),
+                initial_balance: rust_decimal::Decimal::ONE,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = db.authenticate_key(&issued.key, pepper).await.unwrap();
+    let price = db
+        .upsert_model_price(
+            "durable-admission",
+            "USD",
+            rust_decimal::Decimal::ONE,
+            rust_decimal::Decimal::ONE,
+        )
+        .await
+        .unwrap();
+    let request_id = Uuid::new_v4();
+    let locator = format!("gap://{request_id}/request");
+    let input = || StartProxyRequest {
+        request_id,
+        key: &key,
+        price: &price,
+        input_token_ceiling: 7,
+        output_token_ceiling: 11,
+        protocol: "openai",
+        model: "durable-admission",
+        request_object: &locator,
+        upstream_account_id: None,
+        model_route_id: None,
+    };
+    let body = bytes::Bytes::from_static(b"{\"private\":\"request\"}");
+    sqlx::raw_sql("CREATE FUNCTION reject_admission() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test admission rollback'; END $$; CREATE TRIGGER reject_admission_chunk BEFORE INSERT ON request_archive_spool_chunks FOR EACH ROW EXECUTE FUNCTION reject_admission()").execute(&db.pool).await.unwrap();
+    assert!(matches!(
+        db.start_proxy_request_with_archive(input(), &body, pepper)
+            .await,
+        Err(AppError::Overloaded)
+    ));
+    let reservations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM usage_reservations WHERE key_id = $1")
+            .bind(key.key_id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(reservations, 0);
+    for table in [
+        "request_records",
+        "request_record_locators",
+        "request_events",
+    ] {
+        let column = if table == "request_events" {
+            "request_id"
+        } else {
+            "id"
+        };
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE {column} = $1"
+        )))
+        .bind(request_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+    }
+    assert_eq!(budget(db).await, 0);
+    sqlx::query("DROP TRIGGER reject_admission_chunk ON request_archive_spool_chunks")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let reservation = db
+        .start_proxy_request_with_archive(input(), &body, pepper)
+        .await
+        .unwrap();
+    let row = sqlx::query("SELECT s.state, s.reservation_id, r.completed_at FROM request_archive_spools s JOIN request_records r ON r.id = s.request_id WHERE s.request_id = $1").bind(request_id.to_string()).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(row.get::<String, _>("state"), "pending");
+    assert_eq!(
+        row.get::<String, _>("reservation_id"),
+        reservation.id.to_string()
+    );
+    assert_eq!(row.get::<Option<i64>, _>("completed_at"), None);
+    assert!(
+        db.claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    sqlx::query("UPDATE request_records SET completed_at = created_at + 1, status_code = 200, cost_micros = 123 WHERE id = $1").bind(request_id.to_string()).execute(&db.pool).await.unwrap();
+    let (left, right) = tokio::join!(
+        db.claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true),
+        db.claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true),
+    );
+    let tasks: Vec<_> = [left.unwrap(), right.unwrap()]
+        .into_iter()
+        .flatten()
+        .collect();
+    assert_eq!(tasks.len(), 1, "exactly one HA worker acquires the request");
+    let stale = &tasks[0];
+    sqlx::query("UPDATE request_archive_spools SET lease_expires_at = 0 WHERE request_id = $1")
+        .bind(request_id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let recovered = db
+        .claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!db.heartbeat_response_archive_spool(stale).await.unwrap());
+    assert!(
+        db.load_response_archive_spool_batch(stale, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let attempt = crate::proxy_lifecycle::begin_proxy_archive_attempt(
+        db,
+        request_id,
+        ArchiveStagingPurpose::Request,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !db.complete_response_archive_spool(stale, &attempt.lease, &attempt.object_locator)
+            .await
+            .unwrap()
+    );
+    assert!(
+        db.complete_response_archive_spool(&recovered, &attempt.lease, &attempt.object_locator)
+            .await
+            .unwrap()
+    );
+    db.retry_response_archive_spool(&recovered, "upload_failed")
+        .await
+        .unwrap();
+    assert!(
+        !db.complete_response_archive_spool(&recovered, &attempt.lease, &attempt.object_locator)
+            .await
+            .unwrap()
+    );
+    let terminal = sqlx::query(
+        "SELECT request_object, status_code, cost_micros FROM request_records WHERE id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        terminal.get::<String, _>("request_object"),
+        attempt.object_locator
+    );
+    assert_eq!(terminal.get::<i64, _>("status_code"), 200);
+    assert_eq!(terminal.get::<i64, _>("cost_micros"), 123);
+    assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 1);
+    let outstanding: i64 = sqlx::query_scalar(
+        "SELECT request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(outstanding, 0);
+    fixture.finish().await;
+}
 use crate::archive_staging::{
     ArchiveStagingIntentDigest, ArchiveStagingKey, ArchiveStagingLeaseOwner,
     BeginArchiveStagingInput, BeginArchiveStagingResult,
@@ -53,6 +232,10 @@ async fn schema_pool(url: &str, schema: &str) -> AnyPool {
 
 impl PgFixture {
     async fn new() -> Option<Self> {
+        Self::new_with_schema(false).await
+    }
+
+    async fn new_with_schema(full_schema: bool) -> Option<Self> {
         let Ok(url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
             eprintln!("MTC_TEST_POSTGRES_URL unset; skipping real PostgreSQL spool cancellation");
             return None;
@@ -75,47 +258,51 @@ impl PgFixture {
             backend: DatabaseBackend::PostgreSql,
             oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         };
-        // Same request columns exercised by the production spool API; there is
-        // deliberately no FK to billing tables, matching request_records.
-        sqlx::raw_sql("CREATE TABLE request_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, reservation_id TEXT NOT NULL, completed_at BIGINT, response_object TEXT, status_code BIGINT NOT NULL DEFAULT 200, cost_micros BIGINT NOT NULL DEFAULT 123)")
-            .execute(&db.pool).await.unwrap();
-        // This focused fixture intentionally omits the production request
-        // projection tables. Keeping the locator table empty exercises the
-        // legacy/audit-row path where no request-stream signal is emitted.
-        sqlx::raw_sql("CREATE TABLE request_record_locators (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, key_id TEXT NOT NULL)")
-            .execute(&db.pool).await.unwrap();
-        sqlx::raw_sql(include_str!(
-            "../../../migrations/common/0035_archive_staging_attempts.sql"
-        ))
-        .execute(&db.pool)
-        .await
-        .unwrap();
-        sqlx::raw_sql(include_str!(
-            "../../../migrations/common/0071_response_archive_spool.sql"
-        ))
-        .execute(&db.pool)
-        .await
-        .unwrap();
-        sqlx::raw_sql(include_str!(
-            "../../../migrations/common/0080_request_archive_spool.sql"
-        ))
-        .execute(&db.pool)
-        .await
-        .unwrap();
         let id = ArchiveSpoolIdentity {
             request_id: nonce,
             tenant_id: Uuid::new_v4(),
             reservation_id: Uuid::new_v4(),
         };
-        sqlx::query(
-            "INSERT INTO request_records (id, tenant_id, reservation_id) VALUES ($1, $2, $3)",
-        )
-        .bind(id.request_id.to_string())
-        .bind(id.tenant_id.to_string())
-        .bind(id.reservation_id.to_string())
-        .execute(&db.pool)
-        .await
-        .unwrap();
+        if full_schema {
+            db.migrate().await.unwrap();
+        } else {
+            // Same request columns exercised by the production spool API; there is
+            // deliberately no FK to billing tables, matching request_records.
+            sqlx::raw_sql("CREATE TABLE request_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, reservation_id TEXT NOT NULL, completed_at BIGINT, response_object TEXT, status_code BIGINT NOT NULL DEFAULT 200, cost_micros BIGINT NOT NULL DEFAULT 123)")
+            .execute(&db.pool).await.unwrap();
+            // This focused fixture intentionally omits the production request
+            // projection tables. Keeping the locator table empty exercises the
+            // legacy/audit-row path where no request-stream signal is emitted.
+            sqlx::raw_sql("CREATE TABLE request_record_locators (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, key_id TEXT NOT NULL)")
+            .execute(&db.pool).await.unwrap();
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/common/0035_archive_staging_attempts.sql"
+            ))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/common/0071_response_archive_spool.sql"
+            ))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/common/0080_request_archive_spool.sql"
+            ))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO request_records (id, tenant_id, reservation_id) VALUES ($1, $2, $3)",
+            )
+            .bind(id.request_id.to_string())
+            .bind(id.tenant_id.to_string())
+            .bind(id.reservation_id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
         let gate = i64::from(u32::from_be_bytes(
             nonce.as_bytes()[0..4].try_into().unwrap(),
         ));

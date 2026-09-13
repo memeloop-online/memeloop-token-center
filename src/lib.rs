@@ -65,6 +65,7 @@ pub struct AppState {
     pub(crate) responses_body_read_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) gateway_body_rejections: Arc<gateway_body::GatewayBodyRejectionMetrics>,
     pub(crate) proxy_lifecycle_permits: Arc<tokio::sync::Semaphore>,
+    pub(crate) proxy_memory_budget: Arc<gateway_body::memory::ProxyMemoryBudget>,
     pub(crate) proxy_archive_stream_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) upstream_quota: Arc<upstream_quota::QuotaCache>,
 }
@@ -79,11 +80,19 @@ pub enum InitializationError {
     Plugin,
     #[error("HTTP client initialization failed")]
     HttpClient,
+    #[error("invalid proxy memory budget")]
+    ProxyMemoryBudget,
 }
 
 impl AppState {
     pub async fn initialize(config: Config) -> Result<Self, InitializationError> {
+        config
+            .validate_proxy_memory_budget()
+            .map_err(|_| InitializationError::ProxyMemoryBudget)?;
         let proxy_lifecycle_concurrency = config.proxy_lifecycle_concurrency as usize;
+        let proxy_memory_budget = Arc::new(gateway_body::memory::ProxyMemoryBudget::new(
+            config.proxy_memory_budget_bytes,
+        ));
         let gateway_body_read_concurrency = config.gateway_body_read_concurrency as usize;
         let responses_body_read_concurrency = config.responses_body_read_concurrency as usize;
         if config.run_migrations_on_start {
@@ -135,6 +144,7 @@ impl AppState {
             proxy_lifecycle_permits: Arc::new(tokio::sync::Semaphore::new(
                 proxy_lifecycle_concurrency,
             )),
+            proxy_memory_budget,
             proxy_archive_stream_permits: Arc::new(tokio::sync::Semaphore::new(
                 PROXY_ARCHIVE_STREAM_CONCURRENCY,
             )),

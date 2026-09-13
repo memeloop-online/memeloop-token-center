@@ -24,6 +24,7 @@ mod chat_sse_usage;
 mod codex_quota;
 mod ha_policy;
 mod kimi;
+mod memory_admission;
 mod sse_delivery;
 
 #[test]
