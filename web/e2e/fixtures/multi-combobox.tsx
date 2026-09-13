@@ -6,6 +6,7 @@ import '../../src/theme.css';
 import '../../src/operator/operator.css';
 
 const options = Array.from({ length: 20 }, (_, index) => ({ value: String(index), label: `Workspace ${index + 1}`, description: 'A reusable selection field with a descriptive secondary line' }));
+const matrixLayout = new URLSearchParams(location.search).has('matrix');
 function Fixture() {
   const [selected, setSelected] = useState<ComboboxOption[]>([]);
   const [query, setQuery] = useState('');
@@ -15,7 +16,7 @@ function Fixture() {
     <h1 onMouseDown={(event) => event.preventDefault()}>Resource selection</h1>
     <button onClick={() => setError(true)}>Simulate unavailable search</button>
     <form onSubmit={(event) => { event.preventDefault(); setSubmissions(value => value + 1); }}>
-    <div style={{ overflow: 'hidden', height: 160, padding: 8, marginTop: 40 }}>
+    <div style={{ overflow: matrixLayout ? undefined : 'hidden', height: matrixLayout ? undefined : 160, padding: 8, marginTop: 40 }}>
       <MultiCombobox label="Workspaces" options={options} value={selected} onChange={setSelected}
         placeholder="Search workspaces" emptyText="No matching workspaces" removeLabel={label => `Remove ${label}`}
         hint="Choose one or more workspaces. Existing permissions are unchanged until you save."
