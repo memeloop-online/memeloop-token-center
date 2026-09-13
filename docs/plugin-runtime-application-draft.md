@@ -1,8 +1,10 @@
 # Draft application plugin revision integration
 
-Stacked on **#59** (`f1b5eab3c73ff240233aa2cf35886f9c2572372d`),
-which is stacked on #55 (`ea4c937a11b3178319970125c04c79064756c828`).
-**Not production enabled. Do not mix this change with #64/#65/#66 hotfix releases.**
+Stacked on **#59** (configuration snapshots and refill fences),
+which is stacked on **#94** (atomic runtime revision foundation).
+**Not production enabled.** These are distinct dependency layers, not alternative
+implementations. #87 adds execution diagnostics; #54 adds UI projection primitives
+but still requires authenticated backend and real product-slot integration.
 
 The `experimental-plugin-revisions` feature exposes a host-only
 `AppState::with_application_plugin_inventory` opt-in. The production executable
@@ -11,7 +13,7 @@ remote installer API, or plugin-provided activation mechanism.
 
 ## Authority and request ownership
 
-Migration 81 creates global candidate, immutable revision, singleton head, and
+Migration 83 creates global candidate, immutable revision, singleton head, and
 idempotency operation tables. A successful operation claims its idempotency key,
 inserts the next revision, performs `expected_revision` CAS, and records its result
 in one transaction. A failed CAS rolls back the operation and revision. Exact
@@ -19,6 +21,10 @@ replay returns the original revision receipt; a different request with the same
 key conflicts. Rollback selects a historical inventory and publishes a strictly
 new revision, never rewinding head. Identity and contract digests are internal
 metadata and are not included in the API receipt.
+
+Migration 81 is reserved for OAuth authority (#103), and 82 for conversation
+query indexes. This stack must retain both migrations when integrated with master;
+it must not reuse either version or replace their schema contracts.
 
 Each authenticated proxy, synchronous image, or asynchronous generation request
 pins the primary database head once at entry. The resulting request-owned

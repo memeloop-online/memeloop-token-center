@@ -1,4 +1,5 @@
 -- Global runtime authority. Package roots and host grants are never API data.
+-- Versions 81 and 82 belong to OAuth authority and conversation query indexes.
 CREATE TABLE application_plugin_candidates (
     inventory_id TEXT PRIMARY KEY,
     identity_digest TEXT NOT NULL,
