@@ -74,7 +74,7 @@ impl StreamState {
     }
 }
 
-pub(super) fn translate(
+pub(in crate::api::proxy) fn translate(
     response: reqwest::Response,
     context: responses::Context,
     streaming: bool,

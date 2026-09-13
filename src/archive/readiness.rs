@@ -488,7 +488,10 @@ impl ArchiveStore {
             },
         )
         .await?;
-        let path = self.readiness_path.child(uuid::Uuid::now_v7().to_string());
+        let path = self
+            .readiness_path
+            .clone()
+            .join(uuid::Uuid::now_v7().to_string());
         // If creation reaches S3 but is cancelled before returning its upload
         // handle, object_store cannot abort the unknown upload ID. Deployment
         // MUST verify provider-supported incomplete-multipart reclamation
@@ -684,7 +687,7 @@ mod tests {
         ] {
             let store = memory_store();
             let aborts = Arc::new(AtomicUsize::new(0));
-            let path = store.readiness_path.child(failure);
+            let path = store.readiness_path.clone().join(failure);
             // A completed object can exist despite a failed/lost complete response.
             if failure.starts_with("complete") {
                 store
@@ -729,8 +732,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stuck_abort_is_bounded_and_does_not_prevent_delete_or_touch_next_canary() {
         let store = memory_store();
-        let old_path = store.readiness_path.child("old");
-        let new_path = store.readiness_path.child("new");
+        let old_path = store.readiness_path.clone().join("old");
+        let new_path = store.readiness_path.clone().join("new");
         for path in [&old_path, &new_path] {
             store
                 .inner
@@ -765,7 +768,7 @@ mod tests {
     #[tokio::test]
     async fn post_completion_failure_or_cancellation_deletes_without_abort() {
         let store = memory_store();
-        let path = store.readiness_path.child("completed");
+        let path = store.readiness_path.clone().join("completed");
         store
             .inner
             .put(&path, PutPayload::from_static(READINESS_CANARY))

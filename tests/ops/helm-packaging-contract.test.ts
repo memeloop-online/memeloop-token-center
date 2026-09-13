@@ -134,7 +134,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     const oldSchema = spawnSync(helm, ['template', 'invalid-old-schema', chart, '--set', 'migration.schemaVersion=58'], { cwd: repository, encoding: 'utf8', shell: false });
     for (const values of [
       ['roles.gateway.resources.limits.memory=511Mi'],
-      ['roles.all.enabled=true', 'roles.all.resources.limits.memory=511Mi'],
+      ['roles.all.enabled=true', 'roles.gateway.enabled=false', 'roles.control.enabled=false', 'roles.worker.enabled=false', 'roles.all.resources.limits.memory=511Mi'],
       ['config.proxyMemoryBudgetBytes=536870912'],
     ]) {
       const result = spawnSync(helm, ['template', 'invalid-workload-budget', chart, ...values.flatMap((value) => ['--set', value])], { cwd: repository, encoding: 'utf8', shell: false });

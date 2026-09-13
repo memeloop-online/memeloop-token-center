@@ -1031,12 +1031,11 @@ impl PluginRuntime {
                         validate_plugin_text(account_id, MAX_TRAFFIC_ACCOUNT_ID_BYTES, false)
                             .is_ok()
                     });
-            if let (Some(memory), Some(rewrite)) = (memory, result.request_json.as_deref()) {
-                if rewrite.len() > MAX_TRAFFIC_REQUEST_JSON_BYTES
-                    || !memory.try_reserve_rewrite(rewrite.as_bytes())
-                {
-                    return Err(AppError::Overloaded);
-                }
+            if let (Some(memory), Some(rewrite)) = (memory, result.request_json.as_deref())
+                && (rewrite.len() > MAX_TRAFFIC_REQUEST_JSON_BYTES
+                    || !memory.try_reserve_rewrite(rewrite.as_bytes()))
+            {
+                return Err(AppError::Overloaded);
             }
             let validated_request = result
                 .request_json
