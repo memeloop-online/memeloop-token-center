@@ -86,6 +86,18 @@ export function permitEvidence(metrics: string): Record<string, number> {
   }));
 }
 
+export function allocatorEvidence(metrics: string): Record<string, number> {
+  const states = ["allocated", "active", "resident", "mapped", "retained"];
+  return Object.fromEntries(states.map((state) => {
+    const prefix = `memeloop_token_center_allocator_bytes{state="${state}"}`;
+    const line = metrics.split("\n").find((entry) => entry.startsWith(`${prefix} `));
+    assert(line, `required allocator gauge absent: ${state}`);
+    const value = Number(line.slice(prefix.length + 1));
+    assert(Number.isFinite(value) && value >= 0, `invalid allocator gauge: ${state}`);
+    return [state, value];
+  }));
+}
+
 function assert(value: unknown, message: string): asserts value {
   if (!value) throw new Error(message);
 }
@@ -291,6 +303,9 @@ export async function run(binary: string, output: string): Promise<boolean> {
     const key = await seed(base, base, token, mockUrl);
     const idle = processMemory(service.pid).rss_mib as number;
     report.idle_rss_mib = idle;
+    const idleMetrics = await apiRequest(base, "GET", "/metrics", token, undefined, 2000);
+    assert(idleMetrics.status === 200, "idle allocator metrics must be available");
+    report.idle_allocator_bytes = allocatorEvidence(idleMetrics.body.toString("utf8"));
 
     const drain = async (): Promise<Record<string, unknown>> => {
       const reader = new DatabaseSync(database, { readOnly: true });
@@ -303,11 +318,12 @@ export async function run(binary: string, output: string): Promise<boolean> {
             if (Object.values(row).every((value) => Number(value) === 0)) {
               const metrics = await apiRequest(base, "GET", "/metrics", token, undefined, 2000);
               assert(metrics.status === 200, "permit metrics must be available");
-              const gauges = permitEvidence(metrics.body.toString("utf8"));
+              const metricsText = metrics.body.toString("utf8");
+              const gauges = permitEvidence(metricsText);
               if (Object.values(gauges).every((value) => value === 0)) {
                 const successfulGaps = reader.prepare("SELECT COUNT(*) AS count FROM request_records WHERE status_code = 200 AND (request_object LIKE 'gap:%' OR response_object IS NULL OR response_object LIKE 'gap:%')").get();
                 assert(Number(successfulGaps?.count) === 0, "successful buffered requests must converge both archives, not settle with a silent gap");
-                return { ...row, permits: gauges, successful_archive_gaps: Number(successfulGaps?.count) };
+                return { ...row, permits: gauges, rss_mib: processMemory(service!.pid!).rss_mib, allocator_bytes: allocatorEvidence(metricsText), successful_archive_gaps: Number(successfulGaps?.count) };
               }
             }
             await delay(100);
@@ -400,16 +416,29 @@ export async function run(binary: string, output: string): Promise<boolean> {
     report.peak_rss_or_kernel_high_water_mib = peak;
     assert(peak <= LIMIT_MIB, "kernel VmHWM exceeded 448 MiB service allowance");
     let recovered = Infinity;
-    await deadline((async () => {
-      let consecutive = 0;
-      while (consecutive < 5) {
-        assert(!sampleFailure, "service disappeared while sampling RSS");
-        recovered = processMemory(service!.pid!).rss_mib;
-        report.recovered_rss_mib = recovered;
-        consecutive = memoryVerdict(idle, peak, recovered) ? consecutive + 1 : 0;
-        await delay(200);
+    let cooldownComplete = false;
+    try {
+      await deadline((async () => {
+        let consecutive = 0;
+        while (consecutive < 5) {
+          assert(!sampleFailure, "service disappeared while sampling RSS");
+          recovered = processMemory(service!.pid!).rss_mib;
+          report.recovered_rss_mib = recovered;
+          consecutive = memoryVerdict(idle, peak, recovered) ? consecutive + 1 : 0;
+          await delay(200);
+        }
+      })(), 30_000, "real RSS cooldown recovery");
+      cooldownComplete = true;
+    } finally {
+      try {
+        const cooldownMetrics = await apiRequest(base, "GET", "/metrics", token, undefined, 2000);
+        assert(cooldownMetrics.status === 200, "cooldown allocator metrics must be available");
+        report.cooldown_allocator_bytes = allocatorEvidence(cooldownMetrics.body.toString("utf8"));
+      } catch (error) {
+        report.cooldown_allocator_error = error instanceof Error ? error.message : String(error);
+        if (cooldownComplete) throw error;
       }
-    })(), 30_000, "real RSS cooldown recovery");
+    }
     report.recovered_rss_mib = recovered;
     report.duration_seconds = (performance.now() - started) / 1000;
     assert(!sampleFailure && memoryVerdict(idle, peak, recovered), "independent-process RSS peak/recovery gate failed");
