@@ -93,6 +93,7 @@ fn delivery_error_class(error: &AppError) -> &'static str {
         | AppError::QuotaExceeded
         | AppError::RateLimited
         | AppError::LimitExceeded { .. }
+        | AppError::SchemaSecretAnalysisTooComplex
         | AppError::Upstream(_) => "unexpected",
     }
 }
