@@ -5,6 +5,8 @@ use axum::{
 use memeloop_token_center::{
     AppState, api,
     config::{Config, RuntimeRole},
+    db::CreateUpstreamAccountInput,
+    provider::UpstreamCredential,
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -33,6 +35,102 @@ async fn request(state: &AppState, method: &str, path: &str, body: Value) -> (St
     let status = response.status();
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn recursive_schema_accounts_are_cycle_aware_and_creation_is_atomic() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut state = AppState::initialize(Config::for_test(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("recursive-secrets.db").display()
+    )))
+    .await
+    .unwrap();
+    let mock = wiremock::MockServer::start().await;
+    for index in 0..4 {
+        let secret = index >= 2;
+        let node = json!({"type":"object","properties":{"label":{"type":"string"},"token":{"type":"string","writeOnly":secret},"next":{"$ref":"#/$defs/node"}}});
+        let tree = match index {
+            0 => json!({"type":"object"}),
+            3 => json!({"type":"object","additionalProperties":{"$ref":"#/$defs/node"}}),
+            _ => json!({"$ref":"#/$defs/node"}),
+        };
+        let mut provider = state.providers.get("http-json").unwrap().clone();
+        provider.id = format!("recursive-config-{index}");
+        provider.config_schema = json!({"type":"object","$defs":{"node":node,"unused_secret":{"writeOnly":true}},"properties":{"base_url":{"type":"string"},"tree":tree}});
+        let driver = provider.id.clone();
+        state.providers.extend([provider]).unwrap();
+        let tenant = format!("recursive-secret-{index}");
+        let tree_data = if index == 3 {
+            json!({"entry":{"token":"synthetic-cycle","next":{}}})
+        } else if secret {
+            json!({"token":"synthetic-cycle","next":{}})
+        } else {
+            json!({"label":"public","next":{"label":"child"}})
+        };
+        let config = json!({"base_url":mock.uri(),"tree":tree_data});
+        let (status, created) = request(&state,"POST","/internal/v1/upstreams",json!({"tenant_external_id":tenant,"name":"fixture","driver":driver,"config":config,"credential":{"type":"api_key","value":"synthetic-credential"}})).await;
+        let list_path = format!("/internal/v1/upstreams?tenant_external_id={tenant}");
+        if secret {
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let (status, listed) = request(&state, "GET", &list_path, Value::Null).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                listed.as_array().unwrap().len(),
+                0,
+                "rejected create must not insert an account"
+            );
+            // A historical row must still be listable and fully redacted; it
+            // cannot turn a read into a post-commit schema error.
+            let legacy = state
+                .db
+                .create_upstream_account(
+                    CreateUpstreamAccountInput {
+                        tenant_external_id: tenant.clone(),
+                        name: "legacy".into(),
+                        driver: driver.clone(),
+                        config: config.clone(),
+                        credential: UpstreamCredential::ApiKey {
+                            value: "synthetic-credential".into(),
+                            header: "authorization".into(),
+                            prefix: "Bearer ".into(),
+                        },
+                        oauth_session_id: None,
+                        oauth_driver: None,
+                        oauth_refresh_url: None,
+                    },
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await
+                .unwrap();
+            let (status, listed) = request(&state, "GET", &list_path, Value::Null).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(listed[0]["config"], json!({}));
+            let (status, _) = request(&state,"PUT",&format!("/internal/v1/upstreams/{}",legacy.id),json!({"tenant_external_id":tenant,"name":"forbidden","expected_updated_at":legacy.updated_at,"config":config})).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let stored = state
+                .db
+                .upstream_account_with_current_credential(
+                    legacy.id,
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await
+                .unwrap()
+                .0;
+            assert_eq!(stored.updated_at, legacy.updated_at);
+            assert_eq!(stored.name, "legacy");
+        } else {
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(created["config"], config);
+            let (status, updated) = request(&state,"PUT",&format!("/internal/v1/upstreams/{}",created["id"].as_str().unwrap()),json!({"tenant_external_id":tenant,"name":"updated","expected_updated_at":created["updated_at"],"config":config})).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(updated["config"], config);
+            let (status, listed) = request(&state, "GET", &list_path, Value::Null).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(listed.as_array().unwrap().len(), 1);
+            assert_eq!(listed[0]["config"], config);
+        }
+    }
 }
 
 #[tokio::test]

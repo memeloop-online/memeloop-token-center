@@ -1,78 +1,28 @@
 use serde_json::{Map, Value};
+use std::collections::HashSet;
 
+use super::config_secret_graph::{has_secret, secret_cycle};
 use crate::{AppState, error::AppError, provider::UpstreamAccountView};
 
 fn invalid() -> AppError {
     AppError::BadRequest("secret configuration requires an explicit non-empty replacement".into())
 }
 
-/// Dynamic keys and conditional branches cannot safely be reconstructed from
-/// an omitted editor field. Refuse their update and redact the entire config.
-fn dynamic_secret(
-    root: &Value,
-    node: &Value,
-    depth: usize,
-    looking_for_secret: bool,
-) -> Result<bool, AppError> {
-    if depth > 32 {
-        return Err(invalid());
-    }
-    if looking_for_secret
-        && (node.get("writeOnly").and_then(Value::as_bool) == Some(true)
-            || node.get("format").and_then(Value::as_str) == Some("password"))
-    {
-        return Ok(true);
-    }
-    if let Some(reference) = node.get("$ref").and_then(Value::as_str) {
-        let target = reference
-            .strip_prefix('#')
-            .and_then(|pointer| root.pointer(pointer))
-            .ok_or_else(invalid)?;
-        if dynamic_secret(root, target, depth + 1, looking_for_secret)? {
-            return Ok(true);
-        }
-    }
-    if let Some(items) = node.as_array() {
-        for child in items {
-            if dynamic_secret(root, child, depth + 1, looking_for_secret)? {
-                return Ok(true);
-            }
-        }
-    }
-    if let Some(object) = node.as_object() {
-        for (key, child) in object {
-            if ["default", "examples", "const", "enum", "$ref"].contains(&key.as_str()) {
-                continue;
-            }
-            let dynamic = [
-                "additionalProperties",
-                "patternProperties",
-                "if",
-                "then",
-                "else",
-                "dependentSchemas",
-                "contains",
-                "prefixItems",
-            ]
-            .contains(&key.as_str());
-            if dynamic_secret(root, child, depth + 1, looking_for_secret || dynamic)? {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
-}
-
 fn paths(schema: &Value) -> Result<Vec<Vec<String>>, AppError> {
+    if !has_secret(schema, schema, false)? {
+        return Ok(Vec::new());
+    }
     fn visit(
         root: &Value,
         node: &Value,
         path: &mut Vec<String>,
         output: &mut Vec<Vec<String>>,
-        depth: usize,
+        ancestors: &mut HashSet<usize>,
+        budget: &mut usize,
     ) -> Result<(), AppError> {
-        if depth > 32 {
-            return Err(invalid());
+        *budget = budget.checked_sub(1).ok_or_else(invalid)?;
+        if ancestors.len() >= 256 {
+            return Err(super::config_secret_graph::invalid());
         }
         if node.get("writeOnly").and_then(Value::as_bool) == Some(true)
             || node.get("format").and_then(Value::as_str) == Some("password")
@@ -80,24 +30,28 @@ fn paths(schema: &Value) -> Result<Vec<Vec<String>>, AppError> {
             output.push(path.clone());
             return Ok(());
         }
+        let identity = node as *const Value as usize;
+        if !ancestors.insert(identity) {
+            return Ok(());
+        }
         if let Some(reference) = node.get("$ref").and_then(Value::as_str) {
             let target = reference
                 .strip_prefix('#')
                 .and_then(|pointer| root.pointer(pointer))
                 .ok_or_else(invalid)?;
-            visit(root, target, path, output, depth + 1)?;
+            visit(root, target, path, output, ancestors, budget)?;
         }
         for keyword in ["allOf", "oneOf", "anyOf"] {
             if let Some(parts) = node.get(keyword).and_then(Value::as_array) {
                 for part in parts {
-                    visit(root, part, path, output, depth + 1)?;
+                    visit(root, part, path, output, ancestors, budget)?;
                 }
             }
         }
         if let Some(properties) = node.get("properties").and_then(Value::as_object) {
             for (key, child) in properties {
                 path.push(key.clone());
-                visit(root, child, path, output, depth + 1)?;
+                visit(root, child, path, output, ancestors, budget)?;
                 path.pop();
             }
         }
@@ -105,18 +59,37 @@ fn paths(schema: &Value) -> Result<Vec<Vec<String>>, AppError> {
         // reconstruct indices from a partially redacted array.
         if let Some(items) = node.get("items") {
             let mut nested = Vec::new();
-            visit(root, items, &mut Vec::new(), &mut nested, depth + 1)?;
+            visit(root, items, &mut Vec::new(), &mut nested, ancestors, budget)?;
             if !nested.is_empty() {
                 output.push(path.clone());
             }
         }
+        ancestors.remove(&identity);
         Ok(())
     }
     let mut output = Vec::new();
-    visit(schema, schema, &mut Vec::new(), &mut output, 0)?;
+    visit(
+        schema,
+        schema,
+        &mut Vec::new(),
+        &mut output,
+        &mut HashSet::new(),
+        &mut 20_480,
+    )?;
     output.sort();
     output.dedup();
     Ok(output)
+}
+
+pub(super) fn validate_create(schema: &Value) -> Result<(), AppError> {
+    if secret_cycle(schema)? {
+        return Err(super::config_secret_graph::invalid());
+    }
+    // Complete analysis before any account row is inserted.
+    if !has_secret(schema, schema, true)? {
+        paths(schema)?;
+    }
+    Ok(())
 }
 
 /// Only schema-owned secret paths are inherited. Ordinary and unknown fields
@@ -126,7 +99,7 @@ pub(super) fn preserve(
     current: &Value,
     incoming: &mut Value,
 ) -> Result<(), AppError> {
-    if dynamic_secret(schema, schema, 0, false)? {
+    if secret_cycle(schema)? || has_secret(schema, schema, true)? {
         return Err(AppError::BadRequest(
             "dynamic secret configuration cannot be edited through a partial account update".into(),
         ));
@@ -166,7 +139,7 @@ pub(super) fn preserve(
 }
 
 fn redact(schema: &Value, value: &mut Value) -> Result<(), AppError> {
-    if dynamic_secret(schema, schema, 0, false)? {
+    if secret_cycle(schema).unwrap_or(true) || has_secret(schema, schema, true).unwrap_or(true) {
         *value = Value::Object(Map::new());
         return Ok(());
     }
@@ -183,7 +156,11 @@ fn redact(schema: &Value, value: &mut Value) -> Result<(), AppError> {
             remove(child, tail);
         }
     }
-    for path in paths(schema)? {
+    let Ok(paths) = paths(schema) else {
+        *value = Value::Object(Map::new());
+        return Ok(());
+    };
+    for path in paths {
         remove(value, &path);
     }
     Ok(())

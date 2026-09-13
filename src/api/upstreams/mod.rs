@@ -1,5 +1,6 @@
 mod accounts;
 mod availability;
+mod config_secret_graph;
 mod config_secrets;
 mod health;
 mod models;
