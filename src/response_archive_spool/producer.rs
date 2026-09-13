@@ -4,6 +4,75 @@ use bytes::Bytes;
 
 use crate::{AppState, db::ArchiveSpoolIdentity, error::AppError};
 
+pub(crate) fn encrypt_buffered(
+    identity: ArchiveSpoolIdentity,
+    purpose: super::BufferedArchivePurpose,
+    body: &Bytes,
+    pepper: &[u8],
+) -> Result<Vec<crate::db::ArchiveSpoolChunk>, AppError> {
+    if body.len() > 64 * 1024 * 1024 {
+        return Err(AppError::Overloaded);
+    }
+    body.chunks(super::CHUNK_BYTES)
+        .enumerate()
+        .map(|(seq, bytes)| {
+            Ok(crate::db::ArchiveSpoolChunk {
+                seq: seq as i64,
+                byte_count: bytes.len() as i64,
+                ciphertext: super::cipher::seal_for_purpose(
+                    identity, seq as i64, bytes, pepper, purpose,
+                )?,
+            })
+        })
+        .collect()
+}
+
+/// Compatibility capture entry point. Production buffered admission/settlement
+/// use the transaction-composing APIs; no buffered SQL is deadline-cancelled.
+#[cfg(test)]
+pub(crate) async fn capture_buffered(
+    state: &AppState,
+    identity: ArchiveSpoolIdentity,
+    purpose: super::BufferedArchivePurpose,
+    body: Bytes,
+) -> bool {
+    let started = tokio::time::Instant::now();
+    let chunks =
+        match encrypt_buffered(identity, purpose, &body, state.config.key_pepper.as_bytes()) {
+            Ok(chunks) => chunks,
+            Err(_) => {
+                tracing::warn!(
+                    phase = "encrypt",
+                    error_code = "capture_failed",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "buffered archive gap"
+                );
+                return false;
+            }
+        };
+    match state
+        .db
+        .capture_buffered_archive_spool(identity, purpose, &chunks)
+        .await
+    {
+        Ok(true) => true,
+        result => {
+            let error_code = if matches!(result, Ok(false)) {
+                "capacity"
+            } else {
+                "capture_failed"
+            };
+            tracing::warn!(
+                phase = "database_ack",
+                error_code,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "buffered archive gap"
+            );
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 static FAIL_NEXT_APPEND: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));

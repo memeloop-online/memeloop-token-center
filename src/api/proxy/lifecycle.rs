@@ -1,7 +1,27 @@
 use super::*;
 use crate::{db::Database, proxy_lifecycle::ProxyArchiveAttempt};
 
-pub(super) const MAX_PROXY_TEXT_ARCHIVE_WAIT: Duration = Duration::from_secs(2);
+pub(super) async fn finish_buffered_proxy_request_with_retry(
+    database: &Database,
+    input: FinishProxyRequest<'_>,
+    chunks: &[crate::db::ArchiveSpoolChunk],
+) -> Result<FinishProxyRequestResult, AppError> {
+    // Keep the same identity and ciphertext across unknown COMMIT ACKs. Do not
+    // cancel in-flight SQL or replay upstream work to repair archive delivery.
+    for millis in [10, 50, 200] {
+        match database
+            .finish_proxy_request_with_buffered_archive(input.clone(), chunks)
+            .await
+        {
+            Ok(result) => return Ok(result),
+            Err(AppError::Internal) => tokio::time::sleep(Duration::from_millis(millis)).await,
+            Err(error) => return Err(error),
+        }
+    }
+    database
+        .finish_proxy_request_with_buffered_archive(input, chunks)
+        .await
+}
 
 pub(super) async fn run_bounded_proxy_lifecycle<F>(
     deadline: tokio::time::Instant,
@@ -11,15 +31,6 @@ where
     F: std::future::Future,
 {
     tokio::time::timeout_at(deadline, lifecycle).await
-}
-
-pub(super) async fn run_bounded_text_archive<F>(
-    archive: F,
-) -> Result<F::Output, tokio::time::error::Elapsed>
-where
-    F: std::future::Future,
-{
-    tokio::time::timeout(MAX_PROXY_TEXT_ARCHIVE_WAIT, archive).await
 }
 
 pub(super) async fn finish_proxy_request_with_archive_fallback<'a>(

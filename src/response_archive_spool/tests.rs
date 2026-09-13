@@ -7,6 +7,141 @@ use crate::{AppState, config::Config, db::ArchiveSpoolIdentity};
 
 const PEPPER: &[u8] = b"existing-test-pepper-over-thirty-two-bytes";
 
+#[tokio::test]
+async fn both_buffered_purposes_recover_exact_bytes_only_after_terminal() {
+    let (_dir, state, pool, identity) = fixture().await;
+    let request = Bytes::from_static(b"{\"messages\":[{\"content\":\"private request\"}]}");
+    let response = Bytes::from_static(b"{\"output\":\"complete private response\"}");
+    assert!(
+        capture_buffered(
+            &state,
+            identity,
+            BufferedArchivePurpose::Request,
+            request.clone()
+        )
+        .await
+    );
+    assert!(
+        capture_buffered(
+            &state,
+            identity,
+            BufferedArchivePurpose::Response,
+            response.clone()
+        )
+        .await
+    );
+    assert!(!process_one_for_test(&state).await);
+    sqlx::query("UPDATE request_records SET request_object = $1 WHERE id = $2")
+        .bind(format!("gap://{}/request", identity.request_id))
+        .bind(identity.request_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    finish(&pool, identity).await;
+    let permits = state.proxy_archive_stream_permits.clone();
+    let held = permits
+        .clone()
+        .acquire_many_owned(permits.available_permits() as u32)
+        .await
+        .unwrap();
+    assert!(!process_one_for_test(&state).await);
+    for table in ["request_archive_spools", "response_archive_spools"] {
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT state, attempts FROM {table} WHERE request_id = $1"
+        )))
+        .bind(identity.request_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("state"), "pending");
+        assert_eq!(row.get::<i64, _>("attempts"), 0);
+    }
+    drop(held);
+    assert!(process_one_for_test(&state).await);
+    assert!(process_one_for_test(&state).await);
+    let row =
+        sqlx::query("SELECT request_object, response_object FROM request_records WHERE id = $1")
+            .bind(identity.request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let request_locator: String = row.get("request_object");
+    let response_locator: String = row.get("response_object");
+    assert_ne!(request_locator, response_locator);
+    assert_eq!(state.archive.get(&request_locator).await.unwrap(), request);
+    assert_eq!(
+        state.archive.get(&response_locator).await.unwrap(),
+        response
+    );
+}
+
+#[test]
+fn request_cipher_domain_is_distinct_and_schema71_response_aad_is_unchanged() {
+    let identity = ArchiveSpoolIdentity {
+        request_id: Uuid::new_v4(),
+        tenant_id: Uuid::new_v4(),
+        reservation_id: Uuid::new_v4(),
+    };
+    let payload = Bytes::from_static(b"private archive");
+    let request =
+        encrypt_buffered(identity, BufferedArchivePurpose::Request, &payload, PEPPER).unwrap();
+    assert!(
+        cipher::open(
+            identity,
+            0,
+            &request[0].ciphertext,
+            payload.len() as i64,
+            PEPPER
+        )
+        .is_err()
+    );
+    assert_eq!(
+        cipher::open_for_purpose(
+            identity,
+            0,
+            &request[0].ciphertext,
+            payload.len() as i64,
+            PEPPER,
+            BufferedArchivePurpose::Request
+        )
+        .unwrap(),
+        payload
+    );
+    let legacy_aad = format!(
+        "memeloop-token-center/response-archive-spool/v1/{}/{}/{}/0",
+        identity.tenant_id, identity.request_id, identity.reservation_id
+    );
+    let legacy = crate::provider::seal_private_json(
+        &serde_json::json!({"bytes":"cHJpdmF0ZSBhcmNoaXZl"}),
+        PEPPER,
+        legacy_aad.as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        cipher::open_for_purpose(
+            identity,
+            0,
+            &legacy,
+            payload.len() as i64,
+            PEPPER,
+            BufferedArchivePurpose::Response
+        )
+        .unwrap(),
+        payload
+    );
+    assert!(
+        cipher::open_for_purpose(
+            identity,
+            0,
+            &legacy,
+            payload.len() as i64,
+            PEPPER,
+            BufferedArchivePurpose::Request
+        )
+        .is_err()
+    );
+}
+
 #[test]
 fn encrypted_chunks_bind_every_owner_and_sequence_without_plaintext() {
     let id = ArchiveSpoolIdentity {

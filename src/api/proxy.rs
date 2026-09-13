@@ -14,6 +14,7 @@ mod upstream_response;
 
 #[cfg(test)]
 use crate::db::UpstreamFailureKind;
+use crate::response_archive_spool::{BufferedArchivePurpose, encrypt_buffered};
 use crate::{
     db::{SwitchProxyCandidateInput, UpstreamAttemptAdmission},
     metrics::{UpstreamHealthEvent, UpstreamHealthReason},
@@ -22,10 +23,7 @@ use crate::{
 use chat_sse_usage::ChatSseUsageContract;
 pub(in crate::api) use conversation_hints::safe_conversation_hint as safe_response_id;
 use conversation_hints::{client_name, conversation_hints};
-use lifecycle::{
-    finish_proxy_request_with_archive_fallback, run_bounded_proxy_lifecycle,
-    run_bounded_text_archive,
-};
+use lifecycle::{finish_proxy_request_with_archive_fallback, run_bounded_proxy_lifecycle};
 use routing::{
     AdmittedProxyRouteInput, CandidatePreparationSummary, CodexRetryTerminal,
     CodexRetryTerminalGuard, DeferredSharedProbe, NextSendableProxyRouteInput, PlannedProxyRoute,
@@ -687,43 +685,38 @@ pub(super) async fn proxy(
     let input_token_ceiling = route_plan.input_token_ceiling;
     let output_token_ceiling = route_plan.output_token_ceiling;
     let requested_service_tier = requested_service_tier(&request_json, &price)?;
-    let request_digest = blake3::hash(&body).to_hex();
     let admitted_request_object = format!("gap://{request_id}/request");
-    let request_archive_attempt =
-        match begin_proxy_archive_attempt(&state.db, request_id, ArchiveStagingPurpose::Request)
-            .await
-        {
-            Ok(attempt) => Some(attempt),
-            Err(_) => {
-                tracing::warn!(%request_id, stage = "request_archive_begin", "proxy archive gap");
-                None
-            }
-        };
+    let request_capture_memory = state.metrics.memory_usage(
+        crate::metrics::MemoryComponent::StreamCapture,
+        body.len().saturating_mul(3),
+    );
     let reservation = match state
         .db
-        .start_proxy_request(StartProxyRequest {
-            request_id,
-            key: &key,
-            price: &price,
-            input_token_ceiling,
-            output_token_ceiling,
-            protocol: protocol.name(),
-            model: &model,
-            request_object: &admitted_request_object,
-            upstream_account_id,
-            model_route_id,
-        })
+        .start_proxy_request_with_archive(
+            StartProxyRequest {
+                request_id,
+                key: &key,
+                price: &price,
+                input_token_ceiling,
+                output_token_ceiling,
+                protocol: protocol.name(),
+                model: &model,
+                request_object: &admitted_request_object,
+                upstream_account_id,
+                model_route_id,
+            },
+            &body,
+            state.config.key_pepper.as_bytes(),
+        )
         .await
     {
         Ok(reservation) => reservation,
         Err(error) => {
             tracing::error!(%request_id, stage = "request_transaction_admission", "proxy request admission failed");
-            if let Some(attempt) = request_archive_attempt.as_ref() {
-                abandon_proxy_archive_attempt(&state.db, attempt).await;
-            }
             return Err(error);
         }
     };
+    drop(request_capture_memory);
     let client_name = client_name(&headers);
     let conversation = matches!(
         protocol,
@@ -737,7 +730,7 @@ pub(super) async fn proxy(
     });
 
     let started = Instant::now();
-    let mut buffered_request = BufferedRequest {
+    let buffered_request = BufferedRequest {
         state: &state,
         reservation,
         request_id,
@@ -748,42 +741,9 @@ pub(super) async fn proxy(
         conversation,
         protocol,
         tenant_id: key.tenant_id,
-        archive_available: false,
     };
-    if let Some(attempt) = request_archive_attempt.as_ref() {
-        let archive = async {
-            let mut writer = state.archive.start_writer(&attempt.object_locator).await?;
-            writer.write(body.clone()).await?;
-            let staged = writer.finish_staged().await?;
-            if staged.blake3_digest != request_digest.as_str()
-                || staged.object_locator != attempt.object_locator
-            {
-                return Err(AppError::Storage(
-                    "proxy request archive verification failed".into(),
-                ));
-            }
-            attach_proxy_archive_with_retry(
-                &state.db,
-                request_id,
-                key.tenant_id,
-                buffered_request.reservation.id,
-                &admitted_request_object,
-                attempt,
-            )
-            .await?;
-            Ok::<(), AppError>(())
-        };
-        match run_bounded_text_archive(archive).await {
-            Ok(Ok(())) => buffered_request.archive_available = true,
-            Ok(Err(_)) | Err(_) => {
-                // This is safe even after an unknown attach acknowledgement:
-                // a committed bind is no longer in the writable state, so the
-                // abandon CAS becomes a no-op instead of deleting owned data.
-                abandon_proxy_archive_attempt(&state.db, attempt).await;
-                tracing::warn!(%request_id, stage = "request_archive", "proxy archive gap");
-            }
-        }
-    }
+    // Admission ACK includes reservation, request record, and encrypted sealed
+    // request spool in one transaction. No upstream work starts before it.
     let AuthorizedProxyRoutes {
         primary,
         remaining_candidates,
@@ -1206,7 +1166,6 @@ struct BufferedRequest<'a> {
     conversation: Option<ProxyConversation>,
     protocol: Protocol,
     tenant_id: Uuid,
-    archive_available: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1497,51 +1456,24 @@ async fn finish_buffered_request(
         && matches!(request.protocol, Protocol::OpenAiResponses))
     .then(|| extract_response_id(&body))
     .flatten();
-    let mut response_archive_attempt = if request.archive_available {
-        match begin_proxy_archive_attempt(
-            &request.state.db,
+    // Seal the independent response spool in the terminal transaction. Only
+    // its durable ACK gates delivery, never an object-store upload.
+    let capture_started = Instant::now();
+    let response_capture_memory = request.state.metrics.memory_usage(
+        crate::metrics::MemoryComponent::StreamCapture,
+        body.len().saturating_mul(3),
+    );
+    let response_chunks = encrypt_buffered(
+        crate::db::ArchiveSpoolIdentity {
             request_id,
-            ArchiveStagingPurpose::Response,
-        )
-        .await
-        {
-            Ok(attempt) => Some(attempt),
-            Err(_) => {
-                tracing::warn!(%request_id, stage = "buffered_response_archive_begin", "proxy archive gap");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let stored_response = if let Some(attempt) = response_archive_attempt.as_ref() {
-        let archive = async {
-            let mut writer = request
-                .state
-                .archive
-                .start_writer(&attempt.object_locator)
-                .await?;
-            writer.write(body.clone()).await?;
-            let staged = writer.finish_staged().await?;
-            if staged.object_locator != attempt.object_locator {
-                return Err(AppError::Storage(
-                    "proxy response archive verification failed".into(),
-                ));
-            }
-            Ok::<String, AppError>(staged.object_locator)
-        };
-        match run_bounded_text_archive(archive).await {
-            Ok(Ok(stored)) => stored,
-            Ok(Err(_)) | Err(_) => {
-                abandon_proxy_archive_attempt(&request.state.db, attempt).await;
-                response_archive_attempt = None;
-                tracing::warn!(%request_id, stage = "buffered_response_archive", "proxy archive gap");
-                format!("gap://{request_id}/response")
-            }
-        }
-    } else {
-        format!("gap://{request_id}/response")
-    };
+            tenant_id: request.tenant_id,
+            reservation_id: request.reservation.id,
+        },
+        BufferedArchivePurpose::Response,
+        &body,
+        request.state.config.key_pepper.as_bytes(),
+    );
+    let stored_response = format!("gap://{request_id}/response");
     let conversation = request
         .conversation
         .as_ref()
@@ -1552,28 +1484,41 @@ async fn finish_buffered_request(
             client_name: conversation.client_name.as_deref(),
             upstream_response_id: response_id.as_deref(),
         });
-    let gap_response = format!("gap://{request_id}/response");
-    let result = finish_proxy_request_with_archive_fallback(
-        &request.state.db,
-        FinishProxyRequest {
-            request_id,
-            tenant_id: request.tenant_id,
-            reservation: &request.reservation,
-            input_token_ceiling: request.input_token_ceiling,
-            output_token_ceiling: request.output_token_ceiling,
-            requested_service_tier: request.requested_service_tier.as_deref(),
-            status_code: i64::from(status.as_u16()),
-            duration_ms: request.started.elapsed().as_millis() as i64,
-            usage,
-            charge_contract_ceiling: false,
-            error_code: error_code.as_deref(),
-            response_object: &stored_response,
-            conversation,
-        },
-        response_archive_attempt.as_ref(),
-        &gap_response,
-    )
-    .await;
+    let terminal = FinishProxyRequest {
+        request_id,
+        tenant_id: request.tenant_id,
+        reservation: &request.reservation,
+        input_token_ceiling: request.input_token_ceiling,
+        output_token_ceiling: request.output_token_ceiling,
+        requested_service_tier: request.requested_service_tier.as_deref(),
+        status_code: i64::from(status.as_u16()),
+        duration_ms: request.started.elapsed().as_millis() as i64,
+        usage,
+        charge_contract_ceiling: false,
+        error_code: error_code.as_deref(),
+        response_object: &stored_response,
+        conversation,
+    };
+    let result = match response_chunks {
+        Ok(chunks) => {
+            lifecycle::finish_buffered_proxy_request_with_retry(
+                &request.state.db,
+                terminal,
+                &chunks,
+            )
+            .await
+        }
+        Err(_) => {
+            tracing::warn!(
+                phase = "response_encrypt",
+                error_code = "capture_failed",
+                elapsed_ms = capture_started.elapsed().as_millis() as u64,
+                "proxy archive gap"
+            );
+            finish_proxy_request_with_retry(&request.state.db, terminal, None).await
+        }
+    };
+    drop(response_capture_memory);
     if result.is_err() {
         tracing::error!(%request_id, stage = "buffered_terminal_transaction", "proxy request finalization failed");
     }

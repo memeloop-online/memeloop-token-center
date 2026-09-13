@@ -1,11 +1,11 @@
 use std::{future::Future, time::Duration};
 
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::{
     AppState,
-    archive_staging::ArchiveStagingPurpose,
     db::ArchiveSpoolTask,
     error::AppError,
     proxy_lifecycle::{begin_proxy_archive_attempt, heartbeat_proxy_archive_attempt},
@@ -13,6 +13,8 @@ use crate::{
 
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const SLOW_CLAIM: Duration = Duration::from_secs(2);
+const UPLOAD_CONCURRENCY: usize = 4;
+const CLAIMS_PER_DRAIN: usize = 32;
 
 pub(crate) async fn run(state: AppState, mut shutdown: watch::Receiver<bool>) {
     let owner = Uuid::now_v7();
@@ -39,10 +41,19 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = bool>,
 {
-    // Bound each drain without throttling a healthy store to one item/second.
-    for _ in 0..32 {
-        if stopping(shutdown) || !process().await {
-            break;
+    // Each future also acquires the shared archive permit before claiming.
+    // Refill free slots so one slow store operation does not stop the other
+    // uploads. Never cancel a claimed transaction/upload on shutdown.
+    let mut active = FuturesUnordered::new();
+    let mut started = 0;
+    while active.len() < UPLOAD_CONCURRENCY && !stopping(shutdown) {
+        active.push(process());
+        started += 1;
+    }
+    while let Some(progress) = active.next().await {
+        if progress && started < CLAIMS_PER_DRAIN && !stopping(shutdown) {
+            active.push(process());
+            started += 1;
         }
     }
 }
@@ -94,29 +105,71 @@ pub(super) async fn process_one_with_admission(
     else {
         return false;
     };
-    let task = match observe_claim(state.db.claim_response_archive_spool_if(owner, admit)).await {
+    // Alternate queue priority across drain calls, so a permanently busy
+    // response queue cannot starve requests (or vice versa).
+    static REQUEST_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let request_first = REQUEST_FIRST.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+    let first = if request_first {
+        super::BufferedArchivePurpose::Request
+    } else {
+        super::BufferedArchivePurpose::Response
+    };
+    let second = if request_first {
+        super::BufferedArchivePurpose::Response
+    } else {
+        super::BufferedArchivePurpose::Request
+    };
+    let mut admit = Some(admit);
+    let claimed = observe_claim(async {
+        let first_task = {
+            let allow = || admit.take().is_some_and(|check| check());
+            state.db.claim_archive_spool_if(owner, first, allow).await?
+        };
+        match first_task {
+            Some(task) => Ok(Some(task)),
+            None if admit.is_some() => {
+                state
+                    .db
+                    .claim_archive_spool_if(
+                        owner,
+                        second,
+                        admit.take().expect("admission remains unused"),
+                    )
+                    .await
+            }
+            None => Ok(None),
+        }
+    })
+    .await;
+    let task = match claimed {
         Ok(Some(task)) => task,
         Ok(None) | Err(_) => return false,
     };
     // Admission happened inside the claim transaction. Complete this one
     // bounded attempt even if shutdown arrived during COMMIT; never consume a
     // retry merely to abandon a freshly committed claim without object I/O.
+    let started = tokio::time::Instant::now();
+    let mut phase = "staging_begin";
     let success = matches!(
-        tokio::time::timeout(UPLOAD_TIMEOUT, upload(state, &task)).await,
+        tokio::time::timeout(UPLOAD_TIMEOUT, upload(state, &task, &mut phase)).await,
         Ok(Ok(()))
     );
     if !success {
+        let error_code = match phase {
+            "decrypt" => "decrypt_failed",
+            "lease" => "lease_lost",
+            "chunk_validation" => "invalid_chunk",
+            _ => "upload_failed",
+        };
         // An upload/commit ACK may have been lost. Leave staged object cleanup
         // to the existing fenced reaper, which proves it unreferenced first.
         // retry() itself is fenced: a committed bind must never be undone.
         let _ = tokio::time::timeout(
             Duration::from_secs(2),
-            state
-                .db
-                .retry_response_archive_spool(&task, "upload_failed"),
+            state.db.retry_response_archive_spool(&task, error_code),
         )
         .await;
-        tracing::warn!(request_id = %task.identity.request_id, stage = "response_spool_upload", "durable response archive retry pending");
+        tracing::warn!(request_id = %task.identity.request_id, purpose = task.purpose.as_str(), phase, error_code, elapsed_ms = started.elapsed().as_millis() as u64, "durable archive retry pending");
     }
     true
 }
@@ -154,17 +207,18 @@ pub(super) async fn observe_claim<T>(
     result
 }
 
-async fn upload(state: &AppState, task: &ArchiveSpoolTask) -> Result<(), AppError> {
+async fn upload(
+    state: &AppState,
+    task: &ArchiveSpoolTask,
+    phase: &mut &'static str,
+) -> Result<(), AppError> {
     let _archive_memory = state.metrics.memory_usage(
         crate::metrics::MemoryComponent::ArchiveMultipart,
         crate::archive::ARCHIVE_MULTIPART_PART_BYTES + 1024 * 1024 + super::CHUNK_BYTES * 5,
     );
-    let attempt = begin_proxy_archive_attempt(
-        &state.db,
-        task.identity.request_id,
-        ArchiveStagingPurpose::Response,
-    )
-    .await?;
+    let attempt =
+        begin_proxy_archive_attempt(&state.db, task.identity.request_id, task.purpose.staging())
+            .await?;
     let (lost_sender, mut lost_receiver) = tokio::sync::mpsc::channel(1);
     let heartbeat_state = state.clone();
     let heartbeat_task = task.clone();
@@ -193,44 +247,54 @@ async fn upload(state: &AppState, task: &ArchiveSpoolTask) -> Result<(), AppErro
         }
     }));
     let transfer = async {
+        *phase = "object_start";
         let mut writer = state.archive.start_writer(&attempt.object_locator).await?;
         let mut total = 0_i64;
         let mut seq = 0;
         while seq < task.chunk_count {
+            *phase = "chunk_load";
             let chunks = state
                 .db
                 .load_response_archive_spool_batch(task, seq)
                 .await?;
             if chunks.is_empty() {
+                *phase = "lease";
                 return Err(AppError::Internal);
             }
             for chunk in chunks {
+                *phase = "chunk_validation";
                 if chunk.seq != seq || seq >= task.chunk_count {
                     return Err(AppError::Internal);
                 }
-                let bytes = super::cipher::open(
+                *phase = "decrypt";
+                let bytes = super::cipher::open_for_purpose(
                     task.identity,
                     seq,
                     &chunk.ciphertext,
                     chunk.byte_count,
                     state.config.key_pepper.as_bytes(),
+                    task.purpose,
                 )?;
                 total = total
                     .checked_add(chunk.byte_count)
                     .ok_or(AppError::Internal)?;
+                *phase = "object_write";
                 writer.write(bytes).await?;
                 seq += 1;
             }
         }
+        *phase = "chunk_validation";
         if total != task.byte_count {
             return Err(AppError::Internal);
         }
+        *phase = "object_finish";
         let stored = writer.finish_staged().await?;
         if stored.object_locator != attempt.object_locator
             || stored.size_bytes != u64::try_from(total).map_err(|_| AppError::Internal)?
         {
             return Err(AppError::Internal);
         }
+        *phase = "terminal_bind";
         if !state
             .db
             .complete_response_archive_spool(task, &attempt.lease, &stored.object_locator)
@@ -240,10 +304,17 @@ async fn upload(state: &AppState, task: &ArchiveSpoolTask) -> Result<(), AppErro
         }
         Ok(())
     };
-    tokio::select! {
+    let outcome = tokio::select! {
         biased;
-        _ = lost_receiver.recv() => Err(AppError::Internal),
-        result = transfer => result,
+        _ = lost_receiver.recv() => None,
+        result = transfer => Some(result),
+    };
+    match outcome {
+        Some(result) => result,
+        None => {
+            *phase = "lease";
+            Err(AppError::Internal)
+        }
     }
 }
 
@@ -296,7 +367,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_drains_current_boundary_without_starting_another_claim() {
         let (shutdown, receiver) = watch::channel(false);
-        let (entered, mut entering) = tokio::sync::mpsc::channel(1);
+        let (entered, mut entering) = tokio::sync::mpsc::channel(UPLOAD_CONCURRENCY);
         let release = Arc::new(tokio::sync::Semaphore::new(0));
         let completed = Arc::new(AtomicUsize::new(0));
         let drain_release = release.clone();
@@ -311,12 +382,64 @@ mod tests {
             })
             .await;
         });
-        entering.recv().await.unwrap();
+        for _ in 0..UPLOAD_CONCURRENCY {
+            entering.recv().await.unwrap();
+        }
         shutdown.send(true).unwrap();
         assert_eq!(completed.load(Ordering::SeqCst), 0);
-        release.add_permits(1);
+        release.add_permits(UPLOAD_CONCURRENCY);
         drain.await.unwrap();
-        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        assert_eq!(completed.load(Ordering::SeqCst), UPLOAD_CONCURRENCY);
         assert_eq!(entering.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn bounded_drain_refills_around_a_slow_upload_and_stops_at_32() {
+        let (_shutdown, receiver) = watch::channel(false);
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (entered, mut entering) = tokio::sync::mpsc::unbounded_channel();
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let drain_release = release.clone();
+        let drain_peak = peak.clone();
+        let drain_calls = calls.clone();
+        let drain = tokio::spawn(async move {
+            drain_batch(&receiver, || {
+                let index = drain_calls.fetch_add(1, Ordering::SeqCst);
+                let release = drain_release.clone();
+                let running = running.clone();
+                let peak = drain_peak.clone();
+                let entered = entered.clone();
+                async move {
+                    let count = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(count, Ordering::SeqCst);
+                    entered.send(index).unwrap();
+                    if index < UPLOAD_CONCURRENCY {
+                        release.acquire().await.unwrap().forget();
+                    }
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    true
+                }
+            })
+            .await;
+        });
+        let mut first = Vec::new();
+        for _ in 0..UPLOAD_CONCURRENCY {
+            first.push(entering.recv().await.unwrap());
+        }
+        first.sort_unstable();
+        assert_eq!(first, (0..UPLOAD_CONCURRENCY).collect::<Vec<_>>());
+        assert_eq!(peak.load(Ordering::SeqCst), UPLOAD_CONCURRENCY);
+        // Three blocked uploads remain; the released slot drains the queue.
+        release.add_permits(1);
+        for expected in UPLOAD_CONCURRENCY..CLAIMS_PER_DRAIN {
+            assert_eq!(entering.recv().await.unwrap(), expected);
+        }
+        assert!(!drain.is_finished());
+        release.add_permits(UPLOAD_CONCURRENCY - 1);
+        drain.await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), CLAIMS_PER_DRAIN);
+        assert_eq!(peak.load(Ordering::SeqCst), UPLOAD_CONCURRENCY);
     }
 }

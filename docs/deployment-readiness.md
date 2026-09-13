@@ -4,6 +4,35 @@ This document defines release gates for Memeloop Token Center.
 
 ## Archive network diagnostics
 
+### Text archive delivery and recovery
+
+Text requests and buffered responses are captured independently into encrypted
+database spools before upstream dispatch and downstream completion, respectively.
+Request admission persists its reservation, request record and sealed capture in
+one transaction. Only a confirmed commit permits upstream dispatch; capacity
+rejection or an unconfirmed database commit returns a retryable failure before
+any upstream execution. A successful capture acknowledgement means the
+payload survives gateway restart, not that object storage has finished uploading.
+S3 latency is outside these delivery paths. Streaming responses retain their
+existing bounded database capture acknowledgements.
+
+Workers upload sealed captures after request settlement and atomically replace
+the corresponding request or response gap locator under the spool lease and
+archive staging fence. This convergence changes archive state only: it must never
+dispatch another upstream request or repeat settlement. Request capture failure
+does not disable response capture. Pending and uploading captures are recoverable
+work, distinct from a terminal archive gap.
+
+Request and response captures share the existing 256 MiB encrypted spool budget,
+including row and chunk accounting. They do not each receive a separate budget.
+Buffered response capture capacity failure is reported as an explicit archive
+gap while preserving the already executed response and settlement. Leased worker
+retries, expiration and bounded cleanup
+apply independently to each capture. Preserve the database and its encryption
+key together for recovery; restarting a worker does not require recapturing or
+replaying upstream traffic. Existing response captures keep their original
+encrypted format and remain readable across this release.
+
 All roles use the same S3 settings. Helm `config.s3.connectTimeoutMillis`,
 `requestTimeoutMillis` and `readinessDeadlineMillis` map to
 `MTC_S3_CONNECT_TIMEOUT_MILLIS`, `MTC_S3_REQUEST_TIMEOUT_MILLIS` and

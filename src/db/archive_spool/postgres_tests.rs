@@ -96,6 +96,12 @@ impl PgFixture {
         .execute(&db.pool)
         .await
         .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/common/0080_request_archive_spool.sql"
+        ))
+        .execute(&db.pool)
+        .await
+        .unwrap();
         let id = ArchiveSpoolIdentity {
             request_id: nonce,
             tenant_id: Uuid::new_v4(),
@@ -466,6 +472,7 @@ async fn postgres_claim_cancelled_inside_commit_is_reclaimed_with_new_fence() {
     assert_ne!(recovered.lease_token.to_string(), token);
     let stale = ArchiveSpoolTask {
         identity: fixture.id,
+        purpose: BufferedArchivePurpose::Response,
         lease_owner: owner,
         lease_token: Uuid::parse_str(&token).unwrap(),
         chunk_count: 1,
