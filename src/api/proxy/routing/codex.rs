@@ -402,13 +402,13 @@ where
 {
     tokio::pin!(send);
     tokio::select! {
-        // Preserve a connector's typed pre-delivery result when its own
-        // deadline and the request deadline become ready in the same poll.
+        // This budget is absolute. A result that becomes observable only at
+        // or after the deadline cannot authorize delivery or replay.
         biased;
-        result = &mut send => result,
         _ = tokio::time::sleep_until(deadline) => Err(ProxySendError::AmbiguousResponse(
             super::super::upstream_response::UPSTREAM_REQUEST_TIMEOUT,
         )),
+        result = &mut send => result,
     }
 }
 
@@ -418,7 +418,7 @@ mod timeout_tests {
     use super::*;
 
     #[tokio::test(start_paused = true)]
-    async fn typed_connect_deadline_wins_at_the_request_boundary() {
+    async fn request_deadline_wins_at_the_typed_connect_boundary() {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
         let result = send_until_request_deadline(deadline, async move {
             tokio::time::sleep_until(deadline).await;
@@ -427,12 +427,30 @@ mod timeout_tests {
         .await;
         assert!(matches!(
             result,
-            Err(ProxySendError::RetryableConnection("proxy_connect"))
+            Err(ProxySendError::AmbiguousResponse(
+                super::super::upstream_response::UPSTREAM_REQUEST_TIMEOUT
+            ))
         ));
         assert_eq!(
             failover_disposition(None, result.as_ref().err()),
-            FailoverDisposition::ConnectionNotDelivered
+            FailoverDisposition::Stop
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_send_result_cannot_cross_an_expired_request_deadline() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+
+        let result =
+            send_until_request_deadline(deadline, async { Ok::<_, ProxySendError>(()) }).await;
+
+        assert!(matches!(
+            result,
+            Err(ProxySendError::AmbiguousResponse(
+                super::super::upstream_response::UPSTREAM_REQUEST_TIMEOUT
+            ))
+        ));
     }
 
     #[tokio::test(start_paused = true)]

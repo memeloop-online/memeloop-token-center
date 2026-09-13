@@ -137,17 +137,15 @@ impl UpstreamResponse {
                 if finished {
                     return None;
                 }
-                let (deadline, error_code) = if request_deadline <= read_deadline {
-                    (request_deadline, UPSTREAM_REQUEST_TIMEOUT)
-                } else {
-                    (read_deadline, UPSTREAM_READ_TIMEOUT)
-                };
                 let next = tokio::select! {
-                    // If a chunk is already buffered when the consumer polls,
-                    // accept that progress even at the exact timeout boundary.
+                    // The total request budget is absolute: once it expires,
+                    // buffered or continuously-ready body data cannot extend it.
                     biased;
+                    _ = tokio::time::sleep_until(request_deadline) => Err(UPSTREAM_REQUEST_TIMEOUT),
+                    // Inactivity is different: data already buffered at the
+                    // read boundary is progress and starts a fresh read window.
                     next = upstream.next() => Ok(next),
-                    _ = tokio::time::sleep_until(deadline) => Err(()),
+                    _ = tokio::time::sleep_until(read_deadline) => Err(UPSTREAM_READ_TIMEOUT),
                 };
                 match next {
                     Ok(Some(chunk)) => {
@@ -155,7 +153,7 @@ impl UpstreamResponse {
                         Some((chunk, (upstream, read_deadline, false)))
                     }
                     Ok(None) => None,
-                    Err(()) => Some((Err(error_code), (upstream, read_deadline, true))),
+                    Err(error_code) => Some((Err(error_code), (upstream, read_deadline, true))),
                 }
             },
         );
@@ -264,5 +262,53 @@ mod tests {
             tokio::time::Instant::now() - send_started,
             std::time::Duration::from_secs(3)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continuously_ready_body_cannot_cross_the_absolute_request_deadline() {
+        let started = tokio::time::Instant::now();
+        let response = UpstreamResponse::Prefetched {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            version: Version::HTTP_2,
+            content_length: None,
+            stream: Box::pin(stream::repeat(Ok(Bytes::from_static(b"chunk")))),
+        }
+        .with_body_timeouts(
+            started + std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(10),
+        );
+        let mut body = response.bytes_stream();
+        assert!(body.next().await.unwrap().is_ok());
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+
+        assert_eq!(body.next().await.unwrap(), Err(UPSTREAM_REQUEST_TIMEOUT));
+        assert!(body.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_progress_wins_at_the_read_inactivity_boundary() {
+        let started = tokio::time::Instant::now();
+        let response = UpstreamResponse::Prefetched {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            version: Version::HTTP_2,
+            content_length: None,
+            stream: Box::pin(stream::iter([Ok(Bytes::from_static(b"buffered"))])),
+        }
+        .with_body_timeouts(
+            started + std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(1),
+        );
+        let mut body = response.bytes_stream();
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+
+        assert_eq!(
+            body.next().await.unwrap(),
+            Ok(Bytes::from_static(b"buffered"))
+        );
+        assert!(body.next().await.is_none());
     }
 }
