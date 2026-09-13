@@ -8,7 +8,9 @@ use crate::{
     AppState,
     db::ArchiveSpoolTask,
     error::AppError,
-    proxy_lifecycle::{begin_proxy_archive_attempt, heartbeat_proxy_archive_attempt},
+    proxy_lifecycle::{
+        ProxyArchiveAttempt, begin_proxy_archive_attempt, heartbeat_proxy_archive_attempt,
+    },
 };
 
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
@@ -246,9 +248,17 @@ pub(super) async fn process_one_with_admission(
         // An upload/commit ACK may have been lost. Leave staged object cleanup
         // to the existing fenced reaper, which proves it unreferenced first.
         // retry() itself is fenced: a committed bind must never be undone.
-        let _ = tokio::time::timeout(
+        let retry_state = state.clone();
+        let retry_task = task.clone();
+        let _ = super::await_owned(
             Duration::from_secs(2),
-            state.db.retry_response_archive_spool(&task, error_code),
+            async move {
+                retry_state
+                    .db
+                    .retry_response_archive_spool(&retry_task, error_code)
+                    .await
+            },
+            "response_spool_retry",
         )
         .await;
         tracing::warn!(request_id = %task.identity.request_id, purpose = task.purpose.as_str(), phase, error_code, elapsed_ms = started.elapsed().as_millis() as u64, "durable archive retry pending");
@@ -298,36 +308,33 @@ async fn upload(
         crate::metrics::MemoryComponent::ArchiveMultipart,
         crate::archive::ARCHIVE_MULTIPART_PART_BYTES + 1024 * 1024 + super::CHUNK_BYTES * 5,
     );
-    let attempt =
-        begin_proxy_archive_attempt(&state.db, task.identity.request_id, task.purpose.staging())
-            .await?;
+    let attempt_state = state.clone();
+    let attempt_task = task.clone();
+    let attempt = super::await_owned_unbounded(
+        async move {
+            begin_proxy_archive_attempt(
+                &attempt_state.db,
+                attempt_task.identity.request_id,
+                attempt_task.purpose.staging(),
+            )
+            .await
+        },
+        "response_spool_staging_begin",
+    )
+    .await
+    .ok_or(AppError::Internal)??;
     let (lost_sender, mut lost_receiver) = tokio::sync::mpsc::channel(1);
+    let (heartbeat_stop, stop_receiver) = tokio::sync::oneshot::channel();
     let heartbeat_state = state.clone();
     let heartbeat_task = task.clone();
-    let mut heartbeat_attempt = attempt.clone();
-    let _heartbeat = AbortOnDrop(tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            let renewed = tokio::time::timeout(Duration::from_secs(2), async {
-                Ok::<_, AppError>(
-                    heartbeat_state
-                        .db
-                        .heartbeat_response_archive_spool(&heartbeat_task)
-                        .await?
-                        && heartbeat_proxy_archive_attempt(
-                            &heartbeat_state.db,
-                            &mut heartbeat_attempt,
-                        )
-                        .await?,
-                )
-            })
-            .await;
-            if !matches!(renewed, Ok(Ok(true))) {
-                let _ = lost_sender.send(()).await;
-                break;
-            }
-        }
-    }));
+    let heartbeat_attempt = attempt.clone();
+    let heartbeat = tokio::spawn(run_upload_heartbeat(
+        heartbeat_state,
+        heartbeat_task,
+        heartbeat_attempt,
+        stop_receiver,
+        lost_sender,
+    ));
     let transfer = async {
         *phase = "object_start";
         let mut writer = state.archive.start_writer(&attempt.object_locator).await?;
@@ -377,11 +384,22 @@ async fn upload(
             return Err(AppError::Internal);
         }
         *phase = "terminal_bind";
-        if !state
-            .db
-            .complete_response_archive_spool(task, &attempt.lease, &stored.object_locator)
-            .await?
-        {
+        let bind_state = state.clone();
+        let bind_task = task.clone();
+        let bind_lease = attempt.lease.clone();
+        let bind_locator = stored.object_locator.clone();
+        let bound = super::await_owned_unbounded(
+            async move {
+                bind_state
+                    .db
+                    .complete_response_archive_spool(&bind_task, &bind_lease, &bind_locator)
+                    .await
+            },
+            "response_spool_terminal_bind",
+        )
+        .await
+        .ok_or(AppError::Internal)??;
+        if !bound {
             return Err(AppError::Internal);
         }
         Ok(())
@@ -391,6 +409,15 @@ async fn upload(
         _ = lost_receiver.recv() => None,
         result = transfer => Some(result),
     };
+    let _ = heartbeat_stop.send(());
+    if let Err(error) = heartbeat.await {
+        tracing::error!(
+            stage = "response_spool_heartbeat_task",
+            task_cancelled = error.is_cancelled(),
+            task_panicked = error.is_panic(),
+            "response archive heartbeat task failed"
+        );
+    }
     match outcome {
         Some(result) => result,
         None => {
@@ -400,11 +427,60 @@ async fn upload(
     }
 }
 
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+async fn run_upload_heartbeat(
+    state: AppState,
+    task: ArchiveSpoolTask,
+    attempt: ProxyArchiveAttempt,
+    stop: tokio::sync::oneshot::Receiver<()>,
+    lost: tokio::sync::mpsc::Sender<()>,
+) {
+    run_heartbeat_loop(attempt, stop, lost, move |mut attempt| {
+        let heartbeat_state = state.clone();
+        let heartbeat_task = task.clone();
+        async move {
+            match super::await_owned(
+                Duration::from_secs(2),
+                async move {
+                    let live = heartbeat_state
+                        .db
+                        .heartbeat_response_archive_spool(&heartbeat_task)
+                        .await?
+                        && heartbeat_proxy_archive_attempt(&heartbeat_state.db, &mut attempt)
+                            .await?;
+                    Ok::<_, AppError>((live, attempt))
+                },
+                "response_spool_heartbeat",
+            )
+            .await
+            {
+                Some(Ok((true, attempt))) => Some(attempt),
+                _ => None,
+            }
+        }
+    })
+    .await;
+}
 
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
+async fn run_heartbeat_loop<A, R, Renewal>(
+    mut attempt: A,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+    lost: tokio::sync::mpsc::Sender<()>,
+    mut renew: R,
+) where
+    R: FnMut(A) -> Renewal,
+    Renewal: Future<Output = Option<A>>,
+{
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut stop => break,
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+        }
+        let Some(renewed) = renew(attempt).await else {
+            let _ = lost.send(()).await;
+            break;
+        };
+        attempt = renewed;
     }
 }
 
@@ -430,6 +506,48 @@ mod tests {
         assert!(!claim.is_finished(), "slow is not a cancellation deadline");
         release.send(()).unwrap();
         assert_eq!(claim.await.unwrap().unwrap(), Some(17));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_stop_waits_for_the_current_renewal_boundary() {
+        let (stop, stop_receiver) = tokio::sync::oneshot::channel();
+        let (lost, mut lost_receiver) = tokio::sync::mpsc::channel(1);
+        let (entered, entering) = tokio::sync::oneshot::channel();
+        let mut entered = Some(entered);
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let renewal_release = release.clone();
+        let renewals = Arc::new(AtomicUsize::new(0));
+        let renewal_count = renewals.clone();
+        let heartbeat = tokio::spawn(run_heartbeat_loop((), stop_receiver, lost, move |()| {
+            let entered = entered.take();
+            let release = renewal_release.clone();
+            renewal_count.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if let Some(entered) = entered {
+                    entered.send(()).unwrap();
+                }
+                release.acquire().await.unwrap().forget();
+                Some(())
+            }
+        }));
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::time::timeout(Duration::from_secs(1), entering)
+            .await
+            .expect("heartbeat renewal must start")
+            .unwrap();
+        stop.send(()).unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !heartbeat.is_finished(),
+            "stopping must not cancel a renewal that can own a transaction"
+        );
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(1), heartbeat)
+            .await
+            .expect("heartbeat must stop after the active renewal settles")
+            .unwrap();
+        assert_eq!(renewals.load(Ordering::SeqCst), 1);
+        assert!(lost_receiver.try_recv().is_err());
     }
 
     #[tokio::test]

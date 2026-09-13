@@ -1,7 +1,9 @@
-use std::future::Future;
-
 use bytes::Bytes;
 use getrandom::fill;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use crate::{AppState, db::ArchiveSpoolIdentity, error::AppError};
 
@@ -152,6 +154,49 @@ static FAIL_NEXT_APPEND: std::sync::LazyLock<std::sync::Mutex<std::collections::
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
 #[cfg(test)]
+type BeginAckPause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(test)]
+static PAUSE_NEXT_BEGIN_ACK: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, BeginAckPause>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn pause_next_begin_ack_for_test(
+    state: &AppState,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered, entering) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let mut pauses = PAUSE_NEXT_BEGIN_ACK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        pauses
+            .insert(state.config.database_url.clone(), (entered, released))
+            .is_none()
+    );
+    (entering, release)
+}
+
+#[cfg(test)]
+async fn pause_begin_ack_for_test(state: &AppState) {
+    let pause = PAUSE_NEXT_BEGIN_ACK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&state.config.database_url);
+    if let Some((entered, released)) = pause {
+        let _ = entered.send(());
+        let _ = released.await;
+    }
+}
+
+#[cfg(test)]
 /// Latch one producer failure without opening a database transaction, so tests
 /// can isolate capture failure from persistence failure on the following gap.
 pub(crate) fn fail_next_append_for_test(state: &AppState) {
@@ -176,9 +221,83 @@ pub(crate) struct ResponseArchiveProducer {
     bytes: i64,
 }
 
+struct CaptureAck<T> {
+    value: Option<T>,
+    state: AppState,
+    identity: ArchiveSpoolIdentity,
+}
+
+impl<T> CaptureAck<T> {
+    fn new(value: T, state: AppState, identity: ArchiveSpoolIdentity) -> Self {
+        Self {
+            value: Some(value),
+            state,
+            identity,
+        }
+    }
+
+    fn claim(mut self) -> T {
+        self.value.take().expect("capture acknowledgement value")
+    }
+}
+
+impl<T> Drop for CaptureAck<T> {
+    fn drop(&mut self) {
+        if self.value.is_none() {
+            return;
+        }
+        let state = self.state.clone();
+        let identity = self.identity;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Err(error) = state
+                    .db
+                    .fail_response_archive_spool(identity, "capture_failed")
+                    .await
+                {
+                    tracing::warn!(
+                        stage = "response_spool_late_ack_fence",
+                        error_category = error.diagnostic_category(),
+                        "late response archive acknowledgement could not be fenced"
+                    );
+                }
+            });
+        }
+    }
+}
+
+async fn fence_failed_capture(state: &AppState, identity: ArchiveSpoolIdentity) {
+    if let Err(error) = state
+        .db
+        .fail_response_archive_spool(identity, "capture_failed")
+        .await
+    {
+        tracing::warn!(
+            stage = "response_spool_failed_ack_fence",
+            error_category = error.diagnostic_category(),
+            "failed response archive acknowledgement could not be fenced"
+        );
+    }
+}
+
 impl ResponseArchiveProducer {
     pub(crate) async fn begin(state: &AppState, identity: ArchiveSpoolIdentity) -> Option<Self> {
-        match bounded_ack(Self::begin_inner(state, identity)).await {
+        let state = state.clone();
+        let cleanup_state = state.clone();
+        match bounded_ack(move |_| async move {
+            let producer = match Self::begin_inner(state.clone(), identity).await {
+                Ok(producer) => producer,
+                Err(error) => {
+                    fence_failed_capture(&state, identity).await;
+                    return Err(error);
+                }
+            };
+            #[cfg(test)]
+            pause_begin_ack_for_test(&producer.state).await;
+            Ok(CaptureAck::new(producer, cleanup_state, identity))
+        })
+        .await
+        {
             Some(producer) => Some(producer),
             _ => {
                 tracing::warn!(request_id = %identity.request_id, stage = "response_spool_admission", "proxy archive gap");
@@ -188,14 +307,14 @@ impl ResponseArchiveProducer {
     }
 
     async fn begin_inner(
-        state: &AppState,
+        state: AppState,
         identity: ArchiveSpoolIdentity,
     ) -> Result<Self, AppError> {
         if !state.db.begin_response_archive_spool(identity).await? {
             return Err(AppError::Internal);
         }
         Ok(Self {
-            state: state.clone(),
+            state,
             identity,
             seq: 0,
             bytes: 0,
@@ -207,7 +326,7 @@ impl ResponseArchiveProducer {
         state: &AppState,
         identity: ArchiveSpoolIdentity,
     ) -> Result<Self, AppError> {
-        Self::begin_inner(state, identity).await
+        Self::begin_inner(state.clone(), identity).await
     }
 
     pub(crate) async fn append(&mut self, chunks: Vec<Bytes>) -> bool {
@@ -215,14 +334,46 @@ impl ResponseArchiveProducer {
         if take_append_failure_for_test(&self.state) {
             return false;
         }
-        let _memory = self.state.metrics.memory_usage(
-            crate::metrics::MemoryComponent::StreamCapture,
-            super::CHUNK_BYTES * 5,
-        );
-        bounded_ack(self.append_inner(chunks)).await.is_some()
+        let state = self.state.clone();
+        let identity = self.identity;
+        let seq = self.seq;
+        let bytes = self.bytes;
+        let cleanup_state = state.clone();
+        match bounded_ack(move |active| async move {
+            let _memory = state.metrics.memory_usage(
+                crate::metrics::MemoryComponent::StreamCapture,
+                super::CHUNK_BYTES * 5,
+            );
+            let counters =
+                match Self::append_inner(state.clone(), identity, seq, bytes, chunks, active).await
+                {
+                    Ok(counters) => counters,
+                    Err(error) => {
+                        fence_failed_capture(&state, identity).await;
+                        return Err(error);
+                    }
+                };
+            Ok(CaptureAck::new(counters, cleanup_state, identity))
+        })
+        .await
+        {
+            Some((seq, bytes)) => {
+                self.seq = seq;
+                self.bytes = bytes;
+                true
+            }
+            None => false,
+        }
     }
 
-    async fn append_inner(&mut self, chunks: Vec<Bytes>) -> Result<(), AppError> {
+    async fn append_inner(
+        state: AppState,
+        identity: ArchiveSpoolIdentity,
+        mut seq: i64,
+        mut total_bytes: i64,
+        chunks: Vec<Bytes>,
+        active: Arc<AtomicBool>,
+    ) -> Result<(i64, i64), AppError> {
         let mut buffered = Vec::with_capacity(super::CHUNK_BYTES);
         for chunk in chunks {
             let mut remaining = chunk.as_ref();
@@ -231,52 +382,90 @@ impl ResponseArchiveProducer {
                 buffered.extend_from_slice(&remaining[..take]);
                 remaining = &remaining[take..];
                 if buffered.len() == super::CHUNK_BYTES {
-                    self.append_chunk(&buffered).await?;
+                    if !active.load(Ordering::Acquire) {
+                        return Err(AppError::Internal);
+                    }
+                    Self::append_chunk(&state, identity, &mut seq, &mut total_bytes, &buffered)
+                        .await?;
                     buffered.clear();
                 }
             }
         }
         if !buffered.is_empty() {
-            self.append_chunk(&buffered).await?;
+            if !active.load(Ordering::Acquire) {
+                return Err(AppError::Internal);
+            }
+            Self::append_chunk(&state, identity, &mut seq, &mut total_bytes, &buffered).await?;
         }
-        Ok(())
+        Ok((seq, total_bytes))
     }
 
     #[cfg(test)]
     pub(super) async fn append_for_test(&mut self, chunks: Vec<Bytes>) -> Result<(), AppError> {
-        self.append_inner(chunks).await
-    }
-
-    async fn append_chunk(&mut self, bytes: &[u8]) -> Result<(), AppError> {
-        let ciphertext = super::cipher::seal(
+        let (seq, bytes) = Self::append_inner(
+            self.state.clone(),
             self.identity,
             self.seq,
-            bytes,
-            self.state.config.key_pepper.as_bytes(),
-        )?;
+            self.bytes,
+            chunks,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await?;
+        self.seq = seq;
+        self.bytes = bytes;
+        Ok(())
+    }
+
+    async fn append_chunk(
+        state: &AppState,
+        identity: ArchiveSpoolIdentity,
+        seq: &mut i64,
+        total_bytes: &mut i64,
+        bytes: &[u8],
+    ) -> Result<(), AppError> {
+        let ciphertext =
+            super::cipher::seal(identity, *seq, bytes, state.config.key_pepper.as_bytes())?;
         let byte_count = i64::try_from(bytes.len()).map_err(|_| AppError::Internal)?;
-        if !self
-            .state
+        if !state
             .db
-            .append_response_archive_spool(self.identity, self.seq, byte_count, &ciphertext)
+            .append_response_archive_spool(identity, *seq, byte_count, &ciphertext)
             .await?
         {
             return Err(AppError::Internal);
         }
-        self.seq += 1;
-        self.bytes += byte_count;
+        *seq += 1;
+        *total_bytes += byte_count;
         Ok(())
     }
 
     pub(crate) async fn seal(self) -> bool {
-        bounded_ack(self.seal_inner()).await.is_some()
+        let Self {
+            state,
+            identity,
+            seq,
+            bytes,
+        } = self;
+        let cleanup_state = state.clone();
+        bounded_ack(move |_| async move {
+            if let Err(error) = Self::seal_inner(state.clone(), identity, seq, bytes).await {
+                fence_failed_capture(&state, identity).await;
+                return Err(error);
+            }
+            Ok(CaptureAck::new((), cleanup_state, identity))
+        })
+        .await
+        .is_some()
     }
 
-    async fn seal_inner(self) -> Result<(), AppError> {
-        if !self
-            .state
+    async fn seal_inner(
+        state: AppState,
+        identity: ArchiveSpoolIdentity,
+        seq: i64,
+        bytes: i64,
+    ) -> Result<(), AppError> {
+        if !state
             .db
-            .seal_response_archive_spool(self.identity, self.seq, self.bytes)
+            .seal_response_archive_spool(identity, seq, bytes)
             .await?
         {
             return Err(AppError::Internal);
@@ -286,15 +475,31 @@ impl ResponseArchiveProducer {
 
     #[cfg(test)]
     pub(super) async fn seal_for_test(self) -> Result<(), AppError> {
-        self.seal_inner().await
+        let Self {
+            state,
+            identity,
+            seq,
+            bytes,
+        } = self;
+        Self::seal_inner(state, identity, seq, bytes).await
     }
 }
 
-async fn bounded_ack<T>(future: impl Future<Output = Result<T, AppError>>) -> Option<T> {
-    tokio::time::timeout(super::ACK_TIMEOUT, future)
-        .await
-        .ok()?
-        .ok()
+async fn bounded_ack<T, Operation, Ack>(operation: Operation) -> Option<T>
+where
+    T: Send + 'static,
+    Operation: FnOnce(Arc<AtomicBool>) -> Ack,
+    Ack: std::future::Future<Output = Result<CaptureAck<T>, AppError>> + Send + 'static,
+{
+    let active = Arc::new(AtomicBool::new(true));
+    let result = super::await_owned_with_active(
+        super::ACK_TIMEOUT,
+        operation(active.clone()),
+        "response_spool_ack",
+        Some(active),
+    )
+    .await?;
+    result.ok().map(CaptureAck::claim)
 }
 
 pub(crate) async fn mark_gap(
@@ -304,14 +509,21 @@ pub(crate) async fn mark_gap(
 ) {
     // Lost database ACKs are not retried by resending upstream or recharging.
     // Stale unsealed captures are independently fenced and expired by worker.
-    let result = bounded_ack(mark_gap_inner(state, identity, reason)).await;
+    let state = state.clone();
+    let result = super::await_owned(
+        super::ACK_TIMEOUT,
+        async move { mark_gap_inner(state, identity, reason).await },
+        "response_spool_gap_ack",
+    )
+    .await
+    .and_then(Result::ok);
     if result.is_none() {
         tracing::warn!(request_id = %identity.request_id, stage = "response_spool_gap_ack", "proxy archive gap");
     }
 }
 
 async fn mark_gap_inner(
-    state: &AppState,
+    state: AppState,
     identity: ArchiveSpoolIdentity,
     reason: &'static str,
 ) -> Result<(), AppError> {
@@ -324,7 +536,7 @@ pub(super) async fn mark_gap_for_test(
     identity: ArchiveSpoolIdentity,
     reason: &'static str,
 ) -> Result<(), AppError> {
-    mark_gap_inner(state, identity, reason).await
+    mark_gap_inner(state.clone(), identity, reason).await
 }
 
 #[cfg(test)]
@@ -362,11 +574,27 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn acknowledgement_deadline_fails_closed_without_completion() {
+    async fn acknowledgement_deadline_fails_closed_without_cancelling_the_operation() {
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (settled, settlement) = tokio::sync::oneshot::channel();
         let started = tokio::time::Instant::now();
-        let result = bounded_ack(std::future::pending::<Result<(), AppError>>()).await;
+        let result = super::super::await_owned(
+            super::super::ACK_TIMEOUT,
+            async move {
+                released.await.unwrap();
+                settled.send(()).unwrap();
+                Ok(())
+            },
+            "response_spool_ack_test",
+        )
+        .await;
 
         assert!(result.is_none());
         assert_eq!(started.elapsed(), super::super::ACK_TIMEOUT);
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), settlement)
+            .await
+            .expect("timed-out acknowledgement must settle in its owned task")
+            .unwrap();
     }
 }
