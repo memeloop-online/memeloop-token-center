@@ -1,4 +1,4 @@
-import { useId, useState } from 'react';
+import { useId, useLayoutEffect, useState } from 'react';
 import { api } from '../api';
 import { Button } from '../design-system';
 import { useI18n } from '../i18n';
@@ -19,8 +19,9 @@ export function ProxyInput({ value, onChange, disabled = false }: { value: strin
   </div>;
 }
 
-export function UpstreamConnection({ account, token, tenant, disabled, onChanged }: {
+export function UpstreamConnection({ account, token, tenant, disabled, onChanged, onEditingChange }: {
   account: UpstreamAccount; token: string; tenant: string; disabled: boolean; onChanged: () => Promise<void>;
+  onEditingChange?: (editing: boolean) => void;
 }) {
   const { t } = useI18n();
   const [editing, setEditing] = useState(false);
@@ -28,6 +29,10 @@ export function UpstreamConnection({ account, token, tenant, disabled, onChanged
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(false);
   const [saved, setSaved] = useState(false);
+  useLayoutEffect(() => {
+    onEditingChange?.(editing);
+    return () => onEditingChange?.(false);
+  }, [editing, onEditingChange]);
   const codex = account.driver === 'openai-codex' && account.auth_kind === 'oauth';
   const canEditProxy = codex && account.can_update_transport_proxy === true;
   const proxyState = account.has_proxy === undefined ? 'connection.proxyUnknown' : account.has_proxy ? account.proxy_scheme ? 'connection.proxyConfigured' : 'connection.proxyNeedsUpdate' : 'connection.proxyMissing';
