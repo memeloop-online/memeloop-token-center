@@ -44,7 +44,7 @@ test('create and rotate keep provider secrets masked across keyboard, mobile and
           }
           for (const input of await inputs.all()) {
             assert.equal(await input.getAttribute('type'), 'password');
-            assert.equal(await input.inputValue() === '', true, 'existing/default secret must not be prefilled');
+            assert.equal(await input.inputValue() === '', true, `${variant}/${locale}/${theme}/${name}/${await input.getAttribute('id')}: existing/default secret must not be prefilled`);
             assert.equal(await input.getAttribute('autocomplete'), 'new-password');
             const synthetic = (await input.getAttribute('id'))?.endsWith('adapter_state') ? '{"synthetic":true}' : 'synthetic-only';
             if ((await input.getAttribute('id'))?.endsWith('adapter_state')) {

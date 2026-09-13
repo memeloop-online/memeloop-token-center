@@ -40,7 +40,7 @@ import { enumLabel, messageOf, OneTimeSecret, queryForTenant, WriteScopeNotice }
 
 export function OperatorSchemaForm(props: FormProps) {
   const prepared = useMemo(() => prepareSecretForm(props.schema, props.validator, props.formData), [props.schema, props.validator, props.formData]);
-  return <RjsfForm {...props} {...prepared} fields={{ ...props.fields, SchemaField: SecureSchemaField }} noHtml5Validate onError={() => { /* Validation is rendered inline; never log form data. */ }} />;
+  return <RjsfForm {...props} {...prepared} experimental_defaultFormStateBehavior={prepared.schema === props.schema ? props.experimental_defaultFormStateBehavior : { ...props.experimental_defaultFormStateBehavior, emptyObjectFields: 'skipEmptyDefaults', arrayMinItems: { ...props.experimental_defaultFormStateBehavior?.arrayMinItems, computeSkipPopulate: (_validator, schema) => schema.writeOnly === true || schema.format === 'password' } }} fields={{ ...props.fields, SchemaField: SecureSchemaField }} noHtml5Validate onError={() => { /* Validation is rendered inline; never log form data. */ }} />;
 }
 
 const Form = OperatorSchemaForm;
