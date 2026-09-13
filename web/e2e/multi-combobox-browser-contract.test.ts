@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
@@ -56,10 +57,34 @@ test('multi-select escapes clipping and supports keyboard selection, dismissal a
     assert.equal(await retry.evaluate(element => element === document.activeElement), true);
     await retry.press('Enter');
     await page.getByRole('alert').waitFor({ state: 'detached' });
-    for (const theme of ['dark', 'light']) {
+    const artifacts = fileURLToPath(new URL('../e2e-artifacts/ui-system/multi-combobox/', import.meta.url));
+    await mkdir(artifacts, { recursive: true });
+    for (const theme of ['dark', 'light']) for (const width of [320, 390, 768, 1440]) {
       await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
+      await page.setViewportSize({ width, height: 900 });
+      await input.fill('no-such-workspace');
+      await page.getByText('No matching workspaces', { exact: true }).waitFor();
+      const before = await page.getByLabel('Submission count').innerText();
+      await input.press('Enter');
+      assert.equal(await page.getByLabel('Submission count').innerText(), before, 'empty open picker must not submit the editor');
+      assert.equal(await input.evaluate(element => element === document.activeElement), true);
+      await input.press('Escape');
+      await menu.waitFor({ state: 'hidden' });
+      // A closed picker still allows the enclosing form's ordinary Enter action.
+      await input.press('Enter');
+      assert.equal(await page.getByLabel('Submission count').innerText(), String(Number(before) + 1));
+      const remove = page.getByRole('button', { name: /^Remove Workspace/ }).first();
+      await remove.focus();
+      await remove.press('Enter');
+      assert.equal(await input.evaluate(element => element === document.activeElement), true, 'removing the focused chip returns focus to the picker');
+      await input.fill('Workspace');
+      await input.press('ArrowDown');
+      await input.press('Enter');
+      assert.equal(await page.getByLabel('Selected count').innerText(), '2');
       await input.focus();
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+      assert.equal(await menu.getAttribute('aria-modal'), null);
+      await page.screenshot({ path: `${artifacts}/${theme}-${width}.png`, fullPage: true });
     }
   } finally { await browser.close(); await server.close(); }
 });

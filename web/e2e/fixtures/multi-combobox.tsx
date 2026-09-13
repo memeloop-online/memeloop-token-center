@@ -10,9 +10,11 @@ function Fixture() {
   const [selected, setSelected] = useState<ComboboxOption[]>([]);
   const [query, setQuery] = useState('');
   const [error, setError] = useState(false);
+  const [submissions, setSubmissions] = useState(0);
   return <main style={{ padding: 24, maxWidth: 600, margin: '0 auto' }}>
     <h1 onMouseDown={(event) => event.preventDefault()}>Resource selection</h1>
     <button onClick={() => setError(true)}>Simulate unavailable search</button>
+    <form onSubmit={(event) => { event.preventDefault(); setSubmissions(value => value + 1); }}>
     <div style={{ overflow: 'hidden', height: 160, padding: 8, marginTop: 40 }}>
       <MultiCombobox label="Workspaces" options={options} value={selected} onChange={setSelected}
         placeholder="Search workspaces" emptyText="No matching workspaces" removeLabel={label => `Remove ${label}`}
@@ -20,6 +22,8 @@ function Fixture() {
         onQueryChange={setQuery} error={error ? 'Search unavailable. Try again.' : ''} retryLabel="Retry search" onRetry={() => setError(false)} />
     </div>
     <button>Continue</button>
+    </form>
+    <output aria-label="Submission count">{submissions}</output>
     <output aria-label="Selected count">{selected.length}</output>
     <output aria-label="Search query">{query || 'empty'}</output>
   </main>;
