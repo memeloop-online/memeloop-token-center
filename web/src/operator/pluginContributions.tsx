@@ -257,20 +257,35 @@ function TypedPluginData(props: {
   compact?: boolean;
 }) {
   const { registered, token: credential, tenant } = props;
+  const scopeKey = JSON.stringify([credential, tenant, registered.manifestRevision, registered.contribution.data_endpoint]);
   if (registered.contribution.presentation === 'projection_v1') {
-    return <PluginUiSlot
+    return <ProjectionPluginData key={scopeKey} {...props} scopeKey={scopeKey} />;
+  }
+  return <LegacyTypedPluginData key={scopeKey} {...props} />;
+}
+
+function ProjectionPluginData({ registered, token: credential, tenant, scopeKey }: {
+  registered: RegisteredPluginContribution;
+  token: string;
+  tenant: string;
+  scopeKey: string;
+}) {
+  const [partial, setPartial] = useState(false);
+  return <>
+    {partial && <div className="notice" role="status">Showing degraded plugin data.</div>}
+    <PluginUiSlot
       pluginId={registered.pluginId} slotId={registered.contribution.id}
       title={registered.contribution.label}
-      scopeKey={JSON.stringify([credential, tenant, registered.manifestRevision, registered.contribution.data_endpoint])}
+      scopeKey={scopeKey}
       allowedLinkOrigins={registered.allowedLinkOrigins ?? []}
       messages={{ loading: 'Loading plugin data…', unavailable: 'Plugin data is currently unavailable.', empty: 'No current signals.', states: { ok: 'Healthy', warning: 'Warning', error: 'Error', unknown: 'Unknown' } }}
       load={async (signal) => {
         const response = await api<PluginServiceDataResponse>(serviceDataPath(registered.pluginId, registered.contribution.data_endpoint, tenant), credential, { signal });
+        if (!signal.aborted) setPartial(response.partial);
         return response.data;
       }}
-    />;
-  }
-  return <LegacyTypedPluginData key={JSON.stringify([credential, tenant, registered.manifestRevision, registered.contribution.data_endpoint])} {...props} />;
+    />
+  </>;
 }
 
 function LegacyTypedPluginData({ registered, token: credential, tenant, compact = false }: {

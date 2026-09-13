@@ -37,18 +37,20 @@ test('real Operator route authenticates projection reads and discards prior tena
         if (tenant === 'beta') return route.fulfill({ status: 403, json: { error: { message: 'Tenant feed denied' } } });
         return route.fulfill({ json: {
           data: { schema_version: 1, plugin_id: 'dashboard', slot_id: 'summary', components: [{ kind: 'metric', label: 'Tenant requests', value: 'alpha-private-42' }, { kind: 'link', label: 'Details', href: 'https://example.com/details' }] },
-          partial: false, provenance: { plugin_id: 'dashboard', endpoint_id: 'summary-data', origin: 'https://example.com', fetched_at: Date.now(), source: 'network' },
+          partial: true, provenance: { plugin_id: 'dashboard', endpoint_id: 'summary-data', origin: 'https://example.com', fetched_at: Date.now(), source: 'fallback' },
         } });
       }
       return route.fulfill({ json: [] });
     });
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-plugin-projection.html`);
     await page.getByText('alpha-private-42', { exact: true }).waitFor();
+    await page.getByText('Showing degraded plugin data.', { exact: true }).waitFor();
     assert.equal(await page.locator('.plugin-contribution-page .plugin-ui-slot').count(), 1);
     assert.equal(await page.getByRole('link', { name: 'Details', exact: true }).getAttribute('href'), 'https://example.com/details');
     await page.locator('.tenant-scope-switcher select').selectOption('beta');
     await page.getByText('Plugin data is currently unavailable.', { exact: true }).waitFor();
     assert.equal(await page.getByText('alpha-private-42', { exact: true }).count(), 0);
+    assert.equal(await page.getByText('Showing degraded plugin data.', { exact: true }).count(), 0);
     assert.deepEqual(calls, [
       { tenant: 'alpha', authorization: 'Bearer mts_projection_fixture' },
       { tenant: 'beta', authorization: 'Bearer mts_projection_fixture' },
