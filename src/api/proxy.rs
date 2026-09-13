@@ -641,18 +641,7 @@ pub(super) async fn proxy(
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 ) -> Result<Response, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
-    proxy_with_identity(state, headers, body, protocol, key, None).await
-}
-
-fn pinned_request_envelope_changed(
-    pinned_route: Option<Uuid>,
-    original: &Value,
-    applied: &AppliedTraffic,
-) -> bool {
-    pinned_route.is_some()
-        && (applied.request_rewrite_supplied
-            || original != &applied.request_json
-            || original.get("model").and_then(Value::as_str) != Some(applied.model.as_str()))
+    proxy_with_identity(state, headers, body, protocol, key, None, memory).await
 }
 
 /// Internal callers must establish an explicit billing identity. A pinned route
@@ -664,6 +653,7 @@ pub(in crate::api) async fn proxy_with_identity(
     protocol: Protocol,
     key: AuthenticatedKey,
     pinned_route: Option<Uuid>,
+    memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 ) -> Result<Response, AppError> {
     let _request_buffer = state
         .metrics
@@ -691,7 +681,7 @@ pub(in crate::api) async fn proxy_with_identity(
         memory.clone(),
     )
     .await?;
-    if pinned_request_envelope_changed(pinned_route, &original_request_json, &applied) {
+    if pinned_route.is_some() && applied.changes_pinned_envelope(&original_request_json) {
         // Pinned internal callers establish their own reviewed request
         // envelope. Traffic policy may still deny it or rank an already
         // authorized account, but must never add tools, replace instructions,

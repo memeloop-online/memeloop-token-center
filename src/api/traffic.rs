@@ -199,6 +199,14 @@ pub(super) struct AppliedTraffic {
     pub(super) request_rewrite_supplied: bool,
 }
 
+impl AppliedTraffic {
+    pub(in crate::api) fn changes_pinned_envelope(&self, original: &Value) -> bool {
+        self.request_rewrite_supplied
+            || original != &self.request_json
+            || original.get("model").and_then(Value::as_str) != Some(self.model.as_str())
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct TrafficPolicyProtocols<'a> {
     /// The client-facing protocol exposed to traffic-policy plugins.
@@ -343,6 +351,7 @@ async fn apply_traffic_plugin(
             requested_model: requested_model.clone(),
             model: requested_model,
             upstream_account_hint: None,
+            request_rewrite_supplied: false,
         });
     }
     let temporary_memory = if memory.is_some() {

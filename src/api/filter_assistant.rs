@@ -65,8 +65,17 @@ pub(super) async fn execute(
         HeaderValue::from_static("filter-assistant"),
     );
     let body = Bytes::from(serde_json::to_vec(&request).map_err(|_| AppError::Internal)?);
-    let response =
-        proxy_with_identity(state, headers, body, wire_protocol, key, Some(route_id)).await?;
+    let memory = state.proxy_memory_budget.reservation();
+    let response = proxy_with_identity(
+        state,
+        headers,
+        body,
+        wire_protocol,
+        key,
+        Some(route_id),
+        memory,
+    )
+    .await?;
     if !response.status().is_success() {
         return Err(AppError::Upstream(
             "filter assistant model execution failed; no filter was applied".into(),
