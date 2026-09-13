@@ -143,6 +143,7 @@ fn row(id: String, item: &Value, now: i64) -> Result<QuotaWindow, &'static str> 
         used,
         remaining,
         limit,
+        unit: None,
         reset_at: absolute.or(relative),
         period_seconds,
         source: "kimi_usage",
@@ -302,8 +303,15 @@ mod tests {
         assert!(codex.read && codex.reset_credit_expiry && !codex.window_amounts);
         assert!(kimi.read && kimi.window_amounts && !kimi.reset_credit_expiry);
         assert!(!codex.subscription_expiry && !kimi.subscription_expiry);
+        assert!(codex.plan && !kimi.plan);
+        assert!(!codex.workspace && !kimi.workspace);
+        assert!(!codex.window_amount_unit && !kimi.window_amount_unit);
+        assert!(codex.supplier_read_only && kimi.supplier_read_only);
+        assert!(!codex.refreshes_credentials && !kimi.refreshes_credentials);
+        assert!(!codex.consumes_reset_credit && !kimi.consumes_reset_credit);
         assert!(!QuotaCapabilities::for_provider("unknown").read);
         let rows = windows(&json!({"usage":{"used":"NaN","limit":"Infinity"}}), 0).unwrap();
         assert!(rows[0].used.is_none() && rows[0].limit.is_none());
+        assert!(rows[0].unit.is_none());
     }
 }

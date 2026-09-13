@@ -1162,7 +1162,8 @@ paths:
       x-required-scope: providers:read
       description: |
         Requires an explicit authorized tenant. Performs only bounded native
-        Codex usage and reset-credit GETs with server-held encrypted credentials.
+        Codex/Kimi usage GETs and the Codex reset-credit GET with server-held
+        encrypted credentials.
         Never consumes a reset credit or exposes supplier bodies or secrets.
         Snapshots are cached for 30 seconds with bounded singleflight/concurrency;
         stale observations may be retained for five minutes after a read error.
@@ -1185,7 +1186,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [contract_version, upstream_account_id, tenant_external_id, provider, status, observed_at, stale_after, stale, plan_type, windows, credits, reset_capability, error_code]
+                required: [contract_version, upstream_account_id, tenant_external_id, provider, status, observed_at, stale_after, stale, freshness, plan_type, workspace, capabilities, subscription_active_until, reset_credits, windows, credits, reset_capability, error_code]
                 properties:
                   contract_version: { const: upstream_quota_v1 }
                   upstream_account_id: { type: string, format: uuid }
@@ -1195,18 +1196,48 @@ paths:
                   observed_at: { type: [integer, 'null'], format: int64, description: Unix epoch milliseconds of supplier observation. }
                   stale_after: { type: [integer, 'null'], format: int64, description: Unix epoch milliseconds freshness deadline. }
                   stale: { type: boolean }
+                  freshness: { type: string, enum: [unobserved, fresh, stale] }
                   plan_type: { type: [string, 'null'] }
+                  workspace: { type: [string, 'null'], description: Verified supplier workspace label; null when the native adapter has no source contract. }
+                  subscription_active_until: { type: [integer, 'null'], format: int64, description: Verified subscription expiry, never OAuth access-token expiry. }
+                  capabilities:
+                    type: object
+                    required: [read, plan, workspace, window_amounts, window_amount_unit, window_percent, reset_credit_expiry, subscription_expiry, supplier_read_only, refreshes_credentials, consumes_reset_credit]
+                    properties:
+                      read: { type: boolean }
+                      plan: { type: boolean }
+                      workspace: { type: boolean }
+                      window_amounts: { type: boolean }
+                      window_amount_unit: { type: boolean }
+                      window_percent: { type: boolean }
+                      reset_credit_expiry: { type: boolean }
+                      subscription_expiry: { type: boolean }
+                      supplier_read_only: { type: boolean, description: The quota inspection itself does not mutate the supplier. }
+                      refreshes_credentials: { type: boolean }
+                      consumes_reset_credit: { type: boolean }
+                  reset_credits:
+                    type: array
+                    maxItems: 1024
+                    items:
+                      type: object
+                      required: [status, granted_at, expires_at, source]
+                      properties:
+                        status: { type: [string, 'null'] }
+                        granted_at: { type: [integer, 'null'], format: int64 }
+                        expires_at: { type: [integer, 'null'], format: int64 }
+                        source: { type: string, enum: [codex_reset_credits] }
                   error_code: { type: [string, 'null'], description: Sanitized product error code; never upstream text. }
                   credits:
                     type: object
-                    required: [balance, unlimited, has_credits]
+                    required: [balance, unlimited, has_credits, source]
                     properties:
                       balance: { type: [string, 'null'], description: Supplier decimal balance, not customer key balance. }
                       unlimited: { type: [boolean, 'null'] }
                       has_credits: { type: [boolean, 'null'] }
+                      source: { type: [string, 'null'], enum: [codex_usage, null] }
                   reset_capability:
                     type: object
-                    required: [provider_supported, implementation_available, prepare_available, confirmation_required, retryable, available_credits, applicable_credits, reason, credit_error_code]
+                    required: [provider_supported, implementation_available, prepare_available, confirmation_required, retryable, available_credits, applicable_credits, reason, credit_error_code, evidence]
                     properties:
                       provider_supported: { type: [boolean, 'null'] }
                       implementation_available: { type: boolean }
@@ -1217,18 +1248,21 @@ paths:
                       applicable_credits: { type: [integer, 'null'], format: int64 }
                       reason: { type: string }
                       credit_error_code: { type: [string, 'null'] }
+                      evidence: { type: string, enum: [server_driver_contract, unknown_provider], description: Server-held driver capability; dispatch still requires fresh credit evidence. }
                   windows:
                     type: array
                     maxItems: 68
                     items:
                       type: object
-                      required: [id, label, used_percent, remaining, limit, reset_at, period_seconds, source, reset_is_estimated, allowed, limit_reached]
+                      required: [id, label, used_percent, used, remaining, limit, unit, reset_at, period_seconds, source, reset_is_estimated, allowed, limit_reached]
                       properties:
                         id: { type: string }
                         label: { type: string }
                         used_percent: { type: [number, 'null'] }
+                        used: { type: [number, 'null'] }
                         remaining: { type: [number, 'null'] }
                         limit: { type: [number, 'null'] }
+                        unit: { type: [string, 'null'], description: Supplier-declared unit; null when amounts are unitless or the contract is unknown. }
                         reset_at: { type: [integer, 'null'], format: int64, description: Unix epoch milliseconds. }
                         period_seconds: { type: [integer, 'null'], format: int64 }
                         source: { type: string }

@@ -85,6 +85,7 @@ pub(super) fn usage(
         }
     }
     let credits = &usage["credits"];
+    snapshot.credits.source = credits.is_object().then_some("codex_usage");
     // Preserve the supplier's decimal text without a floating-point roundtrip.
     snapshot.credits.balance = match &credits["balance"] {
         Value::String(value)
@@ -138,6 +139,7 @@ fn add_windows(
             used: None,
             remaining: None,
             limit: None,
+            unit: None,
             reset_at: absolute.or(relative),
             period_seconds: integer(field(window, "limit_window_seconds", "limitWindowSeconds")),
             source: "codex_usage",
@@ -175,6 +177,7 @@ pub(super) fn reset_credits(
                     status: text(&credit["status"]),
                     granted_at: timestamp(field(credit, "granted_at", "grantedAt")),
                     expires_at: timestamp(field(credit, "expires_at", "expiresAt")),
+                    source: "codex_reset_credits",
                 });
             }
             if field(credit, "reset_type", "resetType").as_str() != Some("codex_rate_limits")
@@ -230,6 +233,7 @@ mod tests {
             stale: false,
             freshness: "unobserved",
             plan_type: None,
+            workspace: None,
             capabilities: QuotaCapabilities::for_provider("openai-codex"),
             subscription_active_until: None,
             reset_credits: Vec::new(),
@@ -245,6 +249,7 @@ mod tests {
                 applicable_credits: None,
                 reason: "reset_workflow_not_implemented",
                 credit_error_code: None,
+                evidence: "server_driver_contract",
             },
             error_code: None,
         }
@@ -277,6 +282,7 @@ mod tests {
                 .all(|window| window.remaining.is_none())
         );
         assert_eq!(result.reset_capability.available_credits, Some(0));
+        assert_eq!(result.credits.source, Some("codex_usage"));
         assert!(
             !serde_json::to_string(&result)
                 .unwrap()
@@ -298,6 +304,12 @@ mod tests {
         assert_eq!(result.reset_capability.provider_supported, Some(true));
         assert!(!result.reset_capability.implementation_available);
         assert_eq!(result.reset_credits.len(), 3);
+        assert!(
+            result
+                .reset_credits
+                .iter()
+                .all(|credit| credit.source == "codex_reset_credits")
+        );
         assert!(result.reset_credits[0].expires_at.is_some());
         assert!(result.reset_credits[2].expires_at.is_none());
         assert!(result.subscription_active_until.is_none());

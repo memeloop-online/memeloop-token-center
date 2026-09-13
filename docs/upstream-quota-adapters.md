@@ -13,11 +13,11 @@ it is not a supplier mutation or a generic assertion that the account is healthy
 
 ## Supported fields
 
-| Native driver | Read source | Amounts | Reset windows | Credit expiry | Subscription expiry |
-| --- | --- | --- | --- | --- | --- |
-| openai-codex | WHAM usage and reset-credit GET endpoints | Percent used only; absolute amounts null | Supplier instant or marked estimate | Per Codex credit status/granted/expiry, with no identifier or secret | Null, capability false |
-| kimi-oauth | Kimi coding v1 usages GET | Total/used/remaining when supplied or safely derived | Supplier instant or marked relative estimate | Unsupported | Unsupported |
-| Other drivers | No network call | Unsupported | Unsupported | Unsupported | Unsupported |
+| Native driver | Read source | Plan/workspace | Amounts and units | Reset windows | Credit expiry | Subscription expiry |
+| --- | --- | --- | --- | --- | --- | --- |
+| openai-codex | WHAM usage and reset-credit GET endpoints | Supplier plan; workspace null | Percent used only; absolute amounts and unit null | Supplier instant or marked estimate | Per Codex credit status/granted/expiry, source `codex_reset_credits`, with no identifier or secret | Null, capability false |
+| kimi-oauth | Kimi coding v1 usages GET | Null; capability false | Total/used/remaining when supplied or safely derived; unit null because the supplier field has no verified unit contract | Supplier instant or marked relative estimate | Unsupported | Unsupported |
+| Other drivers | No network call | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported |
 
 Capabilities describe implemented fields, not current sample availability. Missing
 values remain null. `freshness` is `unobserved`, `fresh`, or `stale`; clients must
@@ -25,6 +25,11 @@ also compare `stale_after` with current time. `ready` means a parsed observation
 not routing health. Kimi never supplies inferred `allowed` or `limit_reached`.
 Missing or unrecognized Kimi duration units remain unknown. All timestamps are
 milliseconds. Reset-credit rows intentionally exclude supplier credit IDs.
+Machine-readable capabilities distinguish implemented fields from missing sample
+values and state that quota reads are supplier-read-only, do not refresh OAuth
+credentials, and do not consume reset credits. The separate reset capability is
+derived from the server-held driver contract; fresh credit evidence remains a
+requirement before prepare or confirmation can dispatch anything.
 
 Both adapters require the account's private IP-literal socks5h transport. Both
 use dedicated remote-DNS-only clients; supplier names are resolved by the proxy,

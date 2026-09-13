@@ -56,6 +56,8 @@ pub(crate) struct QuotaSnapshot {
     stale: bool,
     freshness: &'static str,
     plan_type: Option<String>,
+    /// No current native adapter has a verified supplier workspace field.
+    workspace: Option<String>,
     capabilities: QuotaCapabilities,
     /// Subscription lifetime is not OAuth token lifetime. Unknown stays null.
     subscription_active_until: Option<i64>,
@@ -74,6 +76,8 @@ struct QuotaWindow {
     used: Option<f64>,
     remaining: Option<f64>,
     limit: Option<f64>,
+    /// Supplier-declared unit only. Numeric values without one remain unknown.
+    unit: Option<String>,
     reset_at: Option<i64>,
     period_seconds: Option<i64>,
     source: &'static str,
@@ -85,20 +89,33 @@ struct QuotaWindow {
 #[derive(Clone, Serialize)]
 struct QuotaCapabilities {
     read: bool,
+    plan: bool,
+    workspace: bool,
     window_amounts: bool,
+    window_amount_unit: bool,
     window_percent: bool,
     reset_credit_expiry: bool,
     subscription_expiry: bool,
+    /// These describe the quota GET itself, not the separately confirmed reset.
+    supplier_read_only: bool,
+    refreshes_credentials: bool,
+    consumes_reset_credit: bool,
 }
 
 impl QuotaCapabilities {
     fn for_provider(provider: &str) -> Self {
         Self {
             read: matches!(provider, "openai-codex" | "kimi-oauth"),
+            plan: provider == "openai-codex",
+            workspace: false,
             window_amounts: provider == "kimi-oauth",
+            window_amount_unit: false,
             window_percent: matches!(provider, "openai-codex" | "kimi-oauth"),
             reset_credit_expiry: provider == "openai-codex",
             subscription_expiry: false,
+            supplier_read_only: true,
+            refreshes_credentials: false,
+            consumes_reset_credit: false,
         }
     }
 }
@@ -108,6 +125,7 @@ struct ResetCredit {
     status: Option<String>,
     granted_at: Option<i64>,
     expires_at: Option<i64>,
+    source: &'static str,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -115,6 +133,7 @@ struct Credits {
     balance: Option<String>,
     unlimited: Option<bool>,
     has_credits: Option<bool>,
+    source: Option<&'static str>,
 }
 
 #[derive(Clone, Serialize)]
@@ -131,11 +150,14 @@ struct ResetCapability {
     applicable_credits: Option<i64>,
     reason: &'static str,
     credit_error_code: Option<&'static str>,
+    /// Server-held driver capability; fresh credit evidence is still required.
+    evidence: &'static str,
 }
 
 impl QuotaSnapshot {
     fn empty(account: &UpstreamAccountView, tenant: &str, error: Option<&'static str>) -> Self {
         let codex = account.driver == "openai-codex";
+        let known_read_adapter = matches!(account.driver.as_str(), "openai-codex" | "kimi-oauth");
         Self {
             contract_version: "upstream_quota_v1",
             upstream_account_id: account.id,
@@ -151,13 +173,20 @@ impl QuotaSnapshot {
             stale: false,
             freshness: "unobserved",
             plan_type: None,
+            workspace: None,
             capabilities: QuotaCapabilities::for_provider(&account.driver),
             subscription_active_until: None,
             reset_credits: Vec::new(),
             windows: Vec::new(),
             credits: Credits::default(),
             reset_capability: ResetCapability {
-                provider_supported: codex.then_some(true),
+                provider_supported: if codex {
+                    Some(true)
+                } else if account.driver == "kimi-oauth" {
+                    Some(false)
+                } else {
+                    None
+                },
                 implementation_available: codex,
                 prepare_available: codex,
                 confirmation_required: codex,
@@ -170,6 +199,11 @@ impl QuotaSnapshot {
                     "quota_reset_not_supported"
                 },
                 credit_error_code: None,
+                evidence: if known_read_adapter {
+                    "server_driver_contract"
+                } else {
+                    "unknown_provider"
+                },
             },
             error_code: error,
         }
@@ -568,6 +602,34 @@ mod tests {
         );
         assert!(expired.observed_at.is_none());
         assert_eq!(expired.status, "error");
+    }
+
+    #[test]
+    fn first_read_failure_retains_server_reset_capability_without_consuming() {
+        let account: UpstreamAccountView = serde_json::from_value(json!({
+            "id":Uuid::from_u128(1), "tenant_id":Uuid::from_u128(2), "name":"fixture",
+            "driver":"openai-codex", "auth_kind":"oauth", "connection_method":"native_oauth",
+            "credential_generation":1, "status":"active", "config":{}, "can_refresh":true,
+            "can_rotate":false, "can_reauthorize":true, "route_count":0, "created_at":0, "updated_at":10
+        })).unwrap();
+        let first_read_failure =
+            QuotaSnapshot::empty(&account, "tenant", Some("quota_transport_failed"));
+        assert_eq!(first_read_failure.freshness, "unobserved");
+        assert_eq!(
+            first_read_failure.reset_capability.provider_supported,
+            Some(true)
+        );
+        assert!(first_read_failure.reset_capability.implementation_available);
+        assert!(first_read_failure.reset_capability.prepare_available);
+        assert!(first_read_failure.reset_capability.confirmation_required);
+        assert_eq!(
+            first_read_failure.reset_capability.evidence,
+            "server_driver_contract"
+        );
+        assert!(first_read_failure.capabilities.supplier_read_only);
+        assert!(!first_read_failure.capabilities.refreshes_credentials);
+        assert!(!first_read_failure.capabilities.consumes_reset_credit);
+        assert!(first_read_failure.workspace.is_none());
     }
 
     #[tokio::test]
