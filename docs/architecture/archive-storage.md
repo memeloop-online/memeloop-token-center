@@ -60,8 +60,12 @@ credentials, lease-owner UUIDs, or object paths. PostgreSQL replicas coordinate
 through `SKIP LOCKED`; SQLite cleanup is supported only for a single process.
 
 Incomplete multipart uploads are outside the completed-object listing used by
-the reaper. Production S3/MinIO therefore requires an
-`AbortIncompleteMultipartUpload` lifecycle rule (one day is recommended).
+the reaper. Production therefore requires verified provider-side reclamation:
+an `AbortIncompleteMultipartUpload` bucket lifecycle rule where supported,
+or provider-wide stale-upload cleanup such as MinIO's global mechanism.
+Application best-effort aborts cannot recover an upload ID lost before the
+create acknowledgement, and expiration/scan settings alone are not a strict
+cleanup service-level guarantee.
 Ordinary object expiry must never target `staging/`, because bound locators can
 remain there for their entire retention life.
 

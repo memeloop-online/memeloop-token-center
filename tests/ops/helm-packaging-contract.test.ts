@@ -46,12 +46,21 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       recreate: render('recreate', ['--set', 'deploymentStrategy=Recreate']),
       archiveReadyBoundary: render('archive-ready-boundary', ['--set', 'config.s3.readinessDeadlineMillis=5001', '--set', 'probes.readiness.timeoutSeconds=8']),
       archiveLive: render('archive-live', ['--set', 'config.s3.readinessDeadlineMillis=30000', '--set', 'probes.readiness.path=/livez']),
+      proxyMemory: render('proxy-memory', ['--set', 'config.proxyMemoryBudgetBytes=536870912', '--set', 'roles.gateway.resources.requests.memory=512Mi', '--set', 'roles.gateway.resources.limits.memory=768Mi']),
+      fractionalMemory: render('fractional-memory', ['--set', 'roles.gateway.resources.limits.memory=0.5Gi']),
+      maximumBodyMemory: render('maximum-body-memory', ['--set', 'config.responsesBodyMaxBytes=67108864', '--set', 'config.proxyMemoryBudgetBytes=1073741824', '--set', 'roles.gateway.resources.requests.memory=1Gi', '--set', 'roles.gateway.resources.limits.memory=1280Mi']),
     };
     const has = (key: string, needle: string): void => assert.ok(output[key]!.includes(needle), `${key} render lacks ${needle}`);
     const lacks = (key: string, pattern: string | RegExp): void => assert.ok(typeof pattern === 'string' ? !output[key]!.includes(pattern) : !pattern.test(output[key]!), `${key} render contains forbidden ${String(pattern)}`);
     const count = (key: string, pattern: string | RegExp, expected: number): void => assert.equal(occurrences(output[key]!, pattern), expected, `${key} count for ${String(pattern)}`);
 
     has('default', 'kind: NetworkPolicy'); has('default', 'kind: PodDisruptionBudget');
+    count('default', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "268435456"/, 3);
+    count('proxyMemory', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "536870912"/, 3);
+    const gatewayDeployment = output.default!.split(/^---$/m).find((document) => document.includes('kind: Deployment') && document.includes('app.kubernetes.io/component: gateway'))!;
+    assert.match(gatewayDeployment, /limits:\s+cpu: [^\n]+\s+memory: 512Mi/);
+    assert.match(gatewayDeployment, /requests:\s+cpu: [^\n]+\s+memory: 256Mi/);
+    has('fractionalMemory', 'memory: 0.5Gi');
     for (const deployment of output.default!.split(/^---$/m).filter((document) => document.includes('kind: Deployment'))) {
       for (const [name, value] of [['CONNECT_TIMEOUT', '5000'], ['REQUEST_TIMEOUT', '30000'], ['READINESS_DEADLINE', '5000']]) {
         assert.match(deployment, new RegExp(`name: MTC_S3_${name}_MILLIS\\s+value: "${value}"`), 'every role must use the same bounded S3 defaults');
@@ -106,6 +115,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       ['roles.control.service.type=NodePort'], ['roles.control.service.type=LoadBalancer'], ['roles.all.service.type=NodePort'], ['roles.all.service.type=LoadBalancer'],
       ['serviceAccount.automount=true'], ['plugins.mountpath=/plugins'], ['hostAliases[0].ip=10.28.0.22'], ['config.databaseMaxConnection=8'], ['config.gatewayBodyReadConcurrency=8193'], ['config.responsesBodyMaxBytes=67108865'], ['config.responsesBodyReadConcurrency=9'],
       ['config.runtimeProfiling.enabled=not-a-boolean'], ['config.runtimeProfiling.unknown=true'],
+      ['config.proxyMemoryBudgetBytes=268435455'], ['config.proxyMemoryBudgetBytes=2147483649'],
     ];
     for (const [index, values] of invalid.entries()) {
       const args = ['template', `invalid-${index}`, chart, ...values!.flatMap((value) => ['--set-string', value])];
@@ -122,7 +132,25 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       assert.match(result.stderr, /archive deadline rounded up plus 2 seconds|connectTimeoutMillis must not exceed requestTimeoutMillis/);
     }
     const oldSchema = spawnSync(helm, ['template', 'invalid-old-schema', chart, '--set', 'migration.schemaVersion=58'], { cwd: repository, encoding: 'utf8', shell: false });
+    for (const values of [
+      ['roles.gateway.resources.limits.memory=511Mi'],
+      ['roles.all.enabled=true', 'roles.gateway.enabled=false', 'roles.control.enabled=false', 'roles.worker.enabled=false', 'roles.all.resources.limits.memory=511Mi'],
+      ['config.proxyMemoryBudgetBytes=536870912'],
+    ]) {
+      const result = spawnSync(helm, ['template', 'invalid-workload-budget', chart, ...values.flatMap((value) => ['--set', value])], { cwd: repository, encoding: 'utf8', shell: false });
+      assert.notEqual(result.status, 0, `memory cross-field gate accepted ${values.join(',')}`);
+      assert.match(result.stderr, /memory must cover config.proxyMemoryBudgetBytes plus 256Mi/);
+    }
     assert.notEqual(oldSchema.status, 0, 'release values schema accepted migration.schemaVersion=58');
+    for (const budget of ['268435456', '805306368']) {
+      const result = spawnSync(helm, ['template', 'invalid-body-memory-budget', chart,
+        '--set', 'config.responsesBodyMaxBytes=67108864',
+        '--set', `config.proxyMemoryBudgetBytes=${budget}`,
+        '--set', 'roles.gateway.resources.limits.memory=1280Mi'],
+      { cwd: repository, encoding: 'utf8', shell: false });
+      assert.notEqual(result.status, 0, '64Mi body accepted insufficient retained-memory headroom');
+      assert.match(result.stderr, /responsesBodyMaxBytes times 12 plus 1Mi/);
+    }
 
     if (process.env.KUBECONFORM_BIN) {
       const result = spawnSync(process.env.KUBECONFORM_BIN, ['-strict', '-summary', '-ignore-missing-schemas'], { cwd: repository, input: Object.values(output).join('\n---\n'), encoding: 'utf8', shell: false });

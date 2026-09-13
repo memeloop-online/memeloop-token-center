@@ -37,6 +37,7 @@ pub struct Metrics {
 }
 
 struct MetricsInner {
+    proxy_memory_rejections: [AtomicU64; 6],
     http: Mutex<BTreeMap<HttpLabels, RequestSeries>>,
     upstream: Mutex<BTreeMap<UpstreamLabels, RequestSeries>>,
     upstream_health: Mutex<BTreeMap<UpstreamHealthLabels, u64>>,
@@ -59,6 +60,7 @@ struct MetricsInner {
 impl Default for MetricsInner {
     fn default() -> Self {
         Self {
+            proxy_memory_rejections: std::array::from_fn(|_| AtomicU64::new(0)),
             http: Mutex::default(),
             upstream: Mutex::default(),
             upstream_health: Mutex::default(),
@@ -76,6 +78,39 @@ impl Default for MetricsInner {
             archive_ready: AtomicI64::new(0),
             readiness: tokio::sync::Mutex::default(),
             process_started: Instant::now(),
+        }
+    }
+}
+
+/// Closed, payload-independent admission stages. Never derive labels from routes.
+#[derive(Clone, Copy)]
+pub(crate) enum ProxyMemoryRejectionStage {
+    Ingress,
+    Json,
+    Retained,
+    Route,
+    Plugin,
+    Response,
+}
+
+impl ProxyMemoryRejectionStage {
+    const ALL: [Self; 6] = [
+        Self::Ingress,
+        Self::Json,
+        Self::Retained,
+        Self::Route,
+        Self::Plugin,
+        Self::Response,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ingress => "ingress",
+            Self::Json => "json",
+            Self::Retained => "retained",
+            Self::Route => "route",
+            Self::Plugin => "plugin",
+            Self::Response => "response",
         }
     }
 }
@@ -349,6 +384,21 @@ impl Metrics {
         }
     }
 
+    pub(crate) fn record_proxy_memory_rejection(&self, stage: ProxyMemoryRejectionStage) {
+        self.inner.proxy_memory_rejections[stage as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn observe_proxy_memory_error(
+        &self,
+        stage: ProxyMemoryRejectionStage,
+        error: crate::error::AppError,
+    ) -> crate::error::AppError {
+        if matches!(&error, crate::error::AppError::Overloaded) {
+            self.record_proxy_memory_rejection(stage);
+        }
+        error
+    }
+
     /// Records one terminal worker projection attempt with a fixed queue label.
     pub fn observe_background_projection(&self, kind: BackgroundProjectionKind, succeeded: bool) {
         let counter = if succeeded {
@@ -516,6 +566,16 @@ impl Metrics {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let mut output = String::with_capacity(16 * 1024);
+        output.push_str("# HELP memeloop_token_center_proxy_memory_rejections_total Capacity rejections by fixed admission stage.\n");
+        output.push_str("# TYPE memeloop_token_center_proxy_memory_rejections_total counter\n");
+        for stage in ProxyMemoryRejectionStage::ALL {
+            let _ = writeln!(
+                output,
+                "memeloop_token_center_proxy_memory_rejections_total{{stage=\"{}\"}} {}",
+                stage.label(),
+                self.inner.proxy_memory_rejections[stage as usize].load(Ordering::Relaxed)
+            );
+        }
 
         output
             .push_str("# HELP memeloop_token_center_build_info Build metadata for this binary.\n");
@@ -652,7 +712,11 @@ pub struct DatabaseRuntimeMetrics {
 pub struct RuntimeMetrics {
     pub database: Option<DatabaseRuntimeMetrics>,
     pub request_event_streams: usize,
-    pub gateway_body_rejections: [[u64; 2]; 4],
+    pub gateway_body_rejections: [[u64; 3]; 4],
+    pub proxy_memory_used_bytes: usize,
+    pub proxy_memory_limit_bytes: usize,
+    pub retained_request_memory_used_bytes: usize,
+    pub retained_request_memory_limit_bytes: usize,
     pub gateway_body_reads: usize,
     pub proxy_lifecycles: usize,
     pub proxy_archive_streams: usize,
@@ -898,6 +962,29 @@ fn render_runtime(output: &mut String, runtime: &RuntimeMetrics) {
         "# HELP memeloop_token_center_gateway_body_rejections_total Rejected gateway request bodies by fixed route class and reason.\n",
     );
     output.push_str("# TYPE memeloop_token_center_gateway_body_rejections_total counter\n");
+    output.push_str("# HELP memeloop_token_center_proxy_memory_bytes Actual weighted memory admission permits by fixed pool and measure.\n");
+    output.push_str("# TYPE memeloop_token_center_proxy_memory_bytes gauge\n");
+    for (pool, used, limit) in [
+        (
+            "lifecycle",
+            runtime.proxy_memory_used_bytes,
+            runtime.proxy_memory_limit_bytes,
+        ),
+        (
+            "retained_request",
+            runtime.retained_request_memory_used_bytes,
+            runtime.retained_request_memory_limit_bytes,
+        ),
+    ] {
+        let _ = writeln!(
+            output,
+            "memeloop_token_center_proxy_memory_bytes{{pool=\"{pool}\",measure=\"used\"}} {used}"
+        );
+        let _ = writeln!(
+            output,
+            "memeloop_token_center_proxy_memory_bytes{{pool=\"{pool}\",measure=\"limit\"}} {limit}"
+        );
+    }
     for route_class in crate::gateway_body::GatewayBodyRouteClass::ALL {
         for reason in crate::gateway_body::GatewayBodyRejectionReason::ALL {
             let value = runtime.gateway_body_rejections[route_class.index()][reason.index()];
@@ -1293,5 +1380,72 @@ mod tests {
         assert!(metrics.try_begin_profile(ProfileKind::Heap).is_none());
         drop(first);
         assert!(metrics.try_begin_profile(ProfileKind::Heap).is_some());
+    }
+
+    #[test]
+    fn memory_admission_gauges_report_fixed_pools_without_dynamic_labels() {
+        let rendered = Metrics::default().render(&RuntimeMetrics {
+            proxy_memory_used_bytes: 65536,
+            proxy_memory_limit_bytes: 268435456,
+            retained_request_memory_used_bytes: 65536,
+            retained_request_memory_limit_bytes: 67108864,
+            ..RuntimeMetrics::default()
+        });
+        let gauges: Vec<_> = rendered
+            .lines()
+            .filter(|line| line.starts_with("memeloop_token_center_proxy_memory_bytes{"))
+            .collect();
+        assert_eq!(
+            gauges,
+            [
+                "memeloop_token_center_proxy_memory_bytes{pool=\"lifecycle\",measure=\"used\"} 65536",
+                "memeloop_token_center_proxy_memory_bytes{pool=\"lifecycle\",measure=\"limit\"} 268435456",
+                "memeloop_token_center_proxy_memory_bytes{pool=\"retained_request\",measure=\"used\"} 65536",
+                "memeloop_token_center_proxy_memory_bytes{pool=\"retained_request\",measure=\"limit\"} 67108864",
+            ]
+        );
+    }
+
+    #[test]
+    fn memory_rejection_stages_render_exactly_six_fixed_series() {
+        let metrics = Metrics::default();
+        let series = |metrics: &Metrics| {
+            metrics
+                .render(&RuntimeMetrics::default())
+                .lines()
+                .filter(|line| {
+                    line.starts_with("memeloop_token_center_proxy_memory_rejections_total{")
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let labels = ["ingress", "json", "retained", "route", "plugin", "response"];
+        assert_eq!(
+            series(&metrics),
+            labels.map(|stage| format!(
+                "memeloop_token_center_proxy_memory_rejections_total{{stage=\"{stage}\"}} 0"
+            ))
+        );
+        for (index, stage) in ProxyMemoryRejectionStage::ALL.into_iter().enumerate() {
+            assert_eq!(stage.label(), labels[index]);
+            for _ in 0..=index {
+                let error =
+                    metrics.observe_proxy_memory_error(stage, crate::error::AppError::Overloaded);
+                assert!(matches!(error, crate::error::AppError::Overloaded));
+            }
+            let error = metrics.observe_proxy_memory_error(stage, crate::error::AppError::Internal);
+            assert!(matches!(error, crate::error::AppError::Internal));
+        }
+        assert_eq!(
+            series(&metrics),
+            labels
+                .into_iter()
+                .enumerate()
+                .map(|(index, stage)| format!(
+                    "memeloop_token_center_proxy_memory_rejections_total{{stage=\"{stage}\"}} {}",
+                    index + 1
+                ))
+                .collect::<Vec<_>>()
+        );
     }
 }

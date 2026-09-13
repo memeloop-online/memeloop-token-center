@@ -120,6 +120,21 @@ jobs:
           cat "$EVIDENCE_DIR/build.log"
           echo "exit_code=$result" >> "$GITHUB_OUTPUT"
           exit "$result"
+      - name: Run independent release-process durable archive RSS pressure gate
+        if: steps.build.outcome == 'success'
+        id: durable_rss
+        timeout-minutes: 6
+        run: |
+          set +e
+          node ops/benchmark-durable-archive-memory.ts \
+            target/release/memeloop-token-center \
+            "$EVIDENCE_DIR/durable-archive-rss-${{ steps.revision.outputs.sha }}.json" \
+            > "$EVIDENCE_DIR/durable-archive-rss-harness.log" 2>&1
+          result=$?
+          set -e
+          cat "$EVIDENCE_DIR/durable-archive-rss-harness.log"
+          echo "exit_code=$result" >> "$GITHUB_OUTPUT"
+          exit "$result"
       - name: Run 15-minute memory, stream, and 500 MiB asset gate
         if: steps.build.outcome == 'success'
         id: benchmark
@@ -151,6 +166,7 @@ jobs:
         env:
           BUILD_EXIT_CODE: ${{ steps.build.outputs.exit_code }}
           HARNESS_EXIT_CODE: ${{ steps.benchmark.outputs.exit_code }}
+          DURABLE_RSS_EXIT_CODE: ${{ steps.durable_rss.outputs.exit_code }}
         run: |
           if [ -z "$BUILD_EXIT_CODE" ]; then
             echo 'The optimized build did not produce an exit code' >&2
@@ -159,6 +175,10 @@ jobs:
           if [ "$BUILD_EXIT_CODE" -ne 0 ]; then
             echo "The optimized build failed with exit code $BUILD_EXIT_CODE" >&2
             exit "$BUILD_EXIT_CODE"
+          fi
+          if [ -z "$DURABLE_RSS_EXIT_CODE" ] || [ "$DURABLE_RSS_EXIT_CODE" -ne 0 ]; then
+            echo 'The independent durable archive RSS pressure gate did not pass' >&2
+            exit 1
           fi
           if [ -z "$HARNESS_EXIT_CODE" ]; then
             echo 'The memory harness did not produce an exit code' >&2

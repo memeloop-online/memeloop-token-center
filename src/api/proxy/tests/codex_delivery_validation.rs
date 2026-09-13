@@ -72,6 +72,7 @@ async fn codex_2xx_non_sse_is_ambiguous_and_never_crosses_accounts() {
         Some("upstream_invalid_content_type")
     );
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    drain_completed_response_archive(&fixture).await;
     for row in rows {
         let refs = fixture
             .state

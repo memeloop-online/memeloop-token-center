@@ -922,6 +922,24 @@ impl PluginRuntime {
         request_json: &Value,
         configurations: &BTreeMap<String, Value>,
     ) -> Result<TrafficDecision, AppError> {
+        self.apply_traffic_with_config_and_memory(context, request_json, configurations, None)
+    }
+
+    pub(crate) fn has_traffic_hooks(&self) -> bool {
+        self.engine.is_some()
+            && self.plugins.iter().any(|plugin| {
+                plugin.manifest.contributions.traffic_policy
+                    || plugin.manifest.contributions.request_rewrite
+            })
+    }
+
+    pub(crate) fn apply_traffic_with_config_and_memory(
+        &self,
+        context: types::RequestContext,
+        request_json: &Value,
+        configurations: &BTreeMap<String, Value>,
+        memory: Option<&crate::gateway_body::memory::ProxyMemoryReservation>,
+    ) -> Result<TrafficDecision, AppError> {
         let Some(engine) = &self.engine else {
             return Ok(TrafficDecision {
                 allow: true,
@@ -1013,6 +1031,12 @@ impl PluginRuntime {
                         validate_plugin_text(account_id, MAX_TRAFFIC_ACCOUNT_ID_BYTES, false)
                             .is_ok()
                     });
+            if let (Some(memory), Some(rewrite)) = (memory, result.request_json.as_deref())
+                && (rewrite.len() > MAX_TRAFFIC_REQUEST_JSON_BYTES
+                    || !memory.try_reserve_rewrite(rewrite.as_bytes()))
+            {
+                return Err(AppError::Overloaded);
+            }
             let validated_request = result
                 .request_json
                 .as_deref()

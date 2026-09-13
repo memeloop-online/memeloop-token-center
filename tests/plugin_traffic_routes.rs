@@ -90,6 +90,70 @@ fn policy_wat(body: &str) -> String {
     format!("{prefix};; BEGIN POST-AUTH BODY\n{body}\n;; END POST-AUTH BODY{suffix}")
 }
 
+#[tokio::test]
+async fn small_text_input_can_expand_to_sixteen_mib_in_a_real_traffic_hook() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(successful_hint_response("expanded"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let mut fixture = hint_routing_fixture_with_database(
+        "large-rewrite-memory",
+        upstream.uri(),
+        upstream.uri(),
+        false,
+        None,
+        Some((32 * 1024 * 1024, Decimal::from(100))),
+    )
+    .await;
+    let prefix = format!(
+        "{{\"model\":\"{}\",\"messages\":[{{\"role\":\"user\",\"content\":\"",
+        fixture.model
+    );
+    let suffix = "\"}],\"stream\":false}";
+    let length = 16 * 1024 * 1024;
+    let pointer = 64 * 1024;
+    let start = stores_for_string(pointer, &prefix);
+    let end = stores_for_string(pointer + length - suffix.len(), suffix);
+    let body = format!(
+        r#"
+        i32.const 256 memory.grow drop
+        i32.const {pointer} i32.const 120 i32.const {length} memory.fill
+        {start}
+        {end}
+        i32.const 256 i32.const 0 i32.store
+        i32.const 260 i32.const 1 i32.store
+        i32.const 264 i32.const 0 i32.store
+        i32.const 276 i32.const 0 i32.store
+        i32.const 288 i32.const 0 i32.store
+        i32.const 300 i32.const 1 i32.store
+        i32.const 304 i32.const {pointer} i32.store
+        i32.const 308 i32.const {length} i32.store
+        i32.const 256
+    "#
+    );
+    write_policy_package(fixture._directory.path(), &body, json!([]));
+    fixture.state = AppState::initialize((*fixture.state.config).clone())
+        .await
+        .unwrap();
+    // Isolate this memory-admission boundary from the independently tested
+    // guest fuel ceiling: bulk-filling 16 MiB intentionally exceeds it.
+    fixture
+        .state
+        .plugins
+        .set_execution_limits_for_tests(std::time::Duration::from_secs(30), u64::MAX);
+    let (status, response) = call_hint_routing_fixture(&fixture).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let received = upstream.received_requests().await.unwrap();
+    let rewritten: Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert_eq!(
+        rewritten["messages"][0]["content"].as_str().unwrap().len(),
+        length - prefix.len() - suffix.len()
+    );
+    upstream.verify().await;
+}
+
 fn write_policy_package(root: &Path, body: &str, capabilities: Value) {
     fs::write(
         root.join("plugin.json"),
@@ -272,6 +336,7 @@ async fn hint_routing_fixture(
         standby_uri,
         hint_unauthorized_account,
         None,
+        None,
     )
     .await
 }
@@ -282,6 +347,7 @@ async fn hint_routing_fixture_with_database(
     standby_uri: String,
     hint_unauthorized_account: bool,
     database_url: Option<String>,
+    credential_capacity: Option<(u64, Decimal)>,
 ) -> HintRoutingFixture {
     let directory = tempfile::tempdir().unwrap();
     let database_url = database_url.unwrap_or_else(|| {
@@ -298,6 +364,8 @@ async fn hint_routing_fixture_with_database(
         .unwrap();
     let tenant = format!("hint-routing-{label}");
     let model = format!("hint-routing-model-{label}");
+    let (tokens_per_minute, initial_balance) = credential_capacity
+        .unwrap_or_else(|| (KeyPolicy::default().tokens_per_minute, Decimal::TEN));
     let mut route_ids = Vec::new();
     let mut account_ids = Vec::new();
     for (name, uri, priority) in [
@@ -355,10 +423,11 @@ async fn hint_routing_fixture_with_database(
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
                     allowed_models: vec![model.clone()],
+                    tokens_per_minute,
                     max_concurrency: 4,
                     ..KeyPolicy::default()
                 },
-                initial_balance: Decimal::TEN,
+                initial_balance,
                 idempotency_key: None,
             },
             &route_ids[..2],
@@ -509,6 +578,7 @@ async fn assert_malformed_standby_is_lazy(database_url: Option<String>, label: &
         standby.uri(),
         false,
         database_url,
+        None,
     )
     .await;
     corrupt_upstream_credential(&fixture, fixture.standby_account_id).await;
@@ -552,6 +622,7 @@ async fn assert_selected_malformed_candidate_fails_closed(
         standby.uri(),
         false,
         database_url,
+        None,
     )
     .await;
     put_accounts_in_cooldown(&fixture, &[fixture.preferred_account_id]).await;
@@ -631,6 +702,7 @@ async fn assert_cooldown_failover_keeps_one_reservation(database_url: Option<Str
         standby.uri(),
         false,
         database_url,
+        None,
     )
     .await;
     put_accounts_in_cooldown(&fixture, &[fixture.preferred_account_id]).await;

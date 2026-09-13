@@ -12,6 +12,7 @@ pub const DEFAULT_RESPONSES_BODY_MAX_BYTES: u32 = 16 * 1024 * 1024;
 pub const MIN_RESPONSES_BODY_MAX_BYTES: u32 = 4 * 1024 * 1024;
 pub const MAX_RESPONSES_BODY_MAX_BYTES: u32 = 64 * 1024 * 1024;
 pub const DEFAULT_RESPONSES_BODY_READ_CONCURRENCY: u32 = 4;
+pub const DEFAULT_PROXY_MEMORY_BUDGET_BYTES: u32 = 256 * 1024 * 1024;
 pub const MAX_RESPONSES_BODY_READ_CONCURRENCY: u32 = 8;
 pub const DEFAULT_UPSTREAM_SHARED_PROBE_ATTEMPTS: u32 = 1;
 pub const MAX_UPSTREAM_SHARED_PROBE_ATTEMPTS: u32 = 4;
@@ -135,6 +136,8 @@ pub struct Config {
     /// Service saturation is distinct from a credential policy limit and is
     /// reported as HTTP 503, never as a per-key 429.
     pub proxy_lifecycle_concurrency: u32,
+    /// Weighted raw body/JSON/ciphertext memory admission, shared by all text routes.
+    pub proxy_memory_budget_bytes: u32,
     /// Maximum gateway request bodies buffered concurrently. The permit covers
     /// only the bounded body read, not the complete proxy lifecycle.
     pub gateway_body_read_concurrency: u32,
@@ -186,6 +189,7 @@ impl std::fmt::Debug for Config {
             .field("listen", &self.listen)
             .field("database_url", &"[redacted]")
             .field("database_max_connections", &self.database_max_connections)
+            .field("proxy_memory_budget_bytes", &self.proxy_memory_budget_bytes)
             .field(
                 "proxy_lifecycle_concurrency",
                 &self.proxy_lifecycle_concurrency,
@@ -341,7 +345,7 @@ impl Config {
         )?;
         let upstream_health = UpstreamHealthConfig::from_env()?;
 
-        Ok(Self {
+        let config = Self {
             listen: env_string("MTC_LISTEN", "0.0.0.0:8080"),
             database_url: env_string(
                 "MTC_DATABASE_URL",
@@ -350,6 +354,10 @@ impl Config {
             database_max_connections: env_u32("MTC_DATABASE_MAX_CONNECTIONS", 4)?.clamp(1, 32),
             proxy_lifecycle_concurrency: env_u32("MTC_PROXY_LIFECYCLE_CONCURRENCY", 64)?
                 .clamp(1, 4_096),
+            proxy_memory_budget_bytes: env_u32(
+                "MTC_PROXY_MEMORY_BUDGET_BYTES",
+                DEFAULT_PROXY_MEMORY_BUDGET_BYTES,
+            )?,
             gateway_body_read_concurrency: gateway_body_read_concurrency(env_u32(
                 "MTC_GATEWAY_BODY_READ_CONCURRENCY",
                 DEFAULT_GATEWAY_BODY_READ_CONCURRENCY,
@@ -387,7 +395,20 @@ impl Config {
             allow_oauth_loopback,
             codex_test_loopback: false,
             runtime_profiling_enabled: env_bool("MTC_RUNTIME_PROFILING_ENABLED", false),
-        })
+        };
+        config.validate_proxy_memory_budget()?;
+        Ok(config)
+    }
+
+    pub(crate) fn validate_proxy_memory_budget(&self) -> Result<(), ConfigError> {
+        if self.proxy_memory_budget_bytes < DEFAULT_PROXY_MEMORY_BUDGET_BYTES
+            || self.proxy_memory_budget_bytes > 2 * 1024 * 1024 * 1024
+            || u64::from(self.proxy_memory_budget_bytes)
+                < u64::from(self.responses_body_max_bytes) * 12 + 1024 * 1024
+        {
+            return Err(ConfigError::InvalidProxyMemoryBudget);
+        }
+        Ok(())
     }
 
     pub fn for_test(database_url: String) -> Self {
@@ -396,6 +417,7 @@ impl Config {
             database_url,
             database_max_connections: 8,
             proxy_lifecycle_concurrency: 64,
+            proxy_memory_budget_bytes: DEFAULT_PROXY_MEMORY_BUDGET_BYTES,
             gateway_body_read_concurrency: DEFAULT_GATEWAY_BODY_READ_CONCURRENCY,
             responses_body_max_bytes: DEFAULT_RESPONSES_BODY_MAX_BYTES,
             responses_body_read_concurrency: DEFAULT_RESPONSES_BODY_READ_CONCURRENCY,
@@ -555,6 +577,10 @@ fn responses_body_read_concurrency(value: u32) -> u32 {
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error(
+        "MTC_PROXY_MEMORY_BUDGET_BYTES must be 256 MiB..2 GiB and at least twelve times MTC_RESPONSES_BODY_MAX_BYTES plus 1 MiB; pod memory must cover this budget plus 256 MiB"
+    )]
+    InvalidProxyMemoryBudget,
+    #[error(
         "S3 timeouts must be bounded: connect/readiness 100..30000 ms, request 100..120000 ms, connect <= request"
     )]
     InvalidS3Timeouts,
@@ -583,6 +609,19 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_memory_budget_reserves_progress_headroom_and_request_capture() {
+        let mut config = Config::for_test("sqlite::memory:".to_owned());
+        assert!(config.validate_proxy_memory_budget().is_ok());
+        config.proxy_memory_budget_bytes = 192 * 1024 * 1024;
+        assert!(config.validate_proxy_memory_budget().is_err());
+        config.proxy_memory_budget_bytes = DEFAULT_PROXY_MEMORY_BUDGET_BYTES;
+        config.responses_body_max_bytes = MAX_RESPONSES_BODY_MAX_BYTES;
+        assert!(config.validate_proxy_memory_budget().is_err());
+        config.proxy_memory_budget_bytes = MAX_RESPONSES_BODY_MAX_BYTES * 12 + 1024 * 1024;
+        assert!(config.validate_proxy_memory_budget().is_ok());
+    }
 
     #[test]
     fn s3_timeout_defaults_and_bounds_are_role_independent() {

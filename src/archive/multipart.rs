@@ -169,8 +169,9 @@ impl Drop for ArchiveWriter {
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
                 // Drop cannot await network I/O. Detach a best-effort abort on
-                // the current runtime; an S3 lifecycle rule remains mandatory
-                // for process crashes and runtime shutdown.
+                // the current runtime; provider-side incomplete upload
+                // reclamation (bucket lifecycle or global stale cleanup)
+                // remains mandatory for process crashes and runtime shutdown.
                 drop(runtime.spawn(async move {
                     if inner.abort().await.is_err() {
                         tracing::error!("failed to abort dropped archive multipart upload");

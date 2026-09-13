@@ -2,7 +2,10 @@ import { useCallback, useEffect, useRef, useState, type RefObject } from 'react'
 import { api } from '../api.js';
 import { useI18n } from '../i18n.js';
 import { SessionDetailSurface, SessionList } from '../SessionViews.js';
-import { drainSessionEventKeys, mergeSessionPage } from './sessionRefresh.js';
+import {
+  drainSessionEventIdentities, mergeSessionPage, sessionEventsRequireDetailRefresh, sessionEventTargetsSelection,
+  sessionIdentityKey,
+} from './sessionRefresh.js';
 import { LatestRequestGate } from './latestRequestGate.js';
 import type {
   LogicalSessionCursor, LogicalSessionDetail, LogicalSessionListResponse, LogicalSessionSummary, RequestDetail, RequestView,
@@ -99,12 +102,15 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
   const refreshTimer = useRef<number | undefined>(undefined);
   const refreshDirty = useRef(false);
   const refreshInFlight = useRef(false);
-  const dirtyKeyIds = useRef(new Set<string>());
+  const dirtyEventIdentities = useRef(new Set<string>());
+  const dirtyDetailEvents = useRef(new Set<string>());
   const scopeGeneration = useRef(0);
   const filtersRef = useRef(filters);
   const selectedRef = useRef<LogicalSessionSummary | undefined>(selected);
+  const detailRef = useRef<LogicalSessionDetail | undefined>(detail);
   filtersRef.current = filters;
   selectedRef.current = selected;
+  detailRef.current = detail;
   const loadReplayArchive = useCallback((request: RequestView, signal: AbortSignal) => api<RequestDetail>(
     requestArchivePath(tenant, request.request_id), token.trim(), { signal },
   ), [tenant, token]);
@@ -276,18 +282,24 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       refreshTimer.current = undefined;
       refreshInFlight.current = true;
       refreshDirty.current = false;
-      const batchKeyIds = new Set(dirtyKeyIds.current);
-      dirtyKeyIds.current.clear();
+      dirtyEventIdentities.current.clear();
+      const batchDetailEvents = new Set(dirtyDetailEvents.current);
+      dirtyDetailEvents.current.clear();
+      const selectedAtBatchStart = selectedRef.current;
+      const selectedIdentity = selectedAtBatchStart ? sessionIdentityKey(selectedAtBatchStart) : undefined;
       const refresh = async () => {
         await loadSessions(false, filtersRef.current, true);
         if (generation !== scopeGeneration.current) return;
-        const selectedSession = selectedRef.current;
-        if (selectedSession && batchKeyIds.has(selectedSession.key_id)) await refreshSelected(selectedSession);
+        const latestSelection = selectedRef.current;
+        if (selectedAtBatchStart && latestSelection && sessionIdentityKey(latestSelection) === selectedIdentity
+          && sessionEventsRequireDetailRefresh(batchDetailEvents, latestSelection, detailRef.current)) {
+          await refreshSelected(selectedAtBatchStart);
+        }
       };
       void refresh().finally(() => {
         if (generation !== scopeGeneration.current) return;
         refreshInFlight.current = false;
-        if (refreshDirty.current || dirtyKeyIds.current.size > 0) scheduleRefresh();
+        if (refreshDirty.current || dirtyEventIdentities.current.size > 0) scheduleRefresh();
       });
     }, 500);
   }
@@ -301,11 +313,19 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
 
   useEffect(() => {
     scopeGeneration.current += 1;
+    // A filter/scope transition starts an authoritative first-page read. Drop
+    // events queued for the previous projection before issuing that snapshot;
+    // otherwise the next unrelated revision drains both batches and can make
+    // an old same-session event look as if it belonged to the new event.
+    // Events arriving after this synchronous boundary receive a new revision
+    // and are processed against the in-flight snapshot normally.
+    eventKeyIds.current.clear();
     if (refreshTimer.current !== undefined) window.clearTimeout(refreshTimer.current);
     refreshTimer.current = undefined;
     refreshDirty.current = false;
     refreshInFlight.current = false;
-    dirtyKeyIds.current.clear();
+    dirtyEventIdentities.current.clear();
+    dirtyDetailEvents.current.clear();
     listSequence.current += 1;
     listRequests.current.invalidate();
     listInFlight.current = false;
@@ -327,7 +347,8 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       refreshTimer.current = undefined;
       refreshDirty.current = false;
       refreshInFlight.current = false;
-      dirtyKeyIds.current.clear();
+      dirtyEventIdentities.current.clear();
+      dirtyDetailEvents.current.clear();
       listSequence.current += 1;
       listRequests.current.invalidate();
       listInFlight.current = false;
@@ -337,7 +358,12 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
 
   useEffect(() => {
     if (!token.trim() || revision === 0) return;
-    for (const keyId of drainSessionEventKeys(eventKeyIds.current)) dirtyKeyIds.current.add(keyId);
+    const eventIdentities = drainSessionEventIdentities(eventKeyIds.current);
+    for (const identity of eventIdentities) dirtyEventIdentities.current.add(identity);
+    const selectedAtEvent = selectedRef.current;
+    if (selectedAtEvent && sessionEventTargetsSelection(eventIdentities, selectedAtEvent)) {
+      for (const identity of eventIdentities) dirtyDetailEvents.current.add(identity);
+    }
     refreshDirty.current = true;
     scheduleRefresh();
   }, [revision, eventKeyIds]);

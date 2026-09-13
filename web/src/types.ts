@@ -20,6 +20,8 @@ export interface RequestView {
   route_id?: string | null;
   currency?: string | null;
   error_code: string | null;
+  /** Durable request/response archive convergence state. */
+  archive_state?: RequestArchiveState;
   session_context?: RequestSessionContext | null;
 }
 
@@ -85,11 +87,14 @@ export interface RequestDetail extends RequestView {
   };
 }
 
+export type RequestEventKind = 'started' | 'finished' | 'projected' | 'archive_bound' | 'archive_gap';
+export type RequestArchiveState = 'capturing' | 'pending' | 'uploading' | 'bound' | 'gap';
+
 export interface RequestEvent {
   event_id: string;
   request_id: string;
   event_at: number;
-  event_kind: 'started' | 'finished' | 'projected';
+  event_kind: RequestEventKind;
   created_at?: number | null;
   completed_at?: number | null;
   upstream_account_id?: string | null;
@@ -107,6 +112,7 @@ export interface RequestEvent {
   output_tokens: number;
   cost: string;
   error_code: string | null;
+  archive_state: RequestArchiveState;
 }
 
 export interface StatsBucket {

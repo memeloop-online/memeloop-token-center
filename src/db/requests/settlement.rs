@@ -342,11 +342,31 @@ pub(crate) async fn reserve_usage_in_transaction(
     output_token_ceiling: i64,
     now: i64,
 ) -> Result<UsageReservation, AppError> {
+    reserve_usage_with_id_in_transaction(
+        tx,
+        key,
+        price,
+        input_token_ceiling,
+        output_token_ceiling,
+        now,
+        Uuid::now_v7(),
+    )
+    .await
+}
+
+pub(crate) async fn reserve_usage_with_id_in_transaction(
+    tx: &mut Transaction<'_, Any>,
+    key: &AuthenticatedKey,
+    price: &ModelPrice,
+    input_token_ceiling: i64,
+    output_token_ceiling: i64,
+    now: i64,
+    id: Uuid,
+) -> Result<UsageReservation, AppError> {
     let (reserved_micros, reserved_tokens) =
         reservation_ceiling_amounts(price, input_token_ceiling, output_token_ceiling)?;
     let window_start = now / 60_000 * 60_000;
     if !key.policy.enforcement_mode.enforces_prepaid_limits() {
-        let id = Uuid::now_v7();
         let price_snapshot_json = serde_json::to_string(price).map_err(|_| AppError::Internal)?;
         sqlx::query(
             "INSERT INTO usage_reservations (id, account_id, key_id, price_id, reserved_micros, reserved_tokens, rate_window_start, status, created_at, price_snapshot_json, enforcement_mode) VALUES ($1, $2, $3, $4, $5, $6, $7, 'reserved', $8, $9, $10)",
@@ -522,7 +542,6 @@ pub(crate) async fn reserve_usage_in_transaction(
     .bind(key.key_id.to_string())
     .execute(&mut **tx)
     .await?;
-    let id = Uuid::now_v7();
     let price_snapshot_json = serde_json::to_string(price).map_err(|_| AppError::Internal)?;
     sqlx::query(
         "INSERT INTO usage_reservations (id, account_id, key_id, price_id, reserved_micros, reserved_tokens, rate_window_start, status, created_at, price_snapshot_json, enforcement_mode) VALUES ($1, $2, $3, $4, $5, $6, $7, 'reserved', $8, $9, $10)",

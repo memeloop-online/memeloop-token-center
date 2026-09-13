@@ -117,15 +117,74 @@ impl Database {
         &self,
         input: StartProxyRequest<'_>,
     ) -> Result<UsageReservation, AppError> {
-        let now = unix_millis();
-        let mut transaction = self.begin_write_transaction().await?;
-        let reservation = reserve_usage_in_transaction(
+        self.start_proxy_request_inner(input, None).await
+    }
+
+    pub(crate) async fn start_proxy_request_with_archive(
+        &self,
+        input: StartProxyRequest<'_>,
+        body: &bytes::Bytes,
+        pepper: &[u8],
+    ) -> Result<UsageReservation, AppError> {
+        let started = std::time::Instant::now();
+        let result = self
+            .start_proxy_request_inner(input, Some((body, pepper)))
+            .await
+            .map_err(|error| match error {
+                AppError::Storage(_) | AppError::Internal => AppError::Overloaded,
+                other => other,
+            });
+        if let Err(error) = &result {
+            tracing::warn!(
+                phase = "request_admission",
+                error_code = error.diagnostic_category(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "durable request admission failed; upstream dispatch prohibited"
+            );
+        }
+        result
+    }
+
+    async fn start_proxy_request_inner(
+        &self,
+        input: StartProxyRequest<'_>,
+        archive: Option<(&bytes::Bytes, &[u8])>,
+    ) -> Result<UsageReservation, AppError> {
+        if archive.is_some_and(|(body, _)| body.len() > 64 * 1024 * 1024) {
+            return Err(AppError::Overloaded);
+        }
+        // A stable reservation UUID supplies the authenticated encryption owner
+        // before any transaction or global budget lock is acquired.
+        let reservation_id = Uuid::now_v7();
+        let identity = ArchiveSpoolIdentity {
+            request_id: input.request_id,
+            tenant_id: input.key.tenant_id,
+            reservation_id,
+        };
+        let purpose = crate::response_archive_spool::BufferedArchivePurpose::Request;
+        let buffered_archive = archive
+            .map(|(body, pepper)| {
+                crate::response_archive_spool::BufferedArchive::new(identity, purpose, body, pepper)
+                    .map_err(|_| AppError::Overloaded)
+            })
+            .transpose()?;
+        // Always acquire the spool budget before request/account locks, matching
+        // the archive worker's budget -> request lock order.
+        let (mut transaction, now) = if archive.is_some() {
+            self.spool_transaction()
+                .await
+                .map_err(|_| AppError::Overloaded)?
+        } else {
+            (self.begin_write_transaction().await?, unix_millis())
+        };
+        let reservation = super::settlement::reserve_usage_with_id_in_transaction(
             &mut transaction,
             input.key,
             input.price,
             input.input_token_ceiling,
             input.output_token_ceiling,
             now,
+            reservation_id,
         )
         .await?;
         if let Err(error) = record_request_started_in_transaction(
@@ -148,7 +207,32 @@ impl Database {
             transaction.rollback().await?;
             return Err(error);
         }
-        transaction.commit().await?;
+        if let Some(archive) = buffered_archive {
+            let capture_started = std::time::Instant::now();
+            if !self
+                .capture_buffered_archive_body_in_transaction(&mut transaction, now, &archive)
+                .await
+                .map_err(|_| AppError::Overloaded)?
+            {
+                tracing::warn!(
+                    phase = "request_admission_capture",
+                    error_code = "capacity",
+                    elapsed_ms = capture_started.elapsed().as_millis() as u64,
+                    "durable request admission capacity exhausted"
+                );
+                return Err(AppError::Overloaded);
+            }
+        }
+        // No cancellation deadline: only a positively observed COMMIT permits
+        // dispatch. Unknown COMMIT returns unavailable, leaving orphan recovery
+        // to settle any admission which actually committed without dispatch.
+        transaction.commit().await.map_err(|error| {
+            if archive.is_some() {
+                AppError::Overloaded
+            } else {
+                error.into()
+            }
+        })?;
         Ok(reservation)
     }
 
@@ -577,6 +661,36 @@ impl Database {
         input: FinishProxyRequest<'_>,
         response_archive_lease: Option<&ArchiveStagingWriteLease>,
     ) -> Result<FinishProxyRequestResult, AppError> {
+        self.finish_proxy_request_inner(input, response_archive_lease, None)
+            .await
+    }
+
+    pub(crate) async fn finish_proxy_request_with_buffered_archive(
+        &self,
+        input: FinishProxyRequest<'_>,
+        archive: &crate::response_archive_spool::BufferedArchive<'_>,
+    ) -> Result<FinishProxyRequestResult, AppError> {
+        self.finish_proxy_request_inner(input, None, Some(archive))
+            .await
+    }
+
+    async fn finish_proxy_request_inner(
+        &self,
+        input: FinishProxyRequest<'_>,
+        response_archive_lease: Option<&ArchiveStagingWriteLease>,
+        buffered_archive: Option<&crate::response_archive_spool::BufferedArchive<'_>>,
+    ) -> Result<FinishProxyRequestResult, AppError> {
+        if let Some(archive) = buffered_archive
+            && (archive.identity().request_id != input.request_id
+                || archive.identity().tenant_id != input.tenant_id
+                || archive.identity().reservation_id != input.reservation.id
+                || archive.purpose()
+                    != crate::response_archive_spool::BufferedArchivePurpose::Response)
+        {
+            return Err(AppError::BadRequest(
+                "buffered response archive does not match its request owner".into(),
+            ));
+        }
         if let Some(lease) = response_archive_lease
             && (lease.key.owner != ArchiveStagingOwner::ProxyRequest(input.request_id)
                 || lease.key.purpose != ArchiveStagingPurpose::Response)
@@ -589,7 +703,11 @@ impl Database {
         let tenant_id = input.tenant_id.to_string();
         let key_id = input.reservation.key_id.to_string();
         let reservation_id = input.reservation.id.to_string();
-        let mut transaction = self.begin_write_transaction().await?;
+        let mut transaction = if buffered_archive.is_some() {
+            self.spool_transaction().await?.0
+        } else {
+            self.begin_write_transaction().await?
+        };
         // SQLite's BEGIN IMMEDIATE can wait for an earlier terminal writer.
         // Capture the observation boundary only after that wait so live writes
         // cannot acquire timestamps in the opposite order from their commits.
@@ -658,6 +776,21 @@ impl Database {
             };
             transaction.commit().await?;
             return Ok(result);
+        }
+
+        if let Some(archive) = buffered_archive {
+            let capture_started = std::time::Instant::now();
+            if !self
+                .capture_buffered_archive_body_in_transaction(&mut transaction, now, archive)
+                .await?
+            {
+                tracing::warn!(
+                    phase = "response_terminal_capture",
+                    error_code = "capacity",
+                    elapsed_ms = capture_started.elapsed().as_millis() as u64,
+                    "buffered response archive gap"
+                );
+            }
         }
 
         if let Some(lease) = response_archive_lease

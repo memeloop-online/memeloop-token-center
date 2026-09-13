@@ -13,6 +13,7 @@ import {
   tenant,
   waitForPendingSessionRequests,
 } from '../support/runtime.js';
+import { requestEventFixture } from '../support/request-event-fixture.js';
 import type { DogfoodWorld } from '../support/world.js';
 import { appPreferenceControls, openAppRoute } from './app-route.support.js';
 
@@ -344,27 +345,57 @@ Then('服务端错误筛选返回含错误的聚合结果', async function () {
 Then('其他凭据事件和无事件重连不会污染已打开的会话', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   const seed = runtime.requireSeed();
+  // The preceding four real requests can still emit independent request and
+  // response archive transitions. Those same-session transitions must refresh
+  // an open detail and therefore cannot serve as a boundary for an
+  // other-credential assertion. Stop that stream and install one controlled
+  // event so the assertion observes exactly the scope it names.
+  await openAppRoute(page, 'operator', 'usage');
+  let releaseOtherEvent!: () => void;
+  const otherEventReleased = new Promise<void>((resolve) => { releaseOtherEvent = resolve; });
+  let resolveControlledStream!: () => void;
+  const controlledStream = new Promise<void>((resolve) => { resolveControlledStream = resolve; });
+  let delivered = false;
+  await page.route('**/internal/v1/request-events**', async (route) => {
+    if (!delivered) {
+      resolveControlledStream();
+      await otherEventReleased;
+      delivered = true;
+      const event = {
+        ...requestEventFixture('browser-other-event', 'browser-other-request', Date.now(), model),
+        key_id: seed.otherClientKeyId,
+        session_context: {
+          session_id: 'browser-other-session', association: 'confirmed' as const,
+          session_name: '其他凭据会话', task_kind: null, agent_id: null, semantics_source: 'declared',
+        },
+      };
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/event-stream',
+        body: `id: ${event.event_id}\nevent: request.${event.event_kind}\ndata: ${JSON.stringify(event)}\n\n`,
+      });
+      return;
+    }
+    await route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': keepalive\n\n' });
+  });
+
+  await openAppRoute(page, 'operator', 'sessions');
+  await controlledStream;
   const controls = page.locator('.session-controls');
-  await controls.getByRole('button', { name: '清除筛选', exact: true }).click();
-  await visible(page.locator('.session-card').first());
-  await page.locator('.session-card').first().getByRole('button', { name: /^打开 / }).click();
+  await controls.getByLabel('凭据 ID', { exact: true }).fill(seed.sessionClientKeyId);
+  await controls.getByRole('button', { name: '应用筛选', exact: true }).click();
+  await page.getByRole('button', { name: '打开 Codex release dogfood', exact: true }).click();
   await visible(page.getByRole('dialog'));
   const observation = observations.get(this)!;
   const detailCount = observation.detailRequests.length;
-  const otherCredentialResponse = await fetch(new URL('/v1/chat/completions', page.url()), {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${seed.otherClientCredential}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model, messages: [{ role: 'user', content: 'different credential session event' }], max_tokens: 16 }),
-  });
-  assert.ok([200, 429].includes(otherCredentialResponse.status), `unexpected other-credential status ${otherCredentialResponse.status}`);
-  await new Promise((resolve) => setTimeout(resolve, 1_200));
+  releaseOtherEvent();
+  await page.locator('.session-live-state.refreshing').waitFor();
+  await page.locator('.session-live-state.reconnecting').waitFor();
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
   assert.equal(observation.detailRequests.length, detailCount, 'another credential event refreshed the selected detail');
 
   await page.getByRole('dialog').getByRole('button', { name: '关闭', exact: true }).click();
   await openAppRoute(page, 'operator', 'usage');
-  await page.route('**/internal/v1/request-events**', async (route) => {
-    await route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': keepalive\n\n' });
-  });
   await openAppRoute(page, 'operator', 'requests');
   await eventually(async () => assert.match(await page.locator('.session-live-state').textContent() ?? '', /正在重新连接/), 4_000);
 });
