@@ -18,7 +18,7 @@ use crate::{
     provider::{UpstreamCredential, open_private_json, seal_private_json, validate_config},
 };
 
-use super::OAuthReauthorizationTarget;
+use super::{OAuthReauthorizationTarget, OAuthRefreshRequestGuard};
 
 pub const PROVIDER_DRIVER: &str = "anthropic-claude";
 pub const OAUTH_DRIVER: &str = "anthropic_claude_manual_pkce";
@@ -449,6 +449,7 @@ async fn finish_claimed_login(
         },
         allow_test_loopback,
         endpoints.timeout,
+        None,
     )
     .await?;
     validate_token_response(&tokens, true)?;
@@ -490,6 +491,7 @@ pub async fn refresh_claude_credential(
     credential: &UpstreamCredential,
     now: i64,
     allow_test_loopback: bool,
+    request_guard: &dyn OAuthRefreshRequestGuard,
 ) -> Result<UpstreamCredential, AppError> {
     refresh_claude_credential_at(
         http,
@@ -497,6 +499,7 @@ pub async fn refresh_claude_credential(
         now,
         allow_test_loopback,
         &ClaudeEndpoints::production(),
+        request_guard,
     )
     .await
 }
@@ -507,6 +510,7 @@ async fn refresh_claude_credential_at(
     now: i64,
     allow_test_loopback: bool,
     endpoints: &ClaudeEndpoints,
+    request_guard: &dyn OAuthRefreshRequestGuard,
 ) -> Result<UpstreamCredential, AppError> {
     let UpstreamCredential::OAuth {
         refresh_token: Some(old_refresh_token),
@@ -529,6 +533,7 @@ async fn refresh_claude_credential_at(
         },
         allow_test_loopback,
         endpoints.timeout,
+        Some(request_guard),
     )
     .await?;
     validate_token_response(&tokens, false)?;
@@ -644,17 +649,21 @@ async fn post_token_grant<T: Serialize + ?Sized>(
     grant: &T,
     allow_test_loopback: bool,
     timeout: Duration,
+    request_guard: Option<&dyn OAuthRefreshRequestGuard>,
 ) -> Result<TokenResponse, AppError> {
     let client = oauth_client(http, endpoint, allow_test_loopback).await?;
-    let response = client
+    let request = client
         .post(endpoint)
         .header(ACCEPT, "application/json")
         .header(CONTENT_TYPE, "application/json")
         .json(grant)
         .timeout(timeout)
-        .send()
-        .await
+        .build()
         .map_err(|_| claude_error())?;
+    if let Some(request_guard) = request_guard {
+        request_guard.mark_request_started().await?;
+    }
+    let response = client.execute(request).await.map_err(|_| claude_error())?;
     if !response.status().is_success() {
         return Err(claude_error());
     }
@@ -1100,6 +1109,7 @@ mod tests {
             now,
             true,
             &slow_endpoints,
+            &crate::oauth::TEST_OAUTH_REFRESH_REQUEST_GUARD,
         )
         .await
         .unwrap_err()
@@ -1133,6 +1143,7 @@ mod tests {
             now,
             true,
             &ClaudeEndpoints::for_test(&rotated_server.uri()),
+            &crate::oauth::TEST_OAUTH_REFRESH_REQUEST_GUARD,
         )
         .await
         .unwrap();
@@ -1170,6 +1181,7 @@ mod tests {
             now,
             true,
             &ClaudeEndpoints::for_test(&retained_server.uri()),
+            &crate::oauth::TEST_OAUTH_REFRESH_REQUEST_GUARD,
         )
         .await
         .unwrap();
