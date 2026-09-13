@@ -3,14 +3,78 @@ export interface SessionIdentity {
   session_id: string;
 }
 
-export function enqueueSessionEventKey(queue: Set<string>, keyId: string) {
-  if (keyId) queue.add(keyId);
+export interface SessionEventIdentity {
+  key_id: string;
+  session_id: string | null;
+  request_id: string;
+  event_kind: 'started' | 'finished' | 'projected';
+  status_code: number | null;
 }
 
-export function drainSessionEventKeys(queue: Set<string>) {
+function identityKey(identity: SessionEventIdentity) {
+  return JSON.stringify(identity);
+}
+
+export function sessionIdentityKey(session: SessionIdentity) {
+  return JSON.stringify([session.key_id, session.session_id]);
+}
+
+export function requestEventSessionIdentity(event: {
+  key_id: string;
+  request_id: string;
+  event_kind: 'started' | 'finished' | 'projected';
+  status_code: number | null;
+  session_context?: {
+    association: string;
+    session_id: string | null;
+  } | null;
+}): SessionEventIdentity | undefined {
+  if (!event.key_id) return undefined;
+  const context = event.session_context;
+  const eventFields = { request_id: event.request_id, event_kind: event.event_kind, status_code: event.status_code };
+  if (!context) return { key_id: event.key_id, session_id: null, ...eventFields };
+  if (context.association === 'unlinked') {
+    return { key_id: event.key_id, session_id: `unlinked:${event.key_id}`, ...eventFields };
+  }
+  return { key_id: event.key_id, session_id: context.session_id || null, ...eventFields };
+}
+
+export function enqueueSessionEventIdentity(queue: Set<string>, event: Parameters<typeof requestEventSessionIdentity>[0]) {
+  const identity = requestEventSessionIdentity(event);
+  if (identity) queue.add(identityKey(identity));
+}
+
+export function drainSessionEventIdentities(queue: Set<string>) {
   const drained = new Set(queue);
   queue.clear();
   return drained;
+}
+
+export function sessionEventTargetsSelection(eventIdentities: ReadonlySet<string>, selected?: SessionIdentity) {
+  if (!selected) return false;
+  return [...eventIdentities].some((value) => {
+    const event = JSON.parse(value) as SessionEventIdentity;
+    return event.key_id === selected.key_id && event.session_id === selected.session_id;
+  });
+}
+
+export function sessionEventsRequireDetailRefresh(
+  eventIdentities: ReadonlySet<string>,
+  selected: SessionIdentity | undefined,
+  detail: { session_id: string; requests: Array<{ request_id: string; status_code: number | null }> } | undefined,
+) {
+  if (!selected) return false;
+  const relevant = [...eventIdentities]
+    .map((value) => JSON.parse(value) as SessionEventIdentity)
+    .filter((event) => event.key_id === selected.key_id && event.session_id === selected.session_id);
+  if (relevant.length === 0) return false;
+  if (!detail || detail.session_id !== selected.session_id) return true;
+  return relevant.some((event) => {
+    const recorded = detail.requests.find((request) => request.request_id === event.request_id);
+    if (!recorded) return true;
+    if (event.event_kind === 'started') return false;
+    return recorded.status_code === null || recorded.status_code !== event.status_code;
+  });
 }
 
 export function mergeSessionPage<T extends SessionIdentity>({
