@@ -3,6 +3,11 @@
 `plugin::lifecycle::RuntimeRevisions` is an experimental library primitive,
 compiled only with the non-default `experimental-plugin-revisions` feature.
 It is not a completed application hot-reload feature.
+Identity hashing, receipt parsing, manifest-ID precedence and epoch-task ownership
+are enabled only by that explicit feature. Default builds retain the original
+directory-order execution and component-file loading path, ignore installer
+receipts, and keep the original detached epoch timer. CI runs focused loader
+compatibility contracts without default features as well as with all features.
 The default application state still holds `PluginRuntime` directly;
 there is no network reload endpoint or cross-replica revision publication in
 this change. Integrators must pin one snapshot before resolving configuration

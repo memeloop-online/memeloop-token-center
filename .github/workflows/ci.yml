@@ -270,6 +270,8 @@ jobs:
               && mc admin policy create test mtc-list-only /tmp/minio-list-only-policy.json \
               && mc admin policy attach test mtc-list-only --user mtc-list-only'
       - run: cargo fmt --all -- --check
+      - name: Verify default plugin loader compatibility without revision feature
+        run: cargo test --locked --no-default-features --test plugin_product loader_feature_boundary
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-targets --all-features --no-fail-fast
         env:

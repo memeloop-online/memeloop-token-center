@@ -288,9 +288,11 @@ struct LoadedPlugin {
     manifest: PluginManifest,
     component: Option<Component>,
     configuration_validator: Option<crate::schema::CompiledSchema>,
+    #[cfg(feature = "experimental-plugin-revisions")]
     identity: PluginPackageIdentity,
 }
 
+#[cfg(feature = "experimental-plugin-revisions")]
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginInstallProvenance {
@@ -300,6 +302,7 @@ pub struct PluginInstallProvenance {
     pub signature_policy: String,
 }
 
+#[cfg(feature = "experimental-plugin-revisions")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PluginPackageIdentity {
     pub component_sha256: Option<String>,
@@ -428,11 +431,14 @@ pub struct PluginRuntime {
     service_data_cache: Arc<tokio::sync::RwLock<BTreeMap<String, CachedPluginServiceData>>>,
     execution_timeout: Duration,
     fuel: u64,
+    #[cfg(feature = "experimental-plugin-revisions")]
     _epoch_task: Option<Arc<EpochTask>>,
 }
 
+#[cfg(feature = "experimental-plugin-revisions")]
 struct EpochTask(tokio::task::JoinHandle<()>);
 
+#[cfg(feature = "experimental-plugin-revisions")]
 impl Drop for EpochTask {
     fn drop(&mut self) {
         self.0.abort();
@@ -454,6 +460,7 @@ struct HostState {
     deadline: Instant,
 }
 
+#[cfg(feature = "experimental-plugin-revisions")]
 fn read_identity_bytes(path: &Path, maximum: u64) -> Result<Vec<u8>, AppError> {
     use std::io::Read;
     let file = fs::File::open(path).map_err(|_| plugin_runtime_failure("package_read"))?;
@@ -488,13 +495,17 @@ impl PluginRuntime {
         let engine = Engine::new(&engine_config)
             .map_err(|_| plugin_runtime_failure("engine_initialization"))?;
         let epoch_engine = engine.clone();
-        let epoch_task = Arc::new(EpochTask(tokio::spawn(async move {
+        let epoch_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(PLUGIN_EPOCH_TICK);
             loop {
                 interval.tick().await;
                 epoch_engine.increment_epoch();
             }
-        })));
+        });
+        #[cfg(feature = "experimental-plugin-revisions")]
+        let epoch_task = Arc::new(EpochTask(epoch_task));
+        #[cfg(not(feature = "experimental-plugin-revisions"))]
+        drop(epoch_task); // Preserve the default loader's detached epoch timer.
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(30))
@@ -536,38 +547,60 @@ impl PluginRuntime {
                 }
                 providers.push(provider);
             }
-            let component_bytes = manifest
+            #[cfg(not(feature = "experimental-plugin-revisions"))]
+            let component = manifest
                 .wasm
                 .as_deref()
                 .map(|wasm| {
                     let wasm_path = safe_child(&directory, wasm)?;
                     require_file_size(&wasm_path, PLUGIN_COMPONENT_BYTES, "plugin component")?;
-                    read_identity_bytes(&wasm_path, PLUGIN_COMPONENT_BYTES)
-                })
-                .transpose()?;
-            use sha2::{Digest, Sha256};
-            let component_sha256 = component_bytes
-                .as_ref()
-                .map(|bytes| format!("sha256:{:x}", Sha256::digest(bytes)));
-            // Compile exactly the bytes that were hashed, never reopen a path.
-            let component = component_bytes
-                .as_ref()
-                .map(|bytes| {
-                    Component::new(&engine, bytes).map_err(|_| {
+                    Component::from_file(&engine, &wasm_path).map_err(|_| {
                         AppError::BadRequest("plugin component cannot be compiled".into())
                     })
                 })
                 .transpose()?;
-            let receipt_path = directory.join(".mtc-oci-install.json");
-            let provenance = if receipt_path.exists() {
-                let path = safe_child(&directory, ".mtc-oci-install.json")?;
-                Some(
-                    serde_json::from_slice(&read_identity_bytes(&path, 16 * 1024)?).map_err(
-                        |_| AppError::BadRequest("invalid plugin install receipt".into()),
-                    )?,
+            #[cfg(feature = "experimental-plugin-revisions")]
+            let (component, identity) = {
+                let component_bytes = manifest
+                    .wasm
+                    .as_deref()
+                    .map(|wasm| {
+                        let wasm_path = safe_child(&directory, wasm)?;
+                        require_file_size(&wasm_path, PLUGIN_COMPONENT_BYTES, "plugin component")?;
+                        read_identity_bytes(&wasm_path, PLUGIN_COMPONENT_BYTES)
+                    })
+                    .transpose()?;
+                use sha2::{Digest, Sha256};
+                let component_sha256 = component_bytes
+                    .as_ref()
+                    .map(|bytes| format!("sha256:{:x}", Sha256::digest(bytes)));
+                // Compile exactly the bytes that were hashed, never reopen a path.
+                let component = component_bytes
+                    .as_ref()
+                    .map(|bytes| {
+                        Component::new(&engine, bytes).map_err(|_| {
+                            AppError::BadRequest("plugin component cannot be compiled".into())
+                        })
+                    })
+                    .transpose()?;
+                let receipt_path = directory.join(".mtc-oci-install.json");
+                let provenance = if receipt_path.exists() {
+                    let path = safe_child(&directory, ".mtc-oci-install.json")?;
+                    Some(
+                        serde_json::from_slice(&read_identity_bytes(&path, 16 * 1024)?).map_err(
+                            |_| AppError::BadRequest("invalid plugin install receipt".into()),
+                        )?,
+                    )
+                } else {
+                    None
+                };
+                (
+                    component,
+                    PluginPackageIdentity {
+                        component_sha256,
+                        provenance,
+                    },
                 )
-            } else {
-                None
             };
             let configuration_validator = manifest
                 .contributions
@@ -579,14 +612,14 @@ impl PluginRuntime {
                 manifest,
                 component,
                 configuration_validator,
-                identity: PluginPackageIdentity {
-                    component_sha256,
-                    provenance,
-                },
+                #[cfg(feature = "experimental-plugin-revisions")]
+                identity,
             });
         }
         validate_loaded_operator_ui_contributions(&plugins)?;
-        // Directory enumeration order must not change policy precedence.
+        // Manifest ordering belongs only to the explicit revision contract.
+        // Default builds retain the existing sorted-directory precedence.
+        #[cfg(feature = "experimental-plugin-revisions")]
         plugins.sort_by(|left, right| left.manifest.id.cmp(&right.manifest.id));
 
         Ok(Self {
@@ -600,6 +633,7 @@ impl PluginRuntime {
             service_data_cache: Arc::default(),
             execution_timeout: PLUGIN_EXECUTION_TIMEOUT,
             fuel: PLUGIN_FUEL,
+            #[cfg(feature = "experimental-plugin-revisions")]
             _epoch_task: Some(epoch_task),
         })
     }
@@ -615,6 +649,7 @@ impl PluginRuntime {
             .collect()
     }
 
+    #[cfg(feature = "experimental-plugin-revisions")]
     pub fn package_identities(&self) -> BTreeMap<String, PluginPackageIdentity> {
         self.plugins
             .iter()
