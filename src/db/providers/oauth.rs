@@ -1006,7 +1006,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<(Uuid, i64)>, AppError> {
         let rows = sqlx::query(
-            "SELECT a.id, a.credential_generation FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.status = 'active' AND a.auth_kind = 'oauth' AND a.oauth_session_id IS NOT NULL AND a.oauth_refresh_url IS NOT NULL AND a.driver <> 'cpa-gemini-oauth-legacy' AND c.expires_at IS NOT NULL AND c.expires_at <= $1 AND NOT EXISTS (SELECT 1 FROM upstream_oauth_refresh_leases l WHERE l.account_id = a.id AND l.credential_generation = a.credential_generation AND l.request_started_at IS NOT NULL) ORDER BY c.expires_at, a.id LIMIT $2",
+            "SELECT a.id, a.credential_generation FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.status = 'active' AND a.auth_kind = 'oauth' AND a.oauth_session_id IS NOT NULL AND a.oauth_refresh_url IS NOT NULL AND a.driver <> 'cpa-gemini-oauth-legacy' AND c.expires_at IS NOT NULL AND c.expires_at <= $1 AND NOT EXISTS (SELECT 1 FROM upstream_oauth_refresh_leases l WHERE l.account_id = a.id AND l.credential_generation = a.credential_generation AND l.request_started_at IS NOT NULL AND l.pending_credential_ciphertext IS NULL) ORDER BY c.expires_at, a.id LIMIT $2",
         )
         .bind(refresh_before)
         .bind(limit.clamp(1, 100))
@@ -1542,6 +1542,7 @@ mod tests {
     async fn consumed_refresh_disconnect_is_not_replayed_on_the_next_attempt() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let refresh_url = format!("http://{}/oauth/refresh", listener.local_addr().unwrap());
+        let (check_second, check_second_after_request) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut first, _) = listener.accept().await.unwrap();
             let mut request = Vec::new();
@@ -1565,7 +1566,8 @@ mod tests {
                     .any(|window| window == b"refresh-once")
             );
             drop(first);
-            tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            check_second_after_request.await.unwrap();
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
                 .await
                 .is_ok()
         });
@@ -1608,7 +1610,7 @@ mod tests {
             .await
             .unwrap();
         let router = api::router_for_role(state.clone(), RuntimeRole::Control);
-        let refresh_request = |key: &'static str| {
+        let refresh_request = |key: &str| {
             Request::post(format!(
                 "/internal/v1/upstreams/{}/oauth/refresh",
                 account.id
@@ -1637,6 +1639,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.status(), StatusCode::CONFLICT);
+        check_second.send(()).unwrap();
         assert!(
             !server.await.unwrap(),
             "an expired lease must not resend a refresh token whose outcome is unknown"

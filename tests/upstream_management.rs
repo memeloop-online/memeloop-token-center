@@ -1412,18 +1412,18 @@ async fn oauth_refresh_finalize_failure_recovers_pending_ciphertext_without_remo
         )
         .await
         .unwrap();
-    let idempotency_key = "refresh-finalize-fault";
+    let idempotency_key = format!("oauth-worker-{}-generation-1", account.id);
     assert!(
         state
             .db
-            .begin_upstream_oauth_refresh(account.id, idempotency_key, pepper)
+            .begin_upstream_oauth_refresh(account.id, &idempotency_key, pepper)
             .await
             .unwrap()
             .is_none()
     );
     state
         .db
-        .mark_upstream_oauth_refresh_request_started(account.id, idempotency_key)
+        .mark_upstream_oauth_refresh_request_started(account.id, &idempotency_key)
         .await
         .unwrap();
 
@@ -1450,7 +1450,7 @@ async fn oauth_refresh_finalize_failure_recovers_pending_ciphertext_without_remo
     };
     let failed = state
         .db
-        .finish_upstream_oauth_refresh(account.id, refreshed_credential, idempotency_key, pepper)
+        .finish_upstream_oauth_refresh(account.id, refreshed_credential, &idempotency_key, pepper)
         .await
         .unwrap_err();
     assert!(matches!(
@@ -1461,11 +1461,17 @@ async fn oauth_refresh_finalize_failure_recovers_pending_ciphertext_without_remo
         "SELECT CASE WHEN request_started_at IS NOT NULL THEN 1 ELSE 0 END, CASE WHEN pending_credential_ciphertext IS NOT NULL THEN 1 ELSE 0 END FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND idempotency_key = $2",
     )
     .bind(account.id.to_string())
-    .bind(idempotency_key)
+    .bind(&idempotency_key)
     .fetch_one(&fault_pool)
     .await
     .unwrap();
     assert_eq!(staged, (1, 1));
+    let candidates = state
+        .db
+        .list_managed_oauth_refresh_candidates(i64::MAX, 20)
+        .await
+        .unwrap();
+    assert!(candidates.contains(&(account.id, 1)));
     sqlx::query("DROP TRIGGER inject_oauth_finalize_failure")
         .execute(&fault_pool)
         .await
@@ -1475,7 +1481,7 @@ async fn oauth_refresh_finalize_failure_recovers_pending_ciphertext_without_remo
     // No authorization-server call or plaintext token is needed here.
     let recovered = state
         .db
-        .begin_upstream_oauth_refresh(account.id, idempotency_key, pepper)
+        .begin_upstream_oauth_refresh(account.id, &idempotency_key, pepper)
         .await
         .unwrap()
         .expect("pending OAuth result finalized");
@@ -1483,7 +1489,7 @@ async fn oauth_refresh_finalize_failure_recovers_pending_ciphertext_without_remo
     assert_eq!(recovered.credential_generation, 2);
     let replay = state
         .db
-        .begin_upstream_oauth_refresh(account.id, idempotency_key, pepper)
+        .begin_upstream_oauth_refresh(account.id, &idempotency_key, pepper)
         .await
         .unwrap()
         .expect("committed result replayed exactly");
