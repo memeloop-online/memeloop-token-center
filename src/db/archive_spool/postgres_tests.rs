@@ -394,8 +394,8 @@ use crate::archive_staging::{
     BeginArchiveStagingInput, BeginArchiveStagingResult,
 };
 
-// Keep bulk-seed disk pressure from distorting this suite's real 250ms ACK
-// contract. Each individual test still uses multiple independent connections.
+// Keep bulk-seed disk pressure from distorting this suite's ordering-sensitive
+// PostgreSQL contracts. Each test still uses multiple independent connections.
 static PG_SPOOL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct PgFixture {

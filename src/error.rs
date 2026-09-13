@@ -67,6 +67,8 @@ pub enum AppError {
     Conflict(String),
     #[error("invalid request: {0}")]
     BadRequest(String),
+    #[error("secret schema analysis exceeds the supported complexity limit")]
+    SchemaSecretAnalysisTooComplex,
     #[error("configured upstream is unavailable: {0}")]
     Upstream(String),
     #[error("service is temporarily overloaded")]
@@ -95,6 +97,7 @@ impl AppError {
             Self::NotFound => "not_found",
             Self::Conflict(_) => "conflict",
             Self::BadRequest(_) => "invalid_request",
+            Self::SchemaSecretAnalysisTooComplex => "schema_secret_analysis_too_complex",
             Self::Upstream(_) => "upstream",
             Self::Overloaded => "overloaded",
             Self::Storage(_) => "storage",
@@ -135,6 +138,11 @@ impl IntoResponse for AppError {
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found", self.to_string()),
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict", self.to_string()),
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request", self.to_string()),
+            Self::SchemaSecretAnalysisTooComplex => (
+                StatusCode::BAD_REQUEST,
+                "schema_secret_analysis_too_complex",
+                self.to_string(),
+            ),
             Self::Upstream(_) => (
                 StatusCode::BAD_GATEWAY,
                 "upstream_error",
@@ -272,6 +280,10 @@ mod tests {
         for (error, expected) in [
             (AppError::Conflict(CANARY.to_owned()), "conflict"),
             (AppError::BadRequest(CANARY.to_owned()), "invalid_request"),
+            (
+                AppError::SchemaSecretAnalysisTooComplex,
+                "schema_secret_analysis_too_complex",
+            ),
             (AppError::Upstream(CANARY.to_owned()), "upstream"),
             (AppError::Storage(CANARY.to_owned()), "storage"),
         ] {
@@ -279,6 +291,15 @@ mod tests {
             assert_eq!(category, expected);
             assert!(!category.contains(CANARY));
         }
+    }
+
+    #[tokio::test]
+    async fn secret_schema_complexity_has_a_distinct_safe_error_code() {
+        let response = AppError::SchemaSecretAnalysisTooComplex.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "schema_secret_analysis_too_complex");
     }
 
     #[tokio::test]

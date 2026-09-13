@@ -1,5 +1,8 @@
 mod accounts;
 mod availability;
+mod config_secret_graph;
+mod config_secret_paths;
+mod config_secrets;
 mod health;
 mod models;
 mod native_oauth_import;
