@@ -2,7 +2,7 @@ import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { CopyButton } from './CopyButton.js';
 import type { RequestView, StatsBucket } from './types.js';
 import { useI18n } from './i18n.js';
-import { formatCurrency, formatMetricNumber, formatMilliseconds, formatNumber } from './format.js';
+import { formatCurrency, formatMetricDisplay, formatMetricNumber, formatMilliseconds, formatNumber } from './format.js';
 import { useAnchoredPopover } from './useAnchoredPopover.js';
 
 export function Shell({ children, operator = false }: { children: ReactNode; operator?: boolean }) {
@@ -69,8 +69,8 @@ export function NumberMetric({
   const formatted = formatMetricNumber(value, locale);
   return <Metric label={label} tone={tone} value={
     <span className="metric-number">
-      <span className="metric-exact">{formatted.text}</span>
-      {showCompact && formatted.compact && <small className="metric-compact" aria-hidden="true">{formatted.compact}</small>}
+      <span className="metric-exact" title={showCompact ? formatted.text : undefined}>{showCompact && formatted.compact ? formatted.compact : formatted.text}</span>
+      {showCompact && formatted.compact && <small className="metric-compact" aria-hidden="true">{formatted.text}</small>}
     </span>
   } />;
 }
@@ -84,8 +84,8 @@ export function Buckets({ values, onSelect }: { values: StatsBucket[]; onSelect?
       {values.map((value) => (
         <div className="bucket" key={value.name}>
           {onSelect
-            ? <button className="bucket-heading" type="button" onClick={() => onSelect(value)} aria-label={t('request.filterBy', { name: value.name })}><b>{value.name}</b><span>{t('request.count', { count: formatNumber(value.requests, locale) })} · {formatNumber(value.input_tokens + value.output_tokens, locale)} {t('request.tokenUnit')}</span></button>
-            : <div className="bucket-heading"><b>{value.name}</b><span>{t('request.count', { count: formatNumber(value.requests, locale) })} · {formatNumber(value.input_tokens + value.output_tokens, locale)} {t('request.tokenUnit')}</span></div>}
+            ? <button className="bucket-heading" type="button" onClick={() => onSelect(value)} aria-label={t('request.filterBy', { name: value.name })}><b>{value.name}</b><span>{t('request.count', { count: formatMetricDisplay(value.requests, locale).text })} · {formatMetricDisplay(value.input_tokens + value.output_tokens, locale).text} {t('request.tokenUnit')}</span></button>
+            : <div className="bucket-heading"><b>{value.name}</b><span>{t('request.count', { count: formatMetricDisplay(value.requests, locale).text })} · {formatMetricDisplay(value.input_tokens + value.output_tokens, locale).text} {t('request.tokenUnit')}</span></div>}
           <div className="bar"><i style={{ width: `${(value.requests / maximum) * 100}%` }} /></div>
         </div>
       ))}
@@ -228,7 +228,7 @@ export function RequestTable({
   return (
     <div className="table-scroll request-table-scroll" role="region" aria-label={t('request.table')} tabIndex={0}>
       <table className="request-table">
-        <thead><tr><th>{t('request.receivedAt')}</th>{showRoutingDetails && <th>{t('request.completedAt')}</th>}<th>{t('request.model')}</th>{showsSession && <th>{t('request.session')}</th>}<th>{t('request.protocol')}</th>{showRoutingDetails && <><th>{t('request.upstreamId')}</th><th>{t('request.routeId')}</th></>}<th>{t('request.status')}</th><th>{t('request.duration')}</th><th>{t('request.tokens')}</th><th>{t('request.cost')}</th><th>{t('request.error')}</th>{onSelect && <th><span className="visually-hidden">{t('request.actions')}</span></th>}</tr></thead>
+        <thead><tr><th>{t('request.receivedAt')}</th><th>{t('request.model')}</th><th>{t('request.tokens')}</th><th>{t('request.cost')}</th>{showRoutingDetails && <th>{t('request.completedAt')}</th>}{showsSession && <th>{t('request.session')}</th>}<th>{t('request.protocol')}</th>{showRoutingDetails && <><th className="request-technical-heading">{t('request.upstreamId')}</th><th className="request-technical-heading">{t('request.routeId')}</th></>}<th>{t('request.status')}</th><th>{t('request.duration')}</th><th>{t('request.error')}</th>{onSelect && <th><span className="visually-hidden">{t('request.actions')}</span></th>}</tr></thead>
         <tbody>
           {requests.map((request) => {
             const context = request.session_context;
@@ -238,8 +238,10 @@ export function RequestTable({
             const currencyForRequest = recordedCurrency(request, currency);
             return <tr key={request.request_id}>
               <td className="request-time-cell"><time>{new Date(request.created_at).toLocaleString(locale)}</time><RequestIdentifier requestId={request.request_id} compact /></td>
-              {showRoutingDetails && <td className="request-completed-cell">{request.completed_at == null ? '—' : <time>{new Date(request.completed_at).toLocaleString(locale)}</time>}</td>}
               <td className="request-model-cell"><code>{request.model}</code></td>
+              <td className="request-token-cell"><span title={formatMetricDisplay(request.input_tokens + request.output_tokens, locale).title}>{formatMetricDisplay(request.input_tokens + request.output_tokens, locale).text}</span><RequestTokenSummary request={request} /></td>
+              <td className="request-cost-cell" title={currencyForRequest ? `${request.cost} ${currencyForRequest}` : undefined}>{currencyForRequest ? formatCurrency(request.cost, currencyForRequest, locale) : '—'}</td>
+              {showRoutingDetails && <td className="request-completed-cell">{request.completed_at == null ? '—' : <time>{new Date(request.completed_at).toLocaleString(locale)}</time>}</td>}
               {showsSession && <td className="request-session-cell">
                 {!context
                   ? '—'
@@ -251,11 +253,9 @@ export function RequestTable({
                 {sessionMeta && <RequestSessionMetadata value={sessionMeta} />}
               </td>}
               <td>{request.protocol}</td>
-              {showRoutingDetails && <><td className="request-upstream-cell">{request.upstream_account_id && upstreamNames?.get(request.upstream_account_id) && <span>{upstreamNames.get(request.upstream_account_id)}</span>}<code>{request.upstream_account_id ?? '—'}</code></td><td className="request-route-cell"><code>{request.route_id ?? '—'}</code></td></>}
+              {showRoutingDetails && <><td className="request-upstream-cell request-technical-cell" title={request.upstream_account_id ? `${upstreamNames?.get(request.upstream_account_id) ?? t('request.upstreamId')}: ${request.upstream_account_id}` : undefined}><span aria-hidden="true">ⓘ</span><span className="visually-hidden">{request.upstream_account_id && upstreamNames?.get(request.upstream_account_id) ? `${upstreamNames.get(request.upstream_account_id)} ${request.upstream_account_id}` : request.upstream_account_id ?? '—'}</span></td><td className="request-route-cell request-technical-cell" title={request.route_id ? `${t('request.routeId')}: ${request.route_id}` : undefined}><span aria-hidden="true">ⓘ</span><span className="visually-hidden">{request.route_id ?? '—'}</span></td></>}
               <td><span className={`status ${request.status_code && request.status_code < 400 ? 'ok' : request.status_code ? 'bad' : 'pending'}`}>{request.status_code ?? t('common.running')}</span></td>
               <td>{request.duration_ms === null ? '—' : `${formatNumber(request.duration_ms, locale, 2)} ms`}</td>
-              <td className="request-token-cell"><span>{formatNumber(request.input_tokens + request.output_tokens, locale)}</span><RequestTokenSummary request={request} /></td>
-              <td>{currencyForRequest ? formatCurrency(request.cost, currencyForRequest, locale) : '—'}</td>
               <td>{request.error_code ? <code className="error-code">{request.error_code}</code> : '—'}</td>
               {onSelect && <td><button className="secondary table-action" type="button" onClick={() => onSelect(request)} aria-label={t('request.openDetail', { model: request.model })}>{t('request.inspect')}</button></td>}
             </tr>

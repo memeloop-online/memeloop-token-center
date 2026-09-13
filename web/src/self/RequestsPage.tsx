@@ -98,7 +98,7 @@ export function RequestsPage({ credential, credentialView, onError, onOpenReques
       <NumberMetric label={t('traffic.total')} value={stats.summary.total_requests} />
       <NumberMetric label={t('traffic.success')} value={stats.summary.successful_requests} tone="positive" />
       <NumberMetric label={t('traffic.failure')} value={stats.summary.failed_requests} tone="negative" />
-      <NumberMetric label={t('request.tokens')} value={stats.summary.input_tokens + stats.summary.output_tokens} showCompact={false} />
+      <NumberMetric label={t('request.tokens')} value={stats.summary.input_tokens + stats.summary.output_tokens} />
     </section>}
     {stats && stats.errors.length > 0 && <article className="panel self-request-errors"><h2>{t('traffic.errors')}</h2><Buckets values={stats.errors} onSelect={(bucket) => filterBy({ status: 'error', errorCode: bucket.name })} /></article>}
     <article className="panel self-history">

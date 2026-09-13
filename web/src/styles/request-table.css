@@ -94,9 +94,20 @@
 }
 
 .request-model-cell {
-  min-width: 10rem;
-  max-width: 12rem;
+  min-width: 13rem;
+  max-width: 18rem;
   white-space: normal;
+}
+
+table.request-table .request-model-cell code {
+  color: #f1fbfc;
+  font-size: 0.88rem;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+:root[data-theme='light'] table.request-table .request-model-cell code {
+  color: #17343a;
 }
 
 .request-model-cell code,
@@ -174,8 +185,19 @@
 }
 
 .request-token-cell {
-  min-width: 18rem;
+  min-width: 16rem;
   white-space: normal;
+}
+
+.request-cost-cell {
+  min-width: 8rem;
+  color: var(--text-strong, #f1fbfc);
+  font-variant-numeric: tabular-nums lining-nums;
+  white-space: nowrap;
+}
+
+:root[data-theme='light'] .request-cost-cell {
+  color: #17343a;
 }
 
 .request-token-cell small {
@@ -240,4 +262,25 @@
   display: block;
   margin-bottom: 0.25rem;
   overflow-wrap: anywhere;
+}
+
+/* Routing identifiers remain available through the cell tooltip and the
+ * request detail view, but do not compete with model, token, and cost facts
+ * in the live request table. */
+.request-technical-cell {
+  color: var(--muted, #82979e);
+  max-width: 2rem;
+  padding-left: 2px;
+  padding-right: 2px;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.request-technical-heading {
+  color: transparent;
+  font-size: 0;
+  max-width: 2rem;
+  padding-left: 2px;
+  padding-right: 2px;
+  width: 2rem;
 }
