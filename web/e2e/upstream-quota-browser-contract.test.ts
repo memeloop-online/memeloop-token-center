@@ -60,6 +60,10 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
       });
       assert.deepEqual(styles, { border: theme === 'light' ? 'rgb(195, 213, 219)' : 'rgb(61, 105, 113)', width: '1px', style: 'solid', muted: theme === 'light' ? 'rgb(82, 105, 112)' : 'rgb(145, 170, 176)' });
       await advanced.focus();
+      // The proxy editor was closed with a pointer click. Re-enter through the
+      // keyboard: programmatic focus alone correctly does not imply :focus-visible.
+      await page.keyboard.press('Tab');
+      await page.keyboard.press('Shift+Tab');
       const focus = await advanced.evaluate(element => {
         const style = getComputedStyle(element);
         return { active: document.activeElement === element, width: Number.parseFloat(style.outlineWidth), style: style.outlineStyle, color: style.outlineColor };
