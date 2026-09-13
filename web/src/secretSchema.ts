@@ -4,12 +4,20 @@ function isSecretSchema(node: Record<string, unknown>, root: RJSFSchema, seen = 
   if (seen.has(node)) return false;
   seen.add(node);
   if (node.writeOnly === true || node.format === 'password') return true;
+  if (node.items && containsSecret(node.items, root, new Set(seen))) return true;
   if (typeof node.$ref === 'string' && node.$ref.startsWith('#/')) {
     let target: unknown = root;
     for (const part of node.$ref.slice(2).split('/')) target = target && typeof target === 'object' ? (target as Record<string, unknown>)[part.replace(/~1/g, '/').replace(/~0/g, '~')] : undefined;
     if (target && typeof target === 'object' && isSecretSchema(target as Record<string, unknown>, root, seen)) return true;
   }
   return Array.isArray(node.allOf) && node.allOf.some((part) => part && typeof part === 'object' && isSecretSchema(part, root, seen));
+}
+
+function containsSecret(value: unknown, root: RJSFSchema, seen = new Set<unknown>()): boolean {
+  if (!value || typeof value !== 'object' || seen.has(value)) return false;
+  if (!Array.isArray(value) && isSecretSchema(value as Record<string, unknown>, root, new Set(seen))) return true;
+  seen.add(value);
+  return Object.entries(value).some(([key, child]) => !['default', 'examples', 'const', 'enum'].includes(key) && containsSecret(child, root, seen));
 }
 
 function withoutSecretDefaults(schema: RJSFSchema): RJSFSchema {
@@ -29,6 +37,9 @@ function withoutSecretDefaults(schema: RJSFSchema): RJSFSchema {
  * secrets are absent, not blank replacements; only subsequent user input may
  * populate them. The server preserves omitted secret paths under its CAS. */
 export function prepareSecretForm(schema: RJSFSchema, validator: ValidatorType, existing?: unknown) {
+  // Forms with no secret annotations keep their original dynamic schema and
+  // default-computation behavior exactly, including unrelated policy editors.
+  if (!containsSecret(schema, schema)) return { schema, formData: existing };
   const root = withoutSecretDefaults(schema);
   const utils = createSchemaUtils(validator, root);
   function visit(input: RJSFSchema, value: unknown, depth = 0): { schema: RJSFSchema; data: unknown; secret: boolean } {
@@ -36,7 +47,7 @@ export function prepareSecretForm(schema: RJSFSchema, validator: ValidatorType, 
     const resolved = utils.retrieveSchema(input, value);
     const secret = isSecretSchema(resolved, root);
     const clean = withoutSecretDefaults(resolved);
-    if (secret) return { schema: clean, data: undefined, secret: true };
+    if (secret) return { schema: { ...clean, writeOnly: true }, data: undefined, secret: true };
     let data = value && typeof value === 'object' && !Array.isArray(value) ? { ...value as Record<string, unknown> } : value;
     if (clean.properties) {
       clean.properties = { ...clean.properties };
@@ -54,6 +65,7 @@ export function prepareSecretForm(schema: RJSFSchema, validator: ValidatorType, 
     }
     for (const key of ['oneOf', 'anyOf'] as const) {
       if (clean[key]) clean[key] = clean[key].map((child) => {
+        if (typeof child === 'boolean') return child;
         const next = visit(child, data, depth + 1);
         data = next.data;
         return next.schema;
