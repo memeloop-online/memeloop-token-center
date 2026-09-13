@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
-import { api } from '../api';
+import { api, ApiError } from '../api';
 import { formatElapsedTime, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
-import { quotaUsedPercent, upstreamQuotaPath, type UpstreamQuotaSnapshot } from './upstreamQuota';
+import { quotaReadErrorMessage, quotaUsedPercent, upstreamQuotaPath, type UpstreamQuotaSnapshot } from './upstreamQuota';
 import './upstreamQuota.css';
 import { UpstreamQuotaReset } from './UpstreamQuotaReset';
 
@@ -26,7 +26,11 @@ export function UpstreamQuotaDetails({ snapshot }: { snapshot: UpstreamQuotaSnap
       {snapshot.credits.balance !== null && <span>{t('quota.balance', { amount: snapshot.credits.balance })}</span>}
       {snapshot.credits.unlimited === true && <span>{t('quota.unlimitedCredits')}</span>}
     </div>
-    {snapshot.status !== 'ready' && <p role={snapshot.status === 'error' ? 'alert' : undefined}>{t(snapshot.status === 'unsupported' ? 'quota.readUnsupported' : 'quota.readFailed')}</p>}
+    {snapshot.status === 'unsupported' && <p>{t('quota.readUnsupported')}</p>}
+    {snapshot.status !== 'unsupported' && (snapshot.status === 'error' || snapshot.error_code) && <div className="notice error" role="alert">
+      <p>{t(quotaReadErrorMessage(snapshot.error_code))}</p>
+      {snapshot.observed_at !== null && <p>{t('quota.refreshFailedRetained')}</p>}
+    </div>}
     {snapshot.status === 'ready' && snapshot.windows.length === 0 && <p>{t('quota.noWindows')}</p>}
     <div className="upstream-quota-windows">{snapshot.windows.map((window) => {
       const used = quotaUsedPercent(window);
@@ -45,7 +49,7 @@ export function UpstreamQuotaDetails({ snapshot }: { snapshot: UpstreamQuotaSnap
       <b>{t('quota.resetCapability')}</b>
       <p>{t(resetMessage)}</p>
       {reset.available_credits !== null && <span>{t('quota.resetCredits', { available: formatNumber(reset.available_credits, locale), applicable: reset.applicable_credits === null ? '—' : formatNumber(reset.applicable_credits, locale) })}</span>}
-      {reset.credit_error_code && <p>{t('quota.resetCreditsUnavailable')}</p>}
+      {reset.credit_error_code && <p>{t('quota.resetCreditsUnavailable')} {t(quotaReadErrorMessage(reset.credit_error_code))}</p>}
     </div>
   </div>;
 }
@@ -55,13 +59,13 @@ export function UpstreamQuota({ accountId, accountName = accountId, tenant, toke
   const { t } = useI18n();
   const [snapshot, setSnapshot] = useState<UpstreamQuotaSnapshot>();
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState(false);
+  const [error, setError] = useState<'quota.readFailed' | 'quota.errorPermission'>();
   const scope = `${token}\0${tenant}\0${accountId}`;
   const scopeRef = useRef(scope);
   scopeRef.current = scope;
   const requestRef = useRef<AbortController | null>(null);
   useEffect(() => {
-    setSnapshot(undefined); setBusy(false); setError(false);
+    setSnapshot(undefined); setBusy(false); setError(undefined);
     return () => requestRef.current?.abort();
   }, [scope]);
   async function load() {
@@ -69,21 +73,21 @@ export function UpstreamQuota({ accountId, accountName = accountId, tenant, toke
     const controller = new AbortController();
     requestRef.current?.abort();
     requestRef.current = controller;
-    setBusy(true); setError(false);
+    setBusy(true); setError(undefined);
     try {
       const value = await api<UpstreamQuotaSnapshot>(upstreamQuotaPath(accountId, tenant), token, { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(20_000)]) });
       if (scopeRef.current !== scope || controller.signal.aborted) return;
       if (value.upstream_account_id !== accountId || value.tenant_external_id !== tenant || value.contract_version !== 'upstream_quota_v1') throw new Error('Quota scope mismatch');
       setSnapshot(value);
-    } catch {
-      if (scopeRef.current === scope && !controller.signal.aborted) setError(true);
+    } catch (reason) {
+      if (scopeRef.current === scope && !controller.signal.aborted) setError(reason instanceof ApiError && [401, 403].includes(reason.status) ? 'quota.errorPermission' : 'quota.readFailed');
     } finally {
       if (scopeRef.current === scope && !controller.signal.aborted) setBusy(false);
     }
   }
   return <section className="upstream-quota" aria-label={t('quota.title')} aria-busy={busy}>
     <div className="upstream-quota-heading"><h3>{t('quota.title')}</h3><button type="button" className="secondary" disabled={busy || !tenant} onClick={() => void load()}>{t(busy ? 'common.loading' : snapshot ? 'quota.refresh' : 'quota.view')}</button></div>
-    {error && <p className="notice error" role="alert">{t(snapshot ? 'quota.refreshFailedRetained' : 'quota.readFailed')}</p>}
+    {error && <div className="notice error" role="alert"><p>{t(error)}</p>{snapshot && <p>{t('quota.refreshFailedRetained')}</p>}</div>}
     {!snapshot && busy && <div className="upstream-quota-loading" role="status"><span>{t('common.loading')}</span><div className="upstream-quota-skeleton" aria-hidden="true"><i /><i /></div></div>}
     {!snapshot && !busy && !error && <p>{t(tenant ? 'quota.notLoaded' : 'quota.selectTenant')}</p>}
     {snapshot && <UpstreamQuotaDetails snapshot={snapshot} />}
