@@ -74,5 +74,22 @@ test('advanced validation remains discoverable without losing field values or mo
     assert.equal(await editBeta.isDisabled(), true);
     await page.getByRole('button', { name: 'Finish refresh', exact: true }).click();
     assert.equal(await editBeta.evaluate(element => document.activeElement === element), true);
+    const extension = page.locator('[data-layout-contract]');
+    await extension.getByRole('note').getByText('This field cannot be edited visually yet', { exact: true }).waitFor();
+    const visibleExtension = await extension.innerText();
+    assert.doesNotMatch(visibleExtension, /schema-default-must-not-render|schema-example-must-not-render|existing-value-must-not-render|Unsupported field schema/);
+    assert.equal(await extension.locator('pre').count(), 0);
+    for (const width of [390, 1440]) {
+      await page.setViewportSize({ width, height: 844 });
+      for (const theme of ['light', 'dark']) {
+        await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
+        assert.equal(await extension.evaluate(element => element.scrollWidth <= element.clientWidth), true, 'unknown schema and array legends stay inside their form');
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+      }
+    }
+    await extension.getByRole('textbox').fill('edited');
+    await extension.getByRole('button', { name: 'Save extended fields' }).click();
+    const submitted = await page.evaluate(() => (window as Window & { formLayoutSubmission?: { future: string; entries: string[] } }).formLayoutSubmission);
+    assert.deepEqual(submitted, { future: 'existing-value-must-not-render', entries: ['edited'] }, 'unsupported fields preserve existing data while supported siblings remain editable');
   } finally { await browser.close(); await server.close(); }
 });

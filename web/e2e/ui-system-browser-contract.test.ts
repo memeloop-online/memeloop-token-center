@@ -138,7 +138,7 @@ test('shared surfaces contain long content and retain keyboard actions across lo
           assert.equal(await action.evaluate(element => (element.parentElement as HTMLDetailsElement).open), true, `${label}: keyboard disclosure`);
           await page.keyboard.press('Enter');
           assert.equal(await action.evaluate(element => (element.parentElement as HTMLDetailsElement).open), false, `${label}: keyboard collapse`);
-          if (width <= 390) assert.ok(await page.locator('.rjsf > button[type="submit"]').evaluate(element => element.getBoundingClientRect().height >= 44), `${label}: save target`);
+          if (width <= 390) assert.ok(await page.locator('.rjsf > button[type="submit"]').evaluateAll(elements => elements.length > 0 && elements.every(element => element.getBoundingClientRect().height >= 44)), `${label}: every save target`);
         }
         if (route.name === 'request-diagnostics') {
           assert.equal(await action.textContent(), 'session_'.repeat(40), `${label}: full label retained`);
