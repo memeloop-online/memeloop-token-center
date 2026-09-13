@@ -129,7 +129,7 @@ function writableBoundary(stream: ClientRequest | ServerResponse): Promise<void>
 
 /** The client streams both directions; it does not buffer a 64MiB response. */
 function send(base: string, key: string, plan: Plan, options: {
-  chunked?: boolean; contentLength?: number; encoding?: string; raw?: Buffer;
+  chunked?: boolean; contentLength?: number; encoding?: string; raw?: Buffer; expectContinue?: boolean;
 } = {}): { uploaded: Promise<void>; result: Promise<Result> } {
   const uploaded = gate();
   const target = new URL(requestPath(plan), base);
@@ -139,6 +139,7 @@ function send(base: string, key: string, plan: Plan, options: {
       authorization: `Bearer ${key}`, "content-type": "application/json", connection: "close",
       ...(options.chunked ? {} : { "content-length": String(options.contentLength ?? options.raw?.length ?? plan.bytes) }),
       ...(options.encoding ? { "content-encoding": options.encoding } : {}),
+      ...(options.expectContinue ? { expect: "100-continue" } : {}),
     } }, (response) => {
       stopped = true;
       uploaded.release();
@@ -151,9 +152,22 @@ function send(base: string, key: string, plan: Plan, options: {
     req.setTimeout(45_000, () => req.destroy(new Error("proxy request timed out")));
     req.once("error", (error) => { stopped = true; uploaded.release(); reject(error); });
     req.once("finish", uploaded.release);
+    const uploadPermission = gate();
+    if (options.expectContinue) {
+      // A known-oversized request must let the gateway answer from its headers
+      // before the client writes a body the gateway is required to reject.
+      // If the gateway needs the body, HTTP/1.1 Continue opens the upload.
+      req.once("continue", uploadPermission.release);
+      req.once("response", uploadPermission.release);
+      req.once("close", uploadPermission.release);
+      req.once("error", uploadPermission.release);
+    } else {
+      uploadPermission.release();
+    }
     req.flushHeaders();
     void (async () => {
       try {
+        await uploadPermission.promise;
         for (const piece of options.raw ? [options.raw] : pieces(plan)) {
           if (stopped || req.destroyed) break;
           if (!req.write(piece)) await writableBoundary(req);
@@ -347,7 +361,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
     await phase("64MiB-input-default-policy-rejection", async () => {
       current = outputPlan(512);
       const before = upstreamCalls;
-      const result = await send(base, key, responsesInputPlan(64 * MIB)).result;
+      const result = await send(base, key, responsesInputPlan(64 * MIB), { expectContinue: true }).result;
       assert([413, 503].includes(result.status) && upstreamCalls === before, "default 16MiB ingress boundary must reject 64MiB before upstream");
       if (result.status === 503) assert(Number(result.retryAfter) >= 1, "503 requires Retry-After");
       return result;
