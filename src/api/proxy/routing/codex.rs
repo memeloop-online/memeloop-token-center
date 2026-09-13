@@ -29,7 +29,7 @@ struct CodexAttemptContext {
 }
 
 #[derive(Clone, Copy)]
-struct CodexAttemptDeadline {
+struct CodexRequestDeadline {
     request: tokio::time::Instant,
     read_inactivity: std::time::Duration,
 }
@@ -123,6 +123,13 @@ pub(super) async fn send_proxy_route(
         state.config.upstream_health.shared_probe_attempts,
     )
     .map_err(|_| ProxySendError::CandidateUnavailable)?;
+    // One logical Codex send may include the sole, explicitly permitted 400
+    // replay. Keep one deadline across both sends so replay cannot refresh an
+    // operator-configured total request budget.
+    let deadline = CodexRequestDeadline {
+        request: tokio::time::Instant::now() + transport_policy.request_timeout,
+        read_inactivity: transport_policy.read_timeout,
+    };
     loop {
         let (response, upstream_activity) = match send_codex_attempt(
             state,
@@ -137,6 +144,7 @@ pub(super) async fn send_proxy_route(
                 transport_policy,
             },
             &client,
+            deadline,
         )
         .await
         {
@@ -233,6 +241,7 @@ async fn send_codex_attempt(
     session_id: &str,
     context: CodexAttemptContext,
     client: &wreq::Client,
+    deadline: CodexRequestDeadline,
 ) -> Result<(UpstreamResponse, crate::metrics::ActivityGuard), ProxySendError> {
     let CodexAttemptContext {
         request_id,
@@ -240,10 +249,6 @@ async fn send_codex_attempt(
         outbound_attempt,
         transport_policy,
     } = context;
-    let deadline = CodexAttemptDeadline {
-        request: tokio::time::Instant::now() + transport_policy.request_timeout,
-        read_inactivity: transport_policy.read_timeout,
-    };
     for connect_attempt in 1..=transport_policy.connect_attempts {
         match send_codex_attempt_once(
             state, headers, target_url, route, session_id, client, deadline,
@@ -318,7 +323,7 @@ async fn send_codex_attempt_once(
     route: &PreparedProxyRoute,
     session_id: &str,
     client: &wreq::Client,
-    deadline: CodexAttemptDeadline,
+    deadline: CodexRequestDeadline,
 ) -> Result<(UpstreamResponse, crate::metrics::ActivityGuard), ProxySendError> {
     #[cfg(test)]
     if TEST_PRE_DELIVERY_CONNECT_FAILURES
@@ -400,7 +405,9 @@ where
         // deadline and the request deadline become ready in the same poll.
         biased;
         result = &mut send => result,
-        _ = tokio::time::sleep_until(deadline) => Err(ProxySendError::NonRetryableTransport),
+        _ = tokio::time::sleep_until(deadline) => Err(ProxySendError::AmbiguousResponse(
+            super::super::upstream_response::UPSTREAM_REQUEST_TIMEOUT,
+        )),
     }
 }
 
@@ -435,10 +442,43 @@ mod timeout_tests {
             std::future::pending::<Result<(), ProxySendError>>(),
         )
         .await;
-        assert!(matches!(result, Err(ProxySendError::NonRetryableTransport)));
+        assert!(matches!(
+            result,
+            Err(ProxySendError::AmbiguousResponse(
+                super::super::upstream_response::UPSTREAM_REQUEST_TIMEOUT
+            ))
+        ));
         assert_eq!(
             failover_disposition(None, result.as_ref().err()),
             FailoverDisposition::Stop
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn total_request_deadline_is_shared_across_the_permitted_replay() {
+        let started = tokio::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(1);
+        let first = send_until_request_deadline(deadline, async {
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            Ok::<_, ProxySendError>(())
+        })
+        .await;
+        assert!(first.is_ok());
+
+        let replay = send_until_request_deadline(
+            deadline,
+            std::future::pending::<Result<(), ProxySendError>>(),
+        )
+        .await;
+        assert!(matches!(
+            replay,
+            Err(ProxySendError::AmbiguousResponse(
+                super::super::upstream_response::UPSTREAM_REQUEST_TIMEOUT
+            ))
+        ));
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            std::time::Duration::from_secs(1)
         );
     }
 

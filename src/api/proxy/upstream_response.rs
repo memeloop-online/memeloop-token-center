@@ -127,26 +127,35 @@ impl UpstreamResponse {
         request_deadline: tokio::time::Instant,
         read_timeout: std::time::Duration,
     ) -> Self {
+        // Start the first inactivity window when headers arrive, not when a
+        // downstream consumer eventually asks for the first body chunk.
+        let first_read_deadline = tokio::time::Instant::now() + read_timeout;
         let parts = self.into_parts();
         let timed = stream::unfold(
-            (parts.stream, false),
-            move |(mut upstream, finished)| async move {
+            (parts.stream, first_read_deadline, false),
+            move |(mut upstream, mut read_deadline, finished)| async move {
                 if finished {
                     return None;
                 }
-                if tokio::time::Instant::now() >= request_deadline {
-                    return Some((Err(UPSTREAM_REQUEST_TIMEOUT), (upstream, true)));
-                }
-                let read_deadline = tokio::time::Instant::now() + read_timeout;
                 let (deadline, error_code) = if request_deadline <= read_deadline {
                     (request_deadline, UPSTREAM_REQUEST_TIMEOUT)
                 } else {
                     (read_deadline, UPSTREAM_READ_TIMEOUT)
                 };
-                match tokio::time::timeout_at(deadline, upstream.next()).await {
-                    Ok(Some(chunk)) => Some((chunk, (upstream, false))),
+                let next = tokio::select! {
+                    // If a chunk is already buffered when the consumer polls,
+                    // accept that progress even at the exact timeout boundary.
+                    biased;
+                    next = upstream.next() => Ok(next),
+                    _ = tokio::time::sleep_until(deadline) => Err(()),
+                };
+                match next {
+                    Ok(Some(chunk)) => {
+                        read_deadline = tokio::time::Instant::now() + read_timeout;
+                        Some((chunk, (upstream, read_deadline, false)))
+                    }
                     Ok(None) => None,
-                    Err(_) => Some((Err(error_code), (upstream, true))),
+                    Err(()) => Some((Err(error_code), (upstream, read_deadline, true))),
                 }
             },
         );
@@ -221,6 +230,23 @@ mod tests {
         assert_eq!(
             tokio::time::Instant::now() - now,
             std::time::Duration::from_millis(2_800)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_read_timeout_starts_when_headers_arrive() {
+        let headers_arrived = tokio::time::Instant::now();
+        let response = delayed_body(vec![std::time::Duration::from_secs(2)]).with_body_timeouts(
+            headers_arrived + std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(1),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        let mut body = response.bytes_stream();
+        assert_eq!(body.next().await.unwrap(), Err(UPSTREAM_READ_TIMEOUT));
+        assert_eq!(
+            tokio::time::Instant::now() - headers_arrived,
+            std::time::Duration::from_secs(1)
         );
     }
 

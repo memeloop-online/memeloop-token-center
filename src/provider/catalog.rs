@@ -350,11 +350,11 @@ impl ProviderCatalog {
                 },
                 "read_timeout_millis": {
                     "type": "integer", "minimum": 1000, "maximum": 1260000, "default": 600000,
-                    "description": "Maximum inactivity between response-body reads after headers arrive."
+                    "description": "Maximum inactivity from response headers to the first body read and between later body reads."
                 },
                 "request_timeout_millis": {
                     "type": "integer", "minimum": 1000, "maximum": 1260000, "default": 1260000,
-                    "description": "One absolute budget from send through the complete response body."
+                    "description": "One absolute budget from the first send through the complete response body, including the sole permitted classified HTTP 400 replay."
                 },
                 "candidate_attempts": {
                     "type": "integer",
