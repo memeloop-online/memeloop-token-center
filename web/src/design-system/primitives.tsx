@@ -43,7 +43,7 @@ export function Disclosure({ title, children, defaultOpen = false, open, onOpenC
   title: string; children: ReactNode; defaultOpen?: boolean;
   open?: boolean; onOpenChange?: (open: boolean) => void;
 }) {
-  return <Accordion collapsible defaultOpenItems={defaultOpen ? ['content'] : []}
+  return <Accordion collapsible defaultOpenItems={open === undefined ? (defaultOpen ? ['content'] : []) : undefined}
     openItems={open === undefined ? undefined : open ? ['content'] : []}
     onToggle={(_, data) => onOpenChange?.(data.openItems.includes('content'))}>
     <AccordionItem value="content">

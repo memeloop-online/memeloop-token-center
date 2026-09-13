@@ -17,6 +17,8 @@ test('Fluent foundation keeps theme, focus details and responsive surfaces acces
   const browser = await chromium.launch({ headless: true });
   try {
     const page = await browser.newPage();
+    const consoleErrors: string[] = [];
+    page.on('console', message => { if (message.type() === 'error') consoleErrors.push(message.text()); });
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/fluent-foundation.html`);
     await page.getByRole('textbox', { name: 'Account name' }).waitFor();
     const colors: string[] = [];
@@ -77,5 +79,6 @@ test('Fluent foundation keeps theme, focus details and responsive surfaces acces
     assert.equal(surface.outline, 'solid');
     assert.equal(surface.shadow, 'none');
     assert.equal(surface.animation, '1e-05s');
+    assert.deepEqual(consoleErrors, [], 'controlled and uncontrolled disclosures must not emit React or Fluent errors');
   } finally { await browser.close(); await server.close(); }
 });
