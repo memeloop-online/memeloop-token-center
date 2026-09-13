@@ -3,6 +3,7 @@ import { CopyButton } from './CopyButton.js';
 import type { RequestView, StatsBucket } from './types.js';
 import { useI18n } from './i18n.js';
 import { formatCurrency, formatMetricNumber, formatMilliseconds, formatNumber } from './format.js';
+import { useAnchoredPopover } from './useAnchoredPopover.js';
 
 export function Shell({ children, operator = false }: { children: ReactNode; operator?: boolean }) {
   const { locale, setLocale, t } = useI18n();
@@ -130,6 +131,32 @@ function recordedCurrency(request: RequestView, fallbackCurrency?: string) {
   return request.currency === undefined ? fallbackCurrency : request.currency;
 }
 
+function RequestSessionMetadata({ value }: { value: string }) {
+  const { t } = useI18n();
+  const id = useId();
+  const [open, setOpen] = useState(false);
+  const { anchor, panel, position } = useAnchoredPopover(open);
+  const close = (restoreFocus = false) => {
+    setOpen(false);
+    if (restoreFocus) anchor.current?.focus();
+  };
+
+  return <>
+    <button ref={anchor} type="button" className="secondary request-session-metadata-trigger" aria-haspopup="dialog" aria-expanded={open} aria-controls={`${id}-popover`} onClick={() => open ? close() : setOpen(true)}>{t('request.sessionMetadata')}</button>
+    {open && <section ref={panel} id={`${id}-popover`} className="request-session-metadata-popover" popover="auto" style={position} role="dialog" aria-modal="false" aria-label={t('request.sessionMetadata')} onKeyDown={(event) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation();
+      close(true);
+    }} onToggle={(event) => {
+      if (event.target === event.currentTarget && event.newState === 'closed') setOpen(false);
+    }}>
+      <code>{value}</code>
+      <CopyButton value={value} label={t('common.copy')} />
+    </section>}
+  </>;
+}
+
 /**
  * The raw-request API deliberately exposes only fields that were durably
  * recorded for the request. Keep its diagnostics in one surface so the self
@@ -221,7 +248,7 @@ export function RequestTable({
                       ? <button type="button" className="table-link" onClick={() => onOpenSession(context.session_id!)}>{sessionLabel}</button>
                       : <span className="request-session-name">{sessionLabel}</span>
                     : <span className="request-session-unlinked">{t('sessions.unlinkedRequests')}</span>}
-                {sessionMeta && <details className="request-session-metadata"><summary>{t('request.sessionMetadata')}</summary><small>{sessionMeta}</small></details>}
+                {sessionMeta && <RequestSessionMetadata value={sessionMeta} />}
               </td>}
               <td>{request.protocol}</td>
               {showRoutingDetails && <><td className="request-upstream-cell">{request.upstream_account_id && upstreamNames?.get(request.upstream_account_id) && <span>{upstreamNames.get(request.upstream_account_id)}</span>}<code>{request.upstream_account_id ?? '—'}</code></td><td className="request-route-cell"><code>{request.route_id ?? '—'}</code></td></>}

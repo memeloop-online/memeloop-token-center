@@ -31,26 +31,50 @@
   width: 100%;
 }
 
-/* Secondary agent identifiers should not set every live row's height. Native
-   disclosure preserves the complete value for keyboard and touch users. */
-.request-session-metadata {
+/* Secondary agent identifiers should not set every live row's height. The
+   shared anchored popover preserves the complete value for every input mode. */
+.request-session-metadata-trigger {
   margin-top: 0.25rem;
+  max-width: 100%;
+  overflow: hidden;
+  padding: 0.15rem 0.25rem;
   text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.request-session-metadata > summary {
-  color: inherit;
-  cursor: pointer;
-  font-size: 0.75rem;
-  line-height: 1.5;
-  padding-block: 0.15rem;
+.request-session-metadata-popover[popover] {
+  background: #0d1c20;
+  border: 1px solid #3d6971;
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgb(0 0 0 / 18%);
+  color: #d7e7e9;
+  display: flex;
+  gap: 0.75rem;
+  inset: auto;
+  margin: 0;
+  overflow: auto;
+  padding: 0.75rem;
+  position: fixed;
+  width: min(24rem, calc(100vw - 16px));
+}
+
+.request-session-metadata-popover code {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  user-select: text;
   white-space: normal;
 }
 
-.request-session-metadata > summary:focus-visible,
-.request-table-scroll:focus-visible {
-  outline: 2px solid currentColor;
-  outline-offset: 2px;
+.request-session-metadata-popover .copy-control {
+  flex: 0 0 auto;
+}
+
+:root[data-theme='light'] .request-session-metadata-popover[popover] {
+  background: #fff;
+  border-color: #c3d5db;
+  color: #19343d;
 }
 
 .request-table .request-time-cell {
@@ -192,7 +216,8 @@
 @media (max-width: 599px) {
   .request-id-control > .copy-control button,
   .request-diagnostic-session,
-  .request-session-metadata > summary {
+  .request-session-metadata-trigger,
+  .request-session-metadata-popover .copy-control button {
     min-height: 44px;
     min-width: 44px;
   }
