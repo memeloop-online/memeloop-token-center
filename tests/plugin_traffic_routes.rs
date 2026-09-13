@@ -135,6 +135,12 @@ async fn small_text_input_can_expand_to_sixteen_mib_in_a_real_traffic_hook() {
     fixture.state = AppState::initialize((*fixture.state.config).clone())
         .await
         .unwrap();
+    // Isolate this memory-admission boundary from the independently tested
+    // guest fuel ceiling: bulk-filling 16 MiB intentionally exceeds it.
+    fixture
+        .state
+        .plugins
+        .set_execution_limits_for_tests(std::time::Duration::from_secs(30), u64::MAX);
     let (status, response) = call_hint_routing_fixture(&fixture).await;
     assert_eq!(status, StatusCode::OK, "{response}");
     let received = upstream.received_requests().await.unwrap();
