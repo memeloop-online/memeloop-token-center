@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { parsePluginUiProjection, type PluginUiPolicy, type PluginUiProjection } from './uiProjection';
+import { parsePluginUiProjection, type PluginUiPolicy, type PluginUiProjection } from './uiProjection.js';
 
 export interface PluginUiSlotProps extends PluginUiPolicy {
   /** Changes on tenant, principal, credential/authorization revision, or plugin revision. */
