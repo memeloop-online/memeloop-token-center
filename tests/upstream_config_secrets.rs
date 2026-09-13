@@ -6,7 +6,7 @@ use memeloop_token_center::{
     AppState, api,
     config::{Config, RuntimeRole},
     db::CreateUpstreamAccountInput,
-    provider::UpstreamCredential,
+    provider::{OAuthAdapterContribution, OAuthFlowKind, UpstreamCredential},
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -131,6 +131,100 @@ async fn recursive_schema_accounts_are_cycle_aware_and_creation_is_atomic() {
             assert_eq!(listed[0]["config"], config);
         }
     }
+}
+
+#[tokio::test]
+async fn provider_adapter_secret_cycles_are_rejected_before_oauth_start_or_reauthorization() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("oauth-secret-gate.db").display()
+    );
+    let mut state = AppState::initialize(Config::for_test(database_url.clone()))
+        .await
+        .unwrap();
+    let mock = wiremock::MockServer::start().await;
+    let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+    // These reserved URLs are only syntax-checked into a login URL. This test
+    // never polls or makes a provider call; the account endpoint is a mock.
+    let adapter = OAuthAdapterContribution {
+        api_version: "oauth-adapter-v1".into(),
+        flow_kind: OAuthFlowKind::CursorPkce,
+        login_url: "https://provider.example/login".into(),
+        poll_url: "https://provider.example/poll".into(),
+        refresh_url: "https://provider.example/refresh".into(),
+    };
+    let config = json!({"base_url":mock.uri(),"tree":{"next":{}}});
+    for secret in [false, true] {
+        let mut provider = state.providers.get("http-json").unwrap().clone();
+        provider.id = format!("oauth-recursive-{secret}");
+        provider.oauth_adapter = Some(adapter.clone());
+        provider.config_schema = json!({"type":"object","$defs":{"node":{"type":"object","properties":{"token":{"type":"string","writeOnly":secret},"next":{"$ref":"#/$defs/node"}}}},"properties":{"base_url":{"type":"string"},"tree":{"$ref":"#/$defs/node"}}});
+        let driver = provider.id.clone();
+        state.providers.extend([provider]).unwrap();
+        let (status, _) = request(&state,"POST","/internal/v1/oauth/provider-adapter/start",json!({"tenant_external_id":"oauth-secret-test","account_name":"new","provider_driver":driver,"provider_config":config})).await;
+        assert_eq!(
+            status,
+            if secret {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::OK
+            }
+        );
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_login_sessions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            sessions, 1,
+            "only the non-secret positive control may create an OAuth session"
+        );
+        if secret {
+            let legacy = state
+                .db
+                .create_upstream_account(
+                    CreateUpstreamAccountInput {
+                        tenant_external_id: "oauth-secret-test".into(),
+                        name: "legacy".into(),
+                        driver: driver.clone(),
+                        config: config.clone(),
+                        credential: UpstreamCredential::OAuth {
+                            access_token: "synthetic-access".into(),
+                            refresh_token: Some("synthetic-refresh".into()),
+                            expires_at: Some(memeloop_token_center::db::unix_millis() + 3_600_000),
+                            header: "authorization".into(),
+                            prefix: "Bearer ".into(),
+                            adapter_state: None,
+                        },
+                        oauth_session_id: None,
+                        oauth_driver: Some("provider_adapter".into()),
+                        oauth_refresh_url: Some(adapter.refresh_url.clone()),
+                    },
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await
+                .unwrap();
+            let (status, _) = request(&state,"POST","/internal/v1/oauth/provider-adapter/start",json!({"tenant_external_id":"oauth-secret-test","account_name":"legacy","provider_driver":driver,"provider_config":config,"upstream_account_id":legacy.id})).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_login_sessions")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(sessions, 1);
+            let stored = state
+                .db
+                .upstream_account_with_current_credential(
+                    legacy.id,
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await
+                .unwrap()
+                .0;
+            assert_eq!(stored.updated_at, legacy.updated_at);
+            assert_eq!(stored.credential_generation, legacy.credential_generation);
+        }
+    }
+    assert!(mock.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]

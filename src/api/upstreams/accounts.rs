@@ -30,11 +30,6 @@ pub(in crate::api) async fn create_upstream(
         return Err(AppError::BadRequest("unknown provider driver".into()));
     }
     validate_provider_config_schema(&state, &body.driver, &body.config)?;
-    let provider = state
-        .providers
-        .get(&body.driver)
-        .ok_or_else(|| AppError::BadRequest("unknown provider driver".into()))?;
-    super::config_secrets::validate_create(&provider.config_schema)?;
     validate_provider_credential_schema(&state, &body.driver, &body.credential)?;
     let credential: UpstreamCredential = serde_json::from_value(body.credential)
         .map_err(|error| AppError::BadRequest(format!("invalid upstream credential: {error}")))?;
@@ -136,7 +131,11 @@ pub(super) fn validate_provider_config_schema(
         .providers
         .get(driver)
         .ok_or_else(|| AppError::BadRequest(format!("unknown provider driver: {driver}")))?;
-    crate::schema::validate_instance(&provider.config_schema, config)
+    crate::schema::validate_instance(&provider.config_schema, config)?;
+    // Shared by direct creation, OAuth start/ready/reauthorization and account
+    // edits. No lifecycle may write an unsupported secret cycle or discover
+    // that configuration analysis failed only after its account mutation.
+    super::config_secrets::validate_create(&provider.config_schema)
 }
 
 pub(super) async fn validate_upstream_destination(
