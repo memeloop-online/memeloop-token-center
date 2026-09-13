@@ -1421,6 +1421,11 @@ async fn oauth_refresh_finalize_failure_recovers_pending_ciphertext_without_remo
             .unwrap()
             .is_none()
     );
+    state
+        .db
+        .mark_upstream_oauth_refresh_request_started(account.id, idempotency_key)
+        .await
+        .unwrap();
 
     sqlx::any::install_default_drivers();
     let fault_pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
@@ -1452,6 +1457,15 @@ async fn oauth_refresh_finalize_failure_recovers_pending_ciphertext_without_remo
         failed,
         memeloop_token_center::error::AppError::Internal
     ));
+    let staged: (i64, i64) = sqlx::query_as(
+        "SELECT CASE WHEN request_started_at IS NOT NULL THEN 1 ELSE 0 END, CASE WHEN pending_credential_ciphertext IS NOT NULL THEN 1 ELSE 0 END FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND idempotency_key = $2",
+    )
+    .bind(account.id.to_string())
+    .bind(idempotency_key)
+    .fetch_one(&fault_pool)
+    .await
+    .unwrap();
+    assert_eq!(staged, (1, 1));
     sqlx::query("DROP TRIGGER inject_oauth_finalize_failure")
         .execute(&fault_pool)
         .await

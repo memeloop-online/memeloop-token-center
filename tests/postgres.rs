@@ -358,6 +358,10 @@ async fn postgres_oauth_refresh_has_one_account_generation_lease() {
     }
     assert_eq!(conflicts, 7);
     let winner = winner.expect("one refresh lease winner");
+    database
+        .mark_upstream_oauth_refresh_request_started(account.id, &winner)
+        .await
+        .unwrap();
     let refreshed = database
         .finish_upstream_oauth_refresh(
             account.id,
