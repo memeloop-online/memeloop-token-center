@@ -341,6 +341,10 @@ impl Database {
             // Explicit session identity is authoritative within one stable key.
             // Serialize candidate selection for that identity so two PostgreSQL
             // writers cannot both observe an empty cluster and create one.
+            // Keep this lock before the content-addressed INSERT ... ON CONFLICT
+            // writes below. Moving it later would invert lock order with an older
+            // process during a rolling deploy (content row -> session lock versus
+            // session lock -> content row) and can deadlock overlapping contexts.
             sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, $2))")
                 .bind(format!("{}:{session_id}", key.key_id))
                 .bind(EXPLICIT_SESSION_LOCK_SEED)
@@ -394,45 +398,33 @@ impl Database {
         }
 
         let principal_id = key.principal_id.to_string();
-        let mut candidates = if hints.parent_turn_id.is_some()
-            || hints.turn_id.is_some()
-            || hints.session_id.is_some()
-        {
+        let key_id = key.key_id.to_string();
+        // Every structured match below is decisive: the selection loop stops on
+        // a direct parent, same turn, or explicit session. Fetch only that one
+        // indexed row instead of reading and sorting up to 50 wide fingerprints
+        // through one OR predicate while the explicit-session lock is held.
+        let structured_candidate = fetch_structured_conversation_candidate(
+            transaction,
+            &tenant_id,
+            &principal_id,
+            &key_id,
+            hints,
+            now,
+        )
+        .await?;
+        let candidates = if let Some(candidate) = structured_candidate {
+            vec![candidate]
+        } else {
             sqlx::query(
-                "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND (($6 IS NOT NULL AND o.explicit_session_id = $6) OR (o.created_at <= $7 AND (($4 IS NOT NULL AND (o.turn_id = $4 OR o.upstream_response_id = $4)) OR ($5 IS NOT NULL AND o.turn_id = $5)))) ORDER BY CASE WHEN o.created_at <= $7 THEN 0 ELSE 1 END, CASE WHEN $4 IS NOT NULL AND (o.turn_id = $4 OR o.upstream_response_id = $4) THEN 0 WHEN $5 IS NOT NULL AND o.turn_id = $5 THEN 1 ELSE 2 END, o.created_at DESC LIMIT 50",
+                "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.created_at <= $4 ORDER BY o.created_at DESC LIMIT 50",
             )
             .bind(&tenant_id)
             .bind(&principal_id)
-            .bind(key.key_id.to_string())
-            .bind(hints.parent_turn_id.as_deref())
-            .bind(hints.turn_id.as_deref())
-            .bind(hints.session_id.as_deref())
+            .bind(&key_id)
             .bind(now)
             .fetch_all(&mut **transaction)
             .await?
-        } else {
-            Vec::new()
         };
-        let recent_candidates = sqlx::query(
-            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.created_at <= $4 ORDER BY o.created_at DESC LIMIT 50",
-        )
-        .bind(&tenant_id)
-        .bind(&principal_id)
-        .bind(key.key_id.to_string())
-        .bind(now)
-        .fetch_all(&mut **transaction)
-        .await?;
-        for recent in recent_candidates {
-            let recent_id: String = recent.try_get("id")?;
-            let duplicate = candidates.iter().any(|candidate| {
-                candidate
-                    .try_get::<String, _>("id")
-                    .is_ok_and(|candidate_id| candidate_id == recent_id)
-            });
-            if !duplicate {
-                candidates.push(recent);
-            }
-        }
 
         let has_semantic_atoms = !atom_hashes.is_empty();
         debug_assert!(atom_hashes_json.len() <= MAX_CONVERSATION_FINGERPRINT_JSON_BYTES);
@@ -855,6 +847,110 @@ impl Database {
             next_cursor,
             edges_truncated,
         })
+    }
+}
+
+async fn fetch_structured_conversation_candidate(
+    transaction: &mut Transaction<'_, Any>,
+    tenant_id: &str,
+    principal_id: &str,
+    key_id: &str,
+    hints: &ConversationHints,
+    observed_at: i64,
+) -> Result<Option<AnyRow>, AppError> {
+    if let Some(parent_turn_id) = hints.parent_turn_id.as_deref() {
+        let by_turn = sqlx::query(
+            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.turn_id = $4 AND o.created_at <= $5 ORDER BY o.created_at DESC LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(principal_id)
+        .bind(key_id)
+        .bind(parent_turn_id)
+        .bind(observed_at)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        let by_response = sqlx::query(
+            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.upstream_response_id = $4 AND o.created_at <= $5 ORDER BY o.created_at DESC LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(principal_id)
+        .bind(key_id)
+        .bind(parent_turn_id)
+        .bind(observed_at)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if let Some(candidate) = newest_conversation_candidate(by_turn, by_response)? {
+            return Ok(Some(candidate));
+        }
+    }
+
+    if let Some(turn_id) = hints.turn_id.as_deref() {
+        let candidate = sqlx::query(
+            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.turn_id = $4 AND o.created_at <= $5 ORDER BY o.created_at DESC LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(principal_id)
+        .bind(key_id)
+        .bind(turn_id)
+        .bind(observed_at)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if candidate.is_some() {
+            return Ok(candidate);
+        }
+    }
+
+    if let Some(session_id) = hints.session_id.as_deref() {
+        let causal = sqlx::query(
+            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.explicit_session_id = $4 AND o.created_at <= $5 ORDER BY o.created_at DESC LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(principal_id)
+        .bind(key_id)
+        .bind(session_id)
+        .bind(observed_at)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if causal.is_some() {
+            return Ok(causal);
+        }
+
+        // Archive projection can commit a later source-time observation first.
+        // A future row is valid only for explicit cluster membership; the caller
+        // still suppresses any edge that would reverse causal ancestry.
+        let future = sqlx::query(
+            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.explicit_session_id = $4 AND o.created_at > $5 ORDER BY o.created_at DESC LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(principal_id)
+        .bind(key_id)
+        .bind(session_id)
+        .bind(observed_at)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        return Ok(future);
+    }
+
+    Ok(None)
+}
+
+fn newest_conversation_candidate(
+    left: Option<AnyRow>,
+    right: Option<AnyRow>,
+) -> Result<Option<AnyRow>, AppError> {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            let left_created_at: i64 = left.try_get("created_at")?;
+            let right_created_at: i64 = right.try_get("created_at")?;
+            Ok(Some(if left_created_at >= right_created_at {
+                left
+            } else {
+                right
+            }))
+        }
+        (left @ Some(_), None) => Ok(left),
+        (None, right @ Some(_)) => Ok(right),
+        (None, None) => Ok(None),
     }
 }
 
