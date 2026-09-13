@@ -204,6 +204,7 @@
             "connectTimeoutMillis": { "type": "integer", "minimum": 100, "maximum": 30000 },
             "requestTimeoutMillis": { "type": "integer", "minimum": 100, "maximum": 120000 },
             "readinessDeadlineMillis": { "type": "integer", "minimum": 100, "maximum": 30000 },
+            "textArchiveDeadlineMillis": { "type": "integer", "minimum": 100, "maximum": 120000 },
             "credentialsSecret": {
               "type": "object",
               "additionalProperties": false,

@@ -76,6 +76,8 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
   value: {{ .Values.config.s3.requestTimeoutMillis | quote }}
 - name: MTC_S3_READINESS_DEADLINE_MILLIS
   value: {{ .Values.config.s3.readinessDeadlineMillis | quote }}
+- name: MTC_TEXT_ARCHIVE_DEADLINE_MILLIS
+  value: {{ .Values.config.s3.textArchiveDeadlineMillis | quote }}
 - name: MTC_S3_ENDPOINT
   value: {{ .Values.config.s3.endpoint | quote }}
 - name: MTC_S3_REGION

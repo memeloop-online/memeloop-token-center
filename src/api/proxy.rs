@@ -689,13 +689,17 @@ pub(super) async fn proxy(
     let requested_service_tier = requested_service_tier(&request_json, &price)?;
     let request_digest = blake3::hash(&body).to_hex();
     let admitted_request_object = format!("gap://{request_id}/request");
+    let archive_begin_started = tokio::time::Instant::now();
     let request_archive_attempt =
         match begin_proxy_archive_attempt(&state.db, request_id, ArchiveStagingPurpose::Request)
             .await
         {
             Ok(attempt) => Some(attempt),
-            Err(_) => {
-                tracing::warn!(%request_id, stage = "request_archive_begin", "proxy archive gap");
+            Err(error) => {
+                tracing::warn!(%request_id, stage = "request_archive", phase = "begin",
+                    error_class = error.diagnostic_category(),
+                    elapsed_millis = archive_begin_started.elapsed().as_millis() as u64,
+                    "proxy archive gap");
                 None
             }
         };
@@ -751,9 +755,12 @@ pub(super) async fn proxy(
         archive_available: false,
     };
     if let Some(attempt) = request_archive_attempt.as_ref() {
+        let archive_phase = lifecycle::ArchivePhase::default();
         let archive = async {
             let mut writer = state.archive.start_writer(&attempt.object_locator).await?;
+            archive_phase.writing();
             writer.write(body.clone()).await?;
+            archive_phase.finishing();
             let staged = writer.finish_staged().await?;
             if staged.blake3_digest != request_digest.as_str()
                 || staged.object_locator != attempt.object_locator
@@ -762,6 +769,7 @@ pub(super) async fn proxy(
                     "proxy request archive verification failed".into(),
                 ));
             }
+            archive_phase.attaching();
             attach_proxy_archive_with_retry(
                 &state.db,
                 request_id,
@@ -773,14 +781,21 @@ pub(super) async fn proxy(
             .await?;
             Ok::<(), AppError>(())
         };
-        match run_bounded_text_archive(archive).await {
+        match run_bounded_text_archive(
+            state.config.s3_timeouts.text_archive_millis,
+            request_id,
+            "request_archive",
+            &archive_phase,
+            archive,
+        )
+        .await
+        {
             Ok(Ok(())) => buffered_request.archive_available = true,
             Ok(Err(_)) | Err(_) => {
                 // This is safe even after an unknown attach acknowledgement:
                 // a committed bind is no longer in the writable state, so the
                 // abandon CAS becomes a no-op instead of deleting owned data.
                 abandon_proxy_archive_attempt(&state.db, attempt).await;
-                tracing::warn!(%request_id, stage = "request_archive", "proxy archive gap");
             }
         }
     }
@@ -1497,6 +1512,7 @@ async fn finish_buffered_request(
         && matches!(request.protocol, Protocol::OpenAiResponses))
     .then(|| extract_response_id(&body))
     .flatten();
+    let archive_begin_started = tokio::time::Instant::now();
     let mut response_archive_attempt = if request.archive_available {
         match begin_proxy_archive_attempt(
             &request.state.db,
@@ -1506,8 +1522,11 @@ async fn finish_buffered_request(
         .await
         {
             Ok(attempt) => Some(attempt),
-            Err(_) => {
-                tracing::warn!(%request_id, stage = "buffered_response_archive_begin", "proxy archive gap");
+            Err(error) => {
+                tracing::warn!(%request_id, stage = "buffered_response_archive", phase = "begin",
+                    error_class = error.diagnostic_category(),
+                    elapsed_millis = archive_begin_started.elapsed().as_millis() as u64,
+                    "proxy archive gap");
                 None
             }
         }
@@ -1515,13 +1534,16 @@ async fn finish_buffered_request(
         None
     };
     let stored_response = if let Some(attempt) = response_archive_attempt.as_ref() {
+        let archive_phase = lifecycle::ArchivePhase::default();
         let archive = async {
             let mut writer = request
                 .state
                 .archive
                 .start_writer(&attempt.object_locator)
                 .await?;
+            archive_phase.writing();
             writer.write(body.clone()).await?;
+            archive_phase.finishing();
             let staged = writer.finish_staged().await?;
             if staged.object_locator != attempt.object_locator {
                 return Err(AppError::Storage(
@@ -1530,12 +1552,19 @@ async fn finish_buffered_request(
             }
             Ok::<String, AppError>(staged.object_locator)
         };
-        match run_bounded_text_archive(archive).await {
+        match run_bounded_text_archive(
+            request.state.config.s3_timeouts.text_archive_millis,
+            request_id,
+            "buffered_response_archive",
+            &archive_phase,
+            archive,
+        )
+        .await
+        {
             Ok(Ok(stored)) => stored,
             Ok(Err(_)) | Err(_) => {
                 abandon_proxy_archive_attempt(&request.state.db, attempt).await;
                 response_archive_attempt = None;
-                tracing::warn!(%request_id, stage = "buffered_response_archive", "proxy archive gap");
                 format!("gap://{request_id}/response")
             }
         }

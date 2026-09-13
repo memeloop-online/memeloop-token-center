@@ -269,6 +269,7 @@ pub struct S3Timeouts {
     pub connect_millis: u32,
     pub request_millis: u32,
     pub readiness_millis: u32,
+    pub text_archive_millis: u32,
 }
 
 impl Default for S3Timeouts {
@@ -277,6 +278,7 @@ impl Default for S3Timeouts {
             connect_millis: 5_000,
             request_millis: 30_000,
             readiness_millis: 5_000,
+            text_archive_millis: 5_000,
         }
     }
 }
@@ -291,6 +293,10 @@ impl S3Timeouts {
                 "MTC_S3_READINESS_DEADLINE_MILLIS",
                 defaults.readiness_millis,
             )?,
+            text_archive_millis: env_u32(
+                "MTC_TEXT_ARCHIVE_DEADLINE_MILLIS",
+                defaults.text_archive_millis,
+            )?,
         };
         value.validate()?;
         Ok(value)
@@ -301,6 +307,7 @@ impl S3Timeouts {
             || !(100..=120_000).contains(&self.request_millis)
             || !(100..=30_000).contains(&self.readiness_millis)
             || self.connect_millis > self.request_millis
+            || !(100..=120_000).contains(&self.text_archive_millis)
         {
             return Err(ConfigError::InvalidS3Timeouts);
         }
@@ -555,7 +562,7 @@ fn responses_body_read_concurrency(value: u32) -> u32 {
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error(
-        "S3 timeouts must be bounded: connect/readiness 100..30000 ms, request 100..120000 ms, connect <= request"
+        "S3 timeouts must be bounded: connect/readiness 100..30000 ms, request/text archive 100..120000 ms, connect <= request"
     )]
     InvalidS3Timeouts,
     #[error("missing required environment variable {0}")]
@@ -596,6 +603,27 @@ mod tests {
             (5000, 30000, 5000)
         );
         assert!(defaults.validate().is_ok());
+        assert_eq!(defaults.text_archive_millis, defaults.readiness_millis);
+        for value in [0, 99, 120_001, u32::MAX] {
+            assert!(
+                S3Timeouts {
+                    text_archive_millis: value,
+                    ..defaults
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        for value in [100, 120_000] {
+            assert!(
+                S3Timeouts {
+                    text_archive_millis: value,
+                    ..defaults
+                }
+                .validate()
+                .is_ok()
+            );
+        }
         for value in [0, 99, 30_001, u32::MAX] {
             assert!(
                 S3Timeouts {

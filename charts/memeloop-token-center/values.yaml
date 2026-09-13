@@ -166,6 +166,7 @@ config:
     connectTimeoutMillis: 5000
     requestTimeoutMillis: 30000
     readinessDeadlineMillis: 5000
+    textArchiveDeadlineMillis: 5000
     bucket: memeloop-token-center
     endpoint: ""
     region: us-east-1

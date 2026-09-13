@@ -4,6 +4,18 @@ This document defines release gates for Memeloop Token Center.
 
 ## Archive network diagnostics
 
+Text request and buffered response archiving each have a total deadline of
+5000 ms (previously a hard-coded 2000 ms). Set Helm
+`config.s3.textArchiveDeadlineMillis` / `MTC_TEXT_ARCHIVE_DEADLINE_MILLIS`
+to 100–120000 ms with a rolling restart; no image rebuild is required.
+The default matches readiness's 5000 ms budget, but these are independent
+operations: this total deadline includes writer creation, writes, finalization
+and request attachment, and may intentionally expire before the S3 per-attempt
+request timeout (30000 ms). Increasing it can delay upstream dispatch and
+buffered responses. Streaming response consumption and EOF remain independent
+of background response archiving. Failure remains fail-open with archive gaps;
+logs include fixed phase/error classes, elapsed time and deadline, never raw errors.
+
 All roles use the same S3 settings. Helm `config.s3.connectTimeoutMillis`,
 `requestTimeoutMillis` and `readinessDeadlineMillis` map to
 `MTC_S3_CONNECT_TIMEOUT_MILLIS`, `MTC_S3_REQUEST_TIMEOUT_MILLIS` and
