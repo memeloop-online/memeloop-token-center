@@ -856,7 +856,6 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
-        '422': { description: Unknown or malformed request fields. }
         '500': { $ref: '#/components/responses/InternalError' }
 
   /internal/v1/plugin-runtime/publish:
@@ -892,7 +891,6 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
-        '422': { description: Unknown or malformed request fields. }
         '500': { $ref: '#/components/responses/InternalError' }
 
   /internal/v1/plugin-runtime/rollback:
@@ -928,7 +926,6 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
-        '422': { description: Unknown or malformed request fields. }
         '500': { $ref: '#/components/responses/InternalError' }
 
   /internal/v1/plugins/{plugin_id}/configuration:

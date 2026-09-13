@@ -11,7 +11,7 @@ remote installer API, or plugin-provided activation mechanism.
 
 ## Authority and request ownership
 
-Migration 82 creates global candidate, immutable revision, singleton head, and
+Migration 81 creates global candidate, immutable revision, singleton head, and
 idempotency operation tables. A successful operation claims its idempotency key,
 inserts the next revision, performs `expected_revision` CAS, and records its result
 in one transaction. A failed CAS rolls back the operation and revision. Exact

@@ -437,7 +437,7 @@ async fn runtime_management_rejects_scoped_credentials_and_forged_candidate_fiel
         forged[field] = json!("forged");
         assert_eq!(
             management_call(&state, &state.config.service_token, forged).await,
-            StatusCode::UNPROCESSABLE_ENTITY
+            StatusCode::BAD_REQUEST
         );
     }
     for id in ["../a", "https://example.com/a", "/tmp/a", "a.wasm"] {

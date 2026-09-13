@@ -432,9 +432,9 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../../migrations/common/0080_request_archive_spool.sql"),
     },
     Migration {
-        version: 82,
+        version: 81,
         name: "global application plugin revision authority",
-        sql: include_str!("../../../migrations/common/0082_application_plugin_revisions.sql"),
+        sql: include_str!("../../../migrations/common/0081_application_plugin_revisions.sql"),
     },
 ];
 
@@ -854,9 +854,9 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../../migrations/common/0080_request_archive_spool.sql"),
     },
     Migration {
-        version: 82,
+        version: 81,
         name: "global application plugin revision authority",
-        sql: include_str!("../../../migrations/common/0082_application_plugin_revisions.sql"),
+        sql: include_str!("../../../migrations/common/0081_application_plugin_revisions.sql"),
     },
 ];
 

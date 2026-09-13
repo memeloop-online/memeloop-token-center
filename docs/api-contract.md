@@ -40,7 +40,8 @@ management only and require both the compile-time experimental feature and
 host-provisioned inventory opt-in. They are not enabled in the production binary.
 Candidate requests accept opaque preinstalled inventory IDs, never package URLs,
 paths, Wasm or grants. Publish and rollback use revision CAS and idempotency;
-rollback always creates a new revision. This draft must not ship with #64/#65/#66.
+rollback always creates a new revision. The feature remains disabled unless a
+host explicitly provisions and opts into the complete trusted inventory.
 
 One provider account may use an API credential, native OAuth, plugin-provided
 authorization or no credential. Its authentication method is metadata, not a
