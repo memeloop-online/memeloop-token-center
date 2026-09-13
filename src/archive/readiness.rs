@@ -491,7 +491,8 @@ impl ArchiveStore {
         let path = self.readiness_path.child(uuid::Uuid::now_v7().to_string());
         // If creation reaches S3 but is cancelled before returning its upload
         // handle, object_store cannot abort the unknown upload ID. Deployment
-        // MUST configure incomplete-multipart lifecycle expiration; this gate
+        // MUST verify provider-supported incomplete-multipart reclamation
+        // (bucket lifecycle or MinIO global stale-upload cleanup); this gate
         // cannot verify that provider-specific policy via ObjectStore.
         let upload = canary_operation(
             &progress,
