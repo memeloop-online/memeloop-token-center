@@ -2,6 +2,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
 };
+use futures_util::StreamExt;
 use memeloop_token_center::{
     AppState, api,
     config::{Config, RuntimeRole},
@@ -11,10 +12,13 @@ use memeloop_token_center::{
     },
     model::KeyPolicy,
     provider::UpstreamCredential,
+    worker,
 };
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
+use tokio::sync::watch;
 use tower::ServiceExt;
+use uuid::Uuid;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{body_json, header as matches_header, method, path},
@@ -406,12 +410,25 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
         .unwrap();
     assert_eq!(exact_account.summary.total_requests, 2);
 
+    let request_ids = requests
+        .iter()
+        .map(|request| request.request_id)
+        .collect::<Vec<_>>();
+    wait_for_bound_plugin_archives(&state, &request_ids).await;
+
     for request in requests {
         let refs = state
             .db
             .request_archive_refs(key.key_id, request.request_id)
             .await
             .unwrap();
+        let request_prefix = format!("staging/proxy/{}/request/", request.request_id);
+        assert!(refs.request_object.starts_with(&request_prefix));
+        assert!(refs.request_object.ends_with("/body"));
+        let response_object = refs.response_object.as_deref().unwrap();
+        let response_prefix = format!("staging/proxy/{}/response/", request.request_id);
+        assert!(response_object.starts_with(&response_prefix));
+        assert!(response_object.ends_with("/body"));
         let archived_request = state
             .archive
             .get_bounded(&refs.request_object, 1024 * 1024)
@@ -419,7 +436,7 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
             .unwrap();
         let archived_response = state
             .archive
-            .get_bounded(refs.response_object.as_deref().unwrap(), 1024 * 1024)
+            .get_bounded(response_object, 1024 * 1024)
             .await
             .unwrap();
         assert!(String::from_utf8_lossy(&archived_request).contains("requested-model"));
@@ -435,6 +452,65 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
         assert!(!combined.contains("component-api-secret"));
         assert!(!combined.contains("component-api-secret-rotated"));
     }
+}
+
+async fn wait_for_bound_plugin_archives(state: &AppState, request_ids: &[Uuid]) {
+    assert!(!request_ids.is_empty());
+    let (shutdown, receiver) = watch::channel(false);
+    let worker = tokio::spawn(worker::run_until_shutdown(state.clone(), receiver));
+    let response = api::router_for_role(state.clone(), RuntimeRole::Control)
+        .oneshot(
+            Request::get("/internal/v1/request-events?after_event_at=0")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", state.config.service_token),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut pending = request_ids.to_vec();
+    let mut stream = response.into_body().into_data_stream();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut buffered = String::new();
+        while let Some(chunk) = stream.next().await {
+            buffered.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+            while let Some(end) = buffered.find("\n\n") {
+                let frame = buffered[..end].to_owned();
+                buffered.drain(..end + 2);
+                let Some(data) = frame
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data:").map(str::trim_start))
+                else {
+                    continue;
+                };
+                let Ok(event) = serde_json::from_str::<Value>(data) else {
+                    continue;
+                };
+                if event["event_kind"] != "archive_bound" || event["archive_state"] != "bound" {
+                    continue;
+                }
+                let Some(request_id) = event["request_id"]
+                    .as_str()
+                    .and_then(|value| Uuid::parse_str(value).ok())
+                else {
+                    continue;
+                };
+                pending.retain(|candidate| *candidate != request_id);
+                if pending.is_empty() {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .expect("plugin request archives reached bound state");
+    assert!(pending.is_empty(), "missing archive bindings: {pending:?}");
+    shutdown.send(true).unwrap();
+    worker.await.unwrap();
 }
 
 async fn call_component_provider(state: &AppState, key: &str) -> (StatusCode, Value) {
