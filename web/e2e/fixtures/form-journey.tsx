@@ -10,7 +10,7 @@ import '../../src/theme.css';
 import '../../src/operator/operator.css';
 import '../../src/app-shell.css';
 
-declare global { interface Window { formJourneyReads: string[]; formJourneyWrites: number; failNextFormWrite: boolean } }
+import type {} from '../support/form-journey-globals';
 window.formJourneyReads = []; window.formJourneyWrites = 0;
 window.failNextFormWrite = false;
 const workflows = new URLSearchParams(location.search).has('workflows');
