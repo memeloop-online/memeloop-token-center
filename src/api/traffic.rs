@@ -373,18 +373,19 @@ async fn apply_traffic_plugin(
     let metrics = state.metrics.clone();
     let plugin_decision = plugin_execution::run(Phase::PostAuth, move || {
         let _temporary_memory = temporary_memory;
-        plugins.apply_traffic_with_config_and_memory(
-            plugin_context,
-            &plugin_request,
-            &plugin_configurations,
-            memory.as_deref(),
-        )
-        .map_err(|error| {
-            metrics.observe_proxy_memory_error(
-                crate::metrics::ProxyMemoryRejectionStage::Plugin,
-                error,
+        plugins
+            .apply_traffic_with_config_and_memory(
+                plugin_context,
+                &plugin_request,
+                &plugin_configurations,
+                memory.as_deref(),
             )
-        })
+            .map_err(|error| {
+                metrics.observe_proxy_memory_error(
+                    crate::metrics::ProxyMemoryRejectionStage::Plugin,
+                    error,
+                )
+            })
     })
     .await?;
     if !plugin_decision.allow {
