@@ -51,6 +51,61 @@ pub struct RevisionReceipt {
     pub reason: RevisionReason,
 }
 
+/// Closed host-owned stages: never include a guest error, identity or grant.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RejectionStage {
+    Grants,
+    Revision,
+    RequiredPolicy,
+    History,
+}
+
+#[derive(Serialize)]
+struct RevisionRejection {
+    schema_version: u8,
+    operation: RevisionReason,
+    expected_revision: u64,
+    stage: RejectionStage,
+    error_category: &'static str,
+}
+
+impl RevisionRejection {
+    fn new(
+        operation: RevisionReason,
+        expected_revision: u64,
+        stage: RejectionStage,
+        error: &AppError,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            operation,
+            expected_revision,
+            stage,
+            error_category: error.diagnostic_category(),
+        }
+    }
+}
+
+fn rejected(
+    operation: RevisionReason,
+    expected_revision: u64,
+    stage: RejectionStage,
+    error: AppError,
+) -> AppError {
+    let diagnostic = RevisionRejection::new(operation, expected_revision, stage, &error);
+    tracing::warn!(
+        event = "plugin_runtime_revision_rejected",
+        schema_version = diagnostic.schema_version,
+        operation = ?diagnostic.operation,
+        expected_revision = diagnostic.expected_revision,
+        stage = ?diagnostic.stage,
+        error_category = diagnostic.error_category,
+        "plugin runtime revision rejected"
+    );
+    error
+}
+
 #[derive(Default)]
 struct Circuit {
     failures: u32,
@@ -204,7 +259,8 @@ impl RuntimeRevisions {
         runtime: PluginRuntime,
         grants: BTreeMap<String, Vec<PluginGrant>>,
     ) -> Result<Self, AppError> {
-        validate_grants(&runtime, &grants)?;
+        validate_grants(&runtime, &grants)
+            .map_err(|error| rejected(RevisionReason::Initial, 0, RejectionStage::Grants, error))?;
         Ok(Self {
             grants,
             state: RwLock::new(State {
@@ -230,10 +286,31 @@ impl RuntimeRevisions {
         expected_revision: u64,
         candidate: PluginRuntime,
     ) -> Result<RevisionReceipt, AppError> {
-        validate_grants(&candidate, &self.grants)?;
+        validate_grants(&candidate, &self.grants).map_err(|error| {
+            rejected(
+                RevisionReason::Reload,
+                expected_revision,
+                RejectionStage::Grants,
+                error,
+            )
+        })?;
         let mut state = self.state.write().map_err(|_| AppError::Internal)?;
-        let revision = next_revision(&state, expected_revision)?;
-        validate_policy_transition(&state.current.runtime, &candidate)?;
+        let revision = next_revision(&state, expected_revision).map_err(|error| {
+            rejected(
+                RevisionReason::Reload,
+                expected_revision,
+                RejectionStage::Revision,
+                error,
+            )
+        })?;
+        validate_policy_transition(&state.current.runtime, &candidate).map_err(|error| {
+            rejected(
+                RevisionReason::Reload,
+                expected_revision,
+                RejectionStage::RequiredPolicy,
+                error,
+            )
+        })?;
         let old = state.current.runtime.clone();
         state.previous.push(old);
         if state.previous.len() > MAX_REVISIONS {
@@ -245,13 +322,38 @@ impl RuntimeRevisions {
 
     pub fn rollback(&self, expected_revision: u64) -> Result<RevisionReceipt, AppError> {
         let mut state = self.state.write().map_err(|_| AppError::Internal)?;
-        let revision = next_revision(&state, expected_revision)?;
-        let runtime = state
-            .previous
-            .last()
-            .ok_or_else(|| AppError::BadRequest("no previous plugin revision".into()))?;
-        validate_grants(runtime, &self.grants)?;
-        validate_policy_transition(&state.current.runtime, runtime)?;
+        let revision = next_revision(&state, expected_revision).map_err(|error| {
+            rejected(
+                RevisionReason::Rollback,
+                expected_revision,
+                RejectionStage::Revision,
+                error,
+            )
+        })?;
+        let runtime = state.previous.last().ok_or_else(|| {
+            rejected(
+                RevisionReason::Rollback,
+                expected_revision,
+                RejectionStage::History,
+                AppError::BadRequest("no previous plugin revision".into()),
+            )
+        })?;
+        validate_grants(runtime, &self.grants).map_err(|error| {
+            rejected(
+                RevisionReason::Rollback,
+                expected_revision,
+                RejectionStage::Grants,
+                error,
+            )
+        })?;
+        validate_policy_transition(&state.current.runtime, runtime).map_err(|error| {
+            rejected(
+                RevisionReason::Rollback,
+                expected_revision,
+                RejectionStage::RequiredPolicy,
+                error,
+            )
+        })?;
         let runtime = state.previous.pop().ok_or(AppError::Internal)?;
         state.current = snapshot(runtime, revision, RevisionReason::Rollback);
         Ok(state.current.receipt)
@@ -287,7 +389,13 @@ fn next_revision(state: &State, expected: u64) -> Result<u64, AppError> {
 }
 
 fn snapshot(runtime: PluginRuntime, revision: u64, reason: RevisionReason) -> Arc<RuntimeSnapshot> {
-    tracing::info!(revision, reason = ?reason, "plugin runtime revision published");
+    tracing::info!(
+        event = "plugin_runtime_revision_published",
+        schema_version = 1_u8,
+        revision,
+        reason = ?reason,
+        "plugin runtime revision published"
+    );
     Arc::new(RuntimeSnapshot {
         receipt: RevisionReceipt { revision, reason },
         runtime,
@@ -396,6 +504,85 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_publishers_have_exactly_one_cas_winner() {
+        let manager = RuntimeRevisions::new(PluginRuntime::default(), BTreeMap::new()).unwrap();
+        let pinned = manager.pin().unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let publish = || {
+                barrier.wait();
+                manager.replace(1, PluginRuntime::default())
+            };
+            let first = scope.spawn(publish);
+            let second = scope.spawn(publish);
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(AppError::Conflict(_))))
+                .count(),
+            1
+        );
+        assert_eq!(manager.pin().unwrap().receipt.revision, 2);
+        assert_eq!(pinned.receipt.revision, 1);
+        assert_eq!(manager.state.read().unwrap().previous.len(), 1);
+        assert_eq!(manager.rollback(2).unwrap().revision, 3);
+        assert!(manager.rollback(3).is_err());
+    }
+
+    #[test]
+    fn rollback_history_is_bounded_and_rejection_preserves_snapshot_identity() {
+        let manager = RuntimeRevisions::new(PluginRuntime::default(), BTreeMap::new()).unwrap();
+        let initial = manager.pin().unwrap();
+        for revision in 1..=5 {
+            manager.replace(revision, PluginRuntime::default()).unwrap();
+            assert_eq!(
+                manager.state.read().unwrap().previous.len(),
+                (revision as usize).min(MAX_REVISIONS)
+            );
+        }
+        let current = manager.pin().unwrap();
+        assert!(manager.rollback(5).is_err());
+        assert!(Arc::ptr_eq(&current, &manager.pin().unwrap()));
+        assert_eq!(manager.state.read().unwrap().previous.len(), MAX_REVISIONS);
+        assert_eq!(manager.rollback(6).unwrap().revision, 7);
+        assert_eq!(manager.rollback(7).unwrap().revision, 8);
+        let last = manager.pin().unwrap();
+        assert!(manager.rollback(8).is_err());
+        assert!(Arc::ptr_eq(&last, &manager.pin().unwrap()));
+        assert_eq!(initial.receipt.revision, 1);
+        assert_eq!(current.receipt.revision, 6);
+    }
+
+    #[test]
+    fn rejection_diagnostic_is_versioned_and_drops_untrusted_error_text() {
+        let marker = "secret-config-token-provider-response";
+        for error in [
+            AppError::BadRequest(marker.into()),
+            AppError::Upstream(marker.into()),
+            AppError::Conflict(marker.into()),
+            AppError::Storage(marker.into()),
+        ] {
+            let diagnostic =
+                RevisionRejection::new(RevisionReason::Reload, 7, RejectionStage::Grants, &error);
+            let value = serde_json::to_value(diagnostic).unwrap();
+            assert_eq!(
+                value,
+                serde_json::json!({
+                    "schema_version": 1,
+                    "operation": "reload",
+                    "expected_revision": 7,
+                    "stage": "grants",
+                    "error_category": error.diagnostic_category(),
+                })
+            );
+            assert!(!value.to_string().contains(marker));
+        }
+    }
+
+    #[test]
     fn grants_pin_versions_capabilities_and_contributions() {
         let manifest: super::super::PluginManifest = serde_json::from_value(serde_json::json!({
             "id": "policy", "version": "1.0.0", "wit_version": "0.2.0", "wasm": null
@@ -461,6 +648,7 @@ mod tests {
             vec![approved(&manifest), approved(&upgrade), approved(&disabled)],
         )]);
         let manager = RuntimeRevisions::new(candidate(manifest), grants).unwrap();
+        let original = manager.pin().unwrap();
         assert!(manager.replace(1, PluginRuntime::default()).is_err());
         assert!(
             manager.replace(1, candidate(disabled)).is_err(),
@@ -469,6 +657,8 @@ mod tests {
         let mut forged = candidate(upgrade.clone());
         Arc::make_mut(&mut forged.plugins)[0].identity.provenance = None;
         assert!(manager.replace(1, forged).is_err());
+        assert!(Arc::ptr_eq(&original, &manager.pin().unwrap()));
+        assert!(manager.state.read().unwrap().previous.is_empty());
         assert_eq!(manager.replace(1, candidate(upgrade)).unwrap().revision, 2);
         assert_eq!(manager.rollback(2).unwrap().revision, 3);
     }
