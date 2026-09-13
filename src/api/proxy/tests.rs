@@ -2925,12 +2925,10 @@ async fn codex_streaming_route_accepts_headerless_bare_cr_sse_without_byte_drift
 }
 
 #[tokio::test]
-async fn streaming_text_delivery_does_not_wait_for_a_timed_out_archive() {
-    let fixture = codex_route_fixture_with_archive_directory(
-        "streaming-archive-timeout",
-        "proxy-response-archive-timeout",
-    )
-    .await;
+async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker() {
+    let fixture = codex_route_fixture("streaming-archive-recovery").await;
+    std::fs::remove_dir_all(&fixture.archive_path).unwrap();
+    std::fs::write(&fixture.archive_path, b"archive backend unavailable").unwrap();
     let upstream = MockServer::start().await;
     let sse = completed_codex_sse("archive-independent stream");
     Mock::given(method("POST"))
@@ -2941,20 +2939,15 @@ async fn streaming_text_delivery_does_not_wait_for_a_timed_out_archive() {
         .expect(1)
         .mount(&upstream)
         .await;
-    let response = send_codex_route(
-        &fixture,
-        &upstream,
-        "/v1/responses",
-        json!({"model": fixture.model, "input": "stream now", "stream": true}),
-    )
-    .await;
+    let original = json!({"model": fixture.model, "input": "stream now", "stream": true});
+    let response = send_codex_route(&fixture, &upstream, "/v1/responses", original.clone()).await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = tokio::time::timeout(
         Duration::from_secs(1),
         to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY),
     )
     .await
-    .expect("downstream SSE bytes and EOF must not wait for the archive timeout")
+    .expect("downstream SSE bytes and EOF must not wait for the archive worker")
     .unwrap();
     assert_eq!(body.as_ref(), sse.as_bytes());
 
@@ -2969,6 +2962,94 @@ async fn streaming_text_delivery_does_not_wait_for_a_timed_out_archive() {
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
     assert_eq!(rows[0].cost, "0.000005");
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, rows[0].request_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        refs.request_object,
+        format!("gap://{}/request", rows[0].request_id)
+    );
+    assert_eq!(
+        refs.response_object.as_deref(),
+        Some(format!("gap://{}/response", rows[0].request_id).as_str())
+    );
+    assert_eq!(
+        refs.request_archive_state,
+        crate::model::RequestArchiveState::Pending
+    );
+    assert_eq!(
+        refs.response_archive_state,
+        crate::model::RequestArchiveState::Pending
+    );
+
+    // HTTP completion publishes only placeholder locators while both exact
+    // bodies remain recoverable from the encrypted database spool. Object
+    // storage and its worker may be unavailable without losing either body.
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    for (spools, chunks, plaintext, expected_bytes) in [
+        (
+            "request_archive_spools",
+            "request_archive_spool_chunks",
+            "stream now",
+            serde_json::to_vec(&original).unwrap().len() as i64,
+        ),
+        (
+            "response_archive_spools",
+            "response_archive_spool_chunks",
+            "archive-independent stream",
+            sse.len() as i64,
+        ),
+    ] {
+        let spool = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT state, attempts, chunk_count, byte_count FROM {spools} WHERE request_id = $1"
+        )))
+        .bind(rows[0].request_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(spool.get::<String, _>("state"), "pending");
+        assert_eq!(spool.get::<i64, _>("attempts"), 0);
+        assert!(spool.get::<i64, _>("chunk_count") > 0);
+        assert_eq!(spool.get::<i64, _>("byte_count"), expected_bytes);
+        let encrypted = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT ciphertext FROM {chunks} WHERE request_id = $1 ORDER BY seq"
+        )))
+        .bind(rows[0].request_id.to_string())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(!encrypted.is_empty());
+        assert!(encrypted.iter().all(|chunk| {
+            let ciphertext = chunk.get::<String, _>("ciphertext");
+            ciphertext.starts_with("v2.") && !ciphertext.contains(plaintext)
+        }));
+    }
+
+    // Exercise a real failed upload, restore the backend, and prove a fresh
+    // worker can bind both staged objects without replaying the request or its
+    // settlement side effects.
+    assert!(crate::response_archive_spool::process_one_for_test(&fixture.state).await);
+    let failed_attempts: i64 = sqlx::query_scalar(
+        "SELECT (SELECT SUM(attempts) FROM request_archive_spools WHERE request_id = $1) + (SELECT SUM(attempts) FROM response_archive_spools WHERE request_id = $1)",
+    )
+    .bind(rows[0].request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(failed_attempts, 1);
+    std::fs::remove_file(&fixture.archive_path).unwrap();
+    std::fs::create_dir_all(&fixture.archive_path).unwrap();
+    sqlx::query("UPDATE request_archive_spools SET next_attempt_at = 0 WHERE state = 'pending'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE response_archive_spools SET next_attempt_at = 0 WHERE state = 'pending'")
+        .execute(&pool)
+        .await
+        .unwrap();
     drain_completed_response_archive(&fixture).await;
     let refs = fixture
         .state
@@ -2976,10 +3057,36 @@ async fn streaming_text_delivery_does_not_wait_for_a_timed_out_archive() {
         .request_archive_refs(fixture.key_id, rows[0].request_id)
         .await
         .unwrap();
-    assert!(!refs.request_object.starts_with("gap://"));
-    let expected_gap = format!("gap://{}/response", rows[0].request_id);
-    assert_eq!(refs.response_object.as_deref(), Some(expected_gap.as_str()));
+    assert_eq!(
+        refs.view.archive_state,
+        crate::model::RequestArchiveState::Bound
+    );
+    assert!(refs.request_object.starts_with("staging/proxy/"));
+    assert!(
+        refs.response_object
+            .as_deref()
+            .is_some_and(|locator| locator.starts_with("staging/proxy/"))
+    );
+    let archived_request = fixture
+        .state
+        .archive
+        .get(&refs.request_object)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&archived_request).unwrap(),
+        original
+    );
+    let archived_response = fixture
+        .state
+        .archive
+        .get(refs.response_object.as_deref().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(archived_response.as_ref(), sse.as_bytes());
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    pool.close().await;
 }
 
 #[tokio::test]
