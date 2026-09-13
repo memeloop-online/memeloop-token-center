@@ -37,33 +37,77 @@ async fn postgres_gc_retries_contention_without_blocking_live_capture() {
         .await
         .unwrap();
     assert!(fixture.db.begin_response_archive_spool(live).await.unwrap());
-    let db = fixture.db.clone();
-    let producer = tokio::spawn(async move {
-        for seq in 0..32 {
-            assert!(
-                tokio::time::timeout(
-                    Duration::from_millis(250),
-                    db.append_response_archive_spool(live, seq, 1, "x")
-                )
-                .await
-                .expect("producer ACK must stay bounded during small GC batches")
-                .unwrap()
-            );
+
+    // Freeze GC after it owns the expired spool row but before it asks for the
+    // global budget. This turns the lock-order assertion into an ordering
+    // contract instead of measuring a shared CI PostgreSQL server's wall clock.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION pause_expired_spool_gc() RETURNS trigger LANGUAGE plpgsql AS $body$ BEGIN
+             IF OLD.request_id = '{}' AND NEW.cipher_bytes < OLD.cipher_bytes THEN
+                 PERFORM pg_advisory_xact_lock({});
+             END IF;
+             RETURN NEW;
+         END $body$;
+         CREATE TRIGGER pause_expired_spool_gc BEFORE UPDATE ON response_archive_spools
+         FOR EACH ROW EXECUTE FUNCTION pause_expired_spool_gc();",
+        fixture.id.request_id, fixture.gate
+    )))
+    .execute(&fixture.db.pool)
+    .await
+    .unwrap();
+    let mut blocker = fixture.admin.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(fixture.gate)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let gc_db = fixture.db.clone();
+    let gc = tokio::spawn(async move { gc_db.cleanup_response_archive_spools(1).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND UPPER(query) LIKE 'UPDATE RESPONSE_ARCHIVE_SPOOLS%' AND wait_event_type = 'Lock' AND wait_event = 'advisory'",
+            )
+            .bind(&fixture.schema)
+            .fetch_one(&fixture.admin)
+            .await
+            .unwrap();
+            if waiting == 1 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+    })
+    .await
+    .expect("GC must reach the deliberate pre-budget lock gate");
+
+    let db = fixture.db.clone();
+    let mut producer = tokio::spawn(async move {
+        for seq in 0..32 {
+            assert!(
+                db.append_response_archive_spool(live, seq, 1, "x")
+                    .await
+                    .unwrap()
+            );
+        }
     });
-    for _ in 0..8 {
-        // NOWAIT contention errors are allowed; blocking behind a producer
-        // while holding a spool lock is not. Retry only bounded GC batches.
-        let _ = tokio::time::timeout(
-            Duration::from_secs(1),
-            fixture.db.cleanup_response_archive_spools(1),
-        )
+    // Any unexpected GC-held lock needed by live capture would keep this
+    // producer unfinished until the gate is released. The timeout is only a
+    // stuck-test guard; completion before the explicit unlock is the assertion.
+    let producer_result = tokio::time::timeout(Duration::from_secs(5), &mut producer).await;
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(fixture.gate)
+        .execute(&mut *blocker)
         .await
-        .expect("GC must complete or fail NOWAIT within bounded time");
-        tokio::task::yield_now().await;
-    }
-    producer.await.unwrap();
+        .unwrap();
+    drop(blocker);
+    producer_result
+        .expect("live capture must finish while GC remains at the pre-budget gate")
+        .unwrap();
+    assert_eq!(gc.await.unwrap().unwrap(), 0);
+
+    // The first bounded batch left one old chunk. A later retry must finish it
+    // without touching the concurrently captured live spool.
     for _ in 0..3 {
         fixture.db.cleanup_response_archive_spools(1).await.unwrap();
     }
