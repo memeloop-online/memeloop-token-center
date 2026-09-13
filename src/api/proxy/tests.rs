@@ -2080,14 +2080,16 @@ async fn drain_completed_response_archive(fixture: &CodexRouteFixture) {
     // Gateway-only fixtures do not run background workers. Settlement and
     // upload are now independent: exercise the real fenced spool worker before
     // asserting object bytes, without making production delivery await S3.
-    assert!(
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            crate::response_archive_spool::process_one_for_test(&fixture.state),
-        )
-        .await
-        .expect("bounded test archive worker")
-    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if crate::response_archive_spool::process_one_for_test(&fixture.state).await {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("bounded test archive worker");
 }
 
 async fn assert_exactly_once_side_effects(
