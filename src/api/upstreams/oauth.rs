@@ -42,6 +42,51 @@ pub(super) async fn reauthorization_target(
     }))
 }
 
+/// Operator account responses omit schema-owned secrets. Reauthorization is
+/// not a configuration edit, so accept only that exact public projection and
+/// restore the current complete configuration before schema, destination and
+/// compare-and-swap validation. A submitted secret or non-secret change never
+/// reaches the OAuth session.
+async fn reauthorization_target_from_public_config(
+    state: &AppState,
+    account_id: Option<Uuid>,
+    tenant_external_id: &str,
+    account_name: &str,
+    provider_driver: &str,
+    provider_config: &mut Value,
+    oauth_driver: &str,
+) -> Result<Option<OAuthReauthorizationTarget>, AppError> {
+    let Some(account_id) = account_id else {
+        return Ok(None);
+    };
+    let account = state
+        .db
+        .upstream_account_for_reauthorization(account_id, tenant_external_id)
+        .await?;
+    let complete_config = account.config.clone();
+    // Preserve the existing fail-closed admission error for a legacy account
+    // whose current schema cannot safely participate in an OAuth lifecycle.
+    validate_provider_config_schema(state, &account.driver, &complete_config)?;
+    let mut public_account = account;
+    super::config_secrets::redact_account(state, &mut public_account)?;
+    if public_account.config != *provider_config {
+        return Err(AppError::Conflict(
+            "reauthorization must use the existing upstream name, driver, configuration, and OAuth lifecycle".into(),
+        ));
+    }
+    *provider_config = complete_config;
+    reauthorization_target(
+        state,
+        Some(account_id),
+        tenant_external_id,
+        account_name,
+        provider_driver,
+        provider_config,
+        oauth_driver,
+    )
+    .await
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(in crate::api) struct StartCodexOAuthRequest {
@@ -341,7 +386,7 @@ pub(in crate::api) struct StartCursorOAuthRequest {
 pub(in crate::api) async fn start_cursor_oauth(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<StartCursorOAuthRequest>,
+    Json(mut body): Json<StartCursorOAuthRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
@@ -351,17 +396,17 @@ pub(in crate::api) async fn start_cursor_oauth(
             body.provider_driver
         )));
     }
-    validate_provider_config_schema(&state, &body.provider_driver, &body.provider_config)?;
-    let reauthorize = reauthorization_target(
+    let reauthorize = reauthorization_target_from_public_config(
         &state,
         body.upstream_account_id,
         &body.tenant_external_id,
         &body.account_name,
         &body.provider_driver,
-        &body.provider_config,
+        &mut body.provider_config,
         "cursor",
     )
     .await?;
+    validate_provider_config_schema(&state, &body.provider_driver, &body.provider_config)?;
     validate_upstream_destination(
         &body.provider_driver,
         &body.provider_config,
@@ -410,7 +455,7 @@ pub(in crate::api) struct StartProviderAdapterOAuthRequest {
 pub(in crate::api) async fn start_provider_adapter_oauth(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<StartProviderAdapterOAuthRequest>,
+    Json(mut body): Json<StartProviderAdapterOAuthRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
@@ -431,17 +476,17 @@ pub(in crate::api) async fn start_provider_adapter_oauth(
             body.provider_driver
         )));
     }
-    validate_provider_config_schema(&state, &body.provider_driver, &body.provider_config)?;
-    let reauthorize = reauthorization_target(
+    let reauthorize = reauthorization_target_from_public_config(
         &state,
         body.upstream_account_id,
         &body.tenant_external_id,
         &body.account_name,
         &body.provider_driver,
-        &body.provider_config,
+        &mut body.provider_config,
         "provider_adapter",
     )
     .await?;
+    validate_provider_config_schema(&state, &body.provider_driver, &body.provider_config)?;
     validate_upstream_destination(
         &body.provider_driver,
         &body.provider_config,

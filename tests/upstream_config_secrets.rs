@@ -230,6 +230,139 @@ async fn provider_adapter_secret_cycles_are_rejected_before_oauth_start_or_reaut
 }
 
 #[tokio::test]
+async fn provider_adapter_reauthorization_restores_only_the_current_secret_config() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("oauth-secret-restore.db").display()
+    );
+    let mut state = AppState::initialize(Config::for_test(database_url.clone()))
+        .await
+        .unwrap();
+    let mock = wiremock::MockServer::start().await;
+    let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+    let adapter = OAuthAdapterContribution {
+        api_version: "oauth-adapter-v1".into(),
+        flow_kind: OAuthFlowKind::CursorPkce,
+        login_url: "https://provider.example/login".into(),
+        poll_url: "https://provider.example/poll".into(),
+        refresh_url: "https://provider.example/refresh".into(),
+    };
+    let mut provider = state.providers.get("http-json").unwrap().clone();
+    provider.id = "oauth-static-secret".into();
+    provider.oauth_adapter = Some(adapter.clone());
+    provider.config_schema = json!({
+        "type":"object", "additionalProperties":false,
+        "required":["base_url","client_secret"],
+        "properties":{
+            "base_url":{"type":"string"},
+            "label":{"type":"string"},
+            "client_secret":{"type":"string","minLength":1,"writeOnly":true}
+        }
+    });
+    state.providers.extend([provider]).unwrap();
+    let tenant = "oauth-static-secret-test";
+    let config = json!({
+        "base_url": mock.uri(),
+        "label": "unchanged",
+        "client_secret": "synthetic-current-secret"
+    });
+    let account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant.into(),
+                name: "reauthorize-me".into(),
+                driver: "oauth-static-secret".into(),
+                config: config.clone(),
+                credential: UpstreamCredential::OAuth {
+                    access_token: "synthetic-access".into(),
+                    refresh_token: Some("synthetic-refresh".into()),
+                    expires_at: Some(memeloop_token_center::db::unix_millis() + 3_600_000),
+                    header: "authorization".into(),
+                    prefix: "Bearer ".into(),
+                    adapter_state: None,
+                    proxy_url: None,
+                    proxy_network_scope: None,
+                },
+                oauth_session_id: None,
+                oauth_driver: Some("provider_adapter".into()),
+                oauth_refresh_url: Some(adapter.refresh_url),
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let (status, listed) = request(
+        &state,
+        "GET",
+        &format!("/internal/v1/upstreams?tenant_external_id={tenant}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let public_config = json!({"base_url":mock.uri(),"label":"unchanged"});
+    assert_eq!(listed[0]["config"], public_config);
+    assert!(!listed.to_string().contains("synthetic-current-secret"));
+
+    let start = |provider_config: Value| {
+        json!({
+            "tenant_external_id":tenant,
+            "account_name":account.name,
+            "provider_driver":account.driver,
+            "provider_config":provider_config,
+            "upstream_account_id":account.id
+        })
+    };
+    let (status, started) = request(
+        &state,
+        "POST",
+        "/internal/v1/oauth/provider-adapter/start",
+        start(public_config.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(started["session_token"].is_string());
+    assert!(!started.to_string().contains("synthetic-current-secret"));
+
+    for tampered in [
+        json!({
+            "base_url":mock.uri(), "label":"unchanged",
+            "client_secret":"synthetic-replacement"
+        }),
+        json!({"base_url":mock.uri(),"label":"changed"}),
+    ] {
+        let (status, rejected) = request(
+            &state,
+            "POST",
+            "/internal/v1/oauth/provider-adapter/start",
+            start(tampered),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(!rejected.to_string().contains("synthetic-"));
+    }
+    let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_login_sessions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        sessions, 1,
+        "tampered configuration cannot create a login session"
+    );
+    let stored = state
+        .db
+        .upstream_account_with_current_credential(account.id, state.config.key_pepper.as_bytes())
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(stored.config, config);
+    assert_eq!(stored.updated_at, account.updated_at);
+    assert_eq!(stored.credential_generation, account.credential_generation);
+    assert!(mock.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn account_secret_config_is_write_only_preserved_and_compare_and_swap_fenced() {
     let directory = tempfile::tempdir().unwrap();
     let mut state = AppState::initialize(Config::for_test(format!(
