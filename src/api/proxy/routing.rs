@@ -11,6 +11,7 @@ mod outcome;
 mod policy;
 mod probe;
 mod readiness;
+mod route_types;
 
 pub(super) use crate::provider::PROXY_ROUTING_POLICY;
 pub(super) use admission::{
@@ -37,71 +38,10 @@ pub(super) use readiness::{
     CandidateCompatibility, PreparedRouteReadiness, candidate_compatibility,
     credential_application_error, refresh_route_snapshot,
 };
-
-pub(super) struct PreparedProxyRoute {
-    pub(super) route: ResolvedUpstream,
-    forwarded_body: Bytes,
-    pub(super) upstream_stream: bool,
-    pub(super) codex_downstream_stream: bool,
-    pub(super) codex_store_disabled: bool,
-    codex_session_id: Option<String>,
-    pub(super) component_request: Option<(PreparedProviderRequest, RequestContext)>,
-    kimi_response: Option<crate::api::kimi_transport::responses::Context>,
-}
-
-pub(super) struct PlannedProxyRoute {
-    pub(super) route: ResolvedUpstream,
-    forwarded_json: Value,
-    pub(super) output_token_ceiling: i64,
-    upstream_stream: bool,
-    codex_downstream_stream: bool,
-    codex_store_disabled: bool,
-    codex_session_id: Option<String>,
-    component_context: Option<RequestContext>,
-    kimi_response: Option<crate::api::kimi_transport::responses::Context>,
-}
-
-impl PlannedProxyRoute {
-    pub(super) fn is_component(&self) -> bool {
-        self.component_context.is_some()
-    }
-
-    pub(super) fn request_body_ceiling(
-        &self,
-        original_body_length: usize,
-    ) -> Result<usize, AppError> {
-        let forwarded_length =
-            crate::gateway_body::memory::json_encoded_length(&self.forwarded_json)?;
-        Ok(original_body_length.max(forwarded_length))
-    }
-}
-
-impl PreparedProxyRoute {
-    pub(super) fn release_request_buffers(&mut self) {
-        self.forwarded_body = Bytes::new();
-        self.kimi_response = None;
-    }
-
-    pub(super) fn is_codex(&self) -> bool {
-        codex_transport::is_driver(&self.route.driver)
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct ProxyRequestContext<'a> {
-    pub(super) state: &'a AppState,
-    pub(super) key: &'a AuthenticatedKey,
-    pub(super) model: &'a str,
-    pub(super) protocol: Protocol,
-    pub(super) request_id: Uuid,
-    pub(super) request_json: &'a Value,
-}
-
-pub(super) struct ProxyRoutePlanInput<'a> {
-    pub(super) request: ProxyRequestContext<'a>,
-    pub(super) route: ResolvedUpstream,
-    pub(super) preparation_now: i64,
-}
+pub(super) use route_types::{
+    PlannedProxyRoute, PreparedProxyRoute, ProxyRequestContext, ProxyRoutePlanInput,
+    ProxyRouteResponse, ProxySendError,
+};
 
 pub(super) fn plan_proxy_route(
     input: ProxyRoutePlanInput<'_>,
@@ -256,24 +196,6 @@ pub(super) async fn materialize_proxy_route(
         component_request,
         kimi_response: planned.kimi_response,
     })
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub(super) enum ProxySendError {
-    RetryableConnection(&'static str),
-    RetryableCodexBadRequest,
-    CodexBadRequest,
-    CandidateUnavailable,
-    AmbiguousResponse(&'static str),
-    NonRetryableTransport,
-    CredentialUnavailable,
-    Credential,
-}
-
-pub(super) struct ProxyRouteResponse {
-    pub(super) response: UpstreamResponse,
-    pub(super) upstream_activity: crate::metrics::ActivityGuard,
-    pub(super) codex_retry: CodexRetryTerminalGuard,
 }
 
 pub(super) async fn send_proxy_route(
