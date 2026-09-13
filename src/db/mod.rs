@@ -12,7 +12,9 @@ use sqlx::{
 use uuid::Uuid;
 
 use crate::{
-    conversation::{ConversationHints, RelationKind, build_prefix, extract_atoms},
+    conversation::{
+        ConversationHints, PrefixNode, RelationKind, SemanticAtom, build_prefix, extract_atoms,
+    },
     crypto,
     error::{AppError, LimitReason},
     model::{
