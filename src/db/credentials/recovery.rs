@@ -1,11 +1,6 @@
 use super::super::*;
 
 const KEY_CREDENTIAL_RECOVERY_AAD_PREFIX: &str = "memeloop-token-center/key-credential-recovery/v1";
-const KEY_CREDENTIAL_RECOVERY_WINDOW_MILLIS: i64 = 60_000;
-const KEY_CREDENTIAL_RECOVERY_TENANT_ACTOR_LIMIT: i64 = 10;
-const KEY_CREDENTIAL_RECOVERY_KEY_LIMIT: i64 = 3;
-const KEY_CREDENTIAL_RECOVERY_TENANT_BUCKET: &str = "*";
-const KEY_CREDENTIAL_RECOVERY_BOOTSTRAP_ACTOR: &str = "bootstrap";
 
 #[derive(Deserialize, Serialize)]
 struct KeyCredentialRecoveryEnvelope {
@@ -22,16 +17,15 @@ struct KeyCredentialRecoverySecret<'a> {
 }
 
 impl Database {
-    /// Seals a caller-supplied existing credential only when it is exactly the
-    /// active credential for this stable key and generation. This supports an
-    /// authorized importer that still has old-source access without changing
-    /// the key, credential generation, or authentication hash.
+    /// Stores a caller-supplied original credential only when it exactly
+    /// matches the active stable key and generation. This supports authorized
+    /// imports without changing the key, generation, or authentication hash.
     pub async fn store_key_credential_recovery_secret(
         &self,
         key_id: Uuid,
         credential: &str,
         pepper: &[u8],
-        actor_service_id: Option<Uuid>,
+        _actor_service_id: Option<Uuid>,
     ) -> Result<(), AppError> {
         if credential.len() < 16
             || credential.len() > 512
@@ -62,26 +56,20 @@ impl Database {
                 "credential does not match the active key".into(),
             ));
         }
-        store_key_credential_recovery_secret_in_transaction(
-            &mut tx,
-            KeyCredentialRecoverySecret {
-                credential_id: parse_uuid(current.try_get("credential_id")?)?,
-                key_id,
-                generation: current.try_get("credential_generation")?,
-                credential,
-            },
-            pepper,
-            actor_service_id,
-            unix_millis(),
-        )
-        .await?;
+        // The caller supplied the active original credential, so make it
+        // directly copyable. Historical hash-only values are never guessed.
+        sqlx::query("UPDATE key_credentials SET secret_plaintext = $1 WHERE id = $2")
+            .bind(credential)
+            .bind(current.try_get::<String, _>("credential_id")?)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
 
-    /// Returns plaintext only through an explicit management action. The stored
-    /// envelope and the HMAC are both rechecked against the active key
-    /// generation, so an old or transplanted row cannot be replayed.
+    /// Returns plaintext only through an explicit management action. Direct
+    /// storage is rechecked against the active hash; legacy envelopes are also
+    /// verified before being promoted to direct storage.
     pub async fn copy_key_credential(
         &self,
         key_id: Uuid,
@@ -93,10 +81,10 @@ impl Database {
         let mut tx = self.begin_write_transaction().await?;
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "SELECT k.tenant_id, t.external_id AS tenant_external_id, k.status, k.credential_generation, c.secret_hash, r.ciphertext FROM key_records k JOIN tenants t ON t.id = k.tenant_id LEFT JOIN key_credentials c ON c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL LEFT JOIN key_credential_recovery_secrets r ON r.credential_id = c.id AND r.key_id = k.id AND r.credential_generation = k.credential_generation WHERE k.id = $1 FOR UPDATE OF k"
+                "SELECT k.tenant_id, t.external_id AS tenant_external_id, k.status, k.credential_generation, c.id AS credential_id, c.secret_hash, c.secret_plaintext, r.ciphertext FROM key_records k JOIN tenants t ON t.id = k.tenant_id LEFT JOIN key_credentials c ON c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL LEFT JOIN key_credential_recovery_secrets r ON r.credential_id = c.id AND r.key_id = k.id AND r.credential_generation = k.credential_generation WHERE k.id = $1 FOR UPDATE OF k"
             }
             DatabaseBackend::Sqlite => {
-                "SELECT k.tenant_id, t.external_id AS tenant_external_id, k.status, k.credential_generation, c.secret_hash, r.ciphertext FROM key_records k JOIN tenants t ON t.id = k.tenant_id LEFT JOIN key_credentials c ON c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL LEFT JOIN key_credential_recovery_secrets r ON r.credential_id = c.id AND r.key_id = k.id AND r.credential_generation = k.credential_generation WHERE k.id = $1"
+                "SELECT k.tenant_id, t.external_id AS tenant_external_id, k.status, k.credential_generation, c.id AS credential_id, c.secret_hash, c.secret_plaintext, r.ciphertext FROM key_records k JOIN tenants t ON t.id = k.tenant_id LEFT JOIN key_credentials c ON c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL LEFT JOIN key_credential_recovery_secrets r ON r.credential_id = c.id AND r.key_id = k.id AND r.credential_generation = k.credential_generation WHERE k.id = $1"
             }
         };
         let current = sqlx::query(select)
@@ -119,9 +107,6 @@ impl Database {
         let tenant_id: String = current.try_get("tenant_id")?;
         let tenant_external_id: String = current.try_get("tenant_external_id")?;
         let generation: i64 = current.try_get("credential_generation")?;
-        let actor_id = actor_service_id
-            .map(|service_id| service_id.to_string())
-            .unwrap_or_else(|| KEY_CREDENTIAL_RECOVERY_BOOTSTRAP_ACTOR.to_owned());
         let now = unix_millis();
         if !actor_allows_recovery {
             record_key_credential_recovery_access_audit(
@@ -153,50 +138,6 @@ impl Database {
             tx.commit().await?;
             return Err(AppError::Forbidden);
         }
-        // Apply recovery quotas only after authorization. Otherwise a
-        // tenant-bound actor could distinguish a foreign key from an unknown
-        // UUID when repeated foreign probes eventually changed 403 to 429.
-        let tenant_attempts = consume_key_credential_recovery_rate_limit(
-            &mut tx,
-            &tenant_id,
-            &actor_id,
-            KEY_CREDENTIAL_RECOVERY_TENANT_BUCKET,
-            now,
-            KEY_CREDENTIAL_RECOVERY_TENANT_ACTOR_LIMIT,
-        )
-        .await?;
-        let key_attempts = consume_key_credential_recovery_rate_limit(
-            &mut tx,
-            &tenant_id,
-            &actor_id,
-            &key_id.to_string(),
-            now,
-            KEY_CREDENTIAL_RECOVERY_KEY_LIMIT,
-        )
-        .await?;
-        if tenant_attempts > KEY_CREDENTIAL_RECOVERY_TENANT_ACTOR_LIMIT
-            || key_attempts > KEY_CREDENTIAL_RECOVERY_KEY_LIMIT
-        {
-            // Record only the transition into a limited state. The durable
-            // bucket continues counting (with a cap), so a valid but abusive
-            // actor cannot cause one audit row per rejected request.
-            if tenant_attempts == KEY_CREDENTIAL_RECOVERY_TENANT_ACTOR_LIMIT + 1
-                || key_attempts == KEY_CREDENTIAL_RECOVERY_KEY_LIMIT + 1
-            {
-                record_key_credential_recovery_access_audit(
-                    &mut tx,
-                    &tenant_id,
-                    key_id,
-                    generation,
-                    actor_service_id,
-                    "rate_limited",
-                    now,
-                )
-                .await?;
-            }
-            tx.commit().await?;
-            return Err(AppError::RateLimited);
-        }
         if current.try_get::<String, _>("status")? != "active" {
             record_key_credential_recovery_access_audit(
                 &mut tx,
@@ -212,8 +153,9 @@ impl Database {
             return Err(AppError::Forbidden);
         }
         let expected: Option<Vec<u8>> = current.try_get("secret_hash")?;
+        let plaintext: Option<String> = current.try_get("secret_plaintext")?;
         let ciphertext: Option<String> = current.try_get("ciphertext")?;
-        let Some((expected, ciphertext)) = expected.zip(ciphertext) else {
+        let Some(expected) = expected else {
             record_key_credential_recovery_access_audit(
                 &mut tx,
                 &tenant_id,
@@ -227,14 +169,14 @@ impl Database {
             tx.commit().await?;
             return Err(AppError::NotFound);
         };
-        let aad = key_credential_recovery_aad(key_id, generation);
-        let recovered = match open_private_json::<KeyCredentialRecoveryEnvelope>(
-            &ciphertext,
-            pepper,
-            aad.as_bytes(),
-        ) {
-            Ok(recovered) => recovered,
-            Err(_) => {
+        let recovered = if let Some(key) = plaintext {
+            KeyCredentialRecoveryEnvelope {
+                key_id,
+                credential_generation: generation,
+                key,
+            }
+        } else {
+            let Some(ciphertext) = ciphertext else {
                 record_key_credential_recovery_access_audit(
                     &mut tx,
                     &tenant_id,
@@ -246,7 +188,29 @@ impl Database {
                 )
                 .await?;
                 tx.commit().await?;
-                return Err(AppError::Internal);
+                return Err(AppError::NotFound);
+            };
+            let aad = key_credential_recovery_aad(key_id, generation);
+            match open_private_json::<KeyCredentialRecoveryEnvelope>(
+                &ciphertext,
+                pepper,
+                aad.as_bytes(),
+            ) {
+                Ok(recovered) => recovered,
+                Err(_) => {
+                    record_key_credential_recovery_access_audit(
+                        &mut tx,
+                        &tenant_id,
+                        key_id,
+                        generation,
+                        actor_service_id,
+                        "integrity_failed",
+                        now,
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    return Err(AppError::Internal);
+                }
             }
         };
         if recovered.key_id != key_id
@@ -266,6 +230,18 @@ impl Database {
             tx.commit().await?;
             return Err(AppError::Internal);
         }
+        // Compatibility path for pre-0084 encrypted envelopes. The key row
+        // lock plus active-generation predicate prevents a stale envelope from
+        // being persisted after a concurrent rotation.
+        sqlx::query(
+            "UPDATE key_credentials SET secret_plaintext = $1 WHERE id = $2 AND key_id = $3 AND generation = $4 AND revoked_at IS NULL AND secret_plaintext IS NULL",
+        )
+        .bind(&recovered.key)
+        .bind(current.try_get::<Option<String>, _>("credential_id")?)
+        .bind(key_id.to_string())
+        .bind(generation)
+        .execute(&mut *tx)
+        .await?;
         record_key_credential_recovery_audit(
             &mut tx,
             key_id,
@@ -292,40 +268,6 @@ impl Database {
             key: recovered.key,
         })
     }
-}
-
-async fn consume_key_credential_recovery_rate_limit(
-    tx: &mut Transaction<'_, Any>,
-    tenant_id: &str,
-    actor_id: &str,
-    bucket_key: &str,
-    now: i64,
-    limit: i64,
-) -> Result<i64, AppError> {
-    let cutoff = now.saturating_sub(KEY_CREDENTIAL_RECOVERY_WINDOW_MILLIS);
-    // Keep one state beyond the first rejection so equality with `limit + 1`
-    // identifies that transition exactly once without unbounded counters.
-    let capped = limit.saturating_add(2);
-    sqlx::query(
-        "INSERT INTO key_credential_recovery_rate_limits (tenant_id, actor_id, bucket_key, window_started_at, attempts) VALUES ($1, $2, $3, $4, 1) ON CONFLICT(tenant_id, actor_id, bucket_key) DO UPDATE SET window_started_at = CASE WHEN window_started_at <= $5 THEN excluded.window_started_at ELSE window_started_at END, attempts = CASE WHEN window_started_at <= $5 THEN 1 WHEN attempts < $6 THEN attempts + 1 ELSE attempts END",
-    )
-    .bind(tenant_id)
-    .bind(actor_id)
-    .bind(bucket_key)
-    .bind(now)
-    .bind(cutoff)
-    .bind(capped)
-    .execute(&mut **tx)
-    .await?;
-    Ok(sqlx::query(
-        "SELECT attempts FROM key_credential_recovery_rate_limits WHERE tenant_id = $1 AND actor_id = $2 AND bucket_key = $3",
-    )
-    .bind(tenant_id)
-    .bind(actor_id)
-    .bind(bucket_key)
-    .fetch_one(&mut **tx)
-    .await?
-    .try_get("attempts")?)
 }
 
 async fn record_key_credential_recovery_access_audit(

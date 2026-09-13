@@ -441,6 +441,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "bounded conversation candidate lookups",
         sql: include_str!("../../../migrations/common/0082_conversation_candidate_indexes.sql"),
     },
+    Migration {
+        version: 84,
+        name: "copyable credential plaintext",
+        sql: include_str!("../../../migrations/common/0084_copyable_credential_plaintext.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -867,6 +872,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 82,
         name: "bounded conversation candidate lookups",
         sql: include_str!("../../../migrations/common/0082_conversation_candidate_indexes.sql"),
+    },
+    Migration {
+        version: 84,
+        name: "copyable credential plaintext",
+        sql: include_str!("../../../migrations/common/0084_copyable_credential_plaintext.sql"),
     },
 ];
 

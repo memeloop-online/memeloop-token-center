@@ -279,7 +279,7 @@ impl Database {
             // surrounding tenant/principal predicates still enforce the
             // caller's management scope, and cursor semantics remain intact.
             sqlx::query(
-                "SELECT k.id, k.account_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, k.alias, k.currency, k.status, k.credential_generation, (SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1) AS fingerprint, CASE WHEN k.status = 'active' AND EXISTS (SELECT 1 FROM key_credential_recovery_secrets recovery JOIN key_credentials credential ON credential.id = recovery.credential_id WHERE recovery.key_id = k.id AND recovery.credential_generation = k.credential_generation AND credential.key_id = k.id AND credential.generation = k.credential_generation AND credential.revoked_at IS NULL) THEN 1 ELSE 0 END AS credential_recovery_available, k.created_at, k.updated_at, k.policy_json, a.available_micros, a.reserved_micros FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN credit_accounts a ON a.id = k.account_id WHERE k.id = $1 AND ($2 = '' OR t.external_id = $2) AND ($3 = '' OR p.external_id = $3) AND (k.created_at < $4 OR (k.created_at = $4 AND k.id < $5)) ORDER BY k.created_at DESC, k.id DESC LIMIT $6",
+                "SELECT k.id, k.account_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, k.alias, k.currency, k.status, k.credential_generation, (SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1) AS fingerprint, CASE WHEN k.status = 'active' AND EXISTS (SELECT 1 FROM key_credentials credential LEFT JOIN key_credential_recovery_secrets recovery ON recovery.credential_id = credential.id WHERE credential.key_id = k.id AND credential.generation = k.credential_generation AND credential.revoked_at IS NULL AND (credential.secret_plaintext IS NOT NULL OR recovery.credential_id IS NOT NULL)) THEN 1 ELSE 0 END AS credential_recovery_available, k.created_at, k.updated_at, k.policy_json, a.available_micros, a.reserved_micros FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN credit_accounts a ON a.id = k.account_id WHERE k.id = $1 AND ($2 = '' OR t.external_id = $2) AND ($3 = '' OR p.external_id = $3) AND (k.created_at < $4 OR (k.created_at = $4 AND k.id < $5)) ORDER BY k.created_at DESC, k.id DESC LIMIT $6",
             )
             .bind(key_id.to_string())
             .bind(tenant_external_id.unwrap_or_default())
@@ -291,7 +291,7 @@ impl Database {
             .await?
         } else {
             sqlx::query(
-                "SELECT k.id, k.account_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, k.alias, k.currency, k.status, k.credential_generation, (SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1) AS fingerprint, CASE WHEN k.status = 'active' AND EXISTS (SELECT 1 FROM key_credential_recovery_secrets recovery JOIN key_credentials credential ON credential.id = recovery.credential_id WHERE recovery.key_id = k.id AND recovery.credential_generation = k.credential_generation AND credential.key_id = k.id AND credential.generation = k.credential_generation AND credential.revoked_at IS NULL) THEN 1 ELSE 0 END AS credential_recovery_available, k.created_at, k.updated_at, k.policy_json, a.available_micros, a.reserved_micros FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN credit_accounts a ON a.id = k.account_id WHERE ($1 = '' OR t.external_id = $1) AND ($2 = '' OR p.external_id = $2) AND (k.created_at < $3 OR (k.created_at = $3 AND k.id < $4)) ORDER BY k.created_at DESC, k.id DESC LIMIT $5",
+                "SELECT k.id, k.account_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, k.alias, k.currency, k.status, k.credential_generation, (SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1) AS fingerprint, CASE WHEN k.status = 'active' AND EXISTS (SELECT 1 FROM key_credentials credential LEFT JOIN key_credential_recovery_secrets recovery ON recovery.credential_id = credential.id WHERE credential.key_id = k.id AND credential.generation = k.credential_generation AND credential.revoked_at IS NULL AND (credential.secret_plaintext IS NOT NULL OR recovery.credential_id IS NOT NULL)) THEN 1 ELSE 0 END AS credential_recovery_available, k.created_at, k.updated_at, k.policy_json, a.available_micros, a.reserved_micros FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN credit_accounts a ON a.id = k.account_id WHERE ($1 = '' OR t.external_id = $1) AND ($2 = '' OR p.external_id = $2) AND (k.created_at < $3 OR (k.created_at = $3 AND k.id < $4)) ORDER BY k.created_at DESC, k.id DESC LIMIT $5",
             )
             .bind(tenant_external_id.unwrap_or_default())
             .bind(principal_external_id.unwrap_or_default())
@@ -1179,13 +1179,14 @@ async fn insert_credential(
     now: i64,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO key_credentials (id, key_id, generation, secret_hash, fingerprint, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO key_credentials (id, key_id, generation, secret_hash, fingerprint, secret_plaintext, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(issued.credential_id.to_string())
     .bind(issued.key_id.to_string())
     .bind(generation)
     .bind(issued.secret_hash.clone())
     .bind(&issued.fingerprint)
+    .bind(&issued.secret)
     .bind(now)
     .execute(&mut **tx)
     .await?;
@@ -1385,6 +1386,14 @@ mod tests {
                 .try_get("ciphertext")
                 .unwrap();
         assert!(!ciphertext.contains(&issued.key));
+        let plaintext: String = sqlx::query_scalar(
+            "SELECT secret_plaintext FROM key_credentials WHERE key_id = $1 AND generation = 1",
+        )
+        .bind(issued.key_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(plaintext, issued.key);
         let audit = sqlx::query(
             "SELECT action, actor_service_id FROM key_credential_recovery_audit WHERE key_id = $1 ORDER BY created_at, id",
         )
@@ -1462,11 +1471,41 @@ mod tests {
             )
             .await
             .unwrap();
+        sqlx::query(
+            "UPDATE key_credentials SET secret_plaintext = NULL WHERE key_id = $1 AND generation = 1",
+        )
+            .bind(issued.key_id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        // Pre-0084 envelopes remain copyable and are promoted to the direct
+        // plaintext column only after their integrity and active generation
+        // have been verified.
+        let copied = database
+            .copy_key_credential(issued.key_id, pepper, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(copied.key, issued.key);
+        let promoted: String = sqlx::query_scalar(
+            "SELECT secret_plaintext FROM key_credentials WHERE key_id = $1 AND generation = 1",
+        )
+        .bind(issued.key_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(promoted, issued.key);
         sqlx::query("DELETE FROM key_credential_recovery_secrets WHERE key_id = $1")
             .bind(issued.key_id.to_string())
             .execute(&database.pool)
             .await
             .unwrap();
+        sqlx::query(
+            "UPDATE key_credentials SET secret_plaintext = NULL WHERE key_id = $1 AND generation = 1",
+        )
+        .bind(issued.key_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
         assert!(matches!(
             database
                 .copy_key_credential(issued.key_id, pepper, None, None, true)
@@ -1526,7 +1565,10 @@ mod tests {
         .map(|row| row.try_get::<String, _>("outcome").unwrap())
         .collect::<Vec<_>>();
         access_outcomes.sort();
-        assert_eq!(access_outcomes, ["inactive", "retrieved", "unavailable"]);
+        assert_eq!(
+            access_outcomes,
+            ["inactive", "retrieved", "retrieved", "unavailable"]
+        );
     }
 
     #[tokio::test]
