@@ -65,6 +65,15 @@ window.credentialFixture = {
   },
 };
 
+if (scenario === 'client-recovery') {
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+    writeText: async (value: string) => {
+      if (parameters.has('clipboard-failure')) throw new Error('fixture clipboard denied');
+      document.documentElement.dataset.copiedFixtureCredential = String(value === 'mts_client_recovered');
+    },
+  } });
+}
+
 if (scenario === 'service-plaintext') {
   Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
   document.execCommand = () => { throw new Error('fixture clipboard failure'); };

@@ -90,11 +90,6 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     await recovery.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await recovery.goto(fixture('client-recovery'));
     await recovery.getByText('Recoverable client', { exact: true }).waitFor();
-    await recovery.evaluate(() => {
-      Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async (value: string) => {
-        document.documentElement.dataset.copiedFixtureCredential = String(value === 'mts_client_recovered');
-      } } });
-    });
     await recovery.getByRole('button', { name: 'Copy credential', exact: true }).click();
     await recovery.getByRole('status').filter({ hasText: 'Copied Recoverable client credential.' }).waitFor();
     assert.equal(await recovery.getByRole('dialog').count(), 0, 'copy does not add a recovery confirmation');
@@ -112,11 +107,8 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     assert.equal(await recovery.evaluate(() => window.credentialFixture.requests.some(request => request.path.endsWith('/rotate'))), false, 'copy never rotates the credential');
     const manualCopy = await browser.newPage();
     await manualCopy.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
-    await manualCopy.goto(fixture('client-recovery'));
+    await manualCopy.goto(`${fixture('client-recovery')}&clipboard-failure`);
     await manualCopy.getByText('Recoverable client', { exact: true }).waitFor();
-    await manualCopy.evaluate(() => {
-      Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async () => { throw new Error('fixture clipboard denied'); } } });
-    });
     await manualCopy.getByRole('button', { name: 'Copy credential', exact: true }).click();
     await manualCopy.getByText('mts_client_recovered', { exact: true }).waitFor();
     await manualCopy.getByRole('status').filter({ hasText: 'Copy this credential manually' }).waitFor();
