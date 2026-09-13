@@ -109,6 +109,18 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
       referrerPolicy: 'no-referrer',
       hasSignal: true,
     });
+    assert.equal(await recovery.evaluate(() => window.credentialFixture.requests.some(request => request.path.endsWith('/rotate'))), false, 'copy never rotates the credential');
+    const manualCopy = await browser.newPage();
+    await manualCopy.addInitScript(() => {
+      localStorage.setItem('mtc-locale', 'en');
+      Object.defineProperty(navigator, 'clipboard', { value: { writeText: async () => { throw new Error('fixture clipboard denied'); } } });
+    });
+    await manualCopy.goto(fixture('client-recovery'));
+    await manualCopy.getByRole('button', { name: 'Copy credential', exact: true }).click();
+    await manualCopy.getByText('mts_client_recovered', { exact: true }).waitFor();
+    await manualCopy.getByRole('status').filter({ hasText: 'Copy this credential manually' }).waitFor();
+    assert.equal(await manualCopy.getByRole('dialog').count(), 0);
+    await manualCopy.close();
 
     const race = await browser.newPage();
     await race.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
