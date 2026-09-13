@@ -8,6 +8,12 @@ on:
       - 'web/src/plugins/**'
       - 'web/e2e/plugin-ui-*-contract.test.ts'
       - 'web/e2e/fixtures/plugin-ui-slot.*'
+      - 'web/src/operator/pluginContributions.tsx'
+      - 'web/src/operator/Operator.tsx'
+      - 'web/e2e/operator-plugin-projection-browser-contract.test.ts'
+      - 'web/e2e/fixtures/operator-plugin-projection.*'
+      - 'src/plugin/ui_projection.rs'
+      - 'src/api/plugins.rs'
   workflow_dispatch:
 
 permissions:
@@ -37,7 +43,7 @@ jobs:
       - run: npm run typecheck
       - run: npx playwright install --with-deps chromium
       - name: Check isolated projection and browser contracts
-        run: MTC_REQUIRE_BROWSER=1 node --import tsx --test e2e/plugin-ui-projection-contract.test.ts e2e/plugin-ui-slot-browser-contract.test.ts
+        run: MTC_REQUIRE_BROWSER=1 node --import tsx --test e2e/plugin-ui-projection-contract.test.ts e2e/plugin-ui-slot-browser-contract.test.ts e2e/operator-plugin-projection-browser-contract.test.ts
       - name: Retain synthetic mobile theme evidence
         if: always()
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
