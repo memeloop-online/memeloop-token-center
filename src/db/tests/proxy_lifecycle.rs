@@ -821,3 +821,150 @@ async fn concurrent_proxy_terminal_owners_settle_and_link_once() {
         assert_eq!(counts.get::<i64, _>(field), 1, "{field}");
     }
 }
+
+#[tokio::test]
+async fn terminal_upstream_attribution_uses_only_dispatched_candidates() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("proxy-attribution.db").display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    database.migrate().await.unwrap();
+    let pepper = b"proxy attribution test pepper value";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "proxy-attribution".to_owned(),
+                principal_external_id: "member".to_owned(),
+                alias: "proxy-attribution".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::ONE,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let price = database
+        .upsert_model_price("proxy-attribution", "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+
+    let selected_account = Uuid::now_v7();
+    let selected_route = Uuid::now_v7();
+    let no_dispatch_request = Uuid::now_v7();
+    let no_dispatch_reservation = database
+        .start_proxy_request(StartProxyRequest {
+            request_id: no_dispatch_request,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 10,
+            output_token_ceiling: 10,
+            protocol: "openai",
+            model: "proxy-attribution",
+            request_object: "gap://proxy-attribution/no-dispatch-request",
+            upstream_account_id: Some(selected_account),
+            model_route_id: Some(selected_route),
+        })
+        .await
+        .unwrap();
+    database
+        .finish_proxy_request_with_archive_staging_and_upstream_attribution(
+            FinishProxyRequest {
+                request_id: no_dispatch_request,
+                tenant_id: key.tenant_id,
+                reservation: &no_dispatch_reservation,
+                input_token_ceiling: 10,
+                output_token_ceiling: 10,
+                requested_service_tier: None,
+                status_code: 503,
+                duration_ms: 1,
+                usage: TokenUsage::default(),
+                charge_contract_ceiling: false,
+                error_code: Some("upstream_unavailable"),
+                response_object: "gap://proxy-attribution/no-dispatch-response",
+                conversation: None,
+            },
+            None,
+            ProxyRequestUpstreamAttribution::LastDispatched(None),
+        )
+        .await
+        .unwrap();
+    let no_dispatch = sqlx::query(
+        "SELECT upstream_account_id, model_route_id FROM request_records WHERE id = $1",
+    )
+    .bind(no_dispatch_request.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        no_dispatch.get::<Option<String>, _>("upstream_account_id"),
+        None
+    );
+    assert_eq!(no_dispatch.get::<Option<String>, _>("model_route_id"), None);
+
+    let dispatched_account = Uuid::now_v7();
+    let dispatched_route = Uuid::now_v7();
+    let failover_request = Uuid::now_v7();
+    let failover_reservation = database
+        .start_proxy_request(StartProxyRequest {
+            request_id: failover_request,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 10,
+            output_token_ceiling: 10,
+            protocol: "openai",
+            model: "proxy-attribution",
+            request_object: "gap://proxy-attribution/failover-request",
+            upstream_account_id: Some(selected_account),
+            model_route_id: Some(selected_route),
+        })
+        .await
+        .unwrap();
+    database
+        .finish_proxy_request_with_archive_staging_and_upstream_attribution(
+            FinishProxyRequest {
+                request_id: failover_request,
+                tenant_id: key.tenant_id,
+                reservation: &failover_reservation,
+                input_token_ceiling: 10,
+                output_token_ceiling: 10,
+                requested_service_tier: None,
+                status_code: 503,
+                duration_ms: 1,
+                usage: TokenUsage::default(),
+                charge_contract_ceiling: false,
+                error_code: Some("upstream_connection"),
+                response_object: "gap://proxy-attribution/failover-response",
+                conversation: None,
+            },
+            None,
+            ProxyRequestUpstreamAttribution::LastDispatched(Some((
+                dispatched_account,
+                dispatched_route,
+            ))),
+        )
+        .await
+        .unwrap();
+    let failover = sqlx::query(
+        "SELECT upstream_account_id, model_route_id FROM request_records WHERE id = $1",
+    )
+    .bind(failover_request.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        failover.get::<Option<String>, _>("upstream_account_id"),
+        Some(dispatched_account.to_string())
+    );
+    assert_eq!(
+        failover.get::<Option<String>, _>("model_route_id"),
+        Some(dispatched_route.to_string())
+    );
+}

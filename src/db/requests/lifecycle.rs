@@ -87,6 +87,12 @@ pub struct FinishProxyRequest<'a> {
     pub conversation: Option<ProxyConversationInput<'a>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ProxyRequestUpstreamAttribution {
+    KeepSelected,
+    LastDispatched(Option<(Uuid, Uuid)>),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FinishProxyRequestResult {
     Finished {
@@ -661,16 +667,32 @@ impl Database {
         input: FinishProxyRequest<'_>,
         response_archive_lease: Option<&ArchiveStagingWriteLease>,
     ) -> Result<FinishProxyRequestResult, AppError> {
-        self.finish_proxy_request_inner(input, response_archive_lease, None)
+        self.finish_proxy_request_inner(
+            input,
+            response_archive_lease,
+            None,
+            ProxyRequestUpstreamAttribution::KeepSelected,
+        )
+        .await
+    }
+
+    pub(crate) async fn finish_proxy_request_with_archive_staging_and_upstream_attribution(
+        &self,
+        input: FinishProxyRequest<'_>,
+        response_archive_lease: Option<&ArchiveStagingWriteLease>,
+        upstream_attribution: ProxyRequestUpstreamAttribution,
+    ) -> Result<FinishProxyRequestResult, AppError> {
+        self.finish_proxy_request_inner(input, response_archive_lease, None, upstream_attribution)
             .await
     }
 
-    pub(crate) async fn finish_proxy_request_with_buffered_archive(
+    pub(crate) async fn finish_proxy_request_with_buffered_archive_and_upstream_attribution(
         &self,
         input: FinishProxyRequest<'_>,
         archive: &crate::response_archive_spool::BufferedArchive<'_>,
+        upstream_attribution: ProxyRequestUpstreamAttribution,
     ) -> Result<FinishProxyRequestResult, AppError> {
-        self.finish_proxy_request_inner(input, None, Some(archive))
+        self.finish_proxy_request_inner(input, None, Some(archive), upstream_attribution)
             .await
     }
 
@@ -679,6 +701,7 @@ impl Database {
         input: FinishProxyRequest<'_>,
         response_archive_lease: Option<&ArchiveStagingWriteLease>,
         buffered_archive: Option<&crate::response_archive_spool::BufferedArchive<'_>>,
+        upstream_attribution: ProxyRequestUpstreamAttribution,
     ) -> Result<FinishProxyRequestResult, AppError> {
         if let Some(archive) = buffered_archive
             && (archive.identity().request_id != input.request_id
@@ -776,6 +799,28 @@ impl Database {
             };
             transaction.commit().await?;
             return Ok(result);
+        }
+
+        if let ProxyRequestUpstreamAttribution::LastDispatched(assignment) = upstream_attribution {
+            let upstream_account_id = assignment.map(|(account_id, _)| account_id.to_string());
+            let model_route_id = assignment.map(|(_, route_id)| route_id.to_string());
+            let attributed = sqlx::query(
+                "UPDATE request_records SET upstream_account_id = $1, model_route_id = $2 WHERE id = $3 AND created_at = $4 AND tenant_id = $5 AND key_id = $6 AND reservation_id = $7 AND completed_at IS NULL",
+            )
+            .bind(upstream_account_id)
+            .bind(model_route_id)
+            .bind(&request_id)
+            .bind(created_at)
+            .bind(&tenant_id)
+            .bind(&key_id)
+            .bind(&reservation_id)
+            .execute(&mut *transaction)
+            .await?;
+            if attributed.rows_affected() != 1 {
+                return Err(AppError::Conflict(
+                    "request terminal upstream attribution changed".into(),
+                ));
+            }
         }
 
         if let Some(archive) = buffered_archive {

@@ -138,9 +138,10 @@ pub use requests::{
     StartProxyRequest, StatsFilter, normalize_proxy_usage,
 };
 pub(crate) use requests::{
-    ConversationObservationInput, MAX_STATS_RANGE_MILLIS, SwitchProxyCandidateInput,
-    allocate_request_event_cursor, attach_conversation_upstream_response_in_transaction,
-    price_token_usage, proxy_contract_ceiling_micros, record_request_finished_in_transaction,
+    ConversationObservationInput, MAX_STATS_RANGE_MILLIS, ProxyRequestUpstreamAttribution,
+    SwitchProxyCandidateInput, allocate_request_event_cursor,
+    attach_conversation_upstream_response_in_transaction, price_token_usage,
+    proxy_contract_ceiling_micros, record_request_finished_in_transaction,
     record_request_started_in_transaction, reserve_usage_in_transaction, search_prefix,
     settle_token_usage_in_transaction, settle_token_usage_in_transaction_with_charge,
     validate_numeric_range,
