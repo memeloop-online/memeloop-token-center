@@ -457,6 +457,7 @@ export interface ServiceTokenView {
   service_id: string;
   name: string;
   credential_generation: number;
+  credential_copy_available?: boolean;
   fingerprint: string;
   scopes: string[];
   tenant_external_id: string | null;
