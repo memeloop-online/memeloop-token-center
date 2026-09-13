@@ -49,6 +49,9 @@ pub struct AggregatedUpstreamModelCatalogView {
     pub data: Vec<AggregatedUpstreamModelView>,
     pub eligible_account_count: i64,
     pub unknown_account_count: i64,
+    /// Unknown candidates with a current-generation, terminal server-owned
+    /// discovery verdict of `unsupported`; never a transport/auth failure.
+    pub unsupported_account_count: i64,
     pub stale_account_count: i64,
 }
 
@@ -535,14 +538,15 @@ impl Database {
             serde_json::to_string(&account_ids).map_err(|_| AppError::Internal)?;
         let states_sql = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "SELECT a.id, a.credential_generation, s.status, s.current_snapshot_id, s.expires_at, snapshot.credential_generation AS snapshot_generation FROM upstream_accounts a LEFT JOIN upstream_model_catalog_state s ON s.upstream_account_id = a.id LEFT JOIN upstream_model_catalog_snapshots snapshot ON snapshot.id = s.current_snapshot_id AND snapshot.upstream_account_id = a.id WHERE a.id IN (SELECT selected.item FROM jsonb_array_elements_text(CAST($1 AS jsonb)) AS selected(item))"
+                "SELECT a.id, a.credential_generation, s.credential_generation AS state_generation, s.status, s.last_error_code, s.current_snapshot_id, s.expires_at, snapshot.credential_generation AS snapshot_generation FROM upstream_accounts a LEFT JOIN upstream_model_catalog_state s ON s.upstream_account_id = a.id LEFT JOIN upstream_model_catalog_snapshots snapshot ON snapshot.id = s.current_snapshot_id AND snapshot.upstream_account_id = a.id WHERE a.id IN (SELECT selected.item FROM jsonb_array_elements_text(CAST($1 AS jsonb)) AS selected(item))"
             }
             DatabaseBackend::Sqlite => {
-                "SELECT a.id, a.credential_generation, s.status, s.current_snapshot_id, s.expires_at, snapshot.credential_generation AS snapshot_generation FROM upstream_accounts a LEFT JOIN upstream_model_catalog_state s ON s.upstream_account_id = a.id LEFT JOIN upstream_model_catalog_snapshots snapshot ON snapshot.id = s.current_snapshot_id AND snapshot.upstream_account_id = a.id WHERE a.id IN (SELECT value FROM json_each($1))"
+                "SELECT a.id, a.credential_generation, s.credential_generation AS state_generation, s.status, s.last_error_code, s.current_snapshot_id, s.expires_at, snapshot.credential_generation AS snapshot_generation FROM upstream_accounts a LEFT JOIN upstream_model_catalog_state s ON s.upstream_account_id = a.id LEFT JOIN upstream_model_catalog_snapshots snapshot ON snapshot.id = s.current_snapshot_id AND snapshot.upstream_account_id = a.id WHERE a.id IN (SELECT value FROM json_each($1))"
             }
         };
         let now = unix_millis();
         let mut unknown_account_count = 0_i64;
+        let mut unsupported_account_count = 0_i64;
         let mut stale_account_count = 0_i64;
         for row in sqlx::query(states_sql)
             .bind(&account_ids_json)
@@ -556,6 +560,14 @@ impl Database {
             let expires_at: Option<i64> = row.try_get("expires_at")?;
             if snapshot_id.is_none() || snapshot_generation != Some(account_generation) {
                 unknown_account_count += 1;
+                let state_generation: Option<i64> = row.try_get("state_generation")?;
+                let error_code: Option<String> = row.try_get("last_error_code")?;
+                if state_generation == Some(account_generation)
+                    && status.as_deref() == Some("error")
+                    && error_code.as_deref() == Some("unsupported")
+                {
+                    unsupported_account_count += 1;
+                }
             } else if status.as_deref() != Some("ready")
                 || expires_at.is_some_and(|expiry| expiry <= now)
             {
@@ -607,6 +619,7 @@ impl Database {
             data,
             eligible_account_count: eligible_count,
             unknown_account_count,
+            unsupported_account_count,
             stale_account_count,
         })
     }

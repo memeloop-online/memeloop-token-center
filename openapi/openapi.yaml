@@ -6017,7 +6017,7 @@ components:
     AggregatedUpstreamModelCatalog:
       type: object
       additionalProperties: false
-      required: [data, eligible_account_count, unknown_account_count, stale_account_count]
+      required: [data, eligible_account_count, unknown_account_count, unsupported_account_count, stale_account_count]
       properties:
         data:
           type: array
@@ -6025,6 +6025,11 @@ components:
           items: { $ref: '#/components/schemas/AggregatedUpstreamModel' }
         eligible_account_count: { type: integer, format: int64, minimum: 0 }
         unknown_account_count: { type: integer, format: int64, minimum: 0 }
+        unsupported_account_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Subset of unknown accounts with a current-generation terminal server-owned unsupported discovery verdict. Never includes pending, network, authentication or permission failures. Counts satisfy unsupported_account_count <= unknown_account_count <= eligible_account_count.
         stale_account_count: { type: integer, format: int64, minimum: 0 }
     Group:
       type: object
