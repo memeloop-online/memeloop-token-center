@@ -1,4 +1,5 @@
 //! Supplier quota projection; mutations live in the explicit durable reset workflow.
+mod kimi;
 mod normalize;
 pub(crate) mod reset;
 
@@ -34,7 +35,12 @@ pub(crate) struct QuotaSnapshot {
     observed_at: Option<i64>,
     stale_after: Option<i64>,
     stale: bool,
+    freshness: &'static str,
     plan_type: Option<String>,
+    capabilities: QuotaCapabilities,
+    /// Subscription lifetime is not OAuth token lifetime. Unknown stays null.
+    subscription_active_until: Option<i64>,
+    reset_credits: Vec<ResetCredit>,
     windows: Vec<QuotaWindow>,
     credits: Credits,
     reset_capability: ResetCapability,
@@ -46,6 +52,7 @@ struct QuotaWindow {
     id: String,
     label: String,
     used_percent: Option<f64>,
+    used: Option<f64>,
     remaining: Option<f64>,
     limit: Option<f64>,
     reset_at: Option<i64>,
@@ -54,6 +61,34 @@ struct QuotaWindow {
     reset_is_estimated: bool,
     allowed: Option<bool>,
     limit_reached: Option<bool>,
+}
+
+#[derive(Clone, Serialize)]
+struct QuotaCapabilities {
+    read: bool,
+    window_amounts: bool,
+    window_percent: bool,
+    reset_credit_expiry: bool,
+    subscription_expiry: bool,
+}
+
+impl QuotaCapabilities {
+    fn for_provider(provider: &str) -> Self {
+        Self {
+            read: matches!(provider, "openai-codex" | "kimi-oauth"),
+            window_amounts: provider == "kimi-oauth",
+            window_percent: matches!(provider, "openai-codex" | "kimi-oauth"),
+            reset_credit_expiry: provider == "openai-codex",
+            subscription_expiry: false,
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct ResetCredit {
+    status: Option<String>,
+    granted_at: Option<i64>,
+    expires_at: Option<i64>,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -87,11 +122,19 @@ impl QuotaSnapshot {
             upstream_account_id: account.id,
             tenant_external_id: tenant.to_owned(),
             provider: account.driver.clone(),
-            status: if codex { "error" } else { "unsupported" },
+            status: if QuotaCapabilities::for_provider(&account.driver).read {
+                "error"
+            } else {
+                "unsupported"
+            },
             observed_at: None,
             stale_after: None,
             stale: false,
+            freshness: "unobserved",
             plan_type: None,
+            capabilities: QuotaCapabilities::for_provider(&account.driver),
+            subscription_active_until: None,
+            reset_credits: Vec::new(),
             windows: Vec::new(),
             credits: Credits::default(),
             reset_capability: ResetCapability {
@@ -149,7 +192,7 @@ impl QuotaCache {
         tenant: &str,
     ) -> QuotaSnapshot {
         let empty = |error| QuotaSnapshot::empty(account, tenant, error);
-        if account.driver != "openai-codex" {
+        if !QuotaCapabilities::for_provider(&account.driver).read {
             return empty(None);
         }
         let key = (
@@ -199,10 +242,13 @@ impl QuotaCache {
             return fallback("quota_busy");
         };
         // Includes DNS/proxy setup, both GETs and bounded body decoding.
-        let result = tokio::time::timeout(
-            Duration::from_secs(8),
-            read_codex(state, account, credential, empty(None)),
-        )
+        let result = tokio::time::timeout(Duration::from_secs(8), async {
+            if account.driver == "kimi-oauth" {
+                kimi::read(state, credential, empty(None)).await
+            } else {
+                read_codex(state, account, credential, empty(None)).await
+            }
+        })
         .await
         .unwrap_or(Err("quota_timeout"));
         let mut value = match result {
@@ -212,8 +258,8 @@ impl QuotaCache {
             }
             Err(error) => fallback(error),
         };
-        if value.error_code.is_some() {
-            value.reset_capability.retryable = true;
+        if value.error_code.is_some() && value.reset_capability.implementation_available {
+            value.reset_capability.retryable = value.reset_capability.implementation_available;
             value.reset_capability.prepare_available =
                 value.reset_capability.implementation_available;
             value.reset_capability.reason = "quota_refresh_failed_retryable";
@@ -242,11 +288,14 @@ fn stale_or_error(
                 .is_some_and(|at| now.saturating_sub(at) <= STALE_MS) =>
         {
             value.stale = true;
+            value.freshness = "stale";
             value.error_code = empty.error_code;
-            value.reset_capability.retryable = true;
+            value.reset_capability.retryable = value.reset_capability.implementation_available;
             value.reset_capability.prepare_available =
                 value.reset_capability.implementation_available;
-            value.reset_capability.reason = "quota_refresh_failed_retryable";
+            if value.reset_capability.implementation_available {
+                value.reset_capability.reason = "quota_refresh_failed_retryable";
+            }
             value
         }
         _ => empty,
@@ -306,6 +355,7 @@ async fn read_codex(
         Err(error) => snapshot.reset_capability.credit_error_code = Some(error),
     }
     snapshot.status = "ready";
+    snapshot.freshness = "fresh";
     snapshot.observed_at = Some(observed_at);
     snapshot.stale_after = Some(observed_at + FRESH_MS);
     snapshot.finalize_reset_capability();
@@ -417,6 +467,10 @@ async fn get_json(
         .send()
         .await
         .map_err(|_| "quota_transport_failed")?;
+    decode_response(response).await
+}
+
+async fn decode_response(response: reqwest::Response) -> Result<Value, &'static str> {
     if !response.status().is_success() {
         return Err(match response.status().as_u16() {
             401 | 403 => "quota_not_authorized",

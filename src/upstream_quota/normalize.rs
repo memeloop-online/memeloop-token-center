@@ -135,6 +135,7 @@ fn add_windows(
             id: id.clone(),
             label: id,
             used_percent: number(field(window, "used_percent", "usedPercent")),
+            used: None,
             remaining: None,
             limit: None,
             reset_at: absolute.or(relative),
@@ -165,9 +166,17 @@ pub(super) fn reset_credits(
         if credits.len() > 1024 {
             return Err("quota_too_many_credits");
         }
+        snapshot.reset_credits.clear();
         let mut applicable = 0;
         let mut incomplete = false;
         for credit in credits {
+            if field(credit, "reset_type", "resetType").as_str() == Some("codex_rate_limits") {
+                snapshot.reset_credits.push(ResetCredit {
+                    status: text(&credit["status"]),
+                    granted_at: timestamp(field(credit, "granted_at", "grantedAt")),
+                    expires_at: timestamp(field(credit, "expires_at", "expiresAt")),
+                });
+            }
             if field(credit, "reset_type", "resetType").as_str() != Some("codex_rate_limits")
                 || credit["status"].as_str() != Some("available")
             {
@@ -198,6 +207,13 @@ pub(super) fn reset_credits(
     Ok(())
 }
 
+pub(super) fn timestamp(value: &Value) -> Option<i64> {
+    value
+        .as_str()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp_millis())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,7 +228,11 @@ mod tests {
             observed_at: None,
             stale_after: None,
             stale: false,
+            freshness: "unobserved",
             plan_type: None,
+            capabilities: QuotaCapabilities::for_provider("openai-codex"),
+            subscription_active_until: None,
+            reset_credits: Vec::new(),
             windows: Vec::new(),
             credits: Credits::default(),
             reset_capability: ResetCapability {
@@ -277,6 +297,10 @@ mod tests {
         assert_eq!(result.reset_capability.applicable_credits, None);
         assert_eq!(result.reset_capability.provider_supported, Some(true));
         assert!(!result.reset_capability.implementation_available);
+        assert_eq!(result.reset_credits.len(), 3);
+        assert!(result.reset_credits[0].expires_at.is_some());
+        assert!(result.reset_credits[2].expires_at.is_none());
+        assert!(result.subscription_active_until.is_none());
     }
 
     #[test]
