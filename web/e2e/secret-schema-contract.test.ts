@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { prepareSecretForm } from '../src/secretSchema';
-import { safeValidator } from '../src/safeValidator';
+import { prepareSecretForm } from '../src/secretSchema.js';
+import { safeValidator } from '../src/safeValidator.js';
 import type { RJSFSchema } from '@rjsf/utils';
 
 test('resolved refs, allOf siblings and existing config never prefill secret fields', () => {

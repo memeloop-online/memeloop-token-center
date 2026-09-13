@@ -241,7 +241,7 @@ async fn finish_copilot_login(
         } else {
             StatusCode::CREATED
         },
-        Json(super::config_secrets::public_account(&state, account)?),
+        Json(super::config_secrets::public_account(state, account)?),
     )
         .into_response())
 }
