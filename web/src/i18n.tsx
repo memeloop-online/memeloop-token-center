@@ -200,7 +200,7 @@ const zh = {
   'sessionReplay.pairing.paired': '已配对', 'sessionReplay.pairing.unpaired': '未配对', 'sessionReplay.pairing.unknown': '配对未知',
   'sessionReplay.expand': '展开 {{count}} 个字符', 'sessionReplay.collapse': '收起内容',
   'sessionReplay.userTurn': '用户轮次 {{index}}：{{text}}', 'sessionReplay.archiveSequence': '归档顺序',
-  'request.time': '时间', 'request.model': '模型', 'request.session': '会话', 'request.sessionMetadata': '任务与代理信息', 'request.table': '请求记录（可横向滚动）', 'request.protocol': '协议', 'request.status': '状态',
+  'request.time': '时间', 'request.model': '模型', 'request.session': '会话', 'request.sessionMetadata': '任务与代理详情', 'request.table': '请求记录（可横向滚动）', 'request.protocol': '协议', 'request.status': '状态',
   'request.receivedAt': '接收时间', 'request.completedAt': '完成时间', 'request.upstreamId': '最终上游 ID', 'request.routeId': '最终路由 ID',
   'request.duration': '耗时', 'request.tokens': 'Token 用量', 'request.cost': '费用', 'request.count': '{{count}} 次',
   'request.archiveComplete': '详情完整', 'request.archiveIncomplete': '部分详情缺失',
