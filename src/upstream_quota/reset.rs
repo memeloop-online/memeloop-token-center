@@ -269,7 +269,7 @@ pub(crate) async fn confirm(
         .entries
         .lock()
         .await
-        .retain(|(id, _, _), _| *id != account.id);
+        .retain(|key, _| key.account != account.id);
     // Accepted means only supplier HTTP 2xx. It does not assert window state.
     state
         .db
