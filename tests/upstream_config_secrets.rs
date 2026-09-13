@@ -195,6 +195,8 @@ async fn provider_adapter_secret_cycles_are_rejected_before_oauth_start_or_reaut
                             header: "authorization".into(),
                             prefix: "Bearer ".into(),
                             adapter_state: None,
+                            proxy_url: None,
+                            proxy_network_scope: None,
                         },
                         oauth_session_id: None,
                         oauth_driver: Some("provider_adapter".into()),
