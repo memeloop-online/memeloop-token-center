@@ -30,9 +30,27 @@ pub(crate) async fn run(state: AppState, mut shutdown: watch::Receiver<bool>) {
                 // Never cancel an in-flight claim/cleanup transaction on
                 // shutdown. The database's acquire/lock/statement deadlines
                 // bound SQL; shutdown is observed at transaction boundaries.
+                cleanup_before_drain(&state).await;
                 drain_batch(&shutdown, || process_one_until_shutdown(&state, owner, Some(&shutdown))).await;
             }
         }
+    }
+}
+
+async fn cleanup_before_drain(state: &AppState) {
+    // Cleanup is one maintenance pass per drain, not per concurrent upload.
+    // Running it inside each upload creates a convoy of SQLite write
+    // transactions that can starve request admission while a batch refills.
+    if state
+        .db
+        .cleanup_response_archive_spools_for(32, Duration::from_secs(2))
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            stage = "response_spool_cleanup",
+            "response archive cleanup failed; committed batches are preserved"
+        );
     }
 }
 
@@ -64,6 +82,9 @@ fn stopping(shutdown: &watch::Receiver<bool>) -> bool {
 
 #[cfg(test)]
 pub(super) async fn process_one(state: &AppState, owner: Uuid) -> bool {
+    // Preserve the single-step worker helper's cleanup semantics while the
+    // production drain performs maintenance once before concurrent claims.
+    cleanup_before_drain(state).await;
     process_one_until_shutdown(state, owner, None).await
 }
 
@@ -84,17 +105,6 @@ pub(super) async fn process_one_with_admission(
     // Stop at a committed transaction boundary instead of cancelling a live
     // SQL future. The latter can race SQLx's asynchronous rollback with the
     // next pooled BEGIN and generate transaction-state protocol notices.
-    if state
-        .db
-        .cleanup_response_archive_spools_for(32, Duration::from_secs(2))
-        .await
-        .is_err()
-    {
-        tracing::warn!(
-            stage = "response_spool_cleanup",
-            "response archive cleanup failed; committed batches are preserved"
-        );
-    }
     if shutdown.is_some_and(stopping) {
         return false;
     }
