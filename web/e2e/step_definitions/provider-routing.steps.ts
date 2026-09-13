@@ -238,12 +238,18 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
   await page.keyboard.press('Escape');
   await onboarding.getByRole('button', { name: '账户授权', exact: true }).click();
   await assertVisible(onboarding.getByLabel('服务提供商'));
-  await assertContains(onboarding.getByLabel('服务提供商'), 'Browser dual method');
-  await assertContains(onboarding.getByLabel('服务提供商'), 'Cursor');
-  await assertContains(onboarding.getByLabel('服务提供商'), 'Anthropic Claude');
-  await assertContains(onboarding.getByLabel('服务提供商'), 'GitHub Copilot');
-  await assertContains(onboarding.getByLabel('服务提供商'), 'OpenAI Codex');
-  await onboarding.getByLabel('服务提供商').selectOption('openai-codex');
+  await onboarding.getByLabel('服务提供商').click();
+  for (const provider of ['Browser dual method', 'Cursor', 'Anthropic Claude', 'GitHub Copilot', 'OpenAI Codex']) {
+    await assertVisible(onboarding.getByRole('option', { name: new RegExp(`^${provider}`) }));
+  }
+  await onboarding.getByRole('option', { name: /^OpenAI Codex/ }).click();
+  await appPreferenceControls(page).getByRole('button', { name: 'English', exact: true }).click();
+  await onboarding.getByLabel('Service provider').click();
+  for (const provider of ['Browser dual method', 'Cursor', 'Anthropic Claude', 'GitHub Copilot', 'OpenAI Codex']) {
+    await assertVisible(onboarding.getByRole('option', { name: new RegExp(`^${provider}`) }));
+  }
+  await page.keyboard.press('Escape');
+  await appPreferenceControls(page).getByRole('button', { name: '中文', exact: true }).click();
   await onboarding.getByLabel('上游名称').fill('codex-primary');
   assert.equal(await onboarding.getByRole('button', { name: '开始登录', exact: true }).isDisabled(), true);
   await onboarding.locator('.upstream-proxy-editor input').fill('socks5h://10.0.0.10:1080');
@@ -267,10 +273,8 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
   await assertVisible(onboarding.getByRole('button', { name: 'API credential', exact: true }));
   await assertVisible(onboarding.getByRole('button', { name: 'Account authorization', exact: true }));
   await assertVisible(onboarding.getByLabel('Service provider'));
-  await assertContains(onboarding.getByLabel('Service provider'), 'Cursor');
-  await assertContains(onboarding.getByLabel('Service provider'), 'Anthropic Claude');
-  await assertContains(onboarding.getByLabel('Service provider'), 'GitHub Copilot');
   await assertContains(onboarding.getByLabel('Service provider'), 'OpenAI Codex');
+  assert.equal(await onboarding.getByLabel('Service provider').isDisabled(), true, 'an in-progress authorization keeps its selected provider locked');
   await assertContains(onboarding.getByRole('status'), 'Continue on OpenAI only if you just started this login.');
   await assertNotContains(page.locator('body'), 'CPA');
   await assertNotContains(page.locator('body'), 'Bridge');
