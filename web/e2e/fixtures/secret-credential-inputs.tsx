@@ -27,6 +27,11 @@ const credential: RJSFSchema = variant === 'oauth' ? {
     client_secret: { $ref: '#/$defs/secret', default: 'must-not-prefill-ref-site' },
     allof_secret: { allOf: [{ $ref: '#/$defs/secret' }, { default: 'must-not-prefill-allof-sibling' }], title: 'Combined secret' },
   },
+} : variant === 'keywords' ? {
+  type: 'object', required: ['default', 'enum'], properties: {
+    default: { ...secret },
+    enum: { $ref: '#/$defs/default' },
+  },
 } : variant === 'array' ? {
   type: 'object', properties: {
     access_token: { ...secret, title: 'Access token' },
@@ -39,7 +44,7 @@ const credential: RJSFSchema = variant === 'oauth' ? {
     proxy_url: { type: ['string', 'null'], writeOnly: true, title: 'Proxy URL' },
   } }, { title: 'No authentication', type: 'object', additionalProperties: false, required: ['type'], properties: { type: { type: 'string', const: 'none' } } }],
 };
-const definitions: RJSFSchema['$defs'] = { secret: { ...secret, title: 'Client secret' } };
+const definitions: RJSFSchema['$defs'] = variant === 'keywords' ? { default: { ...secret } } : { secret: { ...secret, title: 'Client secret' } };
 
 function Fixture() {
   const [submitted, setSubmitted] = useState(0);
@@ -59,7 +64,7 @@ function Fixture() {
     </section>
     <section className="panel" aria-label="Edit connection">
       <h2>Edit connection</h2>
-      <OperatorSchemaForm key={`edit-${generation}`} schema={{ type: 'object', $defs: definitions, properties: { name: { type: 'string' }, config: { type: 'object', required: ['client_secret'], properties: { base_url: { type: 'string' }, client_secret: { $ref: '#/$defs/secret', default: 'must-not-prefill-edit' } } } } }} formData={{ name: 'Existing account', config: { base_url: 'https://provider.example', client_secret: 'must-not-prefill-existing-config' } }} validator={safeValidator} templates={upstreamFormTemplates} onSubmit={({ formData }) => setEditOutcome(Object.hasOwn(formData.config, 'client_secret') ? formData.config.client_secret === 'synthetic-replacement' ? 'replaced' : 'unsafe' : 'unchanged')}><button type="submit">Save fixture</button></OperatorSchemaForm>
+      <OperatorSchemaForm key={`edit-${generation}`} schema={{ type: 'object', $defs: definitions, properties: { name: { type: 'string' }, config: { type: 'object', required: ['client_secret'], properties: { base_url: { type: 'string' }, client_secret: { $ref: variant === 'keywords' ? '#/$defs/default' : '#/$defs/secret', default: 'must-not-prefill-edit' } } } } }} formData={{ name: 'Existing account', config: { base_url: 'https://provider.example', client_secret: 'must-not-prefill-existing-config' } }} validator={safeValidator} templates={upstreamFormTemplates} onSubmit={({ formData }) => setEditOutcome(Object.hasOwn(formData.config, 'client_secret') ? formData.config.client_secret === 'synthetic-replacement' ? 'replaced' : 'unsafe' : 'unchanged')}><button type="submit">Save fixture</button></OperatorSchemaForm>
       <p role="status" aria-label="Edit outcome">{editOutcome}</p>
     </section>
     <section className="panel" aria-label="Account proxy"><ProxyInput value={proxy} onChange={setProxy} /></section>

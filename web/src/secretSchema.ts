@@ -1,11 +1,13 @@
 import { createSchemaUtils, type RJSFSchema, type ValidatorType } from '@rjsf/utils';
 
+const schemaMaps = new Set(['properties', '$defs', 'definitions', 'patternProperties', 'dependentSchemas']);
+
 function isSecretSchema(node: Record<string, unknown>, root: RJSFSchema, seen = new Set<unknown>()): boolean {
   if (seen.has(node)) return false;
   seen.add(node);
   if (node.writeOnly === true || node.format === 'password') return true;
   if (node.items && containsSecret(node.items, root, new Set(seen))) return true;
-  if (['additionalProperties', 'patternProperties', 'if', 'then', 'else', 'dependentSchemas'].some((key) => containsSecret(node[key], root, new Set(seen)))) return true;
+  if (['additionalProperties', 'patternProperties', 'if', 'then', 'else', 'dependentSchemas'].some((key) => containsSecret(node[key], root, new Set(seen), !schemaMaps.has(key)))) return true;
   if (typeof node.$ref === 'string' && node.$ref.startsWith('#/')) {
     let target: unknown = root;
     for (const part of node.$ref.slice(2).split('/')) target = target && typeof target === 'object' ? (target as Record<string, unknown>)[part.replace(/~1/g, '/').replace(/~0/g, '~')] : undefined;
@@ -14,11 +16,13 @@ function isSecretSchema(node: Record<string, unknown>, root: RJSFSchema, seen = 
   return Array.isArray(node.allOf) && node.allOf.some((part) => part && typeof part === 'object' && isSecretSchema(part, root, seen));
 }
 
-function containsSecret(value: unknown, root: RJSFSchema, seen = new Set<unknown>()): boolean {
+function containsSecret(value: unknown, root: RJSFSchema, seen = new Set<unknown>(), schemaNode = true): boolean {
   if (!value || typeof value !== 'object' || seen.has(value)) return false;
-  if (!Array.isArray(value) && isSecretSchema(value as Record<string, unknown>, root, new Set(seen))) return true;
+  if (schemaNode && !Array.isArray(value) && isSecretSchema(value as Record<string, unknown>, root, new Set(seen))) return true;
   seen.add(value);
-  return Object.entries(value).some(([key, child]) => !['default', 'examples', 'const', 'enum'].includes(key) && containsSecret(child, root, seen));
+  return Object.entries(value).some(([key, child]) => !schemaNode
+    ? containsSecret(child, root, seen)
+    : !['default', 'examples', 'const', 'enum'].includes(key) && containsSecret(child, root, seen, !schemaMaps.has(key)));
 }
 
 function withoutSecretDefaults(schema: RJSFSchema): RJSFSchema {
@@ -30,7 +34,7 @@ function withoutSecretDefaults(schema: RJSFSchema): RJSFSchema {
     const secret = inherited || isSecretSchema(node, schema);
     const result = Object.fromEntries(Object.entries(node)
       .filter(([key]) => !secret || (key !== 'default' && key !== 'examples'))
-      .map(([key, child]) => [key, ['default', 'examples', 'const', 'enum'].includes(key) ? child : visit(child, secret, !['properties', '$defs', 'definitions', 'patternProperties', 'dependentSchemas'].includes(key))]));
+      .map(([key, child]) => [key, ['default', 'examples', 'const', 'enum'].includes(key) ? child : visit(child, secret, !schemaMaps.has(key))]));
     if (secret) result.writeOnly = true;
     return result;
   };

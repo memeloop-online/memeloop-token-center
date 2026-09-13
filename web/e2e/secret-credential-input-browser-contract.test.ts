@@ -18,7 +18,7 @@ test('create and rotate keep provider secrets masked across keyboard, mobile and
   const artifacts = fileURLToPath(new URL('../e2e-artifacts/ui-system/secret-inputs/', import.meta.url));
   await mkdir(artifacts, { recursive: true });
   try {
-    for (const variant of ['api', 'oauth', 'plugin', 'array']) for (const locale of ['en', 'zh-CN']) {
+    for (const variant of ['api', 'oauth', 'plugin', 'array', 'keywords']) for (const locale of ['en', 'zh-CN']) {
       const page = await browser.newPage();
       const failures: string[] = [];
       page.on('pageerror', () => failures.push('runtime error'));

@@ -35,3 +35,17 @@ test('nested secret arrays and dynamic or conditional secrets are opaque and unp
     assert.equal(JSON.stringify(edit).includes('synthetic-stored'), false);
   }
 });
+
+test('schema keyword names remain valid secret field and definition names', () => {
+  for (const key of ['default', 'examples', 'const', 'enum']) {
+    const secret: RJSFSchema = { type: 'string', writeOnly: true, default: 'synthetic-default', examples: ['synthetic-example'] };
+    for (const schema of [
+      { type: 'object', properties: { [key]: secret } },
+      { type: 'object', $defs: { [key]: secret }, properties: { [key]: { $ref: `#/$defs/${key}` } } },
+    ] as RJSFSchema[]) {
+      const prepared = prepareSecretForm(schema, safeValidator, { [key]: 'synthetic-existing' });
+      assert.deepEqual(prepared.formData, {});
+      assert.equal(JSON.stringify(prepared).includes('synthetic-'), false);
+    }
+  }
+});
