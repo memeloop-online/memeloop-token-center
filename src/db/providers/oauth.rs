@@ -676,15 +676,21 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         if leased.rows_affected() != 1 {
-            let outcome_unknown: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND credential_generation = $2 AND request_started_at IS NOT NULL AND pending_credential_ciphertext IS NULL)",
+            let current_lease = sqlx::query(
+                "SELECT request_started_at, pending_credential_ciphertext FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND credential_generation = $2",
             )
             .bind(account_id.to_string())
             .bind(generation)
-            .fetch_one(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await?;
-            if outcome_unknown {
-                return Err(oauth_refresh_outcome_unknown());
+            if let Some(current_lease) = current_lease {
+                let request_started_at: Option<i64> =
+                    current_lease.try_get("request_started_at")?;
+                let pending_ciphertext: Option<String> =
+                    current_lease.try_get("pending_credential_ciphertext")?;
+                if request_started_at.is_some() && pending_ciphertext.is_none() {
+                    return Err(oauth_refresh_outcome_unknown());
+                }
             }
             return Err(AppError::Conflict(
                 "OAuth refresh is already in progress for this credential generation".into(),
