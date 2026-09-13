@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { createRoot } from 'react-dom/client';
 
 import { I18nProvider } from '../../src/i18n';
+import { MtcFluentProvider } from '../../src/design-system';
 import { CredentialsPage, ServiceCredentialsPage } from '../../src/operator/pages/ManagementPages';
 import keyCreateSchema from '../../../schemas/key-create.schema.json';
 import keyPolicySchema from '../../../schemas/key-policy.schema.json';
@@ -25,6 +26,7 @@ interface FixtureState {
   calls: string[];
   requests: RecordedRequest[];
   releaseIssue: (token: string) => void;
+  releaseRoutingResponse: (status: number) => void;
   releaseCredentialScopeA: () => void;
   releaseCredentialCursor: () => void;
   createdObjectUrls: string[];
@@ -40,6 +42,8 @@ const scenario = (parameters.get('scenario') ?? 'all-tenants') as Scenario;
 const initialTenant = scenario === 'all-tenants' ? '' : 'tenant-a';
 
 const pendingIssues: Array<(response: Response) => void> = [];
+const pendingRouting: Array<(response: Response) => void> = [];
+const routingResponse = { key_id: 'key-form', route_ids: [], route_group_ids: [], effective_route_ids: [], grant_revision: 1, updated_at: 1 };
 const pendingCredentialScopeA: Array<(response: Response) => void> = [];
 const pendingCredentialCursor: Array<(response: Response) => void> = [];
 window.credentialFixture = {
@@ -47,6 +51,11 @@ window.credentialFixture = {
   requests: [],
   createdObjectUrls: [],
   revokedObjectUrls: [],
+  releaseRoutingResponse(status) {
+    const resolve = pendingRouting.shift();
+    if (!resolve) throw new Error('no pending routing fixture response');
+    resolve(json(status === 200 ? routingResponse : { error: { message: 'late routing conflict must stay hidden' } }, status));
+  },
   releaseIssue(token) {
     const resolve = pendingIssues.shift();
     if (!resolve) throw new Error('no pending service credential issuance');
@@ -63,6 +72,15 @@ window.credentialFixture = {
     resolve(json([credential('Scope B older client', 'tenant-b', 'scope-b-001')]));
   },
 };
+
+if (scenario === 'client-recovery') {
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+    writeText: async (value: string) => {
+      if (parameters.has('clipboard-failure')) throw new Error('fixture clipboard denied');
+      document.documentElement.dataset.copiedFixtureCredential = String(value === 'mts_client_recovered');
+    },
+  } });
+}
 
 if (scenario === 'service-plaintext') {
   Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
@@ -152,6 +170,9 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       service_token: { type: 'object', properties: {} },
     });
   }
+  if (parameters.has('routing-lifecycle') && url.pathname === '/internal/v1/keys/key-form/routing') {
+    return new Promise<Response>(resolve => pendingRouting.push(resolve));
+  }
   if (url.pathname === '/internal/v1/service-tokens' && method === 'POST') {
     // Deliberately ignore AbortSignal so the component, rather than the mock,
     // must fence a response from an old tenant/auth epoch.
@@ -175,7 +196,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     if (url.pathname === '/internal/v1/model-routes') return json([{ id: '00000000-0000-4000-8000-000000000001', public_model: 'Research model', enabled: true, tenant_external_id: 'tenant-a' }]);
     if (url.pathname === '/internal/v1/keys' && method === 'POST') return json({ key_id: 'key-created', key: 'mts_fixture_created' });
     if (url.pathname === '/internal/v1/keys/key-form/policy' && method === 'PUT') return json({});
-    if (url.pathname === '/internal/v1/keys') return json([credential('Editable client', 'tenant-a', 'key-form')]);
+    if (url.pathname === '/internal/v1/keys') return json([credential(localStorage.getItem('mtc-locale')?.startsWith('zh') ? '研发工作区' : 'Research workspace', 'tenant-a', 'key-form')]);
   }
   if (url.pathname.endsWith('credential-groups') || url.pathname.endsWith('route-groups')) return json([]);
   if (url.pathname === '/internal/v1/model-routes') {
@@ -225,4 +246,4 @@ function Fixture() {
   </>;
 }
 
-createRoot(document.getElementById('root')!).render(<I18nProvider><Fixture /></I18nProvider>);
+createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><Fixture /></MtcFluentProvider></I18nProvider>);
