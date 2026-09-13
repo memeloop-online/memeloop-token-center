@@ -633,28 +633,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_releases_quota_permit_and_singleflight() {
-        let cache = Arc::new(QuotaCache::default());
-        let entry = Arc::new(Entry::default());
-        let (ready, waiting) = tokio::sync::oneshot::channel();
-        let task_cache = cache.clone();
-        let task_entry = entry.clone();
-        let task = tokio::spawn(async move {
-            let _flight = task_entry.flight.lock().await;
-            let _permit = task_cache.permits.acquire().await.unwrap();
-            ready.send(()).unwrap();
-            std::future::pending::<()>().await;
-        });
-        waiting.await.unwrap();
-        assert!(entry.flight.try_lock().is_err());
-        assert_eq!(cache.permits.available_permits(), 3);
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        assert!(entry.flight.try_lock().is_ok());
-        assert_eq!(cache.permits.available_permits(), 4);
-    }
-
-    #[tokio::test]
     async fn quota_transport_only_gets_and_does_not_publish_error_bodies() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))

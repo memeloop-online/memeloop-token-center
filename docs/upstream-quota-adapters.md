@@ -31,11 +31,13 @@ credentials, and do not consume reset credits. The separate reset capability is
 derived from the server-held driver contract; fresh credit evidence remains a
 requirement before prepare or confirmation can dispatch anything.
 
-Both adapters require the account's private IP-literal socks5h transport. Both
-use dedicated remote-DNS-only clients; supplier names are resolved by the proxy,
-not the application. Kimi transport construction uses synchronous validation,
-disables retries/redirects/environment proxy inheritance, and performs no DNS.
-No direct-provider fallback is available. No proxy address is serialized.
+Codex quota uses the same mandatory private IP-literal `socks5h` boundary as
+native Codex traffic; supplier DNS is delegated to that proxy, with no direct
+fallback. Kimi quota instead reuses normal native Kimi network policy: direct
+traffic uses validated pinned public DNS, while an account proxy is validated
+and applied through the shared configuration transport. Quota inspection adds
+no Kimi-only proxy requirement. Environment proxy inheritance remains disabled,
+redirects are rejected, and no proxy address is serialized.
 
 Kimi absolute numeric reset timestamps below 100 billion are epoch seconds;
 larger values are epoch milliseconds. Relative durations always use seconds.

@@ -4,15 +4,24 @@ use super::*;
 const USAGE_URL: &str = "https://api.kimi.com/coding/v1/usages";
 
 pub(super) async fn read(
-    _state: &AppState,
+    state: &AppState,
     credential: &UpstreamCredential,
     mut snapshot: QuotaSnapshot,
 ) -> Result<QuotaSnapshot, &'static str> {
     credential
         .validate(unix_millis())
         .map_err(|_| "credential_invalid")?;
-    let http = crate::network::client_for_kimi_quota(credential.proxy())
-        .map_err(|_| "quota_proxy_required")?;
+    // Match normal Kimi model traffic and OAuth refresh: the fixed public
+    // destination may use direct pinned DNS or the account proxy policy.
+    let http = crate::network::client_for_config_url(
+        &state.http,
+        USAGE_URL,
+        &json!({"network_scope":"public"}),
+        credential.proxy(),
+        false,
+    )
+    .await
+    .map_err(|_| "quota_destination_invalid")?;
     let payload = get_usage(&http, credential, USAGE_URL).await?;
     let now = unix_millis();
     snapshot.windows = windows(&payload, now)?;
@@ -243,30 +252,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rows[0].period_seconds, Some(7200));
-    }
-
-    #[test]
-    fn proxy_contract_rejects_direct_local_dns_and_public_endpoints_without_io() {
-        use crate::network::{OutboundScope, client_for_kimi_quota};
-        assert!(client_for_kimi_quota(None).is_err());
-        for proxy in [
-            "socks5://10.0.0.1:1080",
-            "socks5h://proxy.invalid:1080",
-            "socks5h://8.8.8.8:1080",
-            "socks5h://127.0.0.1:1080",
-        ] {
-            assert!(client_for_kimi_quota(Some((proxy, OutboundScope::Private))).is_err());
-        }
-        assert!(
-            client_for_kimi_quota(Some(("socks5h://10.0.0.1:1080", OutboundScope::Public)))
-                .is_err()
-        );
-        // Client construction cannot connect or resolve; an unreachable private
-        // proxy is valid configuration. No real request is sent in this test.
-        assert!(
-            client_for_kimi_quota(Some(("socks5h://10.0.0.1:1080", OutboundScope::Private)))
-                .is_ok()
-        );
     }
 
     #[test]
