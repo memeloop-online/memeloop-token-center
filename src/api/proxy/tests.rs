@@ -31,6 +31,14 @@ mod memory_admission;
 mod memory_metrics;
 mod sse_delivery;
 
+fn pinned_request_envelope_changed(
+    pinned_route: Option<Uuid>,
+    original: &Value,
+    applied: &AppliedTraffic,
+) -> bool {
+    pinned_route.is_some() && applied.changes_pinned_envelope(original)
+}
+
 #[test]
 fn buffered_usage_capture_only_accepts_plausible_json_content_types() {
     assert!(should_capture_buffered_usage(false, None));

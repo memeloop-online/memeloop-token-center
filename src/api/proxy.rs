@@ -784,13 +784,11 @@ pub(in crate::api) async fn proxy_with_identity(
         hints: conversation_hints,
         client_name,
     });
-
-    let started = Instant::now();
     let mut buffered_request = BufferedRequest {
         state: &state,
         reservation,
         request_id,
-        started,
+        started: Instant::now(),
         input_token_ceiling,
         output_token_ceiling,
         requested_service_tier,

@@ -3,7 +3,7 @@ import { useState } from 'react';
 import { I18nProvider } from '../../src/i18n';
 import { TypedFilterBuilder } from '../../src/operator/TypedFilterBuilder';
 import { SystemSettingsPage } from '../../src/operator/pages/SystemSettingsPage';
-import type { ModelRouteView, TypedFilterAst, UpstreamAccount } from '../../src/types';
+import type { ModelRouteView, ProviderType, TypedFilterAst, UpstreamAccount } from '../../src/types';
 import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/operator/operator.css';
@@ -26,6 +26,14 @@ const groups = [
   { id: 'group-b', name: 'Production pool', member_ids: ['b'] },
   { id: 'group-c', name: 'Retired pool', member_ids: ['c'] },
 ];
+const providers = accounts.map((account) => ({
+  id: account.driver,
+  display_name: account.driver,
+  protocols: ['openai', 'anthropic'],
+  modalities: ['text'],
+  config_schema: {},
+  credential_schema: {},
+})) as ProviderType[];
 globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url, location.origin);
   if (init?.method && init.method !== 'GET') await (window as unknown as { recordModelPickerWrite?: (path: string) => Promise<void> }).recordModelPickerWrite?.(url.pathname);
@@ -33,6 +41,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     '/internal/v1/upstreams': accounts,
     '/internal/v1/model-routes': routes,
     '/internal/v1/provider-groups': groups,
+    '/internal/v1/provider-types': providers,
     '/internal/v1/filter-presets': { named: [], recent: [] },
     '/internal/v1/filter-assistant/settings': null,
   };
