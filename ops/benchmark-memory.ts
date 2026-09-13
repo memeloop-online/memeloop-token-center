@@ -20,6 +20,13 @@ export const MP4_PREFIX = Buffer.from("000000186674797069736f6d0000020069736f6d6
 export const ASSET_RANGE_START = 32;
 export const ASSET_RANGE_BYTES = 4096;
 const ASSET_DOWNLOAD_CHUNK_BYTES = 256 * 1024;
+// The gateway's generic reqwest pool retires idle connections after 30 seconds.
+// Keep the in-process benchmark upstream alive well beyond that boundary so
+// the memory gate measures the service rather than Node's shorter defaults.
+const MOCK_KEEP_ALIVE_TIMEOUT_MS = 120_000;
+const MOCK_KEEP_ALIVE_TIMEOUT_BUFFER_MS = 5_000;
+const MOCK_HEADERS_TIMEOUT_MS = 130_000;
+const MOCK_REQUEST_TIMEOUT_MS = 300_000;
 type Obj = Record<string, any>;
 
 export class HarnessFailure extends Error {}
@@ -158,7 +165,7 @@ async function streamChatSse(request: IncomingMessage, response: ServerResponse,
 }
 
 export function createMockServer(state = new MockState()): Server {
-  return createServer(async (request, response) => { try {
+  const server = createServer(async (request, response) => { try {
     const path = request.url ?? "/";
     if (request.method === "POST" && path === "/v1/chat/completions") { const body = await requestJson(request); const benchmark = body.benchmark; if (benchmark?.mode === "stream" || benchmark?.mode === "oversize") { await streamChatSse(request, response, state, Number(benchmark.bytes), Math.max(4096, Math.min(Number(benchmark.chunk_bytes ?? 262144), MIB)), Number(benchmark.delay_ms ?? 0), benchmark?.mode === "stream" ? state.streamStartBarrier : undefined); return; } jsonResponse(response, 200, { id: "chatcmpl-memory-benchmark", object: "chat.completion", model: body.model ?? "benchmark-text", choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 } }); return; }
     if (request.method === "POST" && path === "/api/v3/contents/generations/tasks") { const body = await requestJson(request); const assetMib = Number(body.benchmark_asset_mib ?? 100); const id = `bench-${assetMib}-${randomUUID().slice(0, 12)}`; state.assets.set(id, assetMib * MIB); jsonResponse(response, 200, { id }); return; }
@@ -168,6 +175,12 @@ export function createMockServer(state = new MockState()): Server {
     const asset = /^\/assets\/(.+)$/u.exec(path); if (request.method === "GET" && asset) { const bytes = state.assets.get(asset[1]!); if (bytes === undefined) { jsonResponse(response, 404, { error: "unknown asset" }); return; } await streamBytes(response, state, bytes, 256 * 1024, 0.25, "video/mp4", MP4_PREFIX); return; }
     jsonResponse(response, 404, { error: "mock route not found" });
   } catch { jsonResponse(response, 400, { error: "invalid request" }); } });
+  server.keepAliveTimeout = MOCK_KEEP_ALIVE_TIMEOUT_MS;
+  server.keepAliveTimeoutBuffer = MOCK_KEEP_ALIVE_TIMEOUT_BUFFER_MS;
+  server.headersTimeout = MOCK_HEADERS_TIMEOUT_MS;
+  server.requestTimeout = MOCK_REQUEST_TIMEOUT_MS;
+  server.maxRequestsPerSocket = 0;
+  return server;
 }
 
 interface ApiResponse { status: number; body: Buffer; headers: Record<string, string> }

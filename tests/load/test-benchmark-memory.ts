@@ -12,6 +12,21 @@ import { DatabaseSync } from "node:sqlite";
 import { FirstSoakFailureEvidence, readSoakFailureClassification } from "../../ops/benchmark-soak-diagnostics.ts";
 
 const benchmarkEntry = resolve(import.meta.dirname, "../../ops/benchmark-memory.ts");
+const serviceEntry = resolve(import.meta.dirname, "../../src/lib.rs");
+
+test("memory mock keep-alive lifetime exceeds the gateway idle pool", () => {
+  const server = createMockServer();
+  const source = readFileSync(serviceEntry, "utf8");
+  const baseBuilder = /fn base_http_client_builder\(\)[\s\S]+?(?=pub\(crate\) fn build_http_client)/u.exec(source)?.[0];
+  assert.ok(baseBuilder, "generic HTTP client builder must remain discoverable");
+  const idleSeconds = Number(/pool_idle_timeout\(Duration::from_secs\((\d+)\)\)/u.exec(baseBuilder)?.[1]);
+  assert.ok(Number.isFinite(idleSeconds) && idleSeconds > 0, "generic idle timeout must remain explicit");
+  assert.ok(server.keepAliveTimeout > idleSeconds * 1_000, "mock upstream must outlive every idle pooled connection");
+  assert.ok(server.keepAliveTimeoutBuffer > 0, "mock keep-alive retirement must retain a positive scheduling buffer");
+  assert.ok(server.headersTimeout > server.keepAliveTimeout + server.keepAliveTimeoutBuffer, "header deadline must not retire a keep-alive socket first");
+  assert.ok(server.requestTimeout > server.headersTimeout, "complete-request deadline must contain the header deadline");
+  assert.equal(server.maxRequestsPerSocket, 0, "the mock must not impose an unrelated request-count retirement boundary");
+});
 
 test("first soak failure evidence is frozen before repeated cooldown failures", () => {
   const evidence = new FirstSoakFailureEvidence();
