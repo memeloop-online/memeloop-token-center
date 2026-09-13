@@ -98,11 +98,13 @@ async fn small_text_input_can_expand_to_sixteen_mib_in_a_real_traffic_hook() {
         .expect(1)
         .mount(&upstream)
         .await;
-    let mut fixture = hint_routing_fixture(
+    let mut fixture = hint_routing_fixture_with_database(
         "large-rewrite-memory",
         upstream.uri(),
         upstream.uri(),
         false,
+        None,
+        Some((32 * 1024 * 1024, Decimal::from(100))),
     )
     .await;
     let prefix = format!(
@@ -334,6 +336,7 @@ async fn hint_routing_fixture(
         standby_uri,
         hint_unauthorized_account,
         None,
+        None,
     )
     .await
 }
@@ -344,6 +347,7 @@ async fn hint_routing_fixture_with_database(
     standby_uri: String,
     hint_unauthorized_account: bool,
     database_url: Option<String>,
+    credential_capacity: Option<(u64, Decimal)>,
 ) -> HintRoutingFixture {
     let directory = tempfile::tempdir().unwrap();
     let database_url = database_url.unwrap_or_else(|| {
@@ -360,6 +364,8 @@ async fn hint_routing_fixture_with_database(
         .unwrap();
     let tenant = format!("hint-routing-{label}");
     let model = format!("hint-routing-model-{label}");
+    let (tokens_per_minute, initial_balance) = credential_capacity
+        .unwrap_or_else(|| (KeyPolicy::default().tokens_per_minute, Decimal::TEN));
     let mut route_ids = Vec::new();
     let mut account_ids = Vec::new();
     for (name, uri, priority) in [
@@ -417,10 +423,11 @@ async fn hint_routing_fixture_with_database(
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
                     allowed_models: vec![model.clone()],
+                    tokens_per_minute,
                     max_concurrency: 4,
                     ..KeyPolicy::default()
                 },
-                initial_balance: Decimal::TEN,
+                initial_balance,
                 idempotency_key: None,
             },
             &route_ids[..2],
@@ -571,6 +578,7 @@ async fn assert_malformed_standby_is_lazy(database_url: Option<String>, label: &
         standby.uri(),
         false,
         database_url,
+        None,
     )
     .await;
     corrupt_upstream_credential(&fixture, fixture.standby_account_id).await;
@@ -614,6 +622,7 @@ async fn assert_selected_malformed_candidate_fails_closed(
         standby.uri(),
         false,
         database_url,
+        None,
     )
     .await;
     put_accounts_in_cooldown(&fixture, &[fixture.preferred_account_id]).await;
@@ -693,6 +702,7 @@ async fn assert_cooldown_failover_keeps_one_reservation(database_url: Option<Str
         standby.uri(),
         false,
         database_url,
+        None,
     )
     .await;
     put_accounts_in_cooldown(&fixture, &[fixture.preferred_account_id]).await;
