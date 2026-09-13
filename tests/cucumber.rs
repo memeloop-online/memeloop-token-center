@@ -177,6 +177,67 @@ async fn stop_test_worker(world: &mut TokenCenterWorld) {
     }
 }
 
+async fn wait_for_bound_proxy_archives(world: &TokenCenterWorld, request_ids: &[Uuid]) {
+    assert!(
+        !request_ids.is_empty(),
+        "archive barrier requires a request"
+    );
+    let response = world
+        .client
+        .get(format!(
+            "{}/internal/v1/request-events?after_event_at=0",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .send()
+        .await
+        .expect("proxy archive event stream");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut pending = request_ids.to_vec();
+    let mut stream = response.bytes_stream();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut buffered = String::new();
+        while let Some(chunk) = stream.next().await {
+            buffered.push_str(&String::from_utf8_lossy(
+                &chunk.expect("proxy archive SSE chunk"),
+            ));
+            while let Some(end) = buffered.find("\n\n") {
+                let frame = buffered[..end].to_owned();
+                buffered.drain(..end + 2);
+                let Some(data) = frame
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data:").map(str::trim_start))
+                else {
+                    continue;
+                };
+                let Ok(event) = serde_json::from_str::<Value>(data) else {
+                    continue;
+                };
+                if event["event_kind"] != "archive_bound" || event["archive_state"] != "bound" {
+                    continue;
+                }
+                let Some(request_id) = event["request_id"]
+                    .as_str()
+                    .and_then(|value| Uuid::parse_str(value).ok())
+                else {
+                    continue;
+                };
+                pending.retain(|candidate| *candidate != request_id);
+                if pending.is_empty() {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .expect("proxy archives reached a terminal bound event");
+    assert!(
+        pending.is_empty(),
+        "missing bound archive events: {pending:?}"
+    );
+}
+
 fn panic_message(panic: Box<dyn Any + Send>) -> String {
     match panic.downcast::<String>() {
         Ok(message) => *message,
@@ -4635,6 +4696,14 @@ async fn prepare_authorization_matrix(world: &mut TokenCenterWorld) {
 
 #[then("the global service credential lists both tenants and reads both request details")]
 async fn global_service_reads_both_tenants(world: &mut TokenCenterWorld) {
+    wait_for_bound_proxy_archives(
+        world,
+        &[
+            world.matrix_first_request_id.expect("first request id"),
+            world.matrix_second_request_id.expect("second request id"),
+        ],
+    )
+    .await;
     let keys = world
         .client
         .get(format!("{}/internal/v1/keys", world.service_url))
@@ -5899,6 +5968,11 @@ async fn rotated_credential_retains_all_state(world: &mut TokenCenterWorld) {
     let request_id = requests[0]["request_id"]
         .as_str()
         .expect("continuity request id");
+    wait_for_bound_proxy_archives(
+        world,
+        &[Uuid::parse_str(request_id).expect("continuity request UUID")],
+    )
+    .await;
     let detail = world
         .client
         .get(format!(
@@ -6332,6 +6406,7 @@ async fn realtime_stream_contains_request_lifecycle(world: &mut TokenCenterWorld
         .expect("operator requests JSON");
     let request_id = requests[0]["request_id"].as_str().expect("request id");
     let request_uuid = Uuid::parse_str(request_id).expect("request UUID");
+    wait_for_bound_proxy_archives(world, &[request_uuid]).await;
     let detail = world
         .client
         .get(format!(
@@ -6652,6 +6727,8 @@ async fn request_detail_contains_archive(world: &mut TokenCenterWorld) {
         .await
         .expect("request list JSON");
     let request_id = requests[0]["request_id"].as_str().expect("request id");
+    wait_for_bound_proxy_archives(world, &[Uuid::parse_str(request_id).expect("request UUID")])
+        .await;
     let response = world
         .client
         .get(format!(
