@@ -1239,7 +1239,7 @@ fn conversation_batch_insert_statement(
     statement
 }
 
-async fn materialize_conversation_content_in_transaction(
+pub(crate) async fn materialize_conversation_content_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     tenant_id: &str,
     atoms: &[SemanticAtom],

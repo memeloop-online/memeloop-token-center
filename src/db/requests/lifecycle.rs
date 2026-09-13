@@ -2,6 +2,7 @@ use super::super::archive_staging::bind_archive_staging_attempt_in_transaction;
 use super::super::*;
 use super::conversations::{
     ConversationProjectionEnqueueInput, enqueue_conversation_projection_in_transaction,
+    materialize_conversation_content_in_transaction,
 };
 use super::settlement::resize_usage_reservation_in_transaction;
 use crate::archive_staging::{
@@ -726,22 +727,24 @@ impl Database {
         let tenant_id = input.tenant_id.to_string();
         let key_id = input.reservation.key_id.to_string();
         let reservation_id = input.reservation.id.to_string();
-        let mut transaction = if buffered_archive.is_some() {
-            self.spool_transaction().await?.0
-        } else {
-            self.begin_write_transaction().await?
-        };
-        // SQLite's BEGIN IMMEDIATE can wait for an earlier terminal writer.
-        // Capture the observation boundary only after that wait so live writes
-        // cannot acquire timestamps in the opposite order from their commits.
-        let now = unix_millis();
+        let mut content_materialized = false;
+        let (mut transaction, now, reservation_row, trusted_reservation) = loop {
+            let mut transaction = if buffered_archive.is_some() {
+                self.spool_transaction().await?.0
+            } else {
+                self.begin_write_transaction().await?
+            };
+            // SQLite's BEGIN IMMEDIATE can wait for an earlier terminal writer.
+            // Capture the observation boundary only after that wait so live writes
+            // cannot acquire timestamps in the opposite order from their commits.
+            let now = unix_millis();
 
-        // This no-op update is the portable owner CAS. PostgreSQL takes a row
-        // lock and rechecks the pending predicate after a concurrent owner
-        // commits; as the first SQLite statement it acquires the write lock
-        // without a deferred read-to-write upgrade race. Only the winner may
-        // settle usage or create terminal lineage/statistics.
-        let claimed = sqlx::query(
+            // This no-op update is the portable owner CAS. PostgreSQL takes a row
+            // lock and rechecks the pending predicate after a concurrent owner
+            // commits; as the first SQLite statement it acquires the write lock
+            // without a deferred read-to-write upgrade race. Only the winner may
+            // settle usage or create terminal lineage/statistics.
+            let claimed = sqlx::query(
             "UPDATE request_records SET completed_at = completed_at WHERE id = $1 AND tenant_id = $2 AND key_id = $3 AND reservation_id = $4 AND completed_at IS NULL",
         )
         .bind(&request_id)
@@ -750,21 +753,21 @@ impl Database {
         .bind(&reservation_id)
         .execute(&mut *transaction)
         .await?;
-        let locator = sqlx::query(
-            "SELECT created_at, tenant_id, key_id FROM request_record_locators WHERE id = $1",
-        )
-        .bind(&request_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or(AppError::NotFound)?;
-        let created_at: i64 = locator.try_get("created_at")?;
-        if locator.try_get::<String, _>("tenant_id")? != tenant_id
-            || locator.try_get::<String, _>("key_id")? != key_id
-        {
-            return Err(AppError::NotFound);
-        }
-        if claimed.rows_affected() == 0 {
-            let existing = sqlx::query(
+            let locator = sqlx::query(
+                "SELECT created_at, tenant_id, key_id FROM request_record_locators WHERE id = $1",
+            )
+            .bind(&request_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(AppError::NotFound)?;
+            let created_at: i64 = locator.try_get("created_at")?;
+            if locator.try_get::<String, _>("tenant_id")? != tenant_id
+                || locator.try_get::<String, _>("key_id")? != key_id
+            {
+                return Err(AppError::NotFound);
+            }
+            if claimed.rows_affected() == 0 {
+                let existing = sqlx::query(
                 "SELECT reservation_id, completed_at, status_code, cost_micros, error_code, response_object FROM request_records WHERE id = $1 AND created_at = $2 AND tenant_id = $3 AND key_id = $4",
             )
             .bind(&request_id)
@@ -774,32 +777,135 @@ impl Database {
             .fetch_optional(&mut *transaction)
             .await?
             .ok_or(AppError::NotFound)?;
-            if existing.try_get::<String, _>("reservation_id")? != reservation_id {
+                if existing.try_get::<String, _>("reservation_id")? != reservation_id {
+                    return Err(AppError::Conflict(
+                        "request reservation ownership mismatch".into(),
+                    ));
+                }
+                if existing
+                    .try_get::<Option<i64>, _>("completed_at")?
+                    .is_none()
+                {
+                    return Err(AppError::Conflict(
+                        "request terminal ownership changed".into(),
+                    ));
+                }
+                let result = FinishProxyRequestResult::AlreadyFinished {
+                    status_code: existing
+                        .try_get::<Option<i64>, _>("status_code")?
+                        .ok_or(AppError::Internal)?,
+                    cost_micros: existing.try_get("cost_micros")?,
+                    error_code: existing.try_get("error_code")?,
+                    response_object: existing
+                        .try_get::<Option<String>, _>("response_object")?
+                        .ok_or(AppError::Internal)?,
+                };
+                transaction.commit().await?;
+                return Ok(result);
+            }
+
+            let reservation_row = sqlx::query(
+            "SELECT account_id, key_id, enforcement_mode, reserved_micros, reserved_tokens, rate_window_start, status, actual_micros, price_snapshot_json FROM usage_reservations WHERE id = $1",
+        )
+        .bind(&reservation_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(AppError::NotFound)?;
+            let trusted_account_id = parse_uuid(reservation_row.try_get("account_id")?)?;
+            let trusted_key_id = parse_uuid(reservation_row.try_get("key_id")?)?;
+            if trusted_account_id != input.reservation.account_id
+                || trusted_key_id != input.reservation.key_id
+            {
                 return Err(AppError::Conflict(
                     "request reservation ownership mismatch".into(),
                 ));
             }
-            if existing
-                .try_get::<Option<i64>, _>("completed_at")?
-                .is_none()
+            let reserved_tokens: i64 = reservation_row.try_get("reserved_tokens")?;
+            if input
+                .input_token_ceiling
+                .checked_add(input.output_token_ceiling)
+                != Some(reserved_tokens)
             {
                 return Err(AppError::Conflict(
-                    "request terminal ownership changed".into(),
+                    "request reservation ceiling mismatch".into(),
                 ));
             }
-            let result = FinishProxyRequestResult::AlreadyFinished {
-                status_code: existing
-                    .try_get::<Option<i64>, _>("status_code")?
-                    .ok_or(AppError::Internal)?,
-                cost_micros: existing.try_get("cost_micros")?,
-                error_code: existing.try_get("error_code")?,
-                response_object: existing
-                    .try_get::<Option<String>, _>("response_object")?
-                    .ok_or(AppError::Internal)?,
+            let price_snapshot_json: Option<String> =
+                reservation_row.try_get("price_snapshot_json")?;
+            let (input_micros_per_million, output_micros_per_million, price_tiers) =
+                if let Some(snapshot) = price_snapshot_json {
+                    let price: ModelPrice =
+                        serde_json::from_str(&snapshot).map_err(|_| AppError::Internal)?;
+                    (
+                        price.input_micros_per_million,
+                        price.output_micros_per_million,
+                        price.tiers,
+                    )
+                } else {
+                    (
+                        input.reservation.input_micros_per_million,
+                        input.reservation.output_micros_per_million,
+                        input.reservation.price_tiers.clone(),
+                    )
+                };
+            let trusted_reservation = UsageReservation {
+                id: input.reservation.id,
+                account_id: trusted_account_id,
+                key_id: trusted_key_id,
+                enforcement_mode: EnforcementMode::from_storage(
+                    reservation_row
+                        .try_get::<String, _>("enforcement_mode")?
+                        .as_str(),
+                )
+                .ok_or(AppError::Internal)?,
+                reserved_micros: reservation_row.try_get("reserved_micros")?,
+                input_micros_per_million,
+                output_micros_per_million,
+                price_tiers,
+                rate_window_start: reservation_row.try_get("rate_window_start")?,
+                reserved_tokens,
             };
-            transaction.commit().await?;
-            return Ok(result);
-        }
+
+            if let Some(conversation) = input.conversation.as_ref() {
+                if conversation.key.tenant_id != input.tenant_id
+                    || conversation.key.key_id != input.reservation.key_id
+                {
+                    return Err(AppError::NotFound);
+                }
+                let reservation_status: String = reservation_row.try_get("status")?;
+                if !matches!(reservation_status.as_str(), "reserved" | "settled") {
+                    return Err(AppError::Conflict(
+                        "request reservation is not finishable".into(),
+                    ));
+                }
+                if !content_materialized
+                    && trusted_reservation.enforcement_mode != EnforcementMode::MeteredUnlimited
+                {
+                    // Only a validated, still-pending terminal owner may prepare
+                    // immutable content. AlreadyFinished and forged replays must
+                    // never create tenant content. Commit its unique-key locks
+                    // before acquiring the session lock, including during rolling
+                    // upgrades with older session-before-content writers.
+                    let atoms = extract_atoms(conversation.request_json);
+                    let nodes = build_prefix(&atoms);
+                    materialize_conversation_content_in_transaction(
+                        &mut transaction,
+                        &tenant_id,
+                        &atoms,
+                        &nodes,
+                        now,
+                    )
+                    .await?;
+                    transaction.commit().await?;
+                    content_materialized = true;
+                    // Reclaim and revalidate the owner in the final transaction.
+                    // A concurrent winner leaves only deduplicated, invisible
+                    // content, never an observation or a second ledger charge.
+                    continue;
+                }
+            }
+            break (transaction, now, reservation_row, trusted_reservation);
+        };
 
         if let ProxyRequestUpstreamAttribution::LastDispatched(assignment) = upstream_attribution {
             let upstream_account_id = assignment.map(|(account_id, _)| account_id.to_string());
@@ -852,67 +958,6 @@ impl Database {
                 "proxy response archive writer was fenced".into(),
             ));
         }
-
-        let reservation_row = sqlx::query(
-            "SELECT account_id, key_id, enforcement_mode, reserved_micros, reserved_tokens, rate_window_start, status, actual_micros, price_snapshot_json FROM usage_reservations WHERE id = $1",
-        )
-        .bind(&reservation_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or(AppError::NotFound)?;
-        let trusted_account_id = parse_uuid(reservation_row.try_get("account_id")?)?;
-        let trusted_key_id = parse_uuid(reservation_row.try_get("key_id")?)?;
-        if trusted_account_id != input.reservation.account_id
-            || trusted_key_id != input.reservation.key_id
-        {
-            return Err(AppError::Conflict(
-                "request reservation ownership mismatch".into(),
-            ));
-        }
-        let reserved_tokens: i64 = reservation_row.try_get("reserved_tokens")?;
-        if input
-            .input_token_ceiling
-            .checked_add(input.output_token_ceiling)
-            != Some(reserved_tokens)
-        {
-            return Err(AppError::Conflict(
-                "request reservation ceiling mismatch".into(),
-            ));
-        }
-        let price_snapshot_json: Option<String> = reservation_row.try_get("price_snapshot_json")?;
-        let (input_micros_per_million, output_micros_per_million, price_tiers) =
-            if let Some(snapshot) = price_snapshot_json {
-                let price: ModelPrice =
-                    serde_json::from_str(&snapshot).map_err(|_| AppError::Internal)?;
-                (
-                    price.input_micros_per_million,
-                    price.output_micros_per_million,
-                    price.tiers,
-                )
-            } else {
-                (
-                    input.reservation.input_micros_per_million,
-                    input.reservation.output_micros_per_million,
-                    input.reservation.price_tiers.clone(),
-                )
-            };
-        let trusted_reservation = UsageReservation {
-            id: input.reservation.id,
-            account_id: trusted_account_id,
-            key_id: trusted_key_id,
-            enforcement_mode: EnforcementMode::from_storage(
-                reservation_row
-                    .try_get::<String, _>("enforcement_mode")?
-                    .as_str(),
-            )
-            .ok_or(AppError::Internal)?,
-            reserved_micros: reservation_row.try_get("reserved_micros")?,
-            input_micros_per_million,
-            output_micros_per_million,
-            price_tiers,
-            rate_window_start: reservation_row.try_get("rate_window_start")?,
-            reserved_tokens,
-        };
 
         let (usage, status_code, error_code, response_object, usage_invalid) =
             match normalize_proxy_usage(
@@ -976,7 +1021,7 @@ impl Database {
                         client_name: conversation.client_name,
                         observed_at: now,
                         attach_request_record: true,
-                        content_materialized: false,
+                        content_materialized,
                     },
                 )
                 .await?;

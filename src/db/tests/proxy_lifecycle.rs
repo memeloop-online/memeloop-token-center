@@ -412,6 +412,44 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
             upstream_response_id: Some("resp-atomic"),
         }),
     };
+    // Preparation must be gated by all terminal owner checks, not merely a
+    // caller-provided tenant/key. Invalid pending-owner attempts cannot leave
+    // hidden immutable content behind even though the final transaction fails.
+    for invalid_owner in 0..7 {
+        let mut forged_reservation = reservation.clone();
+        let mut forged_key = key.clone();
+        let mut invalid = finish();
+        match invalid_owner {
+            0 => {
+                forged_reservation.id = Uuid::now_v7();
+                invalid.reservation = &forged_reservation;
+            }
+            1 => {
+                forged_reservation.account_id = Uuid::now_v7();
+                invalid.reservation = &forged_reservation;
+            }
+            2 => invalid.input_token_ceiling += 1,
+            3 => invalid.tenant_id = Uuid::now_v7(),
+            4 => {
+                forged_key.key_id = Uuid::now_v7();
+                invalid.conversation.as_mut().unwrap().key = &forged_key;
+            }
+            5 => {
+                forged_key.tenant_id = Uuid::now_v7();
+                invalid.conversation.as_mut().unwrap().key = &forged_key;
+            }
+            6 => invalid.request_id = Uuid::now_v7(),
+            _ => unreachable!(),
+        }
+        assert!(database.finish_proxy_request(invalid).await.is_err());
+        let content: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM semantic_atoms), (SELECT COUNT(*) FROM context_nodes)",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(content, (0, 0), "invalid owner case {invalid_owner}");
+    }
     assert!(database.finish_proxy_request(finish()).await.is_err());
     let rollback = sqlx::query(
             "SELECT r.status AS reservation_status, q.completed_at, q.status_code, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = r.id) AS ledger_count, (SELECT COUNT(*) FROM request_stats_facts f WHERE f.request_id = q.id) AS fact_count, (SELECT COUNT(*) FROM conversation_observations o WHERE o.request_id = q.id) AS observation_count FROM usage_reservations r JOIN request_records q ON q.reservation_id = r.id WHERE r.id = $1",
