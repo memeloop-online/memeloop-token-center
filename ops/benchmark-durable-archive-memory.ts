@@ -98,6 +98,18 @@ export function allocatorEvidence(metrics: string): Record<string, number> {
   }));
 }
 
+export function nativeAllocatorEvidence(metrics: string): Record<string, number> {
+  const states = ["arena", "allocated", "free", "mmap", "releasable"];
+  return Object.fromEntries(states.map((state) => {
+    const prefix = `memeloop_token_center_native_allocator_bytes{state="${state}"}`;
+    const line = metrics.split("\n").find((entry) => entry.startsWith(`${prefix} `));
+    assert(line, `required native allocator gauge absent: ${state}`);
+    const value = Number(line.slice(prefix.length + 1));
+    assert(Number.isFinite(value) && value >= 0, `invalid native allocator gauge: ${state}`);
+    return [state, value];
+  }));
+}
+
 function assert(value: unknown, message: string): asserts value {
   if (!value) throw new Error(message);
 }
@@ -216,7 +228,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
     started_at: new Date().toISOString(), limit_mib: LIMIT_MIB,
     pod_budget_mib: 512, reserved_runtime_headroom_mib: 64,
     isolation: "independent_process_not_cgroup",
-    evidence_source: "independent service PID /proc/status VmRSS and kernel VmHWM; mock/client excluded",
+    evidence_source: "independent service PID /proc/status RSS partition, /proc/smaps_rollup mapping attribution, kernel VmHWM, jemalloc, and glibc main-arena metrics; mock/client excluded",
     phases: [], samples: [], passed: false,
   };
   let service: ChildProcess | undefined;
@@ -301,11 +313,14 @@ export async function run(binary: string, output: string): Promise<boolean> {
     // The seeded `openai` http-json route covers both Chat and Responses;
     // large ingress must use Responses' real 16MiB limit, not Chat's 4MiB limit.
     const key = await seed(base, base, token, mockUrl);
-    const idle = processMemory(service.pid).rss_mib as number;
+    const idleProcessMemory = processMemory(service.pid);
+    const idle = idleProcessMemory.rss_mib as number;
     report.idle_rss_mib = idle;
+    report.idle_process_memory = idleProcessMemory;
     const idleMetrics = await apiRequest(base, "GET", "/metrics", token, undefined, 2000);
     assert(idleMetrics.status === 200, "idle allocator metrics must be available");
     report.idle_allocator_bytes = allocatorEvidence(idleMetrics.body.toString("utf8"));
+    report.idle_native_allocator_bytes = nativeAllocatorEvidence(idleMetrics.body.toString("utf8"));
 
     const drain = async (): Promise<Record<string, unknown>> => {
       const reader = new DatabaseSync(database, { readOnly: true });
@@ -323,7 +338,8 @@ export async function run(binary: string, output: string): Promise<boolean> {
               if (Object.values(gauges).every((value) => value === 0)) {
                 const successfulGaps = reader.prepare("SELECT COUNT(*) AS count FROM request_records WHERE status_code = 200 AND (request_object LIKE 'gap:%' OR response_object IS NULL OR response_object LIKE 'gap:%')").get();
                 assert(Number(successfulGaps?.count) === 0, "successful buffered requests must converge both archives, not settle with a silent gap");
-                return { ...row, permits: gauges, rss_mib: processMemory(service!.pid!).rss_mib, allocator_bytes: allocatorEvidence(metricsText), successful_archive_gaps: Number(successfulGaps?.count) };
+                const processMemoryEvidence = processMemory(service!.pid!);
+                return { ...row, permits: gauges, rss_mib: processMemoryEvidence.rss_mib, process_memory: processMemoryEvidence, allocator_bytes: allocatorEvidence(metricsText), native_allocator_bytes: nativeAllocatorEvidence(metricsText), successful_archive_gaps: Number(successfulGaps?.count) };
               }
             }
             await delay(100);
@@ -433,7 +449,10 @@ export async function run(binary: string, output: string): Promise<boolean> {
       try {
         const cooldownMetrics = await apiRequest(base, "GET", "/metrics", token, undefined, 2000);
         assert(cooldownMetrics.status === 200, "cooldown allocator metrics must be available");
-        report.cooldown_allocator_bytes = allocatorEvidence(cooldownMetrics.body.toString("utf8"));
+        const cooldownMetricsText = cooldownMetrics.body.toString("utf8");
+        report.cooldown_allocator_bytes = allocatorEvidence(cooldownMetricsText);
+        report.cooldown_native_allocator_bytes = nativeAllocatorEvidence(cooldownMetricsText);
+        report.cooldown_process_memory = processMemory(service!.pid!);
       } catch (error) {
         report.cooldown_allocator_error = error instanceof Error ? error.message : String(error);
         if (cooldownComplete) throw error;
