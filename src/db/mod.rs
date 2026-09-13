@@ -39,7 +39,9 @@ use crate::{
 
 mod archive_spool;
 mod archive_staging;
-pub(crate) use archive_spool::{ArchiveSpoolChunk, ArchiveSpoolIdentity, ArchiveSpoolTask};
+#[cfg(test)]
+pub(crate) use archive_spool::ArchiveSpoolChunk;
+pub(crate) use archive_spool::{ArchiveSpoolIdentity, ArchiveSpoolTask};
 mod billing;
 mod constants;
 mod credentials;

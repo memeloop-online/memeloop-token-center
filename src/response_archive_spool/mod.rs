@@ -36,7 +36,7 @@ impl BufferedArchivePurpose {
     }
 }
 
-const CHUNK_BYTES: usize = 64 * 1024;
+pub(crate) const CHUNK_BYTES: usize = 64 * 1024;
 const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[cfg(test)]
