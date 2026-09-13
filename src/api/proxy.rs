@@ -21,7 +21,7 @@ use crate::{
     metrics::{UpstreamHealthEvent, UpstreamHealthReason},
     provider::AuthorizedUpstreamCandidate,
 };
-use buffered_upstream::{BoundedUpstreamError, read_bounded_upstream};
+use buffered_upstream::read_bounded_upstream;
 use chat_sse_usage::ChatSseUsageContract;
 pub(in crate::api) use conversation_hints::safe_conversation_hint as safe_response_id;
 use conversation_hints::{client_name, conversation_hints};

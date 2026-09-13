@@ -44,7 +44,7 @@ impl PreparedProxyRoute {
         self.kimi_response = None;
     }
 
-    pub(super) fn is_codex(&self) -> bool {
+    pub(in crate::api::proxy) fn is_codex(&self) -> bool {
         codex_transport::is_driver(&self.route.driver)
     }
 }
