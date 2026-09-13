@@ -436,6 +436,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "durable OAuth refresh dispatch boundary",
         sql: include_str!("../../../migrations/common/0081_oauth_refresh_request_started.sql"),
     },
+    Migration {
+        version: 82,
+        name: "bounded conversation candidate lookups",
+        sql: include_str!("../../../migrations/common/0082_conversation_candidate_indexes.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -857,6 +862,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 81,
         name: "durable OAuth refresh dispatch boundary",
         sql: include_str!("../../../migrations/common/0081_oauth_refresh_request_started.sql"),
+    },
+    Migration {
+        version: 82,
+        name: "bounded conversation candidate lookups",
+        sql: include_str!("../../../migrations/common/0082_conversation_candidate_indexes.sql"),
     },
 ];
 
