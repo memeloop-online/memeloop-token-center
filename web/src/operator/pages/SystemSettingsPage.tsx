@@ -4,7 +4,7 @@ import { CopyButton } from '../../CopyButton.js';
 import { useI18n } from '../../i18n';
 import { ModelPicker } from '../../ModelPicker';
 import { SecretInput } from '../../SecretInput';
-import type { FilterAssistantSettings, GroupView, ModelRouteView, UpstreamAccount } from '../../types';
+import type { FilterAssistantSettings, GroupView, ModelRouteView, ProviderType, UpstreamAccount } from '../../types';
 import { routeModelOptions } from '../modelCatalog';
 import { messageOf, queryForTenant } from '../scope/operatorShared';
 
@@ -57,6 +57,7 @@ export function SystemSettingsPage({ token, tenant }: { token: string; tenant: s
   const [routes, setRoutes] = useState<ModelRouteView[]>([]);
   const [upstreams, setUpstreams] = useState<UpstreamAccount[]>([]);
   const [groups, setGroups] = useState<GroupView[]>([]);
+  const [providers, setProviders] = useState<ProviderType[]>([]);
   const [settings, setSettings] = useState<FilterAssistantSettings | null>();
   const [selectedRouteId, setSelectedRouteId] = useState('');
   const [billingChoices, setBillingChoices] = useState<BillingChoice[]>([]);
@@ -71,26 +72,28 @@ export function SystemSettingsPage({ token, tenant }: { token: string; tenant: s
   const [loadError, setLoadError] = useState('');
   const [message, setMessage] = useState('');
   const loadSequence = useRef(0);
-  const assistantOptions = routeModelOptions(routes, upstreams, groups, t('modelPicker.unknown'), 'route');
+  const assistantOptions = routeModelOptions(routes, upstreams, groups, t('modelPicker.unknown'), 'route')
+    .filter((option) => providers.some((provider) => provider.id === option.provider && provider.modalities.includes('text')));
   const selectedRouteHasAvailableCandidate = !selectedRouteId || assistantOptions.some((option) => option.value === selectedRouteId && !option.disabled);
 
   const load = useCallback(async () => {
     const request = ++loadSequence.current;
     setError(''); setLoadError(''); setMessage('');
-    if (!token || !tenant) { setRoutes([]); setSettings(undefined); setLoading(false); return; }
+    if (!token || !tenant) { setRoutes([]); setProviders([]); setSettings(undefined); setLoading(false); return; }
     setLoading(true);
     try {
-      const [nextRoutes, nextSettings, nextUpstreams, nextGroups] = await Promise.all([
+      const [nextRoutes, nextSettings, nextUpstreams, nextGroups, nextProviders] = await Promise.all([
         api<ModelRouteView[]>(`/internal/v1/model-routes${queryForTenant(tenant)}`, token),
         api<FilterAssistantSettings | null>(`/internal/v1/filter-assistant/settings?tenant_external_id=${encodeURIComponent(tenant)}`, token),
         api<UpstreamAccount[]>(`/internal/v1/upstreams${queryForTenant(tenant)}`, token),
         api<GroupView[]>(`/internal/v1/provider-groups${queryForTenant(tenant)}`, token),
+        api<ProviderType[]>('/internal/v1/provider-types', token),
       ]);
       if (request !== loadSequence.current) return;
       const enabled = nextRoutes.filter((route) => route.enabled && ['openai', 'anthropic'].includes(route.protocol));
       setRoutes(enabled); setSettings(nextSettings); setSelectedRouteId(nextSettings?.model_route_id ?? '');
       setSelectedBillingId(nextSettings?.billing_key_id ?? '');
-      setUpstreams(nextUpstreams); setGroups(nextGroups);
+      setUpstreams(nextUpstreams); setGroups(nextGroups); setProviders(nextProviders);
     } catch (reason) {
       if (request !== loadSequence.current) return;
       const nextError = messageOf(reason, t('common.requestFailed'));
