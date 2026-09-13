@@ -162,7 +162,7 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     const oneTimePanel = plaintext.locator('aside.one-time');
     assert.equal(await oneTimePanel.getAttribute('role'), null, 'rendering plaintext must not announce it as a live region');
     assert.equal(await oneTimePanel.locator('code').evaluate((element) => element.closest('[role="status"], [aria-live]') === null), true);
-    await plaintext.getByRole('button', { name: 'Copy credential', exact: true }).click();
+    await oneTimePanel.getByRole('button', { name: 'Copy credential', exact: true }).click();
     await plaintext.getByRole('alert').getByText('Copy failed. Use download or select the credential above manually.', { exact: true }).waitFor();
     assert.equal(await plaintext.locator('textarea').count(), 0, 'a throwing clipboard fallback clears and removes its plaintext node');
     await plaintext.getByRole('button', { name: 'Download credential', exact: true }).click();
