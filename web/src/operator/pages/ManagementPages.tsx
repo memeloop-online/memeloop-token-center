@@ -39,6 +39,7 @@ import { CreateJourney } from '../CreateJourney';
 import { CredentialActionMenu } from '../CredentialActionMenu';
 import { fluentFormWidgets } from '../FluentFormWidgets';
 import '../formJourney.css';
+import '../providerEditLayout.css';
 import { credentialCreateSchema, credentialCreateUiSchema, credentialFormFields, credentialPolicySchema, credentialPolicyUiSchema } from '../CredentialForm';
 import { upstreamAvailabilityPath, type UpstreamAvailabilityWindow } from '../upstreamAvailabilityWindow';
 import { useOperatorResource, type ResourceState } from '../hooks/useOperatorResource';
@@ -84,6 +85,8 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   const [reauthorizing, setReauthorizing] = useState<UpstreamAccount>();
   const [providerWorkspaceOpen, setProviderWorkspaceOpen] = useState(false);
   const [providerCreateGeneration, setProviderCreateGeneration] = useState(0);
+  const [proxyEditorOpen, setProxyEditorOpen] = useState(false);
+  const [providerEditDraft, setProviderEditDraft] = useState<Record<string, unknown>>();
   const providerSuccess = useRef<HTMLDivElement>(null);
   const [busy, setBusy] = useState('');
   const { container: providerList, rememberTrigger } = useInlineEditorFocus(editing?.id, Boolean(busy), `${token}\0${tenant}\0${writeTenant}`);
@@ -141,7 +144,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     },
   };
   useEffect(() => {
-    setMethod('direct'); setDriver(''); setRotating(undefined); setEditing(undefined); setReauthorizing(undefined); setProviderWorkspaceOpen(false);
+    setProviderEditDraft(undefined); setMethod('direct'); setDriver(''); setRotating(undefined); setEditing(undefined); setReauthorizing(undefined); setProviderWorkspaceOpen(false);
     setBusy(''); setHealth({}); setDeletionReadiness({}); setMessage(''); setError('');
   }, [token, tenant, writeTenant]);
 
@@ -229,7 +232,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   }
 
   const providerEditors = <>
-      {editing && editSchema && <div className="inline-editor"><Form key={`${editing.id}-${locale}`} schema={editSchema} uiSchema={{ config: { oauth: { 'ui:disabled': true }, ...(editing.driver === 'openai-codex' && editing.auth_kind === 'oauth' ? { base_url: { 'ui:widget': 'hidden' } } : {}) } }} formData={{ name: editing.name, config: editing.config }} validator={validator} widgets={fluentFormWidgets} templates={upstreamFormTemplates} onSubmit={async ({ formData }) => { if (!formData) return; setBusy(`edit-${editing.id}`); try { await api(`/internal/v1/upstreams/${editing.id}`, token, { method: 'PUT', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant, expected_updated_at: editing.updated_at }) }); setEditing(undefined); setProviderWorkspaceOpen(false); setMessage(t('providers.updated', { name: editing.name })); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}><button type="submit" disabled={!canManage(editing) || Boolean(busy)}>{t('common.save')}</button></Form></div>}
+      {editing && editSchema && <div className="inline-editor"><Form key={`${editing.id}-${locale}`} schema={editSchema} formContext={{ providerEdit: true }} uiSchema={{ config: { oauth: { 'ui:disabled': true }, ...(editing.driver === 'openai-codex' && editing.auth_kind === 'oauth' ? { base_url: { 'ui:widget': 'hidden' } } : {}) } }} formData={providerEditDraft ?? { name: editing.name, config: editing.config }} onChange={({ formData }) => setProviderEditDraft(formData)} validator={validator} widgets={fluentFormWidgets} templates={upstreamFormTemplates} onSubmit={async ({ formData }) => { if (!formData || proxyEditorOpen) return; setBusy(`edit-${editing.id}`); try { await api(`/internal/v1/upstreams/${editing.id}`, token, { method: 'PUT', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant, expected_updated_at: editing.updated_at }) }); setEditing(undefined); setProviderWorkspaceOpen(false); setMessage(t('providers.updated', { name: editing.name })); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}><Button appearance="primary" type="submit" disabled={!canManage(editing) || Boolean(busy) || proxyEditorOpen}>{t('common.save')}</Button></Form></div>}
       {rotating && rotateProvider && <div className="inline-editor"><Form key={`${rotating.id}-${locale}`} schema={localizeSchema(rotateProvider.credential_schema as RJSFSchema, locale)} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { setBusy(`rotate-${rotating.id}`); try { await api(`/internal/v1/upstreams/${rotating.id}/credential`, token, { method: 'PUT', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ credential: formData }) }); setRotating(undefined); setProviderWorkspaceOpen(false); setMessage(t('providers.rotated', { name: rotating.name })); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}><button type="submit" disabled={!canManage(rotating) || Boolean(busy)}>{t('providers.confirmRotate')}</button></Form></div>}
   </>;
   return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} /><section ref={providerList} className="provider-layout">
@@ -261,7 +264,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             <span className="pill">{t('providers.routes', { count: formatNumber(value.route_count, locale) })}</span>
             <details className="upstream-secondary-actions"><summary>{t('connection.manageAccount')}</summary><div className="row-actions">
               {providerAvailable && <>
-                <button type="button" className="secondary" data-inline-edit-trigger={value.id} disabled={!manageable || Boolean(busy)} onClick={(event) => { rememberTrigger(value.id, event.currentTarget); setEditing(value); }}>{t('providers.edit')}</button>
+                <button type="button" className="secondary" data-inline-edit-trigger={value.id} disabled={!manageable || Boolean(busy)} onClick={(event) => { rememberTrigger(value.id, event.currentTarget); setProviderEditDraft(undefined); setEditing(value); }}>{t('providers.edit')}</button>
                 <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void checkHealth(value)}>{t('providers.runManualHealthCheck')}</button>
                 {value.can_refresh && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void refreshOAuth(value)}>{t('providers.refreshAuthorization')}</button>}
                 {value.can_reauthorize && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setReauthorizing(value)}>{t('providers.reauthorize')}</button>}
@@ -277,9 +280,10 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
         </div>;
       })}</div>
     </article>
-    <CreateJourney title={editing ? t('providers.editFor', { name: editing.name }) : rotating ? t('providers.rotateFor', { name: rotating.name }) : reauthorizing ? t('providers.reauthorizeFor', { name: reauthorizing.name }) : t('providers.add')} description={t('providers.description')} open={providerWorkspaceOpen || Boolean(editing || rotating || reauthorizing)} busy={Boolean(busy)} onOpenChange={(open) => { setProviderWorkspaceOpen(open); if (!open) { setEditing(undefined); setRotating(undefined); setReauthorizing(undefined); } }}>
+    <CreateJourney className={editing ? 'provider-edit-workspace' : ''} title={editing ? t('providers.editFor', { name: editing.name }) : rotating ? t('providers.rotateFor', { name: rotating.name }) : reauthorizing ? t('providers.reauthorizeFor', { name: reauthorizing.name }) : t('providers.add')} description={t('providers.description')} open={providerWorkspaceOpen || Boolean(editing || rotating || reauthorizing)} busy={Boolean(busy) || proxyEditorOpen} onOpenChange={(open) => { if (proxyEditorOpen) return; setProviderWorkspaceOpen(open); if (!open) { setEditing(undefined); setRotating(undefined); setReauthorizing(undefined); } }}>
       {error && <div className="notice error" role="alert">{error}</div>}
-      {editing && <UpstreamConnection account={editing} token={token} tenant={writeTenant} disabled={!canManage(editing) || Boolean(busy)} onChanged={onChanged} />}
+      {editing && <UpstreamConnection key={editing.id} account={editing} token={token} tenant={writeTenant} disabled={!canManage(editing) || Boolean(busy)} onChanged={onChanged} onEditingChange={setProxyEditorOpen} onSaved={updated => setEditing(current => current?.id === updated.id ? { ...updated, name: current.name, config: current.config } : current)} />}
+      {editing && proxyEditorOpen && <p role="status">{t('connection.finishProxyFirst')}</p>}
       {editing || rotating ? providerEditors : reauthorizing ? <>
       <AuthorizationConnection key={`reauthorize-${reauthorizing.id}`} token={token} tenant={writeTenant} providers={providers} existing={reauthorizing} onChanged={async () => { setReauthorizing(undefined); setMessage(t('providers.reauthorized', { name: reauthorizing.name })); await onChanged(); }} />
     </> : <>
@@ -1239,7 +1243,7 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schem
     renderScope.current = { token, tenant, writeTenant, generation: renderScope.current.generation + 1 };
   }
   const [values, setValues] = useState<ServiceTokenView[]>([]);
-  const [secret, setSecret] = useState<{ value: string; displayId: string; scopeGeneration: number }>();
+  const [secret, setSecret] = useState<{ value: string; displayId: string; scopeGeneration: number; copied: boolean }>();
   const [busy, setBusy] = useState('');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -1284,14 +1288,41 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schem
     secretOperation.current = undefined;
     setBusy('');
   };
-  const showSecret = (value: string) => {
-    const next = { value, displayId: crypto.randomUUID(), scopeGeneration: renderScope.current.generation };
+  const showSecret = (value: string, copied = false) => {
+    const next = { value, displayId: crypto.randomUUID(), scopeGeneration: renderScope.current.generation, copied };
     secretRef.current = next;
     setSecret(next);
   };
   const dismissSecret = () => {
     secretRef.current = undefined;
     setSecret(undefined);
+  };
+  const copyServiceCredential = async (value: ServiceTokenView) => {
+    if (!token || !value.credential_copy_available || value.status !== 'active') return;
+    const operation = beginSecretOperation();
+    if (!operation) return;
+    const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant; const operationScopeGeneration = renderScope.current.generation;
+    const current = () => ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration);
+    const controller = new AbortController();
+    secretRequest.current?.abort(); secretRequest.current = controller;
+    setBusy(`copy-${value.service_id}`); setError(''); setMessage('');
+    try {
+      const result = await api<{ service_id: string; credential_generation: number; token: string }>(`/internal/v1/service-tokens/${encodeURIComponent(value.service_id)}/copy`, operationToken, { ...secretResponseRequestPolicy, method: 'POST', signal: controller.signal });
+      if (!current()) return;
+      if (result.service_id !== value.service_id || result.credential_generation !== value.credential_generation) throw new Error(t('common.requestFailed'));
+      try {
+        await navigator.clipboard.writeText(result.token);
+        if (current()) setMessage(t('services.copySuccess', { name: value.name }));
+      } catch {
+        if (!current()) return;
+        showSecret(result.token, true); setMessage(t('credentials.copyManual'));
+      }
+    } catch (reason) {
+      if (!controller.signal.aborted && current()) setError(reason instanceof ApiError && reason.status === 403 ? t('services.copyPermission') : reason instanceof ApiError && reason.status === 404 ? t('services.secretUnavailable') : messageOf(reason, t('common.requestFailed')));
+    } finally {
+      if (secretRequest.current === controller) secretRequest.current = undefined;
+      if (current()) finishSecretOperation(operation);
+    }
   };
   const rotateServiceCredential = async (value: ServiceTokenView) => {
     if (!canManage(value) || value.status === 'revoked') return;
@@ -1333,8 +1364,8 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schem
       if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) finishSecretOperation(operation);
     }
   };
-  return <>{confirmationDialog}{visibleSecret && <OneTimeSecret key={visibleSecret.displayId} value={visibleSecret.value} filename="service-credential.txt" onDismiss={dismissSecret} message={t('services.oneTimeSecret')} />}<section className="management-layout">
-    <article className="panel"><div className="panel-title"><div><h2>{t('services.title')}</h2><p className="muted">{t('services.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>{error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="account-list">{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('status.active')} empty={t('services.empty')} />}{statusFilter.values.map((value) => <div className="managed-resource" key={value.service_id}><div className="managed-resource-header"><div><b>{value.name}</b><small>{value.service_id}</small><span>{value.tenant_external_id ?? t('services.globalScope')} · {value.scopes.join(' · ')}</span></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div><div className="row-actions"><button type="button" className="secondary" disabled={!canManage(value) || value.status === 'revoked' || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void rotateServiceCredential(value)}>{t('services.rotate')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" disabled={!canManage(value) || Boolean(busy)} onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; setBusy(`status-${value.service_id}`); try { await api(`/internal/v1/service-tokens/${value.service_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setMessage(t(nextStatus === 'active' ? 'services.resumed' : 'services.suspended', { name: value.name })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); } } }>{value.status === 'active' ? t('services.suspend') : t('services.resume')}</button>}</div></div>)}</div></article>
+  return <>{confirmationDialog}{visibleSecret && <OneTimeSecret key={visibleSecret.displayId} value={visibleSecret.value} recovered={visibleSecret.copied} recoveryAvailable={!visibleSecret.copied} filename="service-credential.txt" onDismiss={dismissSecret} message={t(visibleSecret.copied ? 'credentials.recoveredSecret' : 'services.oneTimeSecret')} />}<section className="management-layout">
+    <article className="panel"><div className="panel-title"><div><h2>{t('services.title')}</h2><p className="muted">{t('services.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>{error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="account-list">{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('status.active')} empty={t('services.empty')} />}{statusFilter.values.map((value) => <div className="managed-resource" key={value.service_id}><div className="managed-resource-header"><div><b>{value.name}</b><small>{value.service_id}</small><span>{value.tenant_external_id ?? t('services.globalScope')} · {value.scopes.join(' · ')}</span></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div><div className="row-actions"><DetailTooltip content={value.status === 'revoked' ? t('credentials.copyRevoked') : value.status === 'suspended' ? t('credentials.copySuspended') : !value.credential_copy_available ? t('services.secretUnavailable') : t('services.copyPermission')}><span tabIndex={!value.credential_copy_available || value.status !== 'active' ? 0 : undefined}><Button appearance="secondary" type="button" disabled={!token || !value.credential_copy_available || value.status !== 'active' || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void copyServiceCredential(value)}>{busy === `copy-${value.service_id}` ? t('common.loading') : t('credentials.copy')}</Button></span></DetailTooltip><button type="button" className="secondary" disabled={!canManage(value) || value.status === 'revoked' || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void rotateServiceCredential(value)}>{t('services.rotate')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" disabled={!canManage(value) || Boolean(busy)} onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; setBusy(`status-${value.service_id}`); try { await api(`/internal/v1/service-tokens/${value.service_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setMessage(t(nextStatus === 'active' ? 'services.resumed' : 'services.suspended', { name: value.name })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); } } }>{value.status === 'active' ? t('services.suspend') : t('services.resume')}</button>}</div></div>)}</div></article>
     <details className="panel create-resource"><summary><span><b>{t('services.createTitle')}</b><small>{t('services.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">{schema ? <Form key={`${tenant}-${writeTenant}-${locale}`} schema={localizeSchema(schema as RJSFSchema, locale)} uiSchema={{ tenant_external_id: { 'ui:widget': 'hidden' } }} validator={validator} templates={schemaFormTemplates} onSubmit={({ formData }) => { void createServiceCredential(formData); }}><button type="submit" disabled={!writeTenant || Boolean(busy) || Boolean(visibleSecret)}>{busy === 'create-service-credential' ? t('common.loading') : t('services.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}</div></details>
   </section></>;
 }

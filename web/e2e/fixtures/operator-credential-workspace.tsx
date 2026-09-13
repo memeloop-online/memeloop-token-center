@@ -10,7 +10,7 @@ import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/operator/operator.css';
 
-type Scenario = 'all-tenants' | 'route-failure' | 'scope-race' | 'scope-lock' | 'client-recovery' | 'service-plaintext' | 'service-scope-aba' | 'client-form';
+type Scenario = 'all-tenants' | 'route-failure' | 'scope-race' | 'scope-lock' | 'client-recovery' | 'service-copy' | 'service-plaintext' | 'service-scope-aba' | 'client-form';
 
 interface RecordedRequest {
   method: string;
@@ -78,6 +78,14 @@ if (scenario === 'client-recovery') {
     writeText: async (value: string) => {
       if (parameters.has('clipboard-failure')) throw new Error('fixture clipboard denied');
       document.documentElement.dataset.copiedFixtureCredential = String(value === 'mts_client_recovered');
+    },
+  } });
+}
+if (scenario === 'service-copy') {
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+    writeText: async (value: string) => {
+      if (parameters.has('clipboard-failure')) throw new Error('fixture clipboard denied');
+      document.documentElement.dataset.copiedServiceFixture = String(value === 'mts_service_original');
     },
   } });
 }
@@ -173,6 +181,10 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   if (parameters.has('routing-lifecycle') && url.pathname === '/internal/v1/keys/key-form/routing') {
     return new Promise<Response>(resolve => pendingRouting.push(resolve));
   }
+  if (url.pathname === '/internal/v1/service-tokens/service-existing/copy' && method === 'POST' && scenario === 'service-copy') {
+    if (parameters.has('forbidden')) return json({ error: { message: 'fixture permission denied' } }, 403);
+    return json({ service_id: 'service-existing', credential_generation: 1, token: 'mts_service_original' });
+  }
   if (url.pathname === '/internal/v1/service-tokens' && method === 'POST') {
     // Deliberately ignore AbortSignal so the component, rather than the mock,
     // must fence a response from an old tenant/auth epoch.
@@ -182,6 +194,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     service_id: 'service-existing',
     name: 'Existing service credential',
     credential_generation: 1,
+    credential_copy_available: scenario === 'service-copy' && !parameters.has('unavailable'),
     fingerprint: 'fixture-fingerprint',
     scopes: ['keys:read'],
     tenant_external_id: initialTenant || 'tenant-a',
@@ -233,7 +246,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
 function Fixture() {
   const [tenant, setTenant] = useState(initialTenant);
   if (scenario === 'client-form') return <main style={{ maxWidth: 760, margin: '0 auto', padding: 12 }}><CredentialsPage token="mts_fixture" tenant={tenant} /></main>;
-  if (scenario === 'service-plaintext' || scenario === 'service-scope-aba') {
+  if (scenario === 'service-plaintext' || scenario === 'service-scope-aba' || scenario === 'service-copy') {
     return <>
       {scenario === 'service-scope-aba' && <button type="button" onClick={() => setTenant((current) => current === 'tenant-a' ? 'tenant-b' : 'tenant-a')}>Switch tenant</button>}
       <span>Tenant {tenant}</span>
