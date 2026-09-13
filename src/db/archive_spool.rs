@@ -69,6 +69,7 @@ impl Database {
         Ok(captured)
     }
 
+    #[cfg(test)]
     pub(super) async fn capture_buffered_archive_spool_in_transaction(
         &self,
         tx: &mut Transaction<'_, Any>,
