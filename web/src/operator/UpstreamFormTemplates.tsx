@@ -14,8 +14,11 @@ function UpstreamObjectTemplate(props: ObjectFieldTemplateProps) {
   const networkNames = ['network_scope', 'timeout_seconds', 'transport_policy'];
   const capabilityNames = ['image_api_mode', 'image_main_model', 'video_api', 'video_models', 'result_origins', 'input_token_overhead_ceiling', 'stream_usage_contract'];
   if (props.fieldPathId.path.length === 0 && props.schema.properties?.name && props.schema.properties?.config) {
+    const identity = props.properties.filter((field) => field.name !== 'config' && field.name !== 'credential');
     return <div className="upstream-form-sections">
-      <FormSection title={t('connection.identitySection')}>{props.properties.filter((field) => field.name !== 'config' && field.name !== 'credential').map((field) => field.content)}</FormSection>
+      {props.registry.formContext?.providerEdit && identity.length === 1 && identity[0].name === 'name'
+        ? identity[0].content
+        : <FormSection title={t('connection.identitySection')}>{identity.map((field) => field.content)}</FormSection>}
       {props.properties.find((field) => field.name === 'config')?.content}
       {props.properties.some(field => field.name === 'credential') && <FormSection title={copy.authentication} description={copy.authenticationHint}>{props.properties.find(field => field.name === 'credential')?.content}</FormSection>}
     </div>;
