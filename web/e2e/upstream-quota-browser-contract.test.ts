@@ -60,7 +60,14 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
       });
       assert.deepEqual(styles, { border: theme === 'light' ? 'rgb(195, 213, 219)' : 'rgb(61, 105, 113)', width: '1px', style: 'solid', muted: theme === 'light' ? 'rgb(82, 105, 112)' : 'rgb(145, 170, 176)' });
       await advanced.focus();
-      assert.equal(await advanced.evaluate(element => getComputedStyle(element).outlineWidth), '2px', 'advanced settings retain a visible keyboard focus indicator');
+      const focus = await advanced.evaluate(element => {
+        const style = getComputedStyle(element);
+        return { active: document.activeElement === element, width: Number.parseFloat(style.outlineWidth), style: style.outlineStyle, color: style.outlineColor };
+      });
+      assert.equal(focus.active, true);
+      assert.ok(focus.width >= 2, 'advanced settings retain a substantial keyboard focus indicator');
+      assert.equal(focus.style, 'solid');
+      assert.notEqual(focus.color, 'rgba(0, 0, 0, 0)');
         await page.setViewportSize({ width, height: 900 });
         assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth));
         await page.screenshot({ path: join(artifacts, `upstream-quota-${theme}-${width}.png`), fullPage: true });
