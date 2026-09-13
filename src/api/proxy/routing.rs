@@ -126,9 +126,16 @@ pub(super) fn plan_proxy_route(
         )));
     }
     route.credential.validate(preparation_now)?;
-    let _planning_memory = state.proxy_memory_budget.temporary(
-        crate::gateway_body::memory::json_encoded_length(request_json)?.saturating_mul(3),
-    )?;
+    let _planning_memory = state
+        .proxy_memory_budget
+        .temporary(
+            crate::gateway_body::memory::json_encoded_length(request_json)?.saturating_mul(3),
+        )
+        .map_err(|error| {
+            state
+                .metrics
+                .observe_proxy_memory_error(crate::metrics::ProxyMemoryRejectionStage::Route, error)
+        })?;
     let is_codex = codex_transport::is_driver(&route.driver);
     if is_codex {
         codex::validate_route(&route, protocol)?;
@@ -214,7 +221,14 @@ pub(super) async fn materialize_proxy_route(
     } else {
         encoded_length.saturating_mul(2)
     };
-    let _temporary_memory = state.proxy_memory_budget.temporary(temporary_bytes)?;
+    let _temporary_memory = state
+        .proxy_memory_budget
+        .temporary(temporary_bytes)
+        .map_err(|error| {
+            state
+                .metrics
+                .observe_proxy_memory_error(crate::metrics::ProxyMemoryRejectionStage::Route, error)
+        })?;
     let component_request = if let Some(context) = planned.component_context {
         let prepared = prepare_component_provider(
             state,

@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { inputPlan, memoryVerdict, outputPlan, permitEvidence, planHash } from "../../ops/benchmark-durable-archive-memory.ts";
+import { inputPlan, memoryVerdict, outputPlan, permitEvidence, planHash, requestPath, responsesInputPlan, responsesOutputPlan } from "../../ops/benchmark-durable-archive-memory.ts";
 
 test("request and response plans have exact wire sizes and valid JSON", () => {
-  for (const plan of [inputPlan(1024), outputPlan(2048)]) {
+  for (const plan of [inputPlan(1024), outputPlan(2048), responsesInputPlan(1024), responsesOutputPlan(2048)]) {
     const body = Buffer.concat([plan.prefix, Buffer.alloc(plan.fillBytes, "x"), plan.suffix]);
     assert.equal(body.length, plan.bytes);
     assert.equal(typeof JSON.parse(body.toString("utf8")), "object");
@@ -13,6 +13,21 @@ test("request and response plans have exact wire sizes and valid JSON", () => {
   }
   assert.equal(inputPlan(16 * 1024 * 1024).bytes, 16 * 1024 * 1024);
   assert.equal(outputPlan(64 * 1024 * 1024).bytes, 64 * 1024 * 1024);
+});
+
+test("16MiB pressure uses the real Responses endpoint and wire contract", () => {
+  assert.equal(requestPath(responsesInputPlan(16 * 1024 * 1024)), "/v1/responses");
+  assert.equal(requestPath(inputPlan(512)), "/v1/chat/completions");
+  const request = responsesInputPlan(1024);
+  const parsed = JSON.parse(Buffer.concat([request.prefix, Buffer.alloc(request.fillBytes, "x"), request.suffix]).toString());
+  assert.equal(typeof parsed.input, "string");
+  assert.equal(parsed.stream, false);
+  assert.equal(parsed.messages, undefined);
+  const response = responsesOutputPlan(1024);
+  const result = JSON.parse(Buffer.concat([response.prefix, Buffer.alloc(response.fillBytes, "x"), response.suffix]).toString());
+  assert.equal(result.status, "completed");
+  assert.equal(result.usage.input_tokens, 2);
+  assert.equal(result.output[0].content[0].type, "output_text");
 });
 
 test("RSS acceptance requires real peak cap AND retained-memory recovery", () => {

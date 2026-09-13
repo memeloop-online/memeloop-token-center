@@ -19,7 +19,23 @@ import { apiRequest, MIB, processMemory, seed } from "./benchmark-memory.ts";
 const LIMIT_MIB = 448;
 const CHUNK = 64 * 1024;
 type Result = { status: number; bytes: number; sha256: string; retryAfter?: string; transportClosed?: boolean };
-type Plan = { prefix: Buffer; fillBytes: number; suffix: Buffer; bytes: number };
+type Plan = { prefix: Buffer; fillBytes: number; suffix: Buffer; bytes: number; path?: string };
+
+export function responsesInputPlan(bytes: number): Plan {
+  const prefix = Buffer.from('{"model":"benchmark-text","input":"');
+  const suffix = Buffer.from('","max_output_tokens":1,"stream":false}');
+  assert(bytes >= prefix.length + suffix.length, "Responses input plan too small");
+  return { prefix, suffix, fillBytes: bytes - prefix.length - suffix.length, bytes, path: "/v1/responses" };
+}
+
+export function responsesOutputPlan(bytes: number): Plan {
+  const prefix = Buffer.from('{"id":"resp-rss","object":"response","status":"completed","model":"benchmark-text","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"');
+  const suffix = Buffer.from('"}]}],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}');
+  assert(bytes >= prefix.length + suffix.length, "Responses output plan too small");
+  return { prefix, suffix, fillBytes: bytes - prefix.length - suffix.length, bytes };
+}
+
+export function requestPath(plan: Plan): string { return plan.path ?? "/v1/chat/completions"; }
 
 export function inputPlan(bytes: number): Plan {
   const prefix = Buffer.from('{"model":"benchmark-text","messages":[{"role":"user","content":"');
@@ -116,7 +132,7 @@ function send(base: string, key: string, plan: Plan, options: {
   chunked?: boolean; contentLength?: number; encoding?: string; raw?: Buffer;
 } = {}): { uploaded: Promise<void>; result: Promise<Result> } {
   const uploaded = gate();
-  const target = new URL("/v1/chat/completions", base);
+  const target = new URL(requestPath(plan), base);
   let stopped = false;
   const result = new Promise<Result>((done, reject) => {
     const req = request(target, { method: "POST", headers: {
@@ -188,7 +204,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
   const mock = createServer(async (req, res) => {
     try {
       if (req.method === "GET") { res.end("{}"); return; }
-      if (req.url !== "/v1/chat/completions") { res.writeHead(404); res.end(); return; }
+      if (!["/v1/chat/completions", "/v1/responses"].includes(req.url ?? "")) { res.writeHead(404); res.end(); return; }
       upstreamCalls += 1;
       for await (const _ of req) { /* real upstream consumes the forwarded body */ }
       if (responseGate) await responseGate.promise;
@@ -256,6 +272,8 @@ export async function run(binary: string, output: string): Promise<boolean> {
         await delay(100);
       }
     })(), 30_000, "readiness");
+    // The seeded `openai` http-json route covers both Chat and Responses;
+    // large ingress must use Responses' real 16MiB limit, not Chat's 4MiB limit.
     const key = await seed(base, base, token, mockUrl);
     const idle = processMemory(service.pid).rss_mib as number;
     report.idle_rss_mib = idle;
@@ -302,21 +320,26 @@ export async function run(binary: string, output: string): Promise<boolean> {
       return result;
     });
     await phase("four-concurrent-16MiB-known-length-inputs", async () => {
-      current = outputPlan(512);
+      current = responsesOutputPlan(512);
       responseGate = gate();
       const callsBefore = upstreamCalls;
-      const clients = Array.from({ length: 4 }, () => send(base, key, inputPlan(16 * MIB)));
+      const clients = Array.from({ length: 4 }, () => send(base, key, responsesInputPlan(16 * MIB)));
       try { await deadline(Promise.all(clients.map((client) => client.uploaded)), 30_000, "concurrent upload boundaries"); }
       finally { responseGate.release(); responseGate = undefined; }
       const results = await Promise.all(clients.map((client) => client.result));
-      assert(results.some((item) => item.status === 200), "pressure must include successful real proxy work");
       assert(results.every((item) => item.status === 200 || (item.status === 503 && Number(item.retryAfter) >= 1)), "pressure may fail closed only with 503 and Retry-After");
       assert(upstreamCalls - callsBefore === results.filter((item) => item.status === 200).length, "rejected pressure requests must not dispatch upstream");
-      return results;
+      // Admission winners depend on scheduling; even an all-503 pressure batch
+      // is valid. Require deterministic real work after every owner drains.
+      await drain();
+      const recovery = await send(base, key, responsesInputPlan(16 * MIB)).result;
+      assert(recovery.status === 200 && recovery.bytes === current.bytes && recovery.sha256 === planHash(current), "single 16MiB recovery must succeed with exact response bytes");
+      assert(upstreamCalls - callsBefore === results.filter((item) => item.status === 200).length + 1, "pressure plus recovery must execute exactly once per successful request");
+      return { results, recovery };
     });
     await phase("unknown-chunked-16MiB-input-and-64MiB-response", async () => {
-      current = outputPlan(64 * MIB); chunkedResponse = true;
-      const result = await send(base, key, inputPlan(16 * MIB), { chunked: true }).result;
+      current = responsesOutputPlan(64 * MIB); chunkedResponse = true;
+      const result = await send(base, key, responsesInputPlan(16 * MIB), { chunked: true }).result;
       assert(result.status === 200 && result.bytes === current.bytes && result.sha256 === planHash(current), "unknown-length request/response must complete exact bytes");
       chunkedResponse = false;
       return result;
@@ -324,14 +347,14 @@ export async function run(binary: string, output: string): Promise<boolean> {
     await phase("64MiB-input-default-policy-rejection", async () => {
       current = outputPlan(512);
       const before = upstreamCalls;
-      const result = await send(base, key, inputPlan(64 * MIB)).result;
+      const result = await send(base, key, responsesInputPlan(64 * MIB)).result;
       assert([413, 503].includes(result.status) && upstreamCalls === before, "default 16MiB ingress boundary must reject 64MiB before upstream");
       if (result.status === 503) assert(Number(result.retryAfter) >= 1, "503 requires Retry-After");
       return result;
     });
     await phase("encoded-body-rejected-without-dispatch", async () => {
       const before = upstreamCalls;
-      const plan = inputPlan(16 * MIB);
+      const plan = responsesInputPlan(16 * MIB);
       const compressed = gzipSync(Buffer.concat([...pieces(plan)]));
       const result = await send(base, key, plan, { encoding: "gzip", raw: compressed }).result;
       assert([400, 415].includes(result.status) && upstreamCalls === before, "encoded body must not bypass bounded JSON admission");
@@ -339,7 +362,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
     });
     await phase("underdeclared-content-length-never-dispatches", async () => {
       const before = upstreamCalls;
-      const result = await send(base, key, inputPlan(16 * MIB), { contentLength: 16 }).result.catch((error: NodeJS.ErrnoException) => {
+      const result = await send(base, key, responsesInputPlan(16 * MIB), { contentLength: 16 }).result.catch((error: NodeJS.ErrnoException) => {
         if (!["ECONNRESET", "EPIPE"].includes(error.code ?? "")) throw error;
         return { status: 0, bytes: 0, sha256: "", transportClosed: true };
       });

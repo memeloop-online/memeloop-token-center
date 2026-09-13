@@ -4,11 +4,12 @@ use super::*;
 async fn executed_response_waits_for_memory_without_replaying_upstream() {
     let fixture = std::sync::Arc::new(codex_route_fixture("response-memory-wait").await);
     let held = fixture.state.proxy_memory_budget.reservation();
-    // Leave two units for request ownership and transient route serialization.
-    // At upstream execution, consume the now-free transient unit so response
+    // Leave the complete route-max ingress allowance before its first poll.
+    // At upstream execution, consume the now-refunded ingress allowance so response
     // admission deterministically waits, without a timer or oversized payload.
+    let ingress_allowance = fixture.state.config.responses_body_max_bytes as usize * 3;
     assert!(held.try_grow(
-        fixture.state.config.proxy_memory_budget_bytes as usize - 128 * 1024,
+        fixture.state.config.proxy_memory_budget_bytes as usize - ingress_allowance,
         1,
     ));
     let upstream = MockServer::start().await;
@@ -17,7 +18,7 @@ async fn executed_response_waits_for_memory_without_replaying_upstream() {
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
         .respond_with(move |_: &wiremock::Request| {
-            assert!(upstream_blocker.try_grow(64 * 1024, 1));
+            assert!(upstream_blocker.try_grow(ingress_allowance - 64 * 1024, 1));
             ResponseTemplate::new(200).set_body_raw(
                 completed_codex_sse("delivered after memory release"),
                 "text/event-stream",

@@ -239,9 +239,10 @@ async fn admit_request_body_for_route(
             .and_then(|length| usize::try_from(length).ok())
             .unwrap_or(maximum)
             .min(maximum);
-        // Cover transport-owned frames as well as our retained buffer before
-        // polling the body even once. Unknown length reserves the route max.
-        if !reservation.try_grow(read_maximum, memory::REQUEST_MEMORY_WEIGHT) {
+        // A transport can yield a frame larger than a dishonest Content-Length
+        // before reporting its framing error. Always cover the route maximum
+        // before the first poll; the declared length only tightens validation.
+        if !reservation.try_grow(maximum, memory::REQUEST_MEMORY_WEIGHT) {
             return Err(GatewayBodyAdmissionError::CapacityExhausted);
         }
         let read = async {
@@ -272,7 +273,7 @@ async fn admit_request_body_for_route(
             .await
             .map_err(|_| GatewayBodyAdmissionError::Timeout)??;
         reservation.release(
-            read_maximum.saturating_sub(bytes.len()),
+            maximum.saturating_sub(bytes.len()),
             memory::REQUEST_MEMORY_WEIGHT,
         );
         parts.extensions.insert(reservation);
@@ -335,6 +336,39 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn understated_content_length_cannot_poll_without_route_maximum_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let budget = memory::ProxyMemoryBudget::new(64 * 1024);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = polls.clone();
+        let request = Request::post("/v1/responses")
+            .header(header::CONTENT_LENGTH, "1")
+            .body(Body::from_stream(stream::poll_fn(move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                std::task::Poll::Ready(Some(Ok::<_, Infallible>(Bytes::from(vec![
+                    b'x';
+                    128 * 1024
+                ]))))
+            })))
+            .unwrap();
+        let result = admit_gateway_request_body_with_memory(
+            request,
+            Duration::from_secs(1),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            16 * 1024 * 1024,
+            Some(&budget),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(GatewayBodyAdmissionError::CapacityExhausted)
+        ));
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        assert_eq!(budget.snapshot().0, 0);
+    }
+
+    #[tokio::test]
     async fn chunked_text_body_reserves_before_retention_and_releases_on_rejection() {
         let budget = memory::ProxyMemoryBudget::new(64 * 1024);
         let request = Request::builder()
@@ -363,7 +397,7 @@ mod tests {
 
     #[tokio::test]
     async fn admitted_text_body_retains_weighted_permit_for_lifecycle_owner() {
-        let budget = memory::ProxyMemoryBudget::new(64 * 1024);
+        let budget = memory::ProxyMemoryBudget::new(48 * 1024 * 1024);
         let request = Request::builder()
             .method("POST")
             .uri("/v1/responses")
@@ -386,9 +420,14 @@ mod tests {
             .unwrap()
             .clone();
         drop(admitted);
-        assert!(!budget.reservation().try_grow(1, 1));
+        assert_eq!(
+            budget.snapshot().0,
+            64 * 1024,
+            "EOF refunds unused route allowance"
+        );
         drop(owner);
-        assert!(budget.reservation().try_grow(64 * 1024, 1));
+        assert_eq!(budget.snapshot().0, 0);
+        assert!(budget.reservation().try_grow(48 * 1024 * 1024, 1));
     }
 
     #[tokio::test]

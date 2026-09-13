@@ -646,6 +646,9 @@ pub(super) async fn proxy(
         .map_err(|_| AppError::Overloaded)?;
     let request_id = Uuid::now_v7();
     if !memory.try_reserve_json(&body) {
+        state
+            .metrics
+            .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Json);
         return Err(AppError::Overloaded);
     }
     let original_request_json: Value = serde_json::from_slice(&body)
@@ -766,6 +769,9 @@ pub(super) async fn proxy(
     // Admission ACK includes reservation, request record, and encrypted sealed
     // request spool in one transaction. No upstream work starts before it.
     if !buffered_request.memory.try_finalize_request() {
+        state
+            .metrics
+            .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Retained);
         let mut response = finish_buffered_request(
             &buffered_request,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1441,6 +1447,13 @@ async fn finish_component_provider_failure(
     request: &BufferedRequest<'_>,
     error_code: &str,
 ) -> Result<Response, AppError> {
+    let memory_capacity = error_code == "upstream_response_memory_capacity";
+    if memory_capacity {
+        request
+            .state
+            .metrics
+            .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Response);
+    }
     finish_buffered_request(
         request,
         StatusCode::BAD_GATEWAY,
@@ -1456,6 +1469,13 @@ async fn finish_proxy_failure(
     request: &BufferedRequest<'_>,
     error_code: &str,
 ) -> Result<Response, AppError> {
+    let memory_capacity = error_code == "upstream_response_memory_capacity";
+    if memory_capacity {
+        request
+            .state
+            .metrics
+            .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Response);
+    }
     finish_buffered_request(
         request,
         StatusCode::BAD_GATEWAY,

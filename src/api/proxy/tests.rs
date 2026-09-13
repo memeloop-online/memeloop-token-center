@@ -25,6 +25,7 @@ mod codex_quota;
 mod ha_policy;
 mod kimi;
 mod memory_admission;
+mod memory_metrics;
 mod sse_delivery;
 
 #[test]

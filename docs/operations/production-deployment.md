@@ -64,7 +64,9 @@ content, model names or raw paths.
 
 `MTC_PROXY_MEMORY_BUDGET_BYTES` (Helm `config.proxyMemoryBudgetBytes`) adds
 process-wide weighted lifecycle admission, defaulting to 256 MiB in 64 KiB
-units. Capacity is acquired before retaining request bytes and before expanding
+units. The complete route maximum times three is reserved before the first
+request-body poll, regardless of Content-Length; EOF refunds the unused allowance.
+Capacity is acquired before retaining request bytes and before expanding
 JSON or encrypted captures; it is released with the owning lifecycle. The
 accounting includes raw bytes, parsed JSON and necessary copies, and the
 base64/encrypted batch peak. Structural JSON expansion is charged separately,
@@ -108,8 +110,15 @@ memeloop_token_center_proxy_memory_bytes{measure="limit"} > 0.9
 ```
 
 Also alert on sustained admission rejection using
-`sum by (instance) (rate(memeloop_token_center_gateway_body_rejections_total{reason="capacity_exhausted"}[5m])) > 0`
-for five minutes. Check retained work and upstream latency before increasing
+`sum by (instance, stage) (rate(memeloop_token_center_proxy_memory_rejections_total[5m])) > 0`
+for five minutes. The counter always exports exactly six fixed stages:
+`ingress` (body-read permits or weighted body admission), `json` (pre-parse
+expansion), `retained` (retained-request partition), `route` (route planning
+and serialization), `plugin` (plugin workspace and rewrite), and `response`
+(buffered response reservation or expansion). Response-stage failures after
+dispatch retain their existing 502 status without `Retry-After`; the counter
+does not imply a request is safe to replay. It does not fabricate a route
+class for failures without route metadata. Check retained work and upstream latency before increasing
 concurrency; changing the logical budget requires the matching Pod memory limit.
 Neither payload bytes, object locators, model names nor credentials are metric
 labels.

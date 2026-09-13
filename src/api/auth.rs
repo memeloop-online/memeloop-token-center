@@ -192,13 +192,8 @@ fn gateway_body_admission_rejection(
         }
         crate::gateway_body::GatewayBodyAdmissionError::CapacityExhausted => {
             state
-                .gateway_body_rejections
-                .observe(crate::gateway_body::GatewayBodyRejection {
-                    route_class: crate::gateway_body::GatewayBodyRouteClass::Other,
-                    declared_content_length: None,
-                    limit_bytes: 0,
-                    reason: crate::gateway_body::GatewayBodyRejectionReason::CapacityExhausted,
-                });
+                .metrics
+                .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Ingress);
             gateway_body_capacity_rejection()
         }
         crate::gateway_body::GatewayBodyAdmissionError::Timeout => (

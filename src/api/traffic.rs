@@ -341,16 +341,23 @@ async fn apply_traffic_plugin(
             upstream_account_hint: None,
         });
     }
-    let temporary_memory =
-        if memory.is_some() {
-            let input_length =
-                crate::gateway_body::memory::json_encoded_length(&original_request_json)?;
-            Some(state.proxy_memory_budget.temporary(
-                64 * 1024 * 1024 + input_length.max(16 * 1024 * 1024).saturating_mul(5),
-            )?)
-        } else {
-            None
-        };
+    let temporary_memory = if memory.is_some() {
+        let input_length =
+            crate::gateway_body::memory::json_encoded_length(&original_request_json)?;
+        Some(
+            state
+                .proxy_memory_budget
+                .temporary(64 * 1024 * 1024 + input_length.max(16 * 1024 * 1024).saturating_mul(5))
+                .map_err(|error| {
+                    state.metrics.observe_proxy_memory_error(
+                        crate::metrics::ProxyMemoryRejectionStage::Plugin,
+                        error,
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
     let plugin_configurations = plugins
         .resolved_traffic_configurations(key.tenant_id)
         .await?;
@@ -381,7 +388,13 @@ async fn apply_traffic_plugin(
     let plugin_decision = tokio::time::timeout(Duration::from_secs(35), plugin_task)
         .await
         .map_err(|_| AppError::Upstream("plugin execution timed out".into()))?
-        .map_err(|error| AppError::Upstream(format!("plugin task failed: {error}")))??;
+        .map_err(|error| AppError::Upstream(format!("plugin task failed: {error}")))?
+        .map_err(|error| {
+            state.metrics.observe_proxy_memory_error(
+                crate::metrics::ProxyMemoryRejectionStage::Plugin,
+                error,
+            )
+        })?;
     if !plugin_decision.allow {
         plugin_decision.log_denial();
         return Err(AppError::Forbidden);
@@ -472,7 +485,13 @@ pub(super) async fn normalize_component_provider(
 ) -> Result<NormalizedProviderResponse, AppError> {
     let temporary_memory = state
         .proxy_memory_budget
-        .temporary(64 * 1024 * 1024 + body.len().saturating_mul(6))?;
+        .temporary(64 * 1024 * 1024 + body.len().saturating_mul(6))
+        .map_err(|error| {
+            state.metrics.observe_proxy_memory_error(
+                crate::metrics::ProxyMemoryRejectionStage::Plugin,
+                error,
+            )
+        })?;
     let plugins = state.plugins.clone();
     let provider_id = provider_id.to_owned();
     let permit = tokio::time::timeout(Duration::from_secs(1), PLUGIN_EXECUTION_PERMITS.acquire())
