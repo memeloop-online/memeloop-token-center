@@ -57,6 +57,53 @@ fn oauth_refresh_lifecycle_from_row(row: &sqlx::any::AnyRow) -> Result<(String, 
 }
 
 impl Database {
+    /// Reads only the current generation's transport proxy while starting an
+    /// interactive reauthorization. A disconnected account deliberately keeps
+    /// its revoked current credential as the stable-identity anchor, so this
+    /// control-plane read must not use the active inference credential lookup.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upstream_oauth_reauthorization_proxy_snapshot(
+        &self,
+        account_id: Uuid,
+        tenant_external_id: &str,
+        expected_updated_at: i64,
+        expected_credential_generation: i64,
+        expected_oauth_driver: &str,
+        key_material: &[u8],
+    ) -> Result<Option<String>, AppError> {
+        let row = sqlx::query(
+            "SELECT a.updated_at, a.credential_generation, a.auth_kind, a.oauth_session_id, a.oauth_driver, c.credential_ciphertext FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation WHERE a.id = $1 AND t.external_id = $2",
+        )
+        .bind(account_id.to_string())
+        .bind(tenant_external_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::Forbidden)?;
+        if row.try_get::<i64, _>("updated_at")? != expected_updated_at
+            || row.try_get::<i64, _>("credential_generation")? != expected_credential_generation
+        {
+            return Err(AppError::Conflict(
+                "upstream credential changed while reauthorization was starting; retry".into(),
+            ));
+        }
+        if row.try_get::<String, _>("auth_kind")? != "oauth"
+            || row
+                .try_get::<Option<String>, _>("oauth_session_id")?
+                .is_none()
+            || row.try_get::<Option<String>, _>("oauth_driver")?.as_deref()
+                != Some(expected_oauth_driver)
+        {
+            return Err(AppError::Conflict(
+                "upstream OAuth lifecycle changed while reauthorization was starting; retry".into(),
+            ));
+        }
+        let credential = open_credential(
+            &row.try_get::<String, _>("credential_ciphertext")?,
+            key_material,
+        )?;
+        Ok(credential.proxy().map(|(proxy, _)| proxy.to_owned()))
+    }
+
     /// Read a completed, exact replay before transport validation performs DNS work.
     /// A concurrent miss is still serialized by the transactional rotation claim.
     #[allow(clippy::too_many_arguments)]
@@ -466,10 +513,10 @@ impl Database {
         let mut tx = self.begin_write_transaction().await?;
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2 FOR UPDATE OF a"
+                "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, c.revoked_at, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation WHERE a.id = $1 AND t.external_id = $2 FOR UPDATE OF a"
             }
             DatabaseBackend::Sqlite => {
-                "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2"
+                "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, c.revoked_at, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation WHERE a.id = $1 AND t.external_id = $2"
             }
         };
         let row = sqlx::query(select)
@@ -508,10 +555,8 @@ impl Database {
                 "upstream account does not support interactive reauthorization".into(),
             ));
         }
-        if !matches!(
-            row.try_get::<String, _>("status")?.as_str(),
-            "active" | "disabled"
-        ) {
+        let current_status = row.try_get::<String, _>("status")?;
+        if !matches!(current_status.as_str(), "active" | "disabled") {
             return Err(AppError::Forbidden);
         }
         if row.try_get::<i64, _>("updated_at")? != input.expected_updated_at
@@ -526,6 +571,11 @@ impl Database {
             &row.try_get::<String, _>("credential_ciphertext")?,
             key_material,
         )?;
+        let installed_status = if row.try_get::<Option<i64>, _>("revoked_at")?.is_some() {
+            "active"
+        } else {
+            current_status.as_str()
+        };
         let credential = input.credential.preserve_proxy_from(&current_credential);
         if current_driver == crate::oauth::codex_device::PROVIDER_DRIVER
             && let Some((proxy_url, proxy_scope)) = credential.proxy()
@@ -563,13 +613,14 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         let changed = sqlx::query(
-            "UPDATE upstream_accounts SET auth_kind = 'oauth', credential_generation = $1, oauth_session_id = $2, oauth_driver = $3, oauth_refresh_url = $4, config_json = COALESCE($5, config_json), updated_at = $6 WHERE id = $7 AND updated_at = $8 AND credential_generation = $9",
+            "UPDATE upstream_accounts SET auth_kind = 'oauth', credential_generation = $1, oauth_session_id = $2, oauth_driver = $3, oauth_refresh_url = $4, config_json = COALESCE($5, config_json), status = $6, updated_at = $7 WHERE id = $8 AND updated_at = $9 AND credential_generation = $10",
         )
         .bind(generation)
         .bind(input.oauth_session_id.to_string())
         .bind(&input.oauth_driver)
         .bind(&input.oauth_refresh_url)
         .bind(provider_config_json)
+        .bind(installed_status)
         .bind(updated_at)
         .bind(account_id.to_string())
         .bind(input.expected_updated_at)

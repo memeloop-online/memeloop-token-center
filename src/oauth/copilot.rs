@@ -1310,7 +1310,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::db::CreateUpstreamAccountInput;
+    use crate::db::{CreateUpstreamAccountInput, ReauthorizeUpstreamAccountInput};
     use serde_json::json;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1871,6 +1871,7 @@ mod tests {
     #[tokio::test]
     async fn account_socks5h_proxy_carries_device_login_and_short_token_remint() {
         let server = MockServer::start().await;
+        let flow_now = crate::db::unix_millis();
         let target = *server.address();
         // This name is intentionally absent from local DNS. The complete
         // lifecycle succeeds only if SOCKS5H carries it to the proxy.
@@ -1902,7 +1903,7 @@ mod tests {
             .and(header("authorization", "Bearer github-proxy-secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "token": "proxied-short-token",
-                "expires_at": 1_700_001_800,
+                "expires_at": (flow_now + 1_800_000) / 1_000,
                 "refresh_in": 900,
                 "endpoints": {"api": DEFAULT_COPILOT_API_ENDPOINT}
             })))
@@ -1911,14 +1912,54 @@ mod tests {
             .await;
 
         let (_directory, _url, database) = sqlite_database().await;
+        let initial_credential = credential(oauth_state("github.com:12345"))
+            .with_transport_proxy(proxy_url.clone())
+            .unwrap();
+        let account = database
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: "tenant-a".into(),
+                    name: "octocat-copilot".into(),
+                    driver: PROVIDER_DRIVER.into(),
+                    config: input().provider_config,
+                    credential: initial_credential,
+                    oauth_session_id: Some(Uuid::now_v7()),
+                    oauth_driver: Some(OAUTH_DRIVER.into()),
+                    oauth_refresh_url: Some(TOKEN_ENDPOINT.into()),
+                },
+                KEY,
+            )
+            .await
+            .unwrap();
+        let (disconnected, oauth_driver, _) = database
+            .disconnect_upstream_oauth(account.id, "tenant-a", account.updated_at, KEY)
+            .await
+            .unwrap();
+        assert_eq!(oauth_driver, OAUTH_DRIVER);
+        let retained_proxy = database
+            .upstream_oauth_reauthorization_proxy_snapshot(
+                account.id,
+                "tenant-a",
+                disconnected.updated_at,
+                disconnected.credential_generation,
+                OAUTH_DRIVER,
+                KEY,
+            )
+            .await
+            .unwrap();
         let mut start = input();
-        start.proxy_url = Some(proxy_url.clone());
+        start.proxy_url = retained_proxy;
+        start.reauthorize = Some(OAuthReauthorizationTarget {
+            account_id: account.id,
+            expected_updated_at: disconnected.updated_at,
+            expected_credential_generation: disconnected.credential_generation,
+        });
         let started = start_at(
             &database,
             &reqwest::Client::new(),
             start,
             KEY,
-            NOW,
+            flow_now,
             true,
             &endpoints,
         )
@@ -1934,7 +1975,7 @@ mod tests {
             &started.session_token,
             PollRuntime {
                 key_material: KEY,
-                now: NOW + 1_000,
+                now: flow_now + 1_000,
                 scope,
                 allow_test_loopback: true,
                 endpoints: &endpoints,
@@ -1954,7 +1995,7 @@ mod tests {
             &started.session_token,
             PollRuntime {
                 key_material: KEY,
-                now: NOW + 2_000,
+                now: flow_now + 2_000,
                 scope,
                 allow_test_loopback: true,
                 endpoints: &endpoints,
@@ -1969,10 +2010,47 @@ mod tests {
             login.credential.proxy(),
             Some((proxy_url.as_str(), OutboundScope::Private))
         );
+        let current = database
+            .upstream_oauth_identity_credential(account.id, KEY)
+            .await
+            .unwrap();
+        assert_eq!(
+            copilot_account_id(&current).unwrap(),
+            login.stable_account_id
+        );
+        let reauthorized = database
+            .reauthorize_upstream_account(
+                account.id,
+                ReauthorizeUpstreamAccountInput {
+                    tenant_external_id: login.tenant_external_id.clone(),
+                    expected_updated_at: disconnected.updated_at,
+                    expected_credential_generation: disconnected.credential_generation,
+                    driver: PROVIDER_DRIVER.into(),
+                    oauth_session_id: login.session_id,
+                    oauth_driver: OAUTH_DRIVER.into(),
+                    oauth_refresh_url: Some(TOKEN_ENDPOINT.into()),
+                    provider_config: Some(login.provider_config.clone()),
+                    credential: login.credential.clone(),
+                },
+                KEY,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reauthorized.id, account.id);
+        assert_eq!(reauthorized.credential_generation, 2);
+        assert_eq!(reauthorized.status, "active");
+        let (_, installed) = database
+            .upstream_account_with_credential(account.id, KEY)
+            .await
+            .unwrap();
+        assert_eq!(
+            installed.proxy(),
+            Some((proxy_url.as_str(), OutboundScope::Private))
+        );
         let refreshed = refresh_at(
             &reqwest::Client::new(),
             &login.credential,
-            NOW + 3_000,
+            flow_now + 3_000,
             true,
             &endpoints,
             &TEST_OAUTH_REFRESH_REQUEST_GUARD,

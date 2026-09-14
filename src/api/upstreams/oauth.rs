@@ -425,16 +425,17 @@ pub(in crate::api) async fn start_cursor_oauth(
     )
     .await?;
     let session_proxy_url = if let Some(target) = reauthorize.as_ref() {
-        let (account, credential) = state
+        state
             .db
-            .upstream_account_with_credential(target.account_id, state.config.key_pepper.as_bytes())
-            .await?;
-        if account.credential_generation != target.expected_credential_generation {
-            return Err(AppError::Conflict(
-                "upstream credential changed while reauthorization was starting; retry".into(),
-            ));
-        }
-        credential.proxy().map(|(proxy, _)| proxy.to_owned())
+            .upstream_oauth_reauthorization_proxy_snapshot(
+                target.account_id,
+                &body.tenant_external_id,
+                target.expected_updated_at,
+                target.expected_credential_generation,
+                "cursor",
+                state.config.key_pepper.as_bytes(),
+            )
+            .await?
     } else {
         body.proxy_url
     };

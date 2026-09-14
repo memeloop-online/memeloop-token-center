@@ -65,6 +65,7 @@ struct TokenCenterWorld {
     cursor_login_url: String,
     cursor_account_id: Option<Uuid>,
     cursor_generation: i64,
+    cursor_updated_at: i64,
     cursor_mock_origin: String,
     cursor_proxy_url: String,
     cursor_proxy_hosts: Arc<Mutex<Vec<String>>>,
@@ -113,6 +114,7 @@ impl Default for TokenCenterWorld {
             cursor_login_url: String::new(),
             cursor_account_id: None,
             cursor_generation: 0,
+            cursor_updated_at: 0,
             cursor_mock_origin: String::new(),
             cursor_proxy_url: String::new(),
             cursor_proxy_hosts: Arc::new(Mutex::new(Vec::new())),
@@ -5805,6 +5807,7 @@ async fn poll_cursor_oauth(world: &mut TokenCenterWorld) {
     world.cursor_generation = value["credential_generation"]
         .as_i64()
         .expect("Cursor generation");
+    world.cursor_updated_at = value["updated_at"].as_i64().expect("Cursor updated_at");
     let retry = poll().await.expect("retry completed Cursor OAuth poll");
     assert_eq!(retry.status(), StatusCode::OK);
     let retry_value: Value = retry.json().await.expect("retried Cursor account JSON");
@@ -5860,6 +5863,7 @@ async fn refresh_cursor_oauth(world: &mut TokenCenterWorld) {
     world.cursor_generation = value["credential_generation"]
         .as_i64()
         .expect("refreshed generation");
+    world.cursor_updated_at = value["updated_at"].as_i64().expect("refreshed updated_at");
 }
 
 #[then("the refreshed Cursor account keeps its id and uses generation 2")]
@@ -5880,6 +5884,32 @@ async fn refreshed_cursor_account_is_stable(world: &mut TokenCenterWorld) {
             .and_then(|value| value.to_str().ok())
             == Some("Bearer cursor-access-2")
     }));
+}
+
+#[when("the service disconnects the Cursor OAuth account before reauthorization")]
+async fn disconnect_cursor_oauth_before_reauthorization(world: &mut TokenCenterWorld) {
+    let account_id = world.cursor_account_id.expect("Cursor account id");
+    let response = world
+        .client
+        .post(format!(
+            "{}/internal/v1/upstreams/{account_id}/oauth/disconnect",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .json(&json!({"expected_updated_at": world.cursor_updated_at}))
+        .send()
+        .await
+        .expect("disconnect Cursor OAuth before reauthorization");
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = response.json().await.expect("disconnected Cursor account");
+    let account = &value["account"];
+    assert_eq!(account["id"], account_id.to_string());
+    assert_eq!(account["status"], "disabled");
+    assert_eq!(account["credential_generation"], world.cursor_generation);
+    assert_eq!(account["has_proxy"], true);
+    world.cursor_updated_at = account["updated_at"]
+        .as_i64()
+        .expect("disconnected updated_at");
 }
 
 #[when("the service starts reauthorization for the Cursor OAuth account")]
@@ -5950,6 +5980,7 @@ async fn poll_cursor_oauth_reauthorization(world: &mut TokenCenterWorld) {
             .to_string()
     );
     assert_eq!(value["credential_generation"], 3);
+    assert_eq!(value["status"], "active");
     assert_eq!(value["route_count"], 1);
     assert_eq!(value["can_reauthorize"], true);
     assert!(value.get("credential").is_none());
