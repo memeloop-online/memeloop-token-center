@@ -93,7 +93,7 @@ Then('自助门户显示自己的 51 条请求和分页统计', async function (
   await assertAttribute(page.locator('html'), 'lang', 'en');
   await assertExactText(metric(page, 'Tokens'), '600');
   await assertContains(metric(page, 'Available balance (USD)'), '$');
-  await assertContains(metric(page, 'Total cost'), '$');
+  await assertContains(metric(page, 'Local settlement'), '$');
   await appPreferenceControls(page).getByRole('button', { name: '中文', exact: true }).click();
   await assertAttribute(page.locator('html'), 'lang', 'zh-CN');
 });
