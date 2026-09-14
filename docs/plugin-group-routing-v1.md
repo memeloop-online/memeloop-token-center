@@ -38,6 +38,18 @@ are logged. One database statement pins every candidate's applicable group,
 priority, membership, nullable configuration and version together; a running
 request never switches to newer config or plugin runtime.
 
+Text proxy requests use this contract for both direct and buffered component
+providers. Component providers always pass the core health admission gate,
+including when planning fails or no strategy is selected: fallback cannot
+revive hard quota/authentication evidence. Invalid received responses complete
+as failed attempts without replay. The component normalization adapter currently
+classifies guest traps and malformed output alike as response-processing
+failures; local capacity/storage failures remain inconclusive.
+
+Asynchronous media jobs and the media synchronous-entry path are not wired to
+this contract yet; their durable strategy/revision pinning is separate pending
+work, not covered by this text-proxy implementation.
+
 ## ABI
 
 This scheduling contract is independent of `traffic-policy.post-auth`. Build

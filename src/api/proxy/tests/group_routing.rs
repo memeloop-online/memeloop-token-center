@@ -335,3 +335,127 @@ async fn gateway_wasm_observe_sets_transient_cooldown_without_replaying_503() {
     );
     assert_eq!(observed.probe_lease_until, 0);
 }
+
+async fn install_component_provider(fixture: &mut ResilientRouteFixture) {
+    // Reuse the audited real buffered provider component, disabling only its
+    // unrelated traffic rewrite and allowing this credential-free mock account.
+    let root = fixture._directory.path().join("group-plugins");
+    let package = root.join("example-provider");
+    fs::create_dir_all(&package).unwrap();
+    let mut manifest: Value = serde_json::from_str(include_str!(
+        "../../../../examples/plugins/policy-rewrite/plugin.json"
+    ))
+    .unwrap();
+    manifest["contributions"]["traffic_policy"] = json!(false);
+    manifest["contributions"]["request_rewrite"] = json!(false);
+    manifest["contributions"]["providers"][0]["credential_schema"] = json!({
+        "type":"object", "additionalProperties":false,
+        "required":["type"], "properties":{"type":{"const":"none"}}
+    });
+    manifest["contributions"]["providers"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("oauth_adapter");
+    fs::write(
+        package.join("plugin.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        package.join("plugin.wasm"),
+        include_bytes!("../../../../examples/plugins/policy-rewrite/plugin.wasm"),
+    )
+    .unwrap();
+    fixture.state.plugins = PluginRuntime::load(root.to_str(), fixture.state.db.clone()).unwrap();
+    fixture
+        .state
+        .providers
+        .extend(fixture.state.plugins.provider_types())
+        .unwrap();
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query("UPDATE upstream_accounts SET driver = 'example-oauth-http' WHERE id = $1")
+        .bind(fixture.accounts[0].to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn gateway_group_component_invalid_wire_response_observes_failure_without_replay() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/vendor/infer"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-encoding", "unsupported-test-encoding")
+                .set_body_json(json!({"vendor_answer":"not-decodable"})),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let label = "group-component-invalid-wire";
+    let mut fixture = resilient_route_fixture(label, &[(upstream.uri(), 0)]).await;
+    let (tenant, generation) = install_strategy(&mut fixture, label, 12345).await;
+    install_component_provider(&mut fixture).await;
+    fixture
+        .state
+        .db
+        .record_upstream_account_failure(
+            fixture.accounts[0],
+            generation,
+            UpstreamFailureKind::Unavailable,
+        )
+        .await
+        .unwrap();
+    let response = send_resilient_chat(&fixture, None, false).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    let observed = health(&fixture, tenant, generation).await;
+    assert_eq!(observed.last_failure_kind, "invalid_response");
+    assert_eq!(observed.cooldown_until - observed.updated_at, 12345 * 2);
+    assert_eq!(observed.probe_lease_until, 0);
+}
+
+#[tokio::test]
+async fn gateway_component_hard_quota_survives_invalid_strategy_native_fallback() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"vendor_answer":"must-not-send"})),
+        )
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    let label = "group-component-hard-fallback";
+    let mut fixture = resilient_route_fixture(label, &[(upstream.uri(), 0)]).await;
+    let (tenant, generation) = install_strategy(&mut fixture, label, 0).await;
+    install_component_provider(&mut fixture).await;
+    fixture
+        .state
+        .db
+        .record_upstream_account_failure(
+            fixture.accounts[0],
+            generation,
+            UpstreamFailureKind::RateLimitedUntil {
+                until: unix_millis() + 60_000,
+                exhausted: true,
+            },
+        )
+        .await
+        .unwrap();
+    let before = health(&fixture, tenant, generation).await;
+    // The real plan always requests allow_transient_probe=true. Hard quota
+    // makes that result invalid and leaves no per-candidate policy. The core
+    // component admission gate must still run under this native fallback.
+    let response = send_resilient_chat(&fixture, None, false).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+    let after = health(&fixture, tenant, generation).await;
+    assert_eq!(after.last_failure_kind, "quota_exhausted");
+    assert_eq!(after.cooldown_until, before.cooldown_until);
+    assert_eq!(after.consecutive_failures, before.consecutive_failures);
+    assert_eq!(after.probe_lease_until, 0);
+}
