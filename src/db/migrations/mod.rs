@@ -456,6 +456,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "model route archive",
         sql: include_str!("../../../migrations/common/0085_model_route_archive.sql"),
     },
+    Migration {
+        version: 86,
+        name: "immutable account settlement feed",
+        sql: include_str!("../../../migrations/common/0086_account_settlement_feed.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -897,6 +902,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 85,
         name: "model route archive",
         sql: include_str!("../../../migrations/common/0085_model_route_archive.sql"),
+    },
+    Migration {
+        version: 86,
+        name: "immutable account settlement feed",
+        sql: include_str!("../../../migrations/common/0086_account_settlement_feed.sql"),
     },
 ];
 

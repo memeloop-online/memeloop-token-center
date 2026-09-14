@@ -1,5 +1,5 @@
 use super::super::*;
-use super::aggregation::aggregate_terminal_generation_job;
+use super::terminal::publish_generation_terminal_effects;
 use crate::archive_staging::{
     ArchiveStagingOwner, ArchiveStagingPurpose, ArchiveStagingWriteLease, locator_matches_prefix,
 };
@@ -824,7 +824,7 @@ impl Database {
             .ok_or(AppError::NotFound)?;
         let status: String = row.try_get("status")?;
         if status == "cancelled" {
-            aggregate_terminal_generation_job(&mut transaction, &job_id.to_string(), now).await?;
+            publish_generation_terminal_effects(&mut transaction, &job_id.to_string(), now).await?;
             transaction.commit().await?;
             return self.generation_job(key_id, job_id).await;
         }
@@ -920,7 +920,7 @@ impl Database {
                 "generation job is currently being submitted upstream".into(),
             ));
         }
-        aggregate_terminal_generation_job(&mut transaction, &job_id.to_string(), now).await?;
+        publish_generation_terminal_effects(&mut transaction, &job_id.to_string(), now).await?;
         let key_id_string = key_id.to_string();
         let request_id = job_id.to_string();
         let event = allocate_request_event_cursor(
@@ -1367,7 +1367,7 @@ async fn fail_preparing_generation_in_transaction(
             "generation request archive owner changed during failure settlement".into(),
         ));
     }
-    aggregate_terminal_generation_job(tx, &job_id.to_string(), now).await?;
+    publish_generation_terminal_effects(tx, &job_id.to_string(), now).await?;
     let tenant_id: String = row.try_get("tenant_id")?;
     let key_id = key_id.to_string();
     let request_id = job_id.to_string();

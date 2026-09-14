@@ -5,4 +5,5 @@ mod operations;
 mod proxy_lifecycle;
 mod session_analytics;
 mod settlement;
+mod settlement_feed;
 mod synchronous;

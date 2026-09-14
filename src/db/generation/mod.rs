@@ -2,6 +2,7 @@ mod aggregation;
 mod jobs;
 mod operator;
 mod synchronous;
+mod terminal;
 
 use sqlx::{Any, Transaction};
 
