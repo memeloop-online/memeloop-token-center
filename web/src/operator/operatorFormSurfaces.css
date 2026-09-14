@@ -1,5 +1,15 @@
 @import '../modelPicker.css';
 
+.provider-additional-property { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; align-items: end; gap: 12px; margin-block: 10px; }
+.provider-additional-property :is(.provider-property-key, .provider-property-value, .form-group) { min-width: 0; margin: 0; }
+.provider-property-key { display: grid; gap: 6px; }
+.provider-additional-property > button { margin-bottom: 2px; }
+.provider-edit-workspace .form-journey-disclosure fieldset { border: 0; padding: 0; margin: 0; }
+@media (max-width: 600px) {
+  .provider-additional-property { grid-template-columns: minmax(0, 1fr) auto; }
+  .provider-property-key { grid-column: 1 / -1; }
+}
+
 /* Shared by create, inline edit and schema-generated fields. No fixed overlays. */
 :root { --form-danger: #ef9292; --form-danger-surface: #291d22; --form-focus: #79dfcf; }
 :root[data-theme='light'] { --form-danger: #922f2f; --form-danger-surface: #fff5f4; --form-focus: #08796e; }
