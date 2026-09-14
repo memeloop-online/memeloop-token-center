@@ -1243,7 +1243,10 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
     try {
       await api(`/internal/v1/keys/${value.key_id}/${suffix}`, token, { method: suffix === 'alias' ? 'PATCH' : 'PUT', body: JSON.stringify(body) });
       if (!current()) return;
-      if (suffix === 'policy') setPolicyDrafts({});
+      if (suffix === 'policy') setPolicyDrafts(current => {
+        const { [value.key_id]: _savedDraft, ...remaining } = current;
+        return remaining;
+      });
       setWorkspace(undefined); await load(); if (current()) setMessage(success);
     } catch (reason) { if (current()) setError(messageOf(reason, t('common.requestFailed'))); }
     finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); }

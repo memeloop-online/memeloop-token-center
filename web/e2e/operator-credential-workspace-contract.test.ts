@@ -283,6 +283,28 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
       assert.equal('route_ids' in body.policy || 'route_group_ids' in body.policy, false);
       await client.close();
     }
+    const policies = await browser.newPage();
+    await policies.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await policies.goto(`${fixture('client-form')}&multiple-policies=1`);
+    const openPolicy = async (alias: string) => {
+      await policies.locator('.credential-compact-row').filter({ has: policies.getByText(alias, { exact: true }) }).getByRole('button', { name: 'More actions', exact: true }).click();
+      await policies.getByRole('menuitem', { name: 'Policy and limits', exact: true }).click();
+      await policies.locator('.inline-editor #root_max_concurrency').waitFor();
+    };
+    await openPolicy('Other workspace');
+    await policies.locator('#root_max_concurrency').fill('7');
+    await policies.locator('.create-journey [data-workspace-toggle]').click();
+    await openPolicy('Research workspace');
+    await policies.locator('#root_max_concurrency').fill('3');
+    await policies.locator('.inline-editor').getByRole('button', { name: 'Save', exact: true }).click();
+    await policies.locator('.inline-editor').waitFor({ state: 'hidden' });
+    await openPolicy('Other workspace');
+    assert.equal(await policies.locator('#root_max_concurrency').inputValue(), '7', 'saving one credential policy must retain another credential’s unsaved draft');
+    const policyWrites = await policies.evaluate(() => window.credentialFixture.requests.filter(request => request.method === 'PUT' && request.path.endsWith('/policy')));
+    assert.equal(policyWrites.length, 1);
+    assert.equal(policyWrites[0].path, '/internal/v1/keys/key-form/policy');
+    assert.equal(JSON.parse(policyWrites[0].body!).max_concurrency, 3);
+    await policies.close();
   } finally {
     await browser.close();
     await server.close();
