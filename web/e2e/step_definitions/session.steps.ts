@@ -139,7 +139,7 @@ Then('同时间戳会话详情分页无重复遗漏且 USD 与 CNY 分行', asyn
   const firstCard = page.locator('.session-card').first();
   await visible(firstCard);
   await firstCard.getByRole('button', { name: /^打开 / }).click();
-  const drawer = page.getByRole('dialog');
+  const drawer = page.locator('.session-detail-region .session-detail');
   await visible(drawer);
   await eventually(async () => assert.equal(await drawer.locator('.session-event').count(), 7));
   assert.match(await drawer.textContent() ?? '', /US\$|\$/);
@@ -155,7 +155,7 @@ Then('同时间戳会话详情分页无重复遗漏且 USD 与 CNY 分行', asyn
 
 Then('六类可靠关系、候选关系、未关联请求和语义执行图被明确区分', async function (this: DogfoodWorld) {
   const page = this.requirePage();
-  const drawer = page.getByRole('dialog');
+  const drawer = page.locator('.session-detail-region .session-detail');
   const text = await drawer.textContent() ?? '';
   assert.match(text, /语义执行图.*发布试用/s);
   assert.match(text, /codex-root.*research-worker/s);
@@ -180,7 +180,7 @@ Then('六类可靠关系、候选关系、未关联请求和语义执行图被�
   await drawer.getByRole('button', { name: '关闭', exact: true }).click();
   await appPreferenceControls(page).getByRole('button', { name: 'English', exact: true }).click();
   await page.locator('.session-card').first().getByRole('button', { name: /^Open / }).click();
-  const englishDrawer = page.getByRole('dialog');
+  const englishDrawer = page.locator('.session-detail-region .session-detail');
   await visible(englishDrawer);
   const englishText = await englishDrawer.textContent() ?? '';
   for (const sentence of ['continues the conversation', 'retries', 'edits the input', 'branches from', 'compacting the context', 'subagent request spawned']) {
@@ -300,7 +300,7 @@ Then('Codex 上报的会话名称、代理层级和任务分类进入真实语�
   const card = page.locator('.session-card').filter({ hasText: 'Codex release dogfood' }).first();
   await card.waitFor({ state: 'visible', timeout: 5_000 });
   await card.getByRole('button', { name: /^打开 / }).click();
-  const drawer = page.getByRole('dialog');
+  const drawer = page.locator('.session-detail-region .session-detail');
   await drawer.waitFor({ state: 'visible', timeout: 5_000 });
   assert.equal(await drawer.locator('.session-event').count(), 4);
   const text = await drawer.textContent() ?? '';
@@ -382,10 +382,10 @@ Then('其他凭据事件和无事件重连不会污染已打开的会话', async
   await openAppRoute(page, 'operator', 'sessions');
   await controlledStream;
   const controls = page.locator('.session-controls');
-  await controls.getByLabel('凭据 ID', { exact: true }).fill(seed.sessionClientKeyId);
+  await controls.getByLabel('凭据别名', { exact: true }).fill(seed.sessionClientKeyId);
   await controls.getByRole('button', { name: '应用筛选', exact: true }).click();
   await page.getByRole('button', { name: '打开 Codex release dogfood', exact: true }).click();
-  await visible(page.getByRole('dialog'));
+  await visible(page.locator('.session-detail-region .session-detail'));
   const observation = observations.get(this)!;
   const detailCount = observation.detailRequests.length;
   releaseOtherEvent();
@@ -394,7 +394,7 @@ Then('其他凭据事件和无事件重连不会污染已打开的会话', async
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
   assert.equal(observation.detailRequests.length, detailCount, 'another credential event refreshed the selected detail');
 
-  await page.getByRole('dialog').getByRole('button', { name: '关闭', exact: true }).click();
+  await page.locator('.session-detail-region .session-detail').getByRole('button', { name: '关闭', exact: true }).click();
   await openAppRoute(page, 'operator', 'usage');
   await openAppRoute(page, 'operator', 'requests');
   await eventually(async () => assert.match(await page.locator('.session-live-state').textContent() ?? '', /正在重新连接/), 4_000);
