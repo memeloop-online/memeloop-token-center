@@ -1093,7 +1093,7 @@ async fn log_capability_emits_only_bounded_host_owned_fields() {
             line.starts_with("memeloop_token_center_plugin_execution_observations_total{")
         })
         .collect();
-    assert_eq!(observations.len(), 21, "fixed phase/outcome cardinality");
+    assert_eq!(observations.len(), 35, "fixed phase/outcome cardinality");
     assert!(observations.contains(&"memeloop_token_center_plugin_execution_observations_total{phase=\"post_auth\",outcome=\"returned\"} 1"));
     assert_eq!(
         observations

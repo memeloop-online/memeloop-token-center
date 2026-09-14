@@ -258,13 +258,14 @@ async fn prepare_inner(
         let execute_input = input.clone();
         let result = tokio::time::timeout_at(
             hook_deadline,
-            tokio::task::spawn_blocking(move || {
-                runtime.execute_group_routing_plan(&execute_id, &execute_input)
-            }),
+            crate::api::plugin_execution::run_group(
+                state.metrics.clone(),
+                crate::metrics::plugin_execution::Phase::GroupRoutingPlan,
+                move || runtime.execute_group_routing_plan(&execute_id, &execute_input),
+            ),
         )
         .await
         .map_err(|_| AppError::Internal)
-        .and_then(|result| result.map_err(|_| AppError::Internal))
         .and_then(|result| result);
         match result {
             Ok(mut plan) => {
@@ -351,12 +352,14 @@ pub(crate) async fn observe(
     };
     let runtime = state.plugins.clone();
     let plugin_id = policy.plugin_id.clone();
-    match tokio::task::spawn_blocking(move || {
-        runtime.execute_group_routing_observe(&plugin_id, &input)
-    })
+    match crate::api::plugin_execution::run_group(
+        state.metrics.clone(),
+        crate::metrics::plugin_execution::Phase::GroupRoutingObserve,
+        move || runtime.execute_group_routing_observe(&plugin_id, &input),
+    )
     .await
     {
-        Ok(Ok(directive)) => Some(directive),
+        Ok(directive) => Some(directive),
         _ => {
             tracing::warn!(%request_id, upstream_account_id=%account,stage="group_routing_observe_fallback","group observe failed; native health policy retained");
             None

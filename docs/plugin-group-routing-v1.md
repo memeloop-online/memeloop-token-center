@@ -131,6 +131,12 @@ uncertain execution and lease updates are core decisions.
 ## Isolation and revision pinning
 
 Each call has fuel, memory/table limits and at most 100 ms of execution time.
+The host shares its existing eight-component process capacity, including
+after caller cancellation. Scheduling waits at most 25 ms for capacity; the
+entire batch snapshot and plan stage is capped at 250 ms and the frozen core
+deadline. Health and group selection are read by one generation-bound batch,
+not a serial query per candidate. Closed metric phases `group_routing_plan`
+and `group_routing_observe` expose returned/error/timeout/cancellation outcomes.
 Routing gets no network or KV access even if another contribution in the same
 package declares those capabilities. Guest traps, malformed results and
 timeouts are errors; the integration records native-policy fallback for the

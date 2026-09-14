@@ -202,6 +202,9 @@ async fn gateway_wasm_zero_transient_cooldown_recovers_only_after_durable_succes
     let recovered = health(&fixture, tenant, generation).await;
     assert_eq!(recovered.consecutive_failures, 0);
     assert_eq!(recovered.probe_lease_until, 0);
+    let metrics = fixture.state.metrics.render(&Default::default());
+    assert!(metrics.contains("phase=\"group_routing_plan\",outcome=\"returned\"} 1"));
+    assert!(metrics.contains("phase=\"group_routing_observe\",outcome=\"returned\"} 1"));
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let status: i64 = sqlx::query_scalar("SELECT status_code FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1")
         .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();
