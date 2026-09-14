@@ -303,6 +303,7 @@ mod tests {
                 component: None,
                 configuration_validator: Some(validator),
                 routing_validator: None,
+                routing_fingerprint: String::new(),
                 identity: super::super::PluginPackageIdentity {
                     component_sha256: None,
                     provenance: None,
