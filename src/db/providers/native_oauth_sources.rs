@@ -199,7 +199,7 @@ async fn cursor_source_row(
     source_identity: &str,
 ) -> Result<Option<sqlx::any::AnyRow>, AppError> {
     let sql = "SELECT b.provider_subject_hash, b.payload_digest, b.source_identity_hash AS import_source_identity_hash, b.source_document_sha256 AS import_source_document_sha256, a.*, t.external_id AS tenant_external_id, c.expires_at, c.credential_ciphertext, (SELECT COUNT(DISTINCT r.model_route_id) FROM model_route_upstream_accounts r WHERE r.tenant_id = a.tenant_id AND r.upstream_account_id = a.id) AS route_count FROM native_oauth_source_bindings b JOIN upstream_accounts a ON a.id = b.upstream_account_id AND a.tenant_id = b.tenant_id JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE b.tenant_id = $1 AND b.provider_driver = 'cursor' AND b.source_identity_hash = $2";
-    let sql = if backend == DatabaseBackend::PostgreSql {
+    let sql = if matches!(backend, DatabaseBackend::PostgreSql) {
         format!("{sql} FOR UPDATE OF b, a, c")
     } else {
         sql.to_owned()
