@@ -661,3 +661,197 @@ async fn truncated_successful_image_body_keeps_reservation_and_never_replays() {
     let body: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body["error"]["code"], "image_submission_uncertain");
 }
+
+#[tokio::test]
+async fn rejected_image_arm_cas_never_sends_and_settles_zero_without_uncertainty() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    let fixture = fixture(&upstream).await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query("CREATE TRIGGER reject_image_arm BEFORE UPDATE OF submission_started_at ON request_records WHEN NEW.submission_started_at IS NOT NULL BEGIN SELECT RAISE(IGNORE); END")
+        .execute(&pool).await.unwrap();
+    let response = post(
+        fixture.state.clone(),
+        &fixture.credential,
+        "arm-cas-rejected",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_ne!(body["error"]["code"], "image_submission_uncertain");
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+    let row = sqlx::query("SELECT r.status, r.actual_micros, q.submission_started_at, q.submission_uncertain_at FROM usage_reservations r JOIN request_records q ON q.reservation_id=r.id WHERE q.key_id=$1")
+        .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!(row.get::<String, _>("status"), "settled");
+    assert_eq!(row.get::<i64, _>("actual_micros"), 0);
+    assert!(row.get::<Option<i64>, _>("submission_started_at").is_none());
+    assert!(
+        row.get::<Option<i64>, _>("submission_uncertain_at")
+            .is_none()
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn pending_image_arm_uses_durable_truth_and_preserves_unknown_query_failures() {
+    use super::super::synchronous_image::{
+        ARM_CONFIRMED, ARM_NOT_STARTED, ARM_PENDING, SyncImageRequest, submission_may_have_started,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+    for scenario in ["not_started", "committed_ack_lost", "query_failed"] {
+        let upstream = MockServer::start().await;
+        let fixture = fixture(&upstream).await;
+        let key = fixture
+            .state
+            .db
+            .authenticate_key(
+                &fixture.credential,
+                fixture.state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let price = fixture
+            .state
+            .db
+            .generation_price("image-replay-model", &key.currency)
+            .await
+            .unwrap()
+            .reservation_price()
+            .unwrap();
+        let request_id = Uuid::now_v7();
+        let reservation = match fixture
+            .state
+            .db
+            .start_synchronous_image_request(StartSynchronousImageRequest {
+                routing_snapshot: None,
+                request_id,
+                key: &key,
+                price: &price,
+                input_token_ceiling: 0,
+                output_token_ceiling: 1,
+                idempotency: None,
+                protocol: "openai-image",
+                model: "image-replay-model",
+                request_object: "objects/blake3/test-arm-proof",
+                upstream_account_id: Some(fixture.account),
+                model_route_id: None,
+            })
+            .await
+            .unwrap()
+        {
+            StartSynchronousImageResult::Started(value) => value,
+            _ => panic!("fresh request"),
+        };
+        if scenario == "committed_ack_lost" {
+            // Leave local state Pending, simulating loss of the successful
+            // transaction acknowledgement after the durable marker committed.
+            fixture
+                .state
+                .db
+                .arm_synchronous_image_submission(fixture.key_id, None, request_id, reservation.id)
+                .await
+                .unwrap();
+        }
+        let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+        if scenario == "query_failed" {
+            sqlx::query("CREATE TRIGGER fail_arm_confirmation BEFORE UPDATE OF completed_at ON request_records BEGIN SELECT RAISE(FAIL, 'confirmation unavailable'); END")
+                .execute(&pool).await.unwrap();
+        }
+        let context = SyncImageRequest {
+            state: &fixture.state,
+            reservation: &reservation,
+            request_id,
+            started: Instant::now(),
+            billed_units: 1,
+            expected_image_count: 1,
+            key_id: fixture.key_id,
+            idempotency_key: None,
+            tenant_id: fixture.tenant,
+            arm_state: AtomicU8::new(ARM_PENDING),
+            invalid_response: AtomicBool::new(false),
+            confirmed_rejection: AtomicBool::new(false),
+        };
+        assert_eq!(
+            submission_may_have_started(&context).await.unwrap(),
+            scenario != "not_started"
+        );
+        let expected_state = match scenario {
+            "not_started" => ARM_NOT_STARTED,
+            "committed_ack_lost" => ARM_CONFIRMED,
+            _ => ARM_PENDING,
+        };
+        assert_eq!(context.arm_state.load(Ordering::Acquire), expected_state);
+        let response = fail_image_request(&context, "image_submission_failed")
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if scenario == "not_started" {
+                StatusCode::BAD_GATEWAY
+            } else {
+                StatusCode::CONFLICT
+            }
+        );
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM usage_reservations WHERE id=$1")
+                .bind(reservation.id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status,
+            if scenario == "not_started" {
+                "settled"
+            } else {
+                "reserved"
+            }
+        );
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+        pool.close().await;
+    }
+}
+
+#[tokio::test]
+async fn non_connect_image_send_timeout_keeps_health_unchanged_and_reservation_uncertain() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let mut fixture = fixture(&upstream).await;
+    fixture.state.http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_millis(100))
+        .build()
+        .unwrap();
+    let response = post(
+        fixture.state.clone(),
+        &fixture.credential,
+        "non-connect-timeout",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    let health = fixture
+        .state
+        .db
+        .group_routing_health(fixture.tenant, fixture.account, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(health.consecutive_failures, 0);
+    assert_eq!(health.last_failure_kind, "");
+    assert_eq!(health.probe_lease_until, 0);
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let status:String=sqlx::query_scalar("SELECT r.status FROM usage_reservations r JOIN request_records q ON q.reservation_id=r.id WHERE q.key_id=$1")
+        .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!(status, "reserved");
+    pool.close().await;
+}

@@ -33,6 +33,7 @@ pub struct ResolveImageGenerationQuarantine<'a> {
     pub tenant_external_id: &'a str,
     pub request_id: Uuid,
     pub actor_service_id: Uuid,
+    pub actor_credential_generation: i64,
     pub idempotency_hash: &'a str,
     pub expected_revision: &'a str,
     pub action: &'a str,
@@ -109,15 +110,15 @@ impl Database {
         let mut tx = self.begin_write_transaction().await?;
         // Lock current service identity/credential, and recheck permission even
         // for replay. Revocation or tenant reassignment cannot race the write.
-        let actor = sqlx::query("UPDATE service_principals SET updated_at = updated_at WHERE id = $1 AND status = 'active'")
-            .bind(input.actor_service_id.to_string()).execute(&mut *tx).await?;
+        let actor = sqlx::query("UPDATE service_principals SET updated_at = updated_at WHERE id = $1 AND status = 'active' AND credential_generation = $2")
+            .bind(input.actor_service_id.to_string()).bind(input.actor_credential_generation).execute(&mut *tx).await?;
         if actor.rows_affected() != 1 {
             return Err(AppError::Forbidden);
         }
-        sqlx::query("UPDATE service_credentials SET created_at = created_at WHERE service_principal_id = $1 AND generation = (SELECT credential_generation FROM service_principals WHERE id = $1)")
-            .bind(input.actor_service_id.to_string()).execute(&mut *tx).await?;
-        let credential = sqlx::query("SELECT c.scopes_json, c.tenant_external_id FROM service_credentials c JOIN service_principals s ON s.id = c.service_principal_id AND s.credential_generation = c.generation WHERE s.id = $1 AND s.status = 'active' AND c.revoked_at IS NULL")
-            .bind(input.actor_service_id.to_string()).fetch_optional(&mut *tx).await?.ok_or(AppError::Forbidden)?;
+        sqlx::query("UPDATE service_credentials SET created_at = created_at WHERE service_principal_id = $1 AND generation = $2")
+            .bind(input.actor_service_id.to_string()).bind(input.actor_credential_generation).execute(&mut *tx).await?;
+        let credential = sqlx::query("SELECT c.scopes_json, c.tenant_external_id FROM service_credentials c JOIN service_principals s ON s.id = c.service_principal_id AND s.credential_generation = c.generation WHERE s.id = $1 AND c.generation = $2 AND s.status = 'active' AND c.revoked_at IS NULL")
+            .bind(input.actor_service_id.to_string()).bind(input.actor_credential_generation).fetch_optional(&mut *tx).await?.ok_or(AppError::Forbidden)?;
         let scopes: Vec<String> =
             serde_json::from_str(&credential.try_get::<String, _>("scopes_json")?)
                 .map_err(|_| AppError::Internal)?;
@@ -213,8 +214,8 @@ impl Database {
             resulting_status: "failed".into(),
             created_at: now,
         };
-        let inserted = sqlx::query("INSERT INTO image_generation_quarantine_resolutions (id,tenant_id,request_id,actor_service_id,idempotency_hash,request_digest,expected_revision,action,confirmed_cost_micros,currency,evidence_digest,result_json,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT DO NOTHING")
-            .bind(result.resolution_id.to_string()).bind(&tenant_id).bind(input.request_id.to_string()).bind(input.actor_service_id.to_string()).bind(input.idempotency_hash).bind(digest).bind(input.expected_revision).bind(input.action).bind(input.confirmed_cost_micros).bind(input.currency).bind(input.evidence_digest).bind(serde_json::to_string(&result).map_err(|_| AppError::Internal)?).bind(now).execute(&mut *tx).await?;
+        let inserted = sqlx::query("INSERT INTO image_generation_quarantine_resolutions (id,tenant_id,request_id,actor_service_id,idempotency_hash,request_digest,expected_revision,action,confirmed_cost_micros,currency,evidence_digest,result_json,created_at,actor_credential_generation) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT DO NOTHING")
+            .bind(result.resolution_id.to_string()).bind(&tenant_id).bind(input.request_id.to_string()).bind(input.actor_service_id.to_string()).bind(input.idempotency_hash).bind(digest).bind(input.expected_revision).bind(input.action).bind(input.confirmed_cost_micros).bind(input.currency).bind(input.evidence_digest).bind(serde_json::to_string(&result).map_err(|_| AppError::Internal)?).bind(now).bind(input.actor_credential_generation).execute(&mut *tx).await?;
         if inserted.rows_affected() != 1 {
             return Err(AppError::Conflict(
                 "request or Idempotency-Key already resolved".into(),

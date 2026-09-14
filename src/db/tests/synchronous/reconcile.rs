@@ -98,6 +98,7 @@ impl Fixture {
             tenant_external_id: &self.tenant,
             request_id: self.request_id,
             actor_service_id: self.actor,
+            actor_credential_generation: 1,
             idempotency_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             expected_revision: &self.revision,
             action: "settle_confirmed",
@@ -361,6 +362,54 @@ async fn concurrent_image_resolution_has_one_receipt_and_one_charge() {
             .await
             .unwrap();
     assert_eq!(cost, 500);
+}
+
+#[tokio::test]
+async fn image_rotation_with_same_scopes_fences_old_authenticated_request_but_allows_fresh_replay()
+{
+    for replay in [false, true] {
+        let f = Fixture::new(true).await;
+        let receipt = if replay {
+            Some(
+                f.db.resolve_image_generation_quarantine(f.input())
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let rotated =
+            f.db.rotate_service_token(f.actor, "same-scopes-rotation", b"service test pepper")
+                .await
+                .unwrap();
+        assert_eq!(rotated.credential_generation, 2);
+        assert!(matches!(
+            f.db.resolve_image_generation_quarantine(f.input()).await,
+            Err(AppError::Forbidden)
+        ));
+        let mut fresh = f.input();
+        fresh.actor_credential_generation = 2;
+        let resolved =
+            f.db.resolve_image_generation_quarantine(fresh)
+                .await
+                .unwrap();
+        if let Some(receipt) = receipt {
+            assert_eq!(receipt, resolved);
+        }
+        let audited_generation: i64 = sqlx::query_scalar("SELECT actor_credential_generation FROM image_generation_quarantine_resolutions WHERE request_id = $1")
+            .bind(f.request_id.to_string()).fetch_one(&f.db.pool).await.unwrap();
+        assert_eq!(
+            audited_generation,
+            if replay { 1 } else { 2 },
+            "rotation replay does not rewrite original authorization evidence"
+        );
+        let receipts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM image_generation_quarantine_resolutions")
+                .fetch_one(&f.db.pool)
+                .await
+                .unwrap();
+        assert_eq!(receipts, 1);
+    }
 }
 
 #[tokio::test]

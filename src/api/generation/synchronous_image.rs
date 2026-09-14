@@ -96,9 +96,54 @@ pub(super) struct SyncImageRequest<'a> {
     pub(super) key_id: Uuid,
     pub(super) idempotency_key: Option<&'a str>,
     pub(super) tenant_id: Uuid,
-    pub(super) submission_armed: std::sync::atomic::AtomicBool,
+    pub(super) arm_state: std::sync::atomic::AtomicU8,
     pub(super) invalid_response: std::sync::atomic::AtomicBool,
     pub(super) confirmed_rejection: std::sync::atomic::AtomicBool,
+}
+
+pub(super) const ARM_NOT_STARTED: u8 = 0;
+pub(super) const ARM_PENDING: u8 = 1;
+pub(super) const ARM_CONFIRMED: u8 = 2;
+
+pub(super) async fn submission_may_have_started(
+    context: &SyncImageRequest<'_>,
+) -> Result<bool, AppError> {
+    use std::sync::atomic::Ordering;
+    match context.arm_state.load(Ordering::Acquire) {
+        ARM_NOT_STARTED => Ok(false),
+        ARM_CONFIRMED => Ok(true),
+        _ => match context
+            .state
+            .db
+            .confirm_synchronous_image_submission_started(
+                context.key_id,
+                context.request_id,
+                context.reservation.id,
+            )
+            .await
+        {
+            Ok(started) => {
+                context.arm_state.store(
+                    if started {
+                        ARM_CONFIRMED
+                    } else {
+                        ARM_NOT_STARTED
+                    },
+                    Ordering::Release,
+                );
+                Ok(started)
+            }
+            // Missing/changed ownership is not ours to refund or quarantine.
+            // Preserve that explicit conflict instead of inventing uncertainty
+            // for a request now owned or already settled by another worker.
+            Err(error @ (AppError::NotFound | AppError::Conflict(_))) => Err(error),
+            Err(error) => {
+                tracing::warn!(request_id=%context.request_id, error_category=error.diagnostic_category(),
+                    "image arm outcome could not be established; retaining uncertainty");
+                Ok(true)
+            }
+        },
+    }
 }
 
 fn uncertain_image_response(request_id: Uuid) -> Response {
@@ -218,12 +263,12 @@ pub(super) async fn execute_synchronous_image_request(
         Ok(request) => request,
         Err(_) => return fail_image_request(context, "upstream_credential_invalid").await,
     };
-    // Set before awaiting the transaction: cancellation while its commit is
-    // ambiguous must never run the pre-send refund path. Only an acknowledged
-    // arm permits the first and only network send.
+    // Pending is not proof of dispatch. After an error/cancelled wait, resolve
+    // this state through the serialized authoritative DB query before deciding
+    // whether zero-cost cleanup is safe. Only an acknowledged arm permits send.
     context
-        .submission_armed
-        .store(true, std::sync::atomic::Ordering::Release);
+        .arm_state
+        .store(ARM_PENDING, std::sync::atomic::Ordering::Release);
     state
         .db
         .arm_synchronous_image_submission(
@@ -233,6 +278,9 @@ pub(super) async fn execute_synchronous_image_request(
             context.reservation.id,
         )
         .await?;
+    context
+        .arm_state
+        .store(ARM_CONFIRMED, std::sync::atomic::Ordering::Release);
     let _upstream_activity = state.metrics.active_upstream(&route.driver, "image");
     let upstream_result = request.send().await;
     state.metrics.observe_upstream(
@@ -250,12 +298,15 @@ pub(super) async fn execute_synchronous_image_request(
                 is_connect = error.is_connect(),
                 "synchronous image upstream request failed"
             );
-            attempt
-                .complete(crate::api::MediaAttemptTerminal::Failed {
+            let terminal = if error.is_connect() {
+                crate::api::MediaAttemptTerminal::Failed {
                     kind: crate::db::UpstreamFailureKind::Connection,
                     reason: crate::metrics::UpstreamHealthReason::Connection,
-                })
-                .await;
+                }
+            } else {
+                crate::api::MediaAttemptTerminal::Inconclusive
+            };
+            attempt.complete(terminal).await;
             return fail_image_request(context, "upstream_connection").await;
         }
     };
@@ -472,9 +523,7 @@ async fn fail_image_request_with_staging(
     error_code: &str,
     result_lease: Option<&crate::archive_staging::ArchiveStagingWriteLease>,
 ) -> Result<Response, AppError> {
-    if context
-        .submission_armed
-        .load(std::sync::atomic::Ordering::Acquire)
+    if submission_may_have_started(context).await?
         && !context
             .confirmed_rejection
             .load(std::sync::atomic::Ordering::Acquire)

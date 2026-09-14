@@ -1,4 +1,6 @@
 use super::*;
+#[path = "reconciliation/actor_authority.rs"]
+mod actor_authority;
 #[path = "reconciliation/media_routing.rs"]
 mod media_routing;
 use axum::{
@@ -826,6 +828,7 @@ async fn postgres_quarantine_reconciliation_serializes_conflicting_decisions() {
         tenant_external_id: &tenant,
         job_id: job,
         actor_service_id: actor.service_id,
+        actor_credential_generation: actor.credential_generation,
         idempotency_hash: if first { &digest_a } else { &digest_b },
         expected_revision: &revision,
         action: "confirmed_submitted",

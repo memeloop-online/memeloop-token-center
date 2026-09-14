@@ -351,7 +351,7 @@ impl Database {
     ) -> Result<AuthenticatedService, AppError> {
         let parsed = crypto::parse_service_credential(value).ok_or(AppError::Unauthorized)?;
         let row = sqlx::query(
-            "SELECT p.status, c.secret_hash, c.scopes_json, c.tenant_external_id FROM service_principals p JOIN service_credentials c ON c.service_principal_id = p.id AND c.generation = p.credential_generation AND c.revoked_at IS NULL LEFT JOIN tenants t ON t.external_id = c.tenant_external_id WHERE p.id = $1 AND (c.tenant_external_id IS NULL OR t.status = 'active')",
+            "SELECT p.status, p.credential_generation, c.secret_hash, c.scopes_json, c.tenant_external_id FROM service_principals p JOIN service_credentials c ON c.service_principal_id = p.id AND c.generation = p.credential_generation AND c.revoked_at IS NULL LEFT JOIN tenants t ON t.external_id = c.tenant_external_id WHERE p.id = $1 AND (c.tenant_external_id IS NULL OR t.status = 'active')",
         )
         .bind(parsed.key_id.to_string())
         .fetch_optional(&self.pool)
@@ -373,6 +373,7 @@ impl Database {
         }
         Ok(AuthenticatedService {
             service_id: Some(parsed.key_id),
+            credential_generation: Some(row.try_get("credential_generation")?),
             scopes,
             tenant_external_id: row.try_get("tenant_external_id")?,
         })
@@ -483,6 +484,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(authenticated.service_id, Some(first.service_id));
+        assert_eq!(authenticated.credential_generation, Some(1));
         assert!(authenticated.allows("keys:write"));
         assert!(!authenticated.allows("prices:write"));
 
@@ -504,11 +506,15 @@ mod tests {
                 .await,
             Err(AppError::Unauthorized)
         ));
-        assert!(
-            database
-                .authenticate_service_token(&rotated.token, pepper)
-                .await
-                .is_ok()
+        let current = database
+            .authenticate_service_token(&rotated.token, pepper)
+            .await
+            .unwrap();
+        assert_eq!(current.credential_generation, Some(2));
+        assert_eq!(
+            authenticated.credential_generation,
+            Some(1),
+            "an in-flight authentication receipt must not silently become the replacement credential"
         );
     }
 

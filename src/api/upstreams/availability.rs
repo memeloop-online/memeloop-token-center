@@ -104,6 +104,7 @@ mod tests {
 
         let tenant_scoped_service = crate::model::AuthenticatedService {
             service_id: Some(uuid::Uuid::now_v7()),
+            credential_generation: Some(1),
             scopes: vec!["providers:read".to_owned(), "requests:read".to_owned()],
             tenant_external_id: Some("tenant-b".to_owned()),
         };

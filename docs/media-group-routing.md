@@ -42,6 +42,10 @@ key, and an explicit same-currency confirmed amount (zero for non-delivery).
 Resolution atomically audits and settles the original reservation, never
 resends the request and never fabricates a successful image. A ledger that
 cannot apply the exact confirmed amount rejects the whole resolution.
+Both image and async-job resolutions recheck the exact authenticated service
+credential generation under transaction locks, including on idempotent replay.
+Rotation revokes an in-flight old-credential decision even if the replacement
+has identical permissions; the audit retains the actual authorizing generation.
 Confirmed amounts are nonnegative integer micro-units capped at
 9,007,199,254,740,991 (the API/UI exact-integer bound); accounting additions
 are checked before mutation, and any overflow or budget shortfall rolls back.
