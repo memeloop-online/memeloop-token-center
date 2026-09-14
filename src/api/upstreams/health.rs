@@ -12,13 +12,33 @@ fn health_probe_error(driver: &str, status: StatusCode) -> Option<&'static str> 
     }
 }
 
-fn health_probe_transport_error(proxy_configured: bool, preparing: bool) -> &'static str {
-    match (proxy_configured, preparing) {
-        (true, true) => "proxy_destination_invalid",
-        (true, false) => "proxy_connection_failed",
-        (false, true) => "destination_invalid",
-        (false, false) => "connection_failed",
+fn health_probe_transport_error(proxy_configured: bool) -> &'static str {
+    if proxy_configured {
+        "proxy_connection_failed"
+    } else {
+        "connection_failed"
     }
+}
+
+fn suppressed_health_body(
+    account_id: Uuid,
+    failure: &str,
+    retry_at: i64,
+    checked_at: i64,
+) -> Value {
+    let error_code = match failure {
+        "quota_exhausted" => "quota_exhausted",
+        "rate_limited" => "rate_limited",
+        _ => "upstream_unavailable",
+    };
+    json!({
+        "account_id": account_id,
+        "status": "unhealthy",
+        "error_code": error_code,
+        "retry_at": retry_at,
+        "source": "routing_state",
+        "checked_at": checked_at
+    })
 }
 
 fn upstream_health_probe_url(driver: &str, config: &Value, base_url: &str) -> String {
@@ -94,19 +114,9 @@ pub(in crate::api) async fn probe_upstream_health(
         .await
     {
         Ok(Some((failure, retry_at))) => {
-            let error_code = match failure.as_str() {
-                "quota_exhausted" => "quota_exhausted",
-                "rate_limited" => "rate_limited",
-                _ => "upstream_unavailable",
-            };
-            return Ok(Json(json!({
-                "account_id": account_id,
-                "status": "unhealthy",
-                "error_code": error_code,
-                "retry_at": retry_at,
-                "source": "routing_state",
-                "checked_at": checked_at
-            })));
+            return Ok(Json(suppressed_health_body(
+                account_id, &failure, retry_at, checked_at,
+            )));
         }
         Ok(None) => {}
         Err(_) => {
@@ -158,7 +168,7 @@ pub(in crate::api) async fn probe_upstream_health(
             return Ok(Json(json!({
                 "account_id": account_id,
                 "status": "unhealthy",
-                "error_code": health_probe_transport_error(proxy_configured, true),
+                "error_code": "destination_invalid",
                 "checked_at": unix_millis()
             })));
         }
@@ -210,6 +220,41 @@ pub(in crate::api) async fn probe_upstream_health(
             // copied into logs or the management response.
             let upstream_status = response.status();
             let error_code = health_probe_error(&account.driver, upstream_status);
+            if error_code.is_none() {
+                // A request that began while the account was healthy can race
+                // with a routed generation failure. Re-read the same account
+                // and credential generation before reporting healthy; this
+                // never acquires a lease or changes the breaker.
+                let completed_at = unix_millis();
+                match state
+                    .db
+                    .upstream_manual_health_suppression(
+                        account_id,
+                        account.credential_generation,
+                        completed_at,
+                    )
+                    .await
+                {
+                    Ok(Some((failure, retry_at))) => {
+                        return Ok(Json(suppressed_health_body(
+                            account_id,
+                            &failure,
+                            retry_at,
+                            completed_at,
+                        )));
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        return Ok(Json(json!({
+                            "account_id": account_id,
+                            "status": "unhealthy",
+                            "error_code": "health_state_unavailable",
+                            "source": "local_state",
+                            "checked_at": completed_at
+                        })));
+                    }
+                }
+            }
             let healthy = error_code.is_none();
             Ok(Json(json!({
                 "account_id": account_id,
@@ -224,7 +269,7 @@ pub(in crate::api) async fn probe_upstream_health(
         Err(_) => Ok(Json(json!({
             "account_id": account_id,
             "status": "unhealthy",
-            "error_code": health_probe_transport_error(proxy_configured, false),
+            "error_code": health_probe_transport_error(proxy_configured),
             "latency_ms": latency_ms,
             "checked_at": checked_at
         }))),
@@ -239,20 +284,9 @@ mod tests {
 
     #[test]
     fn probe_transport_errors_keep_proxy_and_direct_paths_distinct() {
+        assert_eq!(health_probe_transport_error(false), "connection_failed");
         assert_eq!(
-            health_probe_transport_error(false, true),
-            "destination_invalid"
-        );
-        assert_eq!(
-            health_probe_transport_error(false, false),
-            "connection_failed"
-        );
-        assert_eq!(
-            health_probe_transport_error(true, true),
-            "proxy_destination_invalid"
-        );
-        assert_eq!(
-            health_probe_transport_error(true, false),
+            health_probe_transport_error(true),
             "proxy_connection_failed"
         );
     }

@@ -10,7 +10,6 @@ export function manualHealthLabel(health: UpstreamHealth) {
     case 'rate_limited': return 'providers.healthRateLimited';
     case 'upstream_unavailable': return 'providers.healthUnavailable';
     case 'health_state_unavailable': return 'providers.healthStateUnavailable';
-    case 'proxy_destination_invalid': return 'providers.healthProxyDestinationInvalid';
     case 'proxy_connection_failed': return 'providers.healthProxyConnectionFailed';
     case 'destination_invalid': return 'providers.healthDestinationInvalid';
     case 'connection_failed': return 'providers.healthConnectionFailed';
