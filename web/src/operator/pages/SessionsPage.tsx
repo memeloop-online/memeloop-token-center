@@ -71,7 +71,7 @@ export function SessionsPage({ token, tenant, focus, revision, eventKeyIds, stre
   return <>
     {scopedError && <div className="notice error" role="alert">{scopedError}</div>}
     {streamError && <div className="notice error" role="alert">{streamError}</div>}
-    <article className="panel">
+    <article className="panel sessions-page">
       <div className="panel-title traffic-heading"><div><h2>{t('sessions.recent')}</h2><span>{t('sessions.monitorHint')}</span></div><div className="segmented" role="group" aria-label={t('sessions.monitorMode')}><button type="button" aria-pressed="false" onClick={onOpenRequests}>{t('sessions.requestsMode')}</button><button type="button" className="active" aria-pressed="true">{t('sessions.sessionsMode')}</button></div></div>
       <SessionMonitor
         token={token}

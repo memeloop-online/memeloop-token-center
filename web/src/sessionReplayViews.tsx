@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { Disclosure } from './design-system';
 import {
   projectSessionReplay,
   SESSION_REPLAY_MAX_REQUESTS,
@@ -52,10 +53,9 @@ function ArchiveText({ value, kind, t }: { value: string; kind: 'message' | 'too
   if (value.length <= REPLAY_EXPAND_TEXT_LENGTH) return body;
   return <>
     {!expanded && <p className={`session-replay-preview ${kind}`}>{value}</p>}
-    <details className={`session-replay-expand ${kind}`} onToggle={(event) => setExpanded(event.currentTarget.open)}>
-      <summary>{expanded ? t('sessionReplay.collapse') : t('sessionReplay.expand', { count: value.length.toLocaleString() })}</summary>
+    <div className={`session-replay-expand ${kind}`}><Disclosure open={expanded} onOpenChange={setExpanded} title={expanded ? t('sessionReplay.collapse') : t('sessionReplay.expand', { count: value.length.toLocaleString() })}>
       {body}
-    </details>
+    </Disclosure></div>
   </>;
 }
 
@@ -76,13 +76,13 @@ function EntryContent({ entry, t }: { entry: ReplayEntry; t: Translate }) {
     <header><b>{t('sessionReplay.toolCall')}</b><span>{item.body === 'request' ? t('request.request') : t('request.response')}</span></header>
     <p className="session-replay-tool-name">{item.name ?? t('sessionReplay.unknown')}</p>
     {item.pairing !== 'paired' && <small className="session-replay-flag">{t(`sessionReplay.pairing.${item.pairing}`)}</small>}
-    <details className="session-replay-technical"><summary>{t('request.technicalDetails')}</summary>
+    <Disclosure title={t('request.technicalDetails')}>
       <dl>
         <div><dt>{t('sessionReplay.callId')}</dt><dd><code>{item.callId ?? t('sessionReplay.unknown')}</code></dd></div>
         <div><dt>{t('sessionReplay.pairing')}</dt><dd>{t(`sessionReplay.pairing.${item.pairing}`)}</dd></div>
       </dl>
       <ArchiveText kind="tool" t={t} value={item.arguments ?? unknownLabel(t, item.unknownFields.includes('arguments') ? 'missing_text' : null)} />
-    </details>
+    </Disclosure>
     {item.truncated && <small className="session-replay-flag">{t('sessionReplay.truncated')}</small>}
   </article>;
 
@@ -91,12 +91,12 @@ function EntryContent({ entry, t }: { entry: ReplayEntry; t: Translate }) {
     {item.name && <p className="session-replay-tool-name">{item.name}</p>}
     <ArchiveText kind="tool" t={t} value={item.output ?? unknownLabel(t, item.unknownFields.includes('output') ? 'missing_text' : null)} />
     {item.pairing !== 'paired' && <small className="session-replay-flag">{t(`sessionReplay.pairing.${item.pairing}`)}</small>}
-    <details className="session-replay-technical"><summary>{t('request.technicalDetails')}</summary>
+    <Disclosure title={t('request.technicalDetails')}>
       <dl>
         <div><dt>{t('sessionReplay.callId')}</dt><dd><code>{item.callId ?? t('sessionReplay.unknown')}</code></dd></div>
         <div><dt>{t('sessionReplay.pairing')}</dt><dd>{t(`sessionReplay.pairing.${item.pairing}`)}</dd></div>
       </dl>
-    </details>
+    </Disclosure>
     {item.truncated && <small className="session-replay-flag">{t('sessionReplay.truncated')}</small>}
   </article>;
 }
