@@ -146,7 +146,7 @@
                   "required": ["api_version", "flow_kind", "login_url", "poll_url", "refresh_url"],
                   "properties": {
                     "api_version": { "const": "oauth-adapter-v1" },
-                    "flow_kind": { "const": "cursor_pkce" },
+                    "flow_kind": { "enum": ["cursor_pkce", "authorization_code_pkce"] },
                     "login_url": { "type": "string", "format": "uri" },
                   "poll_url": { "type": "string", "format": "uri" },
                   "refresh_url": { "type": "string", "format": "uri" }

@@ -2064,6 +2064,74 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '502': { $ref: '#/components/responses/UpstreamError' }
 
+  /internal/v1/oauth/authorization-code/start:
+    post:
+      tags: [Upstream providers]
+      operationId: startProviderAuthorizationCode
+      summary: Start standard PKCE authorization for a provider contribution
+      security: [{ serviceBearer: [] }]
+      x-required-scope: oauth:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StartProviderAuthorizationCodeRequest' }
+      responses:
+        '200':
+          description: Authorization URL and encrypted revision-bound session; global operator only.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [driver, login_url, session_token, expires_at, recovery_expires_at]
+                properties:
+                  driver: { type: string }
+                  login_url: { type: string, format: uri }
+                  session_token: { type: string, writeOnly: true }
+                  expires_at: { type: integer, format: int64 }
+                  recovery_expires_at: { type: integer, format: int64, description: Deadline for already-issued result finalization only; does not extend code exchange. }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /internal/v1/oauth/authorization-code/complete:
+    post:
+      tags: [Upstream providers]
+      operationId: completeProviderAuthorizationCode
+      summary: Complete a revision-bound standard OAuth session
+      security: [{ serviceBearer: [] }]
+      x-required-scope: oauth:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [session_token, callback_url]
+              properties:
+                session_token: { type: string, writeOnly: true }
+                callback_url: { type: string, format: uri, writeOnly: true }
+      responses:
+        '200':
+          description: Completed session replay.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
+        '201':
+          description: Upstream account created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
+        '202':
+          description: Another completion owns the session lease.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthPending' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
   /internal/v1/oauth/claude/start:
     post:
       tags: [Upstream providers]
@@ -6452,6 +6520,27 @@ components:
           maxLength: 2048
           writeOnly: true
           description: Required for a new account and must be a private IP-literal SOCKS5H endpoint. Reauthorization must omit it and reuses the existing encrypted account proxy.
+    StartProviderAuthorizationCodeRequest:
+      type: object
+      additionalProperties: false
+      required: [account_name, provider_driver, provider_config]
+      properties:
+        tenant_external_id: { type: string, default: default }
+        account_name: { type: string, minLength: 1, maxLength: 200 }
+        provider_driver: { type: string }
+        provider_config: { type: object }
+        proxy_url: { type: string, writeOnly: true }
+        proxy_network_scope: { type: string, enum: [private] }
+        client:
+          type: object
+          additionalProperties: false
+          required: [client_id, redirect_uri, scopes]
+          description: Overrides deployment Secret defaults from MTC_PROVIDER_OAUTH_CLIENT_DEFAULTS_JSON.
+          properties:
+            client_id: { type: string }
+            redirect_uri: { type: string, format: uri }
+            scopes: { type: array, items: { type: string }, minItems: 1, maxItems: 32 }
+            client_secret: { type: string, writeOnly: true }
     StartClaudeOAuthRequest:
       type: object
       additionalProperties: false

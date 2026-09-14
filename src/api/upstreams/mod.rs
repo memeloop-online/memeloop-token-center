@@ -7,6 +7,7 @@ mod health;
 mod models;
 mod native_oauth_import;
 mod oauth;
+mod oauth_authorization_code;
 mod oauth_claude;
 mod oauth_copilot;
 mod proxy_settings;
@@ -43,6 +44,9 @@ pub(crate) use oauth::refresh_managed_upstream_oauth_for_worker;
 pub(in crate::api) use oauth::{
     disconnect_upstream_oauth, poll_codex_oauth, poll_cursor_oauth, refresh_upstream_oauth,
     start_codex_oauth, start_cursor_oauth, start_provider_adapter_oauth,
+};
+pub(in crate::api) use oauth_authorization_code::{
+    complete_authorization_code_oauth, start_authorization_code_oauth,
 };
 pub(in crate::api) use oauth_claude::{complete_claude_oauth, start_claude_oauth};
 pub(crate) use oauth_copilot::trigger_copilot_remint_on_auth_failure;

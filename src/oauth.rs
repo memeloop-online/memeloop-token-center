@@ -4,6 +4,7 @@ use uuid::Uuid;
 use crate::{db::Database, error::AppError};
 
 mod adapter;
+pub mod authorization_code;
 pub mod claude;
 pub mod codex_device;
 pub mod copilot;

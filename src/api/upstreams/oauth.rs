@@ -824,6 +824,24 @@ async fn refresh_managed_upstream_oauth_impl(
             ));
         }
         let refreshed = match driver.as_str() {
+            crate::oauth::authorization_code::FLOW => {
+                let adapter = state
+                    .providers
+                    .get(&account.driver)
+                    .and_then(|provider| provider.oauth_adapter.as_ref())
+                    .ok_or_else(|| {
+                        AppError::Conflict("OAuth provider contribution is unavailable".into())
+                    })?;
+                crate::oauth::authorization_code::refresh(
+                    &state.http,
+                    &credential,
+                    adapter,
+                    unix_millis(),
+                    state.config.allow_oauth_loopback,
+                    &request_guard,
+                )
+                .await?
+            }
             crate::oauth::claude::OAUTH_DRIVER => {
                 crate::oauth::claude::refresh_claude_credential(
                     &state.http,
@@ -936,7 +954,9 @@ async fn refresh_managed_upstream_oauth_impl(
 fn supports_oauth_refresh_proxy(driver: &str) -> bool {
     matches!(
         driver,
-        crate::oauth::codex_device::OAUTH_DRIVER | crate::oauth::managed::kimi::PROVIDER_DRIVER
+        crate::oauth::codex_device::OAUTH_DRIVER
+            | crate::oauth::managed::kimi::PROVIDER_DRIVER
+            | crate::oauth::authorization_code::FLOW
     )
 }
 
@@ -951,6 +971,9 @@ mod oauth_proxy_tests {
         ));
         assert!(supports_oauth_refresh_proxy(
             crate::oauth::managed::kimi::PROVIDER_DRIVER
+        ));
+        assert!(supports_oauth_refresh_proxy(
+            crate::oauth::authorization_code::FLOW
         ));
         for driver in [
             crate::oauth::claude::OAUTH_DRIVER,
