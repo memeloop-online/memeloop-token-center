@@ -1,6 +1,7 @@
 import { createRoot } from 'react-dom/client';
 import { useState } from 'react';
 import { I18nProvider } from '../../src/i18n';
+import { MtcFluentProvider } from '../../src/design-system/MtcFluentProvider';
 import { TypedFilterBuilder } from '../../src/operator/TypedFilterBuilder';
 import { SystemSettingsPage } from '../../src/operator/pages/SystemSettingsPage';
 import type { ModelRouteView, TypedFilterAst, UpstreamAccount } from '../../src/types';
@@ -56,27 +57,42 @@ const projection = {
     { selection: { kind: 'route', route_id: 'route-custom' }, value: 'route-custom', label: 'friendly-custom-chat', sources: [source({ routeId: 'route-custom', accountId: 'a', accountLabel: 'Research account', providerId: 'provider-a', providerLabel: 'provider-a', status: 'never_observed', listed: false, upstreamModel: 'friendly-custom-chat' })] },
   ],
 };
+const control = { delaySave: false, delayBilling: false, pendingBilling: '', failBilling: false, writes: 0, releaseSave: () => {}, releaseBilling: () => {} };
+Object.assign(window, { settingsFixture: control });
 globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url, location.origin);
   if (init?.method && init.method !== 'GET') await (window as unknown as { recordModelPickerWrite?: (path: string) => Promise<void> }).recordModelPickerWrite?.(url.pathname);
+  if (url.pathname.endsWith('/filter-assistant/settings') && init?.method === 'PUT') {
+    control.writes += 1;
+    if (control.delaySave) await new Promise<void>((resolve) => { control.releaseSave = resolve; });
+    return Response.json({ ...JSON.parse(String(init.body)), updated_at: 99 });
+  }
+  if (url.pathname.endsWith('/billing-choices')) {
+    const route = url.searchParams.get('model_route_id');
+    if (control.delayBilling) await new Promise<void>((resolve) => { control.pendingBilling = route ?? ''; control.releaseBilling = resolve; });
+    if (control.failBilling) return Response.json({ error: { message: 'Billing unavailable' } }, { status: 503 });
+    return Response.json({ data: [{ key_id: `key-${route}`, alias: `Budget ${route}`, principal: 'Research team' }], next_cursor: null });
+  }
   const values: Record<string, unknown> = {
     '/internal/v1/upstreams': accounts,
     '/internal/v1/model-routes': routes,
     '/internal/v1/model-picker-options': projection,
     '/internal/v1/provider-groups': groups,
     '/internal/v1/filter-presets': { named: [], recent: [] },
-    '/internal/v1/filter-assistant/settings': { model_route_id: 'route-custom', updated_at: Date.now() },
+    '/internal/v1/filter-assistant/settings': { model_route_id: url.searchParams.get('tenant_external_id') === 'other' ? 'route-b' : 'route-custom', updated_at: 1 },
   };
   return new Response(JSON.stringify(values[url.pathname] ?? {}), { status: Object.hasOwn(values, url.pathname) ? 200 : 404, headers: { 'Content-Type': 'application/json' } });
 };
 function Fixture() {
   const [ast, setAst] = useState<TypedFilterAst>({ logical_operator: 'and', conditions: [] });
   const [outside, setOutside] = useState(0);
+  const [tenant, setTenant] = useState('tenant');
   return <main style={{ padding: 12 }}>
     <button type="button" data-outside onClick={() => setOutside((value) => value + 1)}>Outside {outside}</button>
     <TypedFilterBuilder ast={ast} onApply={setAst} onClear={() => setAst({ logical_operator: 'and', conditions: [] })} token="fixture" tenant="tenant" scope="requests" upstreams={accounts} />
     <output data-filter-model>{ast.conditions.find((condition) => condition.field === 'model')?.value.value}</output>
-    <SystemSettingsPage token="fixture" tenant="tenant" />
+    <button data-switch-scope type="button" onClick={() => setTenant('other')}>Switch scope</button>
+    <SystemSettingsPage token="fixture" tenant={tenant} />
   </main>;
 }
-createRoot(document.getElementById('root')!).render(<I18nProvider><Fixture /></I18nProvider>);
+createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><Fixture /></MtcFluentProvider></I18nProvider>);
