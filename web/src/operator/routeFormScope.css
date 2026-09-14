@@ -1,0 +1,5 @@
+.route-protocol-field { display: grid; gap: 4px; min-width: 0; }
+.route-protocol-heading { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: center; justify-content: flex-start; }
+.route-protocol-heading > label { margin: 0; }
+.route-scope-item { display: block; overflow-wrap: anywhere; }
+.route-scope-item + .route-scope-item { margin-top: 4px; }
