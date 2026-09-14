@@ -47,6 +47,7 @@ pub(super) struct ChatSseUsageState {
     usage: Option<TokenUsage>,
     done: bool,
     invalid: bool,
+    invalid_reason: Option<&'static str>,
 }
 
 impl Default for ChatSseUsageState {
@@ -64,18 +65,28 @@ impl Default for ChatSseUsageState {
             usage: None,
             done: false,
             invalid: false,
+            invalid_reason: None,
         }
     }
 }
 
 impl ChatSseUsageState {
+    fn invalidate(&mut self, reason: &'static str) {
+        self.invalid = true;
+        self.invalid_reason.get_or_insert(reason);
+    }
+
+    pub(super) fn invalid_reason(&self) -> Option<&'static str> {
+        self.invalid_reason
+    }
+
     pub(super) fn observe_data(&mut self, data: &[u8]) -> ChatSseDeliveryClass {
         let Ok(chunk) = serde_json::from_slice::<CanonicalChatChunk>(data) else {
-            self.invalid = true;
+            self.invalidate("chat_chunk_schema");
             return ChatSseDeliveryClass::Billable;
         };
         if self.done || !self.observe_envelope(&chunk) {
-            self.invalid = true;
+            self.invalidate("chat_envelope_or_post_done");
             return ChatSseDeliveryClass::Billable;
         }
         if chunk.choices.is_empty() {
@@ -104,7 +115,7 @@ impl ChatSseUsageState {
             || self.seen_choice_indices != self.expected_choice_indices
             || self.finished_choice_indices != self.expected_choice_indices
         {
-            self.invalid = true;
+            self.invalidate("chat_done_missing_usage_or_finished_choices");
         }
         self.done = true;
     }
@@ -166,7 +177,7 @@ impl ChatSseUsageState {
         choices: &[CanonicalChatChoice],
     ) {
         if self.usage.is_some() || usage.is_some() {
-            self.invalid = true;
+            self.invalidate("chat_usage_on_choice_or_choice_after_usage");
             return;
         }
         let mut frame_indices = BTreeSet::new();
@@ -174,7 +185,7 @@ impl ChatSseUsageState {
             if !self.expected_choice_indices.contains(&choice.index)
                 || !frame_indices.insert(choice.index)
             {
-                self.invalid = true;
+                self.invalidate("chat_choice_index");
                 return;
             }
             match choice.finish_reason.as_deref() {
@@ -186,7 +197,7 @@ impl ChatSseUsageState {
                         && self.seen_choice_indices.contains(&choice.index)
                         && self.finished_choice_indices.insert(choice.index) => {}
                 _ => {
-                    self.invalid = true;
+                    self.invalidate("chat_finish_sequence");
                     return;
                 }
             }
@@ -198,12 +209,12 @@ impl ChatSseUsageState {
             || self.seen_choice_indices != self.expected_choice_indices
             || self.finished_choice_indices != self.expected_choice_indices
         {
-            self.invalid = true;
+            self.invalidate("chat_usage_sequence");
             return;
         }
         match usage.and_then(|usage| canonical_chat_usage(usage, self.service_tier.clone())) {
             Some(usage) => self.usage = Some(usage),
-            None => self.invalid = true,
+            None => self.invalidate("chat_usage_invalid"),
         }
     }
 }

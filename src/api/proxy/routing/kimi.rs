@@ -39,33 +39,64 @@ struct StreamState {
     pending: VecDeque<Result<Bytes, &'static str>>,
     terminal: bool,
     failed: bool,
+    diagnostic: crate::api::proxy_diagnostics::Context,
+    event_class: &'static str,
+    usage_observed: bool,
+    done_observed: bool,
 }
 
 impl StreamState {
-    fn observe(&mut self, chunk: &[u8]) -> Result<(), ()> {
+    fn report_failure(&self, stage: &'static str, reason: &'static str) {
+        report_failure(
+            self.diagnostic,
+            stage,
+            reason,
+            self.event_class,
+            self.usage_observed,
+            self.done_observed,
+        );
+    }
+
+    fn observe(&mut self, chunk: &[u8]) -> Result<(), &'static str> {
         let framed = self.framer.push(chunk);
-        if framed.rejection.is_some() {
-            return Err(());
+        if let Some(rejection) = framed.rejection {
+            return Err(rejection.error_code());
         }
         for frame in framed.events {
-            let (_, data) = parse_sse_event(&frame).map_err(|_| ())?;
+            self.event_class = "sse";
+            let (_, data) = parse_sse_event(&frame).map_err(|_| "sse_field_invalid")?;
             let Some(data) = data else {
                 continue;
             };
             if self.terminal {
-                return Err(());
+                return Err("data_after_done");
             }
             if data == b"[DONE]" {
+                self.event_class = "done";
+                self.done_observed = true;
                 self.usage.observe_done();
                 if self.usage.usage_invalid() {
-                    return Err(());
+                    return Err(self
+                        .usage
+                        .invalid_reason()
+                        .unwrap_or("chat_terminal_usage_invalid"));
                 }
                 self.terminal = true;
                 // Hold completed until EOF. An error after [DONE] must not be
                 // laundered into a completed Responses generation.
             } else {
+                self.event_class = "json";
                 self.usage.observe_data(&data);
-                let value = crate::api::sse::parse_unique_json(&data).map_err(|_| ())?;
+                let value =
+                    crate::api::sse::parse_unique_json(&data).map_err(|_| "json_invalid")?;
+                self.usage_observed |= !value["usage"].is_null();
+                self.event_class = if !value["error"].is_null() {
+                    "provider_error"
+                } else if value["choices"].as_array().is_some_and(Vec::is_empty) {
+                    "usage_or_control"
+                } else {
+                    "choice"
+                };
                 let events = self.translator.observe(&value)?;
                 self.pending
                     .extend(events.into_iter().map(|event| Ok(Bytes::from(event))));
@@ -73,6 +104,21 @@ impl StreamState {
         }
         Ok(())
     }
+}
+
+fn report_failure(
+    context: crate::api::proxy_diagnostics::Context,
+    stage: &'static str,
+    reason: &'static str,
+    event_class: &'static str,
+    usage_observed: bool,
+    done_observed: bool,
+) {
+    // All labels are code-owned. Never emit provider text, JSON, or serde errors.
+    tracing::warn!(phase = "kimi_response_translation", request_id = %context.request_id,
+        request_elapsed_ms = context.elapsed_millis_at(std::time::Instant::now()),
+        stage, error_kind = reason, event_class, usage_observed, done_observed,
+        "Kimi response translation failed");
 }
 
 pub(in crate::api::proxy) fn translate(
@@ -83,6 +129,7 @@ pub(in crate::api::proxy) fn translate(
     if !response.status().is_success() {
         return Ok(response.into());
     }
+    let diagnostic = crate::api::proxy_diagnostics::Context::current();
     let mut parts = UpstreamResponse::from(response).into_parts();
     if parts
         .headers
@@ -90,6 +137,14 @@ pub(in crate::api::proxy) fn translate(
         .iter()
         .any(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
     {
+        report_failure(
+            diagnostic,
+            "headers",
+            "content_encoding_invalid",
+            "none",
+            false,
+            false,
+        );
         return Err(ProxySendError::AmbiguousResponse(
             "upstream_invalid_content_encoding",
         ));
@@ -102,11 +157,27 @@ pub(in crate::api::proxy) fn translate(
         .unwrap_or("")
         .trim();
     if streaming && !media_type.eq_ignore_ascii_case("text/event-stream") {
+        report_failure(
+            diagnostic,
+            "headers",
+            "content_type_invalid",
+            "none",
+            false,
+            false,
+        );
         return Err(ProxySendError::AmbiguousResponse(
             "upstream_invalid_response",
         ));
     }
     if !streaming && !media_type.eq_ignore_ascii_case("application/json") {
+        report_failure(
+            diagnostic,
+            "headers",
+            "content_type_invalid",
+            "none",
+            false,
+            false,
+        );
         return Err(ProxySendError::AmbiguousResponse(
             "upstream_invalid_response",
         ));
@@ -123,6 +194,10 @@ pub(in crate::api::proxy) fn translate(
             pending: VecDeque::new(),
             terminal: false,
             failed: false,
+            diagnostic,
+            event_class: "none",
+            usage_observed: false,
+            done_observed: false,
         };
         Box::pin(futures_util::stream::unfold(
             state,
@@ -136,26 +211,39 @@ pub(in crate::api::proxy) fn translate(
                     }
                     match state.upstream.next().await {
                         Some(Ok(chunk)) => {
-                            if state.observe(&chunk).is_err() {
+                            if let Err(reason) = state.observe(&chunk) {
+                                state.report_failure("observe", reason);
                                 state.pending.clear();
                                 state.failed = true;
                                 return Some((Err(UPSTREAM_STREAM_ERROR), state));
                             }
                         }
                         Some(Err(error)) => {
+                            state.report_failure("body_read", "transport_body_error");
                             state.failed = true;
                             return Some((Err(error), state));
                         }
                         None => {
                             state.failed = true;
                             if !state.terminal || !state.framer.is_complete() {
+                                state.report_failure(
+                                    "eof",
+                                    if !state.framer.is_complete() {
+                                        "sse_frame_incomplete"
+                                    } else {
+                                        "done_missing"
+                                    },
+                                );
                                 return Some((Err(UPSTREAM_STREAM_ERROR), state));
                             }
                             match state.translator.finish() {
                                 Ok(events) => state
                                     .pending
                                     .extend(events.into_iter().map(|event| Ok(Bytes::from(event)))),
-                                Err(()) => return Some((Err(UPSTREAM_STREAM_ERROR), state)),
+                                Err(reason) => {
+                                    state.report_failure("eof", reason);
+                                    return Some((Err(UPSTREAM_STREAM_ERROR), state));
+                                }
                             }
                         }
                     }
@@ -164,28 +252,46 @@ pub(in crate::api::proxy) fn translate(
         )) as UpstreamByteStream
     } else {
         Box::pin(futures_util::stream::once(async move {
-            let mut upstream = parts.stream;
-            let mut body = Vec::new();
-            while let Some(chunk) = upstream.next().await {
-                let chunk = chunk?;
-                if body.len().saturating_add(chunk.len()) > MAX_PROXY_RESPONSE_BODY {
-                    return Err(UPSTREAM_STREAM_ERROR);
+            let mut usage_observed = false;
+            let result: Result<Bytes, &'static str> = async {
+                let mut upstream = parts.stream;
+                let mut body = Vec::new();
+                while let Some(chunk) = upstream.next().await {
+                    let chunk = chunk.map_err(|_| "transport_body_error")?;
+                    if body.len().saturating_add(chunk.len()) > MAX_PROXY_RESPONSE_BODY {
+                        return Err("buffered_body_limit");
+                    }
+                    body.extend_from_slice(&chunk);
                 }
-                body.extend_from_slice(&chunk);
+                body.shrink_to_fit();
+                if !crate::gateway_body::memory::bounded_json_fits(
+                    &body,
+                    MAX_PROXY_RESPONSE_BODY * 3,
+                ) {
+                    return Err("buffered_json_memory_limit");
+                }
+                let value =
+                    crate::api::sse::parse_unique_json(&body).map_err(|_| "json_invalid")?;
+                usage_observed = !value["usage"].is_null();
+                drop(body);
+                let response = responses::buffered(&context, &value)?;
+                drop(value);
+                serde_json::to_vec(&response)
+                    .map(Bytes::from)
+                    .map_err(|_| "event_serialization")
             }
-            body.shrink_to_fit();
-            if !crate::gateway_body::memory::bounded_json_fits(&body, MAX_PROXY_RESPONSE_BODY * 3) {
-                return Err(UPSTREAM_STREAM_ERROR);
-            }
-            let value =
-                crate::api::sse::parse_unique_json(&body).map_err(|_| UPSTREAM_STREAM_ERROR)?;
-            drop(body);
-            let response =
-                responses::buffered(&context, &value).map_err(|_| UPSTREAM_STREAM_ERROR)?;
-            drop(value);
-            serde_json::to_vec(&response)
-                .map(Bytes::from)
-                .map_err(|_| UPSTREAM_STREAM_ERROR)
+            .await;
+            result.map_err(|reason| {
+                report_failure(
+                    diagnostic,
+                    "buffered",
+                    reason,
+                    "buffered",
+                    usage_observed,
+                    false,
+                );
+                UPSTREAM_STREAM_ERROR
+            })
         }))
     };
     parts.headers.insert(
@@ -204,6 +310,10 @@ pub(in crate::api::proxy) fn translate(
         stream: translated,
     })
 }
+
+#[cfg(test)]
+#[path = "kimi_diagnostics_tests.rs"]
+mod diagnostics_tests;
 
 #[cfg(test)]
 mod tests {
