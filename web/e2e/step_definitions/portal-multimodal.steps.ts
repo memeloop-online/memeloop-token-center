@@ -320,8 +320,11 @@ Then('生成任务取消请求包含明确租户且页面显示已取消', async
   const cancellation = operatorGenerationCancellations.get(this);
   assert.equal(cancellation?.status, 200);
   assert.equal(cancellation?.body.status, 'cancelled');
-  await assertContains(page.getByRole('status'), '已提交取消请求');
+  await assertContains(page.locator('.drawer').getByRole('status'), '已提交取消请求');
+  await page.locator('.drawer').getByRole('button', { name: '关闭', exact: true }).click();
+  await page.locator('.drawer').waitFor({ state: 'detached' });
   const panel = page.locator('.operator-generations');
+  assert.equal(await panel.evaluate(element => !!element.closest('[inert], [aria-hidden="true"]')), false, 'closing restores the generation page after the confirmed action');
   await assertContains(panel, '已取消');
   this.assertNoBrowserFailures();
 });
