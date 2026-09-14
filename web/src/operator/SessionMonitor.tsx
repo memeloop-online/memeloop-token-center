@@ -379,7 +379,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     <div className={`session-live-state ${status}`} role="status">{t(`sessions.live.${status}`)}</div>
     <form className="session-controls" onSubmit={(event) => { event.preventDefault(); setFilters({ ...draft }); }}>
       <label>{t('sessions.search')}<input value={draft.q} onChange={(event) => setDraft({ ...draft, q: event.target.value })} placeholder={t('sessions.searchPlaceholder')} /></label>
-      <SessionCredentialFilter value={draft.keyId} sessions={visibleSessions} onChange={(keyId) => setDraft({ ...draft, keyId })} />
+      <SessionCredentialFilter value={draft.keyId} sessions={visibleSessions} token={token} tenant={tenant} onChange={(keyId) => setDraft({ ...draft, keyId })} />
       <label>{t('request.model')}<input value={draft.model} onChange={(event) => setDraft({ ...draft, model: event.target.value })} /></label>
       <label>{t('sessions.state')}<select value={draft.state} onChange={(event) => setDraft({ ...draft, state: event.target.value as SessionFilters['state'] })}><option value="">{t('common.all')}</option><option value="active">{t('sessions.filter.active')}</option><option value="has_errors">{t('sessions.filter.hasErrors')}</option></select></label>
       <div className="filter-actions"><button type="submit" disabled={loading}>{t('traffic.applyFilters')}</button><button type="button" className="secondary" disabled={loading || !Object.values(filters).some(Boolean)} onClick={() => { setDraft(emptySessionFilters); setFilters(emptySessionFilters); }}>{t('traffic.clearFilters')}</button></div>
