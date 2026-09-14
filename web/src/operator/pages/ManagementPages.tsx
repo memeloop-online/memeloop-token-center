@@ -36,7 +36,7 @@ import { providerConnectionCopy } from '../providerConnectionCopy';
 import { providerFormWidgets } from '../ProviderFormWidgets';
 import { appHref } from '../../app/routes';
 import { credentialFormTemplates } from '../CredentialFormTemplates';
-import { Button, Input, Select, DetailTooltip, Disclosure, FormSection } from '../../design-system';
+import { Button, Combobox, Input, Option, Select, DetailTooltip, Disclosure, FormSection } from '../../design-system';
 import { JourneyDisclosure as AdvancedFormSection } from '../JourneyDisclosure';
 import { formJourneyCopy } from '../formJourneyCopy';
 import { CreateJourney } from '../CreateJourney';
@@ -52,7 +52,7 @@ import { useOperatorResource, type ResourceState } from '../hooks/useOperatorRes
 import { useInlineEditorFocus } from '../hooks/useInlineEditorFocus';
 import { loadModelPricePages } from '../pricingLoading';
 import { CredentialPolicySummary } from '../CredentialPolicySummary';
-import { PriceSource } from '../PriceSource';
+import { PricingTable } from '../PricingTable';
 import { enumLabel, messageOf, OneTimeSecret, queryForTenant, WriteScopeNotice } from '../scope/operatorShared';
 
 export function OperatorSchemaForm(props: FormProps) {
@@ -469,8 +469,12 @@ function Pricing({ token, tenant, writeTenant = tenant, schemas, schemasLoading 
   const [displayCurrency, setDisplayCurrency] = useState('USD');
   const [loadedCurrency, setLoadedCurrency] = useState('');
   const [pricingLoading, setPricingLoading] = useState(false);
+  const [priceCatalogFailed, setPriceCatalogFailed] = useState(false);
   const [usageFailed, setUsageFailed] = useState(false);
   const [usageLoading, setUsageLoading] = useState(false);
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [savingPrice, setSavingPrice] = useState(false);
+  const priceSaveLock = useRef(false);
   const [basePricingScope, setBasePricingScope] = useState('');
   const [message, setMessage] = useState('');
   const loadSequence = useRef(0);
@@ -493,7 +497,7 @@ function Pricing({ token, tenant, writeTenant = tenant, schemas, schemasLoading 
     // with the first price page rather than holding it behind a long catalog
     // walk (or re-reading it for every currency switch).
     setBasePricingScope(loadScope);
-    setPricingLoading(true); setPrices([]); setGenerationPrices([]);
+    setPricingLoading(true); setPriceCatalogFailed(false); setPrices([]); setGenerationPrices([]);
     // Publish each independent price table as soon as it arrives. Usage does
     // not vary by currency and must never gate price rendering.
     const results = await Promise.allSettled([
@@ -508,6 +512,7 @@ function Pricing({ token, tenant, writeTenant = tenant, schemas, schemasLoading 
     ]);
     if (!current()) return;
     setLoadedCurrency(requestedCurrency); setPricingLoading(false);
+    setPriceCatalogFailed(results[0].status === 'rejected');
     const failures = results.filter((result) => result.status === 'rejected');
     setError(failures.length ? t('pricing.partialLoad', { count: formatNumber(failures.length, locale) }) : '');
   };
@@ -542,19 +547,30 @@ function Pricing({ token, tenant, writeTenant = tenant, schemas, schemasLoading 
     return Array.from(new Set([...usageByModel.keys(), ...pricesByModel.keys()])).sort().flatMap((name) => {
       const price = pricesByModel.get(name);
       const tiers = price?.tiers?.length ? price.tiers : price ? [{ service_tier: 'default', input_per_million: price.input_per_million, cached_input_per_million: price.input_per_million, cache_write_per_million: price.input_per_million, output_per_million: price.output_per_million, source: price.source, updated_at: price.updated_at, cache_price_estimated: true }] : [undefined];
-      return tiers.map((tier, index) => ({ model: name, usage: index === 0 ? usageByModel.get(name) : undefined, tier }));
+      return tiers.map((tier) => ({ model: name, usage: usageByModel.get(name), tier }));
     });
   }, [prices, usage]);
   const schema = kind === 'generation' ? schemas?.generation_price : schemas?.model_price;
+  const pricingSchema = useMemo(() => {
+    if (!schema) return undefined;
+    const localized = localizeSchema(schema as RJSFSchema, locale);
+    const tier = localized.properties?.service_tier;
+    if (tier && typeof tier === 'object' && Array.isArray(tier.enum)) {
+      tier.oneOf = tier.enum.map(value => ({ const: value, title: value === 'default' ? t('pricing.tierDefault') : value === 'priority' ? t('pricing.tierPriority') : value === 'flex' ? t('pricing.tierFlex') : String(value) }));
+      delete tier.enum;
+    }
+    if (locale === 'zh-CN') for (const [field, key] of Object.entries({ input_per_million: 'pricing.input', output_per_million: 'pricing.output', cached_input_per_million: 'pricing.cachedInput', cache_write_per_million: 'pricing.cacheWrite' })) {
+      const definition = localized.properties?.[field];
+      if (definition && typeof definition === 'object') definition.title = t(key);
+    }
+    return localized;
+  }, [schema, locale, t]);
   // Prices/usage do not carry provider or account attribution. Offer known
   // models without fabricating that metadata or issuing editor-only reads.
   const modelOptions = useMemo(() => Array.from(new Set(kind === 'generation'
     ? generationPrices.map((price) => price.model)
     : [...prices.map((price) => price.model), ...usage.models.map((item) => item.model)]
-  )).sort().map((name) => ({
-    key: name, value: name, label: name,
-    provider: t('sessionReplay.unknown'), upstream: t('sessionReplay.unknown'),
-  })), [kind, generationPrices, prices, usage, t]);
+  )).sort(), [kind, generationPrices, prices, usage]);
   const sync = async () => {
     if (!writeTenant) return;
     const syncToken = token; const syncTenant = tenant; const syncWriteTenant = writeTenant; const syncCurrency = displayCurrency;
@@ -565,22 +581,25 @@ function Pricing({ token, tenant, writeTenant = tenant, schemas, schemasLoading 
     try {
       const result = await api<ModelPriceSyncResult>('/internal/v1/model-prices/sync', syncToken, { method: 'POST', body: JSON.stringify({ models: usage.models.map((value) => value.model), currency: displayCurrency, tenant_external_id: syncWriteTenant }) });
       if (sequence !== syncSequence.current || scopeRef.current.token !== syncToken || scopeRef.current.tenant !== syncTenant || scopeRef.current.writeTenant !== syncWriteTenant || scopeRef.current.displayCurrency !== syncCurrency) return;
-      setSyncResult(result); setPrices(result.prices); setLoadedCurrency(syncCurrency); setMessage(t('pricing.synced', { count: formatNumber(result.imported, locale) }));
+      setSyncResult(result); setPrices(result.prices); setPriceCatalogFailed(false); setLoadedCurrency(syncCurrency); setMessage(t('pricing.synced', { count: formatNumber(result.imported, locale) }));
     } catch (reason) { if (sequence === syncSequence.current && scopeRef.current.token === syncToken && scopeRef.current.tenant === syncTenant && scopeRef.current.writeTenant === syncWriteTenant && scopeRef.current.displayCurrency === syncCurrency) setError(messageOf(reason, t('common.requestFailed'))); }
     finally { if (sequence === syncSequence.current && scopeRef.current.token === syncToken && scopeRef.current.tenant === syncTenant && scopeRef.current.writeTenant === syncWriteTenant && scopeRef.current.displayCurrency === syncCurrency) setSyncing(false); }
   };
   return <div className="pricing-page"><WriteScopeNotice tenant={writeTenant} />
-    {usageFailed && <div className="notice error" role="alert">{t('pricing.partialLoad')}</div>}
-    <article className="panel pricing-overview"><div className="panel-title"><div><h2>{t('pricing.title')}</h2><p className="muted">{t('pricing.description')}</p></div><div className="pricing-heading-actions"><label>{t('pricing.viewCurrency')}<select aria-label={t('pricing.viewCurrency')} value={displayCurrency} onChange={(event) => { const next = event.target.value; syncSequence.current += 1; setSyncing(false); setSyncResult(undefined); setMessage(''); setDisplayCurrency(next); setCurrency(next); }}><option value="USD">USD</option><option value="CNY">CNY</option></select></label><div className="disabled-action"><button type="button" onClick={() => void sync()} disabled={!writeTenant || syncing}>{syncing ? t('pricing.syncing') : t('pricing.sync')}</button></div></div></div>
-      <div className="pricing-summary"><span>{usageLoading ? t('common.loading') : t('pricing.usedModels', { count: formatNumber(usage.models.length, locale) })}</span><span>{t('pricing.saved', { count: formatNumber(prices.length, locale) })}</span><span>{t('pricing.sourceOrder')}: models.dev → LiteLLM → OpenRouter</span></div>
+    {usageFailed && <div className="notice error" role="alert">{t('pricing.usageUnavailable')}</div>}
+    <article className="panel pricing-overview"><div className="panel-title"><div><h2>{t('pricing.title')}</h2><p className="muted">{t('pricing.description')}</p></div><div className="pricing-heading-actions"><label>{t('pricing.viewCurrency')}<select aria-label={t('pricing.viewCurrency')} value={displayCurrency} onChange={(event) => { const next = event.target.value; syncSequence.current += 1; setSyncing(false); setSyncResult(undefined); setMessage(''); setDisplayCurrency(next); setCurrency(next); }}><option value="USD">USD</option><option value="CNY">CNY</option></select></label><DetailTooltip content={t('pricing.syncHint')}><span><Button appearance="secondary" type="button" onClick={() => void sync()} disabled={!writeTenant || syncing || usageLoading || usageFailed}>{syncing ? t('pricing.syncing') : t('pricing.sync')}</Button></span></DetailTooltip></div></div>
+      <div className="pricing-summary"><span>{usageLoading ? t('pricing.usageLoading') : usageFailed ? t('pricing.usageUnavailable') : t('pricing.usedModels', { count: formatNumber(usage.models.length, locale) })}</span><span>{t('pricing.saved', { count: formatNumber(prices.length, locale) })}</span><span>{t('pricing.sourceOrder')}: models.dev → LiteLLM → OpenRouter</span></div>
+      <CreateJourney className="manual-pricing" title={t('pricing.manual')} description={t('pricing.manualHint')} open={editorOpen} onOpenChange={setEditorOpen} onOpen={() => onRequestSchemas?.()} busy={savingPrice}><div className="manual-pricing-body">
+        {error && <div className="notice error" role="alert">{error}</div>}
+        <label>{t('pricing.type')}<select value={kind} onChange={(event) => setKind(event.target.value as typeof kind)}><option value="token">{t('pricing.tokenModel')}</option><option value="generation">{t('pricing.generationModel')}</option></select></label><label>{t('pricing.model')}<Combobox aria-label={t('pricing.model')} freeform value={model} onChange={event => setModel(event.target.value)} onOptionSelect={(_, data) => { if (data.optionValue) setModel(data.optionValue); }} disabled={savingPrice}>{modelOptions.filter(name => name.toLocaleLowerCase(locale).includes(model.toLocaleLowerCase(locale))).map(name => <Option key={name} value={name}>{name}</Option>)}</Combobox></label><label>{t('pricing.currency')}<select value={currency} onChange={(event) => setCurrency(event.target.value)}><option value="USD">USD</option><option value="CNY">CNY</option></select></label>{pricingSchema ? <Form key={`${kind}-${locale}`} schema={pricingSchema} validator={validator} templates={schemaFormTemplates} widgets={fluentFormWidgets} onSubmit={async ({ formData }) => { if (!writeTenant || priceSaveLock.current) return; priceSaveLock.current = true; setSavingPrice(true); setError(''); const current = () => scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant; try { const prefix = kind === 'generation' ? 'generation-prices' : 'prices'; await api(`/internal/v1/${prefix}/${encodeURIComponent(currency)}/${encodeURIComponent(model)}`, token, { method: 'POST', body: JSON.stringify(formData) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setMessage(t('pricing.savedMessage')); if (currency === displayCurrency) await load(currency); else setDisplayCurrency(currency); } catch (reason) { if (current()) setError(messageOf(reason, t('common.requestFailed'))); } finally { priceSaveLock.current = false; if (current()) setSavingPrice(false); } }}><Button appearance="primary" type="submit" disabled={!writeTenant || !model.trim() || savingPrice}>{savingPrice ? t('common.loading') : t('pricing.save')}</Button></Form> : <div className="empty">{schemasLoading ? t('common.loading') : t('providers.schemaMissing')}</div>}</div></CreateJourney>
       {error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice success" role="status">{message}</div>}
       {syncResult && <><div className="source-status">{syncResult.sourceResults.map((source) => <div className={`source-card ${source.error ? 'failed' : 'healthy'}`} key={source.source}><b>{source.source}</b><span>{source.error ? t('pricing.sourceFailed') : t('pricing.sourceHealthy', { count: formatNumber(source.models, locale) })}</span>{source.error && <small>{source.error}</small>}</div>)}</div><div className="notice success"><b>{t('pricing.result')}</b> · {t('pricing.imported', { count: formatNumber(syncResult.imported, locale) })} · {t('pricing.candidates', { count: formatNumber(syncResult.candidates.length, locale) })} · {t('pricing.unmatched', { count: formatNumber(syncResult.unmatched.length, locale) })} · {t('pricing.preserved', { count: formatNumber(syncResult.preserved.length, locale) })}</div>
-        {(syncResult.candidates.length > 0 || syncResult.unmatched.length > 0) && <div className="sync-details"><h3>{t('pricing.candidateDetails')}</h3>{syncResult.candidates.map((candidate) => <details key={candidate.model}><summary><code>{candidate.model}</code><span>{t('pricing.candidateCount', { count: formatNumber(candidate.candidates.length, locale) })}</span></summary><div className="candidate-list">{candidate.candidates.map((match) => <div key={`${match.source}-${match.sourceModelId}-${match.serviceTier}`}><b>{match.sourceModelId}</b><span>{match.source} · {match.serviceTier} · {match.reason}</span><code>{t('pricing.input')}: {formatCurrency(match.inputPerMillion, renderCurrency, locale)} · {t('pricing.output')}: {formatCurrency(match.outputPerMillion, renderCurrency, locale)}</code></div>)}</div></details>)}{syncResult.unmatched.length > 0 && <details><summary>{t('pricing.unmatchedModels')}</summary><div className="model-name-list">{syncResult.unmatched.map((name) => <code key={name}>{name}</code>)}</div></details>}</div>}
+        {(syncResult.candidates.length > 0 || syncResult.unmatched.length > 0) && <div className="sync-details"><h3>{t('pricing.candidateDetails')}</h3>{syncResult.candidates.map((candidate) => <Disclosure key={candidate.model} title={`${candidate.model} · ${t('pricing.candidateCount', { count: formatNumber(candidate.candidates.length, locale) })}`}><div className="candidate-list">{candidate.candidates.map((match) => <div key={`${match.source}-${match.sourceModelId}-${match.serviceTier}`}><b>{match.sourceModelId}</b><span>{match.source} · {match.serviceTier} · {match.reason}</span><code>{t('pricing.input')}: {formatCurrency(match.inputPerMillion, renderCurrency, locale)} · {t('pricing.output')}: {formatCurrency(match.outputPerMillion, renderCurrency, locale)}</code></div>)}</div></Disclosure>)}{syncResult.unmatched.length > 0 && <Disclosure title={t('pricing.unmatchedModels')}><div className="model-name-list">{syncResult.unmatched.map((name) => <code key={name}>{name}</code>)}</div></Disclosure>}</div>}
       </>}
-      <div className="table-scroll token-pricing-scroll" tabIndex={0} role="region" aria-label={t('pricing.title')}><table className="token-pricing-table"><thead><tr><th>{t('pricing.model')}</th><th>{t('pricing.calls')}</th><th>{t('pricing.serviceTier')}</th><th>{t('pricing.input')}</th><th>{t('pricing.cachedInput')}</th><th>{t('pricing.cacheWrite')}</th><th>{t('pricing.output')}</th><th>{t('pricing.source')}</th><th>{t('pricing.updated')}</th></tr></thead><tbody>{rows.map((row) => <tr key={`${row.model}-${row.tier?.service_tier ?? 'missing'}`}><td><code>{row.model}</code></td><td>{row.usage ? formatNumber(row.usage.calls, locale) : ''}</td><td>{row.tier?.service_tier ?? '—'}</td><td>{row.tier ? formatCurrency(row.tier.input_per_million, renderCurrency, locale) : '—'}</td><td>{row.tier ? <>{formatCurrency(row.tier.cached_input_per_million, renderCurrency, locale)}{row.tier.cache_price_estimated && <small className="muted"> {t('pricing.estimated')}</small>}</> : '—'}</td><td>{row.tier ? <>{formatCurrency(row.tier.cache_write_per_million, renderCurrency, locale)}{row.tier.cache_price_estimated && <small className="muted"> {t('pricing.estimated')}</small>}</> : '—'}</td><td>{row.tier ? formatCurrency(row.tier.output_per_million, renderCurrency, locale) : '—'}</td><td>{row.tier ? <PriceSource source={row.tier.source} /> : <span className="status pending">{t('pricing.missing')}</span>}</td><td>{row.tier ? new Date(row.tier.updated_at).toLocaleString(locale) : '—'}</td></tr>)}</tbody></table>{rows.length === 0 && <div className="empty">{pricingLoading ? t('common.loading') : t('pricing.noPricesForCurrency', { currency: renderCurrency })}</div>}</div>
+      <PricingTable rows={rows} currency={renderCurrency} loading={pricingLoading} catalogFailed={priceCatalogFailed} usageLoading={usageLoading} usageFailed={usageFailed} />
     </article>
     <article className="panel"><div className="panel-title"><h2>{t('pricing.generationPrices')}</h2><span>{formatNumber(generationPrices.length, locale)}</span></div><div className="table-scroll"><table><thead><tr><th>{t('pricing.model')}</th><th>{t('pricing.currency')}</th><th>{t('self.units')}</th><th>{t('pricing.unitPrice')}</th></tr></thead><tbody>{generationPrices.map((price) => <tr key={`${price.currency}-${price.model}`}><td><code>{price.model}</code></td><td>{price.currency}</td><td>{enumLabel(t, 'billingUnit', price.billing_unit)}</td><td>{formatCurrency(price.price_per_unit, price.currency, locale)}</td></tr>)}</tbody></table>{generationPrices.length === 0 && <div className="empty">{t('pricing.noGenerationPrices')}</div>}</div></article>
-    <details className="panel manual-pricing" onToggle={(event) => { if (event.currentTarget.open) onRequestSchemas?.(); }}><summary><span><b>{t('pricing.manual')}</b><small>{t('pricing.manualHint')}</small></span><span>＋</span></summary><div className="manual-pricing-body form-panel"><label>{t('pricing.type')}<select value={kind} onChange={(event) => setKind(event.target.value as typeof kind)}><option value="token">{t('pricing.tokenModel')}</option><option value="generation">{t('pricing.generationModel')}</option></select></label><ModelPicker label={t('pricing.model')} value={model} onChange={setModel} options={modelOptions} editable /><label>{t('pricing.currency')}<select value={currency} onChange={(event) => setCurrency(event.target.value)}><option value="USD">USD</option><option value="CNY">CNY</option></select></label>{schema ? <Form key={`${kind}-${locale}`} schema={localizeSchema(schema as RJSFSchema, locale)} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!writeTenant) return; try { const prefix = kind === 'generation' ? 'generation-prices' : 'prices'; await api(`/internal/v1/${prefix}/${encodeURIComponent(currency)}/${encodeURIComponent(model)}`, token, { method: 'POST', body: JSON.stringify(formData) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setMessage(t('pricing.savedMessage')); if (currency === displayCurrency) await load(currency); else setDisplayCurrency(currency); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!writeTenant || !model.trim()}>{t('pricing.save')}</button></Form> : <div className="empty">{schemasLoading ? t('common.loading') : t('providers.schemaMissing')}</div>}</div></details>
+
   </div>;
 }
 

@@ -2,16 +2,17 @@
 
 `plugin::lifecycle::RuntimeRevisions` is an experimental library primitive,
 compiled only with the non-default `experimental-plugin-revisions` feature.
-It is not a completed application hot-reload feature.
+The service image includes that feature; installed-version application integration
+and host inventory configuration are described in
+[the application contract](plugin-runtime-application-draft.md).
 Identity hashing, receipt parsing, manifest-ID precedence and epoch-task ownership
 are enabled only by that explicit feature. Default builds retain the original
 directory-order execution and component-file loading path, ignore installer
 receipts, and keep the original detached epoch timer. CI runs focused loader
 compatibility contracts without default features as well as with all features.
-The default application state still holds `PluginRuntime` directly;
-there is no network reload endpoint or cross-replica revision publication in
-this change. Integrators must pin one snapshot before resolving configuration
-and execute every hook for that request on that snapshot.
+Without host inventory the application retains its startup runtime. With host
+inventory, application requests pin the database-authoritative runtime/catalog
+pair and execute every hook for that request on that snapshot.
 
 Candidates are loaded from the read-only package directory populated by the
 existing digest-pinned, signature-verified OCI installer. The revision manager

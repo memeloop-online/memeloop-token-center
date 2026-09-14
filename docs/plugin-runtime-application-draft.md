@@ -1,15 +1,27 @@
-# Draft application plugin revision integration
+# Installed plugin hot revisions
 
-Stacked on **#59** (configuration snapshots and refill fences),
-which is stacked on **#94** (atomic runtime revision foundation).
-**Not production enabled.** These are distinct dependency layers, not alternative
-implementations. #87 adds execution diagnostics; #54 adds UI projection primitives
-but still requires authenticated backend and real product-slot integration.
+The service image includes `experimental-plugin-revisions`. Configure
+`MTC_PLUGIN_DIR` with the installed baseline and `MTC_PLUGIN_INVENTORY_FILE` with
+an absolute path to host-provisioned JSON. Every Control/Gateway/Worker process
+must have the same inventory and read-only revision directories before publishing.
+The file maps opaque inventory IDs to `{"root":"/absolute/revision/root",
+"grants":{"plugin-id":[{"version":"1.0.1","capabilities":[],
+"manifest_digest":"<approved manifest digest>","identity":{
+"component_sha256":"<approved Wasm digest>","provenance":{
+"format_version":1,"source":"<approved OCI repository>",
+"digest":"sha256:<approved artifact digest>",
+"signature_policy":"cosign-public-key"}}}]}}`.
+Grants are independently approved host input, not values supplied by management
+requests. The complete inventory is read once at startup; replacing that file
+requires restarting processes, but publishing any already-provisioned version
+and rolling back do not require a binary rebuild or restart.
 
-The `experimental-plugin-revisions` feature exposes a host-only
-`AppState::with_application_plugin_inventory` opt-in. The production executable
-does not call it. There is deliberately no new environment variable, UI toggle,
-remote installer API, or plugin-provided activation mechanism.
+Absent configuration preserves the startup runtime. An empty `{}` inventory is
+valid and exposes an empty management status. Before the first publication,
+requests pin the startup runtime. After publication, failures never fall back to
+it. A configured malformed inventory fails startup; binaries built without the
+feature reject the inventory option rather than silently ignoring it.
+This is **not dynamic installation** or arbitrary contribution/schema replacement.
 
 ## Authority and request ownership
 
@@ -35,7 +47,9 @@ request state retains the first snapshot. There is no notification dependency:
 another AppState/replica reads the database on its next request, even if it has
 missed every notification. Database failures, missing local inventory, identity
 mismatches, schema/provider-contract changes, and package/configuration validation
-failures stop admission; no startup-runtime fallback is permitted.
+failures stop admission once a head exists; no startup-runtime fallback is permitted.
+Control plugin manifests, provider types, service-data and configuration handlers
+pin the same runtime/catalog pair as execution, after authenticating the caller.
 
 ## Trusted inventory and management boundary
 
@@ -57,6 +71,13 @@ With the feature and host opt-in, the following control endpoints require a
 | `/internal/v1/plugin-runtime/candidates` | `{"inventory_id":"approved-a"}` |
 | `/internal/v1/plugin-runtime/publish` | `{"inventory_id":"approved-a","expected_revision":0}` |
 | `/internal/v1/plugin-runtime/rollback` | `{"target_revision":1,"expected_revision":2}` |
+
+`GET /internal/v1/plugin-runtime` (also `GET .../candidates`) requires a global
+`plugins:read` credential. It returns `current` (null before publication) and
+`candidates`, each with `inventory_id`, `staged`, and host-approved plugin versions.
+It never returns roots, grant digests, executable bytes or provenance. Discover
+the inventory, stage an ID, publish with `expected_revision` equal to current
+revision (or 0), then verify current and the plugin catalog on another replica.
 
 Publish and rollback require `Idempotency-Key`. Unknown fields are rejected,
 including URL, path, Wasm, grant and tenant overrides. Candidate IDs cannot encode
@@ -103,6 +124,6 @@ runtime also retains its revision circuit state across requests. CI extends the
 existing SQLite/PostgreSQL authority exercise with concurrent Arc identity,
 single-compilation after leader cancellation and bounded-history checks; warm DB/missing-root failures remain
 covered. This has **not** passed a production performance or rollout gate. The
-feature remains off by default and host opt-in is not wired into the executable.
+service image includes the feature and host inventory is wired into startup.
 It does not implement arbitrary schema/provider-contract changes, strict
 configuration revocation, UI changes, or health/archive changes.

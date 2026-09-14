@@ -11,7 +11,7 @@ test('manual schemas are fetched only when the collapsed editor is opened', () =
   assert.match(page, /Boolean\(token\) && schemasRequested/);
   assert.match(page, /onRequestSchemas=\{\(\) => setSchemasRequested\(true\)\}/);
   assert.match(page, /schemas=\{resource\.state\.kind === 'ready' \? resource\.state\.value : undefined\}/);
-  assert.match(pricing, /onToggle=\{\(event\) => \{ if \(event\.currentTarget\.open\) onRequestSchemas\?\.\(\); \}\}/);
+  assert.match(pricing, /onOpen=\{\(\) => onRequestSchemas\?\.\(\)\}/);
 });
 
 test('pricing usage is scope-only and independent from currency price requests', () => {
@@ -37,7 +37,7 @@ test('pricing cancels superseded reads, bounds waits and memoizes indexed rows',
 });
 
 test('manual pricing offers known models without restricting free-form names or inventing attribution', () => {
-  assert.match(pricing, /<ModelPicker label=\{t\('pricing\.model'\)\} value=\{model\} onChange=\{setModel\} options=\{modelOptions\} editable \/>/);
-  assert.match(pricing, /provider: t\('sessionReplay\.unknown'\), upstream: t\('sessionReplay\.unknown'\)/);
+  assert.match(pricing, /<Combobox aria-label=\{t\('pricing\.model'\)\} freeform value=\{model\}/);
+  assert.doesNotMatch(pricing, /provider:|upstream:/);
   assert.doesNotMatch(pricing, /\/internal\/v1\/upstreams|\/internal\/v1\/model-routes/);
 });

@@ -35,7 +35,7 @@ use routing::{
     ProxySendError, UpstreamAttemptGuard, UpstreamAttemptTerminal, candidate_reservation_bounds,
     exhausted_candidate_error, materialize_proxy_route, next_planned_proxy_candidate,
     plan_proxy_route, prepare_admitted_proxy_route, prepared_input_reservation_bound,
-    refresh_route_snapshot, send_proxy_route,
+    refresh_route_snapshot, retain_pinned_text_candidates, send_proxy_route,
 };
 use upstream_response::UpstreamResponse;
 
@@ -774,13 +774,27 @@ pub(super) async fn proxy(
     protocol: Protocol,
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 ) -> Result<Response, AppError> {
+    let key = authenticate_downstream(&headers, &state).await?;
+    proxy_with_identity(state, headers, body, protocol, key, None, memory).await
+}
+
+/// Internal callers must establish an explicit billing identity. A pinned route
+/// narrows normal grants; it never grants access or falls back to another route.
+pub(in crate::api) async fn proxy_with_identity(
+    state: AppState,
+    headers: HeaderMap,
+    body: Bytes,
+    protocol: Protocol,
+    key: AuthenticatedKey,
+    pinned_route: Option<Uuid>,
+    memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+) -> Result<Response, AppError> {
     let diagnostic_context = proxy_diagnostics::Context::current();
     let request_id = diagnostic_context.request_id;
     let preparation = proxy_diagnostics::Phase::new(diagnostic_context, "request_preparation");
     let _request_buffer = state
         .metrics
         .memory_usage(crate::metrics::MemoryComponent::RequestBuffer, body.len());
-    let key = authenticate_downstream(&headers, &state).await?;
     let mut state = state.pin_application_plugins().await?;
     let proxy_lifecycle_permit = state
         .proxy_lifecycle_permits
@@ -805,12 +819,25 @@ pub(super) async fn proxy(
         memory.clone(),
     )
     .await?;
+    if pinned_route.is_some() && applied.changes_pinned_envelope(&original_request_json) {
+        // Pinned internal callers establish their own reviewed request
+        // envelope. Traffic policy may still deny it or rank an already
+        // authorized account, but must never add tools, replace instructions,
+        // redirect model input, enable streaming, or alter token ceilings.
+        // Keep the diagnostic fixed and exclude both request bodies.
+        tracing::warn!(
+            %request_id,
+            stage = "pinned_request_rewrite_rejected",
+            "traffic policy attempted to rewrite a pinned internal request"
+        );
+        return Err(AppError::Forbidden);
+    }
     let request_json = applied.request_json;
     let model = applied.model;
     preparation.finish("completed", None, Some(body.len()));
     let route_preparation = proxy_diagnostics::Phase::new(diagnostic_context, "route_preparation");
     let selection_seed = routing_selection_seed(&key, request_id, &conversation_hints);
-    let candidates = state
+    let mut candidates = state
         .db
         .list_authorized_upstream_candidates_with_hint(
             key.key_id,
@@ -823,6 +850,7 @@ pub(super) async fn proxy(
             },
         )
         .await?;
+    retain_pinned_text_candidates(&state, pinned_route, &mut candidates)?;
     let strategy_candidates = (state.plugins.has_group_routing_hooks()
         || state.db.has_group_routing_strategies(key.tenant_id).await?)
         .then(|| candidates.clone());
@@ -946,13 +974,11 @@ pub(super) async fn proxy(
         hints: conversation_hints,
         client_name,
     });
-
-    let started = Instant::now();
     let mut buffered_request = BufferedRequest {
         state: &state,
         reservation,
         request_id,
-        started,
+        started: Instant::now(),
         input_token_ceiling,
         output_token_ceiling,
         requested_service_tier,

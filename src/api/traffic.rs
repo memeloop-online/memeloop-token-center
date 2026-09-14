@@ -193,6 +193,18 @@ pub(super) struct AppliedTraffic {
     pub(super) requested_model: String,
     pub(super) model: String,
     pub(super) upstream_account_hint: Option<Uuid>,
+    /// Preserve whether a plugin supplied either rewrite channel even when
+    /// its parsed value is identical to the original request. Pinned internal
+    /// callers use this provenance to reject byte-only or exact-echo rewrites.
+    pub(super) request_rewrite_supplied: bool,
+}
+
+impl AppliedTraffic {
+    pub(in crate::api) fn changes_pinned_envelope(&self, original: &Value) -> bool {
+        self.request_rewrite_supplied
+            || original != &self.request_json
+            || original.get("model").and_then(Value::as_str) != Some(self.model.as_str())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -339,6 +351,7 @@ async fn apply_traffic_plugin(
             requested_model: requested_model.clone(),
             model: requested_model,
             upstream_account_hint: None,
+            request_rewrite_supplied: false,
         });
     }
     let temporary_memory = if memory.is_some() {
@@ -405,6 +418,8 @@ async fn apply_traffic_plugin(
         plugin_decision.log_denial();
         return Err(AppError::Forbidden);
     }
+    let request_rewrite_supplied =
+        plugin_decision.request_json.is_some() || plugin_decision.model.is_some();
     let mut request_json = plugin_decision
         .request_json
         .unwrap_or(original_request_json);
@@ -446,6 +461,7 @@ async fn apply_traffic_plugin(
         requested_model,
         model,
         upstream_account_hint,
+        request_rewrite_supplied,
     })
 }
 

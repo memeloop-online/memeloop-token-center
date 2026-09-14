@@ -66,6 +66,8 @@ pub struct AppState {
     #[cfg(feature = "experimental-plugin-revisions")]
     pub(crate) application_plugins: Option<Arc<plugin::application::ApplicationPlugins>>,
     #[cfg(feature = "experimental-plugin-revisions")]
+    application_plugins_pinned: bool,
+    #[cfg(feature = "experimental-plugin-revisions")]
     pub(crate) pinned_application_plugins:
         Option<Arc<plugin::application::ApplicationPluginSnapshot>>,
     pub metrics: metrics::Metrics,
@@ -134,6 +136,29 @@ impl AppState {
             .extend(plugins.provider_types())
             .map_err(|_| InitializationError::Plugin)?;
 
+        #[cfg(feature = "experimental-plugin-revisions")]
+        let application_plugins = match config.plugin_inventory_file.as_deref() {
+            Some(path) => {
+                if !std::path::Path::new(path).is_absolute() {
+                    return Err(InitializationError::Plugin);
+                }
+                let bytes = tokio::fs::read(path)
+                    .await
+                    .map_err(|_| InitializationError::Plugin)?;
+                let inventory =
+                    serde_json::from_slice(&bytes).map_err(|_| InitializationError::Plugin)?;
+                Some(Arc::new(
+                    plugin::application::ApplicationPlugins::new(db.clone(), inventory, &plugins)
+                        .map_err(|_| InitializationError::Plugin)?,
+                ))
+            }
+            None => None,
+        };
+        #[cfg(not(feature = "experimental-plugin-revisions"))]
+        if config.plugin_inventory_file.is_some() {
+            return Err(InitializationError::Plugin);
+        }
+
         Ok(Self {
             config: Arc::new(config),
             db,
@@ -142,7 +167,9 @@ impl AppState {
             plugins,
             group_routing: None,
             #[cfg(feature = "experimental-plugin-revisions")]
-            application_plugins: None,
+            application_plugins,
+            #[cfg(feature = "experimental-plugin-revisions")]
+            application_plugins_pinned: false,
             #[cfg(feature = "experimental-plugin-revisions")]
             pinned_application_plugins: None,
             metrics: metrics::Metrics::default(),
@@ -167,7 +194,7 @@ impl AppState {
         })
     }
 
-    /// Explicit host-only draft opt-in. Configuration, HTTP input and plugin
+    /// Host-only inventory override, also used by tests. HTTP input and plugin
     /// guests cannot grant inventory access or enable revision publication.
     #[cfg(feature = "experimental-plugin-revisions")]
     pub fn with_application_plugin_inventory(
@@ -180,6 +207,7 @@ impl AppState {
             &self.plugins,
         )?));
         self.pinned_application_plugins = None;
+        self.application_plugins_pinned = false;
         Ok(self)
     }
 
@@ -189,13 +217,15 @@ impl AppState {
         #[cfg(feature = "experimental-plugin-revisions")]
         {
             let mut state = self;
-            if state.pinned_application_plugins.is_none()
+            if !state.application_plugins_pinned
                 && let Some(authority) = &state.application_plugins
             {
-                let snapshot = authority.pin().await?;
-                state.plugins = snapshot.runtime.runtime().clone();
-                state.providers = snapshot.providers.clone();
-                state.pinned_application_plugins = Some(snapshot);
+                if let Some(snapshot) = authority.pin_if_published().await? {
+                    state.plugins = snapshot.runtime.runtime().clone();
+                    state.providers = snapshot.providers.clone();
+                    state.pinned_application_plugins = Some(snapshot);
+                }
+                state.application_plugins_pinned = true;
             }
             Ok(state)
         }

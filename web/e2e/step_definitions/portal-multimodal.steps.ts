@@ -221,8 +221,8 @@ Then('多模态模型 {string} 以 {string} 计费并显示价格 {string}', asy
 When('管理员通过可见表单保存 CNY 多模态价格', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   const modelName = 'browser-cny-image-model';
-  const manualPricing = page.locator('details.manual-pricing');
-  await manualPricing.locator('summary').click();
+  const manualPricing = page.locator('.manual-pricing');
+  await manualPricing.getByRole('button', { name: '设置模型价格', exact: true }).click();
   await manualPricing.locator('.manual-pricing-body > label select').nth(1).selectOption('CNY');
   await manualPricing.getByLabel('类型').selectOption('generation');
   await manualPricing.getByRole('combobox', { name: '模型', exact: true }).fill(modelName);
@@ -524,8 +524,8 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await assertContains(page.getByRole('status'), '路由已创建');
 
   await openAppRoute(page, 'operator', 'pricing');
-  const manualPricing = page.locator('details.manual-pricing');
-  await manualPricing.locator('summary').click();
+  const manualPricing = page.locator('.manual-pricing');
+  await manualPricing.getByRole('button', { name: '设置模型价格', exact: true }).click();
   await manualPricing.getByLabel('类型').selectOption('generation');
   await manualPricing.getByRole('combobox', { name: '模型', exact: true }).fill(imageModel);
   await manualPricing.getByLabel('计费单位').selectOption('job');

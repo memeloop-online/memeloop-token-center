@@ -178,6 +178,9 @@ pub struct Config {
     pub pricing_litellm_url: String,
     pub pricing_openrouter_url: String,
     pub plugin_dir: Option<String>,
+    /// Host-provisioned JSON inventory; never accepted from plugin/tenant input.
+    #[serde(default)]
+    pub plugin_inventory_file: Option<String>,
     pub allow_oauth_loopback: bool,
     /// Not populated by environment or deserialization. `Config::for_test`
     /// is the only constructor that enables direct Codex loopback traffic.
@@ -261,6 +264,7 @@ impl std::fmt::Debug for Config {
             .field("pricing_litellm_url", &"[configured public HTTPS URL]")
             .field("pricing_openrouter_url", &"[configured public HTTPS URL]")
             .field("plugin_dir", &self.plugin_dir)
+            .field("plugin_inventory_file", &self.plugin_inventory_file)
             .field("allow_oauth_loopback", &self.allow_oauth_loopback)
             .field("codex_test_loopback", &self.codex_test_loopback)
             .field("runtime_profiling_enabled", &self.runtime_profiling_enabled)
@@ -406,6 +410,7 @@ impl Config {
             pricing_litellm_url,
             pricing_openrouter_url,
             plugin_dir: env::var("MTC_PLUGIN_DIR").ok(),
+            plugin_inventory_file: env::var("MTC_PLUGIN_INVENTORY_FILE").ok(),
             allow_oauth_loopback,
             codex_test_loopback: false,
             runtime_profiling_enabled: env_bool("MTC_RUNTIME_PROFILING_ENABLED", false),
@@ -460,6 +465,7 @@ impl Config {
             pricing_litellm_url: DEFAULT_PRICING_LITELLM_URL.to_owned(),
             pricing_openrouter_url: DEFAULT_PRICING_OPENROUTER_URL.to_owned(),
             plugin_dir: None,
+            plugin_inventory_file: None,
             allow_oauth_loopback: true,
             codex_test_loopback: true,
             runtime_profiling_enabled: false,

@@ -44,6 +44,23 @@ async fn application_authority(
 }
 
 #[cfg(feature = "experimental-plugin-revisions")]
+pub(in crate::api) async fn application_plugin_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "plugins:read").await?;
+    super::require_global_service(&service)?;
+    let authority = state
+        .application_plugins
+        .as_ref()
+        .ok_or(AppError::NotFound)?;
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "private, no-store")],
+        Json(authority.status().await?),
+    ))
+}
+
+#[cfg(feature = "experimental-plugin-revisions")]
 fn runtime_operation_key(headers: &HeaderMap) -> Result<&str, AppError> {
     headers
         .get("idempotency-key")
@@ -119,6 +136,7 @@ pub(in crate::api) async fn get_plugin_service_data(
     Query(query): Query<PluginServiceDataQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "plugins:read").await?;
+    let state = state.pin_application_plugins().await?;
     let endpoint = state
         .plugins
         .service_data_endpoint(&plugin_id, &endpoint_id)
@@ -147,6 +165,7 @@ pub(in crate::api) async fn get_plugin_configuration(
     Query(query): Query<PluginConfigurationQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "plugins:read").await?;
+    let state = state.pin_application_plugins().await?;
     let tenant_external_id = management_tenant(&service, query.tenant_external_id)?;
     let tenant_id = match tenant_external_id.as_deref() {
         Some(tenant) => Some(state.db.plugin_configuration_tenant_id(tenant).await?),
@@ -164,6 +183,7 @@ pub(in crate::api) async fn put_plugin_configuration(
     Json(body): Json<PutPluginConfigurationRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "plugins:write").await?;
+    let state = state.pin_application_plugins().await?;
     let tenant_external_id = management_tenant(&service, body.tenant_external_id)?;
     let tenant_id = match tenant_external_id.as_deref() {
         Some(tenant) => Some(state.db.plugin_configuration_tenant_id(tenant).await?),

@@ -27,7 +27,7 @@ RUN mkdir -p src tests \
     && printf 'fn main() {}\n' > src/main.rs \
     && printf 'fn main() {}\n' > tests/cucumber.rs \
     && printf 'fn main() {}\n' > tests/postgres.rs \
-    && cargo build --locked --release --bin memeloop-token-center \
+    && cargo build --locked --release --features experimental-plugin-revisions --bin memeloop-token-center \
     && cargo clean --release --package memeloop-token-center \
     && rm -rf src
 COPY build.rs ./build.rs
@@ -41,7 +41,7 @@ ARG MTC_BUILD_TARGET_INPUT=unknown
 RUN MTC_BUILD_GIT_SHA="${MTC_BUILD_GIT_SHA_INPUT}" \
     MTC_BUILD_TIMESTAMP="${MTC_BUILD_TIMESTAMP_INPUT}" \
     MTC_BUILD_TARGET="${MTC_BUILD_TARGET_INPUT}" \
-    cargo build --locked --release --bin memeloop-token-center \
+    cargo build --locked --release --features experimental-plugin-revisions --bin memeloop-token-center \
     && cp target/release/memeloop-token-center /tmp/memeloop-token-center \
     && cp "$(gcc -print-file-name=libgcc_s.so.1)" /tmp/libgcc_s.so.1 \
     && cp "$(g++ -print-file-name=libstdc++.so.6)" /tmp/libstdc++.so.6 \
