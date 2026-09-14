@@ -11,8 +11,8 @@ use uuid::Uuid;
 use super::super::proxy_diagnostics;
 use super::super::sse::{
     BoundedSseEvent, BoundedSseFramer, ResponseIdentityGate, ResponsesStreamingSanitizer,
-    SAFE_SSE_HEARTBEAT_COMMENT, SseFramerRejection, is_response_metadata_event,
-    is_sse_field_line, parse_sse_event, parse_unique_json, trim_ascii,
+    SAFE_SSE_HEARTBEAT_COMMENT, SseFramerRejection, is_response_metadata_event, is_sse_field_line,
+    parse_sse_event, parse_unique_json, trim_ascii,
 };
 use super::{
     MAX_PROXY_LIFETIME, MAX_PROXY_RESPONSE_BODY, MAX_REPORTED_TOKENS,
