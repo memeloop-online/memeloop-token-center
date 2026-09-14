@@ -71,7 +71,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
     } = buffered_request;
     tokio::spawn(async move {
         // Streaming responses outlive the handler response. Keep the workload
-        // permit inside this task until archive and billing finalization end.
+        // permit until proxy finalization or timeout reconciliation; accepted
+        // archive tails have a separate bounded EOF owner below.
         let _proxy_lifecycle_permit = proxy_lifecycle_permit;
         let archive_memory = memory.clone();
         let _request_memory = memory;
@@ -535,6 +536,11 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 }
             }
         }
+        // The absolute proxy lifecycle ends after normal finalization or
+        // timeout reconciliation. A slow archive tail remains memory-bounded
+        // and connection-drain-owned, but must not retain scarce admission
+        // concurrency past that boundary.
+        drop(_proxy_lifecycle_permit);
         if let Err(error) = archive_eof_owner.await {
             tracing::error!(
                 task_cancelled = error.is_cancelled(),
