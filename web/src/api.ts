@@ -16,11 +16,12 @@ function responseRequestId(response: Response): string | undefined {
 }
 
 /** Safe transport evidence; never include a URL, credentials or response text. */
-export function apiDiagnosticMessage(reason: unknown, fallback: string): string {
+export function apiDiagnosticMessage(reason: unknown, fallback: string, labels: { requestId: string; streamInterrupted: string }): string {
   if (!(reason instanceof ApiError)) return reason instanceof Error ? reason.message : fallback;
   const status = `HTTP ${reason.status}`;
-  const message = reason.message.includes(status) ? reason.message : `${reason.message} (${status})`;
-  return reason.requestId ? `${message} · request ID: ${reason.requestId}` : message;
+  const detail = reason.code === 'sse_response_interrupted' ? labels.streamInterrupted : reason.message;
+  const message = detail.includes(status) ? detail : `${detail} (${status})`;
+  return reason.requestId ? `${message} · ${labels.requestId}: ${reason.requestId}` : message;
 }
 
 export async function api<T>(
@@ -176,7 +177,7 @@ export async function streamSse<T>(
     }
   } catch (reason) {
     if (signal.aborted) throw reason;
-    throw new ApiError('SSE response interrupted or invalid', response.status, undefined, responseRequestId(response));
+    throw new ApiError('SSE response interrupted or invalid', response.status, 'sse_response_interrupted', responseRequestId(response));
   } finally {
     try { await reader.cancel(); } catch { /* Abort and remote close can already release the reader. */ }
     reader.releaseLock();

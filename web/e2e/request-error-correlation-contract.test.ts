@@ -3,6 +3,7 @@ import test from 'node:test';
 import { api, apiDiagnosticMessage, ApiError, streamSse } from '../src/api.js';
 
 const requestId = '01900000-0000-7000-8000-000000000001';
+const labels = { requestId: '关联请求 ID', streamInterrupted: '事件流响应中断或格式无效' };
 
 test('JSON and plain ingress errors retain HTTP status and only a validated service ID', async () => {
   const original = globalThis.fetch;
@@ -14,9 +15,10 @@ test('JSON and plain ingress errors retain HTTP status and only a validated serv
       await assert.rejects(api('/internal/v1/requests/query', 'credential-canary'), (error: unknown) => {
         assert.ok(error instanceof ApiError);
         assert.equal(error.requestId, requestId);
-        const message = apiDiagnosticMessage(error, 'fallback');
+        const message = apiDiagnosticMessage(error, 'fallback', labels);
         assert.match(message, /HTTP 503/);
         assert.ok(message.includes(requestId));
+        assert.match(message, /关联请求 ID/);
         assert.doesNotMatch(message, /secret-body-canary|credential-canary/);
         return true;
       });
@@ -41,7 +43,12 @@ test('SSE failures distinguish rejected headers from a failed 200 body without e
         assert.ok(error instanceof ApiError);
         assert.equal(error.status, status);
         assert.equal(error.requestId, requestId);
-        assert.doesNotMatch(apiDiagnosticMessage(error, 'fallback'), /secret-stream-canary|credential-canary/);
+        const message = apiDiagnosticMessage(error, 'fallback', labels);
+        assert.doesNotMatch(message, /secret-stream-canary|credential-canary/);
+        if (status === 200) {
+          assert.match(message, /事件流响应中断或格式无效 \(HTTP 200\)/);
+          assert.doesNotMatch(message, /SSE response interrupted/);
+        }
         return true;
       });
     }

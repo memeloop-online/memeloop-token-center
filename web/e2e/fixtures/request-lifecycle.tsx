@@ -21,7 +21,12 @@ let failQuery: (() => void) | undefined;
 const json = (value: unknown) => new Response(JSON.stringify(value), { headers: { 'Content-Type': 'application/json' } });
 window.fetch = async (input) => {
   const url = new URL(String(input), location.origin);
-  if (url.pathname === '/internal/v1/upstreams') return json([]);
+  if (url.pathname === '/internal/v1/upstreams') {
+    if (new URLSearchParams(location.search).has('directory-error')) {
+      return new Response('secret-directory-body-canary', { status: 503, headers: { 'x-mtc-request-id': '01900000-0000-7000-8000-000000000001' } });
+    }
+    return json([]);
+  }
   if (url.pathname === '/internal/v1/requests/query') {
     if (holdQuery) {
       holdQuery = false; window.requestLifecycleFixture.queryHeld = true;

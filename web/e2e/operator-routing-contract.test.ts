@@ -53,7 +53,6 @@ test('credential review defaults to active and mutation scopes remain explicit',
 });
 
 test('request filters use current scoped routing metadata without upstream model enumeration', () => {
-  assert.match(requestsPage, /setUpstreamError\(messageOf/);
   assert.match(requestsPage, /<TypedFilterBuilder ast=\{filters\} disabled=\{loading\} onApply=\{onApply\} onClear=\{onClear\} scope="requests" token=\{token\} tenant=\{tenant\} upstreams=\{upstreams\} \/>/);
   assert.match(typedFilterBuilder, /api<ModelRouteView\[\]>\(`\/internal\/v1\/model-routes\$\{query\}`/);
   assert.match(typedFilterBuilder, /routeModelOptions\(routes, upstreams, groups/);

@@ -1,5 +1,6 @@
 import { useEffect, useReducer, useRef } from 'react';
 import { apiDiagnosticMessage, streamSse } from '../../api';
+import { useI18n } from '../../i18n';
 import type { RequestEvent } from '../../types';
 import type { SessionStreamState } from '../SessionMonitor';
 
@@ -71,6 +72,9 @@ export function useRequestEventStream({
   disconnectedMessage: string;
   onEvent: (event: RequestEvent) => void;
 }) {
+  const { t } = useI18n();
+  const requestIdLabel = t('request.correlationId');
+  const streamInterrupted = t('request.streamInterrupted');
   const [status, dispatch] = useReducer(reducer, { kind: 'idle' });
   const cursor = useRef<EventCursor | undefined>(undefined);
   const callback = useRef(onEvent);
@@ -115,7 +119,7 @@ export function useRequestEventStream({
           if (!controller.signal.aborted) {
             dispatch({
               type: 'reconnecting',
-              message: apiDiagnosticMessage(reason, disconnectedMessage),
+              message: apiDiagnosticMessage(reason, disconnectedMessage, { requestId: requestIdLabel, streamInterrupted }),
             });
           }
         }
@@ -124,7 +128,7 @@ export function useRequestEventStream({
     };
     void connect();
     return () => controller.abort();
-  }, [disconnectedMessage, enabled, tenant, token]);
+  }, [disconnectedMessage, enabled, tenant, token, requestIdLabel, streamInterrupted]);
 
   return {
     state: status.kind as SessionStreamState,
