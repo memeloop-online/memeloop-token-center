@@ -1,6 +1,6 @@
 use super::super::*;
 use super::synchronous_image::{
-    SyncImageRequest, execute_synchronous_image_request, fail_image_request,
+    ImageResponseFormat, SyncImageRequest, execute_synchronous_image_request, fail_image_request,
     image_idempotency_replay_response, responses_tool_image_request,
     scoped_upstream_image_idempotency,
 };
@@ -109,7 +109,8 @@ async fn proxy_openai_image_generation(
             request_id,
         )
         .await?;
-        if !crate::provider::is_openai_compatible_http_driver(&route.driver) {
+        let antigravity = route.driver == crate::provider::antigravity::DRIVER;
+        if !antigravity && !crate::provider::is_openai_compatible_http_driver(&route.driver) {
             return Err(AppError::Upstream(format!(
                 "generation driver {} does not implement the OpenAI Images API",
                 route.driver
@@ -131,12 +132,29 @@ async fn proxy_openai_image_generation(
             .get("image_api_mode")
             .and_then(Value::as_str)
             .is_some_and(|value| value == "responses-tool");
-        if responses_tool_mode && image_count != 1 {
+        if (responses_tool_mode || antigravity) && image_count != 1 {
             return Err(AppError::BadRequest(
                 "responses-tool image routes currently require n=1".into(),
             ));
         }
-        let (upstream_path, forwarded) = if responses_tool_mode {
+        let response_format = if antigravity {
+            ImageResponseFormat::Antigravity
+        } else if responses_tool_mode {
+            ImageResponseFormat::ResponsesTool
+        } else {
+            ImageResponseFormat::OpenAi
+        };
+        let (upstream_path, forwarded) = if antigravity {
+            let config = crate::provider::antigravity::Config::from_account(&route.config)?;
+            (
+                "/v1internal:generateContent",
+                crate::provider::antigravity::openai_image_request(
+                    &route.upstream_model,
+                    &config.project_id,
+                    &request_json,
+                )?,
+            )
+        } else if responses_tool_mode {
             (
                 "/v1/responses",
                 responses_tool_image_request(&route.config, &route.upstream_model, &request_json)?,
@@ -146,7 +164,7 @@ async fn proxy_openai_image_generation(
             forwarded["model"] = Value::String(route.upstream_model.clone());
             ("/v1/images/generations", forwarded)
         };
-        let outbound_http = network::client_for_config_url(
+        let outbound_http = network::client_for_config_url_no_retry(
             &state.http,
             &route.base_url,
             &route.config,
@@ -173,16 +191,20 @@ async fn proxy_openai_image_generation(
             request = request.header("idempotency-key", upstream_idempotency);
         }
         request = route.credential.apply(request, unix_millis())?;
+        if antigravity {
+            let config = crate::provider::antigravity::Config::from_account(&route.config)?;
+            request = config.apply_headers(request)?;
+        }
         Ok::<_, AppError>((
             route,
             billed_units,
             reservation_price,
             request,
-            responses_tool_mode,
+            response_format,
         ))
     }
     .await;
-    let (route, billed_units, reservation_price, request, responses_tool_mode) = match preparation {
+    let (route, billed_units, reservation_price, request, response_format) = match preparation {
         Ok(prepared) => prepared,
         Err(error) => {
             if let Some(idempotency) = image_idempotency.as_ref() {
@@ -261,7 +283,7 @@ async fn proxy_openai_image_generation(
             &staged_request_object,
             &route,
             request,
-            responses_tool_mode,
+            response_format,
         ),
     )
     .await
@@ -373,6 +395,86 @@ mod tests {
             )
             .await
             .expect("image response")
+    }
+
+    #[tokio::test]
+    async fn antigravity_image_uses_shared_submission_and_idempotent_archive() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/v1internal:generateContent"))
+            .and(wiremock::matchers::header("authorization", "Bearer fixture-access"))
+            .and(wiremock::matchers::header("x-custom-client", "fixture-client"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"response": {"candidates": [{"content": {"parts": [{"inlineData": {"mimeType": "image/png", "data": "bW9jay1wbmc="}}]}}]}})))
+            .expect(1).mount(&upstream).await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_test(format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("native-image.db").display()
+        ));
+        config.plugin_dir = Some("plugins".into());
+        let state = AppState::initialize(config).await.unwrap();
+        let tenant = "native-image-fixture";
+        let upstream_account = state.db.create_upstream_account(CreateUpstreamAccountInput {
+            tenant_external_id: tenant.into(), name: "native image".into(), driver: crate::provider::antigravity::DRIVER.into(),
+            config: json!({"base_url": upstream.uri(), "network_scope": "public", "project_id": "fixture-project", "request_headers": {"x-custom-client": "fixture-client"}}),
+            credential: UpstreamCredential::OAuth { access_token: "fixture-access".into(), refresh_token: None, expires_at: None, header: "authorization".into(), prefix: "Bearer ".into(), adapter_state: None, proxy_url: None, proxy_network_scope: None },
+            oauth_session_id: None, oauth_driver: None, oauth_refresh_url: None,
+        }, state.config.key_pepper.as_bytes()).await.unwrap();
+        let route = state
+            .db
+            .create_model_route(CreateModelRouteInput {
+                tenant_external_id: tenant.into(),
+                public_model: "image-replay-model".into(),
+                upstream_account_id: upstream_account.id,
+                upstream_model: "gemini-3-pro-image".into(),
+                protocol: "generation".into(),
+                priority: 0,
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .upsert_generation_price("image-replay-model", "USD", "image", Decimal::new(3, 1))
+            .await
+            .unwrap();
+        let granted = state
+            .db
+            .create_key_with_routing(
+                CreateKeyInput {
+                    tenant_external_id: tenant.into(),
+                    principal_external_id: "native-fixture".into(),
+                    alias: "native-fixture".into(),
+                    currency: "USD".into(),
+                    policy: KeyPolicy::default(),
+                    initial_balance: Decimal::ONE,
+                    idempotency_key: None,
+                },
+                &[route.id],
+                &[],
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let first =
+            post_openai_image(&state, &granted.key, "native-stable-replay", "draw a fox").await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = axum::body::to_bytes(first.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&first).unwrap();
+        assert_eq!(payload["data"][0]["b64_json"], "bW9jay1wbmc=");
+        let replay =
+            post_openai_image(&state, &granted.key, "native-stable-replay", "draw a fox").await;
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(replay.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+            first
+        );
+        let requests = upstream.received_requests().await.unwrap();
+        let request: Value = requests[0].body_json().unwrap();
+        assert_eq!(request["project"], "fixture-project");
+        assert_eq!(request["requestType"], "image_gen");
     }
 
     #[tokio::test]

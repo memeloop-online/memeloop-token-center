@@ -13,10 +13,11 @@ use crate::{error::AppError, network, provider::UpstreamCredential};
 pub const DRIVER: &str = "google-antigravity";
 pub const BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
 pub const CONTROL_URL: &str = "https://cloudcode-pa.googleapis.com";
+
 const IMAGE_LIMIT: usize = 32 * 1024 * 1024;
 const CONTROL_LIMIT: usize = 1024 * 1024;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub base_url: String,
@@ -38,13 +39,51 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn apply_headers(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder, AppError> {
+        if self.request_headers.len() > 64 {
+            return Err(AppError::BadRequest("too many request headers".into()));
+        }
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (name, value) in &self.request_headers {
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| AppError::BadRequest("invalid request header".into()))?;
+            if matches!(
+                name.as_str(),
+                "content-length"
+                    | "transfer-encoding"
+                    | "connection"
+                    | "upgrade"
+                    | "trailer"
+                    | "te"
+            ) || value.len() > 8192
+            {
+                return Err(AppError::BadRequest(
+                    "request header overrides HTTP framing".into(),
+                ));
+            }
+            let value = reqwest::header::HeaderValue::from_str(value)
+                .map_err(|_| AppError::BadRequest("invalid request header".into()))?;
+            headers.insert(name, value);
+        }
+        Ok(request.headers(headers))
+    }
     pub fn from_account(value: &Value) -> Result<Self, AppError> {
         let mut config = Self::default();
-        if let Some(base) = value.get("base_url").and_then(Value::as_str) { config.base_url = base.to_owned(); }
-        if let Some(base) = value.get("control_url").and_then(Value::as_str) { config.control_url = base.to_owned(); }
-        if let Some(project) = value.get("project_id").and_then(Value::as_str) { config.project_id = project.to_owned(); }
+        if let Some(base) = value.get("base_url").and_then(Value::as_str) {
+            config.base_url = base.to_owned();
+        }
+        if let Some(base) = value.get("control_url").and_then(Value::as_str) {
+            config.control_url = base.to_owned();
+        }
+        if let Some(project) = value.get("project_id").and_then(Value::as_str) {
+            config.project_id = project.to_owned();
+        }
         if let Some(headers) = value.get("request_headers") {
-            config.request_headers = serde_json::from_value(headers.clone()).map_err(|_| AppError::BadRequest("invalid request headers".into()))?;
+            config.request_headers = serde_json::from_value(headers.clone())
+                .map_err(|_| AppError::BadRequest("invalid request headers".into()))?;
         }
         Ok(config)
     }
@@ -85,37 +124,14 @@ impl NativeClient<'_> {
             self.allow_test_loopback,
         )
         .await?;
-        let mut request = http
+        let request = http
             .post(endpoint)
             .timeout(Duration::from_secs(180))
             .json(body);
-        for (name, value) in &self.config.request_headers {
-            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
-                .map_err(|_| AppError::BadRequest("invalid Antigravity request header".into()))?;
-            // Client compatibility metadata cannot replace credential or transport authority.
-            if matches!(
-                name.as_str(),
-                "authorization"
-                    | "proxy-authorization"
-                    | "host"
-                    | "content-length"
-                    | "transfer-encoding"
-                    | "connection"
-                    | "upgrade"
-                    | "trailer"
-                    | "te"
-            ) {
-                return Err(AppError::BadRequest(
-                    "unsupported Antigravity compatibility header".into(),
-                ));
-            }
-            let value = reqwest::header::HeaderValue::from_str(value)
-                .map_err(|_| AppError::BadRequest("invalid Antigravity request header".into()))?;
-            request = request.header(name, value);
-        }
+        let request = self.credential.apply(request, crate::db::unix_millis())?;
         let response = self
-            .credential
-            .apply(request, crate::db::unix_millis())?
+            .config
+            .apply_headers(request)?
             .send()
             .await
             .map_err(|_| AppError::Upstream("Antigravity request failed".into()))?;
@@ -215,6 +231,49 @@ impl NativeClient<'_> {
     }
 }
 
+pub fn openai_image_request(
+    model: &str,
+    project: &str,
+    request: &Value,
+) -> Result<Value, AppError> {
+    let prompt = request
+        .get("prompt")
+        .and_then(Value::as_str)
+        .filter(|prompt| !prompt.trim().is_empty())
+        .ok_or_else(|| AppError::BadRequest("image prompt is required".into()))?;
+    if request
+        .get("n")
+        .and_then(Value::as_i64)
+        .is_some_and(|n| n != 1)
+    {
+        return Err(AppError::BadRequest(
+            "Antigravity image generation requires n=1".into(),
+        ));
+    }
+    let mut generation_config = json!({});
+    if let Some(size) = request.get("size").and_then(Value::as_str) {
+        let ratio = match size {
+            "auto" => None,
+            "1024x1024" => Some("1:1"),
+            "1536x1024" => Some("3:2"),
+            "1024x1536" => Some("2:3"),
+            _ => {
+                return Err(AppError::BadRequest(
+                    "unsupported Antigravity image size".into(),
+                ));
+            }
+        };
+        if let Some(ratio) = ratio {
+            generation_config["imageConfig"] = json!({"aspectRatio": ratio});
+        }
+    }
+    image_request(
+        model,
+        project,
+        json!({"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": generation_config}),
+    )
+}
+
 pub fn image_request(model: &str, project: &str, mut request: Value) -> Result<Value, AppError> {
     if !model.contains("image") || model.len() > 200 || project.trim().is_empty() {
         return Err(AppError::BadRequest(
@@ -257,7 +316,7 @@ pub fn image_request(model: &str, project: &str, mut request: Value) -> Result<V
         "project": project,
         "userAgent": "antigravity",
         "requestType": "image_gen",
-        "requestId": format!("image_gen/{}/{}/12", crate::db::unix_millis(), Uuid::new_v4()),
+        "requestId": format!("image_gen/{}/{}/12", crate::db::unix_millis(), Uuid::now_v7()),
         "request": request,
     }))
 }

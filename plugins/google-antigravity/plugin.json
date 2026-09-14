@@ -46,6 +46,7 @@
             },
             "request_headers": {
               "type": "object",
+              "writeOnly": true,
               "additionalProperties": {
                 "type": "string",
                 "maxLength": 8192

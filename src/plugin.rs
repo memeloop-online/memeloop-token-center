@@ -2378,7 +2378,11 @@ fn validate_provider_contribution(
     }
     if let Some(adapter) = &provider.oauth_adapter {
         if adapter.api_version != "oauth-adapter-v1"
-            || !matches!(adapter.flow_kind, crate::provider::OAuthFlowKind::CursorPkce | crate::provider::OAuthFlowKind::AuthorizationCodePkce)
+            || !matches!(
+                adapter.flow_kind,
+                crate::provider::OAuthFlowKind::CursorPkce
+                    | crate::provider::OAuthFlowKind::AuthorizationCodePkce
+            )
         {
             return Err(AppError::BadRequest(format!(
                 "plugin {plugin_id} provider {} contributes an unsupported OAuth adapter contract",

@@ -20,6 +20,29 @@ use crate::{
 };
 
 pub const FLOW: &str = "generic_authorization_code";
+pub const CLIENT_DEFAULTS_ENV: &str = "MTC_PROVIDER_OAUTH_CLIENT_DEFAULTS_JSON";
+
+/// Deployment-owned Secret injection. Values never appear in config debug or
+/// public catalog JSON; the chosen client is snapshotted into the AEAD session.
+pub fn deployment_client_default(provider: &str) -> Result<ClientConfig, AppError> {
+    let raw = std::env::var(CLIENT_DEFAULTS_ENV).map_err(|_| {
+        AppError::Conflict("default OAuth client configuration is not provisioned".into())
+    })?;
+    if raw.len() > 64 * 1024 {
+        return Err(AppError::Conflict(
+            "default OAuth client configuration exceeds limits".into(),
+        ));
+    }
+    let mut clients: std::collections::BTreeMap<String, ClientConfig> = serde_json::from_str(&raw)
+        .map_err(|_| AppError::Conflict("default OAuth client configuration is invalid".into()))?;
+    let client = clients.remove(provider).ok_or_else(|| {
+        AppError::Conflict(
+            "default OAuth client configuration is not provisioned for this provider".into(),
+        )
+    })?;
+    validate_client(&client)?;
+    Ok(client)
+}
 const TOKEN_AAD: &[u8] = b"memeloop-token-center/authorization-code/session/v1";
 const STATE_AAD: &[u8] = b"memeloop-token-center/authorization-code/state/v1";
 const READY_AAD: &[u8] = b"memeloop-token-center/authorization-code/ready/v1";
@@ -100,6 +123,44 @@ pub enum CompleteResult {
         lease_owner: Uuid,
         login: Box<ReadyLogin>,
     },
+}
+
+/// Validate the sealed session's authority before selecting its historical runtime.
+pub fn session_application_revision(
+    token: &str,
+    key: &[u8],
+    required_tenant: Option<&str>,
+    operator_service_id: Option<Uuid>,
+    now: i64,
+) -> Result<Option<i64>, AppError> {
+    let session: Session = open_private_json(token, key, TOKEN_AAD)
+        .map_err(|_| AppError::BadRequest("invalid OAuth session".into()))?;
+    if required_tenant.is_some_and(|tenant| tenant != session.tenant_external_id)
+        || session.operator_service_id != operator_service_id
+    {
+        return Err(AppError::Forbidden);
+    }
+    if session.expires_at <= now {
+        return Err(AppError::BadRequest("OAuth session expired".into()));
+    }
+    Ok(session.application_plugin_revision)
+}
+
+fn open_ready(
+    ciphertext: &str,
+    key: &[u8],
+    session: &Session,
+) -> Result<Box<ReadyLogin>, AppError> {
+    let ready: ReadyLogin = open_private_json(ciphertext, key, READY_AAD)?;
+    if ready.application_plugin_revision != session.application_plugin_revision
+        || ready.session_id != session.session_id
+        || ready.tenant_external_id != session.tenant_external_id
+    {
+        return Err(AppError::Conflict(
+            "OAuth ready session binding changed".into(),
+        ));
+    }
+    Ok(Box::new(ready))
 }
 
 #[derive(Deserialize)]
@@ -236,7 +297,7 @@ pub async fn complete(
         } => {
             return Ok(CompleteResult::Ready {
                 lease_owner,
-                login: Box::new(open_private_json(&ready_ciphertext, key, READY_AAD)?),
+                login: open_ready(&ready_ciphertext, key, &session)?,
             });
         }
         OAuthLoginClaim::Claimed {
@@ -246,7 +307,9 @@ pub async fn complete(
     };
     let login: LoginState = open_private_json(&ciphertext, key, STATE_AAD)?;
     if login.input.application_plugin_revision != session.application_plugin_revision {
-        return Err(AppError::Conflict("OAuth application revision binding changed".into()));
+        return Err(AppError::Conflict(
+            "OAuth application revision binding changed".into(),
+        ));
     }
     let code = match callback_code(callback_url, &login.input.client.redirect_uri, &login.state) {
         Ok(code) => code,
@@ -276,11 +339,13 @@ pub async fn complete(
         allow_test_loopback,
         None,
     )
-    .await.and_then(|tokens| credential(tokens, &login.input, now, None));
+    .await
+    .and_then(|tokens| credential(tokens, &login.input, now, None));
     let credential = match tokens {
         Ok(credential) => credential,
         Err(error) => {
-            db.fail_oauth_login_poll(session.session_id, lease_owner, now).await?;
+            db.fail_oauth_login_poll(session.session_id, lease_owner, now)
+                .await?;
             return Err(error);
         }
     };
@@ -307,7 +372,7 @@ pub async fn complete(
             ready_ciphertext,
         } => Ok(CompleteResult::Ready {
             lease_owner,
-            login: Box::new(open_private_json(&ready_ciphertext, key, READY_AAD)?),
+            login: open_ready(&ready_ciphertext, key, &session)?,
         }),
         OAuthLoginClaim::Consumed { account_id } => Ok(CompleteResult::Consumed {
             account_id,
@@ -407,6 +472,7 @@ fn credential(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn token_request(
     http: &reqwest::Client,
     endpoint: &str,
@@ -417,7 +483,8 @@ async fn token_request(
     guard: Option<&dyn OAuthRefreshRequestGuard>,
 ) -> Result<TokenResponse, AppError> {
     let http =
-        network::client_for_config_url_no_retry(http, endpoint, config, proxy, allow_test_loopback).await?;
+        network::client_for_config_url_no_retry(http, endpoint, config, proxy, allow_test_loopback)
+            .await?;
     let request = http
         .post(endpoint)
         .timeout(std::time::Duration::from_secs(20))
@@ -453,7 +520,7 @@ fn validate_client(client: &ClientConfig) -> Result<(), AppError> {
         .map_err(|_| AppError::BadRequest("invalid OAuth redirect URI".into()))?;
     let loopback = redirect
         .host_str()
-        .is_some_and(|host| matches!(host, "127.0.0.1" | "[::1]"));
+        .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "[::1]"));
     if client.client_id.is_empty()
         || client.client_id.len() > 1024
         || client.scopes.is_empty()
@@ -513,6 +580,170 @@ fn callback_code(callback: &str, redirect: &str, state: &str) -> Result<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{body_string_contains, method, path},
+    };
+
+    fn input(token_endpoint: String) -> StartInput {
+        StartInput {
+            application_plugin_revision: Some(7),
+            tenant_external_id: "fixture-tenant".into(),
+            account_name: "fixture-account".into(),
+            provider_driver: "fixture-provider".into(),
+            provider_config: json!({"base_url": "https://api.example.com", "network_scope": "public"}),
+            operator_service_id: None,
+            client: ClientConfig {
+                client_id: "fixture-client".into(),
+                client_secret: Some("fixture-client-parameter".into()),
+                redirect_uri: "http://127.0.0.1:51121/oauth-callback".into(),
+                scopes: vec!["profile".into()],
+            },
+            adapter: OAuthAdapterContribution {
+                api_version: "oauth-adapter-v1".into(),
+                flow_kind: OAuthFlowKind::AuthorizationCodePkce,
+                login_url: "https://accounts.example.com/authorize".into(),
+                poll_url: token_endpoint.clone(),
+                refresh_url: token_endpoint,
+            },
+            proxy_url: None,
+            proxy_network_scope: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn session_binds_operator_revision_and_never_exposes_client_parameter() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("oauth.db").display()
+        ))
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        let key = b"fixture encryption key at least 32 bytes long";
+        let started = start(
+            &db,
+            input("https://tokens.example.com/token".into()),
+            key,
+            1000,
+        )
+        .await
+        .unwrap();
+        assert!(started.login_url.contains("code_challenge_method=S256"));
+        assert!(!started.login_url.contains("fixture-client-parameter"));
+        assert!(!started.session_token.contains("fixture-client-parameter"));
+        assert_eq!(
+            session_application_revision(
+                &started.session_token,
+                key,
+                Some("fixture-tenant"),
+                None,
+                1001
+            )
+            .unwrap(),
+            Some(7)
+        );
+        assert!(
+            session_application_revision(
+                &started.session_token,
+                key,
+                Some("other-tenant"),
+                None,
+                1001
+            )
+            .is_err()
+        );
+        assert!(
+            session_application_revision(
+                &started.session_token,
+                key,
+                None,
+                Some(Uuid::now_v7()),
+                1001
+            )
+            .is_err()
+        );
+        assert!(
+            session_application_revision(
+                &started.session_token,
+                key,
+                None,
+                None,
+                started.expires_at
+            )
+            .is_err()
+        );
+        let session: Session = open_private_json(&started.session_token, key, TOKEN_AAD).unwrap();
+        let ready = ReadyLogin {
+            application_plugin_revision: Some(8),
+            session_id: session.session_id,
+            tenant_external_id: session.tenant_external_id.clone(),
+            account_name: "fixture".into(),
+            provider_driver: "fixture".into(),
+            provider_config: json!({}),
+            refresh_url: "https://tokens.example.com/token".into(),
+            credential: UpstreamCredential::None,
+        };
+        assert!(
+            open_ready(
+                &seal_private_json(&ready, key, READY_AAD).unwrap(),
+                key,
+                &session
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_is_form_encoded_preserves_identity_and_retains_missing_refresh_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("client_secret=fixture-client-parameter"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token": "new-fixture-access", "expires_in": 3600, "token_type": "Bearer"}))).expect(1).mount(&server).await;
+        let input = input(format!("{}/token", server.uri()));
+        let current = credential(
+            TokenResponse {
+                access_token: "old-fixture-access".into(),
+                refresh_token: Some("fixture-refresh".into()),
+                expires_in: 3600,
+                token_type: Some("Bearer".into()),
+            },
+            &input,
+            1000,
+            None,
+        )
+        .unwrap();
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let refreshed = refresh(
+            &http,
+            &current,
+            &input.adapter,
+            2000,
+            true,
+            &super::super::TEST_OAUTH_REFRESH_REQUEST_GUARD,
+        )
+        .await
+        .unwrap();
+        match refreshed {
+            UpstreamCredential::OAuth {
+                access_token,
+                refresh_token,
+                expires_at,
+                ..
+            } => {
+                assert_eq!(access_token, "new-fixture-access");
+                assert_eq!(refresh_token.as_deref(), Some("fixture-refresh"));
+                assert_eq!(expires_at, Some(3_602_000));
+            }
+            _ => panic!("expected OAuth credential"),
+        }
+    }
     #[test]
     fn callback_binds_destination_and_unique_state() {
         assert_eq!(

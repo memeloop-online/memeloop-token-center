@@ -12,7 +12,8 @@ pub(in crate::api) struct StartRequest {
     account_name: String,
     provider_driver: String,
     provider_config: Value,
-    client: ClientConfig,
+    #[serde(default)]
+    client: Option<ClientConfig>,
     #[serde(default)]
     proxy_url: Option<String>,
     #[serde(default)]
@@ -26,6 +27,7 @@ pub(in crate::api) async fn start_authorization_code_oauth(
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
+    let state = state.pin_application_plugins().await?;
     // Supplying a client, callback or explicit proxy changes token destination
     // authority and is restricted to the global operator, just like plugin install.
     if service.tenant_external_id.is_some() {
@@ -52,17 +54,21 @@ pub(in crate::api) async fn start_authorization_code_oauth(
         .oauth_adapter
         .clone()
         .ok_or_else(|| AppError::BadRequest("provider does not offer OAuth".into()))?;
+    let client = match body.client {
+        Some(client) => client,
+        None => authorization_code::deployment_client_default(&body.provider_driver)?,
+    };
     Ok(Json(
         authorization_code::start(
             &state.db,
-        StartInput {
-            application_plugin_revision: None,
+            StartInput {
+                application_plugin_revision: state.application_plugin_revision(),
                 tenant_external_id: body.tenant_external_id,
                 account_name: body.account_name,
                 provider_driver: body.provider_driver,
                 provider_config: body.provider_config,
                 operator_service_id: service.service_id,
-                client: body.client,
+                client,
                 adapter,
                 proxy_url: body.proxy_url,
                 proxy_network_scope: body.proxy_network_scope,
@@ -87,6 +93,14 @@ pub(in crate::api) async fn complete_authorization_code_oauth(
     Json(body): Json<CompleteRequest>,
 ) -> Result<Response, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
+    let revision = authorization_code::session_application_revision(
+        &body.session_token,
+        state.config.key_pepper.as_bytes(),
+        service.tenant_external_id.as_deref(),
+        service.service_id,
+        unix_millis(),
+    )?;
+    let state = state.pin_oauth_application_revision(revision).await?;
     match authorization_code::complete(
         &state.db,
         &state.http,
@@ -128,9 +142,16 @@ pub(in crate::api) async fn complete_authorization_code_oauth(
             // Tokens are already durably staged before this recoverable read.
             // Project discovery failure must never discard a newly issued refresh token.
             if ready.provider_driver == crate::provider::antigravity::DRIVER {
-                let config = crate::provider::antigravity::Config::from_account(&ready.provider_config)?;
-                let native = crate::provider::antigravity::NativeClient { http: &state.http, credential: &ready.credential, config: &config, allow_test_loopback: state.config.allow_oauth_loopback };
-                ready.provider_config["project_id"] = Value::String(native.discover_project().await?);
+                let config =
+                    crate::provider::antigravity::Config::from_account(&ready.provider_config)?;
+                let native = crate::provider::antigravity::NativeClient {
+                    http: &state.http,
+                    credential: &ready.credential,
+                    config: &config,
+                    allow_test_loopback: state.config.allow_oauth_loopback,
+                };
+                ready.provider_config["project_id"] =
+                    Value::String(native.discover_project().await?);
             }
             validate_provider_schema(
                 &state,
