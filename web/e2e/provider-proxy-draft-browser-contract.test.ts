@@ -60,9 +60,26 @@ test('independent proxy save updates concurrency metadata without dropping the p
     await page.getByRole('button', { name: '编辑', exact: true }).click();
     assert.equal(await row.isVisible(), false, 'another detail cannot replace an unsaved edit');
     const workspace = page.locator('.provider-edit-workspace');
+    const originalProxy = 'socks5h://fixture-user:fixture-password@10.0.0.15:1080';
+    const proxyValue = workspace.locator('.provider-proxy-value input');
+    await proxyValue.waitFor();
+    assert.equal(await proxyValue.inputValue(), originalProxy);
+    assert.equal(await workspace.locator('form form').count(), 0, 'connection settings share one form without nested forms');
+    assert.equal(await workspace.locator('form .upstream-connection').count(), 1, 'connection settings are inside the account form');
+    assert.equal(await proxyValue.getAttribute('value'), null, 'the original is not serialized into HTML');
+    assert.equal(await proxyValue.getAttribute('type'), 'text', 'authorized proxy values are directly visible by default');
+    await workspace.getByRole('button', { name: '隐藏代理地址', exact: true }).click();
+    assert.equal(await proxyValue.getAttribute('type'), 'password', 'hiding is an explicit option');
+    await workspace.getByRole('button', { name: '查看代理地址', exact: true }).click();
+    await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+    await workspace.getByRole('button', { name: '复制代理地址', exact: true }).click();
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), originalProxy);
     const name = workspace.getByLabel('上游名称', { exact: false });
     await name.fill('保留名称草稿');
+    assert.equal(await proxyValue.getAttribute('type'), 'text', 'editing another field does not conceal an authorized configuration value');
     await page.getByRole('button', { name: '配置网络代理', exact: true }).click();
+    assert.equal(await page.locator('.upstream-proxy-editor input').inputValue(), originalProxy, 'editing starts with the actual current address');
+    assert.equal(await page.locator('.upstream-proxy-editor input').getAttribute('type'), 'text', 'proxy edits are directly readable');
     const save = workspace.locator('.rjsf > button[type="submit"]');
     assert.equal(await save.isEnabled(), false);
     await page.locator('.upstream-proxy-editor input').fill('socks5h://10.0.0.10:1080');
@@ -73,6 +90,21 @@ test('independent proxy save updates concurrency metadata without dropping the p
     await save.click();
     await page.locator('.provider-list').getByText('保留名称草稿', { exact: true }).waitFor();
     assert.equal(await page.evaluate(() => window.formJourneyWrites), 2, 'provider save succeeds against the new revision without retries');
+    await page.evaluate(() => { window.deferNextFormProxyRead = true; });
+    await row.getByRole('button', { name: '编辑', exact: true }).click();
+    await page.waitForFunction(() => !window.deferNextFormProxyRead);
+    await workspace.getByRole('button', { name: '配置网络代理', exact: true }).click();
+    await workspace.locator('.upstream-proxy-editor input').fill('socks5h://10.0.0.40:1080');
+    await workspace.getByRole('button', { name: '保存网络代理', exact: true }).click();
+    await workspace.locator('.provider-proxy-value input').waitFor();
+    await page.evaluate(() => window.releaseFormProxyRead());
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    assert.equal(await workspace.locator('.provider-proxy-value input').inputValue(), 'socks5h://10.0.0.40:1080', 'a late old-generation read cannot restore the previous proxy');
+    await page.goto(`${origin}/e2e/fixtures/form-journey.html?workflows&proxy-no-authority`);
+    await row.getByRole('button', { name: '编辑', exact: true }).click();
+    assert.equal(await workspace.locator('.provider-proxy-value input').count(), 0);
+    assert.equal(await workspace.getByRole('button', { name: '查看代理地址', exact: true }).count(), 0);
+    assert.equal(await page.evaluate(() => window.formJourneyReads.filter(path => path.endsWith('/transport-proxy')).length), 0, 'an account without management capability never requests the original');
     // Credential-generation change invalidates both the cached summary and
     // reset capability. Unknown discovery remains visible, but cannot prepare
     // a reset. These reads and the proxy update are in-memory only; no reset

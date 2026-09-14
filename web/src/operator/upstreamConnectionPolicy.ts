@@ -15,6 +15,16 @@ export function isPrivateProxyUrl(value: string) {
   } catch { return false; }
 }
 
+/** Generic SOCKS5 hostnames are resolved and checked for private IPs by the server. */
+export function isGenericProxyUrlInput(value: string) {
+  if (isPrivateProxyUrl(value)) return true;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'socks5:' && Boolean(url.hostname) && url.port !== '0'
+      && !url.search && !url.hash && (!url.pathname || url.pathname === '/');
+  } catch { return false; }
+}
+
 export function connectionSchema(schema: RJSFSchema, endpointHint: string): RJSFSchema {
   const result = structuredClone(schema);
   const base = result.properties?.base_url;
