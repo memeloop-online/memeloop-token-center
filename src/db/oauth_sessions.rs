@@ -422,6 +422,7 @@ fn validate_session_scope(
             | "provider_adapter_cursor_pkce"
             | "claude_manual_pkce"
             | "github_copilot_device"
+            | "kimi-oauth"
     ) || tenant.is_empty()
         || tenant.len() > 200
         || tenant.trim() != tenant

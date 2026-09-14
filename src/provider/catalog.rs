@@ -56,6 +56,8 @@ pub enum OAuthFlowKind {
     ClaudeManualPkce,
     /// GitHub device authorization followed by a Copilot token exchange.
     GithubDeviceCopilot,
+    /// Native Kimi Code RFC 8628 device authorization.
+    KimiDevice,
 }
 
 /// Explicit opt-in to the executable provider ABI. Component providers are
@@ -446,6 +448,13 @@ impl ProviderCatalog {
             true,
         );
         kimi.protocols = vec!["openai".to_owned(), "anthropic".to_owned()];
+        kimi.oauth_adapter = Some(OAuthAdapterContribution {
+            api_version: "oauth-adapter-v1".to_owned(),
+            flow_kind: OAuthFlowKind::KimiDevice,
+            login_url: crate::oauth::kimi_device::DEVICE_ENDPOINT.to_owned(),
+            poll_url: crate::oauth::managed::kimi::TOKEN_ENDPOINT.to_owned(),
+            refresh_url: crate::oauth::managed::kimi::TOKEN_ENDPOINT.to_owned(),
+        });
         kimi.credential_schema["properties"]["expires_at"] = json!({"type": ["integer", "null"], "description": "Unix milliseconds, absent source expiry remains unknown"});
         types.push(kimi);
         Self {
