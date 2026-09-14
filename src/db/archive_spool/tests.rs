@@ -1,6 +1,110 @@
 use super::*;
 
 #[tokio::test]
+async fn compressed_buffered_capture_refunds_to_exact_ciphertext_in_the_same_transaction() {
+    let (_dir, db, id) = fixture().await;
+    let pepper = b"compressed-budget-test-pepper-over-32-bytes";
+    let body = bytes::Bytes::from(
+        serde_json::to_vec(&vec![
+            serde_json::json!({
+                "role": "assistant",
+                "content": "synthetic repeated JSON content for deterministic accounting",
+            });
+            2_000
+        ])
+        .unwrap(),
+    );
+    let archive = crate::response_archive_spool::BufferedArchive::new(
+        id,
+        BufferedArchivePurpose::Request,
+        &body,
+        pepper,
+        true,
+    )
+    .unwrap();
+    let legacy_upper = body
+        .chunks(crate::response_archive_spool::CHUNK_BYTES)
+        .try_fold(SPOOL_OVERHEAD, |total, bytes| {
+            total.checked_add(archive.sealed_len(bytes.len())? as i64 + CHUNK_OVERHEAD)
+        })
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER reject_compressed_refund BEFORE UPDATE OF cipher_bytes ON request_archive_spools WHEN NEW.cipher_bytes < OLD.cipher_bytes BEGIN SELECT RAISE(ABORT, 'refund failure'); END",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let prepared = archive.prepare_first_batch().await.unwrap();
+    let (mut tx, now) = db.spool_transaction().await.unwrap();
+    assert!(
+        db.capture_buffered_archive_body_in_transaction(&mut tx, now, &archive, Some(prepared))
+            .await
+            .is_err()
+    );
+    drop(tx);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1",
+        )
+        .bind(id.request_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        0,
+        "refund failure must roll back the spool insert"
+    );
+    assert_eq!(
+        budget(&db).await,
+        0,
+        "refund failure must roll back admission"
+    );
+    sqlx::query("DROP TRIGGER reject_compressed_refund")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let prepared = archive.prepare_first_batch().await.unwrap();
+    let (mut tx, now) = db.spool_transaction().await.unwrap();
+    assert!(
+        db.capture_buffered_archive_body_in_transaction(&mut tx, now, &archive, Some(prepared))
+            .await
+            .unwrap()
+    );
+    tx.commit().await.unwrap();
+
+    let row = sqlx::query(
+        "SELECT s.byte_count, s.cipher_bytes, b.cipher_bytes AS budget_bytes, b.request_cipher_bytes, 1024 + SUM(LENGTH(c.ciphertext) + 512) AS actual_bytes, MIN(CASE WHEN c.ciphertext LIKE 'zstd1.%' THEN 1 ELSE 0 END) AS compressed FROM request_archive_spools s JOIN request_archive_spool_chunks c ON c.request_id = s.request_id CROSS JOIN response_archive_spool_budget b WHERE s.request_id = $1 AND b.singleton = 1 GROUP BY s.byte_count, s.cipher_bytes, b.cipher_bytes, b.request_cipher_bytes",
+    )
+    .bind(id.request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let actual = row.get::<i64, _>("actual_bytes");
+    assert_eq!(row.get::<i64, _>("byte_count"), body.len() as i64);
+    assert_eq!(row.get::<i64, _>("cipher_bytes"), actual);
+    assert_eq!(row.get::<i64, _>("budget_bytes"), actual);
+    assert_eq!(row.get::<i64, _>("request_cipher_bytes"), actual);
+    assert_eq!(row.get::<i64, _>("compressed"), 1);
+    assert!(
+        actual < legacy_upper,
+        "the conservative reservation must be refunded"
+    );
+
+    let (mut replay, replay_now) = db.spool_transaction().await.unwrap();
+    assert!(
+        db.capture_buffered_archive_body_in_transaction(&mut replay, replay_now, &archive, None)
+            .await
+            .unwrap()
+    );
+    replay.commit().await.unwrap();
+    assert_eq!(
+        budget(&db).await,
+        actual,
+        "exact replay cannot charge twice"
+    );
+}
+
+#[tokio::test]
 async fn bounded_multirow_capture_rolls_back_across_batch_boundary() {
     let (_dir, db, id) = fixture().await;
     let chunks: Vec<_> = (0..257)

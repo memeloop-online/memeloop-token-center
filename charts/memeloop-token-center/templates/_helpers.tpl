@@ -51,6 +51,8 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
   value: {{ printf "%d" (int64 .Values.config.responsesBodyMaxBytes) | quote }}
 - name: MTC_RESPONSES_BODY_READ_CONCURRENCY
   value: {{ .Values.config.responsesBodyReadConcurrency | quote }}
+- name: MTC_ARCHIVE_SPOOL_COMPRESSION_ENABLED
+  value: {{ .Values.config.archiveSpoolCompression.enabled | quote }}
 - name: MTC_UPSTREAM_HEALTH_PROBE_LEASE_MILLIS
   value: {{ .Values.config.upstreamHealth.probeLeaseMillis | quote }}
 - name: MTC_UPSTREAM_HEALTH_PROBE_HEARTBEAT_MILLIS

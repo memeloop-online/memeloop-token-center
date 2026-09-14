@@ -131,6 +131,7 @@
         "responsesBodyReadConcurrency",
         "upstreamHealth",
         "runtimeProfiling",
+        "archiveSpoolCompression",
         "databaseUrlSecret",
         "keyPepperSecret",
         "serviceTokenSecret",
@@ -176,6 +177,15 @@
             "enabled": { "type": "boolean" }
           },
           "description": "Registers bounded authenticated diagnostic handlers only for the control or all role. Keep disabled outside a time-bounded internal incident investigation."
+        },
+        "archiveSpoolCompression": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled"],
+          "properties": {
+            "enabled": { "type": "boolean" }
+          },
+          "description": "Enables compressed archive spool writes only after every runtime role has deployed the dual-format reader. Keep false during the reader-first rollout."
         },
         "databaseUrlSecret": { "$ref": "#/definitions/secretKeyRef" },
         "keyPepperSecret": { "$ref": "#/definitions/secretKeyRef" },

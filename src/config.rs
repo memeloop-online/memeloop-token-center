@@ -16,6 +16,7 @@ pub const DEFAULT_PROXY_MEMORY_BUDGET_BYTES: u32 = 256 * 1024 * 1024;
 pub const MAX_RESPONSES_BODY_READ_CONCURRENCY: u32 = 8;
 pub const DEFAULT_UPSTREAM_SHARED_PROBE_ATTEMPTS: u32 = 1;
 pub const MAX_UPSTREAM_SHARED_PROBE_ATTEMPTS: u32 = 4;
+pub const DEFAULT_ARCHIVE_SPOOL_COMPRESSION_ENABLED: bool = false;
 
 /// Global circuit-breaker safety defaults. Provider/account transport policy
 /// may narrow or tune supported recovery controls at runtime; these values
@@ -155,6 +156,11 @@ pub struct Config {
     /// endpoint fails closed when this integration is not configured.
     pub memeloop_cloud_webhook_secret: Option<String>,
     pub archive_backend: ArchiveBackend,
+    /// Enables new compressed spool writes only after every runtime role has
+    /// deployed the format-compatible reader. Readers always accept both
+    /// formats; this role-independent switch deliberately defaults off.
+    #[serde(default)]
+    pub archive_spool_compression_enabled: bool,
     pub archive_path: Option<String>,
     pub s3_bucket: Option<String>,
     pub s3_endpoint: Option<String>,
@@ -215,6 +221,10 @@ impl std::fmt::Debug for Config {
                     .map(|_| "[redacted]"),
             )
             .field("archive_backend", &self.archive_backend)
+            .field(
+                "archive_spool_compression_enabled",
+                &self.archive_spool_compression_enabled,
+            )
             .field("archive_path", &self.archive_path)
             .field("s3_bucket", &self.s3_bucket)
             .field(
@@ -376,6 +386,10 @@ impl Config {
             service_token,
             memeloop_cloud_webhook_secret,
             archive_backend,
+            archive_spool_compression_enabled: env_bool(
+                "MTC_ARCHIVE_SPOOL_COMPRESSION_ENABLED",
+                DEFAULT_ARCHIVE_SPOOL_COMPRESSION_ENABLED,
+            ),
             archive_path: env::var("MTC_ARCHIVE_PATH").ok(),
             s3_bucket: env::var("MTC_S3_BUCKET").ok(),
             s3_endpoint: env::var("MTC_S3_ENDPOINT").ok(),
@@ -429,6 +443,7 @@ impl Config {
                 "test-memeloop-cloud-webhook-secret-long-enough".to_owned(),
             ),
             archive_backend: ArchiveBackend::Memory,
+            archive_spool_compression_enabled: DEFAULT_ARCHIVE_SPOOL_COMPRESSION_ENABLED,
             archive_path: None,
             s3_bucket: None,
             s3_endpoint: None,
@@ -788,6 +803,10 @@ mod tests {
         assert_eq!(
             Config::for_test("sqlite::memory:".to_owned()).archive_backend,
             ArchiveBackend::Memory
+        );
+        assert!(
+            !Config::for_test("sqlite::memory:".to_owned()).archive_spool_compression_enabled,
+            "new spool writers must remain disabled until every old reader has exited"
         );
     }
 
