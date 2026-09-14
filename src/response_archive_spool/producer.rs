@@ -503,9 +503,7 @@ impl ResponseArchiveProducer {
             ..
         } = self;
         let tail = Bytes::from(pending);
-        let Some(terminal) = terminal.take() else {
-            return None;
-        };
+        let terminal = terminal.take()?;
         if terminal.send(tail).is_err() {
             active.store(false, Ordering::Release);
             return None;
