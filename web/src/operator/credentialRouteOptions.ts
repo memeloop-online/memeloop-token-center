@@ -35,6 +35,7 @@ export function credentialRouteOptions(routes: ModelRouteView[], accounts: Upstr
     const accountDescription = candidateAccounts.map(account => `${account.name} · ${account.provider}`).join(' / ');
     return {
       value: route.id,
+      scopeIdentity: JSON.stringify([route.public_model, candidates === undefined ? 'unknown' : 'confirmed', [...ids].sort(), route.protocol, route.upstream_model]),
       label: route.public_model,
       chipDescription: [scope, ids.length === 1 ? candidateAccounts[0].name : providerNames].filter(Boolean).join(' · '),
       description: [state, scope, accountDescription, route.protocol, route.upstream_model !== route.public_model ? `${zh ? '上游' : 'Upstream'}: ${route.upstream_model}` : ''].filter(Boolean).join(' · '),
@@ -54,7 +55,7 @@ export function credentialRouteOptions(routes: ModelRouteView[], accounts: Upstr
   });
   // Account/scope descriptions already distinguish ordinary same-model routes.
   // Reserve technical suffixes for genuinely identical human-visible choices.
-  return options.map(option => options.some(other => other.value !== option.value && other.label === option.label && other.description === option.description && (option.disabled || !other.disabled))
+  return options.map(option => options.some(other => other.value !== option.value && other.scopeIdentity === option.scopeIdentity && (option.disabled || !other.disabled))
     ? { ...option, label: `${option.label} (${shortIdentity(option.value, options.map(value => value.value))})` }
     : option);
 }

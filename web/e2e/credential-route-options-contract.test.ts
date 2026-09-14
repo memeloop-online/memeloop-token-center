@@ -43,3 +43,18 @@ test('technical IDs are tooltip details and duplicate labels use collision-safe 
   assert.equal(inactiveDuplicate[1].disabled, true);
   assert.ok(inactiveDuplicate[1].details.includes(second), 'inactive identity stays available to existing grant previews');
 });
+
+test('same candidate scope is order independent, while inactive copies do not rename active choices', () => {
+  const accounts = [{ id: 'a', name: 'Personal', driver: 'kimi' }, { id: 'b', name: 'Team', driver: 'kimi' }] as UpstreamAccount[];
+  const input = [route('scope-one', { candidate_upstream_account_ids: ['a', 'b'] }), route('scope-two', { candidate_upstream_account_ids: ['b', 'a'] })];
+  const same = credentialRouteOptions(input, accounts, [], 'zh-CN');
+  assert.notEqual(same[0].label, same[1].label, 'genuinely equal active scopes require stable disambiguation');
+  assert.notEqual(same[0].label, 'Sol');
+  assert.notEqual(same[1].label, 'Sol');
+  const inactive = credentialRouteOptions([input[0], { ...input[1], enabled: false }], accounts, [], 'zh-CN');
+  assert.equal(inactive[0].label, 'Sol');
+  assert.equal(inactive[1].value, 'scope-two');
+  const unknown = credentialRouteOptions([input[0], route('unknown-scope', { upstream_account_ids: ['a', 'b'] })], accounts, [], 'zh-CN');
+  assert.equal(unknown[0].label, 'Sol', 'unknown catalog scope is not conflated with confirmed candidates');
+  assert.equal(unknown[1].label, 'Sol');
+});
