@@ -5,7 +5,7 @@ import { useI18n } from './i18n.js';
 import { formatCurrency, formatCurrencyDisplay, formatDurationDisplay, formatMetricDisplay, formatMetricNumber, formatMilliseconds, formatNumber } from './format.js';
 import { useAnchoredPopover } from './useAnchoredPopover.js';
 import { DetailTooltip } from './design-system';
-import { averageRequestOutputTps, nonCachedRequestInput, requestCredentialLabel, requestTableCopy } from './requestTablePresentation';
+import { averageRequestOutputTps, nonCachedRequestInput, requestCredentialLabel, requestIsPending } from './requestTablePresentation';
 
 export function Shell({ children, operator = false }: { children: ReactNode; operator?: boolean }) {
   const { locale, setLocale, t } = useI18n();
@@ -231,7 +231,12 @@ export function RequestTable({
   const { locale, t } = useI18n();
   if (!requests.length) return <div className="empty">{t('common.noRequests')}</div>;
   const showsSession = requests.some((request) => request.session_context !== undefined);
-  const copy = requestTableCopy(locale);
+  const copy = {
+    total: t('request.totalTokens'), input: t('request.uncachedInput'), output: t('request.outputTokens'),
+    unknown: t('request.usageUnknown'), averageTps: t('request.averageTps'), tpsHint: t('request.averageTpsHint'),
+    tpsMissing: t('request.tpsMissing'), tpsRunning: t('request.tpsRunning'),
+    cacheMissing: t('request.cacheMissing'), pendingUsage: t('request.pendingUsage'),
+  };
   return (
     <div className="table-scroll request-table-scroll" role="region" aria-label={t('request.table')} tabIndex={0}>
       <table className="request-table">
@@ -253,15 +258,16 @@ export function RequestTable({
             const durationSummary = request.completed_at != null
               ? `${t('request.completedAt')}: ${new Date(request.completed_at).toLocaleString(locale)}`
               : '';
-            const pending = request.status_code === null;
+            const pending = requestIsPending(request);
             const cost = pending ? { text: '—', title: copy.pendingUsage } : currencyForRequest ? formatCurrencyDisplay(request.cost, currencyForRequest, locale) : { text: '—' };
             const tokenDisplay = formatMetricDisplay(request.input_tokens + request.output_tokens, locale);
             const tokenDetails = pending ? copy.pendingUsage : requestTokenDetails(request, locale, t);
             const duration = formatDurationDisplay(request.duration_ms, locale);
             const uncachedInput = nonCachedRequestInput(request);
             const averageTps = averageRequestOutputTps(request);
-            const rateHint = averageTps === null ? request.status_code === null ? copy.tpsRunning : copy.tpsMissing : copy.tpsHint;
-            const credentialLabel = requestCredentialLabel(request, credentialAlias, locale);
+            const rateHint = averageTps === null ? pending ? copy.tpsRunning : copy.tpsMissing : copy.tpsHint;
+            const credential = requestCredentialLabel(request, credentialAlias);
+            const credentialLabel = 'label' in credential ? credential.label : t(credential.key);
             const credentialDetails = request.credential_identity ? `${request.credential_identity.key_id} · ${request.credential_identity.principal_external_id}` : credentialLabel;
             const upstreamName = request.upstream_account_id ? upstreamNames?.get(request.upstream_account_id) : undefined;
             return <tr key={request.request_id}>

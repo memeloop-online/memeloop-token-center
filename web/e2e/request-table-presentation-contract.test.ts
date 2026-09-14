@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { averageRequestOutputTps, nonCachedRequestInput, requestCredentialLabel } from '../src/requestTablePresentation';
-import type { RequestView } from '../src/types';
+import { averageRequestOutputTps, nonCachedRequestInput, requestCredentialLabel, requestIsPending } from '../src/requestTablePresentation.js';
+import type { RequestView } from '../src/types.js';
 
 const request: RequestView = {
   request_id: 'fixture', created_at: 1, protocol: 'openai', model: 'fixture', status_code: 200,
@@ -27,7 +27,18 @@ test('average output TPS uses recorded total seconds, distinguishes valid zero f
 });
 
 test('credential identity remains meaningful without inventing an alias for explicitly unbound history', () => {
-  assert.equal(requestCredentialLabel(request, 'Portal key', 'en'), 'Portal key');
-  assert.equal(requestCredentialLabel({ ...request, credential_identity: null }, 'Portal key', 'en'), 'Credential not recorded');
-  assert.equal(requestCredentialLabel({ ...request, credential_identity: { tenant_external_id: 'fixture', key_id: 'key', key_alias: '', principal_external_id: 'user' } }, 'Portal key', 'en'), 'Unnamed credential');
+  assert.deepEqual(requestCredentialLabel(request, 'Portal key'), { label: 'Portal key' });
+  assert.deepEqual(requestCredentialLabel({ ...request, credential_identity: null }, 'Portal key'), { key: 'request.missingCredential' });
+  assert.deepEqual(requestCredentialLabel({ ...request, credential_identity: { tenant_external_id: 'fixture', key_id: 'key', key_alias: '', principal_external_id: 'user' } }, 'Portal key'), { key: 'request.unnamedCredential' });
+});
+
+test('terminal imported history need not have completion timestamps; live started events remain pending', () => {
+  assert.equal(requestIsPending({ ...request, status_code: null, completed_at: null }), true);
+  assert.equal(requestIsPending({ ...request, completed_at: null }), false);
+  assert.equal(averageRequestOutputTps({ ...request, completed_at: null }), 16);
+});
+
+test('Anthropic uses persisted normalized total input, not raw provider input', () => {
+  // Provider input=100 + cache_read=40 + cache_creation=20 persists as input_tokens=160.
+  assert.equal(nonCachedRequestInput({ ...request, protocol: 'anthropic', input_tokens: 160 }), 100);
 });
