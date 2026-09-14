@@ -66,6 +66,7 @@
 .request-detail-group > div { min-width: 0; overflow-wrap: anywhere; }
 .request-detail-group b { display: block; margin-bottom: 4px; }
 .request-detail-group small { display: block; }
+.request-detail-summary.request-diagnostics .request-token-primary b { color: inherit; font-size: inherit; margin: 0; text-decoration: none; }
 .request-detail-wide { grid-column: 1 / -1; }
 .request-detail-group .request-metadata-trigger {
   color: inherit;

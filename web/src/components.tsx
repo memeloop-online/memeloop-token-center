@@ -121,7 +121,13 @@ function requestTokenDetails(request: RequestView, locale: Parameters<typeof for
 
 function RequestTokenSummary({ request }: { request: RequestView }) {
   const { locale, t } = useI18n();
-  return <small>{requestTokenDetails(request, locale, t)}</small>;
+  const pending = requestIsPending(request);
+  const tokenDisplay = formatMetricDisplay(request.input_tokens + request.output_tokens, locale);
+  const tokenDetails = pending ? t('request.pendingUsage') : requestTokenDetails(request, locale, t);
+  const uncachedInput = nonCachedRequestInput(request);
+  return <><DetailTooltip content={tokenDetails}><span className="request-value-info request-token-total" aria-label={pending ? t('request.pendingUsage') : `${t('request.totalTokens')} ${tokenDisplay.text} (${tokenDetails})`} tabIndex={0}>{pending ? t('common.running') : <>{t('request.totalTokens')} <span>{tokenDisplay.text}</span></>}</span></DetailTooltip>
+    {pending ? <DetailTooltip content={t('request.pendingUsage')}><span className="request-token-pending" tabIndex={0}>{locale === 'zh-CN' ? '用量待结算' : 'Usage pending settlement'}</span></DetailTooltip> : <span className="request-token-primary"><span>{t('request.uncachedInput')} <b>{uncachedInput === null ? <DetailTooltip content={t('request.cacheMissing')}><span tabIndex={0}>{t('request.usageUnknown')}</span></DetailTooltip> : formatMetricDisplay(uncachedInput, locale).text}</b></span><span>{t('request.outputTokens')} <b>{formatMetricDisplay(request.output_tokens, locale).text}</b></span></span>}
+  </>;
 }
 
 function RequestIdentifier({ requestId, compact = false }: { requestId: string; compact?: boolean }) {
@@ -219,27 +225,24 @@ export function RequestDiagnostics({
   const credential = requestCredentialLabel(request, undefined);
   const credentialLabel = 'label' in credential ? credential.label : t(credential.key);
   const duration = formatDurationDisplay(request.duration_ms, locale);
+  const timingDetails = `${t('request.receivedAt')}: ${new Date(request.created_at).toLocaleString(locale)} · ${t('request.completedAt')}: ${request.completed_at == null ? (pending ? (zh ? '尚未结束' : 'Still running') : missing) : new Date(request.completed_at).toLocaleString(locale)} · ${t('request.duration')}: ${duration.title ?? missing}`;
   const cost = currencyForRequest ? formatCurrencyDisplay(request.cost, currencyForRequest, locale) : { text: missing };
   const settlement = <DetailTooltip content={t('request.pendingUsage')}><span tabIndex={0}>{zh ? '待结算' : 'Awaiting settlement'}</span></DetailTooltip>;
 
   return <div className="request-diagnostics request-detail-surface request-detail-summary">
-    <section className="request-detail-group" aria-label={zh ? '请求身份' : 'Request identity'}>
+    <section className="request-detail-group request-detail-primary" aria-label={zh ? '模型与用量' : 'Model and usage'}>
       <div className="request-detail-wide"><b>{t('request.model')}</b><RequestMetadata label={request.model} fields={[[t('request.routeId'), request.route_id], [t('request.protocol'), request.protocol]]} /></div>
-      <div><b>{zh ? '凭据' : 'Credential'}</b><RequestMetadata label={credentialLabel} fields={[[zh ? '凭据 ID' : 'Credential ID', request.credential_identity?.key_id], [zh ? '主体' : 'Principal', request.credential_identity?.principal_external_id], [zh ? '租户' : 'Tenant', request.credential_identity?.tenant_external_id]]} /></div>
+      <div className="request-detail-wide"><b>{zh ? '凭据' : 'Credential'}</b><RequestMetadata label={credentialLabel} fields={[[zh ? '凭据 ID' : 'Credential ID', request.credential_identity?.key_id], [zh ? '主体' : 'Principal', request.credential_identity?.principal_external_id], [zh ? '租户' : 'Tenant', request.credential_identity?.tenant_external_id]]} /></div>
+      <div className="request-token-cell"><b>{t('request.tokens')}</b><RequestTokenSummary request={request} /></div>
+      <div><b>{t('request.cost')}</b>{pending ? settlement : <DetailTooltip content={cost.title ?? missing}><span tabIndex={0}>{cost.text}</span></DetailTooltip>}</div>
+    </section>
+    <section className="request-detail-group" aria-label={zh ? '交付与性能' : 'Delivery and performance'}>
       <div><b>{zh ? '最终上游' : 'Final upstream'}</b><RequestMetadata label={upstreamName || (request.upstream_account_id ? (zh ? '未命名上游' : 'Unnamed upstream') : missing)} fields={[[t('request.upstreamId'), request.upstream_account_id]]} /></div>
       <div><b>{t('request.status')}</b><RequestStatus request={request} /></div>
       <div><b>{t('request.request')}</b><RequestMetadata label={zh ? '记录标识' : 'Record identifiers'} fields={[[zh ? '请求 ID' : 'Request ID', request.request_id]]} /></div>
       {request.error_code && <div className="request-detail-wide"><b>{t('request.error')}</b>{request.error_code}</div>}
-    </section>
-    <section className="request-detail-group" aria-label={zh ? '时间与性能' : 'Timing and performance'}>
-      <div><b>{t('request.duration')}</b><DetailTooltip content={duration.title ?? missing}><span tabIndex={0}>{duration.text === '—' ? missing : duration.text}</span></DetailTooltip></div>
+      <div><b>{t('request.duration')}</b><DetailTooltip content={timingDetails}><span className="request-detail-timing" tabIndex={0}>{duration.text === '—' ? missing : duration.text}</span></DetailTooltip></div>
       <div><RequestOutputRate request={request} /></div>
-      <div><b>{t('request.receivedAt')}</b><time>{new Date(request.created_at).toLocaleString(locale)}</time></div>
-      <div><b>{t('request.completedAt')}</b>{request.completed_at == null ? (pending ? (zh ? '尚未结束' : 'Still running') : missing) : <time>{new Date(request.completed_at).toLocaleString(locale)}</time>}</div>
-    </section>
-    <section className="request-detail-group" aria-label={zh ? '用量与费用' : 'Usage and cost'}>
-      <div><b>{t('request.tokens')}</b>{pending ? settlement : <><strong>{formatNumber(request.input_tokens + request.output_tokens, locale)}</strong><RequestTokenSummary request={request} /></>}</div>
-      <div><b>{t('request.cost')}</b>{pending ? settlement : <DetailTooltip content={cost.title ?? missing}><span tabIndex={0}>{cost.text}</span></DetailTooltip>}</div>
     </section>
     {context && <section className="request-detail-group request-detail-session" aria-label={t('request.session')}><div className="request-detail-wide"><b>{t('request.session')}</b>
       {context.association === 'confirmed'
@@ -271,9 +274,8 @@ export function RequestTable({
   if (!requests.length) return <div className="empty">{t('common.noRequests')}</div>;
   const showsSession = requests.some((request) => request.session_context !== undefined);
   const copy = {
-    total: t('request.totalTokens'), input: t('request.uncachedInput'), output: t('request.outputTokens'),
-    unknown: t('request.usageUnknown'), tpsHint: `${t('request.generationTpsHint')} ${t('request.averageTpsHint')}`,
-    cacheMissing: t('request.cacheMissing'), pendingUsage: t('request.pendingUsage'),
+    tpsHint: `${t('request.generationTpsHint')} ${t('request.averageTpsHint')}`,
+    pendingUsage: t('request.pendingUsage'),
   };
   return (
     <div className="table-scroll request-table-scroll" role="region" aria-label={t('request.table')} tabIndex={0}>
@@ -298,10 +300,7 @@ export function RequestTable({
               : '';
             const pending = requestIsPending(request);
             const cost = pending ? { text: '—', title: copy.pendingUsage } : currencyForRequest ? formatCurrencyDisplay(request.cost, currencyForRequest, locale) : { text: '—' };
-            const tokenDisplay = formatMetricDisplay(request.input_tokens + request.output_tokens, locale);
-            const tokenDetails = pending ? copy.pendingUsage : requestTokenDetails(request, locale, t);
             const duration = formatDurationDisplay(request.duration_ms, locale);
-            const uncachedInput = nonCachedRequestInput(request);
             const credential = requestCredentialLabel(request, credentialAlias);
             const credentialLabel = 'label' in credential ? credential.label : t(credential.key);
             const credentialDetails = request.credential_identity ? `${request.credential_identity.key_id} · ${request.credential_identity.principal_external_id}` : credentialLabel;
@@ -310,9 +309,7 @@ export function RequestTable({
               <td className="request-time-cell" data-label={t('request.receivedAt')}><time>{new Date(request.created_at).toLocaleString(locale)}</time><RequestIdentifier requestId={request.request_id} compact /></td>
               <td className="request-credential-cell" data-label={t('self.credential')}><DetailTooltip content={credentialDetails}><strong tabIndex={0}>{credentialLabel}</strong></DetailTooltip></td>
               <td className="request-model-cell"><DetailTooltip content={technicalSummary}><span className="request-routing-info" tabIndex={0}><code>{request.model}</code>{upstreamName && <small className="request-upstream-name">{upstreamName}</small>}</span></DetailTooltip></td>
-              <td className="request-token-cell" data-label={t('request.tokens')}><DetailTooltip content={tokenDetails}><span className="request-value-info request-token-total" aria-label={pending ? copy.pendingUsage : `${copy.total} ${tokenDisplay.text} (${tokenDetails})`} tabIndex={0}>{pending ? t('common.running') : <>{copy.total} <span>{tokenDisplay.text}</span></>}</span></DetailTooltip>
-                {pending ? <DetailTooltip content={copy.pendingUsage}><span className="request-token-pending" tabIndex={0}>{locale === 'zh-CN' ? '用量待结算' : 'Usage pending settlement'}</span></DetailTooltip> : <span className="request-token-primary"><span>{copy.input} <b>{uncachedInput === null ? <DetailTooltip content={copy.cacheMissing}><span tabIndex={0}>{copy.unknown}</span></DetailTooltip> : formatMetricDisplay(uncachedInput, locale).text}</b></span><span>{copy.output} <b>{formatMetricDisplay(request.output_tokens, locale).text}</b></span></span>}
-              </td>
+              <td className="request-token-cell" data-label={t('request.tokens')}><RequestTokenSummary request={request} /></td>
               <td className="request-cost-cell" data-label={t('request.cost')}><span className="request-value-info" title={cost.title} aria-label={cost.title ? `${cost.text} (${cost.title})` : undefined} tabIndex={cost.title ? 0 : undefined}>{cost.text}</span></td>
               {showsSession && <td className="request-session-cell" data-label={t('request.session')}>
                 {!context
