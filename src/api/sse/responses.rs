@@ -19,6 +19,7 @@ pub(in crate::api) fn safe_failure_event() -> Bytes {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum StreamTerminal {
     Completed,
+    Incomplete,
     Failed,
 }
 
@@ -304,6 +305,16 @@ impl ResponsesStreamingSanitizer {
             .map_err(|code| SanitizerRejection::new(code, "response_identity"))?;
         self.saw_protocol_event = true;
         let failure = matches!(terminal_kind(payload_name), Some(StreamTerminal::Failed))
+            || (payload_name == "response.incomplete"
+                && (value.pointer("/response/status").and_then(Value::as_str)
+                    != Some("incomplete")
+                    || value
+                        .pointer("/response/id")
+                        .and_then(Value::as_str)
+                        .is_none()
+                    || value.get("response").is_none_or(|response| {
+                        crate::api::codex_transport::canonical_responses_usage(response).is_err()
+                    })))
             || value.get("error").is_some_and(|error| !error.is_null())
             || value
                 .pointer("/response/error")
@@ -315,7 +326,7 @@ impl ResponsesStreamingSanitizer {
         };
         match self.terminal {
             Some(StreamTerminal::Failed) => return Ok(()),
-            Some(StreamTerminal::Completed) => {
+            Some(StreamTerminal::Completed | StreamTerminal::Incomplete) => {
                 return Err(SanitizerRejection::new(
                     "upstream_invalid_response",
                     "post_terminal",
@@ -324,7 +335,10 @@ impl ResponsesStreamingSanitizer {
             None => {}
         }
         self.terminal = terminal;
-        if matches!(terminal, Some(StreamTerminal::Completed)) {
+        if matches!(
+            terminal,
+            Some(StreamTerminal::Completed | StreamTerminal::Incomplete)
+        ) {
             self.terminal_hold.begin();
         }
         if failure {
@@ -456,9 +470,8 @@ pub(in crate::api) fn trim_ascii(mut value: &[u8]) -> &[u8] {
 fn terminal_kind(name: &str) -> Option<StreamTerminal> {
     match name {
         "response.completed" => Some(StreamTerminal::Completed),
-        "response.failed" | "response.incomplete" | "response.error" | "error" => {
-            Some(StreamTerminal::Failed)
-        }
+        "response.incomplete" => Some(StreamTerminal::Incomplete),
+        "response.failed" | "response.error" | "error" => Some(StreamTerminal::Failed),
         _ => None,
     }
 }
