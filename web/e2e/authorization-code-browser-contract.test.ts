@@ -14,7 +14,11 @@ test('plugin OAuth uses default client, full callback once, safe errors and isol
   try {
     const page = await browser.newPage({ viewport: { width: 390, height: 900 } });
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'zh-CN'));
-    let starts = 0; let completes = 0;
+    let starts = 0; let completes = 0; let reads = 0;
+    await page.route('**/internal/v1/upstreams', async route => {
+      assert.equal(route.request().method(), 'GET'); reads++;
+      return route.fulfill({ status: reads === 1 ? 503 : 200, json: [] });
+    });
     await page.route('**/internal/v1/oauth/**', async route => {
       const body = route.request().postDataJSON();
       if (route.request().url().endsWith('/start')) {
@@ -24,6 +28,8 @@ test('plugin OAuth uses default client, full callback once, safe errors and isol
       }
       assert.ok(route.request().url().endsWith('/complete')); completes++;
       assert.equal(body.callback_url, 'http://localhost:8080/callback?code=fixture-code&state=fixture-state');
+      if (completes === 2) return route.fulfill({ status: 201, json: { id: 'fixture-account', name: 'Fixture OAuth' } });
+      if (completes === 3) return route.fulfill({ status: 202, json: { status: 'pending', retry_after_seconds: 5 } });
       return route.fulfill({ status: 502, json: { error: { message: 'must-not-display-sensitive-token' } } });
     });
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/authorization-code.html`);
@@ -42,5 +48,25 @@ test('plugin OAuth uses default client, full callback once, safe errors and isol
     await start.waitFor(); assert.match(await page.locator('body').innerText(), /fixture-b/);
     assert.equal(await page.getByLabel('完整回调地址', { exact: true }).count(), 0);
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth), false);
+    assert.equal(reads, 0, 'uncertain exchange does not automatically read or retry');
+    await start.click();
+    await page.getByLabel('完整回调地址', { exact: true }).fill('http://localhost:8080/callback?code=fixture-code&state=fixture-state');
+    await page.getByRole('button', { name: '完成授权', exact: true }).click();
+    await page.getByText('账号已保存，但暂时无法刷新账号列表。请重试读取列表，无需重新登录或再次提交授权码。', { exact: true }).waitFor();
+    assert.equal(reads, 1, 'successful account creation automatically refreshes the account list');
+    assert.equal(completes, 2);
+    await page.getByRole('button', { name: '检查账号列表', exact: true }).click();
+    await page.getByTestId('account-reads').filter({ hasText: '2' }).waitFor();
+    assert.equal(completes, 2, 'retrying a failed list read never exchanges the code again');
+    assert.equal(await page.getByRole('alert').count(), 0);
+    await page.reload(); await start.click();
+    await page.getByLabel('完整回调地址', { exact: true }).fill('http://localhost:8080/callback?code=fixture-code&state=fixture-state');
+    await page.getByRole('button', { name: '完成授权', exact: true }).click();
+    await page.getByText('服务器仍在处理登录。不会自动重发；请稍后检查账号列表。', { exact: true }).waitFor();
+    assert.equal(reads, 2, 'pending exchange leaves account refresh to an explicit read-only check');
+    assert.equal(completes, 3);
+    await page.getByRole('button', { name: '检查账号列表', exact: true }).click();
+    await page.getByTestId('account-reads').filter({ hasText: '1' }).waitFor();
+    assert.equal(completes, 3, 'checking a pending exchange never posts complete again');
   } finally { await browser.close(); await server.close(); }
 });

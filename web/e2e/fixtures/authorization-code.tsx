@@ -16,6 +16,11 @@ const provider: ProviderType = {
 function Fixture() {
   const [tenant, setTenant] = useState('fixture-a');
   const [, setLocked] = useState(false);
-  return <main style={{ maxWidth: 720, margin: 'auto', padding: 16 }}><button onClick={() => setTenant('fixture-b')}>Switch scope</button><AuthorizationCodeConnection key={tenant} token="fixture-token" tenant={tenant} provider={provider} onLock={setLocked} onChanged={async () => {}} /></main>;
+  const [reads, setReads] = useState(0);
+  return <main style={{ maxWidth: 720, margin: 'auto', padding: 16 }}><button onClick={() => setTenant('fixture-b')}>Switch scope</button><output data-testid="account-reads">{reads}</output><AuthorizationCodeConnection key={tenant} token="fixture-token" tenant={tenant} provider={provider} onLock={setLocked} onChanged={async () => {
+    const response = await fetch('/internal/v1/upstreams');
+    setReads(value => value + 1);
+    if (!response.ok) throw new Error('fixture list read failed');
+  }} /></main>;
 }
 createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><Fixture /></MtcFluentProvider></I18nProvider>);

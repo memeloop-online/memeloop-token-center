@@ -13,6 +13,7 @@ export function authorizationCodeCopy(locale: string) {
     waiting: '等待你在提供商页面完成登录', expires: '登录有效期至', config: '提供商连接配置', reset: '清除登录草稿',
     abandon: '清除当前登录草稿？此操作不会撤销提供商已授予的授权，也不会删除已创建的账号。',
     check: '检查账号列表', saved: '账号已创建；可在上游列表查看状态和代理配置。',
+    savedButReadFailed: '账号已保存，但暂时无法刷新账号列表。请重试读取列表，无需重新登录或再次提交授权码。',
   } : {
     help: 'Use the deployment-provided login client; no Google OAuth project setup is required. Drafts stay only on this page and are cleared when you leave.',
     admin: 'The default OAuth client for this provider is missing or invalid. Ask an administrator to configure deployment Secret MTC_PROVIDER_OAUTH_CLIENT_DEFAULTS_JSON.',
@@ -27,5 +28,6 @@ export function authorizationCodeCopy(locale: string) {
     waiting: 'Waiting for you to sign in with the provider', expires: 'Login expires', config: 'Provider connection settings', reset: 'Clear login draft',
     abandon: 'Clear this login draft? This does not revoke provider authorization or delete an account already created.',
     check: 'Check account list', saved: 'Account created. View its status and proxy settings in the upstream list.',
+    savedButReadFailed: 'The account is saved, but the account list could not refresh. Retry reading the list; do not sign in again or resubmit the authorization code.',
   };
 }

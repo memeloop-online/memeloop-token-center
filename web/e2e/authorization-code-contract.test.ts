@@ -24,6 +24,11 @@ test('host flow is catalog selected and has no replay, storage, or raw error dis
   assert.match(component, /callback_url: callbackUrl/);
   assert.match(component, /consumed\.current = true/);
   assert.match(component, /setCallback\(''\)/);
+  assert.match(component, /widgets=\{fluentFormWidgets\}/);
+  assert.doesNotMatch(component, /<input\b|<select\b/);
+  assert.match(component, /saved\.current = true/);
+  assert.match(component, /try \{ await onChanged\(\); \}/);
+  assert.match(component, /copy\.savedButReadFailed/);
   assert.doesNotMatch(component, /localStorage|sessionStorage|console\.|apiRead|setInterval|setTimeout|reason\.message/);
   assert.doesNotMatch(component, /google-antigravity|upstream_account_id|provider-adapter/);
 });
