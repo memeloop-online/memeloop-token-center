@@ -270,7 +270,7 @@ export function RequestTable({
                     : <span className="request-session-unlinked">{t('sessions.unlinkedRequests')}</span>}
                 {sessionMeta && <RequestSessionMetadata value={sessionMeta} />}
               </td>}
-              <td><span className={`status ${request.status_code && request.status_code < 400 ? 'ok' : request.status_code ? 'bad' : 'pending'}`} title={request.error_code ?? undefined} aria-label={request.error_code ? `${request.status_code ?? t('common.running')}: ${request.error_code}` : undefined}>{request.status_code ?? t('common.running')}</span></td>
+              <td><span className={`status ${request.status_code && request.status_code < 400 ? 'ok' : request.status_code ? 'bad' : 'pending'}`} title={request.error_code ?? undefined} aria-label={request.error_code ? `${request.status_code ?? t('common.running')}: ${request.error_code}` : undefined}>{request.status_code ?? t('common.running')}</span>{request.error_code && <span className="visually-hidden">{request.error_code}</span>}</td>
               <td><span className="request-duration-info" title={durationSummary || undefined} aria-label={durationSummary ? `${durationText}; ${durationSummary}` : undefined} tabIndex={durationSummary ? 0 : undefined}>{durationText}</span></td>
               {onSelect && <td><button className="secondary table-action" type="button" onClick={() => onSelect(request)} aria-label={t('request.openDetail', { model: request.model })}>{t('request.inspect')}</button></td>}
             </tr>
