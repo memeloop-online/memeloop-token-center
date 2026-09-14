@@ -141,6 +141,7 @@ impl UpstreamAccountView {
         self.proxy_remote_dns = metadata.remote_dns;
         self.proxy_label = metadata.label;
         self.proxy_fingerprint = metadata.fingerprint;
+        self.can_update_transport_proxy = credential.supports_transport_proxy();
         Ok(())
     }
 }

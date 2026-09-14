@@ -178,7 +178,29 @@ pub(super) async fn observe_http(
         .unwrap_or("unmatched")
         .to_owned();
     let started = Instant::now();
-    let response = next.run(request).await;
+    let response = if let Some(route_class) = proxy_diagnostics::route_class(request.uri().path()) {
+        let context = proxy_diagnostics::Context::new();
+        let ingress_request_id = proxy_diagnostics::ingress_request_id(
+            request
+                .headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+        );
+        proxy_diagnostics::CONTEXT.scope(context, async move {
+            tracing::info!(request_id = %context.request_id, ?ingress_request_id, route_class, phase = "gateway_entry", "proxy request entered gateway");
+            let phase = proxy_diagnostics::Phase::new(context, "gateway_response_headers");
+            let mut response = next.run(request).await;
+            phase.finish("completed", Some(response.status().as_u16()), None);
+            // The same server-owned ID is used by durable proxy admission.
+            // Also return it on failures before a request record can exist.
+            if let Ok(value) = HeaderValue::from_str(&context.request_id.to_string()) {
+                response.headers_mut().insert(REQUEST_ID_HEADER, value);
+            }
+            response
+        }).await
+    } else {
+        next.run(request).await
+    };
     state
         .metrics
         .observe_http(&method, &route, response.status(), started.elapsed());

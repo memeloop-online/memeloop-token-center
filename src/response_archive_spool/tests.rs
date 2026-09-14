@@ -193,14 +193,25 @@ async fn fixture() -> (
     sqlx::AnyPool,
     ArchiveSpoolIdentity,
 ) {
+    fixture_with_compression(false).await
+}
+
+async fn fixture_with_compression(
+    compression_enabled: bool,
+) -> (
+    tempfile::TempDir,
+    AppState,
+    sqlx::AnyPool,
+    ArchiveSpoolIdentity,
+) {
     let dir = tempfile::tempdir().unwrap();
     let url = format!(
         "sqlite://{}?mode=rwc",
         dir.path().join("spool.db").display()
     );
-    let state = AppState::initialize(Config::for_test(url.clone()))
-        .await
-        .unwrap();
+    let mut config = Config::for_test(url.clone());
+    config.archive_spool_compression_enabled = compression_enabled;
+    let state = AppState::initialize(config).await.unwrap();
     let pool = sqlx::AnyPool::connect(&url).await.unwrap();
     let identity = ArchiveSpoolIdentity {
         request_id: Uuid::new_v4(),
@@ -212,6 +223,49 @@ async fn fixture() -> (
         .bind(Uuid::new_v4().to_string()).bind(identity.reservation_id.to_string())
         .execute(&pool).await.unwrap();
     (dir, state, pool, identity)
+}
+
+#[tokio::test]
+async fn enabled_response_writer_persists_compressed_chunks_and_dual_read_uploads_exact_bytes() {
+    let (_dir, state, pool, identity) = fixture_with_compression(true).await;
+    let body = Bytes::from(
+        serde_json::to_vec(&vec![
+            serde_json::json!({
+                "type": "response.output_text.delta",
+                "delta": "synthetic repeated JSON content for writer coverage",
+            });
+            900
+        ])
+        .unwrap(),
+    );
+    let mut writer = ResponseArchiveProducer::begin_for_test(&state, identity)
+        .await
+        .unwrap();
+    writer.append_for_test(vec![body.clone()]).await.unwrap();
+    writer.seal_for_test().await.unwrap();
+
+    let row = sqlx::query(
+        "SELECT s.byte_count, s.cipher_bytes, b.cipher_bytes AS budget_bytes, 1024 + SUM(LENGTH(c.ciphertext) + 512) AS actual_bytes, MIN(CASE WHEN c.ciphertext LIKE 'zstd1.%' THEN 1 ELSE 0 END) AS compressed FROM response_archive_spools s JOIN response_archive_spool_chunks c ON c.request_id = s.request_id CROSS JOIN response_archive_spool_budget b WHERE s.request_id = $1 AND b.singleton = 1 GROUP BY s.byte_count, s.cipher_bytes, b.cipher_bytes",
+    )
+    .bind(identity.request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<i64, _>("byte_count"), body.len() as i64);
+    let actual = row.get::<i64, _>("actual_bytes");
+    assert_eq!(row.get::<i64, _>("cipher_bytes"), actual);
+    assert_eq!(row.get::<i64, _>("budget_bytes"), actual);
+    assert_eq!(row.get::<i64, _>("compressed"), 1);
+
+    finish(&pool, identity).await;
+    assert!(process_one_for_test(&state).await);
+    let locator: String =
+        sqlx::query_scalar("SELECT response_object FROM request_records WHERE id = $1")
+            .bind(identity.request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state.archive.get(&locator).await.unwrap(), body);
 }
 
 async fn finish(pool: &sqlx::AnyPool, identity: ArchiveSpoolIdentity) {

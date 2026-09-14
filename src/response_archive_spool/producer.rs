@@ -4,6 +4,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use tracing::Instrument;
 
 use crate::{AppState, db::ArchiveSpoolIdentity, error::AppError};
 
@@ -11,6 +12,7 @@ use crate::{AppState, db::ArchiveSpoolIdentity, error::AppError};
 pub(crate) struct PreparedArchiveBatch {
     identity: ArchiveSpoolIdentity,
     purpose: super::BufferedArchivePurpose,
+    compression_enabled: bool,
     chunks: Vec<crate::db::ArchiveSpoolChunk>,
 }
 
@@ -19,7 +21,9 @@ impl PreparedArchiveBatch {
         self,
         archive: &BufferedArchive<'_>,
     ) -> Option<Vec<crate::db::ArchiveSpoolChunk>> {
-        (self.identity == archive.identity && self.purpose == archive.purpose)
+        (self.identity == archive.identity
+            && self.purpose == archive.purpose
+            && self.compression_enabled == archive.compression_enabled)
             .then_some(self.chunks)
     }
 }
@@ -31,6 +35,7 @@ pub(crate) struct BufferedArchive<'a> {
     purpose: super::BufferedArchivePurpose,
     body: &'a Bytes,
     pepper: &'a [u8],
+    compression_enabled: bool,
     nonces: Vec<[u8; 12]>,
 }
 
@@ -40,6 +45,7 @@ impl<'a> BufferedArchive<'a> {
         purpose: super::BufferedArchivePurpose,
         body: &'a Bytes,
         pepper: &'a [u8],
+        compression_enabled: bool,
     ) -> Result<Self, AppError> {
         if body.len() > 64 * 1024 * 1024 {
             return Err(AppError::Overloaded);
@@ -56,6 +62,7 @@ impl<'a> BufferedArchive<'a> {
             purpose,
             body,
             pepper,
+            compression_enabled,
             nonces,
         })
     }
@@ -83,15 +90,19 @@ impl<'a> BufferedArchive<'a> {
             .ok_or(AppError::Internal)?;
         let end = (start + super::CHUNK_BYTES).min(self.body.len());
         let bytes = self.body.get(start..end).ok_or(AppError::Internal)?;
-        let sealed = super::cipher::seal_for_purpose_with_nonce(
+        let sealed = super::cipher::seal_for_purpose_with_nonce_and_compression(
             self.identity,
             i64::try_from(seq).map_err(|_| AppError::Internal)?,
             bytes,
             self.pepper,
             self.purpose,
             nonce,
+            self.compression_enabled,
         )?;
-        debug_assert_eq!(Some(sealed.len()), self.sealed_len(bytes.len()));
+        debug_assert!(
+            self.sealed_len(bytes.len())
+                .is_some_and(|upper| sealed.len() <= upper)
+        );
         Ok(sealed)
     }
 
@@ -118,6 +129,7 @@ impl<'a> BufferedArchive<'a> {
         Ok(PreparedArchiveBatch {
             identity: self.identity,
             purpose: self.purpose,
+            compression_enabled: self.compression_enabled,
             chunks,
         })
     }
@@ -335,6 +347,7 @@ fn take_append_failure_for_test(state: &AppState) -> bool {
 }
 
 pub(crate) struct ResponseArchiveProducer {
+    identity: ArchiveSpoolIdentity,
     #[cfg(test)]
     state: AppState,
     sender: Option<tokio::sync::mpsc::Sender<Bytes>>,
@@ -378,8 +391,22 @@ impl ResponseArchiveSettlement {
 pub(super) struct ResponseArchiveWriter {
     state: AppState,
     identity: ArchiveSpoolIdentity,
+    compression_enabled: bool,
     seq: i64,
     bytes: i64,
+    append_attempts: u64,
+    append_wait: std::time::Duration,
+    max_append_wait: std::time::Duration,
+}
+
+impl Drop for ResponseArchiveWriter {
+    fn drop(&mut self) {
+        tracing::info!(request_id = %self.identity.request_id, phase = "response_spool_writer_summary",
+            append_attempts = self.append_attempts, acknowledged_chunks = self.seq, bytes = self.bytes,
+            append_wait_ms = self.append_wait.as_millis() as u64,
+            max_append_wait_ms = self.max_append_wait.as_millis() as u64,
+            "response archive writer append summary");
+    }
 }
 
 struct CaptureQueueMemory {
@@ -396,12 +423,17 @@ impl Drop for CaptureQueueMemory {
 }
 
 async fn fence_failed_capture(state: &AppState, identity: ArchiveSpoolIdentity) {
-    if let Err(error) = state
-        .db
-        .fail_response_archive_spool(identity, "capture_failed")
-        .await
+    if let Err(error) = observe_writer_database(identity, "response_spool_failed_fence", 0, async {
+        state
+            .db
+            .fail_response_archive_spool(identity, "capture_failed")
+            .await
+            .map(|()| true)
+    })
+    .await
     {
         tracing::warn!(
+            request_id = %identity.request_id,
             stage = "response_spool_failed_ack_fence",
             error_category = error.diagnostic_category(),
             "failed response archive acknowledgement could not be fenced"
@@ -460,6 +492,7 @@ impl ResponseArchiveProducer {
             Some(active.clone()),
         );
         Some(Self {
+            identity,
             #[cfg(test)]
             state: state.clone(),
             sender: Some(sender),
@@ -481,12 +514,12 @@ impl ResponseArchiveProducer {
 
     pub(crate) fn append(&mut self, chunks: Vec<Bytes>) -> bool {
         if !self.active.load(Ordering::Acquire) {
-            self.abandon();
+            self.abandon("writer_inactive");
             return false;
         }
         #[cfg(test)]
         if take_append_failure_for_test(&self.state) {
-            self.abandon();
+            self.abandon("injected_append_failure");
             return false;
         }
         for chunk in chunks {
@@ -501,8 +534,11 @@ impl ResponseArchiveProducer {
                     };
                     let permit = match sender.try_reserve() {
                         Ok(permit) => permit,
-                        Err(_) => {
-                            self.abandon();
+                        Err(error) => {
+                            self.abandon(match error {
+                                tokio::sync::mpsc::error::TrySendError::Full(_) => "queue_capacity",
+                                tokio::sync::mpsc::error::TrySendError::Closed(_) => "queue_closed",
+                            });
                             return false;
                         }
                     };
@@ -515,7 +551,8 @@ impl ResponseArchiveProducer {
         true
     }
 
-    fn abandon(&mut self) {
+    fn abandon(&mut self, reason: &'static str) {
+        tracing::warn!(request_id = %self.identity.request_id, phase = "response_spool_producer", outcome = reason, "response capture abandoned");
         self.active.store(false, Ordering::Release);
         self.sender.take();
         self.terminal.take();
@@ -556,31 +593,59 @@ impl ResponseArchiveWriter {
         state: AppState,
         identity: ArchiveSpoolIdentity,
     ) -> Result<Self, AppError> {
-        if !state.db.begin_response_archive_spool(identity).await? {
+        let compression_enabled = state.config.archive_spool_compression_enabled;
+        if !observe_writer_database(
+            identity,
+            "response_spool_begin",
+            0,
+            state.db.begin_response_archive_spool(identity),
+        )
+        .await?
+        {
             return Err(AppError::Internal);
         }
         Ok(Self {
             state,
             identity,
+            compression_enabled,
             seq: 0,
             bytes: 0,
+            append_attempts: 0,
+            append_wait: std::time::Duration::ZERO,
+            max_append_wait: std::time::Duration::ZERO,
         })
     }
 
     async fn append_chunk(&mut self, bytes: &[u8]) -> Result<(), AppError> {
-        let ciphertext = super::cipher::seal(
+        let ciphertext = super::cipher::seal_for_purpose_with_compression(
             self.identity,
             self.seq,
             bytes,
             self.state.config.key_pepper.as_bytes(),
-        )?;
+            super::BufferedArchivePurpose::Response,
+            self.compression_enabled,
+        ).inspect_err(|error| {
+            tracing::warn!(request_id = %self.identity.request_id, phase = "response_spool_encrypt", error_category = error.diagnostic_category(), "response archive chunk encryption failed");
+        })?;
         let byte_count = i64::try_from(bytes.len()).map_err(|_| AppError::Internal)?;
-        if !self
-            .state
-            .db
-            .append_response_archive_spool(self.identity, self.seq, byte_count, &ciphertext)
-            .await?
-        {
+        let append_started = std::time::Instant::now();
+        let appended = observe_writer_database(
+            self.identity,
+            "response_spool_append",
+            byte_count,
+            self.state.db.append_response_archive_spool(
+                self.identity,
+                self.seq,
+                byte_count,
+                &ciphertext,
+            ),
+        )
+        .await;
+        let elapsed = append_started.elapsed();
+        self.append_attempts += 1;
+        self.append_wait += elapsed;
+        self.max_append_wait = self.max_append_wait.max(elapsed);
+        if !appended? {
             return Err(AppError::Internal);
         }
         self.seq += 1;
@@ -610,11 +675,15 @@ impl ResponseArchiveWriter {
     }
 
     async fn seal_inner(self) -> Result<(), AppError> {
-        if !self
-            .state
-            .db
-            .seal_response_archive_spool(self.identity, self.seq, self.bytes)
-            .await?
+        if !observe_writer_database(
+            self.identity,
+            "response_spool_seal",
+            self.bytes,
+            self.state
+                .db
+                .seal_response_archive_spool(self.identity, self.seq, self.bytes),
+        )
+        .await?
         {
             return Err(AppError::Internal);
         }
@@ -641,19 +710,21 @@ async fn run_response_archive_writer(
     pause_begin_ack_for_test(&state).await;
     while let Some(bytes) = receiver.recv().await {
         if !active.load(Ordering::Acquire) {
-            return Err(AppError::Internal);
+            return Err(writer_interrupted(identity, "abandoned_before_append"));
         }
         writer.append_chunk(&bytes).await?;
     }
-    let tail = terminal.await.map_err(|_| AppError::Internal)?;
+    let tail = terminal
+        .await
+        .map_err(|_| writer_interrupted(identity, "terminal_sender_dropped"))?;
     if !active.load(Ordering::Acquire) {
-        return Err(AppError::Internal);
+        return Err(writer_interrupted(identity, "abandoned_before_tail"));
     }
     if !tail.is_empty() {
         writer.append_chunk(&tail).await?;
     }
     if !active.load(Ordering::Acquire) {
-        return Err(AppError::Internal);
+        return Err(writer_interrupted(identity, "abandoned_before_seal"));
     }
     writer.seal_inner().await
 }
@@ -683,7 +754,62 @@ async fn mark_gap_inner(
     identity: ArchiveSpoolIdentity,
     reason: &'static str,
 ) -> Result<(), AppError> {
-    state.db.fail_response_archive_spool(identity, reason).await
+    observe_writer_database(identity, "response_spool_gap_write", 0, async {
+        state
+            .db
+            .fail_response_archive_spool(identity, reason)
+            .await
+            .map(|()| true)
+    })
+    .await
+    .map(|_| ())
+}
+
+fn writer_interrupted(identity: ArchiveSpoolIdentity, reason: &'static str) -> AppError {
+    tracing::warn!(request_id = %identity.request_id, phase = "response_spool_writer", outcome = reason, "response writer was abandoned before durable completion");
+    AppError::Internal
+}
+
+async fn observe_writer_database(
+    identity: ArchiveSpoolIdentity,
+    phase: &'static str,
+    bytes: i64,
+    operation: impl std::future::Future<Output = Result<bool, AppError>>,
+) -> Result<bool, AppError> {
+    let started = std::time::Instant::now();
+    if phase == "response_spool_append" {
+        tracing::debug!(request_id = %identity.request_id, phase, outcome = "started", bytes, "response archive database operation");
+    } else {
+        tracing::info!(request_id = %identity.request_id, phase, outcome = "started", bytes, "response archive database operation");
+    }
+    // The existing SQLx conversion emits only a safe fixed error_kind (for
+    // example pool_timeout/query_cancelled). Keep that event correlated before
+    // conversion erases its type into AppError::Internal.
+    let result = operation.instrument(tracing::info_span!("response_archive_database", request_id = %identity.request_id, phase)).await;
+    let outcome = match &result {
+        Ok(true) => "acknowledged",
+        Ok(false) => "rejected",
+        Err(_) => "database_error",
+    };
+    match &result {
+        Ok(true) if phase == "response_spool_append" => {
+            tracing::debug!(request_id = %identity.request_id, phase, outcome,
+                elapsed_ms = started.elapsed().as_millis() as u64, bytes,
+                "response archive database operation");
+        }
+        Ok(true) => {
+            tracing::info!(request_id = %identity.request_id, phase, outcome,
+                elapsed_ms = started.elapsed().as_millis() as u64, bytes,
+                "response archive database operation");
+        }
+        _ => {
+            tracing::warn!(request_id = %identity.request_id, phase, outcome,
+                error_category = result.as_ref().err().map(AppError::diagnostic_category),
+                elapsed_ms = started.elapsed().as_millis() as u64, bytes,
+                "response archive database operation");
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -699,6 +825,83 @@ pub(super) async fn mark_gap_for_test(
 mod tests {
     use super::*;
 
+    #[test]
+    fn writer_observation_preserves_results_and_correlates_safe_database_errors() {
+        use futures_util::FutureExt;
+        use std::sync::Mutex;
+        #[derive(Clone, Default)]
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let writer = Writer::default();
+        let sink = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(move || sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for accepted in [true, false] {
+                let result =
+                    observe_writer_database(identity(), "response_spool_begin", 0, async {
+                        Ok(accepted)
+                    })
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(result, accepted);
+            }
+            let result = observe_writer_database(identity(), "response_spool_append", 8, async {
+                Err(sqlx::Error::PoolTimedOut.into())
+            })
+            .now_or_never()
+            .unwrap();
+            assert!(matches!(result, Err(AppError::Internal)));
+            let result = observe_writer_database(identity(), "response_spool_seal", 8, async {
+                Err(AppError::Storage("SECRET_CANARY".to_owned()))
+            })
+            .now_or_never()
+            .unwrap();
+            assert!(matches!(result, Err(AppError::Storage(_))));
+        });
+        let bytes = writer.0.lock().unwrap();
+        let logs = std::str::from_utf8(&bytes).unwrap();
+        assert!(!logs.contains("SECRET_CANARY"));
+        let events: Vec<serde_json::Value> = logs
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let error = events
+            .iter()
+            .find(|event| event["fields"]["error_kind"] == "pool_timeout")
+            .unwrap();
+        assert_eq!(
+            error["span"]["request_id"],
+            identity().request_id.to_string()
+        );
+        assert_eq!(error["span"]["phase"], "response_spool_append");
+        let outcomes: Vec<_> = events
+            .iter()
+            .filter_map(|event| event["fields"]["outcome"].as_str())
+            .collect();
+        assert!(outcomes.contains(&"acknowledged"));
+        assert!(outcomes.contains(&"rejected"));
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == "database_error")
+                .count(),
+            2
+        );
+    }
+
     fn identity() -> ArchiveSpoolIdentity {
         ArchiveSpoolIdentity {
             request_id: uuid::Uuid::nil(),
@@ -709,12 +912,19 @@ mod tests {
 
     #[test]
     fn buffered_archive_replays_its_body_but_new_captures_get_fresh_nonces() {
-        let body = Bytes::from_static(b"immutable private response");
+        let body = Bytes::from(
+            serde_json::to_vec(&vec![
+                serde_json::json!({"content":"synthetic repeat for fixed nonce replay"});
+                400
+            ])
+            .unwrap(),
+        );
         let first = BufferedArchive::new(
             identity(),
             super::super::BufferedArchivePurpose::Response,
             &body,
             b"archive-spool-test-pepper",
+            true,
         )
         .unwrap();
         let second = BufferedArchive::new(
@@ -722,10 +932,13 @@ mod tests {
             super::super::BufferedArchivePurpose::Response,
             &body,
             b"archive-spool-test-pepper",
+            true,
         )
         .unwrap();
 
-        assert_eq!(first.seal(0).unwrap(), first.seal(0).unwrap());
+        let replay = first.seal(0).unwrap();
+        assert!(replay.starts_with("zstd1."));
+        assert_eq!(replay, first.seal(0).unwrap());
         assert_ne!(first.seal(0).unwrap(), second.seal(0).unwrap());
     }
 

@@ -46,6 +46,8 @@ tags:
     description: Exact, versioned subscription credit reconciliation for memeloop web.
   - name: Operator traffic
     description: Tenant/global traffic statistics, request detail, and live events.
+  - name: Generation quarantine
+    description: Tenant-bound evidence-confirmed reconciliation of interrupted provider submissions.
   - name: Self service
     description: Credential-scoped, read-only usage and logical-conversation views.
   - name: OpenAI compatible
@@ -1608,21 +1610,65 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
 
   /internal/v1/upstreams/{account_id}/transport-proxy:
-    put:
+    get:
       tags: [Upstream providers]
-      operationId: rotateOpenAiCodexTransportProxy
-      summary: Replace only the transport proxy of an existing OpenAI Codex OAuth account
+      operationId: getUpstreamTransportProxySettings
+      summary: Read the selected account's full proxy URL for management editing and copying
       security: [{ serviceBearer: [] }]
       x-required-scope: providers:write
       description: |
-        Requires a global operator authorized for the tenant, an existing Codex
-        OAuth credential, `Idempotency-Key`, and exact account/credential
+        Requires the same global operator authority as editing private transport
+        proxies and verifies the explicitly selected tenant owns the account.
+        Returns only credential-backed proxy settings and account CAS revisions,
+        including proxy username and password where configured. Never returns
+        API keys, OAuth access/refresh tokens, adapter state or configuration.
+        Works for supported OAuth and API-key proxy credentials. An unconfigured
+        proxy is null. Ordinary account lists remain sanitized. No upstream
+        connection, probe, refresh or mutation is performed.
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/RequiredTenant'
+      responses:
+        '200':
+          description: Explicit management-only proxy settings; private, no-store.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, no-store' }
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [account_id, proxy_url, proxy_network_scope, updated_at, credential_generation, supported]
+                properties:
+                  account_id: { type: string, format: uuid }
+                  proxy_url: { type: [string, 'null'] }
+                  proxy_network_scope: { type: [string, 'null'], enum: [private, null] }
+                  updated_at: { type: integer, format: int64 }
+                  credential_generation: { type: integer, format: int64 }
+                  supported: { type: boolean, description: Whether this credential has an OAuth or proxied API-key container supported by the transport editor. }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Upstream providers]
+      operationId: rotateOpenAiCodexTransportProxy
+      summary: Replace only the transport proxy of a supported existing upstream credential
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      description: |
+        Requires a global operator authorized for the tenant, an existing OAuth
+        or proxied API-key credential, `Idempotency-Key`, and exact account/credential
         compare-and-swap values.
-        The operation preserves all OAuth material and the fixed official Codex
-        base URL, installs a new encrypted credential generation, and records an
-        audit row containing only keyed fingerprints and schemes. Only a private
-        IP-literal `socks5h` URL is accepted so target DNS is resolved remotely.
-        The full proxy URL, credentials, and endpoint are never returned.
+        The operation preserves all non-proxy credential material and account
+        configuration, installs a new encrypted credential generation, and records an
+        audit row containing only keyed fingerprints and schemes. Codex retains
+        its fixed official endpoint and private IP-literal socks5h requirement.
+        Generic socks5 endpoints must resolve only to private addresses; socks5h
+        requires a private IP literal. Unsupported credential containers reject
+        the edit. PUT returns sanitized metadata; only the explicit GET above
+        returns the proxy original value.
       parameters:
         - $ref: '#/components/parameters/AccountId'
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
@@ -2185,6 +2231,124 @@ paths:
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/generations/quarantine:
+    get:
+      tags: [Generation quarantine]
+      operationId: listGenerationQuarantine
+      summary: List one tenant's interrupted generation submissions
+      description: |
+        Requires a persistent service credential bound to exactly the requested tenant.
+        Global credentials, bootstrap, client keys, and cross-tenant access are rejected.
+        Metadata only; no provider credentials, request objects, or submission payloads.
+        Ordered by job_id ascending; continue with the last job_id as after_id.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: generations:quarantine:read
+      x-persistent-service-only: true
+      parameters:
+        - $ref: '#/components/parameters/RequiredTenant'
+        - name: limit
+          in: query
+          schema: { type: integer, format: int64, minimum: 1, maximum: 100, default: 100 }
+        - name: after_id
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Bounded quarantine metadata page.
+          content:
+            application/json:
+              schema:
+                type: array
+                maxItems: 100
+                items: { $ref: '#/components/schemas/GenerationQuarantine' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/generations/quarantine/{job_id}:
+    get:
+      tags: [Generation quarantine]
+      operationId: getGenerationQuarantine
+      summary: Read an exact tenant-bound pending quarantine and revision
+      security: [{ serviceBearer: [] }]
+      x-required-scope: generations:quarantine:read
+      x-persistent-service-only: true
+      parameters:
+        - $ref: '#/components/parameters/RequiredTenant'
+        - name: job_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Safe metadata; revision is required for resolution.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GenerationQuarantine' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/generations/quarantine/{job_id}/resolutions:
+    post:
+      tags: [Generation quarantine]
+      operationId: resolveGenerationQuarantine
+      summary: Reconcile an interrupted submission using independently retained evidence
+      description: |
+        Requires a persistent service credential bound to the requested tenant with
+        generations:reconcile. Bootstrap, global, broad generations:write, client keys,
+        cross-tenant access, active leases, stale revisions, unknown actions and duplicate
+        decisions are rejected. Only confirmed_submitted is supported: it requires a
+        provider submission ID and resumes normal running processing. Unknown and
+        confirmed_not_submitted assertions are rejected and leave credit reserved.
+        An expired lease alone cannot prove the old process cannot resume its POST;
+        safe release requires a future server-verifiable dispatch-stop protocol.
+        This API never directly contacts a provider or settles/refunds credit.
+        Confirmed delivery starts a bounded 24-hour polling window at confirmation time;
+        the original admission timestamp is preserved. The normal timeout policy resumes
+        at that deadline. Replaying a resolution never extends the window.
+        evidence_digest is the lowercase SHA-256 of independently retained confirmation
+        evidence, never the raw evidence or credentials. The operator is responsible for
+        verifying the evidence against the provider before making this assertion.
+        CAS transition, immutable audit and Idempotency-Key receipt commit together.
+        An exact same-actor, same-tenant replay returns the original receipt; changed
+        payloads or a second key for an already resolved attempt return 409.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: generations:reconcile
+      x-persistent-service-only: true
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [tenant_external_id, expected_revision, action, evidence_digest, upstream_job_id]
+              properties:
+                tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+                expected_revision: { type: string, pattern: '^[0-9a-f]{64}$' }
+                action: { type: string, enum: [confirmed_submitted] }
+                evidence_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
+                upstream_job_id: { type: string, minLength: 1, maxLength: 256, pattern: '^[A-Za-z0-9_.:-]+$' }
+      responses:
+        '200':
+          description: Immutable reconciliation receipt, including exact idempotent replay.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GenerationQuarantineResolution' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
   /internal/v1/model-routes:
@@ -5599,6 +5763,8 @@ components:
         - entitlements:write
         - filter_assistant:execute
         - generations:write
+        - generations:quarantine:read
+        - generations:reconcile
         - requests:read
         - providers:read
         - providers:write
@@ -5919,11 +6085,11 @@ components:
         tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
         proxy_url:
           type: string
-          pattern: '^socks5h://'
+          pattern: '^socks5h?://'
           minLength: 1
           maxLength: 2048
           writeOnly: true
-          description: Private IPv4 or bracketed IPv6 literal SOCKS5H endpoint. May contain proxy authentication; never returned.
+          description: Private SOCKS endpoint. Codex and remote-DNS socks5h require a private IP literal; generic socks5 may use a hostname resolving only to private addresses. Proxy authentication is returned only by the explicit management GET, never ordinary metadata.
         expected_updated_at: { type: integer, format: int64 }
         expected_credential_generation: { type: integer, format: int64, minimum: 1 }
     UpstreamProvider:
@@ -5950,7 +6116,7 @@ components:
         proxy_remote_dns: { type: boolean, description: True only for socks5h. No proxy endpoint or credential is exposed. }
         proxy_label: { type: [string, 'null'], description: Server-generated generic label without host, port, username, or password. }
         proxy_fingerprint: { type: [string, 'null'], pattern: '^proxy_[0-9a-f]{16}$', description: Pepper-keyed non-reversible comparison fingerprint. }
-        can_update_transport_proxy: { type: boolean, description: True only for a global operator viewing an OpenAI Codex OAuth account supported by the explicit transport operation. }
+        can_update_transport_proxy: { type: boolean, description: True only for a global operator viewing a current OAuth or proxied API-key credential supported by the explicit transport operation. }
         import_source_identity_hash: { type: [string, 'null'], pattern: '^[0-9a-f]{64}$', description: Opaque operator-HMAC provenance for a native OAuth import; null for other accounts. }
         import_source_document_sha256: { type: [string, 'null'], pattern: '^[0-9a-f]{64}$', description: Canonical source-document digest for a native OAuth import; null for other accounts. }
         can_refresh: { type: boolean, description: Managed OAuth refresh is available for the active generation. }
@@ -8000,6 +8166,37 @@ components:
           maxItems: 168
           description: Missing UTC hour-of-week coordinates mean zero activity.
           items: { $ref: '#/components/schemas/UsageAnalysisHeatmapBucket' }
+    GenerationQuarantine:
+      type: object
+      additionalProperties: false
+      required: [job_id, tenant_external_id, model, driver, attempt_count, updated_at, lease_expires_at, revision]
+      properties:
+        job_id: { type: string, format: uuid }
+        tenant_external_id: { type: string }
+        model: { type: string }
+        driver: { type: string }
+        attempt_count: { type: integer, format: int64 }
+        updated_at: { type: integer, format: int64 }
+        lease_expires_at: { type: [integer, 'null'], format: int64 }
+        revision: { type: string, pattern: '^[0-9a-f]{64}$' }
+
+    GenerationQuarantineResolution:
+      type: object
+      additionalProperties: false
+      required: [resolution_id, job_id, tenant_external_id, action, upstream_job_id, evidence_digest, resolved_by_service_id, resulting_status, delivery_confirmed_at, reconciliation_deadline_at, created_at]
+      properties:
+        resolution_id: { type: string, format: uuid }
+        job_id: { type: string, format: uuid }
+        tenant_external_id: { type: string }
+        action: { type: string, enum: [confirmed_submitted] }
+        upstream_job_id: { type: [string, 'null'] }
+        evidence_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
+        resolved_by_service_id: { type: string, format: uuid }
+        resulting_status: { type: string, enum: [running] }
+        delivery_confirmed_at: { type: [integer, 'null'], format: int64 }
+        reconciliation_deadline_at: { type: [integer, 'null'], format: int64 }
+        created_at: { type: integer, format: int64 }
+
     GenerationJob:
       type: object
       required: [job_id, created_at, updated_at, completed_at, model, driver, billing_unit, status, upstream_job_id, estimated_units, billed_units, cost, error_code, result, assets]

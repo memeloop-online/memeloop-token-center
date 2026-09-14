@@ -47,6 +47,86 @@ export function quotaUsedPercent(window: UpstreamQuotaSnapshot['windows'][number
   return null;
 }
 
+export type QuotaObservationState = 'unobserved' | 'current' | 'historical';
+
+/** A retained snapshot is evidence from its observation time, never a current successful read. */
+export function quotaObservationState(snapshot: UpstreamQuotaSnapshot, now = Date.now(), refreshFailed = false): QuotaObservationState {
+  if (snapshot.observed_at === null) return 'unobserved';
+  if (refreshFailed || snapshot.status === 'error' || snapshot.error_code || snapshot.stale
+    || (snapshot.stale_after !== null && now >= snapshot.stale_after)) return 'historical';
+  return 'current';
+}
+
+export interface QuotaSummaryPresentation {
+  key: string;
+  usedPercent: number | null;
+}
+
+export function quotaSummaryPresentation(snapshot: UpstreamQuotaSnapshot | undefined, now = Date.now(), refreshFailed = false): QuotaSummaryPresentation {
+  if (!snapshot) return { key: refreshFailed ? 'providerDirectory.readFailed' : 'providerDirectory.notChecked', usedPercent: null };
+  if (snapshot.status === 'unsupported') return { key: 'providerDirectory.unsupported', usedPercent: null };
+  const observation = quotaObservationState(snapshot, now, refreshFailed);
+  const readFailed = refreshFailed || snapshot.status === 'error' || Boolean(snapshot.error_code);
+  if (observation === 'unobserved') return { key: readFailed ? 'providerDirectory.readFailed' : 'providerDirectory.usageUnavailable', usedPercent: null };
+  const percents = snapshot.windows.map(quotaUsedPercent).filter((percent): percent is number => percent !== null);
+  const usedPercent = percents.length ? Math.max(...percents) : null;
+  if (readFailed) return { key: usedPercent === null ? 'providerDirectory.refreshFailedRetained' : 'providerDirectory.refreshFailedUsed', usedPercent };
+  if (observation === 'historical') return { key: usedPercent === null ? 'providerDirectory.lastObservedUnavailable' : 'providerDirectory.lastObservedUsed', usedPercent };
+  return { key: usedPercent === null ? 'providerDirectory.usageUnavailable' : 'providerDirectory.used', usedPercent };
+}
+
+export interface QuotaWindowPresentation {
+  scopeKey: string;
+  periodKey: string;
+  supplierLabel: string | null;
+  qualifier: string | null;
+}
+
+const PERIODS: [seconds: number, key: string][] = [
+  [18_000, 'quota.periodFiveHour'],
+  [86_400, 'quota.periodDaily'],
+  [604_800, 'quota.periodWeekly'],
+  [2_592_000, 'quota.periodMonthly'],
+  [31_536_000, 'quota.periodAnnual'],
+];
+
+function quotaPeriodKey(periodSeconds: number | null, role: string | undefined) {
+  if (periodSeconds !== null && Number.isFinite(periodSeconds) && periodSeconds > 0) {
+    const period = PERIODS.find(([seconds]) => Math.abs(periodSeconds - seconds) <= seconds * 0.05);
+    if (period) return period[1];
+  }
+  if (role === 'primary_window') return 'quota.periodPrimary';
+  if (role === 'secondary_window') return 'quota.periodSecondary';
+  return 'quota.periodSupplier';
+}
+
+/**
+ * Codex names durations from the supplier's window length (matching the official
+ * Codex status surface); primary/secondary are only fallbacks when no duration exists.
+ */
+export function quotaWindowPresentation(provider: string, window: UpstreamQuotaSnapshot['windows'][number]): QuotaWindowPresentation {
+  const match = /^([^:]+):(primary_window|secondary_window)$/.exec(window.id);
+  const role = match?.[2];
+  const periodKey = quotaPeriodKey(window.period_seconds, role);
+  if (provider === 'openai-codex') {
+    const scopeKey = match?.[1] === 'code' ? 'quota.scopeCodex'
+      : match?.[1] === 'code_review' ? 'quota.scopeCodexReview'
+      : 'quota.scopeCodexAdditional';
+    const qualifier = scopeKey !== 'quota.scopeCodexAdditional' ? null
+      : match?.[1] ? match[1].replace(/[_.-]+/g, ' ').replace(/\s+/g, ' ').trim() || null
+      : window.label.trim() && window.label !== window.id ? window.label : null;
+    return { scopeKey, periodKey, supplierLabel: null, qualifier };
+  }
+  const supplierLabel = window.label.trim() && window.label !== window.id ? window.label : null;
+  return { scopeKey: provider === 'kimi-oauth' ? 'quota.scopeKimi' : 'quota.scopeSupplier', periodKey, supplierLabel, qualifier: null };
+}
+
+export function quotaSourceLabel(source: string) {
+  if (source === 'codex_usage') return 'quota.sourceCodexUsage';
+  if (source === 'kimi_usage') return 'quota.sourceKimiUsage';
+  return 'quota.sourceSupplierResponse';
+}
+
 /** Only translate known normalized codes; never render supplier/error payloads. */
 export function quotaReadErrorMessage(code: string | null | undefined) {
   switch (code) {

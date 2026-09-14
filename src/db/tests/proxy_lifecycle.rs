@@ -84,6 +84,7 @@ async fn buffered_conversation_content_wait_does_not_hold_archive_budget() {
             BufferedArchivePurpose::Response,
             &body,
             pepper,
+            false,
         )
         .unwrap();
         let hints = ConversationHints {

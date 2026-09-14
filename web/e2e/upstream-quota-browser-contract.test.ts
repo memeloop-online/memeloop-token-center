@@ -48,7 +48,7 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     assert.equal(await page.getByRole('button', { name: 'Save network proxy', exact: true }).isEnabled(), true);
     // Do not save or activate any quota operation in this no-network fixture.
     await page.getByRole('button', { name: 'Cancel', exact: true }).click();
-    await page.getByText('Stale data', { exact: true }).waitFor();
+    await page.getByText('Historical snapshot', { exact: true }).waitFor();
     assert.equal(await page.getByRole('meter').count(), 1, 'unknown usage never renders a zero/full meter');
     assert.equal(await page.getByRole('button', { name: 'Reset upstream quota', exact: true }).isEnabled(), true);
     for (const [theme, width] of [['light', 1440], ['dark', 390]] as const) {
@@ -83,7 +83,7 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     await view.waitFor();
     assert.deepEqual(await page.evaluate(() => [window.quotaReads, window.quotaWrites]), [0, 0]);
     await view.click();
-    await page.getByText('Primary window', { exact: true }).waitFor();
+    await page.getByText('Codex usage · 5-hour limit', { exact: true }).waitFor();
     await page.getByRole('button', { name: 'Quota reset options', exact: true }).click();
     const reset = page.getByRole('button', { name: 'Reset upstream quota', exact: true });
     await reset.hover();
@@ -125,8 +125,8 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
       await view.click();
       await page.getByRole('alert').getByText(message, { exact: true }).waitFor();
       if (mode !== 'permission') {
-        await page.getByText('Primary window', { exact: true }).waitFor();
-        await page.getByText('Refresh failed. The previous result remains below and may not reflect current quota. Retry manually.', { exact: true }).waitFor();
+        await page.getByText('Codex usage · 5-hour limit', { exact: true }).waitFor();
+        await page.getByText(/This refresh failed\. The values below are only the last successful observation from .+, not current quota\./).waitFor();
         assert.equal(await page.getByRole('meter').count(), 1);
       }
       assert.equal(await page.getByText('fixture-sensitive-message-must-not-render').count(), 0);

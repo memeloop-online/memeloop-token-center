@@ -5,6 +5,7 @@ const USAGE_URL: &str = "https://api.kimi.com/coding/v1/usages";
 
 pub(super) async fn read(
     state: &AppState,
+    account: &UpstreamAccountView,
     credential: &UpstreamCredential,
     mut snapshot: QuotaSnapshot,
 ) -> Result<QuotaSnapshot, &'static str> {
@@ -22,7 +23,13 @@ pub(super) async fn read(
     )
     .await
     .map_err(|_| "quota_destination_invalid")?;
-    let payload = get_usage(&http, credential, USAGE_URL).await?;
+    let payload = get_usage(
+        &http,
+        credential,
+        USAGE_URL,
+        QuotaRequestContext::for_account(account, "usage"),
+    )
+    .await?;
     let now = unix_millis();
     snapshot.windows = windows(&payload, now)?;
     snapshot.status = "ready";
@@ -38,7 +45,9 @@ async fn get_usage(
     http: &reqwest::Client,
     credential: &UpstreamCredential,
     url: &str,
+    context: QuotaRequestContext,
 ) -> Result<Value, &'static str> {
+    let started = tokio::time::Instant::now();
     let request = crate::oauth::managed::kimi::apply_headers(
         http.get(url)
             .header(reqwest::header::ACCEPT, "application/json")
@@ -51,8 +60,11 @@ async fn get_usage(
         .map_err(|_| "credential_invalid")?
         .send()
         .await
-        .map_err(|_| "quota_transport_failed")?;
-    decode_response(response).await
+        .map_err(|error| {
+            log_quota_request_error(context, "send", &error, started);
+            quota_reqwest_error_code(error.is_timeout())
+        })?;
+    decode_response(response, context, started).await
 }
 
 fn amount(value: &Value) -> Option<f64> {
@@ -211,7 +223,12 @@ mod tests {
             get_usage(
                 &http,
                 &credential,
-                &format!("{}/coding/v1/usages", server.uri())
+                &format!("{}/coding/v1/usages", server.uri()),
+                QuotaRequestContext {
+                    account_id: Uuid::from_u128(1),
+                    credential_generation: 2,
+                    endpoint_kind: "usage",
+                },
             )
             .await
             .unwrap_err(),

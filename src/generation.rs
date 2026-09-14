@@ -207,6 +207,28 @@ fn is_asset_archive_limit_error(error: &AppError) -> bool {
     matches!(error, AppError::Upstream(message) if message == ASSET_ARCHIVE_LIMIT_ERROR)
 }
 
+/// Dispatch durably arms a quarantine before the provider POST. Cancellation
+/// is not an attempt failure: leave the persisted fencing and reservation
+/// untouched for recovery, especially after provider dispatch.
+pub async fn process_one_until_shutdown(
+    state: &AppState,
+    worker_id: &str,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<bool, AppError> {
+    finish_attempt_until_shutdown(process_one(state, worker_id), shutdown).await
+}
+
+pub(crate) async fn finish_attempt_until_shutdown(
+    attempt: impl std::future::Future<Output = Result<bool, AppError>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<bool, AppError> {
+    tokio::select! {
+        biased;
+        _ = crate::worker::wait_for_shutdown(&mut shutdown) => Ok(false),
+        outcome = attempt => outcome,
+    }
+}
+
 pub async fn process_one(state: &AppState, worker_id: &str) -> Result<bool, AppError> {
     let Some(job) = state.db.claim_generation_job(worker_id).await? else {
         return Ok(false);
@@ -216,6 +238,19 @@ pub async fn process_one(state: &AppState, worker_id: &str) -> Result<bool, AppE
     // reschedule, or otherwise mutate a job that another worker may now own.
     let outcome = process_claimed_with_lease(state, worker_id, &job).await?;
     if let Err(error) = outcome {
+        // A send, response-body, response-parsing, or ACK-persistence error
+        // cannot prove non-delivery. Inspect the durable state, not the claimed
+        // snapshot (which was queued before submit armed its guard). Never let
+        // generic retry/exhaustion turn an unknown provider side effect into a
+        // refund. This also covers a guard commit whose acknowledgement failed.
+        if state
+            .db
+            .retain_generation_delivery_unknown(job.job_id, worker_id)
+            .await?
+        {
+            tracing::warn!(job_id = %job.job_id, "generation delivery remains quarantined pending provider confirmation");
+            return Ok(true);
+        }
         let next_failure = job.failure_count.saturating_add(1);
         tracing::warn!(job_id = %job.job_id, attempt = job.attempt_count, failure = next_failure, %error, "generation job attempt failed");
         if job.status == "cancelling" {
@@ -373,9 +408,12 @@ async fn process_claimed(
     worker_id: &str,
     job: &GenerationJobWork,
 ) -> Result<(), AppError> {
-    if job.status != "cancelling"
-        && unix_millis().saturating_sub(job.created_at) > MAX_JOB_AGE_MILLIS
-    {
+    // Manual proof of a previously unknown delivery starts one bounded polling
+    // window. Preserve admission time and every ordinary job's timeout policy.
+    let deadline = job
+        .reconciliation_deadline_at
+        .unwrap_or_else(|| job.created_at.saturating_add(MAX_JOB_AGE_MILLIS));
+    if job.status != "cancelling" && unix_millis() > deadline {
         return terminal_failure(state, worker_id, job, "generation_timeout").await;
     }
     if job.status == "submitting"
@@ -610,11 +648,20 @@ async fn submit(
         .post(format!("{}{}", route.base_url, path))
         .header("idempotency-key", job.job_id.to_string())
         .json(&input);
+    let request = route.credential.apply(request, unix_millis())?;
+    // Commit before send, including before its first poll, for both supervised
+    // and single-attempt workers. Only a durable provider ACK or an explicit
+    // provider rejection may clear this guard; transport/response/ACK errors
+    // and cancellation retain it for evidence-bearing reconciliation.
+    state
+        .db
+        .arm_generation_shutdown_quarantine(job.job_id, worker_id, submission_nonce)
+        .await?;
     let _upstream_activity = state
         .metrics
         .active_upstream(&route.driver, "generation_submit");
     let upstream_started = std::time::Instant::now();
-    let response_result = route.credential.apply(request, unix_millis())?.send().await;
+    let response_result = request.send().await;
     state.metrics.observe_upstream(
         &route.driver,
         "generation_submit",

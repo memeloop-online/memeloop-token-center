@@ -20,6 +20,7 @@ use super::limits::{
     CLOUD_WEBHOOK_BODY_PERMITS, CLOUD_WEBHOOK_BODY_READ_DEADLINE, IMAGE_RESPONSE_PERMITS,
     MAX_CLOUD_WEBHOOK_BODY, REQUEST_ID_HEADER,
 };
+use super::proxy_diagnostics;
 
 const CONTROL_BODY_READ_DEADLINE: Duration = Duration::from_secs(60);
 const CONTROL_BODY_PERMIT_WAIT: Duration = Duration::from_secs(1);
@@ -140,7 +141,13 @@ pub(super) async fn authenticate_gateway_before_body(
     mut request: Request,
     next: Next,
 ) -> Result<Response, AppError> {
+    let diagnostic_context = proxy_diagnostics::CONTEXT.try_with(|context| *context).ok();
+    let authentication = diagnostic_context
+        .map(|context| proxy_diagnostics::Phase::new(context, "gateway_authentication"));
     let _ = authenticate_downstream(request.headers(), &state).await?;
+    if let Some(phase) = authentication {
+        phase.finish("completed", None, None);
+    }
     let image_lifecycle_permit = if request.uri().path() == "/v1/images/generations" {
         Some(
             IMAGE_RESPONSE_PERMITS
@@ -151,7 +158,11 @@ pub(super) async fn authenticate_gateway_before_body(
         None
     };
     if request.method() == axum::http::Method::POST {
-        let request_id = safe_gateway_request_id(request.headers());
+        let request_id = diagnostic_context
+            .map(|context| context.request_id.to_string())
+            .unwrap_or_else(|| safe_gateway_request_id(request.headers()));
+        let body_read = diagnostic_context
+            .map(|context| proxy_diagnostics::Phase::new(context, "gateway_request_body"));
         request = match crate::gateway_body::admit_gateway_request_body_with_memory(
             request,
             crate::gateway_body::GATEWAY_BODY_READ_DEADLINE,
@@ -163,8 +174,17 @@ pub(super) async fn authenticate_gateway_before_body(
         .await
         {
             Ok(request) => request,
-            Err(error) => return Ok(gateway_body_admission_rejection(&state, &request_id, error)),
+            Err(error) => {
+                let response = gateway_body_admission_rejection(&state, &request_id, error);
+                if let Some(phase) = body_read {
+                    phase.finish("rejected", Some(response.status().as_u16()), None);
+                }
+                return Ok(response);
+            }
         };
+        if let Some(phase) = body_read {
+            phase.finish("completed", None, None);
+        }
     }
     let memory = request
         .extensions()

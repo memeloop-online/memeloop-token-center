@@ -39,6 +39,7 @@ mod credentials;
 mod diagnostics;
 mod filter_assistant;
 mod generation;
+mod generation_quarantine;
 mod groups;
 mod health;
 mod kimi_transport;
@@ -49,6 +50,7 @@ mod monitoring_snapshot;
 mod plugin_execution;
 mod plugins;
 mod proxy;
+mod proxy_diagnostics;
 mod request_detail;
 mod router;
 mod routes;
@@ -123,7 +125,7 @@ use upstreams::*;
 use web::{operator_index, portal_index, web_asset};
 
 pub(crate) use upstreams::{
-    refresh_managed_upstream_oauth, trigger_copilot_remint_on_auth_failure,
+    refresh_managed_upstream_oauth_for_worker, trigger_copilot_remint_on_auth_failure,
 };
 
 use crate::{

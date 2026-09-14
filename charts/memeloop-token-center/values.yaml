@@ -15,7 +15,7 @@ migration:
   enabled: true
   # Must equal the greatest migration registered by the release binary.
   # The packaging contract rejects drift between this value and migrations/.
-  schemaVersion: 86
+  schemaVersion: 87
   # The hook is the only component that applies schema migrations. Application
   # Deployments always set MTC_RUN_MIGRATIONS_ON_START=false.
   backoffLimit: 4
@@ -141,6 +141,10 @@ config:
   # deployment during an incident. They remain disabled by default and are
   # never rendered for gateway or worker roles.
   runtimeProfiling:
+    enabled: false
+  # Keep compressed spool writes disabled until every gateway/control/worker
+  # replica runs a reader that accepts both the legacy and compressed formats.
+  archiveSpoolCompression:
     enabled: false
   databaseUrlSecret:
     name: memeloop-token-center-secrets

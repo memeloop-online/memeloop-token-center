@@ -15,6 +15,7 @@ const recorded: RequestView = {
   input_tokens: 100, output_tokens: 20, cost: '1', error_code: null,
   upstream_account_id: 'upstream', route_id: 'route', currency: 'USD',
   cached_input_tokens: 30, cache_write_tokens: 10,
+  credential_identity: { tenant_external_id: 'tenant', key_id: 'key', key_alias: 'Research key', principal_external_id: 'research-team' },
   archive_state: 'pending',
   session_context: {
     session_id: 'session', association: 'confirmed', session_name: 'named',

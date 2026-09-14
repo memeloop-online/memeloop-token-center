@@ -8,6 +8,7 @@ use http::header;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
+use super::super::proxy_diagnostics;
 use super::super::sse::{
     BoundedSseEvent, BoundedSseFramer, ResponseIdentityGate, ResponsesStreamingSanitizer,
     SseFramerRejection, is_response_metadata_event, is_sse_field_line, parse_sse_event,
@@ -772,9 +773,17 @@ pub(super) async fn buffer_response(
         .min(MAX_PROXY_RESPONSE_BODY);
     let deadline =
         tokio::time::Instant::now() + MAX_PROXY_LIFETIME.saturating_sub(started.elapsed());
+    let diagnostic_context = proxy_diagnostics::Context::current();
+    let capacity = proxy_diagnostics::Phase::new(diagnostic_context, "buffered_response_memory");
     if !memory.reserve_buffered_response(maximum, deadline).await {
+        capacity.finish("rejected", None, None);
         return Err("upstream_response_memory_capacity");
     }
+    capacity.finish("completed", None, None);
+    let mut first_byte = Some(proxy_diagnostics::Phase::new(
+        diagnostic_context,
+        "buffered_first_byte",
+    ));
     let mut parser = BufferedResponsesParser::default();
     let mut total = 0_usize;
     let mut memory_scanner = crate::gateway_body::memory::JsonMemoryScanner::default();
@@ -785,6 +794,11 @@ pub(super) async fn buffer_response(
             .map_err(|_| "upstream_timeout")?;
         let Some(next) = next else { break };
         let chunk = next?;
+        if !chunk.is_empty()
+            && let Some(phase) = first_byte.take()
+        {
+            phase.finish("received", None, Some(chunk.len()));
+        }
         total = total.saturating_add(chunk.len());
         if total > maximum {
             return Err("upstream_response_too_large");
@@ -794,6 +808,9 @@ pub(super) async fn buffer_response(
             return Err("upstream_response_memory_capacity");
         }
         parser.push(&chunk)?;
+    }
+    if let Some(phase) = first_byte.take() {
+        phase.finish("no_bytes", None, Some(0));
     }
     parser.finish()
 }

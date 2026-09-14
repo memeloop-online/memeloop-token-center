@@ -8,6 +8,7 @@ async fn archive_eof_owner_keeps_the_body_open_until_settlement_handoff_finishes
     let owner = tokio::spawn(hold_response_eof_until_archive_settles(
         settlement_receiver,
         body_sender.clone(),
+        proxy_diagnostics::Context::new(),
     ));
     let settlement =
         crate::response_archive_spool::ResponseArchiveSettlement::pending_for_test(released);

@@ -508,6 +508,10 @@ async fn finish_non_sse_proxy_response(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json")
         .to_owned();
+    let buffer_phase = proxy_diagnostics::Phase::new(
+        proxy_diagnostics::Context::for_request(buffered_request.request_id),
+        "buffered_response",
+    );
     let response_body = match read_bounded_upstream(
         upstream,
         MAX_PROXY_RESPONSE_BODY,
@@ -519,6 +523,7 @@ async fn finish_non_sse_proxy_response(
     {
         Ok(body) => Bytes::from(body),
         Err(error) => {
+            buffer_phase.finish(error.code(), Some(status.as_u16()), None);
             let result = finish_proxy_failure(buffered_request, error.code()).await;
             upstream_attempt
                 .complete(UpstreamAttemptTerminal::invalid_response())
@@ -526,6 +531,11 @@ async fn finish_non_sse_proxy_response(
             return result;
         }
     };
+    buffer_phase.finish(
+        "completed",
+        Some(status.as_u16()),
+        Some(response_body.len()),
+    );
     let validation = match protocol {
         Protocol::OpenAiChat => validate_buffered_chat_success(&response_body),
         Protocol::OpenAiResponses => validate_buffered_responses_success(&response_body),
@@ -701,6 +711,9 @@ pub(in crate::api) async fn proxy_with_identity(
     pinned_route: Option<Uuid>,
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 ) -> Result<Response, AppError> {
+    let diagnostic_context = proxy_diagnostics::Context::current();
+    let request_id = diagnostic_context.request_id;
+    let preparation = proxy_diagnostics::Phase::new(diagnostic_context, "request_preparation");
     let _request_buffer = state
         .metrics
         .memory_usage(crate::metrics::MemoryComponent::RequestBuffer, body.len());
@@ -710,7 +723,6 @@ pub(in crate::api) async fn proxy_with_identity(
         .clone()
         .try_acquire_owned()
         .map_err(|_| AppError::Overloaded)?;
-    let request_id = Uuid::now_v7();
     if !memory.try_reserve_json(&body) {
         state
             .metrics
@@ -720,6 +732,7 @@ pub(in crate::api) async fn proxy_with_identity(
     let original_request_json: Value = serde_json::from_slice(&body)
         .map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))?;
     let conversation_hints = conversation_hints(&headers, &original_request_json);
+    tracing::info!(%request_id, phase = "request_shape", bytes = body.len(), compaction_hint = conversation_hints.compaction, "proxy request metadata");
     let applied = super::traffic::apply_traffic_policy_with_memory(
         &state,
         &key,
@@ -743,6 +756,8 @@ pub(in crate::api) async fn proxy_with_identity(
     }
     let request_json = applied.request_json;
     let model = applied.model;
+    preparation.finish("completed", None, Some(body.len()));
+    let route_preparation = proxy_diagnostics::Phase::new(diagnostic_context, "route_preparation");
     let selection_seed = routing_selection_seed(&key, request_id, &conversation_hints);
     let mut candidates = state
         .db
@@ -784,6 +799,13 @@ pub(in crate::api) async fn proxy_with_identity(
     let input_token_ceiling = route_plan.input_token_ceiling;
     let output_token_ceiling = route_plan.output_token_ceiling;
     let requested_service_tier = requested_service_tier(&request_json, &price)?;
+    route_preparation.finish("completed", None, None);
+    let admission = proxy_diagnostics::Phase::account(
+        diagnostic_context,
+        "request_archive_admission",
+        upstream_account_id,
+        Some(primary.credential_generation),
+    );
     let admitted_request_object = format!("gap://{request_id}/request");
     let request_capture_memory = state.metrics.memory_usage(
         crate::metrics::MemoryComponent::StreamCapture,
@@ -791,7 +813,7 @@ pub(in crate::api) async fn proxy_with_identity(
     );
     let reservation = match state
         .db
-        .start_proxy_request_with_archive(
+        .start_proxy_request_with_archive_compression(
             StartProxyRequest {
                 request_id,
                 key: &key,
@@ -806,15 +828,18 @@ pub(in crate::api) async fn proxy_with_identity(
             },
             &body,
             state.config.key_pepper.as_bytes(),
+            state.config.archive_spool_compression_enabled,
         )
         .await
     {
         Ok(reservation) => reservation,
         Err(error) => {
+            admission.finish(error.diagnostic_category(), None, Some(body.len()));
             tracing::error!(%request_id, stage = "request_transaction_admission", failure_domain = "local_admission", error_category = error.diagnostic_category(), "proxy request admission failed");
             return Err(error);
         }
     };
+    admission.finish("completed", None, Some(body.len()));
     drop(request_capture_memory);
     memory.release(
         body.len(),
@@ -852,11 +877,14 @@ pub(in crate::api) async fn proxy_with_identity(
     // needs the buffered-response safety partition until the response headers
     // prove that the actual downstream path is SSE. Waiting here is bounded,
     // FIFO, and occurs after durable admission but before any upstream send.
+    let retained_admission =
+        proxy_diagnostics::Phase::new(diagnostic_context, "retained_memory_admission");
     if !buffered_request
         .memory
         .finalize_request(tokio::time::Instant::now() + RETAINED_REQUEST_ADMISSION_WAIT)
         .await
     {
+        retained_admission.finish("rejected", Some(503), None);
         state
             .metrics
             .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Retained);
@@ -876,6 +904,7 @@ pub(in crate::api) async fn proxy_with_identity(
             .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
         return Ok(response);
     }
+    retained_admission.finish("completed", None, None);
     let AuthorizedProxyRoutes {
         primary,
         remaining_candidates,
@@ -910,6 +939,7 @@ pub(in crate::api) async fn proxy_with_identity(
                 policy_version = attempt_budget.version, "proxy request budget exhausted");
             return finish_unavailable(&buffered_request, reason, last_dispatch).await;
         }
+        let selection = proxy_diagnostics::Phase::new(diagnostic_context, "candidate_selection");
         let selected = match next_sendable_proxy_route(NextSendableProxyRouteInput {
             request: request_context,
             price: &price,
@@ -931,6 +961,7 @@ pub(in crate::api) async fn proxy_with_identity(
         {
             Ok(selected) => selected,
             Err(error) => {
+                selection.finish(error.diagnostic_category(), None, None);
                 tracing::warn!(
                     %request_id,
                     error_category = error.diagnostic_category(),
@@ -941,6 +972,15 @@ pub(in crate::api) async fn proxy_with_identity(
                 return finish_proxy_failure(&buffered_request, "upstream_candidate_invalid").await;
             }
         };
+        selection.finish(
+            if selected.is_some() {
+                "completed"
+            } else {
+                "unavailable"
+            },
+            None,
+            None,
+        );
         let Some((active_route, mut upstream_attempt, selected_candidate_rank, outbound_attempt)) =
             selected
         else {
@@ -958,6 +998,12 @@ pub(in crate::api) async fn proxy_with_identity(
                 .await;
             return finish_unavailable(&buffered_request, reason, last_dispatch).await;
         }
+        let attempt = proxy_diagnostics::Phase::account(
+            diagnostic_context,
+            "upstream_response_admission",
+            Some(active_route.route.account_id),
+            Some(active_route.route.credential_generation),
+        );
         let (result, rate_limit) = match attempt_budget
             .send(send_proxy_route(
                 &state,
@@ -980,6 +1026,18 @@ pub(in crate::api) async fn proxy_with_identity(
             }
             result => (result, None),
         };
+        attempt.finish(
+            if result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+            result
+                .as_ref()
+                .ok()
+                .map(|response| response.response.status().as_u16()),
+            None,
+        );
         let consumed_outbound_attempt = !matches!(
             &result,
             Err(ProxySendError::CandidateUnavailable | ProxySendError::CredentialUnavailable)
@@ -1173,6 +1231,12 @@ pub(in crate::api) async fn proxy_with_identity(
     }
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
     if is_codex_route && !codex_downstream_stream {
+        let buffer_phase = proxy_diagnostics::Phase::account(
+            diagnostic_context,
+            "codex_buffered_response",
+            Some(active_route.route.account_id),
+            Some(active_route.route.credential_generation),
+        );
         let buffered = match codex_transport::buffer_response(
             upstream,
             &buffered_request.memory,
@@ -1182,6 +1246,7 @@ pub(in crate::api) async fn proxy_with_identity(
         {
             Ok(buffered) => buffered,
             Err(error_code) => {
+                buffer_phase.finish(error_code, None, None);
                 tracing::warn!(%request_id, stage = error_code, "Codex upstream response failed");
                 let result = finish_proxy_failure(&buffered_request, error_code).await;
                 upstream_attempt
@@ -1200,6 +1265,7 @@ pub(in crate::api) async fn proxy_with_identity(
                 return result;
             }
         };
+        buffer_phase.finish("completed", Some(200), Some(buffered.body.len()));
         let result = finish_buffered_request(
             &buffered_request,
             StatusCode::OK,
@@ -1276,6 +1342,7 @@ pub(in crate::api) async fn proxy_with_identity(
         upstream_activity,
         request_id,
         upstream_account_id: active_route.route.account_id,
+        credential_generation: active_route.route.credential_generation,
         buffered_request,
         proxy_lifecycle_permit,
     })
@@ -1696,6 +1763,7 @@ async fn finish_buffered_request_with_upstream_attribution(
             crate::response_archive_spool::BufferedArchivePurpose::Response,
             &body,
             request.state.config.key_pepper.as_bytes(),
+            request.state.config.archive_spool_compression_enabled,
         )
     } else {
         Err(AppError::Overloaded)
@@ -1726,6 +1794,10 @@ async fn finish_buffered_request_with_upstream_attribution(
         response_object: &stored_response,
         conversation,
     };
+    let terminal_phase = proxy_diagnostics::Phase::new(
+        proxy_diagnostics::Context::for_request(request_id),
+        "buffered_archive_settlement",
+    );
     let result = match response_archive {
         Ok(archive) => {
             lifecycle::finish_buffered_proxy_request_with_retry(
@@ -1747,6 +1819,15 @@ async fn finish_buffered_request_with_upstream_attribution(
                 .await
         }
     };
+    terminal_phase.finish(
+        if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        },
+        Some(status.as_u16()),
+        Some(body.len()),
+    );
     drop(response_capture_memory);
     drop(response_capture_permit);
     if result.is_err() {

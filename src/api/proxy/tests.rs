@@ -29,6 +29,7 @@ mod ha_policy;
 mod kimi;
 mod memory_admission;
 mod memory_metrics;
+mod phase_diagnostics;
 mod recovery_wait;
 mod sse_delivery;
 
