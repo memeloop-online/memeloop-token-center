@@ -1,0 +1,26 @@
+.request-page-surface.panel,
+:root[data-theme] .request-page-surface.panel { padding: 0; border: 0; box-shadow: none; background: transparent; }
+.request-page-surface .traffic-heading { margin-bottom: 24px; }
+.request-page-surface .request-traffic-metrics { margin: 20px 0; }
+.request-page-surface .request-traffic-metrics .metric { border: 0; padding: 12px 14px; background: transparent; box-shadow: none; }
+.request-page-surface .request-traffic-metrics .metric-value { font-family: inherit; font-size: clamp(20px, 3vw, 28px); font-weight: 600; }
+.request-table .request-outcome { display: inline-flex; align-items: center; gap: 6px; white-space: normal; }
+.request-outcome.status { border: 0; border-radius: 4px; padding: 4px 6px; text-transform: none; font-size: 12px; line-height: 1.45; }
+.request-outcome small { font: inherit; opacity: .8; }
+.request-outcome.ok { color: #64dfc2; background: #173e38; }
+.request-outcome.bad { color: #ffb1bb; background: #49262e; }
+.request-outcome.pending { color: #f0d697; background: #3d3624; }
+.request-outcome.unknown { color: #c4d3d9; background: #28343a; }
+:root[data-theme='light'] .request-outcome.ok { color: #087967; background: #e0f2eb; }
+:root[data-theme='light'] .request-outcome.bad { color: #a12b40; background: #fbe9ed; }
+:root[data-theme='light'] .request-outcome.pending { color: #765600; background: #faf0d3; }
+:root[data-theme='light'] .request-outcome.unknown { color: #445d68; background: #edf2f4; }
+.request-token-pending { font-size: 11px; color: #a7bbc3; }
+:root[data-theme='light'] .request-token-pending { color: #526d78; }
+.request-detail-surface.request-diagnostics,
+:root[data-theme] .request-detail-surface.request-diagnostics { border: 0; background: transparent; gap: 18px 24px; }
+.request-detail-surface.request-diagnostics > span,
+:root[data-theme] .request-detail-surface.request-diagnostics > span { background: transparent; padding: 0; }
+.request-detail-surface.request-diagnostics b { font-size: 11px; letter-spacing: 0; text-transform: none; color: #a7bbc3; }
+:root[data-theme='light'] .request-detail-surface.request-diagnostics b { color: #526d78; }
+.request-detail-surface .request-outcome small { display: inline; margin: 0 0 0 6px; color: inherit; }

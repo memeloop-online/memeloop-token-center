@@ -9,7 +9,7 @@ let requestNumber = 0;
 function request(status_code: number | null, duration_ms: number | null): RequestView {
   return {
     request_id: `request-${++requestNumber}`, created_at: 1, protocol: 'openai', model: 'example', status_code, duration_ms,
-    input_tokens: 0, output_tokens: 0, cost: '0', error_code: null,
+    input_tokens: 0, output_tokens: 0, cost: '0', error_code: null, completed_at: status_code === null ? null : 400,
   };
 }
 
@@ -23,6 +23,7 @@ test('visible traffic summary separates terminal health from live work', () => {
     successful: 2,
     failed: 1,
     running: 1,
+    unknown: 0,
     successRate: 2 / 3,
     averageDurationMs: 240,
   });
@@ -34,7 +35,12 @@ test('visible traffic summary has no fabricated rate or latency without terminal
     successful: 0,
     failed: 0,
     running: 1,
+    unknown: 0,
     successRate: null,
     averageDurationMs: null,
   });
+  const unknown = summarizeVisibleRequests([{ ...request(200, 100), completed_at: undefined }]);
+  assert.equal(unknown.unknown, 1);
+  assert.equal(unknown.successful, 0);
+  assert.equal(unknown.successRate, null);
 });

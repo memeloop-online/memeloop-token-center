@@ -1,4 +1,5 @@
 import type { RequestEvent, RequestListCursor, RequestListResponse, RequestView, TypedFilterAst } from '../../types.js';
+import { requestOutcome } from '../../requestStatusPresentation.js';
 
 export const emptyTypedFilterAst: TypedFilterAst = { logical_operator: 'and', conditions: [] };
 
@@ -34,6 +35,7 @@ export interface VisibleRequestTrafficSummary {
   successful: number;
   failed: number;
   running: number;
+  unknown: number;
   successRate: number | null;
   averageDurationMs: number | null;
 }
@@ -42,15 +44,21 @@ export function summarizeVisibleRequests(requests: readonly RequestView[]): Visi
   let successful = 0;
   let failed = 0;
   let running = 0;
+  let unknown = 0;
   let durationTotal = 0;
   let durationCount = 0;
 
   for (const request of requests) {
-    if (request.status_code === null) {
+    const outcome = requestOutcome(request);
+    if (outcome === 'running' || outcome === 'delivering') {
       running += 1;
       continue;
     }
-    if (request.status_code < 400) successful += 1;
+    if (outcome === 'unknown') {
+      unknown += 1;
+      continue;
+    }
+    if (outcome === 'completed') successful += 1;
     else failed += 1;
     if (request.duration_ms !== null && Number.isFinite(request.duration_ms)) {
       durationTotal += request.duration_ms;
@@ -64,6 +72,7 @@ export function summarizeVisibleRequests(requests: readonly RequestView[]): Visi
     successful,
     failed,
     running,
+    unknown,
     successRate: terminal > 0 ? successful / terminal : null,
     averageDurationMs: durationCount > 0 ? durationTotal / durationCount : null,
   };
