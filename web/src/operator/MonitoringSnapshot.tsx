@@ -62,7 +62,6 @@ export function MonitoringSnapshot({ snapshot, points = [] }: { snapshot: Operat
         <div><h2 id="monitoring-heading">{t('monitoring.title')}</h2><p className="muted">{range}</p></div>
         <RoutingStatusBadge health={snapshot.health} />
       </div>
-      <LocalSettlementNotice />
       <section className="metrics operator-monitoring-metrics monitoring-metrics-grid" aria-label={t('monitoring.summary')}>
         <AnalyticsMetric label={t('usage.requests')} value={count(summary.requests).text} title={count(summary.requests).title} trend={points.map((point) => point.requests)} />
         <AnalyticsMetric label={t('traffic.success')} value={count(summary.successful_requests).text} title={count(summary.successful_requests).title} tone="positive" trend={points.map((point) => point.success)} ratio={successRate} />
@@ -70,7 +69,7 @@ export function MonitoringSnapshot({ snapshot, points = [] }: { snapshot: Operat
         <AnalyticsMetric label={t('usage.successRate')} value={formatPercent(successRate, locale)} tone="positive" ratio={successRate} />
         <AnalyticsMetric label={t('usage.average')} value={average.text} title={average.title} trend={points.map((point) => point.avg_duration_ms)} />
         <AnalyticsMetric label={t('usage.p95Approx')} value={p95.text} title={p95.title} trend={finiteP95Points(points).map((point) => point.p95_duration_ms)} />
-        <AnalyticsMetric label={localSettlementLabel(locale)} value={<CostLines costs={summary.costs} />} trend={currency ? points.map((point) => Number(point.costs.find((cost) => cost.currency === currency)?.cost ?? 0)) : undefined} />
+        <AnalyticsMetric label={localSettlementLabel(locale)} labelContent={<LocalSettlementNotice />} value={<CostLines costs={summary.costs} />} trend={currency ? points.map((point) => Number(point.costs.find((cost) => cost.currency === currency)?.cost ?? 0)) : undefined} />
         <AnalyticsMetric label={t('monitoring.freshness')} value={<Freshness snapshot={snapshot} />} />
       </section>
     </article>
