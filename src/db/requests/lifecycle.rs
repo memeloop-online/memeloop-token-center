@@ -219,22 +219,20 @@ impl Database {
             reservation_id,
         )
         .await?;
-        if let Err(error) = record_request_started_in_transaction(
-            &mut transaction,
-            &NewRequest {
-                request_id: input.request_id,
-                key_id: input.key.key_id,
-                tenant_id: input.key.tenant_id,
-                protocol: input.protocol.to_owned(),
-                model: input.model.to_owned(),
-                request_object: input.request_object.to_owned(),
-                reservation_id: reservation.id,
-                upstream_account_id: input.upstream_account_id,
-                model_route_id: input.model_route_id,
-            },
-            now,
-        )
-        .await
+        let started_request = NewRequest {
+            request_id: input.request_id,
+            key_id: input.key.key_id,
+            tenant_id: input.key.tenant_id,
+            protocol: input.protocol.to_owned(),
+            model: input.model.to_owned(),
+            request_object: input.request_object.to_owned(),
+            reservation_id: reservation.id,
+            upstream_account_id: input.upstream_account_id,
+            model_route_id: input.model_route_id,
+        };
+        if let Err(error) =
+            insert_request_started_record_in_transaction(&mut transaction, &started_request, now)
+                .await
         {
             transaction.rollback().await?;
             return Err(error);
@@ -263,6 +261,11 @@ impl Database {
         } else if prepared_request_batch.is_some() {
             return Err(AppError::Internal);
         }
+        // Acquire the globally serialized event cursor only after all archive
+        // batches are inserted. The event and admission remain one commit,
+        // without holding the cross-tenant cursor during compression/inserts.
+        insert_request_started_event_in_transaction(&mut transaction, &started_request, now)
+            .await?;
         // No cancellation deadline: only a positively observed COMMIT permits
         // dispatch. Unknown COMMIT returns unavailable, leaving orphan recovery
         // to settle any admission which actually committed without dispatch.
@@ -762,6 +765,12 @@ impl Database {
         let reservation_id = input.reservation.id.to_string();
         let mut content_materialized = false;
         let mut preparation_complete = input.conversation.is_none();
+        // Match request admission: retain at most one existing insert batch,
+        // and perform its compression/encryption before shared database locks.
+        let prepared_response_batch = match buffered_archive {
+            Some(archive) => Some(archive.prepare_first_batch().await?),
+            None => None,
+        };
         let (mut transaction, now, created_at, reservation_row, trusted_reservation) = loop {
             // Preparing immutable content must not hold either shared lock:
             // spool_transaction takes the global archive budget row, and the
@@ -1024,7 +1033,12 @@ impl Database {
         if let Some(archive) = buffered_archive {
             let capture_started = std::time::Instant::now();
             if !self
-                .capture_buffered_archive_body_in_transaction(&mut transaction, now, archive, None)
+                .capture_buffered_archive_body_in_transaction(
+                    &mut transaction,
+                    now,
+                    archive,
+                    prepared_response_batch,
+                )
                 .await?
             {
                 tracing::warn!(
@@ -1474,6 +1488,15 @@ pub(crate) async fn record_request_started_in_transaction(
     request: &NewRequest,
     now: i64,
 ) -> Result<(), AppError> {
+    insert_request_started_record_in_transaction(transaction, request, now).await?;
+    insert_request_started_event_in_transaction(transaction, request, now).await
+}
+
+async fn insert_request_started_record_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    request: &NewRequest,
+    now: i64,
+) -> Result<(), AppError> {
     let request_id = request.request_id.to_string();
     let tenant_id = request.tenant_id.to_string();
     let key_id = request.key_id.to_string();
@@ -1502,6 +1525,17 @@ pub(crate) async fn record_request_started_in_transaction(
     .bind(&model_route_id)
     .execute(&mut **transaction)
     .await?;
+    Ok(())
+}
+
+async fn insert_request_started_event_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    request: &NewRequest,
+    now: i64,
+) -> Result<(), AppError> {
+    let request_id = request.request_id.to_string();
+    let tenant_id = request.tenant_id.to_string();
+    let key_id = request.key_id.to_string();
     let event =
         allocate_request_event_cursor(transaction, now, &tenant_id, &key_id, &request_id).await?;
     sqlx::query(

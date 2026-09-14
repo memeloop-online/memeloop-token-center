@@ -44,6 +44,24 @@ its own errors, not proof that persistence or network delivery succeeded.
 First-byte observations can be after bounded protocol sniffing/prefetching.
 None of these observations authorize retry, change billing, or set health.
 
+`archive_budget_acquire` separates `pool_wait_ms` (connection acquisition and
+transaction begin) from `budget_wait_ms` (the singleton budget row acquisition).
+It is DEBUG normally and WARN if either exceeds 250 ms; successful chunks do
+not add INFO events. These are acquisition timings, **not** transaction hold
+times. Join them through the enclosing request/writer span and compare the
+existing admission or settlement duration. A slow lock wait identifies a waiter,
+not its blocker: capture `pg_blocking_pids`, transaction age and sanitized query
+classes before attributing the holder. An idle-in-transaction chunk insert alone
+does not prove an object upload or downstream ACK is awaited inside PostgreSQL.
+
+Buffered admission publishes its event only after inserting the archive, in the
+same atomic transaction; the event cursor remains serialized through COMMIT.
+Request and response first batches are sealed before opening the transaction,
+with the existing bounded batch size. Larger bodies still seal subsequent
+batches under the budget lock; this change does not remove all budget contention
+or change the budget-first ordering, atomic reservation/refund, or writer EOF
+ownership.
+
 For a late `response_spool_writer` failure, first inspect correlated
 `response_spool_producer` and writer outcomes: `queue_capacity`, `queue_closed`,
 `terminal_sender_dropped` and `abandoned_before_*` are not database failures.
