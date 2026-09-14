@@ -68,9 +68,9 @@ When('管理员以中文暗色主题连接控制台', async function (this: Dogf
 Then('下游凭据表单使用本地化校验且模型计费可见', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   await openAppRoute(page, 'operator', 'credentials');
-  const createPanel = page.locator('details.create-resource').filter({ hasText: '创建客户端凭据' });
-  await assertVisible(createPanel.locator('summary'));
-  await createPanel.locator('summary').click();
+  const createPanel = page.locator('.create-journey');
+  await assertVisible(createPanel.locator('[data-workspace-toggle]'));
+  await createPanel.locator('[data-workspace-toggle]').click();
   const createButton = page.getByRole('button', { name: '创建凭据', exact: true });
   await assertVisible(createButton);
   await createButton.click();
@@ -87,11 +87,12 @@ Then('管理员可以重命名凭据并查看当前限制状态', async function
   const page = this.requirePage();
   const seed = runtime.requireSeed();
   await openAppRoute(page, 'operator', 'credentials');
-  const resource = page.locator('.managed-resource').filter({ hasText: seed.clientKeyId });
+  const resource = page.locator('.managed-resource').filter({ has: page.locator(`b[title*="${seed.clientKeyId}"]`) });
   await assertContains(resource, 'Browser E2E credential');
 
-  await resource.getByRole('button', { name: '修改别名', exact: true }).click();
-  const editor = resource.locator('.inline-editor').filter({ hasText: '修改' });
+  await resource.getByRole('button', { name: '更多操作', exact: true }).click();
+  await page.getByRole('menuitem', { name: '修改别名', exact: true }).click();
+  const editor = page.locator('.credential-active-editor .inline-editor').filter({ hasText: '修改' });
   await editor.locator('input').fill('Browser E2E renamed credential');
   const renameResponse = page.waitForResponse((response) =>
     response.url().endsWith(`/internal/v1/keys/${seed.clientKeyId}/alias`) &&
@@ -105,21 +106,24 @@ Then('管理员可以重命名凭据并查看当前限制状态', async function
   const limitsResponse = page.waitForResponse((response) =>
     response.url().endsWith(`/internal/v1/keys/${seed.clientKeyId}/limits`) &&
     response.request().method() === 'GET');
-  await resource.getByRole('button', { name: '当前额度状态', exact: true }).click();
+  await resource.getByRole('button', { name: '更多操作', exact: true }).click();
+  await page.getByRole('menuitem', { name: '当前额度状态', exact: true }).click();
   const limits = await limitsResponse;
   assert.equal(limits.status(), 200);
   const snapshot = await limits.json();
   assert.equal(snapshot.key_id, seed.clientKeyId);
   assert.equal(snapshot.currency, 'USD');
   assert.ok(snapshot.rpm && snapshot.tpm && snapshot.concurrency);
-  await assertVisible(resource.getByRole('heading', { name: '当前额度与限流状态', exact: true }));
-  await assertContains(resource, 'RPM');
-  await assertContains(resource, 'TPM');
-  await assertContains(resource, '并发');
-  await assertContains(resource, '每日额度');
+  await assertVisible(page.locator('.credential-active-editor').getByRole('heading', { name: '当前额度与限流状态', exact: true }));
+  await assertContains(page.locator('.credential-active-editor'), 'RPM');
+  await assertContains(page.locator('.credential-active-editor'), 'TPM');
+  await assertContains(page.locator('.credential-active-editor'), '并发');
+  await assertContains(page.locator('.credential-active-editor'), '每日额度');
 
-  await resource.getByRole('button', { name: '修改别名', exact: true }).click();
-  const restoreEditor = resource.locator('.inline-editor').filter({ hasText: '修改' });
+  await page.locator('.create-journey [data-workspace-toggle]').click();
+  await resource.getByRole('button', { name: '更多操作', exact: true }).click();
+  await page.getByRole('menuitem', { name: '修改别名', exact: true }).click();
+  const restoreEditor = page.locator('.credential-active-editor .inline-editor').filter({ hasText: '修改' });
   await restoreEditor.locator('input').fill('Browser E2E credential');
   const restoreResponse = page.waitForResponse((response) =>
     response.url().endsWith(`/internal/v1/keys/${seed.clientKeyId}/alias`) &&
@@ -424,9 +428,13 @@ Then('中文指标显示万、亿、万亿、USD 与 CNY 并保留精确值', as
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(localizationUsageFixture()) });
   });
   await page.getByRole('button', { name: '刷新', exact: true }).click();
-  await assertExactText(metric(page, '请求数'), '111,227');
-  await assertExactText(metric(page, '总 Token'), '1,000,100,111,227');
-  await assertExactText(metric(page, '生成计费单位'), '12,345');
+  const exactMetric = (label: string) => metric(page, label).locator('.metric-exact');
+  await assertExactText(metric(page, '请求数'), '11.12万');
+  await assertAttribute(exactMetric('请求数'), 'title', '111,227');
+  await assertExactText(metric(page, '总 Token'), '1万亿');
+  await assertAttribute(exactMetric('总 Token'), 'title', '1,000,100,111,227');
+  await assertExactText(metric(page, '生成计费单位'), '1.23万');
+  await assertAttribute(exactMetric('生成计费单位'), 'title', '12,345');
   await assertExactText(metric(page, '缓存 Token'), '0');
   const costs = page.locator('.usage-cost-lines');
   await assertContains(costs, '¥2.5');
@@ -436,7 +444,7 @@ Then('中文指标显示万、亿、万亿、USD 与 CNY 并保留精确值', as
   await assertCount(page.locator('.usage-chart-card .usage-echart canvas'), 3);
   const trendTable = page.locator('.usage-chart-card').first().locator('.usage-chart-table');
   await trendTable.locator('summary').click();
-  await assertContains(trendTable, '1,000,100,111,227');
+  await assertContains(trendTable, '1万亿');
   await assertContains(trendTable, '18.5 ms');
   await assertContains(trendTable, '25 ms');
   await assertContains(trendTable, '¥2.5');
@@ -452,13 +460,15 @@ When('管理员将请求统计切换为英文', async function (this: DogfoodWor
   await page.getByRole('tab', { name: 'Overview', exact: true }).click();
 });
 
-Then('英文大数使用完整千分位而非 K 或 M 且亮暗主题均可切换', async function (this: DogfoodWorld) {
+Then('英文大数使用紧凑 K、M、B 或 T 且 tooltip 保留精确值并可切换亮暗主题', async function (this: DogfoodWorld) {
   const page = this.requirePage();
-  await assertExactText(metric(page, 'Requests'), '111,227');
-  await assertNotContains(metric(page, 'Requests'), 'K');
-  await assertNotContains(metric(page, 'Requests'), 'M');
-  await assertExactText(metric(page, 'Total tokens'), '1,000,100,111,227');
-  await assertExactText(metric(page, 'Generation billing units'), '12,345');
+  const exactMetric = (label: string) => metric(page, label).locator('.metric-exact');
+  await assertExactText(metric(page, 'Requests'), '111.23K');
+  await assertAttribute(exactMetric('Requests'), 'title', '111,227');
+  await assertExactText(metric(page, 'Total tokens'), '1T');
+  await assertAttribute(exactMetric('Total tokens'), 'title', '1,000,100,111,227');
+  await assertExactText(metric(page, 'Generation billing units'), '12.35K');
+  await assertAttribute(exactMetric('Generation billing units'), 'title', '12,345');
   await assertExactText(metric(page, 'Cached tokens'), '0');
   await assertAttribute(page.locator('html'), 'data-theme', 'dark');
   await appPreferenceControls(page).getByRole('button', { name: 'Switch to light theme' }).click();

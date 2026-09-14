@@ -3,7 +3,7 @@ import { api } from '../api';
 import { HeatmapDataTable } from '../charts/HeatmapDataTable';
 import { costOption, heatmapOption, latencyOption, throughputOption, totalTokens, type UsageChartCopy, type UsageChartFormatters } from '../charts/usageCharts';
 import { Metric, NumberMetric } from '../components';
-import { formatCurrency, formatMilliseconds, formatNumber, formatPercent } from '../format';
+import { formatCurrency, formatMetricDisplay, formatMilliseconds, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
 import type { KeyView, SelfUsageAnalysis, UsageAnalysisBucket, UsageAnalysisCost, UsageAnalysisTimeBucket } from '../types';
 import '../operator/usage.css';
@@ -23,14 +23,14 @@ function CostLines({ values }: { values: UsageAnalysisCost[] }) {
   if (!values.length) return <>—</>;
   return <span className="usage-cost-lines">{[...values]
     .sort((left, right) => left.currency.localeCompare(right.currency))
-    .map((value) => <span key={value.currency}>{formatCurrency(value.cost, value.currency, locale)}</span>)}</span>;
+    .map((value) => <span key={value.currency} title={`${value.cost} ${value.currency}`}>{formatCurrency(value.cost, value.currency, locale)}</span>)}</span>;
 }
 
 function ChartDataTable({ timeZone, values }: { timeZone: string; values: UsageAnalysisTimeBucket[] }) {
   const { locale, t } = useI18n();
   return <details className="usage-chart-table"><summary>{t('usage.trendData')}</summary><div className="table-scroll"><table>
     <thead><tr><th>{t('request.time')} · {timeZone}</th><th>{t('traffic.success')}</th><th>{t('traffic.failure')}</th><th>{t('usage.totalTokens')}</th><th>{t('usage.average')}</th><th>{t('usage.p95Approx')}</th><th>{t('usage.cost')}</th></tr></thead>
-    <tbody>{values.map((value) => <tr key={value.bucket_start}><td>{new Date(value.bucket_start).toLocaleString(locale, { timeZone })}</td><td>{formatNumber(value.success, locale)}</td><td>{formatNumber(value.failed, locale)}</td><td>{formatNumber(totalTokens(value), locale)}</td><td>{formatMilliseconds(value.avg_duration_ms, locale)}</td><td>{formatMilliseconds(value.p95_duration_ms, locale)}</td><td><CostLines values={value.costs} /></td></tr>)}</tbody>
+    <tbody>{values.map((value) => { const success = formatMetricDisplay(value.success, locale); const failed = formatMetricDisplay(value.failed, locale); const tokens = formatMetricDisplay(totalTokens(value), locale); return <tr key={value.bucket_start}><td>{new Date(value.bucket_start).toLocaleString(locale, { timeZone })}</td><td title={success.title}>{success.text}</td><td title={failed.title}>{failed.text}</td><td title={tokens.title}>{tokens.text}</td><td>{formatMilliseconds(value.avg_duration_ms, locale)}</td><td>{formatMilliseconds(value.p95_duration_ms, locale)}</td><td><CostLines values={value.costs} /></td></tr>; })}</tbody>
   </table></div></details>;
 }
 
@@ -43,7 +43,7 @@ function DimensionTable({ title, values }: { title: string; values: UsageAnalysi
   const { locale, t } = useI18n();
   return <article className="panel usage-dimension"><div className="panel-title"><h2>{title}</h2><span>{formatNumber(values.length, locale)}</span></div>
     {values.length === 0 ? <div className="empty">{t('usage.noDimensionData')}</div> : <div className="table-scroll"><table><thead><tr><th>{title}</th><th>{t('usage.requests')}</th><th>{t('usage.successRate')}</th><th>{t('usage.totalTokens')}</th><th>{t('usage.cost')}</th></tr></thead><tbody>
-      {values.map((value) => <tr key={value.id}><td>{value.label}</td><td>{formatNumber(value.requests, locale)}</td><td>{formatPercent(value.requests ? value.success / value.requests : null, locale)}</td><td>{formatNumber(totalTokens(value), locale)}</td><td><CostLines values={value.costs} /></td></tr>)}
+      {values.map((value) => { const requests = formatMetricDisplay(value.requests, locale); const tokens = formatMetricDisplay(totalTokens(value), locale); return <tr key={value.id}><td>{value.label}</td><td title={requests.title}>{requests.text}</td><td>{formatPercent(value.requests ? value.success / value.requests : null, locale)}</td><td title={tokens.title}>{tokens.text}</td><td><CostLines values={value.costs} /></td></tr>; })}
     </tbody></table></div>}
   </article>;
 }
@@ -89,7 +89,7 @@ export function UsagePage({ credential, credentialView, onError }: {
   const formatters: UsageChartFormatters = useMemo(() => ({
     bucket: (epoch) => new Date(epoch).toLocaleString(locale, { timeZone }),
     cost: (value, currency) => formatCurrency(value, currency, locale), duration: (value) => formatMilliseconds(value, locale),
-    number: (value) => formatNumber(value, locale), percent: (value) => formatPercent(value, locale),
+    number: (value) => formatMetricDisplay(value, locale).text, percent: (value) => formatPercent(value, locale),
   }), [locale, timeZone]);
   const throughput = useMemo(() => throughputOption(stats?.time_series ?? [], copy, formatters), [stats?.time_series, copy, formatters]);
   const latency = useMemo(() => latencyOption(stats?.time_series ?? [], copy, formatters), [stats?.time_series, copy, formatters]);
@@ -107,9 +107,9 @@ export function UsagePage({ credential, credentialView, onError }: {
       <NumberMetric label={t('usage.requests')} value={stats.summary.requests} />
       <Metric label={t('usage.successRate')} value={formatPercent(successRate, locale)} tone="positive" />
       <NumberMetric label={t('usage.failures')} value={stats.summary.failed} tone="negative" />
-      <NumberMetric label={t('usage.totalTokens')} value={totalTokens(stats.summary)} showCompact={false} />
-      <NumberMetric label={t('usage.cachedTokens')} value={stats.summary.cached_input_tokens} showCompact={false} />
-      <NumberMetric label={t('usage.cacheWriteTokens')} value={stats.summary.cache_write_tokens} showCompact={false} />
+      <NumberMetric label={t('usage.totalTokens')} value={totalTokens(stats.summary)} />
+      <NumberMetric label={t('usage.cachedTokens')} value={stats.summary.cached_input_tokens} />
+      <NumberMetric label={t('usage.cacheWriteTokens')} value={stats.summary.cache_write_tokens} />
       <Metric label={t('usage.average')} value={formatMilliseconds(stats.summary.avg_duration_ms, locale)} />
       <Metric label={t('usage.p95Approx')} value={formatMilliseconds(stats.summary.p95_duration_ms, locale)} />
       <Metric label={t('usage.cost')} value={<CostLines values={stats.summary.costs} />} />

@@ -18,8 +18,13 @@ import { apiRequest, MIB, processMemory, seed } from "./benchmark-memory.ts";
 // explicit pod/runtime headroom within the declared 512MiB deployment budget.
 const LIMIT_MIB = 448;
 const CHUNK = 64 * 1024;
+export const NATIVE_MMAP_THRESHOLD_BYTES = 64 * 1024;
 type Result = { status: number; bytes: number; sha256: string; retryAfter?: string; transportClosed?: boolean };
 type Plan = { prefix: Buffer; fillBytes: number; suffix: Buffer; bytes: number; path?: string };
+
+export function nativeAllocatorEnvironment(): NodeJS.ProcessEnv {
+  return { GLIBC_TUNABLES: `glibc.malloc.mmap_threshold=${NATIVE_MMAP_THRESHOLD_BYTES}` };
+}
 
 export function responsesInputPlan(bytes: number): Plan {
   const prefix = Buffer.from('{"model":"benchmark-text","input":"');
@@ -83,6 +88,30 @@ export function permitEvidence(metrics: string): Record<string, number> {
     const value = Number(line.slice(prefix.length + 1));
     assert(Number.isFinite(value) && value >= 0, `invalid permit gauge: ${name}`);
     return [name, value];
+  }));
+}
+
+export function allocatorEvidence(metrics: string): Record<string, number> {
+  const states = ["allocated", "active", "resident", "mapped", "retained"];
+  return Object.fromEntries(states.map((state) => {
+    const prefix = `memeloop_token_center_allocator_bytes{state="${state}"}`;
+    const line = metrics.split("\n").find((entry) => entry.startsWith(`${prefix} `));
+    assert(line, `required allocator gauge absent: ${state}`);
+    const value = Number(line.slice(prefix.length + 1));
+    assert(Number.isFinite(value) && value >= 0, `invalid allocator gauge: ${state}`);
+    return [state, value];
+  }));
+}
+
+export function nativeAllocatorEvidence(metrics: string): Record<string, number> {
+  const states = ["arena", "allocated", "free", "mmap", "releasable"];
+  return Object.fromEntries(states.map((state) => {
+    const prefix = `memeloop_token_center_native_allocator_bytes{state="${state}"}`;
+    const line = metrics.split("\n").find((entry) => entry.startsWith(`${prefix} `));
+    assert(line, `required native allocator gauge absent: ${state}`);
+    const value = Number(line.slice(prefix.length + 1));
+    assert(Number.isFinite(value) && value >= 0, `invalid native allocator gauge: ${state}`);
+    return [state, value];
   }));
 }
 
@@ -202,9 +231,10 @@ export async function run(binary: string, output: string): Promise<boolean> {
     benchmark: "durable-archive-release-process-rss", binary,
     binary_sha256: createHash("sha256").update(readFileSync(binary)).digest("hex"),
     started_at: new Date().toISOString(), limit_mib: LIMIT_MIB,
+    native_allocator_environment: nativeAllocatorEnvironment(),
     pod_budget_mib: 512, reserved_runtime_headroom_mib: 64,
     isolation: "independent_process_not_cgroup",
-    evidence_source: "independent service PID /proc/status VmRSS and kernel VmHWM; mock/client excluded",
+    evidence_source: "independent service PID /proc/status RSS partition, /proc/smaps_rollup mapping attribution, kernel VmHWM, jemalloc, and glibc main-arena metrics; mock/client excluded",
     phases: [], samples: [], passed: false,
   };
   let service: ChildProcess | undefined;
@@ -250,7 +280,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
     for (const name of ["PATH", "HOME", "LANG", "TMPDIR", "SSL_CERT_DIR", "SSL_CERT_FILE"]) {
       if (process.env[name] !== undefined) env[name] = process.env[name];
     }
-    Object.assign(env, {
+    Object.assign(env, nativeAllocatorEnvironment(), {
       MTC_LISTEN: `127.0.0.1:${serviceAddress.port}`, MTC_DATABASE_URL: `sqlite://${database}?mode=rwc`,
       MTC_DATABASE_MAX_CONNECTIONS: "2", MTC_SERVICE_TOKEN: token,
       MTC_KEY_PEPPER: "durable-rss-pepper-has-at-least-thirty-two-bytes",
@@ -289,8 +319,14 @@ export async function run(binary: string, output: string): Promise<boolean> {
     // The seeded `openai` http-json route covers both Chat and Responses;
     // large ingress must use Responses' real 16MiB limit, not Chat's 4MiB limit.
     const key = await seed(base, base, token, mockUrl);
-    const idle = processMemory(service.pid).rss_mib as number;
+    const idleProcessMemory = processMemory(service.pid);
+    const idle = idleProcessMemory.rss_mib as number;
     report.idle_rss_mib = idle;
+    report.idle_process_memory = idleProcessMemory;
+    const idleMetrics = await apiRequest(base, "GET", "/metrics", token, undefined, 2000);
+    assert(idleMetrics.status === 200, "idle allocator metrics must be available");
+    report.idle_allocator_bytes = allocatorEvidence(idleMetrics.body.toString("utf8"));
+    report.idle_native_allocator_bytes = nativeAllocatorEvidence(idleMetrics.body.toString("utf8"));
 
     const drain = async (): Promise<Record<string, unknown>> => {
       const reader = new DatabaseSync(database, { readOnly: true });
@@ -303,11 +339,13 @@ export async function run(binary: string, output: string): Promise<boolean> {
             if (Object.values(row).every((value) => Number(value) === 0)) {
               const metrics = await apiRequest(base, "GET", "/metrics", token, undefined, 2000);
               assert(metrics.status === 200, "permit metrics must be available");
-              const gauges = permitEvidence(metrics.body.toString("utf8"));
+              const metricsText = metrics.body.toString("utf8");
+              const gauges = permitEvidence(metricsText);
               if (Object.values(gauges).every((value) => value === 0)) {
                 const successfulGaps = reader.prepare("SELECT COUNT(*) AS count FROM request_records WHERE status_code = 200 AND (request_object LIKE 'gap:%' OR response_object IS NULL OR response_object LIKE 'gap:%')").get();
                 assert(Number(successfulGaps?.count) === 0, "successful buffered requests must converge both archives, not settle with a silent gap");
-                return { ...row, permits: gauges, successful_archive_gaps: Number(successfulGaps?.count) };
+                const processMemoryEvidence = processMemory(service!.pid!);
+                return { ...row, permits: gauges, rss_mib: processMemoryEvidence.rss_mib, process_memory: processMemoryEvidence, allocator_bytes: allocatorEvidence(metricsText), native_allocator_bytes: nativeAllocatorEvidence(metricsText), successful_archive_gaps: Number(successfulGaps?.count) };
               }
             }
             await delay(100);
@@ -318,13 +356,17 @@ export async function run(binary: string, output: string): Promise<boolean> {
     const phase = async (name: string, operation: () => Promise<unknown>): Promise<void> => {
       const callsBefore = upstreamCalls;
       const from = report.samples.length;
+      const operationStarted = performance.now();
       const result = await deadline(operation(), 60_000, name);
+      const operationDurationMs = performance.now() - operationStarted;
       sample();
       const peak = Math.max(...report.samples.slice(from).map((s: any) => s.rss_mib));
-      const entry = { name, result, upstream_calls: upstreamCalls - callsBefore, peak_rss_mib: peak, drain: {} };
+      const entry = { name, result, upstream_calls: upstreamCalls - callsBefore, peak_rss_mib: peak, operation_duration_ms: operationDurationMs, drain_duration_ms: 0, drain: {} };
       report.phases.push(entry);
       assert(peak <= LIMIT_MIB, `${name}: service RSS exceeded 448 MiB (512 MiB pod minus 64 MiB headroom)`);
+      const drainStarted = performance.now();
       entry.drain = await drain();
+      entry.drain_duration_ms = performance.now() - drainStarted;
     };
 
     await phase("single-64MiB-buffered-response", async () => {
@@ -400,16 +442,32 @@ export async function run(binary: string, output: string): Promise<boolean> {
     report.peak_rss_or_kernel_high_water_mib = peak;
     assert(peak <= LIMIT_MIB, "kernel VmHWM exceeded 448 MiB service allowance");
     let recovered = Infinity;
-    await deadline((async () => {
-      let consecutive = 0;
-      while (consecutive < 5) {
-        assert(!sampleFailure, "service disappeared while sampling RSS");
-        recovered = processMemory(service!.pid!).rss_mib;
-        report.recovered_rss_mib = recovered;
-        consecutive = memoryVerdict(idle, peak, recovered) ? consecutive + 1 : 0;
-        await delay(200);
+    let cooldownComplete = false;
+    try {
+      await deadline((async () => {
+        let consecutive = 0;
+        while (consecutive < 5) {
+          assert(!sampleFailure, "service disappeared while sampling RSS");
+          recovered = processMemory(service!.pid!).rss_mib;
+          report.recovered_rss_mib = recovered;
+          consecutive = memoryVerdict(idle, peak, recovered) ? consecutive + 1 : 0;
+          await delay(200);
+        }
+      })(), 30_000, "real RSS cooldown recovery");
+      cooldownComplete = true;
+    } finally {
+      try {
+        const cooldownMetrics = await apiRequest(base, "GET", "/metrics", token, undefined, 2000);
+        assert(cooldownMetrics.status === 200, "cooldown allocator metrics must be available");
+        const cooldownMetricsText = cooldownMetrics.body.toString("utf8");
+        report.cooldown_allocator_bytes = allocatorEvidence(cooldownMetricsText);
+        report.cooldown_native_allocator_bytes = nativeAllocatorEvidence(cooldownMetricsText);
+        report.cooldown_process_memory = processMemory(service!.pid!);
+      } catch (error) {
+        report.cooldown_allocator_error = error instanceof Error ? error.message : String(error);
+        if (cooldownComplete) throw error;
       }
-    })(), 30_000, "real RSS cooldown recovery");
+    }
     report.recovered_rss_mib = recovered;
     report.duration_seconds = (performance.now() - started) / 1000;
     assert(!sampleFailure && memoryVerdict(idle, peak, recovered), "independent-process RSS peak/recovery gate failed");

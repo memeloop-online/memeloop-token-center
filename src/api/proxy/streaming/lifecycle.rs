@@ -48,6 +48,8 @@ fn streaming_upstream_evidence(
         Some(
             "upstream_stream"
                 | "upstream_timeout"
+                | "upstream_read_timeout"
+                | "upstream_request_timeout"
                 | "upstream_response_event_batch_too_large"
                 | "downstream_disconnected"
                 | "downstream_backpressure"
@@ -356,6 +358,16 @@ mod tests {
             ),
             StreamingUpstreamEvidence::Inconclusive
         );
+    }
+
+    #[test]
+    fn dynamic_body_timeouts_are_inconclusive_transport_evidence() {
+        for timeout in ["upstream_read_timeout", "upstream_request_timeout"] {
+            assert_eq!(
+                streaming_upstream_evidence(false, Some(timeout), None, Some(timeout)),
+                StreamingUpstreamEvidence::Inconclusive
+            );
+        }
     }
 
     #[test]

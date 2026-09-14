@@ -45,6 +45,7 @@ mod limits;
 mod model_picker;
 mod model_routes;
 mod monitoring_snapshot;
+mod plugin_execution;
 mod plugins;
 mod proxy;
 mod request_detail;
@@ -94,8 +95,8 @@ use health::{
 use limits::*;
 use model_picker::list_model_picker_options;
 use model_routes::{
-    create_model_route, delete_model_route, list_model_routes, retire_model_route_upstreams,
-    set_model_route_enabled, update_model_route,
+    archive_model_route, create_model_route, delete_model_route, get_archived_model_route,
+    list_model_routes, retire_model_route_upstreams, set_model_route_enabled, update_model_route,
 };
 use plugins::{get_plugin_configuration, get_plugin_service_data, put_plugin_configuration};
 use request_detail::*;

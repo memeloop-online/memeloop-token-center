@@ -7,6 +7,7 @@ use serde_json::Value;
 
 #[cfg(test)]
 use crate::network::OutboundScope;
+use crate::oauth::OAuthRefreshRequestGuard;
 use crate::{error::AppError, network, provider::UpstreamCredential};
 
 pub const TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
@@ -37,8 +38,16 @@ pub async fn refresh(
     http: &reqwest::Client,
     credential: &UpstreamCredential,
     allow_test_loopback: bool,
+    request_guard: &dyn OAuthRefreshRequestGuard,
 ) -> Result<UpstreamCredential, AppError> {
-    refresh_at(http, credential, allow_test_loopback, TOKEN_ENDPOINT).await
+    refresh_at(
+        http,
+        credential,
+        allow_test_loopback,
+        TOKEN_ENDPOINT,
+        request_guard,
+    )
+    .await
 }
 
 async fn refresh_at(
@@ -46,6 +55,7 @@ async fn refresh_at(
     credential: &UpstreamCredential,
     allow_test_loopback: bool,
     endpoint: &str,
+    request_guard: &dyn OAuthRefreshRequestGuard,
 ) -> Result<UpstreamCredential, AppError> {
     let UpstreamCredential::OAuth {
         refresh_token: Some(refresh_token),
@@ -75,17 +85,21 @@ async fn refresh_at(
         .append_pair("refresh_token", refresh_token)
         .append_pair("scope", "openid profile email")
         .finish();
+    let request = client
+        .post(endpoint)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body(form)
+        .timeout(REFRESH_TIMEOUT)
+        .build()
+        .map_err(|_| refresh_failed())?;
+    request_guard.mark_request_started().await?;
     let operation = async {
         let response = client
-            .post(endpoint)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .header(
-                reqwest::header::CONTENT_TYPE,
-                "application/x-www-form-urlencoded",
-            )
-            .body(form)
-            .timeout(REFRESH_TIMEOUT)
-            .send()
+            .execute(request)
             .await
             .map_err(|_| refresh_failed())?;
         if !response.status().is_success() {
@@ -356,6 +370,7 @@ mod tests {
                 "http://codex-refresh.test:{}/oauth/token",
                 server.address().port()
             ),
+            &crate::oauth::TEST_OAUTH_REFRESH_REQUEST_GUARD,
         )
         .await
         .unwrap();
@@ -403,6 +418,7 @@ mod tests {
             &credential("old-refresh-secret"),
             true,
             &format!("{}/token", server.uri()),
+            &crate::oauth::TEST_OAUTH_REFRESH_REQUEST_GUARD,
         )
         .await
         .unwrap();
@@ -438,6 +454,7 @@ mod tests {
                 &credential("request-refresh-secret"),
                 true,
                 &format!("{}/token", server.uri()),
+                &crate::oauth::TEST_OAUTH_REFRESH_REQUEST_GUARD,
             )
             .await
             .unwrap_err();

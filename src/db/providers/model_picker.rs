@@ -420,7 +420,7 @@ WITH direct_sources AS (
       FROM model_routes route
       JOIN selected_sources source
         ON source.tenant_id = route.tenant_id AND source.model_route_id = route.id
-     WHERE route.enabled = 1
+     WHERE route.enabled = 1 AND route.archived_at IS NULL
 ), matching_items AS (
     SELECT item.*
       FROM logical_items item
@@ -431,7 +431,7 @@ WITH direct_sources AS (
              ON source.tenant_id = route.tenant_id AND source.model_route_id = route.id
            JOIN upstream_accounts account
              ON account.tenant_id = source.tenant_id AND account.id = source.upstream_account_id
-          WHERE route.enabled = 1
+          WHERE route.enabled = 1 AND route.archived_at IS NULL
             AND (($2 = 'route' AND route.id = item.item_identity)
                  OR ($2 = 'model' AND route.public_model = item.item_identity))
             AND (LOWER(route.public_model COLLATE "C") LIKE CAST($3 AS TEXT) COLLATE "C" ESCAPE '\'
@@ -500,7 +500,7 @@ WITH direct_sources AS (
            health.updated_at AS health_observed_at
       FROM page
       JOIN model_routes route
-        ON route.enabled = 1
+        ON route.enabled = 1 AND route.archived_at IS NULL
        AND (($2 = 'route' AND route.id = page.item_identity)
             OR ($2 = 'model' AND route.public_model = page.item_identity))
       JOIN selected_sources source
@@ -597,7 +597,7 @@ WITH direct_sources AS (
       FROM model_routes route
       JOIN selected_sources source
         ON source.tenant_id = route.tenant_id AND source.model_route_id = route.id
-     WHERE route.enabled = 1
+     WHERE route.enabled = 1 AND route.archived_at IS NULL
 ), matching_items AS (
     SELECT item.*
       FROM logical_items item
@@ -608,7 +608,7 @@ WITH direct_sources AS (
              ON source.tenant_id = route.tenant_id AND source.model_route_id = route.id
            JOIN upstream_accounts account
              ON account.tenant_id = source.tenant_id AND account.id = source.upstream_account_id
-          WHERE route.enabled = 1
+          WHERE route.enabled = 1 AND route.archived_at IS NULL
             AND (($2 = 'route' AND route.id = item.item_identity)
                  OR ($2 = 'model' AND route.public_model = item.item_identity))
             AND (LOWER(route.public_model) LIKE LOWER($3) ESCAPE '\'
@@ -677,7 +677,7 @@ WITH direct_sources AS (
            health.updated_at AS health_observed_at
       FROM page
       JOIN model_routes route
-        ON route.enabled = 1
+        ON route.enabled = 1 AND route.archived_at IS NULL
        AND (($2 = 'route' AND route.id = page.item_identity)
             OR ($2 = 'model' AND route.public_model = page.item_identity))
       JOIN selected_sources source

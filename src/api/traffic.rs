@@ -22,7 +22,7 @@ use crate::{
     },
 };
 
-static PLUGIN_EXECUTION_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+use super::plugin_execution::{self, Phase};
 
 #[cfg(test)]
 tokio::task_local! {
@@ -362,6 +362,8 @@ async fn apply_traffic_plugin(
         .resolved_traffic_configurations(key.tenant_id)
         .await?;
     let plugin_request = original_request_json.clone();
+    #[cfg(feature = "experimental-plugin-revisions")]
+    let application_snapshot = state.pinned_application_plugins.clone();
     let plugin_context = RequestContext {
         tenant_id: key.tenant_id.to_string(),
         principal_id: key.principal_id.to_string(),
@@ -370,31 +372,35 @@ async fn apply_traffic_plugin(
         model: requested_model.clone(),
         config_json: "{}".to_owned(),
     };
-    let plugin_permit =
-        tokio::time::timeout(Duration::from_secs(1), PLUGIN_EXECUTION_PERMITS.acquire())
-            .await
-            .map_err(|_| AppError::Upstream("plugin execution capacity is exhausted".into()))?
-            .map_err(|_| AppError::Internal)?;
-    let plugin_task = tokio::task::spawn_blocking(move || {
-        let _plugin_permit = plugin_permit;
-        let _temporary_memory = temporary_memory;
-        plugins.apply_traffic_with_config_and_memory(
-            plugin_context,
-            &plugin_request,
-            &plugin_configurations,
-            memory.as_deref(),
-        )
-    });
-    let plugin_decision = tokio::time::timeout(Duration::from_secs(35), plugin_task)
-        .await
-        .map_err(|_| AppError::Upstream("plugin execution timed out".into()))?
-        .map_err(|error| AppError::Upstream(format!("plugin task failed: {error}")))?
-        .map_err(|error| {
-            state.metrics.observe_proxy_memory_error(
-                crate::metrics::ProxyMemoryRejectionStage::Plugin,
-                error,
-            )
-        })?;
+    let metrics = state.metrics.clone();
+    let plugin_decision =
+        plugin_execution::run(state.metrics.clone(), Phase::PostAuth, move || {
+            let _temporary_memory = temporary_memory;
+            let result = (|| {
+                #[cfg(feature = "experimental-plugin-revisions")]
+                if let Some(snapshot) = application_snapshot {
+                    return snapshot.runtime.apply_traffic_with_config_and_memory(
+                        plugin_context,
+                        &plugin_request,
+                        &plugin_configurations,
+                        memory.as_deref(),
+                    );
+                }
+                plugins.apply_traffic_with_config_and_memory(
+                    plugin_context,
+                    &plugin_request,
+                    &plugin_configurations,
+                    memory.as_deref(),
+                )
+            })();
+            result.map_err(|error| {
+                metrics.observe_proxy_memory_error(
+                    crate::metrics::ProxyMemoryRejectionStage::Plugin,
+                    error,
+                )
+            })
+        })
+        .await?;
     if !plugin_decision.allow {
         plugin_decision.log_denial();
         return Err(AppError::Forbidden);
@@ -457,22 +463,14 @@ pub(super) async fn prepare_component_provider(
     });
     let plugins = state.plugins.clone();
     let provider_id = provider_id.to_owned();
-    let permit = tokio::time::timeout(Duration::from_secs(1), PLUGIN_EXECUTION_PERMITS.acquire())
-        .await
-        .map_err(|_| AppError::Upstream("plugin execution capacity is exhausted".into()))?
-        .map_err(|_| AppError::Internal)?;
-    let task = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
+    plugin_execution::run(state.metrics.clone(), Phase::Prepare, move || {
         let _memory = memory;
         plugins.prepare_provider_request(&provider_id, context, &config, &request_json)
-    });
-    tokio::time::timeout(Duration::from_secs(35), task)
-        .await
-        .map_err(|_| AppError::Upstream("component provider prepare timed out".into()))?
-        .map_err(|error| AppError::Upstream(format!("component provider task failed: {error}")))??
-        .ok_or_else(|| {
-            AppError::Upstream("component provider adapter is declared but unavailable".into())
-        })
+    })
+    .await?
+    .ok_or_else(|| {
+        AppError::Upstream("component provider adapter is declared but unavailable".into())
+    })
 }
 
 pub(super) async fn normalize_component_provider(
@@ -494,22 +492,14 @@ pub(super) async fn normalize_component_provider(
         })?;
     let plugins = state.plugins.clone();
     let provider_id = provider_id.to_owned();
-    let permit = tokio::time::timeout(Duration::from_secs(1), PLUGIN_EXECUTION_PERMITS.acquire())
-        .await
-        .map_err(|_| AppError::Upstream("plugin execution capacity is exhausted".into()))?
-        .map_err(|_| AppError::Internal)?;
-    let task = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
+    plugin_execution::run(state.metrics.clone(), Phase::Normalize, move || {
         let _temporary_memory = temporary_memory;
         plugins.normalize_provider_response(&provider_id, context, status, &headers, &body)
-    });
-    tokio::time::timeout(Duration::from_secs(35), task)
-        .await
-        .map_err(|_| AppError::Upstream("component provider normalize timed out".into()))?
-        .map_err(|error| AppError::Upstream(format!("component provider task failed: {error}")))??
-        .ok_or_else(|| {
-            AppError::Upstream("component provider adapter is declared but unavailable".into())
-        })
+    })
+    .await?
+    .ok_or_else(|| {
+        AppError::Upstream("component provider adapter is declared but unavailable".into())
+    })
 }
 
 pub(super) fn component_provider_url(base_url: &str, path: &str) -> Result<String, AppError> {

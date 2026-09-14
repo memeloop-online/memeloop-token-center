@@ -385,3 +385,49 @@ async fn rejected_capture_never_publishes_a_complete_prefix() {
             .unwrap();
     assert_eq!(locator, format!("gap://{}/response", identity.request_id));
 }
+
+#[tokio::test]
+async fn late_begin_ack_is_fenced_as_gap_and_cannot_leave_a_capturing_spool() {
+    let (_dir, state, pool, identity) = fixture().await;
+    let clock = capture_ack_clock_for_test(&state);
+    let (entering, release) = pause_next_begin_ack_for_test(&state);
+    let begin_state = state.clone();
+    let begin =
+        tokio::spawn(async move { ResponseArchiveProducer::begin(&begin_state, identity).await });
+    tokio::time::timeout(std::time::Duration::from_secs(1), entering)
+        .await
+        .expect("begin transaction must commit before its ACK is paused")
+        .unwrap();
+    let state_before_timeout: String =
+        sqlx::query_scalar("SELECT state FROM response_archive_spools WHERE request_id = $1")
+            .bind(identity.request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state_before_timeout, "capturing");
+
+    // Expire this fixture's ACK timer only after the transaction committed.
+    // The same controlled clock keeps unrelated byte-redaction tests independent
+    // of CI scheduler latency without relaxing production's 250 ms deadline.
+    clock.expire();
+    assert!(begin.await.unwrap().is_none());
+    release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let row = sqlx::query(
+                "SELECT state, expires_at, updated_at FROM response_archive_spools WHERE request_id = $1",
+            )
+            .bind(identity.request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if row.get::<String, _>("state") == "gap" {
+                assert!(row.get::<i64, _>("expires_at") <= row.get::<i64, _>("updated_at"));
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("unobserved successful begin must be made immediately GC-eligible");
+}

@@ -31,6 +31,9 @@ use crate::provider::ModelRouteView;
 #[path = "retirement.rs"]
 mod retirement;
 
+#[path = "archive.rs"]
+mod archive;
+
 impl Database {
     pub async fn update_routed_model_route(
         &self,
@@ -63,7 +66,7 @@ impl Database {
         let mut tx = self.begin_write_transaction().await?;
         let tenant_id = tenant_id(&mut tx, &input.tenant_external_id).await?;
         lock_routing_relation_writes(&mut tx, &tenant_id).await?;
-        let current = sqlx::query("SELECT public_model, upstream_model, protocol, priority, created_at, enabled, updated_at FROM model_routes WHERE id = $1 AND tenant_id = $2")
+        let current = sqlx::query("SELECT public_model, upstream_model, protocol, priority, created_at, enabled, updated_at FROM model_routes WHERE id = $1 AND tenant_id = $2 AND archived_at IS NULL")
             .bind(route_id.to_string()).bind(&tenant_id).fetch_optional(&mut *tx).await?.ok_or(AppError::NotFound)?;
         let current_updated_at: i64 = current.try_get("updated_at")?;
         if current_updated_at != input.expected_updated_at {
@@ -284,15 +287,18 @@ impl Database {
             tx.commit().await?;
             return Ok(None);
         };
-        let route_exists =
-            sqlx::query("SELECT 1 FROM model_routes WHERE id = $1 AND tenant_id = $2")
-                .bind(route_id.to_string())
-                .bind(&tenant_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .is_some();
+        let route_exists = sqlx::query(
+            "SELECT 1 FROM model_routes WHERE id = $1 AND tenant_id = $2 AND archived_at IS NULL",
+        )
+        .bind(route_id.to_string())
+        .bind(&tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
         if !route_exists {
-            return Err(AppError::Internal);
+            return Err(AppError::Conflict(
+                "the previously created route is archived".into(),
+            ));
         }
         tx.commit().await?;
         let (route, routing) = self
@@ -532,7 +538,7 @@ impl Database {
                     r.protocol, r.priority, r.enabled, r.created_at, r.updated_at \
              FROM model_routes r \
              JOIN tenants t ON t.id = r.tenant_id \
-             WHERE r.id = $1 AND t.external_id = $2",
+             WHERE r.id = $1 AND t.external_id = $2 AND r.archived_at IS NULL",
         )
         .bind(route_id.to_string())
         .bind(tenant_external_id)
@@ -566,7 +572,7 @@ impl Database {
         tenant_external_id: &str,
     ) -> Result<RouteRoutingView, AppError> {
         let row = sqlx::query(
-            "SELECT r.tenant_id, r.updated_at FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE r.id = $1 AND t.external_id = $2",
+            "SELECT r.tenant_id, r.updated_at FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE r.id = $1 AND t.external_id = $2 AND r.archived_at IS NULL",
         )
         .bind(route_id.to_string())
         .bind(tenant_external_id)
@@ -604,7 +610,7 @@ impl Database {
         let tenant_id = tenant_id(&mut tx, &input.tenant_external_id).await?;
         lock_routing_relation_writes(&mut tx, &tenant_id).await?;
         let route = sqlx::query(
-            "SELECT upstream_model, enabled, updated_at FROM model_routes WHERE id = $1 AND tenant_id = $2",
+            "SELECT upstream_model, enabled, updated_at FROM model_routes WHERE id = $1 AND tenant_id = $2 AND archived_at IS NULL",
         )
         .bind(route_id.to_string())
         .bind(&tenant_id)

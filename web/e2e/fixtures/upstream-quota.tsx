@@ -59,4 +59,4 @@ window.fetch = async (_input, init) => {
   const denied = mode === 'permission';
   return new Response(JSON.stringify(mode === 'error' || denied ? { error: { message: 'fixture-sensitive-message-must-not-render' } } : snapshot), { status: denied ? 403 : mode === 'error' ? 503 : 200 });
 };
-createRoot(document.getElementById('root')!).render(<I18nProvider><main className="main"><article className="panel provider-list"><div className="account provider-account"><div className="account-main"><b>Quota account</b><UpstreamQuota accountId="quota-account" tenant="default" token="fixture-only" /></div></div></article></main></I18nProvider>);
+createRoot(document.getElementById('root')!).render(<I18nProvider><main className="main"><article className="panel provider-list"><div className="account provider-account"><div className="account-main"><b>Quota account</b><UpstreamQuota accountId="quota-account" credentialGeneration={1} tenant="default" token="fixture-only" /></div></div></article></main></I18nProvider>);

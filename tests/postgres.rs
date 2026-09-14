@@ -290,6 +290,30 @@ async fn postgres_credential_rotations_are_locked_and_idempotent() {
             && value.credential_generation == 2
             && value.token == service_replays[0].token
     }));
+    let copyable = database
+        .list_service_tokens_page(None, None, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|view| view.service_id == service.service_id)
+        .unwrap();
+    assert!(copyable.credential_copy_available);
+    let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+    sqlx::query(
+        "UPDATE service_credentials SET secret_plaintext = NULL WHERE service_principal_id = $1 AND generation = 2",
+    )
+    .bind(service.service_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let hash_only = database
+        .list_service_tokens_page(None, None, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|view| view.service_id == service.service_id)
+        .unwrap();
+    assert!(!hash_only.credential_copy_available);
     assert!(
         database
             .rotate_key(issued.key_id, &service_idempotency_key, pepper)
@@ -358,6 +382,10 @@ async fn postgres_oauth_refresh_has_one_account_generation_lease() {
     }
     assert_eq!(conflicts, 7);
     let winner = winner.expect("one refresh lease winner");
+    database
+        .mark_upstream_oauth_refresh_request_started(account.id, &winner)
+        .await
+        .unwrap();
     let refreshed = database
         .finish_upstream_oauth_refresh(
             account.id,

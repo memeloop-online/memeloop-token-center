@@ -53,6 +53,9 @@ pub(crate) struct ConversationObservationInput<'a> {
     pub(crate) observed_at: i64,
     /// Archive-only observations intentionally have no request_records row.
     pub(crate) attach_request_record: bool,
+    /// Content-addressed atoms and prefixes were committed before this
+    /// transaction, so the session lock never nests shared unique-row waits.
+    pub(crate) content_materialized: bool,
 }
 
 /// A lease-owned terminal observation awaiting semantic materialization.
@@ -119,6 +122,27 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
 }
 
 impl Database {
+    async fn materialize_conversation_content(
+        &self,
+        tenant_id: &str,
+        request_json: &serde_json::Value,
+        observed_at: i64,
+    ) -> Result<(), AppError> {
+        let atoms = extract_atoms(request_json);
+        let nodes = build_prefix(&atoms);
+        let mut transaction = self.begin_write_transaction().await?;
+        materialize_conversation_content_in_transaction(
+            &mut transaction,
+            tenant_id,
+            &atoms,
+            &nodes,
+            observed_at,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     /// Claims a bounded batch of terminal conversation observations for one
     /// projector. A crashed worker's lease expires and another worker can
     /// safely retry the same durable payload.
@@ -170,6 +194,35 @@ impl Database {
         lease_owner: Uuid,
         request_id: Uuid,
     ) -> Result<bool, AppError> {
+        // Materialize immutable, tenant-scoped content in its own transaction
+        // before taking the explicit-session lock below. A stale lease is
+        // rechecked in the final transaction; its durable outbox row makes a
+        // committed content-only prefix retryable rather than user-visible.
+        {
+            let prepare_now = unix_millis();
+            let prepare = sqlx::query(
+                "SELECT tenant_id, request_json, observed_at FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND lease_owner = $2 AND lease_expires_at >= $3",
+            )
+            .bind(request_id.to_string())
+            .bind(lease_owner.to_string())
+            .bind(prepare_now)
+            .fetch_optional(&self.pool)
+            .await?;
+            let Some(prepare) = prepare else {
+                return Ok(false);
+            };
+            let prepare_tenant_id: String = prepare.try_get("tenant_id")?;
+            let prepare_request_json =
+                serde_json::from_str(&prepare.try_get::<String, _>("request_json")?)
+                    .map_err(|_| AppError::Internal)?;
+            self.materialize_conversation_content(
+                &prepare_tenant_id,
+                &prepare_request_json,
+                prepare.try_get("observed_at")?,
+            )
+            .await?;
+        }
+
         let now = unix_millis();
         let mut transaction = self.begin_write_transaction().await?;
         let select = match self.backend {
@@ -232,6 +285,7 @@ impl Database {
                 client_name: client_name.as_deref(),
                 observed_at,
                 attach_request_record: true,
+                content_materialized: true,
             },
         )
         .await?;
@@ -287,6 +341,7 @@ impl Database {
                     client_name,
                     observed_at: unix_millis(),
                     attach_request_record: true,
+                    content_materialized: false,
                 },
             )
             .await?;
@@ -307,6 +362,7 @@ impl Database {
             client_name,
             observed_at,
             attach_request_record,
+            content_materialized,
         } = input;
         let atoms = extract_atoms(request_json);
         let nodes = build_prefix(&atoms);
@@ -341,6 +397,11 @@ impl Database {
             // Explicit session identity is authoritative within one stable key.
             // Serialize candidate selection for that identity so two PostgreSQL
             // writers cannot both observe an empty cluster and create one.
+            // Synchronous writers keep this lock before their content-addressed
+            // INSERT ... ON CONFLICT writes below. Moving it later would invert
+            // lock order with an older process during a rolling deploy. Projected
+            // tasks instead commit those rows in a separate transaction first, so
+            // they retain no content-row lock when they enter this session scope.
             sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, $2))")
                 .bind(format!("{}:{session_id}", key.key_id))
                 .bind(EXPLICIT_SESSION_LOCK_SEED)
@@ -349,90 +410,45 @@ impl Database {
         }
 
         let tenant_id = key.tenant_id.to_string();
-        for atom_batch in
-            atoms.chunks(CONVERSATION_INSERT_BATCH_BIND_LIMIT / SEMANTIC_ATOM_INSERT_BIND_COUNT)
-        {
-            let statement = conversation_batch_insert_statement(
-                "INSERT INTO semantic_atoms (tenant_id, content_hash, instance_hash, role, kind, content_json, created_at) VALUES ",
-                atom_batch.len(),
-                SEMANTIC_ATOM_INSERT_BIND_COUNT,
-                " ON CONFLICT(tenant_id, content_hash) DO NOTHING",
-            );
-            let mut query = sqlx::query(sqlx::AssertSqlSafe(statement));
-            for atom in atom_batch {
-                query = query
-                    .bind(&tenant_id)
-                    .bind(&atom.content_hash)
-                    .bind(&atom.instance_hash)
-                    .bind(&atom.role)
-                    .bind(&atom.kind)
-                    .bind(serde_json::to_string(&atom.content).map_err(|_| AppError::Internal)?)
-                    .bind(now);
-            }
-            query.execute(&mut **transaction).await?;
-        }
-        for node_batch in
-            nodes.chunks(CONVERSATION_INSERT_BATCH_BIND_LIMIT / CONTEXT_NODE_INSERT_BIND_COUNT)
-        {
-            let statement = conversation_batch_insert_statement(
-                "INSERT INTO context_nodes (tenant_id, node_hash, parent_hash, atom_hash, depth, created_at) VALUES ",
-                node_batch.len(),
-                CONTEXT_NODE_INSERT_BIND_COUNT,
-                " ON CONFLICT(tenant_id, node_hash) DO NOTHING",
-            );
-            let mut query = sqlx::query(sqlx::AssertSqlSafe(statement));
-            for node in node_batch {
-                query = query
-                    .bind(&tenant_id)
-                    .bind(&node.node_hash)
-                    .bind(&node.parent_hash)
-                    .bind(&node.atom_hash)
-                    .bind(node.depth as i64)
-                    .bind(now);
-            }
-            query.execute(&mut **transaction).await?;
+        if !content_materialized {
+            materialize_conversation_content_in_transaction(
+                transaction,
+                &tenant_id,
+                &atoms,
+                &nodes,
+                now,
+            )
+            .await?;
         }
 
         let principal_id = key.principal_id.to_string();
-        let mut candidates = if hints.parent_turn_id.is_some()
-            || hints.turn_id.is_some()
-            || hints.session_id.is_some()
-        {
+        let key_id = key.key_id.to_string();
+        // Every structured match below is decisive: the selection loop stops on
+        // a direct parent, same turn, or explicit session. Fetch only that one
+        // indexed row instead of reading and sorting up to 50 wide fingerprints
+        // through one OR predicate while the explicit-session lock is held.
+        let structured_candidate = fetch_structured_conversation_candidate(
+            transaction,
+            &tenant_id,
+            &principal_id,
+            &key_id,
+            hints,
+            now,
+        )
+        .await?;
+        let candidates = if let Some(candidate) = structured_candidate {
+            vec![candidate]
+        } else {
             sqlx::query(
-                "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND (($6 IS NOT NULL AND o.explicit_session_id = $6) OR (o.created_at <= $7 AND (($4 IS NOT NULL AND (o.turn_id = $4 OR o.upstream_response_id = $4)) OR ($5 IS NOT NULL AND o.turn_id = $5)))) ORDER BY CASE WHEN o.created_at <= $7 THEN 0 ELSE 1 END, CASE WHEN $4 IS NOT NULL AND (o.turn_id = $4 OR o.upstream_response_id = $4) THEN 0 WHEN $5 IS NOT NULL AND o.turn_id = $5 THEN 1 ELSE 2 END, o.created_at DESC LIMIT 50",
+                "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.created_at <= $4 ORDER BY o.created_at DESC LIMIT 50",
             )
             .bind(&tenant_id)
             .bind(&principal_id)
-            .bind(key.key_id.to_string())
-            .bind(hints.parent_turn_id.as_deref())
-            .bind(hints.turn_id.as_deref())
-            .bind(hints.session_id.as_deref())
+            .bind(&key_id)
             .bind(now)
             .fetch_all(&mut **transaction)
             .await?
-        } else {
-            Vec::new()
         };
-        let recent_candidates = sqlx::query(
-            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.created_at <= $4 ORDER BY o.created_at DESC LIMIT 50",
-        )
-        .bind(&tenant_id)
-        .bind(&principal_id)
-        .bind(key.key_id.to_string())
-        .bind(now)
-        .fetch_all(&mut **transaction)
-        .await?;
-        for recent in recent_candidates {
-            let recent_id: String = recent.try_get("id")?;
-            let duplicate = candidates.iter().any(|candidate| {
-                candidate
-                    .try_get::<String, _>("id")
-                    .is_ok_and(|candidate_id| candidate_id == recent_id)
-            });
-            if !duplicate {
-                candidates.push(recent);
-            }
-        }
 
         let has_semantic_atoms = !atom_hashes.is_empty();
         debug_assert!(atom_hashes_json.len() <= MAX_CONVERSATION_FINGERPRINT_JSON_BYTES);
@@ -858,6 +874,110 @@ impl Database {
     }
 }
 
+async fn fetch_structured_conversation_candidate(
+    transaction: &mut Transaction<'_, Any>,
+    tenant_id: &str,
+    principal_id: &str,
+    key_id: &str,
+    hints: &ConversationHints,
+    observed_at: i64,
+) -> Result<Option<AnyRow>, AppError> {
+    if let Some(parent_turn_id) = hints.parent_turn_id.as_deref() {
+        let by_turn = sqlx::query(
+            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.turn_id = $4 AND o.created_at <= $5 ORDER BY o.created_at DESC LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(principal_id)
+        .bind(key_id)
+        .bind(parent_turn_id)
+        .bind(observed_at)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        let by_response = sqlx::query(
+            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.upstream_response_id = $4 AND o.created_at <= $5 ORDER BY o.created_at DESC LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(principal_id)
+        .bind(key_id)
+        .bind(parent_turn_id)
+        .bind(observed_at)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if let Some(candidate) = newest_conversation_candidate(by_turn, by_response)? {
+            return Ok(Some(candidate));
+        }
+    }
+
+    if let Some(turn_id) = hints.turn_id.as_deref() {
+        let candidate = sqlx::query(
+            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.turn_id = $4 AND o.created_at <= $5 ORDER BY o.created_at DESC LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(principal_id)
+        .bind(key_id)
+        .bind(turn_id)
+        .bind(observed_at)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if candidate.is_some() {
+            return Ok(candidate);
+        }
+    }
+
+    if let Some(session_id) = hints.session_id.as_deref() {
+        let causal = sqlx::query(
+            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.explicit_session_id = $4 AND o.created_at <= $5 ORDER BY o.created_at DESC LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(principal_id)
+        .bind(key_id)
+        .bind(session_id)
+        .bind(observed_at)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if causal.is_some() {
+            return Ok(causal);
+        }
+
+        // Archive projection can commit a later source-time observation first.
+        // A future row is valid only for explicit cluster membership; the caller
+        // still suppresses any edge that would reverse causal ancestry.
+        let future = sqlx::query(
+            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.explicit_session_id = $4 AND o.created_at > $5 ORDER BY o.created_at DESC LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(principal_id)
+        .bind(key_id)
+        .bind(session_id)
+        .bind(observed_at)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        return Ok(future);
+    }
+
+    Ok(None)
+}
+
+fn newest_conversation_candidate(
+    left: Option<AnyRow>,
+    right: Option<AnyRow>,
+) -> Result<Option<AnyRow>, AppError> {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            let left_created_at: i64 = left.try_get("created_at")?;
+            let right_created_at: i64 = right.try_get("created_at")?;
+            Ok(Some(if left_created_at >= right_created_at {
+                left
+            } else {
+                right
+            }))
+        }
+        (left @ Some(_), None) => Ok(left),
+        (None, right @ Some(_)) => Ok(right),
+        (None, None) => Ok(None),
+    }
+}
+
 async fn emit_conversation_projected_event_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     request_id: Uuid,
@@ -1117,6 +1237,59 @@ fn conversation_batch_insert_statement(
     }
     statement.push_str(suffix);
     statement
+}
+
+pub(crate) async fn materialize_conversation_content_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    tenant_id: &str,
+    atoms: &[SemanticAtom],
+    nodes: &[PrefixNode],
+    observed_at: i64,
+) -> Result<(), AppError> {
+    for atom_batch in
+        atoms.chunks(CONVERSATION_INSERT_BATCH_BIND_LIMIT / SEMANTIC_ATOM_INSERT_BIND_COUNT)
+    {
+        let statement = conversation_batch_insert_statement(
+            "INSERT INTO semantic_atoms (tenant_id, content_hash, instance_hash, role, kind, content_json, created_at) VALUES ",
+            atom_batch.len(),
+            SEMANTIC_ATOM_INSERT_BIND_COUNT,
+            " ON CONFLICT(tenant_id, content_hash) DO NOTHING",
+        );
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(statement));
+        for atom in atom_batch {
+            query = query
+                .bind(tenant_id)
+                .bind(&atom.content_hash)
+                .bind(&atom.instance_hash)
+                .bind(&atom.role)
+                .bind(&atom.kind)
+                .bind(serde_json::to_string(&atom.content).map_err(|_| AppError::Internal)?)
+                .bind(observed_at);
+        }
+        query.execute(&mut **transaction).await?;
+    }
+    for node_batch in
+        nodes.chunks(CONVERSATION_INSERT_BATCH_BIND_LIMIT / CONTEXT_NODE_INSERT_BIND_COUNT)
+    {
+        let statement = conversation_batch_insert_statement(
+            "INSERT INTO context_nodes (tenant_id, node_hash, parent_hash, atom_hash, depth, created_at) VALUES ",
+            node_batch.len(),
+            CONTEXT_NODE_INSERT_BIND_COUNT,
+            " ON CONFLICT(tenant_id, node_hash) DO NOTHING",
+        );
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(statement));
+        for node in node_batch {
+            query = query
+                .bind(tenant_id)
+                .bind(&node.node_hash)
+                .bind(&node.parent_hash)
+                .bind(&node.atom_hash)
+                .bind(node.depth as i64)
+                .bind(observed_at);
+        }
+        query.execute(&mut **transaction).await?;
+    }
+    Ok(())
 }
 
 fn bounded_atom_hashes(atoms: &[crate::conversation::SemanticAtom]) -> Vec<String> {
