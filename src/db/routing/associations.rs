@@ -8,7 +8,6 @@ use super::super::{AppError, DatabaseBackend, unix_millis};
 use super::grant_revisions::bump_credential_grant_revisions;
 
 const ASSOCIATION_CHUNK_SIZE: usize = 64;
-const CONSERVATIVE_CUSTOM_MODEL_RESERVATION_BOUND: i64 = 1_000_000_000;
 
 pub(super) struct RouteRelationSnapshot {
     pub(super) credential_ids: Vec<Uuid>,
@@ -220,14 +219,10 @@ pub(super) async fn replace_route_associations(
     Ok(())
 }
 
-/// Establish the transport-side half of an explicit custom Codex route.
-///
-/// Callers already hold the tenant routing-relation write lock. Keeping this
-/// config update in the association transaction gives catalog replacement and
-/// association replacement one serialization boundary. If catalog pruning is
-/// ordered first, the route recreates a conservative bound; if the route is
-/// ordered first, catalog replacement observes the committed association and
-/// preserves its bound.
+/// Preserve existing transport metadata when saving an explicit custom route.
+/// Selecting a model is not authorization to invent its financial exposure.
+/// Missing bounds remain missing: the route may be saved, but admission waits
+/// for authenticated model metadata or a separately configured verified bound.
 pub(in crate::db) async fn ensure_explicit_custom_reservation_bounds(
     tx: &mut Transaction<'_, Any>,
     tenant_id: &str,
@@ -254,25 +249,24 @@ pub(in crate::db) async fn ensure_explicit_custom_reservation_bounds(
         let object = config.as_object_mut().ok_or(AppError::Internal)?;
         let current = object.get("reservation_token_bounds");
         let legacy = object.get("output_token_limits");
-        let (mut bounds, needs_normalization) = match (current, legacy) {
+        let (bounds, needs_normalization) = match (current, legacy) {
             (Some(Value::Object(bounds)), None) => (bounds.clone(), false),
             (None, Some(Value::Object(bounds))) => (bounds.clone(), true),
             (None, None) => (serde_json::Map::new(), true),
             _ => return Err(AppError::Internal),
         };
         let has_valid_bound = bounds.get(upstream_model).is_some_and(|bound| {
-            bound.as_i64().is_some_and(|bound| {
-                (1..=CONSERVATIVE_CUSTOM_MODEL_RESERVATION_BOUND).contains(&bound)
-            })
+            bound
+                .as_i64()
+                .is_some_and(|bound| (1..=1_000_000_000).contains(&bound))
         });
         if !has_valid_bound {
             if bounds.contains_key(upstream_model) {
                 return Err(AppError::Internal);
             }
-            bounds.insert(
-                upstream_model.to_owned(),
-                Value::from(CONSERVATIVE_CUSTOM_MODEL_RESERVATION_BOUND),
-            );
+            // No evidence is not an upper bound. In particular, never use the
+            // parser's integer safety maximum as a billable output quantity.
+            continue;
         } else if !needs_normalization {
             continue;
         }

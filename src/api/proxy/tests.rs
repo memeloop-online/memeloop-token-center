@@ -350,6 +350,84 @@ mod breaker_validation;
 mod codex_delivery_validation;
 mod credential_readiness;
 
+#[tokio::test]
+async fn missing_custom_bound_neither_reserves_nor_dispatches_and_valid_candidate_still_works() {
+    let fixture = codex_route_fixture("missing-custom-bound").await;
+    let upstream = MockServer::start().await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let mut config: Value = serde_json::from_str(
+        &sqlx::query_scalar::<_, String>("SELECT config_json FROM upstream_accounts WHERE id = $1")
+            .bind(fixture.upstream_account_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    config["reservation_token_bounds"] = json!({});
+    sqlx::query("UPDATE upstream_accounts SET config_json = $1 WHERE id = $2")
+        .bind(config.to_string())
+        .bind(fixture.upstream_account_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "no invented bound", "stream": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM usage_reservations")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM request_records")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+
+    // A missing-bound candidate must not block a different, already authorized
+    // account with its own valid exact-model configuration. Do not copy bounds.
+    add_codex_standby_route(&fixture, "codex-route-missing-custom-bound", "account-456").await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .and(header_matcher("chatgpt-account-id", "account-456"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            completed_codex_sse("verified candidate").into_bytes(),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "use existing bound", "stream": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _body = to_bytes(response.into_body(), 1_000_000).await.unwrap();
+    wait_for_request_settlement(&fixture, 1).await;
+    let reserved_tokens: i64 = sqlx::query_scalar("SELECT reserved_tokens FROM usage_reservations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        reserved_tokens < 1_000_000,
+        "only the valid candidate's bounded reservation is created"
+    );
+    pool.close().await;
+}
+
 async fn assert_response_archives_omit(fixture: &CodexRouteFixture, sensitive: &str) {
     drain_completed_response_archive(fixture).await;
     for row in fixture

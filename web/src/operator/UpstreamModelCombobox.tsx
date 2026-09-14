@@ -202,6 +202,7 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
       {syncAccountIds.length > 0 && <button type="button" className="secondary" disabled={loading} onClick={() => void sync()}>{t('routes.syncModels')}</button>}
     </div>
     {needsCustomConfirmation && customAllowed && <div className="notice warning compact">{t('routes.catalogUnverified')}{hasExplicitCodexOAuth && <> {t('routes.codexCapabilityHint')}</>}</div>}
+    {needsCustomConfirmation && hasExplicitCodexOAuth && <small className="field-hint">{locale === 'zh-CN' ? '缺少模型信息时，需先同步后使用。' : 'Sync missing model information before use.'}</small>}
     {needsCustomConfirmation && <div className={`custom-model-confirm${customAllowed ? '' : ' disabled'}`}>
       {customAllowed ? <label><input type="checkbox" checked={customConfirmed} onChange={(event) => setCustomConfirmed(event.target.checked)} />{t('routes.confirmCustomModel', { model: value.trim() })}</label> : <span>{t('routes.customUnavailableForGroups')}</span>}
     </div>}
