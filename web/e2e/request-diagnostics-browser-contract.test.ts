@@ -67,7 +67,7 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
   const address = server.httpServer?.address();
   assert.ok(address && typeof address !== 'string');
   const browser = await chromium.launch({ executablePath, headless: true });
-  const context = await browser.newContext();
+  const context = await browser.newContext({ hasTouch: true });
   const history: string[] = [];
   const current = { value: 'create browser context' };
   const pageErrors: string[] = [];
@@ -101,14 +101,35 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     const recordedText = await stage('read recorded diagnostics', () => recorded.textContent(), history, current) ?? '';
     assert.match(recordedText, /http_429/);
     assert.match(recordedText, /Production Codex/);
-    assert.match(recordedText, new RegExp(upstreamId));
-    assert.match(recordedText, new RegExp(routeId));
+    assert.match(recordedText, /Research key/);
+    assert.doesNotMatch(recordedText, new RegExp(`${upstreamId}|${routeId}|${requestId}|${sessionId}`), 'technical identifiers are supplemental, not permanent detail rows');
+    await recordedDiagnostics.getByRole('button', { name: 'Production Codex · Details', exact: true }).click();
+    const metadata = page.locator('.request-metadata-surface');
+    await metadata.waitFor({ state: 'visible' });
+    assert.match(await metadata.innerText(), new RegExp(upstreamId));
+    await metadata.getByRole('button', { name: 'Copy Final upstream ID', exact: true }).click();
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), upstreamId, 'supplemental upstream ID remains copyable');
+    await page.keyboard.press('Escape');
+    const modelMetadata = recordedDiagnostics.getByRole('button', { name: /fixture-long-model-name.*Details/ });
+    await modelMetadata.focus();
+    await page.keyboard.press('Enter');
+    await metadata.waitFor({ state: 'visible' });
+    assert.match(await metadata.innerText(), new RegExp(routeId));
+    assert.match(await metadata.innerText(), /Protocol\s*openai/);
+    await page.keyboard.press('Escape');
     const historicalGapText = await stage('read historical diagnostics', () => historicalGap.textContent(), history, current) ?? '';
-    assert.match(historicalGapText, /Completed at—/);
-    assert.match(historicalGapText, /Final upstream ID—/);
-    assert.match(historicalGapText, /Final route ID—/);
+    assert.doesNotMatch(historicalGapText, /Completed at/, 'completion is supplemental timing information, not another permanent row');
+    assert.match(historicalGapText, /Final upstreamNot recorded/);
+    assert.doesNotMatch(historicalGapText, /Final upstream ID|Final route ID/, 'missing technical values do not occupy empty rows');
     assert.doesNotMatch(historicalGapText, /Cache read|Cache write/, 'missing historical cache fields must remain absent rather than becoming zero-valued rows');
-    assert.match(historicalGapText, /Input tokens: 160.*Output tokens: 32/, 'known input/output must remain visible when historical cache telemetry is missing');
+    assert.match(await historicalGapDiagnostics.locator('.request-token-total').getAttribute('aria-label') ?? '', /Input tokens: 160.*Output tokens: 32/, 'known input/output remain available when historical cache telemetry is missing');
+    assert.match(await historicalGapDiagnostics.locator('.request-token-primary').innerText(), /Uncached input\s*Not recorded[\s\S]*Output\s*32/);
+    assert.equal(await recordedDiagnostics.locator('.request-token-total > span').evaluate(element => getComputedStyle(element).textDecorationLine), 'line-through', 'detail reuses the de-emphasized total');
+    assert.equal(await recordedDiagnostics.locator('.request-token-primary b').first().evaluate(element => getComputedStyle(element).textDecorationLine), 'none', 'detail non-cached counts retain normal emphasis');
+    assert.equal(await recordedDiagnostics.locator('.request-detail-primary').getByRole('button', { name: 'Research key · Details', exact: true }).count(), 1, 'credential and usage share the same primary comparison group');
+    assert.equal(await recordedDiagnostics.locator('.request-detail-primary .request-token-cell').count(), 1);
+    await historicalGapDiagnostics.locator('.request-detail-timing').focus();
+    await page.getByRole('tooltip').filter({ hasText: /Received at:.*Completed at: Not recorded.*Duration: Not recorded/ }).waitFor();
     assert.equal(await recordedRow.locator('.request-credential-cell').innerText(), 'Research key');
     assert.equal(await recordedRow.locator('.request-credential-cell').evaluate(cell => cell.nextElementSibling?.classList.contains('request-model-cell')), true, 'the credential alias is adjacent to the model');
     assert.equal(await page.locator('.request-technical-cell, .request-technical-heading, .request-technical-info').count(), 0, 'technical data has no blank column or isolated information icon');
@@ -181,6 +202,33 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
         assert.ok(layout.compactIdScrollWidth >= layout.compactIdClientWidth, `${theme} ${width}px request ID remains safely clipped in its cell`);
         assert.equal(layout.diagnostics.length, 2, `${theme} ${width}px fixture must retain both recorded and historical diagnostic surfaces`);
         for (const diagnostics of layout.diagnostics) assert.ok(diagnostics.scrollWidth <= diagnostics.clientWidth, `${theme} ${width}px each detail diagnostics surface must remain contained`);
+        if (width < 600) {
+          await recordedRow.evaluate((row) => row.scrollIntoView({ block: 'start' }));
+          const priority = await recordedRow.evaluate((row) => {
+            const boxes = {} as Record<'model' | 'credential' | 'tokens' | 'cost' | 'status' | 'time', { top: number; bottom: number; left: number; right: number; text: string }>;
+            // Keep this browser closure self-contained: a named nested function
+            // can acquire a tsx __name helper that does not exist in the page.
+            for (const [name, selector] of [['model', '.request-model-cell'], ['credential', '.request-credential-cell'], ['tokens', '.request-token-cell'], ['cost', '.request-cost-cell'], ['status', '.request-status-cell'], ['time', '.request-time-cell']] as const) {
+              const element = row.querySelector<HTMLElement>(selector)!;
+              const bounds = element.getBoundingClientRect();
+              boxes[name] = { top: bounds.top, bottom: bounds.bottom, left: bounds.left, right: bounds.right, text: element.innerText };
+            }
+            return { width: innerWidth, height: innerHeight, ...boxes };
+          });
+          assert.ok(priority.model.top < priority.credential.top && priority.credential.top < priority.tokens.top, 'mobile rows lead with model and credential, followed by accounting facts');
+          assert.ok(priority.time.top > priority.status.top, 'receipt metadata stays secondary to the outcome');
+          for (const key of ['model', 'credential', 'tokens', 'cost', 'status'] as const) {
+            const value = priority[key];
+            assert.ok(value.text.trim() && value.left >= 0 && value.right <= priority.width && value.top >= 0 && value.bottom <= priority.height, `${theme} ${width}px ${key} must be readable together without horizontal scrolling or hover`);
+          }
+          assert.equal(layout.tableScrollWidth, layout.tableClientWidth, 'mobile request cards do not require horizontal panning');
+          await recordedRow.locator('.request-routing-info').tap();
+          await page.getByRole('tooltip').filter({ hasText: upstreamId }).waitFor();
+          await recordedRow.locator('.request-credential-cell [tabindex="0"]').focus();
+          assert.equal(await recordedRow.locator('.request-credential-cell [tabindex="0"]').evaluate((element) => document.activeElement === element), true, 'credential identity remains keyboard reachable');
+        } else {
+          assert.equal(await page.locator('.request-table').evaluate((element) => getComputedStyle(element).display), 'table', 'wider viewports retain the existing desktop table');
+        }
         if (width === 390) {
           await mkdir(artifactRoot, { recursive: true });
           await page.screenshot({ path: join(artifactRoot, `request-diagnostics-${theme}-390.png`), fullPage: true });

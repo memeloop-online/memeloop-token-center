@@ -52,7 +52,7 @@ async fn actor(
     state: &AppState,
     tenant: &str,
     scope: &str,
-) -> Result<Uuid, AppError> {
+) -> Result<(Uuid, i64), AppError> {
     let service = super::require_service(headers, state, scope).await?;
     // Both bootstrap and unbounded global credentials are excluded from these
     // evidence-bearing decisions. The audit actor must be persistent and bound
@@ -60,7 +60,10 @@ async fn actor(
     if service.tenant_external_id.as_deref() != Some(tenant) {
         return Err(AppError::Forbidden);
     }
-    service.service_id.ok_or(AppError::Forbidden)
+    Ok((
+        service.service_id.ok_or(AppError::Forbidden)?,
+        service.credential_generation.ok_or(AppError::Forbidden)?,
+    ))
 }
 
 pub(super) async fn list_generation_quarantine(
@@ -110,7 +113,7 @@ pub(super) async fn resolve_generation_quarantine(
     Path(job_id): Path<Uuid>,
     Json(body): Json<ResolveRequest>,
 ) -> Result<Json<GenerationQuarantineResolution>, AppError> {
-    let actor_service_id = actor(
+    let (actor_service_id, actor_credential_generation) = actor(
         &headers,
         &state,
         &body.tenant_external_id,
@@ -151,6 +154,7 @@ pub(super) async fn resolve_generation_quarantine(
                 tenant_external_id: &body.tenant_external_id,
                 job_id,
                 actor_service_id,
+                actor_credential_generation,
                 idempotency_hash: &idempotency_hash,
                 expected_revision: &body.expected_revision,
                 action: &body.action,

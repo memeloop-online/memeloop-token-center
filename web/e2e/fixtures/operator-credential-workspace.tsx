@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { createRoot } from 'react-dom/client';
 
-import { I18nProvider } from '../../src/i18n';
+import { I18nProvider, useI18n } from '../../src/i18n';
 import { MtcFluentProvider } from '../../src/design-system';
 import { CredentialsPage, ServiceCredentialsPage } from '../../src/operator/pages/ManagementPages';
 import keyCreateSchema from '../../../schemas/key-create.schema.json';
@@ -209,7 +209,12 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     if (url.pathname === '/internal/v1/model-routes') return json([{ id: '00000000-0000-4000-8000-000000000001', public_model: 'Research model', enabled: true, tenant_external_id: 'tenant-a' }]);
     if (url.pathname === '/internal/v1/keys' && method === 'POST') return json({ key_id: 'key-created', key: 'mts_fixture_created' });
     if (url.pathname === '/internal/v1/keys/key-form/policy' && method === 'PUT') return json({});
-    if (url.pathname === '/internal/v1/keys') return json([credential(localStorage.getItem('mtc-locale')?.startsWith('zh') ? '研发工作区' : 'Research workspace', 'tenant-a', 'key-form')]);
+    if (url.pathname === '/internal/v1/keys') return json([
+      // Match the API's descending (created_at, key_id) keyset order.
+      // These rows share a timestamp, and key-other sorts before key-form.
+      ...(parameters.has('multiple-policies') ? [credential('Other workspace', 'tenant-a', 'key-other')] : []),
+      credential(localStorage.getItem('mtc-locale')?.startsWith('zh') ? '研发工作区' : 'Research workspace', 'tenant-a', 'key-form'),
+    ]);
   }
   if (url.pathname.endsWith('credential-groups') || url.pathname.endsWith('route-groups')) return json([]);
   if (url.pathname === '/internal/v1/model-routes') {
@@ -249,7 +254,8 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
 
 function Fixture() {
   const [tenant, setTenant] = useState(initialTenant);
-  if (scenario === 'client-form') return <main style={{ maxWidth: 760, margin: '0 auto', padding: 12 }}><CredentialsPage token="mts_fixture" tenant={tenant} /></main>;
+  const { locale, setLocale } = useI18n();
+  if (scenario === 'client-form') return <main style={{ maxWidth: 960, margin: '0 auto', padding: 12 }}><button data-change-locale type="button" onClick={() => setLocale(locale === 'en' ? 'zh-CN' : 'en')}>Switch language</button><CredentialsPage token="mts_fixture" tenant={tenant} /></main>;
   if (scenario === 'service-plaintext' || scenario === 'service-scope-aba' || scenario === 'service-copy') {
     return <>
       {scenario === 'service-scope-aba' && <button type="button" onClick={() => setTenant((current) => current === 'tenant-a' ? 'tenant-b' : 'tenant-a')}>Switch tenant</button>}

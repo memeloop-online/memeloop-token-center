@@ -307,24 +307,24 @@ Feature: Stable key identity and read-only self-service statistics
     And the mock OpenAI Images upstream returns ten assets over the aggregate budget
     When the service creates a metered OpenAI Images route and key
     And the client creates ten OpenAI-compatible images in one request
-    Then the response status is 502
-    And the ten image request is refunded and leaves no staged assets
+    Then the response status is 409
+    And the ten image request is quarantined until audited confirmation and leaves no published assets
 
-  Scenario: Empty URL-backed OpenAI image results are rejected without billing
+  Scenario: Empty URL-backed OpenAI image results require audited confirmation before refund
     Given a token center backed by SQLite and memory object storage
     And the mock OpenAI Images upstream returns an empty signed URL asset
     When the service creates a metered OpenAI Images route and key
     And the client creates an OpenAI-compatible image
-    Then the response status is 502
-    And the empty URL image is rejected unbilled without exposing the signed URL
+    Then the response status is 409
+    And the empty URL image is quarantined and reconciled without exposing the signed URL
 
-  Scenario: Oversized OpenAI image responses are rejected without billing
+  Scenario: Oversized OpenAI image responses require audited confirmation before refund
     Given a token center backed by SQLite and memory object storage
     And the mock OpenAI Images upstream exceeds the response limit by one byte
     When the service creates a metered OpenAI Images route and key
     And the client creates an OpenAI-compatible image
-    Then the response status is 502
-    And the oversized image is unbilled and has no partial response archive
+    Then the response status is 409
+    And the oversized image is quarantined and reconciled with no partial response archive
 
   Scenario: OpenAI image provider errors never expose or archive the upstream body
     Given a token center backed by SQLite and memory object storage
@@ -347,5 +347,5 @@ Feature: Stable key identity and read-only self-service statistics
     And the mock Codex Responses upstream returns a sensitive invalid image payload
     When the service creates a metered Codex Responses image route and key
     And the client creates a Codex-backed OpenAI-compatible image
-    Then the response status is 502
-    And the invalid Codex image payload is sanitized and never archived
+    Then the response status is 409
+    And the invalid Codex image payload is quarantined and reconciled without archiving provider details

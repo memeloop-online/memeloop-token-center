@@ -99,6 +99,14 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route("/internal/v1/oauth/codex/poll", post(poll_codex_oauth))
         .route("/internal/v1/oauth/claude/start", post(start_claude_oauth))
         .route(
+            "/internal/v1/oauth/authorization-code/start",
+            post(start_authorization_code_oauth),
+        )
+        .route(
+            "/internal/v1/oauth/authorization-code/complete",
+            post(complete_authorization_code_oauth),
+        )
+        .route(
             "/internal/v1/oauth/claude/complete",
             post(complete_claude_oauth),
         )
@@ -171,6 +179,18 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route(
             "/internal/v1/generations/quarantine/{job_id}/resolutions",
             post(super::super::generation_quarantine::resolve_generation_quarantine),
+        )
+        .route(
+            "/internal/v1/image-generation-quarantine",
+            get(super::super::image_generation_quarantine::list_image_generation_quarantine),
+        )
+        .route(
+            "/internal/v1/image-generation-quarantine/{request_id}",
+            get(super::super::image_generation_quarantine::get_image_generation_quarantine),
+        )
+        .route(
+            "/internal/v1/image-generation-quarantine/{request_id}/resolve",
+            post(super::super::image_generation_quarantine::resolve_image_generation_quarantine),
         )
         .route("/internal/v1/generations", get(internal_generations))
         .route(

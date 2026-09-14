@@ -32,6 +32,7 @@ pub struct ResolveGenerationQuarantine<'a> {
     pub tenant_external_id: &'a str,
     pub job_id: Uuid,
     pub actor_service_id: Uuid,
+    pub actor_credential_generation: i64,
     pub idempotency_hash: &'a str,
     pub expected_revision: &'a str,
     pub action: &'a str,
@@ -88,6 +89,36 @@ impl Database {
         .to_hex()
         .to_string();
         let mut transaction = self.begin_write_transaction().await?;
+        // Hold the same tenant row that lifecycle archive/rename updates use.
+        // Check before actor locks and before replay, so captured authorization
+        // cannot outlive an archive committed before this transaction.
+        let tenant = sqlx::query("UPDATE tenants SET updated_at = updated_at WHERE external_id = $1 AND status = 'active'")
+            .bind(input.tenant_external_id).execute(&mut *transaction).await?;
+        if tenant.rows_affected() != 1 {
+            return Err(AppError::Forbidden);
+        }
+        let actor = sqlx::query("UPDATE service_principals SET updated_at = updated_at WHERE id = $1 AND status = 'active' AND credential_generation = $2")
+            .bind(input.actor_service_id.to_string()).bind(input.actor_credential_generation).execute(&mut *transaction).await?;
+        if actor.rows_affected() != 1 {
+            return Err(AppError::Forbidden);
+        }
+        sqlx::query("UPDATE service_credentials SET created_at = created_at WHERE service_principal_id = $1 AND generation = $2")
+            .bind(input.actor_service_id.to_string()).bind(input.actor_credential_generation).execute(&mut *transaction).await?;
+        let credential = sqlx::query("SELECT c.scopes_json, c.tenant_external_id FROM service_credentials c JOIN service_principals s ON s.id = c.service_principal_id AND s.credential_generation = c.generation WHERE s.id = $1 AND c.generation = $2 AND s.status = 'active' AND c.revoked_at IS NULL")
+            .bind(input.actor_service_id.to_string()).bind(input.actor_credential_generation).fetch_optional(&mut *transaction).await?.ok_or(AppError::Forbidden)?;
+        let scopes: Vec<String> =
+            serde_json::from_str(&credential.try_get::<String, _>("scopes_json")?)
+                .map_err(|_| AppError::Internal)?;
+        crate::db::credentials::validate_service_scopes(&scopes)
+            .map_err(|_| AppError::Forbidden)?;
+        if !scopes.iter().any(|scope| scope == "generations:reconcile")
+            || credential
+                .try_get::<Option<String>, _>("tenant_external_id")?
+                .as_deref()
+                != Some(input.tenant_external_id)
+        {
+            return Err(AppError::Forbidden);
+        }
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT j.id, j.tenant_id, t.external_id AS tenant_external_id, j.public_model, j.driver, j.attempt_count, j.updated_at, j.lease_expires_at, j.submission_nonce, j.status, j.error_code, j.upstream_job_id FROM generation_jobs j JOIN tenants t ON t.id = j.tenant_id WHERE t.external_id = $1 AND j.id = $2 FOR UPDATE OF j"
@@ -160,12 +191,12 @@ impl Database {
         };
         // One immutable resolution per submission attempt. The insert and the
         // fenced state transition commit together, including their replay data.
-        let inserted = sqlx::query("INSERT INTO generation_quarantine_resolutions (id, tenant_id, job_id, submission_nonce, actor_service_id, idempotency_hash, request_digest, expected_revision, action, evidence_digest, upstream_job_id, result_json, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT DO NOTHING")
+        let inserted = sqlx::query("INSERT INTO generation_quarantine_resolutions (id, tenant_id, job_id, submission_nonce, actor_service_id, idempotency_hash, request_digest, expected_revision, action, evidence_digest, upstream_job_id, result_json, created_at, actor_credential_generation) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT DO NOTHING")
             .bind(result.resolution_id.to_string()).bind(&tenant_id).bind(input.job_id.to_string())
             .bind(&nonce).bind(input.actor_service_id.to_string()).bind(input.idempotency_hash)
             .bind(request_digest).bind(input.expected_revision).bind(input.action).bind(input.evidence_digest)
             .bind(input.upstream_job_id).bind(serde_json::to_string(&result).map_err(|_| AppError::Internal)?)
-            .bind(now).execute(&mut *transaction).await?;
+            .bind(now).bind(input.actor_credential_generation).execute(&mut *transaction).await?;
         if inserted.rows_affected() != 1 {
             return Err(AppError::Conflict(
                 "submission or Idempotency-Key already resolved".into(),

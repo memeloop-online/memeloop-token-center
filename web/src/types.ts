@@ -1,4 +1,6 @@
 export interface RequestView {
+  /** Explicit client context-compaction evidence only; absent/null is unknown. */
+  compaction?: true | null;
   first_output_ms?: number | null;
   generation_duration_ms?: number | null;
   request_id: string;
@@ -101,6 +103,7 @@ export type RequestEventKind = 'started' | 'finished' | 'projected' | 'archive_b
 export type RequestArchiveState = 'capturing' | 'pending' | 'uploading' | 'bound' | 'gap';
 
 export interface RequestEvent {
+  compaction?: true | null;
   first_output_ms?: number | null;
   generation_duration_ms?: number | null;
   event_id: string;

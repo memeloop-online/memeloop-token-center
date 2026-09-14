@@ -117,7 +117,8 @@ pub use generation::{
     AttachGenerationJobResult, AttachSynchronousImageRequestObject, CreateGenerationJobInput,
     CreateGenerationJobResult, FinishGenerationJobInput, FinishSynchronousImageRequest,
     FinishSynchronousImageResult, GenerationJobIdempotency, GenerationQuarantineResolution,
-    GenerationQuarantineView, ResolveGenerationQuarantine, StartGenerationJobInput,
+    GenerationQuarantineView, ImageGenerationQuarantineResolution, ImageGenerationQuarantineView,
+    ResolveGenerationQuarantine, ResolveImageGenerationQuarantine, StartGenerationJobInput,
     StartSynchronousImageRequest, StartSynchronousImageResult, SynchronousImageIdempotencyClaim,
 };
 pub use groups::{

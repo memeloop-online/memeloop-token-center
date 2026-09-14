@@ -4,6 +4,7 @@ use crate::api::tests::test_state;
 fn request_detail_refs(request_id: Uuid) -> crate::model::RequestArchiveRefs {
     crate::model::RequestArchiveRefs {
         view: crate::model::RequestView {
+            compaction: None,
             first_output_ms: None,
             generation_duration_ms: None,
             request_id,

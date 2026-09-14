@@ -49,6 +49,11 @@ test('real form composition keeps Codex proxy required and route drafts across d
     await routeToggle.click(); await routeToggle.click();
     assert.equal(await input.inputValue(), '7', 'closing the workspace preserves its draft');
     await page.getByRole('region', { name: '配置预览' }).waitFor();
+    const sourceSection = page.locator('.route-form-sections > .mtc-form-section').nth(1);
+    const accessSection = page.locator('.route-form-sections > .mtc-form-section').nth(2);
+    const sourceBounds = await sourceSection.boundingBox();
+    const accessBounds = await accessSection.boundingBox();
+    assert.ok(sourceBounds && accessBounds && accessBounds.y >= sourceBounds.y + sourceBounds.height, 'authorization follows the complete source/model step, including on desktop');
     await page.screenshot({ path: `${artifacts}/routes-dark-1440.png`, fullPage: true });
     assert.equal(await page.evaluate(() => window.formJourneyWrites), 0);
     await page.goto(`${origin}/e2e/fixtures/operator-credential-workspace.html?scenario=client-form`);
@@ -60,6 +65,15 @@ test('real form composition keeps Codex proxy required and route drafts across d
     const daily = page.locator('#root_policy_daily_budget');
     await daily.fill('12.5'); await budgets.click(); await budgets.click();
     assert.equal(await daily.inputValue(), '12.5');
+    await page.locator('#root_alias').fill('Unsaved client draft');
+    await page.locator('[data-change-locale]').click();
+    await page.getByRole('button', { name: 'Usage and budget', exact: true }).waitFor();
+    assert.equal(await page.locator('#root_alias').inputValue(), 'Unsaved client draft');
+    assert.equal(await daily.inputValue(), '12.5', 'locale changes preserve the budget draft');
+    const credentialToggle = page.locator('.create-journey [data-workspace-toggle]');
+    await credentialToggle.click(); await credentialToggle.click();
+    assert.equal(await page.locator('#root_alias').inputValue(), 'Unsaved client draft');
+    assert.equal(await daily.inputValue(), '12.5', 'closing and reopening preserves the create draft');
     await page.setViewportSize({ width: 390, height: 1000 });
     await page.screenshot({ path: `${artifacts}/credentials-dark-390.png`, fullPage: true });
     assert.equal(await page.evaluate(() => window.credentialFixture.requests.filter(request => request.method !== 'GET').length), 0);

@@ -1,5 +1,6 @@
 import { createRoot } from 'react-dom/client';
 import { useLayoutEffect, useState } from 'react';
+import { Tooltip } from '@fluentui/react-components';
 import { I18nProvider } from '../../src/i18n';
 import { MtcFluentProvider } from '../../src/design-system';
 import { RequestsPage } from '../../src/operator/pages/RequestsPage';
@@ -21,7 +22,12 @@ let failQuery: (() => void) | undefined;
 const json = (value: unknown) => new Response(JSON.stringify(value), { headers: { 'Content-Type': 'application/json' } });
 window.fetch = async (input) => {
   const url = new URL(String(input), location.origin);
-  if (url.pathname === '/internal/v1/upstreams') return json([]);
+  if (url.pathname === '/internal/v1/upstreams') {
+    if (new URLSearchParams(location.search).has('directory-error')) {
+      return new Response('secret-directory-body-canary', { status: 503, headers: { 'x-mtc-request-id': '01900000-0000-7000-8000-000000000001' } });
+    }
+    return json([]);
+  }
   if (url.pathname === '/internal/v1/requests/query') {
     if (holdQuery) {
       holdQuery = false; window.requestLifecycleFixture.queryHeld = true;
@@ -63,6 +69,6 @@ function Fixture() {
   useLayoutEffect(() => {
     window.requestLifecycleFixture.scopeCommits.push({ scope: tenant, drawers: document.querySelectorAll('.drawer').length });
   }, [tenant]);
-  return <div data-request-fixture-scope={tenant}><RequestsPage token="fixture-token" tenant={tenant} liveEvents={events} streamRevision={revision} streamState="live" streamError="" onOpenSessions={() => {}} onOpenSession={() => {}} requestDrilldown={drilldown} /></div>;
+  return <div data-request-fixture-scope={tenant}><RequestsPage token="fixture-token" tenant={tenant} liveEvents={events} streamRevision={revision} streamState="live" streamError="" onOpenSessions={() => {}} onOpenSession={() => {}} requestDrilldown={drilldown} /><Tooltip content="Background scope help" visible relationship="description"><button id="background-help">Background helper</button></Tooltip></div>;
 }
 createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><Fixture /></MtcFluentProvider></I18nProvider>);

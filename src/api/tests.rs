@@ -948,14 +948,25 @@ async fn synchronous_image_budget_is_acquired_before_reading_the_request_body() 
         Decimal::TEN,
     )
     .await;
-    let both = IMAGE_RESPONSE_PERMITS
+    let both = fixture
+        .state
+        .image_response_permits
         .acquire_many(2)
         .await
         .expect("acquire both image permits");
+    let cloned = fixture.state.clone();
+    assert!(std::sync::Arc::ptr_eq(
+        &fixture.state.image_response_permits,
+        &cloned.image_response_permits,
+    ));
+    assert!(cloned.image_response_permits.try_acquire().is_err());
     assert!(
-        tokio::time::timeout(Duration::from_millis(25), IMAGE_RESPONSE_PERMITS.acquire())
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            fixture.state.image_response_permits.acquire()
+        )
+        .await
+        .is_err(),
         "a third synchronous image lifecycle must not have a permit"
     );
 
@@ -978,11 +989,13 @@ async fn synchronous_image_budget_is_acquired_before_reading_the_request_body() 
     assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
 
     drop(both);
-    let _released =
-        tokio::time::timeout(Duration::from_millis(100), IMAGE_RESPONSE_PERMITS.acquire())
-            .await
-            .expect("permit becomes available")
-            .expect("semaphore remains open");
+    let _released = tokio::time::timeout(
+        Duration::from_millis(100),
+        fixture.state.image_response_permits.acquire(),
+    )
+    .await
+    .expect("permit becomes available")
+    .expect("semaphore remains open");
 }
 
 #[tokio::test]

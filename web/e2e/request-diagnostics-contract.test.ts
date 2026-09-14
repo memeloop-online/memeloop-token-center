@@ -49,8 +49,6 @@ test('request diagnostics use only nullable server-recorded final routing fields
   assert.match(components, /request\.completedAt/);
   assert.match(components, /request\.upstreamId/);
   assert.match(components, /request\.routeId/);
-  assert.match(components, /upstream_account_id \?\? '—'/);
-  assert.match(components, /route_id \?\? '—'/);
   assert.match(components, /request\.currency === undefined \? fallbackCurrency : request\.currency/);
   assert.doesNotMatch(components, /routing_attempts|ttft|tokens_per_second/i);
 });

@@ -259,3 +259,45 @@ test("generation quarantine has dedicated tenant-bound reconciliation authority"
   for (const field of ["expected_revision", "tenant_external_id", "evidence_digest"]) assert.ok(body.required.includes(field));
   for (const field of ["request_object", "credential", "submission_nonce"]) assert.ok(!(field in document.components.schemas.GenerationQuarantine.properties));
 });
+
+test("image quarantine reconciliation never implies successful delivery or a resend", () => {
+  const document = cloneDocument();
+  const base = "/internal/v1/image-generation-quarantine";
+  for (const [operation, scope] of [
+    [document.paths[base].get, "generations:quarantine:read"],
+    [document.paths[`${base}/{request_id}`].get, "generations:quarantine:read"],
+    [document.paths[`${base}/{request_id}/resolve`].post, "generations:reconcile"],
+  ] as const) {
+    assert.deepEqual(operation.security, [{ serviceBearer: [] }]);
+    assert.equal(operation["x-required-scope"], scope);
+    assert.equal(operation["x-persistent-service-only"], true);
+    assert.ok(document.components.schemas.ServiceScope.enum.includes(scope));
+  }
+  const operation = document.paths[`${base}/{request_id}/resolve`].post;
+  assert.ok(operation.parameters.some((parameter: Obj) => parameter.$ref === "#/components/parameters/RequiredIdempotencyKey"));
+  assert.ok(operation.responses["409"]);
+  const body = document.components.schemas.ResolveImageGenerationQuarantine;
+  assert.equal(body.additionalProperties, false);
+  assert.deepEqual(body.properties.action.enum, ["not_delivered", "settle_confirmed"]);
+  assert.deepEqual(body.required, ["tenant_external_id", "expected_revision", "action", "confirmed_cost_micros", "currency", "evidence_digest"]);
+  assert.equal(body.properties.confirmed_cost_micros.format, "int64");
+  assert.equal(body.properties.confirmed_cost_micros.minimum, 0);
+  assert.equal(body.properties.confirmed_cost_micros.maximum, Number.MAX_SAFE_INTEGER);
+  assert.equal(document.components.schemas.ImageGenerationQuarantineResolution.properties.confirmed_cost_micros.maximum, Number.MAX_SAFE_INTEGER);
+  assert.equal(body.allOf[0].then.properties.confirmed_cost_micros.const, 0);
+  assert.deepEqual(document.components.schemas.ImageGenerationQuarantineResolution.properties.resulting_status.enum, ["failed"]);
+  const metadata = document.components.schemas.ImageGenerationQuarantine;
+  assert.equal(metadata.additionalProperties, false);
+  assert.ok(metadata.required.includes("status"));
+  assert.ok(metadata.required.includes("resolution"));
+  assert.deepEqual(metadata.properties.status.enum, ["awaiting_confirmation", "resolved"]);
+  assert.deepEqual(metadata.properties.resolution.oneOf, [
+    { $ref: "#/components/schemas/ImageGenerationQuarantineResolution" },
+    { type: "null" },
+  ]);
+  for (const field of ["credential", "request_object", "prompt", "routing_snapshot", "submission_nonce", "source_image"]) assert.ok(!(field in metadata.properties));
+  const api = readFileSync(`${repository}/src/api/image_generation_quarantine.rs`, "utf8");
+  assert.match(api, /service\.tenant_external_id\.as_deref\(\) != Some\(tenant\)/);
+  assert.match(api, /service\.service_id\.ok_or\(AppError::Forbidden\)/);
+  assert.match(api, /image-generation-quarantine-idempotency-v1/);
+});

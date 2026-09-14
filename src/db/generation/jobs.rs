@@ -23,6 +23,7 @@ pub struct CreateGenerationJobInput {
 }
 
 pub struct StartGenerationJobInput {
+    pub routing_snapshot: Option<serde_json::Value>,
     pub job_id: Uuid,
     pub key: AuthenticatedKey,
     pub model_route_id: Uuid,
@@ -121,6 +122,8 @@ impl Database {
         input: StartGenerationJobInput,
         idempotency: Option<&GenerationJobIdempotency>,
     ) -> Result<CreateGenerationJobResult, AppError> {
+        let routing_snapshot =
+            super::synchronous::serialize_media_routing_snapshot(input.routing_snapshot.as_ref())?;
         if input.model_route_id.is_nil() {
             return Err(AppError::BadRequest(
                 "generation model route snapshot is required".into(),
@@ -231,7 +234,7 @@ impl Database {
         )
         .await?;
         let inserted = sqlx::query(
-            "INSERT INTO generation_jobs (id, tenant_id, key_id, model_route_id, upstream_account_id, reservation_id, public_model, upstream_model, driver, status, request_object, estimated_units, billing_unit_snapshot, micros_per_unit_snapshot, client_idempotency_key, request_hash, next_attempt_at, lease_expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'preparing', '', $10, $11, $12, $13, $14, $15, $16, $17, $18) ON CONFLICT(key_id, client_idempotency_key) DO NOTHING",
+            "INSERT INTO generation_jobs (id, tenant_id, key_id, model_route_id, upstream_account_id, reservation_id, public_model, upstream_model, driver, status, request_object, estimated_units, billing_unit_snapshot, micros_per_unit_snapshot, client_idempotency_key, request_hash, next_attempt_at, lease_expires_at, created_at, updated_at, routing_snapshot) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'preparing', '', $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) ON CONFLICT(key_id, client_idempotency_key) DO NOTHING",
         )
         .bind(input.job_id.to_string())
         .bind(input.key.tenant_id.to_string())
@@ -251,6 +254,7 @@ impl Database {
         .bind(preparation_expires_at)
         .bind(now)
         .bind(now)
+        .bind(routing_snapshot)
         .execute(&mut *transaction)
         .await?;
         if inserted.rows_affected() == 0 {
@@ -986,7 +990,7 @@ impl Database {
             return Ok(None);
         }
         let row = sqlx::query(
-            "SELECT j.id, j.created_at, j.reconciliation_deadline_at, j.tenant_id, j.key_id, j.model_route_id, j.upstream_account_id, j.public_model, j.upstream_model, j.driver, j.status, j.request_object, j.upstream_job_id, j.submission_nonce, j.staged_assets_json, j.billing_unit_snapshot, j.estimated_units, j.attempt_count, j.failure_count, r.id AS reservation_id, r.account_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.rate_window_start, j.micros_per_unit_snapshot FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1",
+            "SELECT j.id, j.routing_snapshot, j.created_at, j.reconciliation_deadline_at, j.tenant_id, j.key_id, j.model_route_id, j.upstream_account_id, j.public_model, j.upstream_model, j.driver, j.status, j.request_object, j.upstream_job_id, j.submission_nonce, j.staged_assets_json, j.billing_unit_snapshot, j.estimated_units, j.attempt_count, j.failure_count, r.id AS reservation_id, r.account_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.rate_window_start, j.micros_per_unit_snapshot FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1",
         )
         .bind(&job_id)
         .fetch_one(&mut *transaction)
@@ -1004,6 +1008,10 @@ impl Database {
             .map(|value| serde_json::from_str(&value).map_err(|_| AppError::Internal))
             .transpose()?;
         Ok(Some(GenerationJobWork {
+            routing_snapshot: row
+                .try_get::<Option<String>, _>("routing_snapshot")?
+                .map(|value| serde_json::from_str(&value).map_err(|_| AppError::Internal))
+                .transpose()?,
             job_id: parse_uuid(row.try_get("id")?)?,
             created_at: row.try_get("created_at")?,
             reconciliation_deadline_at: row.try_get("reconciliation_deadline_at")?,

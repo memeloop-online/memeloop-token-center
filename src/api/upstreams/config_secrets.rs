@@ -64,6 +64,57 @@ pub(super) fn preserve(
     Ok(())
 }
 
+/// Standard OAuth credentials bind tenant-level editing to the existing config.
+/// Global operators may change configuration, but must explicitly replace/clear
+/// every existing hidden secret instead of inheriting it into changed authority.
+pub(super) fn preserve_managed_oauth(
+    schema: &Value,
+    current: &Value,
+    incoming: &mut Value,
+    global_operator: bool,
+) -> Result<(), AppError> {
+    let supplied = incoming.clone();
+    let mut previous = current.clone();
+    fn at<'a>(value: &'a Value, path: &[String]) -> Option<&'a Value> {
+        path.iter().try_fold(value, |value, key| value.get(key))
+    }
+    fn remove(value: &mut Value, path: &[String]) {
+        if let Some((first, tail)) = path.split_first() {
+            if tail.is_empty() {
+                if let Some(object) = value.as_object_mut() {
+                    object.remove(first);
+                }
+            } else if let Some(child) = value.get_mut(first) {
+                remove(child, tail);
+            }
+        }
+    }
+    let secret_paths = paths(schema)?;
+    if global_operator {
+        for path in &secret_paths {
+            if at(&supplied, path).is_some_and(|value| {
+                value.is_null() || value.as_object().is_some_and(Map::is_empty)
+            }) {
+                remove(&mut previous, path);
+                remove(incoming, path);
+            }
+        }
+    }
+    preserve(schema, &previous, incoming)?;
+    if *incoming != *current {
+        if !global_operator {
+            return Err(AppError::Forbidden);
+        }
+        if secret_paths
+            .iter()
+            .any(|path| at(current, path).is_some() && at(&supplied, path).is_none())
+        {
+            return Err(AppError::BadRequest("changing OAuth account configuration requires explicit secret replacement or clearing".into()));
+        }
+    }
+    Ok(())
+}
+
 fn redact(schema: &Value, value: &mut Value) -> Result<(), AppError> {
     if secret_cycle(schema).unwrap_or(true) || has_secret(schema, schema, true).unwrap_or(true) {
         *value = Value::Object(Map::new());
@@ -266,5 +317,24 @@ mod tests {
         }
         redact(&schema, &mut next).unwrap();
         assert_eq!(next, json!({"plain":"new","nested":{}}));
+    }
+
+    #[test]
+    fn generic_oauth_rebinding_requires_global_authority_and_explicit_secret_intent() {
+        let schema = json!({"properties": {"base_url": {"type": "string"}, "headers": {"type": "object", "writeOnly": true}}});
+        let current = json!({"base_url": "https://api.example.com", "headers": {"authorization": "fixture-secret"}});
+        let mut rename_only = json!({"base_url": "https://api.example.com"});
+        preserve_managed_oauth(&schema, &current, &mut rename_only, false).unwrap();
+        assert_eq!(rename_only, current);
+        for global in [false, true] {
+            let mut moved = json!({"base_url": "https://other.example.com"});
+            assert!(preserve_managed_oauth(&schema, &current, &mut moved, global).is_err());
+        }
+        let mut cleared = json!({"base_url": "https://other.example.com", "headers": {}});
+        preserve_managed_oauth(&schema, &current, &mut cleared, true).unwrap();
+        assert!(cleared.get("headers").is_none());
+        let mut replaced = json!({"base_url": "https://other.example.com", "headers": {"authorization": "fixture-replacement"}});
+        preserve_managed_oauth(&schema, &current, &mut replaced, true).unwrap();
+        assert_eq!(replaced["headers"]["authorization"], "fixture-replacement");
     }
 }

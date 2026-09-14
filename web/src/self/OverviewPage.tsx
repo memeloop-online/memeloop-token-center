@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
+import { DetailTooltip } from '../design-system';
 import { Metric, NumberMetric, RequestTable } from '../components';
-import { formatCurrency, formatNumber, formatPercent } from '../format';
+import { formatCompactCurrency, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
 import { LimitSnapshot } from '../LimitSnapshot';
 import type { KeyLimitSnapshot, KeyView, RequestView, SelfStats } from '../types';
@@ -56,29 +57,27 @@ export function OverviewPage({ credential, credentialView, onError, onOpenReques
 
   if (loading && !stats && !limits) return <div className="boot">{t('common.loading')}</div>;
   const summary = stats?.summary;
+  const balance = formatCompactCurrency(currentKey.available_balance, currentKey.currency, locale);
+  const cost = formatCompactCurrency(summary?.total_cost, currentKey.currency, locale);
   const successRate = summary && summary.total_requests > 0
     ? summary.successful_requests / summary.total_requests
     : null;
   return <div className="self-page self-overview" data-self-page="overview">
+    <div className="self-overview-caption">{t('usage.preset.24h')}</div>
     <section className="metrics self-overview-metrics" aria-label={t('usage.preset.24h')}>
-      <Metric label={t('self.balance', { currency: currentKey.currency })} value={<span title={`${currentKey.available_balance} ${currentKey.currency}`}>{formatCurrency(currentKey.available_balance, currentKey.currency, locale)}</span>} tone="positive" />
       <NumberMetric label={t('traffic.total')} value={summary?.total_requests} />
       <Metric label={t('usage.successRate')} value={formatPercent(successRate, locale)} tone="positive" />
       <NumberMetric label={t('traffic.failure')} value={summary?.failed_requests} tone="negative" />
       <NumberMetric label={t('request.tokens')} value={summary ? summary.input_tokens + summary.output_tokens : undefined} />
-      <Metric label={t('traffic.cost')} value={formatCurrency(summary?.total_cost, currentKey.currency, locale)} />
+      <Metric label={t('traffic.cost')} value={<DetailTooltip content={cost.title ?? cost.text}><span tabIndex={0}>{cost.text}</span></DetailTooltip>} />
     </section>
     <article className="panel key-summary self-account-summary">
-      <div><span className="eyebrow">{t('self.stableCredential')}</span><h2>{currentKey.alias}</h2><code>{currentKey.key_id}</code></div>
-      <div className="policy-grid">
-        <span><b>RPM</b>{formatNumber(currentKey.policy.requests_per_minute, locale)}</span>
-        <span><b>TPM</b>{formatNumber(currentKey.policy.tokens_per_minute, locale)}</span>
-        <span><b>{t('self.concurrency')}</b>{formatNumber(currentKey.policy.max_concurrency, locale)}</span>
-      </div>
+      <div><span className="eyebrow">{t('self.stableCredential')}</span><DetailTooltip content={currentKey.key_id}><h2 tabIndex={0}>{currentKey.alias}</h2></DetailTooltip><span>{t(`enforcementMode.${currentKey.policy.enforcement_mode}`)}</span></div>
+      <Metric label={t('self.balance', { currency: currentKey.currency })} value={<DetailTooltip content={balance.title ?? balance.text}><span tabIndex={0}>{balance.text}</span></DetailTooltip>} />
     </article>
-    {limits && <article className="panel self-limit-snapshot"><LimitSnapshot value={limits} /></article>}
+    {limits && <article className="panel self-limit-snapshot"><LimitSnapshot value={limits} enforcementMode={currentKey.policy.enforcement_mode} /></article>}
     <article className="panel self-history self-overview-recent">
-      <div className="panel-title"><h2>{t('self.recent')}</h2><span>{t('self.loadedRequests', { count: formatNumber(recentRequests.length, locale) })}</span></div>
+      <div className="panel-title"><h2>{t('self.recent')}</h2><span>{locale === 'zh-CN' ? '不限时间 · ' : 'All time · '}{t('self.loadedRequests', { count: formatNumber(recentRequests.length, locale) })}</span></div>
       <RequestTable requests={recentRequests} currency={currentKey.currency} credentialAlias={currentKey.alias} onSelect={onOpenRequest} onOpenSession={onOpenSession} />
     </article>
   </div>;

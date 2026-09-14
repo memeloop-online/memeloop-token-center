@@ -198,6 +198,27 @@ pub(super) async fn observe_http(
             }
             proxy_diagnostics::observe_response(response, context)
         }).await
+    } else if let Some(route_class) = proxy_diagnostics::control_route_class(&route) {
+        let context = proxy_diagnostics::Context::new();
+        let ingress_request_id = proxy_diagnostics::ingress_request_id(
+            request
+                .headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+        );
+        proxy_diagnostics::CONTEXT
+            .scope(context, async move {
+                tracing::info!(request_id = %context.request_id, ?ingress_request_id, route_class,
+                phase = "control_entry", "control request entered service");
+                let phase = proxy_diagnostics::Phase::new(context, "control_response_headers");
+                let mut response = next.run(request).await;
+                phase.finish("completed", Some(response.status().as_u16()), None);
+                if let Ok(value) = HeaderValue::from_str(&context.request_id.to_string()) {
+                    response.headers_mut().insert(REQUEST_ID_HEADER, value);
+                }
+                response
+            })
+            .await
     } else {
         next.run(request).await
     };
