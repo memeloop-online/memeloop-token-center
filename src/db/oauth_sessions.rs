@@ -79,6 +79,33 @@ impl Database {
         now: i64,
         poll_interval_seconds: u64,
     ) -> Result<OAuthLoginClaim, AppError> {
+        self.claim_oauth_login_poll_impl(reference, now, poll_interval_seconds, false)
+            .await
+    }
+
+    /// Only already-issued code-flow results may recover during the existing
+    /// 24-hour session cleanup retention. Expired pending exchanges stay closed.
+    pub async fn claim_oauth_code_ready_recovery(
+        &self,
+        reference: &OAuthLoginSessionReference,
+        now: i64,
+    ) -> Result<OAuthLoginClaim, AppError> {
+        if reference.flow_kind != "generic_authorization_code"
+            || now >= reference.expires_at.saturating_add(24 * 60 * 60 * 1000)
+        {
+            return Err(AppError::BadRequest("OAuth login recovery expired".into()));
+        }
+        self.claim_oauth_login_poll_impl(reference, now, 1, true)
+            .await
+    }
+
+    async fn claim_oauth_login_poll_impl(
+        &self,
+        reference: &OAuthLoginSessionReference,
+        now: i64,
+        poll_interval_seconds: u64,
+        allow_ready_recovery: bool,
+    ) -> Result<OAuthLoginClaim, AppError> {
         if poll_interval_seconds == 0 {
             return Err(AppError::BadRequest(
                 "OAuth login poll interval must be positive".into(),
@@ -131,7 +158,12 @@ impl Database {
         .ok_or(AppError::Forbidden)?;
         require_matching_reference(&row, reference)?;
         let expires_at: i64 = row.try_get("expires_at")?;
-        if expires_at <= now {
+        let recoverable = allow_ready_recovery
+            && matches!(
+                row.try_get::<String, _>("status")?.as_str(),
+                "ready" | "finalizing" | "consumed"
+            );
+        if expires_at <= now && !recoverable {
             let _ = sqlx::query(
                 "UPDATE oauth_login_sessions SET status = 'failed', lease_owner = NULL, lease_expires_at = NULL, updated_at = $1 WHERE id = $2 AND status IN ('pending', 'polling')",
             )

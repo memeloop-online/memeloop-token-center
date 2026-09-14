@@ -2083,12 +2083,13 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [driver, login_url, session_token, expires_at]
+                required: [driver, login_url, session_token, expires_at, recovery_expires_at]
                 properties:
                   driver: { type: string }
                   login_url: { type: string, format: uri }
                   session_token: { type: string, writeOnly: true }
                   expires_at: { type: integer, format: int64 }
+                  recovery_expires_at: { type: integer, format: int64, description: Deadline for already-issued result finalization only; does not extend code exchange. }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -6422,7 +6423,7 @@ components:
         provider_driver: { type: string }
         provider_config: { type: object }
         proxy_url: { type: string, writeOnly: true }
-        proxy_network_scope: { type: string, enum: [public, private] }
+        proxy_network_scope: { type: string, enum: [private] }
         client:
           type: object
           additionalProperties: false

@@ -33,10 +33,28 @@ pub(in crate::api) async fn start_authorization_code_oauth(
     if service.tenant_external_id.is_some() {
         return Err(AppError::Forbidden);
     }
-    if body.proxy_url.is_some() != body.proxy_network_scope.is_some() {
+    if body.proxy_url.is_some() != body.proxy_network_scope.is_some()
+        || body
+            .proxy_network_scope
+            .is_some_and(|scope| scope != crate::network::OutboundScope::Private)
+    {
         return Err(AppError::BadRequest(
-            "proxy URL and network scope must be supplied together".into(),
+            "proxy URL must be paired with private network scope".into(),
         ));
+    }
+    if let Some(proxy) = &body.proxy_url {
+        crate::provider::validate_proxy_url(proxy)?;
+    }
+    if body.provider_driver == crate::provider::antigravity::DRIVER {
+        let config = crate::provider::antigravity::Config::from_account(&body.provider_config)?;
+        let _ = crate::network::client_for_config_url_no_retry(
+            &state.http,
+            &config.control_url,
+            &body.provider_config,
+            body.proxy_url.as_deref().zip(body.proxy_network_scope),
+            state.config.allow_oauth_loopback,
+        )
+        .await?;
     }
     validate_provider_config_schema(&state, &body.provider_driver, &body.provider_config)?;
     validate_upstream_destination(
