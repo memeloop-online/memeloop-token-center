@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use super::TokenUsage;
+mod kimi;
 
 /// An account or route opt-in for the exact Chat SSE usage dialect it supports.
 /// This stays separate from a generic HTTP JSON driver: compatible upstreams
@@ -99,9 +100,17 @@ impl ChatSseUsageState {
     }
 
     pub(super) fn observe_data(&mut self, data: &[u8]) -> ChatSseDeliveryClass {
-        let Ok(chunk) = serde_json::from_slice::<CanonicalChatChunk>(data) else {
-            self.invalidate("chat_chunk_schema");
-            return ChatSseDeliveryClass::Billable;
+        let parsed = if self.allow_terminal_choice_usage {
+            kimi::parse(data)
+        } else {
+            serde_json::from_slice::<CanonicalChatChunk>(data).map_err(|_| "chat_chunk_schema")
+        };
+        let chunk = match parsed {
+            Ok(chunk) => chunk,
+            Err(reason) => {
+                self.invalidate(reason);
+                return ChatSseDeliveryClass::Billable;
+            }
         };
         if self.done || !self.observe_envelope(&chunk) {
             self.invalidate("chat_envelope_or_post_done");
