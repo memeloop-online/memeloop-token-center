@@ -1445,6 +1445,32 @@ pub(in crate::api) async fn proxy_with_identity(
                 return result;
             }
         };
+        if matches!(protocol, Protocol::OpenAiResponses) && buffered.terminal.is_incomplete() {
+            buffer_phase.finish(
+                "upstream_incomplete_response",
+                Some(200),
+                Some(buffered.body.len()),
+            );
+            let result = finish_buffered_request(
+                &buffered_request,
+                StatusCode::BAD_GATEWAY,
+                Bytes::from_static(
+                    b"{\"error\":{\"message\":\"upstream response was incomplete\",\"type\":\"upstream_error\"}}",
+                ),
+                "application/json",
+                (
+                    buffered.usage,
+                    crate::model::RequestUsageBasis::ProviderReported,
+                ),
+                Some("upstream_incomplete_response".to_owned()),
+            )
+            .await;
+            upstream_attempt
+                .complete(UpstreamAttemptTerminal::Inconclusive)
+                .await;
+            codex_retry.complete(CodexRetryTerminal::Failed);
+            return result;
+        }
         let buffered = if matches!(protocol, Protocol::OpenAiChat) {
             match codex_transport::translate_buffered_chat_response(buffered, request_id, &model) {
                 Ok(buffered) => buffered,

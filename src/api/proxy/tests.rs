@@ -346,6 +346,63 @@ async fn add_codex_standby_route(
     standby.id
 }
 
+async fn add_native_chat_standby_route(
+    fixture: &CodexRouteFixture,
+    tenant: &str,
+    base_url: &str,
+) -> (Uuid, Uuid) {
+    let account = fixture
+        .state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant.to_owned(),
+                name: "native-chat-standby".to_owned(),
+                driver: "http-json".to_owned(),
+                config: json!({"base_url": base_url, "network_scope": "public"}),
+                credential: UpstreamCredential::None,
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            fixture.state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let route = fixture
+        .state
+        .db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: tenant.to_owned(),
+            public_model: fixture.model.clone(),
+            upstream_account_id: account.id,
+            upstream_model: "native-chat-model".to_owned(),
+            protocol: "openai".to_owned(),
+            priority: 10,
+        })
+        .await
+        .unwrap();
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let tenant_id: String = sqlx::query_scalar("SELECT tenant_id FROM key_records WHERE id = $1")
+        .bind(fixture.key_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO routing_grants (tenant_id, key_id, model_route_id, route_group_id, created_at)
+         VALUES ($1, $2, $3, NULL, $4)",
+    )
+    .bind(&tenant_id)
+    .bind(fixture.key_id.to_string())
+    .bind(route.id.to_string())
+    .bind(crate::db::unix_millis())
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    (account.id, route.id)
+}
+
 mod breaker_validation;
 mod codex_delivery_validation;
 mod credential_readiness;
@@ -2437,6 +2494,92 @@ fn streaming_codex_sse(output: &str, first_delta: &str, second_delta: &str) -> S
     .collect()
 }
 
+fn incomplete_codex_sse(output: &str, reason: &str, include_delta: bool) -> String {
+    let mut events = vec![json!({
+        "type": "response.created",
+        "response": {"id": "resp-incomplete"}
+    })];
+    if include_delta {
+        events.push(json!({"type": "response.output_text.delta", "delta": output}));
+    }
+    events.push(json!({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+            "id": "item-incomplete",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": output}]
+        }
+    }));
+    events.push(json!({
+        "type": "response.incomplete",
+        "response": {
+            "id": "resp-incomplete",
+            "object": "response",
+            "status": "incomplete",
+            "error": null,
+            "incomplete_details": {"reason": reason},
+            "output": [{
+                "id": "item-incomplete",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": output}]
+            }],
+            "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+        }
+    }));
+    events
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .chain(std::iter::once("data: [DONE]\n\n".to_owned()))
+        .collect()
+}
+
+fn refusal_codex_sse(refusal: &str, include_deltas: bool) -> String {
+    let mut events = vec![json!({
+        "type": "response.created",
+        "response": {"id": "resp-refusal"}
+    })];
+    if include_deltas {
+        let split = refusal.len() / 2;
+        events.push(json!({"type": "response.refusal.delta", "delta": &refusal[..split]}));
+        events.push(json!({"type": "response.refusal.delta", "delta": &refusal[split..]}));
+        events.push(json!({"type": "response.refusal.done", "refusal": refusal}));
+    }
+    events.push(json!({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+            "id": "item-refusal",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "refusal", "refusal": refusal}]
+        }
+    }));
+    events.push(json!({
+        "type": "response.completed",
+        "response": {
+            "id": "resp-refusal",
+            "object": "response",
+            "status": "completed",
+            "error": null,
+            "output": [{
+                "id": "item-refusal",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "refusal", "refusal": refusal}]
+            }],
+            "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+        }
+    }));
+    events
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .chain(std::iter::once("data: [DONE]\n\n".to_owned()))
+        .collect()
+}
+
 fn assert_codex_wire(request: &wiremock::Request, upstream_model: &str) {
     assert_eq!(request.url.path(), codex_transport::RESPONSES_PATH);
     assert_eq!(request.headers[header::ACCEPT], "text/event-stream");
@@ -2533,6 +2676,12 @@ fn assert_codex_chat_wire(request: &wiremock::Request, upstream_model: &str) {
         "stream_options",
         "tools",
         "parallel_tool_calls",
+        "max_tokens",
+        "max_completion_tokens",
+        "temperature",
+        "top_p",
+        "presence_penalty",
+        "frequency_penalty",
     ] {
         assert!(body.get(field).is_none(), "{field}");
     }
@@ -2547,7 +2696,7 @@ async fn unsupported_codex_protocol_and_chat_shapes_fail_before_side_effects() {
         .expect(0)
         .mount(&upstream)
         .await;
-    for (path, request) in [
+    for (path, request, expected_detail) in [
         (
             "/v1/chat/completions",
             json!({
@@ -2555,6 +2704,7 @@ async fn unsupported_codex_protocol_and_chat_shapes_fail_before_side_effects() {
                 "messages": [{"role": "user", "content": "hello"}],
                 "tools": [{"type": "function", "function": {"name": "lookup"}}]
             }),
+            None,
         ),
         (
             "/v1/chat/completions",
@@ -2565,6 +2715,7 @@ async fn unsupported_codex_protocol_and_chat_shapes_fail_before_side_effects() {
                     "content": [{"type": "image_url", "image_url": {"url": "https://example.invalid/a.png"}}]
                 }]
             }),
+            None,
         ),
         (
             "/v1/chat/completions",
@@ -2573,10 +2724,40 @@ async fn unsupported_codex_protocol_and_chat_shapes_fail_before_side_effects() {
                 "messages": [{"role": "user", "content": "hello"}],
                 "n": 2
             }),
+            None,
+        ),
+        (
+            "/v1/chat/completions",
+            json!({
+                "model": fixture.model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "temperature": 0.2
+            }),
+            Some("temperature"),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({
+                "model": fixture.model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 63
+            }),
+            Some("max_tokens"),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({
+                "model": fixture.model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false,
+                "stream_options": {"include_usage": true}
+            }),
+            Some("stream_options"),
         ),
         (
             "/v1/embeddings",
             json!({"model": fixture.model, "input": "hello"}),
+            None,
         ),
     ] {
         let response = send_codex_route(&fixture, &upstream, path, request).await;
@@ -2584,6 +2765,9 @@ async fn unsupported_codex_protocol_and_chat_shapes_fail_before_side_effects() {
         let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let body = String::from_utf8_lossy(&body);
         assert!(body.contains("error"), "{body}");
+        if let Some(expected_detail) = expected_detail {
+            assert!(body.contains(expected_detail), "{body}");
+        }
     }
     assert!(
         fixture
@@ -2605,6 +2789,66 @@ async fn unsupported_codex_protocol_and_chat_shapes_fail_before_side_effects() {
         0
     );
     pool.close().await;
+}
+
+#[tokio::test]
+async fn codex_specific_chat_limits_skip_to_a_compatible_native_candidate() {
+    let fixture = codex_route_fixture("chat-fallback").await;
+    let upstream = MockServer::start().await;
+    let (native_account_id, native_route_id) =
+        add_native_chat_standby_route(&fixture, "codex-route-chat-fallback", &upstream.uri()).await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(successful_chat_response())
+        .expect(2)
+        .mount(&upstream)
+        .await;
+
+    for extra in [json!({"temperature": 0.7}), json!({"max_tokens": 63})] {
+        let mut request = json!({
+            "model": fixture.model,
+            "messages": [{"role": "user", "content": "translate"}],
+            "stream": false
+        });
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let response = send_codex_route(&fixture, &upstream, "/v1/chat/completions", request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap();
+    }
+
+    wait_for_request_settlement(&fixture, 2).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert_eq!(row.upstream_account_id, Some(native_account_id));
+        assert_eq!(row.route_id, Some(native_route_id));
+        assert_eq!(row.status_code, Some(200));
+        assert_exactly_once_side_effects_for(
+            &fixture,
+            row.request_id,
+            None,
+            native_account_id,
+            native_route_id,
+        )
+        .await;
+    }
+    upstream.verify().await;
 }
 
 #[tokio::test]
@@ -2630,7 +2874,12 @@ async fn codex_buffered_chat_translates_request_and_response_and_settles_once() 
             {"role": "user", "content": "Goodbye"}
         ],
         "stream": false,
-        "n": 1
+        "n": 1,
+        "max_tokens": 64,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0
     });
     let response = send_codex_route(
         &fixture,
@@ -2665,7 +2914,7 @@ async fn codex_buffered_chat_translates_request_and_response_and_settles_once() 
         .unwrap();
     assert_eq!(rows[0].status_code, Some(200));
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
     drain_completed_response_archive(&fixture).await;
     let refs = fixture
         .state
@@ -2729,7 +2978,12 @@ async fn codex_streaming_chat_emits_only_chat_chunks_with_terminal_usage() {
                 {"role": "user", "content": "Goodbye"}
             ],
             "stream": true,
-            "stream_options": {"include_usage": true}
+            "stream_options": {"include_usage": true},
+            "max_completion_tokens": 64,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0
         }),
     )
     .await;
@@ -2762,10 +3016,303 @@ async fn codex_streaming_chat_emits_only_chat_chunks_with_terminal_usage() {
         .unwrap();
     assert_eq!(rows[0].status_code, Some(200));
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
     let requests = upstream.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     assert_codex_chat_wire(&requests[0], &fixture.upstream_model);
+}
+
+#[tokio::test]
+async fn codex_buffered_chat_maps_valid_incomplete_to_success_with_provider_usage() {
+    let fixture = codex_route_fixture("buffered-chat-incomplete").await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            incomplete_codex_sse("Partial translation", "max_output_tokens", false).into_bytes(),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/chat/completions",
+        json!({
+            "model": fixture.model,
+            "messages": [{"role": "user", "content": "Translate a long document"}],
+            "stream": false
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let parsed: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        parsed["choices"][0]["message"]["content"],
+        "Partial translation"
+    );
+    assert_eq!(parsed["choices"][0]["finish_reason"], "length");
+    assert_eq!(parsed["usage"]["total_tokens"], 5);
+
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!(rows[0].error_code, None);
+    assert_eq!(
+        rows[0].usage_basis,
+        Some(crate::model::RequestUsageBasis::ProviderReported)
+    );
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    drain_completed_response_archive(&fixture).await;
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, rows[0].request_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .state
+            .archive
+            .get(refs.response_object.as_deref().unwrap())
+            .await
+            .unwrap()
+            .as_ref(),
+        body.as_ref()
+    );
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn codex_streaming_chat_maps_valid_incomplete_without_responses_lifecycle_drift() {
+    let fixture = codex_route_fixture("streaming-chat-incomplete").await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            incomplete_codex_sse("Partial translation", "future_bounded_reason", true).into_bytes(),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/chat/completions",
+        json!({
+            "model": fixture.model,
+            "messages": [{"role": "user", "content": "Translate a long document"}],
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let rendered = String::from_utf8(body.to_vec()).unwrap();
+    assert!(rendered.contains("Partial translation"));
+    assert!(rendered.contains("\"finish_reason\":\"length\""));
+    assert!(rendered.contains("\"prompt_tokens\":3"));
+    assert!(rendered.contains("data: [DONE]"));
+    assert!(!rendered.contains("response.incomplete"));
+
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!(rows[0].error_code, None);
+    assert_eq!(
+        rows[0].usage_basis,
+        Some(crate::model::RequestUsageBasis::ProviderReported)
+    );
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    drain_completed_response_archive(&fixture).await;
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, rows[0].request_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .state
+            .archive
+            .get(refs.response_object.as_deref().unwrap())
+            .await
+            .unwrap()
+            .as_ref(),
+        body.as_ref()
+    );
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn codex_buffered_chat_maps_a_single_safety_refusal() {
+    let fixture = codex_route_fixture("buffered-chat-refusal").await;
+    let upstream = MockServer::start().await;
+    let refusal = "I cannot help with that request.";
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            refusal_codex_sse(refusal, false).into_bytes(),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/chat/completions",
+        json!({
+            "model": fixture.model,
+            "messages": [{"role": "user", "content": "Unsafe request"}],
+            "stream": false
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let parsed: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["choices"][0]["message"]["content"], Value::Null);
+    assert_eq!(parsed["choices"][0]["message"]["refusal"], refusal);
+    assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
+    assert_eq!(parsed["usage"]["total_tokens"], 5);
+
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!(rows[0].error_code, None);
+    assert_eq!(
+        rows[0].usage_basis,
+        Some(crate::model::RequestUsageBasis::ProviderReported)
+    );
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn codex_streaming_chat_maps_refusal_deltas_and_settles_once() {
+    let fixture = codex_route_fixture("streaming-chat-refusal").await;
+    let upstream = MockServer::start().await;
+    let refusal = "I cannot help with that request.";
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            refusal_codex_sse(refusal, true).into_bytes(),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/chat/completions",
+        json!({
+            "model": fixture.model,
+            "messages": [{"role": "user", "content": "Unsafe request"}],
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let rendered = String::from_utf8(body.to_vec()).unwrap();
+    assert!(rendered.contains("\"refusal\":\"I cannot help"));
+    assert!(rendered.contains("that request."));
+    assert!(rendered.contains("\"finish_reason\":\"stop\""));
+    assert!(rendered.contains("\"prompt_tokens\":3"));
+    assert!(rendered.contains("data: [DONE]"));
+    assert!(!rendered.contains("response.refusal"));
+
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!(rows[0].error_code, None);
+    assert_eq!(
+        rows[0].usage_basis,
+        Some(crate::model::RequestUsageBasis::ProviderReported)
+    );
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn codex_buffered_responses_keeps_valid_incomplete_as_non_success() {
+    let fixture = codex_route_fixture("buffered-responses-incomplete").await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            incomplete_codex_sse("Partial response", "max_output_tokens", false).into_bytes(),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "long response", "stream": false}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(502));
+    assert_eq!(
+        rows[0].error_code.as_deref(),
+        Some("upstream_incomplete_response")
+    );
+    assert_eq!(
+        rows[0].usage_basis,
+        Some(crate::model::RequestUsageBasis::ProviderReported)
+    );
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    upstream.verify().await;
 }
 
 #[tokio::test]

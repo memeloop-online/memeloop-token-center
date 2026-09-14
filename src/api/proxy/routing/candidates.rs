@@ -87,6 +87,8 @@ pub(in crate::api::proxy) struct CandidatePreparationSummary {
     protocol_mismatch: usize,
     incompatible_usage: usize,
     reservation_metadata_unavailable: usize,
+    codex_chat_incompatible: usize,
+    codex_chat_rejection: Option<String>,
     skipped_incompatible_strict_route: bool,
     skipped_local_protocol_mismatch: bool,
     skipped_kimi_protocol_mismatch: bool,
@@ -181,22 +183,41 @@ pub(in crate::api::proxy) async fn next_planned_proxy_candidate(
             );
             continue;
         }
-        return plan_proxy_route(ProxyRoutePlanInput {
+        let planned = plan_proxy_route(ProxyRoutePlanInput {
             request,
             route,
             preparation_now: unix_millis(),
-        })
-        .map(Some)
-        .inspect_err(|error| {
-            tracing::warn!(
-                %request.request_id,
-                %route_id,
-                upstream_account_id = %account_id,
-                error_category = error.diagnostic_category(),
-                stage = "candidate_prepare",
-                "selected authorized proxy candidate is unusable"
-            );
         });
+        match planned {
+            Ok(planned) => return Ok(Some(planned)),
+            Err(AppError::BadRequest(message))
+                if codex_transport::is_driver(&candidate.driver)
+                    && matches!(request.protocol, Protocol::OpenAiChat)
+                    && codex_transport::is_chat_candidate_incompatibility(&message) =>
+            {
+                summary.codex_chat_incompatible += 1;
+                summary.codex_chat_rejection.get_or_insert(message);
+                tracing::warn!(
+                    %request.request_id,
+                    %route_id,
+                    upstream_account_id = %account_id,
+                    stage = "candidate_codex_chat_incompatible",
+                    "proxy skipped a Codex candidate that cannot preserve Chat semantics"
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %request.request_id,
+                    %route_id,
+                    upstream_account_id = %account_id,
+                    error_category = error.diagnostic_category(),
+                    stage = "candidate_prepare",
+                    "selected authorized proxy candidate is unusable"
+                );
+                return Err(error);
+            }
+        }
     }
     tracing::warn!(
         request_id = %request.request_id,
@@ -207,6 +228,7 @@ pub(in crate::api::proxy) async fn next_planned_proxy_candidate(
         protocol_mismatch = summary.protocol_mismatch,
         incompatible_usage = summary.incompatible_usage,
         reservation_metadata_unavailable = summary.reservation_metadata_unavailable,
+        codex_chat_incompatible = summary.codex_chat_incompatible,
         "authorized candidate preparation exhausted without dispatch"
     );
     Ok(None)
@@ -227,6 +249,9 @@ pub(in crate::api::proxy) fn exhausted_candidate_error(
     }
     if summary.skipped_incompatible_strict_route {
         validate_openai_chat_choice_count(request_json)?;
+    }
+    if let Some(message) = summary.codex_chat_rejection.as_ref() {
+        return Ok(AppError::BadRequest(message.clone()));
     }
     if summary.reservation_metadata_unavailable > 0 {
         return Ok(AppError::Upstream(

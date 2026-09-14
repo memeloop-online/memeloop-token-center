@@ -64,8 +64,15 @@ fn streaming_upstream_evidence(
     }
     if matches!(
         sse_summary.map(|summary| &summary.outcome),
-        Some(ResponsesSseOutcome::Failed | ResponsesSseOutcome::TerminatedIncomplete)
+        Some(ResponsesSseOutcome::Failed)
     ) {
+        return StreamingUpstreamEvidence::Inconclusive;
+    }
+    if matches!(
+        sse_summary.map(|summary| &summary.outcome),
+        Some(ResponsesSseOutcome::TerminatedIncomplete)
+    ) && error_code.is_some()
+    {
         return StreamingUpstreamEvidence::Inconclusive;
     }
     if error_code.is_some() {
@@ -102,11 +109,19 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
         stored_response,
         gap_response,
     } = input;
+    let mapped_chat_incomplete = is_codex_route
+        && matches!(protocol, Protocol::OpenAiChat)
+        && matches!(
+            sse_summary.as_ref().map(|summary| &summary.outcome),
+            Some(ResponsesSseOutcome::TerminatedIncomplete)
+        );
     let protocol_error = match sse_summary.as_ref().map(|summary| &summary.outcome) {
         Some(ResponsesSseOutcome::Failed) => Some("upstream_failed_response"),
-        Some(ResponsesSseOutcome::Incomplete | ResponsesSseOutcome::TerminatedIncomplete) => {
+        Some(ResponsesSseOutcome::Incomplete) => Some("upstream_incomplete_response"),
+        Some(ResponsesSseOutcome::TerminatedIncomplete) if !mapped_chat_incomplete => {
             Some("upstream_incomplete_response")
         }
+        Some(ResponsesSseOutcome::TerminatedIncomplete) => None,
         Some(ResponsesSseOutcome::Completed { .. }) | None => None,
     };
     let (mut terminal_status, mut error_code) = match transport_error {
@@ -260,12 +275,13 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
     let retry_terminal = if is_codex_route
         && error_code.is_none()
         && (200..400).contains(&terminal_status)
-        && matches!(
-            sse_summary.as_ref().map(|summary| &summary.outcome),
-            Some(ResponsesSseOutcome::Completed {
-                response_id: Some(_)
-            })
-        ) {
+        && (mapped_chat_incomplete
+            || matches!(
+                sse_summary.as_ref().map(|summary| &summary.outcome),
+                Some(ResponsesSseOutcome::Completed {
+                    response_id: Some(_)
+                })
+            )) {
         CodexRetryTerminal::Succeeded
     } else if matches!(
         transport_error,
@@ -289,6 +305,7 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
             && !charge_contract_ceiling
             && sse_summary.as_ref().is_some_and(|summary| {
                 matches!(summary.outcome, ResponsesSseOutcome::Completed { .. })
+                    || mapped_chat_incomplete
             }),
     );
     let terminal_result = finish_proxy_request_with_archive_fallback(
