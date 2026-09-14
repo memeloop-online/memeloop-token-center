@@ -6,7 +6,7 @@ import { quotaObservationState, quotaReadErrorMessage, quotaResetCreditExpiry, q
 import type { QuotaReadState } from './useUpstreamQuotaReads';
 import './upstreamQuota.css';
 import { UpstreamQuotaReset } from './UpstreamQuotaReset';
-import { Disclosure, DetailTooltip } from '../design-system';
+import { DetailTooltip } from '../design-system';
 
 export function UpstreamQuotaDetails({ snapshot, refreshError }: { snapshot: UpstreamQuotaSnapshot; refreshError?: 'quota.readFailed' | 'quota.errorPermission' }) {
   const { locale, t } = useI18n();
@@ -18,17 +18,13 @@ export function UpstreamQuotaDetails({ snapshot, refreshError }: { snapshot: Ups
   const observation = quotaObservationState(snapshot, now, Boolean(refreshError));
   const hasObservation = observation !== 'unobserved';
   const readFailed = Boolean(refreshError) || snapshot.status === 'error' || Boolean(snapshot.error_code);
-  const reset = snapshot.reset_capability;
-  const resetMessage = reset.provider_supported === false ? 'quota.resetUnsupported'
-    : reset.provider_supported === null ? 'quota.resetUnknown'
-    : !reset.implementation_available ? 'quota.resetNotIntegrated' : 'quota.resetAvailable';
   return <div className="upstream-quota-details">
     <div className="upstream-quota-meta">
       {hasObservation && snapshot.plan_type && <b>{snapshot.plan_type}</b>}
       <span>{snapshot.observed_at === null ? t('quota.notObserved') : t(observation === 'historical' ? 'quota.lastObservedAt' : 'quota.observedAt', { time: new Date(snapshot.observed_at).toLocaleString(locale) })}</span>
       {observation === 'historical' && <span className="status pending">{t('quota.historical')}</span>}
-      {hasObservation && snapshot.credits.balance !== null && <span>{t(observation === 'historical' ? 'quota.lastObservedBalance' : 'quota.balance', { amount: snapshot.credits.balance })}</span>}
-      {hasObservation && snapshot.credits.unlimited === true && <span>{t(observation === 'historical' ? 'quota.lastObservedUnlimitedCredits' : 'quota.unlimitedCredits')}</span>}
+      {hasObservation && snapshot.credits.source === 'codex_usage' && snapshot.credits.balance !== null && <span>{t(observation === 'historical' ? 'quota.lastObservedBalance' : 'quota.balance', { amount: snapshot.credits.balance })}</span>}
+      {hasObservation && snapshot.credits.source === 'codex_usage' && snapshot.credits.unlimited === true && <span>{t(observation === 'historical' ? 'quota.lastObservedUnlimitedCredits' : 'quota.unlimitedCredits')}</span>}
     </div>
     {snapshot.status === 'unsupported' && <p>{t('quota.readUnsupported')}</p>}
     {(snapshot.status !== 'unsupported' || refreshError) && readFailed && <div className="notice error" role="alert">
@@ -54,13 +50,6 @@ export function UpstreamQuotaDetails({ snapshot, refreshError }: { snapshot: Ups
         <DetailTooltip content={t('quota.sourceEvidence', { source, id: window.id, rawSource: window.source })}><small tabIndex={0} data-quota-evidence={window.id}>{t('quota.sourceLabel')}</small></DetailTooltip>
       </section>;
     })}</div>}
-    <div className="upstream-quota-reset">
-      <b>{t('quota.resetCapability')}</b>
-      <p>{t(resetMessage)}</p>
-      {reset.available_credits !== null && <span>{t('quota.resetCredits', { available: formatNumber(reset.available_credits, locale), applicable: reset.applicable_credits === null ? '—' : formatNumber(reset.applicable_credits, locale) })}</span>}
-      {snapshot.provider === 'openai-codex' && <QuotaResetCreditExpiry snapshot={snapshot} now={now} />}
-      {reset.credit_error_code && <p>{t('quota.resetCreditsUnavailable')} {t(quotaReadErrorMessage(reset.credit_error_code))}</p>}
-    </div>
   </div>;
 }
 
@@ -78,23 +67,31 @@ export function QuotaResetCreditExpiry({ snapshot, now }: { snapshot: UpstreamQu
 
 /** Capability discovery must remain visible even when the first read fails.
  * An absent snapshot is unknown, never evidence that a supplier supports reset.
- * Expanding this disclosure performs no network or quota operation.
+ * Rendering this section performs no network or quota operation.
  */
 export function UpstreamQuotaResetSection({ accountId, accountName, tenant, token, snapshot, readFailed = false }: {
   accountId: string; accountName: string; tenant: string; token: string;
   snapshot?: UpstreamQuotaSnapshot; readFailed?: boolean;
 }) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const capability = snapshot?.reset_capability;
-  if (capability && (capability.provider_supported !== true || !capability.implementation_available)) return null;
-  return <Disclosure title={t('quota.resetOptions')}>
-    <p>{t('quota.resetWarning')}</p>
-    {snapshot ? <UpstreamQuotaReset accountId={accountId} accountName={accountName} tenant={tenant} token={token} snapshot={snapshot} /> : <>
-      <b>{t('quota.resetCapability')}</b>
+  const resetMessage = capability?.provider_supported === false ? 'quota.resetUnsupported'
+    : capability?.provider_supported == null ? 'quota.resetUnknown'
+    : !capability.implementation_available ? 'quota.resetNotIntegrated' : 'quota.resetAvailable';
+  const actionable = capability?.provider_supported === true && capability.implementation_available;
+  return <section className="upstream-quota-reset" aria-label={t('quota.resetCapability')}>
+    <h3>{t('quota.resetCapability')}</h3>
+    {snapshot ? <>
+      <p>{t(resetMessage)}</p>
+      {capability?.available_credits !== null && capability?.available_credits !== undefined && <span>{t('quota.resetCredits', { available: formatNumber(capability.available_credits, locale), applicable: capability.applicable_credits === null ? '—' : formatNumber(capability.applicable_credits, locale) })}</span>}
+      {snapshot.provider === 'openai-codex' && <QuotaResetCreditExpiry snapshot={snapshot} />}
+      {capability?.credit_error_code && <p>{t('quota.resetCreditsUnavailable')} {t(quotaReadErrorMessage(capability.credit_error_code))}</p>}
+      {actionable && <><p>{t('quota.resetWarning')}</p><UpstreamQuotaReset accountId={accountId} accountName={accountName} tenant={tenant} token={token} snapshot={snapshot} /></>}
+    </> : <>
       <p role="status">{t(readFailed ? 'quota.resetDiscoveryFailed' : 'quota.resetDiscoveryPending')}</p>
       <button type="button" className="danger" disabled>{t('quota.resetAction')}</button>
     </>}
-  </Disclosure>;
+  </section>;
 }
 
 /** User-triggered read: never starts one upstream request per card on page load. */
