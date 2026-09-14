@@ -14,6 +14,11 @@ use wiremock::MockServer;
 
 #[tokio::test]
 async fn tenant_cannot_move_operator_oauth_or_hidden_headers_to_another_origin() {
+    assert_no_tenant_rebind("google-antigravity").await;
+    assert_no_tenant_rebind("http-json").await;
+}
+
+async fn assert_no_tenant_rebind(driver: &str) {
     let directory = tempfile::tempdir().unwrap();
     let mut config = Config::for_test(format!(
         "sqlite://{}?mode=rwc",
@@ -23,14 +28,18 @@ async fn tenant_cannot_move_operator_oauth_or_hidden_headers_to_another_origin()
     let state = AppState::initialize(config).await.unwrap();
     let original = MockServer::start().await;
     let other = MockServer::start().await;
-    let provider_config = json!({"base_url": original.uri(), "network_scope": "public", "project_id": "fixture-project", "request_headers": {"x-private-header": "fixture-private-header"}});
+    let provider_config = if driver == "google-antigravity" {
+        json!({"base_url": original.uri(), "network_scope": "public", "project_id": "fixture-project", "request_headers": {"x-private-header": "fixture-private-header"}})
+    } else {
+        json!({"base_url": original.uri(), "network_scope": "public"})
+    };
     let account = state
         .db
         .create_upstream_account(
             CreateUpstreamAccountInput {
                 tenant_external_id: "fixture-tenant".into(),
                 name: "fixture-native".into(),
-                driver: "google-antigravity".into(),
+                driver: driver.into(),
                 config: provider_config.clone(),
                 credential: UpstreamCredential::OAuth {
                     access_token: "fixture-access".into(),
@@ -43,7 +52,7 @@ async fn tenant_cannot_move_operator_oauth_or_hidden_headers_to_another_origin()
                     proxy_network_scope: None,
                 },
                 oauth_session_id: None,
-                oauth_driver: None,
+                oauth_driver: Some("generic_authorization_code".into()),
                 oauth_refresh_url: None,
             },
             state.config.key_pepper.as_bytes(),
@@ -62,10 +71,11 @@ async fn tenant_cannot_move_operator_oauth_or_hidden_headers_to_another_origin()
         )
         .await
         .unwrap();
-    for (token, status) in [
-        (tenant.token.as_str(), StatusCode::FORBIDDEN),
-        (state.config.service_token.as_str(), StatusCode::BAD_REQUEST),
-    ] {
+    let mut cases = vec![(tenant.token.as_str(), StatusCode::FORBIDDEN)];
+    if driver == "google-antigravity" {
+        cases.push((state.config.service_token.as_str(), StatusCode::BAD_REQUEST));
+    }
+    for (token, status) in cases {
         let response = api::router_for_role(state.clone(), RuntimeRole::Control).oneshot(Request::put(format!("/internal/v1/upstreams/{}", account.id))
             .header("authorization", format!("Bearer {token}")).header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&json!({"tenant_external_id": "fixture-tenant", "name": "fixture-update", "expected_updated_at": account.updated_at, "config": {"base_url": other.uri(), "network_scope": "public", "project_id": "fixture-project"}})).unwrap())).unwrap()).await.unwrap();

@@ -366,6 +366,15 @@ pub async fn complete(
             "OAuth application revision binding changed".into(),
         ));
     }
+    // Empty callbacks are explicit status/finalization checks from the UI.
+    // They may claim a Ready result, but may never arm, exchange or fail a code.
+    if callback_url.is_empty() {
+        db.release_oauth_login_poll(session.session_id, lease_owner, now)
+            .await?;
+        return Err(AppError::Conflict(
+            "OAuth credentials are not ready for finalization".into(),
+        ));
+    }
     if login.exchange_started {
         db.fail_oauth_login_poll(session.session_id, lease_owner, now)
             .await?;
@@ -1155,6 +1164,35 @@ mod tests {
         )
         .await
         .unwrap();
+        let check_only = complete(
+            &db,
+            &reqwest::Client::new(),
+            &started.session_token,
+            "",
+            Some("fixture-tenant"),
+            None,
+            key,
+            31_002,
+            false,
+        )
+        .await;
+        assert!(matches!(check_only, Err(AppError::Conflict(_))));
+        let OAuthLoginClaim::Claimed {
+            lease_owner: check_owner,
+            state_ciphertext,
+        } = db
+            .claim_oauth_login_poll(&reference, 32_003, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("empty callback must not fail the session")
+        };
+        let state_after_check: LoginState =
+            open_private_json(&state_ciphertext, key, STATE_AAD).unwrap();
+        assert!(state_after_check.exchange_started);
+        db.release_oauth_login_poll(session.session_id, check_owner, 32_003)
+            .await
+            .unwrap();
         let reclaimed = complete(
             &db,
             &reqwest::Client::new(),
@@ -1163,7 +1201,7 @@ mod tests {
             Some("fixture-tenant"),
             None,
             key,
-            31_002,
+            33_004,
             false,
         )
         .await;

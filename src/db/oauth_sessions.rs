@@ -164,6 +164,11 @@ impl Database {
                 "ready" | "finalizing" | "consumed"
             );
         if expires_at <= now && !recoverable {
+            if allow_ready_recovery {
+                // A finalization/status check must not mutate an expired
+                // pending exchange into failed or attempt a token request.
+                return Err(AppError::BadRequest("OAuth login session expired".into()));
+            }
             let _ = sqlx::query(
                 "UPDATE oauth_login_sessions SET status = 'failed', lease_owner = NULL, lease_expires_at = NULL, updated_at = $1 WHERE id = $2 AND status IN ('pending', 'polling')",
             )

@@ -375,7 +375,7 @@ pub(in crate::api) async fn update_upstream(
         .require_upstream_tenant(account_id, &body.tenant_external_id)
         .await?;
     let driver = state.db.upstream_driver(account_id).await?;
-    let (current, current_credential, credential_active, _) = state
+    let (current, current_credential, credential_active, oauth_driver) = state
         .db
         .upstream_account_with_current_credential(account_id, state.config.key_pepper.as_bytes())
         .await?;
@@ -405,7 +405,20 @@ pub(in crate::api) async fn update_upstream(
             }
         }
     }
-    super::config_secrets::preserve(&provider.config_schema, &previous_config, &mut body.config)?;
+    if oauth_driver.as_deref() == Some(crate::oauth::authorization_code::FLOW) {
+        super::config_secrets::preserve_managed_oauth(
+            &provider.config_schema,
+            &previous_config,
+            &mut body.config,
+            service.tenant_external_id.is_none(),
+        )?;
+    } else {
+        super::config_secrets::preserve(
+            &provider.config_schema,
+            &previous_config,
+            &mut body.config,
+        )?;
+    }
     validate_provider_config_schema(&state, &driver, &body.config)?;
     validate_upstream_destination(&driver, &body.config, &service, &state).await?;
     let should_sync_models = driver != crate::oauth::codex_device::PROVIDER_DRIVER
