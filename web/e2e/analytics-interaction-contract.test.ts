@@ -30,6 +30,7 @@ test('analytics background exposes actual indexed buckets through pointer, keybo
       await page.keyboard.press('Escape');await page.getByRole('tooltip').waitFor({state:'hidden'});
       assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
       if(width===2560)assert.ok(await page.locator('.app-main-content').evaluate(el=>el.getBoundingClientRect().width)>2500,'analytics must not retain 2048px shell cap');
+      if(width===2560)assert.ok(await page.locator('.usage-page').evaluate(el=>el.getBoundingClientRect().width)>2400,'late operator CSS must not restore the 1360px inner page cap');
     }
     assert.equal(await page.getByRole('slider').count(),2,'missing series must not invent samples');
     await page.getByRole('slider',{name:'All zero'}).focus();assert.match(await page.getByRole('slider',{name:'All zero'}).getAttribute('aria-valuetext')??'',/: 0$/);

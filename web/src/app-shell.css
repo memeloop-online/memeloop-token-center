@@ -137,6 +137,7 @@
 
 .app-main-content > .app-shell { display: block; min-height: 0; }
 .app-main-content:has(.usage-page, .operator-overview-dashboard) { width: 100%; max-width: none; }
+.app-main-content .usage-page { width: 100%; max-width: none; }
 .app-main-content > .app-shell > .rail { display: none; }
 .app-main-content > .app-shell > .main { width: 100%; max-width: none; padding: 0; }
 .app-main-content > .app-shell > .main > .mobile-controls { display: none; }

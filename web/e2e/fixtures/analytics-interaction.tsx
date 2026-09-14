@@ -6,6 +6,7 @@ import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/app-shell.css';
 import '../../src/styles/metrics.css';
+import '../../src/operator/operator.css';
 const timestamps = [1700000000000,1700003600000,1700007200000,1700010800000];
 const noSamples = { timestamps: [], trend: [], formatSample: () => { throw new Error('An absent trend has no sample to format'); } };
 createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><main className="app-main-content"><section className="usage-page"><div className="metrics usage-metrics"><AnalyticsMetric label="Requests" value="17" timestamps={timestamps} trend={[2, null, 10, 5]} timeZone="UTC"/><AnalyticsMetric label="All zero" value="0" timestamps={timestamps} trend={[0,0,0,0]} timeZone="UTC"/><AnalyticsMetric label="No source" value="—" {...noSamples}/></div></section></main></MtcFluentProvider></I18nProvider>);
