@@ -106,6 +106,33 @@ table.request-table .request-model-cell code {
   overflow-wrap: anywhere;
 }
 
+.request-model-facts {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem 0.65rem;
+  margin-top: 0.35rem;
+}
+
+.request-model-facts > span {
+  color: var(--text-strong, #f1fbfc);
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums lining-nums;
+  white-space: nowrap;
+}
+
+.request-model-facts > span + span {
+  color: #d6bd72;
+}
+
+:root[data-theme='light'] .request-model-facts > span {
+  color: #17343a;
+}
+
+:root[data-theme='light'] .request-model-facts > span + span {
+  color: #765d16;
+}
+
 :root[data-theme='light'] table.request-table .request-model-cell code {
   color: #17343a;
 }
@@ -194,6 +221,12 @@ table.request-table .request-model-cell code {
   color: var(--text-strong, #f1fbfc);
   font-variant-numeric: tabular-nums lining-nums;
   white-space: nowrap;
+}
+
+.request-table .request-secondary-heading,
+.request-table .request-token-cell,
+.request-table .request-cost-cell {
+  display: none;
 }
 
 :root[data-theme='light'] .request-cost-cell {
