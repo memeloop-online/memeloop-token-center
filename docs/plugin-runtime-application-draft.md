@@ -11,8 +11,11 @@ The file maps opaque inventory IDs to `{"root":"/absolute/revision/root",
 "format_version":1,"source":"<approved OCI repository>",
 "digest":"sha256:<approved artifact digest>",
 "signature_policy":"cosign-public-key"}}}]}}`.
-Grants are independently approved host input, not values supplied by management
-requests. The inventory is re-read on discovery, staging and revision pinning.
+Grants are independently approved host input, or derived after a global
+administrator approves the exact signed-install review through the
+[Operator installation workflow](operator-plugin-installation.md). Management
+requests never supply filesystem roots, trust keys or raw grant identities.
+The inventory is re-read on discovery, staging and revision pinning.
 Atomically append new IDs to this file after installation on every replica;
 neither new contributions nor publication/rollback require a rebuild or restart.
 Observed IDs, grants and roots cannot be changed or removed. The file is bounded
@@ -27,8 +30,9 @@ valid and exposes an empty management status. Before the first publication,
 requests pin the startup runtime. After publication, failures never fall back to
 it. A configured malformed inventory fails startup; binaries built without the
 feature reject the inventory option rather than silently ignoring it.
-Installation remains a trusted host/installer operation, not a browser upload or
-an arbitrary filesystem/URL management API.
+Installation uses the trusted host-configured installer, either from the CLI or
+the global Operator/API workflow. It is not a browser upload or arbitrary
+filesystem/URL execution API.
 
 ## Authority and request ownership
 
@@ -128,8 +132,9 @@ Retry re-verifies the signature and compares the complete installed package
 against fresh verified artifact bytes (manifest, component, assets and receipt);
 only exact matches can continue to registration. An existing identical inventory
 entry is a successful replay; differing bytes or grants never get overwritten.
-This PR supplies the CLI registration and existing Control activation chain;
-browser installation/upload and revision-log presentation are separate surfaces.
+The Operator Plugins page also exposes signed-reference installation, explicit
+review approval, current/candidate versions, publication, rollback and actor
+audit. Browser file uploads remain unsupported.
 
 ## Verification and remaining deployment gate
 

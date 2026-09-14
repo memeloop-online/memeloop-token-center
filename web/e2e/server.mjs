@@ -324,7 +324,7 @@ upstream.listen(mockPort, '127.0.0.1', () => {
     prebuiltBinary || 'cargo',
     prebuiltBinary
       ? ['serve', '--role', 'all']
-      : ['run', '--quiet', '--manifest-path', join(repositoryRoot, 'Cargo.toml'), '--bin', 'memeloop-token-center', '--', 'serve', '--role', 'all'],
+      : ['run', '--quiet', '--manifest-path', join(repositoryRoot, 'Cargo.toml'), '--features', 'experimental-plugin-revisions', '--bin', 'memeloop-token-center', '--', 'serve', '--role', 'all'],
     {
       cwd: repositoryRoot,
       env: {
