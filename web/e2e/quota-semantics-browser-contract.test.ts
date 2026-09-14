@@ -44,7 +44,7 @@ test('failed quota refresh labels retained zeroes as historical and hides unobse
     assert.doesNotMatch(await page.locator('[data-case="missing-balance"]').innerText(), /balance/i, 'a credits source without its balance field does not imply a zero balance');
 
     await retained.locator('[data-quota-evidence="code:primary_window"]').click();
-    const evidence = page.getByText(/OpenAI Codex usage endpoint · Raw window ID: code:primary_window · Raw source: codex_usage/);
+    const evidence = page.getByRole('tooltip').filter({ hasText: /OpenAI Codex usage endpoint · Raw window ID: code:primary_window · Raw source: codex_usage/ });
     await evidence.waitFor();
 
     const unobserved = page.locator('[data-case="unobserved"]');
