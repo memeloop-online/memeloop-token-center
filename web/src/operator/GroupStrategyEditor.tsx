@@ -15,8 +15,8 @@ export interface GroupRoutingStrategyOption {
 }
 
 /** Parent keys by tenant, token, kind and group. Refresh never discards edits. */
-export function GroupStrategyEditor({ kind, token, tenant, group, onChanged }: {
-  kind: 'provider' | 'route'; token: string; tenant: string; group: GroupView; onChanged: () => Promise<void>;
+export function GroupStrategyEditor({ kind, token, tenant, group, onChanged, onSaved }: {
+  kind: 'provider' | 'route'; token: string; tenant: string; group: GroupView; onChanged: () => Promise<void>; onSaved?: (group: GroupView) => void;
 }) {
   const { locale, t } = useI18n();
   const [catalog, setCatalog] = useState<GroupRoutingStrategyOption[]>([]);
@@ -32,6 +32,9 @@ export function GroupStrategyEditor({ kind, token, tenant, group, onChanged }: {
   const [message, setMessage] = useState('');
   const [needsRefresh, setNeedsRefresh] = useState(false);
   const mounted = useRef(true);
+  useEffect(() => {
+    setSnapshot(current => group.updated_at > current.updated_at ? group : current);
+  }, [group]);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   useEffect(() => {
     const controller = new AbortController();
@@ -51,7 +54,7 @@ export function GroupStrategyEditor({ kind, token, tenant, group, onChanged }: {
     const current = groups.find(value => value.id === group.id);
     if (!current) throw new Error(t('groups.strategyMissingGroup'));
     if (!mounted.current) return;
-    setSnapshot(current); setNeedsRefresh(false);
+    setSnapshot(current); onSaved?.(current); setNeedsRefresh(false);
     await onChanged();
   }
   async function save(formData: Record<string, unknown>) {
@@ -64,7 +67,7 @@ export function GroupStrategyEditor({ kind, token, tenant, group, onChanged }: {
           routing_strategy: pluginId ? { plugin_id: pluginId, config: formData } : null }),
       });
       if (!mounted.current) return;
-      setSnapshot(saved); setMessage(t('groups.strategySaved'));
+      setSnapshot(saved); onSaved?.(saved); setMessage(t('groups.strategySaved'));
       await onChanged();
     } catch (reason) {
       if (!mounted.current) return;

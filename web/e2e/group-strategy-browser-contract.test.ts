@@ -28,8 +28,8 @@ test('group strategy schema validation, CAS refresh preservation, native reset a
         await route.fulfill({ json: [{ id: 'weighted', version: 'group-routing-v1', default: { factor: 3 }, schema: { type: 'object', required: ['factor'], properties: { factor: { type: 'integer', title: 'Weight factor', minimum: 1 } } } }] });
       } else if (route.request().method() === 'PUT') {
         writes.push(route.request().postDataJSON());
-        await route.fulfill(writes.length === 1 ? { status: 409, json: { error: { message: 'conflict' } } } : { json: { id: 'group', updated_at: 4, strategy_version: 5 } });
-      } else await route.fulfill({ json: [{ id: 'group', updated_at: 3, strategy_version: 4 }] });
+        await route.fulfill(writes.length === 1 ? { status: 409, json: { error: { message: 'conflict' } } } : { json: { id: 'group', name: 'Group', member_ids: [], member_count: 0, created_at: 1, updated_at: 4, strategy_version: 5 } });
+      } else await route.fulfill({ json: [{ id: 'group', name: 'Group', member_ids: [], member_count: 0, created_at: 1, updated_at: 3, strategy_version: 4 }] });
     });
     const base = `http://127.0.0.1:${address.port}/e2e/fixtures/group-strategy.html`;
     await page.goto(base);
@@ -72,6 +72,7 @@ test('group strategy schema validation, CAS refresh preservation, native reset a
     const listGate = new Promise<void>(resolve => { releaseList = resolve; });
     const oldGroup = { id: 'group', name: 'CSiL', member_ids: ['sol', 'terra', 'luna'], member_count: 3, created_at: 1, updated_at: 1 };
     let newGroup = { id: 'new-group', name: 'Kimi models', member_ids: [] as string[], member_count: 0, created_at: 2, updated_at: 2 };
+    const staleNewGroup = { ...newGroup };
     const memberWrites: { path: string; body: Record<string, any> }[] = [];
     await page.route('**/internal/v1/**', async route => {
       const request = route.request(), path = new URL(request.url()).pathname;
@@ -79,12 +80,13 @@ test('group strategy schema validation, CAS refresh preservation, native reset a
       if (request.method() === 'POST') return route.fulfill({ status: 201, json: newGroup });
       if (request.method() === 'PUT') {
         const body = request.postDataJSON(); memberWrites.push({ path, body });
-        if (path.endsWith('/members')) newGroup = { ...newGroup, member_ids: body.member_ids, member_count: body.member_ids.length, updated_at: 4 };
+        if (path.endsWith('/routing-strategy')) newGroup = { ...newGroup, updated_at: 5 };
+        else if (path.endsWith('/members')) newGroup = { ...newGroup, member_ids: body.member_ids, member_count: body.member_ids.length, updated_at: 4 };
         else newGroup = { ...newGroup, name: body.name, updated_at: 3 };
         return route.fulfill({ json: newGroup });
       }
       listStarted(); await listGate;
-      await route.fulfill({ json: [oldGroup, newGroup] });
+      await route.fulfill({ json: [oldGroup, staleNewGroup] });
     });
     await page.goto(`${base}?lifecycle=1`);
     await page.locator('.selection-chip-label').filter({ hasText: 'sol' }).waitFor();
@@ -97,19 +99,26 @@ test('group strategy schema validation, CAS refresh preservation, native reset a
     releaseList();
     await page.waitForFunction(() => !document.querySelector<HTMLButtonElement>('.group-editor-actions button')?.disabled);
     assert.equal(await page.locator('.group-list .active').innerText(), 'Kimi models\n0 members');
+    const members = page.getByRole('combobox', { name: 'Provider members' });
+    await members.fill('kimi'); await members.press('Enter'); await members.press('Escape');
     await page.locator('.group-rename input').fill('Kimi renamed');
     await page.locator('.group-rename').getByRole('button', { name: 'Save', exact: true }).click();
     await page.locator('.group-list .active').filter({ hasText: 'Kimi renamed' }).waitFor();
     await page.waitForFunction(() => !document.querySelector<HTMLButtonElement>('.group-editor-actions button')?.disabled);
-    const members = page.getByRole('combobox', { name: 'Provider members' });
-    await members.fill('kimi'); await members.press('Enter'); await members.press('Escape');
+    assert.equal(await page.locator('.group-rename input').inputValue(), 'Kimi renamed', 'stale CAS2 list cannot revert the successful CAS3 rename');
+    assert.deepEqual(await page.locator('.selection-chip-label').allTextContents(), ['kimi'], 'rename and stale list preserve unsaved member draft');
     await page.getByRole('button', { name: 'Save members', exact: true }).click();
     await page.getByText('Group members saved', { exact: true }).waitFor();
     assert.deepEqual(memberWrites, [
       { path: '/internal/v1/provider-groups/new-group', body: { tenant_external_id: 'tenant', name: 'Kimi renamed', expected_updated_at: 2 } },
       { path: '/internal/v1/provider-groups/new-group/members', body: { tenant_external_id: 'tenant', member_ids: ['kimi'], expected_updated_at: 3 } },
     ], 'rename and member saves target only the created group with its latest CAS');
+    await page.waitForFunction(() => !document.querySelector<HTMLButtonElement>('.group-editor-actions button')?.disabled);
     assert.deepEqual(await page.locator('.selection-chip-label').allTextContents(), ['kimi']);
+    await page.getByRole('button', { name: 'Save group strategy', exact: true }).click();
+    await page.getByText('Group strategy saved', { exact: true }).waitFor();
+    assert.equal(memberWrites[2].path, '/internal/v1/provider-groups/new-group/routing-strategy');
+    assert.equal(memberWrites[2].body.expected_updated_at, 4, 'strategy CAS adopts the authoritative member-save revision despite stale list reads');
     const ordering = await page.evaluate(() => document.querySelector('.group-editor-actions')!.compareDocumentPosition(document.querySelector('.group-strategy-editor')!));
     assert.ok(ordering & 4, 'member editing precedes advanced strategy configuration');
 
