@@ -162,7 +162,7 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
     let b_root = directory.join("inventory-b");
     write_inventory(&a_root, false);
     write_inventory(&b_root, true);
-    let mut config = Config::for_test(database_url);
+    let mut config = Config::for_test(database_url.clone());
     config.plugin_dir = a_root.to_str().map(str::to_owned);
     let first = AppState::initialize(config.clone()).await.unwrap();
     let trusted = inventory(&first.db, &[("a", a_root.clone()), ("b", b_root.clone())]);
@@ -216,17 +216,19 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
 
     // A matching revision number is not sufficient authority for a warm hit.
     // Simulate a corrupt/mismatched primary receipt without touching the package.
+    let inspection_pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
     sqlx::query("UPDATE application_plugin_candidates SET identity_digest = 'mismatched' WHERE inventory_id = 'a'")
-        .execute(&first.db.pool).await.unwrap();
+        .execute(&inspection_pool).await.unwrap();
     assert!(authority_a.pin().await.is_err());
     sqlx::query(
         "UPDATE application_plugin_candidates SET identity_digest = $1 WHERE inventory_id = 'a'",
     )
     .bind(&initial.receipt.identity_digest)
-    .execute(&first.db.pool)
+    .execute(&inspection_pool)
     .await
     .unwrap();
     assert!(Arc::ptr_eq(&initial, &authority_a.pin().await.unwrap()));
+    inspection_pool.close().await;
 
     // A request is blocked after policy; B publishes while it is parked. No
     // sleeps, time thresholds, or notification delivery are involved.
