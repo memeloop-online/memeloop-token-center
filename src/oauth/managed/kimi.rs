@@ -11,7 +11,7 @@ use crate::{
 pub const PROVIDER_DRIVER: &str = "kimi-oauth";
 pub const BASE_URL: &str = "https://api.kimi.com/coding";
 pub const TOKEN_ENDPOINT: &str = "https://auth.kimi.com/api/oauth/token";
-const CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
+pub(crate) const CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const SCHEMA: &str = "kimi-oauth-v1";
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -177,7 +177,14 @@ pub(crate) fn apply_headers(
         .and_then(|v| v["device_id"].as_str())
         .filter(|v| !v.is_empty())
         .unwrap_or("cli-proxy-api-device");
-    Ok(request
+    Ok(apply_device_headers(request, device))
+}
+
+pub(crate) fn apply_device_headers(
+    request: reqwest::RequestBuilder,
+    device: &str,
+) -> reqwest::RequestBuilder {
+    request
         .header(
             "User-Agent",
             concat!("memeloop-token-center/", env!("CARGO_PKG_VERSION")),
@@ -186,7 +193,7 @@ pub(crate) fn apply_headers(
         .header("X-Msh-Version", env!("CARGO_PKG_VERSION"))
         .header("X-Msh-Device-Name", "memeloop-token-center")
         .header("X-Msh-Device-Model", "Linux")
-        .header("X-Msh-Device-Id", device))
+        .header("X-Msh-Device-Id", device)
 }
 
 #[derive(Deserialize)]

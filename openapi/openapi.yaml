@@ -2395,6 +2395,70 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '502': { $ref: '#/components/responses/UpstreamError' }
 
+  /internal/v1/oauth/kimi/start:
+    post:
+      tags: [Upstream providers]
+      operationId: startKimiOAuth
+      summary: Start native Kimi Code device authorization
+      security: [{ serviceBearer: [] }]
+      x-required-scope: oauth:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StartKimiOAuthRequest' }
+      responses:
+        '200':
+          description: Expiring device code and encrypted operator-bound session.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KimiDeviceLoginStart' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /internal/v1/oauth/kimi/poll:
+    post:
+      tags: [Upstream providers]
+      operationId: pollKimiOAuth
+      summary: Poll Kimi authorization and preserve the selected upstream identity
+      description: Reauthorization preserves the selected MTC account ID, name, configuration and proxy with generation CAS. Kimi device IDs are not subscriber identity proofs. The operator must authorize the intended subscription; completion is audited and never silently creates a replacement account.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: oauth:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OAuthPollRequest' }
+      responses:
+        '200':
+          description: Existing upstream reauthorized or completed session replayed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
+        '201':
+          description: Native upstream created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
+        '202':
+          description: Waiting for authorization; respect retry_after_seconds, including slow-down responses.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, retry_after_seconds]
+                properties:
+                  status: { const: pending }
+                  retry_after_seconds: { type: integer, minimum: 1 }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
   /internal/v1/oauth/copilot/start:
     post:
       tags: [Upstream providers]
@@ -6469,7 +6533,7 @@ components:
         api_version: { type: string, enum: [oauth-adapter-v1] }
         flow_kind:
           type: string
-          enum: [cursor_pkce, openai_device, claude_manual_pkce, github_device_copilot]
+          enum: [cursor_pkce, openai_device, claude_manual_pkce, github_device_copilot, kimi_device]
         login_url: { type: string, format: uri }
         poll_url: { type: string, format: uri }
         refresh_url: { type: string, format: uri }
@@ -6892,6 +6956,27 @@ components:
         session_token: { type: string, writeOnly: true, description: Authenticated, encrypted login state bound to the tenant and operator credential. }
         expires_at: { type: integer, format: int64 }
         security_notice: { const: paste_only_the_code_from_the_login_you_started }
+    StartKimiOAuthRequest:
+      type: object
+      additionalProperties: false
+      required: [account_name]
+      properties:
+        tenant_external_id: { type: string, default: default }
+        account_name: { type: string, minLength: 1 }
+        upstream_account_id: { type: string, format: uuid, description: Existing native Kimi upstream to reauthorize without changing its name or configuration. }
+        proxy_url: { type: string, writeOnly: true, description: Optional account SOCKS5H proxy for creation by a global operator. Reauthorization uses the current account proxy and rejects this field. }
+    KimiDeviceLoginStart:
+      type: object
+      additionalProperties: false
+      required: [driver, verification_url, user_code, session_token, expires_at, poll_after_seconds, security_notice]
+      properties:
+        driver: { const: kimi-oauth }
+        verification_url: { type: string, format: uri }
+        user_code: { type: string, minLength: 1 }
+        session_token: { type: string, writeOnly: true }
+        expires_at: { type: integer, format: int64 }
+        poll_after_seconds: { type: integer, minimum: 5 }
+        security_notice: { const: only_continue_if_you_started_this_login }
     StartCopilotOAuthRequest:
       type: object
       additionalProperties: false

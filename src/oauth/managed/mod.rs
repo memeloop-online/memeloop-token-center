@@ -10,7 +10,7 @@ fn invalid_document(kind: &str) -> AppError {
     AppError::BadRequest(format!("{kind} OAuth document is invalid"))
 }
 
-fn required_secret(value: &str, kind: &str) -> Result<(), AppError> {
+pub(super) fn required_secret(value: &str, kind: &str) -> Result<(), AppError> {
     if value.is_empty()
         || value.len() > MAX_TOKEN_BYTES
         || value.trim() != value

@@ -11,6 +11,7 @@ mod oauth;
 mod oauth_authorization_code;
 mod oauth_claude;
 mod oauth_copilot;
+mod oauth_kimi;
 mod proxy_settings;
 mod quota;
 
@@ -53,3 +54,4 @@ pub(in crate::api) use oauth_authorization_code::{
 pub(in crate::api) use oauth_claude::{complete_claude_oauth, start_claude_oauth};
 pub(crate) use oauth_copilot::trigger_copilot_remint_on_auth_failure;
 pub(in crate::api) use oauth_copilot::{poll_copilot_oauth, start_copilot_oauth};
+pub(in crate::api) use oauth_kimi::{poll_kimi_oauth, start_kimi_oauth};

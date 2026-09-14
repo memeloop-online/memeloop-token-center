@@ -54,6 +54,7 @@ pub(super) fn upstream_can_reauthorize(
                     | "openai_codex_device"
                     | "anthropic_claude_manual_pkce"
                     | "github_copilot_device"
+                    | "kimi-oauth"
             )
         )
 }

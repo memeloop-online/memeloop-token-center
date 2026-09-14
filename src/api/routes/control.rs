@@ -111,6 +111,8 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             "/internal/v1/oauth/claude/complete",
             post(complete_claude_oauth),
         )
+        .route("/internal/v1/oauth/kimi/start", post(start_kimi_oauth))
+        .route("/internal/v1/oauth/kimi/poll", post(poll_kimi_oauth))
         .route(
             "/internal/v1/oauth/copilot/start",
             post(start_copilot_oauth),
