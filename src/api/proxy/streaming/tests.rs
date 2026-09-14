@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn ready_upstream_evidence_wins_once_when_downstream_is_already_closed() {
+async fn ready_upstream_evidence_wins_when_downstream_is_already_closed() {
     let (body_sender, body_receiver) = tokio::sync::mpsc::channel(1);
     drop(body_receiver);
 
@@ -13,7 +13,7 @@ async fn ready_upstream_evidence_wins_once_when_downstream_is_already_closed() {
             assert_eq!(value, "terminal");
             assert!(
                 downstream_closed,
-                "the caller must stop after preserving the one ready item"
+                "the caller must restrict follow-up polls to pending sanitizer evidence"
             );
         }
         DownstreamAwarePoll::DownstreamClosed => {

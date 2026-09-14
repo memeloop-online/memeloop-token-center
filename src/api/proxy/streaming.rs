@@ -21,11 +21,11 @@ async fn poll_upstream_or_downstream_closed<T>(
     upstream: impl std::future::Future<Output = T>,
 ) -> DownstreamAwarePoll<T> {
     tokio::select! {
-        // If both sides became ready before this poll, retain one already
-        // available upstream item. It may contain the authoritative completed
+        // If both sides became ready before this poll, retain the already
+        // available upstream item. It may contain authoritative completed
         // usage needed for settlement. The caller observes `is_closed` and
-        // stops after that single item, so a continuously ready upstream can
-        // never turn cancellation into an unbounded drain.
+        // only polls again to finish protocol evidence already buffered by the
+        // sanitizer; a pending provider read loses immediately to `closed`.
         biased;
         value = upstream => DownstreamAwarePoll::Upstream {
             value,
@@ -181,9 +181,10 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let mut terminal_memory = background_state
                 .metrics
                 .memory_usage(crate::metrics::MemoryComponent::StreamCapture, 0);
+            let mut downstream_closed_observed = false;
+            let mut downstream_ready_bytes = 0_usize;
             loop {
                 let mut flushing_terminal = false;
-                let mut downstream_closed_after_poll = false;
                 let next = if let Some(chunk) = terminal_delivery.take_pending() {
                     flushing_terminal = true;
                     Some(Ok(chunk))
@@ -200,7 +201,10 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             value: next,
                             downstream_closed,
                         }) => {
-                            downstream_closed_after_poll = downstream_closed;
+                            downstream_closed_observed |= downstream_closed;
+                            if downstream_closed {
+                                drop(archive_sender.take());
+                            }
                             next
                         }
                         Ok(DownstreamAwarePoll::DownstreamClosed) => {
@@ -226,14 +230,14 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                     }
                 };
                 let Some(next) = next else {
-                    if downstream_closed_after_poll {
-                        transport_error = Some("downstream_disconnected");
-                        drop(archive_sender.take());
-                        break;
-                    }
                     match terminal_delivery.finish_at_eof(responses_streaming_sanitizer.as_mut()) {
                         TerminalEof::Flush => continue,
-                        TerminalEof::Complete => break,
+                        TerminalEof::Complete => {
+                            if downstream_closed_observed {
+                                transport_error = Some("downstream_disconnected");
+                            }
+                            break;
+                        }
                         TerminalEof::Error(error_code) => {
                             let protocol_rejection_stage = responses_streaming_sanitizer
                                 .as_ref()
@@ -263,6 +267,17 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 };
                 match next {
                     Ok(raw_chunk) => {
+                        if downstream_closed_observed && !flushing_terminal {
+                            downstream_ready_bytes =
+                                downstream_ready_bytes.saturating_add(raw_chunk.len());
+                            if downstream_ready_bytes
+                                > crate::api::limits::MAX_RESPONSES_SSE_TERMINAL_HOLD_BYTES
+                            {
+                                transport_error = Some("downstream_disconnected");
+                                drop(archive_sender.take());
+                                break;
+                            }
+                        }
                         if !raw_chunk.is_empty()
                             && let Some(phase) = first_byte.take()
                         {
@@ -333,7 +348,10 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         // SSE event. Empty partial output must not occupy the
                         // bounded archive channel or cancel a healthy archive.
                         if chunk.is_empty() {
-                            if downstream_closed_after_poll {
+                            let terminal_evidence_pending = responses_streaming_sanitizer
+                                .as_ref()
+                                .is_some_and(|sanitizer| sanitizer.has_pending_delivery());
+                            if downstream_closed_observed && !terminal_evidence_pending {
                                 transport_error = Some("downstream_disconnected");
                                 drop(archive_sender.take());
                                 break;
@@ -383,6 +401,19 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         {
                             tracing::warn!(%request_id, stage = "response_spool_ack", "proxy archive gap");
                             drop(archive_sender.take());
+                        }
+                        // A successful Responses terminal is held privately
+                        // until EOF validates its tail. Once the receiver is
+                        // gone, do not attempt more downstream sends, but do
+                        // allow immediately-ready fragments/EOF to complete
+                        // that already-started evidence. The next pending read
+                        // is interrupted by `body_sender.closed()` above.
+                        if downstream_closed_observed
+                            && responses_streaming_sanitizer
+                                .as_ref()
+                                .is_some_and(|sanitizer| sanitizer.has_pending_delivery())
+                        {
+                            continue;
                         }
                         for frame in delivery_frames {
                             let frame = match terminal_frames.hold(frame) {
@@ -443,7 +474,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             }
                             break;
                         }
-                        if downstream_closed_after_poll {
+                        if downstream_closed_observed {
                             transport_error = Some("downstream_disconnected");
                             drop(archive_sender.take());
                             break;
