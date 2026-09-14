@@ -530,12 +530,11 @@ mod tests {
     #[tokio::test]
     async fn slow_poll_uses_response_clock_and_cannot_stage_after_expiry() {
         let directory = tempfile::tempdir().unwrap();
-        let db = Database::connect(&format!(
+        let database_url = format!(
             "sqlite://{}?mode=rwc",
             directory.path().join("clock.db").display()
-        ))
-        .await
-        .unwrap();
+        );
+        let db = Database::connect(&database_url).await.unwrap();
         db.migrate().await.unwrap();
         let server = MockServer::start().await;
         let http = crate::build_no_retry_http_client(None, &[]).unwrap();
@@ -639,11 +638,12 @@ mod tests {
             Err(AppError::BadRequest(message)) if message == "Kimi authorization expired")
         );
         let session: Session = open_private_json(&started.session_token, key, SESSION_AAD).unwrap();
+        let audit_pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
         let (status, ready): (String, Option<String>) = sqlx::query_as(
             "SELECT status, ready_ciphertext FROM oauth_login_sessions WHERE id = $1",
         )
         .bind(session.session_id.to_string())
-        .fetch_one(&db.pool)
+        .fetch_one(&audit_pool)
         .await
         .unwrap();
         assert_eq!(status, "failed");
