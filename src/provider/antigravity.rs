@@ -283,10 +283,10 @@ pub fn image_request(model: &str, project: &str, mut request: Value) -> Result<V
     let object = request
         .as_object_mut()
         .ok_or_else(|| AppError::BadRequest("Gemini image request must be an object".into()))?;
-    if !object
+    if object
         .get("contents")
         .and_then(Value::as_array)
-        .is_some_and(|contents| !contents.is_empty())
+        .is_none_or(|contents| contents.is_empty())
     {
         return Err(AppError::BadRequest(
             "Gemini image contents are required".into(),
