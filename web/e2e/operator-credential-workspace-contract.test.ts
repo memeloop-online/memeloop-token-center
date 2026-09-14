@@ -72,6 +72,11 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     await allTenants.goto(fixture('all-tenants'));
     await allTenants.getByText('All tenant client', { exact: true }).waitFor();
     await allTenants.getByText('Tenant: tenant-visible', { exact: false }).waitFor();
+    const allTenantBalance = allTenants.getByText('Available:', { exact: false });
+    assert.equal(await allTenantBalance.count(), 1);
+    assert.doesNotMatch(await allTenantBalance.innerText(), /9,223,372,036,854/, 'a large prepaid balance stays compact in the row');
+    assert.match(await allTenantBalance.getAttribute('title') ?? '', /9,223,372,036,854\.775807/, 'the complete prepaid balance remains available in the tooltip');
+    assert.equal(await allTenants.getByText('key-all', { exact: true }).count(), 0, 'technical credential IDs are not part of the list reading path');
     await allTenants.getByRole('button', { name: 'More actions', exact: true }).click();
     assert.equal(await allTenants.getByRole('menuitem', { name: 'Rename', exact: true }).isDisabled(), true);
     const limits = allTenants.getByRole('menuitem', { name: 'Current limit state', exact: true });
@@ -91,6 +96,7 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     await recovery.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await recovery.goto(fixture('client-recovery'));
     await recovery.getByText('Recoverable client', { exact: true }).waitFor();
+    await recovery.getByText('Unlimited (metered)', { exact: true }).waitFor();
     await recovery.getByRole('button', { name: 'Copy credential', exact: true }).click();
     await recovery.getByRole('status').filter({ hasText: 'Copied Recoverable client credential.' }).waitFor();
     assert.equal(await recovery.getByRole('dialog').count(), 0, 'copy does not add a recovery confirmation');

@@ -21,6 +21,8 @@ test('service credential copying uses original values and explains unavailable o
       await page.goto(`${origin}/e2e/fixtures/operator-credential-workspace.html?scenario=service-copy&${mode}`);
       const copy = page.locator('.managed-resource').getByRole('button', { name: 'Copy credential', exact: true });
       await copy.waitFor();
+      assert.equal(await page.getByText('Not billed', { exact: true }).count(), 1);
+      assert.equal(await page.getByText('service-existing', { exact: true }).count(), 0, 'technical service identifiers stay in the tooltip');
       if (mode === 'unavailable') {
         assert.equal(await copy.isEnabled(), false);
         await copy.locator('..').focus();

@@ -87,7 +87,7 @@ Then('管理员可以重命名凭据并查看当前限制状态', async function
   const page = this.requirePage();
   const seed = runtime.requireSeed();
   await openAppRoute(page, 'operator', 'credentials');
-  const resource = page.locator('.managed-resource').filter({ hasText: seed.clientKeyId });
+  const resource = page.locator('.managed-resource').filter({ has: page.locator(`b[title*="${seed.clientKeyId}"]`) });
   await assertContains(resource, 'Browser E2E credential');
 
   await resource.getByRole('button', { name: '更多操作', exact: true }).click();
