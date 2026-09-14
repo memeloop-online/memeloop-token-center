@@ -11,7 +11,7 @@ test('manual schemas are fetched only when the collapsed editor is opened', () =
   assert.match(page, /Boolean\(token\) && schemasRequested/);
   assert.match(page, /onRequestSchemas=\{\(\) => setSchemasRequested\(true\)\}/);
   assert.match(page, /schemas=\{resource\.state\.kind === 'ready' \? resource\.state\.value : undefined\}/);
-  assert.match(pricing, /onToggle=\{\(event\) => \{ if \(event\.currentTarget\.open\) onRequestSchemas\?\.\(\); \}\}/);
+  assert.match(pricing, /onOpen=\{\(\) => onRequestSchemas\?\.\(\)\}/);
 });
 
 test('pricing usage is scope-only and independent from currency price requests', () => {

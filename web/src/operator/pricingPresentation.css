@@ -1,16 +1,30 @@
 .token-pricing-scroll { max-width: 100%; overflow-x: auto; }
-.token-pricing-scroll:focus-visible, .price-provenance summary:focus-visible { outline: 2px solid var(--accent, #219b8a); outline-offset: -2px; }
-.token-pricing-table { min-width: 960px; font-variant-numeric: tabular-nums; }
+.token-pricing-scroll:focus-visible, .price-provenance:focus-visible { outline: 2px solid var(--accent, #219b8a); outline-offset: 2px; }
+.token-pricing-table { min-width: 840px; font-variant-numeric: tabular-nums; }
 .token-pricing-table th, .token-pricing-table td { vertical-align: top; padding: 12px; }
-.token-pricing-table th:first-child, .token-pricing-table td:first-child { position: sticky; left: 0; z-index: 1; background: var(--picker-surface); min-width: 140px; max-width: 240px; box-shadow: 1px 0 var(--picker-border); }
-.token-pricing-table td:first-child code { white-space: normal; overflow-wrap: anywhere; }
-.token-pricing-table th:nth-child(n+4):nth-child(-n+7), .token-pricing-table td:nth-child(n+4):nth-child(-n+7) { text-align: right; white-space: nowrap; }
-.token-pricing-table td small { display: block; color: var(--picker-muted); }
-.token-pricing-table td:last-child { min-width: 150px; }
-.price-provenance { min-width: 130px; max-width: 260px; }
-.price-provenance summary { cursor: pointer; min-height: 44px; padding: 8px 0; color: var(--picker-text); }
-.price-provenance > div { display: grid; gap: 6px; padding: 8px; border: 1px solid var(--picker-border); }
-.price-provenance code { white-space: normal; overflow-wrap: anywhere; font-size: 12px; }
+.token-pricing-table th:first-child, .token-pricing-table td:first-child { position: sticky; left: 0; z-index: 1; background: var(--colorNeutralBackground1, var(--picker-surface)); min-width: 170px; max-width: 250px; }
+.pricing-page .pricing-model-name { color: var(--colorNeutralForeground1, var(--text)); display: block; font-size: 13px; font-weight: 600; white-space: normal; overflow-wrap: anywhere; }
+.token-pricing-table th:nth-child(n+2):nth-child(-n+6), .token-pricing-table td:nth-child(n+2):nth-child(-n+6) { text-align: right; white-space: nowrap; }
+.token-pricing-table td small, .token-pricing-table td time { display: block; margin-top: 5px; color: var(--colorNeutralForeground2, var(--picker-muted)); font-size: 12px; }
+.token-pricing-table td:last-child { min-width: 125px; }
+.price-provenance { color: var(--colorNeutralForeground1, var(--picker-text)); cursor: help; font-size: 12px; overflow-wrap: anywhere; }
+.pricing-list-controls { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; margin: 18px 0 10px; }
+.pricing-list-controls label { display: grid; gap: 6px; min-width: 160px; }
+.pricing-list-controls label:first-child { flex: 1; min-width: 220px; }
+.pricing-table-caption { color: var(--colorNeutralForeground2, var(--picker-muted)); font-size: 12px; }
+.pricing-page .pricing-summary span { border: 0; background: transparent; padding: 0; color: var(--colorNeutralForeground2, var(--picker-muted)); font-size: 12px; }
+.pricing-page .pricing-summary { gap: 8px 24px; }
+.pricing-page .manual-pricing { border: 0; background: transparent; margin: 12px 0; padding: 0; }
+.pricing-page .manual-pricing .journey-heading { padding: 0; }
+.pricing-page .manual-pricing .create-resource-body { border: 0; padding: 0; }
+.pricing-page .manual-pricing-body { border: 0; max-width: 760px; padding: 0; }
+.pricing-page .manual-pricing-body > label { display: grid; gap: 6px; margin: 12px 0; }
+.pricing-page .manual-pricing[data-open='true'] { padding: 16px 0; border-block: 1px solid var(--colorNeutralStroke2, var(--picker-border)); }
+.pricing-page .source-card { border: 0; background: transparent; }
+.pricing-page .candidate-list > div { border: 0; }
+.pricing-page > article + article { margin-top: 20px; }
+.pricing-page > article:last-child code { color: var(--colorNeutralForeground1, var(--text)); }
 @media (max-width: 600px) {
-  .token-pricing-table th:first-child, .token-pricing-table td:first-child { min-width: 120px; max-width: 150px; }
+  .token-pricing-table th:first-child, .token-pricing-table td:first-child { min-width: 140px; max-width: 170px; }
+  .pricing-list-controls > label { width: 100%; min-width: 0; }
 }
