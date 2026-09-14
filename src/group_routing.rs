@@ -18,6 +18,39 @@ type BucketMember = (
     i64,
 );
 type StrategyBuckets = BTreeMap<(std::cmp::Reverse<i32>, String), Vec<BucketMember>>;
+type CandidateKey = (Uuid, Uuid, i64);
+
+fn planned_candidate<'a>(
+    input: &'a GroupRoutingInput,
+    directive: &GroupRoutingDirective,
+) -> Option<&'a GroupRoutingCandidate> {
+    input.candidates.iter().find(|candidate| {
+        candidate.tenant_id == directive.tenant_id
+            && candidate.route_id == directive.route_id
+            && candidate.account_id == directive.account_id
+            && candidate.generation == directive.generation
+    })
+}
+
+fn reserve_native_bucket_ranks(
+    members: &[BucketMember],
+    ranks: &mut BTreeMap<CandidateKey, usize>,
+    next_rank: &mut usize,
+) -> usize {
+    let start = *next_rank;
+    for (_, candidate, _, _) in members {
+        ranks.insert(
+            (
+                candidate.route_id,
+                candidate.account_id,
+                candidate.credential_generation,
+            ),
+            *next_rank,
+        );
+        *next_rank += 1;
+    }
+    start
+}
 
 fn sort_plan_candidates(selection_seed: Uuid, directives: &mut [GroupRoutingDirective]) {
     // Stable sort preserves plugin order among non-sticky candidates.
@@ -147,13 +180,17 @@ async fn prepare_inner(
         .candidate_group_strategies(tenant_id, &candidate_ids)
         .await?
         .into_iter()
-        .map(|(route, account, binding)| ((route, account), binding))
+        .map(|(route, account, binding)| ((route, account, binding.generation), binding))
         .collect::<BTreeMap<_, _>>();
     if bindings.is_empty() {
         return Ok(());
     }
     for (index, candidate) in candidates.iter().enumerate() {
-        if let Some(binding) = bindings.get(&(candidate.route_id, candidate.account_id)) {
+        if let Some(binding) = bindings.get(&(
+            candidate.route_id,
+            candidate.account_id,
+            candidate.credential_generation,
+        )) {
             buckets
                 .entry((std::cmp::Reverse(binding.priority), binding.id.clone()))
                 .or_default()
@@ -169,6 +206,10 @@ async fn prepare_inner(
     let mut ranks = BTreeMap::new();
     let mut next_rank = 0usize;
     for ((_, group_id), members) in buckets {
+        // A broken strategy does not demote its high-priority group behind
+        // healthy lower-priority plugins. Reserve native order first, and
+        // replace only this bucket's slots after a validated plan succeeds.
+        let bucket_rank = reserve_native_bucket_ranks(&members, &mut ranks, &mut next_rank);
         if tokio::time::Instant::now() >= hook_deadline {
             tracing::warn!(%request_id, %group_id, stage="group_routing_native_fallback", "request group scheduling budget exhausted");
             continue;
@@ -182,7 +223,11 @@ async fn prepare_inner(
         let mut inputs = Vec::new();
         for (_, candidate, _, _) in &members {
             let health = match bindings
-                .get(&(candidate.route_id, candidate.account_id))
+                .get(&(
+                    candidate.route_id,
+                    candidate.account_id,
+                    candidate.credential_generation,
+                ))
                 .map(|binding| binding.health.as_str())
             {
                 Some("healthy") => GroupRoutingHealth::Healthy,
@@ -226,14 +271,8 @@ async fn prepare_inner(
                 // Sticky candidates form a deterministic, tenant/key/session
                 // seeded rendezvous tier. Others preserve plugin plan order.
                 sort_plan_candidates(selection_seed, &mut plan.candidates);
-                for directive in plan.candidates {
-                    let candidate = input
-                        .candidates
-                        .iter()
-                        .find(|candidate| {
-                            candidate.route_id == directive.route_id
-                                && candidate.account_id == directive.account_id
-                        })
+                for (position, directive) in plan.candidates.into_iter().enumerate() {
+                    let candidate = planned_candidate(&input, &directive)
                         .expect("validated exact candidate permutation")
                         .clone();
                     let key = (
@@ -241,8 +280,7 @@ async fn prepare_inner(
                         Uuid::parse_str(&directive.account_id).map_err(|_| AppError::Internal)?,
                         directive.generation as i64,
                     );
-                    ranks.insert(key, next_rank);
-                    next_rank += 1;
+                    ranks.insert(key, bucket_rank + position);
                     policies.insert(
                         key,
                         CandidatePolicy {

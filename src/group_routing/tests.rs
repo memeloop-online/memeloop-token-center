@@ -1,5 +1,118 @@
 use super::*;
 
+#[tokio::test]
+async fn blocked_snapshot_with_maximum_candidates_cannot_extend_frozen_deadline() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut state = AppState::initialize(crate::config::Config::for_test(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("blocked-groups.db").display()
+    )))
+    .await
+    .unwrap();
+    let held = state.db.hold_group_snapshot_pool_for_tests().await;
+    let tenant = Uuid::now_v7();
+    let mut candidates = (1..=1024)
+        .map(|id| AuthorizedUpstreamCandidate {
+            route_id: Uuid::from_u128(id),
+            account_id: Uuid::from_u128(id + 2048),
+            driver: "http-json".into(),
+            transport_revision: 1,
+            credential_generation: 1,
+        })
+        .collect::<Vec<_>>();
+    let before = candidates.clone();
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_millis(25);
+    prepare(
+        &mut state,
+        tenant,
+        Uuid::nil(),
+        Uuid::now_v7(),
+        deadline,
+        &mut candidates,
+    )
+    .await
+    .unwrap();
+    assert_eq!(tokio::time::Instant::now(), deadline);
+    assert_eq!(candidates, before);
+    assert!(state.group_routing.is_none());
+    drop(held);
+}
+
+#[test]
+fn reversed_plan_retains_exact_generation_and_health_snapshot() {
+    let tenant = Uuid::from_u128(1);
+    let route = Uuid::from_u128(2);
+    let account = Uuid::from_u128(3);
+    let first = policy(tenant, route, account);
+    let mut second = first.clone();
+    second.candidate.generation = 4;
+    second.candidate.health = GroupRoutingHealth::Authentication;
+    second.directive.generation = 4;
+    let input = GroupRoutingInput {
+        tenant_id: tenant.to_string(),
+        seed: 1,
+        remaining_deadline_ms: 1000,
+        config: serde_json::json!({}),
+        candidates: vec![first.candidate.clone(), second.candidate.clone()],
+    };
+    assert_eq!(
+        planned_candidate(&input, &second.directive),
+        Some(&second.candidate)
+    );
+    assert_eq!(
+        planned_candidate(&input, &first.directive),
+        Some(&first.candidate)
+    );
+}
+
+#[test]
+fn failed_high_priority_bucket_keeps_slots_before_success_and_native_tail() {
+    let member = |id| {
+        (
+            0,
+            AuthorizedUpstreamCandidate {
+                route_id: Uuid::from_u128(id),
+                account_id: Uuid::from_u128(id + 100),
+                driver: "http-json".into(),
+                transport_revision: 1,
+                credential_generation: 1,
+            },
+            crate::db::GroupRoutingStrategy {
+                plugin_id: "test".into(),
+                config: serde_json::json!({}),
+            },
+            1,
+        )
+    };
+    let high = vec![member(2), member(1)];
+    let low = vec![member(3)];
+    let mut ranks = BTreeMap::new();
+    let mut next = 0;
+    assert_eq!(reserve_native_bucket_ranks(&high, &mut ranks, &mut next), 0);
+    // No valid plan for high: its native member order must stay reserved.
+    assert_eq!(reserve_native_bucket_ranks(&low, &mut ranks, &mut next), 2);
+    let mut candidates = vec![member(99).1, member(3).1, member(1).1, member(2).1];
+    candidates.sort_by_key(|candidate| {
+        ranks
+            .get(&(
+                candidate.route_id,
+                candidate.account_id,
+                candidate.credential_generation,
+            ))
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.route_id.as_u128())
+            .collect::<Vec<_>>(),
+        vec![2, 1, 3, 99]
+    );
+}
+
 #[test]
 fn equal_priority_buckets_order_by_uuid_before_kind() {
     let low_route = format!("{}:route", Uuid::from_u128(1));
