@@ -86,3 +86,44 @@ test('Usage analysis keeps exact localized metrics and real trend charts contain
     await server.close();
   }
 });
+
+test('Usage analysis publishes completed data while the lazy chart module is paused', async () => {
+  const executablePath = await localChromiumExecutable();
+  if (!executablePath) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for the usage analysis browser gate');
+    return test.skip('a local Chromium runtime is required for UsageAnalysis progressive rendering assertions');
+  }
+  const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0, strictPort: false } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ executablePath, headless: true });
+  let releaseChart: () => void = () => undefined;
+  const chartGate = new Promise<void>((resolve) => { releaseChart = resolve; });
+  try {
+    const page = await browser.newPage({ viewport: { width: 1024, height: 800 } });
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await page.route('**/src/charts/EChart.tsx*', async (route) => {
+      await chartGate;
+      await route.continue();
+    });
+    const chartRequested = page.waitForRequest((request) => new URL(request.url()).pathname.endsWith('/src/charts/EChart.tsx'));
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/usage-analysis.html`, { waitUntil: 'domcontentloaded' });
+    await chartRequested;
+
+    await page.locator('.usage-metrics').waitFor();
+    assert.equal(await page.locator('.usage-echart canvas').count(), 0, 'paused chart code must not fabricate a ready chart');
+    await page.getByRole('tab', { name: 'Dimensions', exact: true }).click();
+    await page.locator('.usage-dimension-picker').waitFor();
+    const callsWhilePaused = await page.evaluate(() => (window as unknown as { usageAnalysisFixture: { calls: string[] } }).usageAnalysisFixture.calls);
+    assert.equal(callsWhilePaused.filter((path) => path.startsWith('/internal/v1/usage-analysis?')).length, 1, 'progressive rendering must not repeat the usage read');
+
+    await page.getByRole('tab', { name: 'Overview', exact: true }).click();
+    releaseChart();
+    await page.locator('.usage-overview-chart-grid .usage-echart canvas').first().waitFor();
+  } finally {
+    releaseChart();
+    await browser.close();
+    await server.close();
+  }
+});

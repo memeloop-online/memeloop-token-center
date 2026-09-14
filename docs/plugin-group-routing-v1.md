@@ -82,6 +82,19 @@ version), `schema`, and `default`. Group configurations are validated against
 the installed schema. The host caches compiled validators. Credentials and
 write-only configuration are not supported by this contribution.
 
+An optional signed manifest contribution field, `health_policy: "native"`,
+selects order-only scheduling. The default is `"plugin"`, preserving existing
+v1 behavior and serialized manifest fingerprints when omitted. This is not a
+group-config setting. Native mode still executes and validates the same exact
+candidate permutation, including stickiness ordering, but installs no candidate
+health policy: all text/media admission, recovery, lease and terminal handling
+uses the existing native paths. Observe is not called. The v1 health fields in
+plan output remain required and validated for wire compatibility, but cannot
+change any cooldown, probe or recovery behavior in this mode. Durable media
+selection retains its already-selected identity and has no guest health policy
+to restore. Older hosts/installers reject the new manifest field; publish and
+install these packages only with a reviewed compatible image.
+
 ## Plan
 
 Example input:

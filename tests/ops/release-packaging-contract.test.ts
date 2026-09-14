@@ -58,6 +58,7 @@ test('release contains only runtime images and no retired migration delivery sur
   const rust = parsed.jobs?.rust;
   const web = parsed.jobs?.web;
   const migration = parsed.jobs?.['migration-smoke'];
+  const verifier = parsed.jobs?.['verify-ghcr-release'];
   const hasRuntimeFeature = (command: string): boolean => {
     const args = command.trim().split(/\s+/);
     return args.some((arg, index) => {
@@ -123,6 +124,12 @@ test('release contains only runtime images and no retired migration delivery sur
 
   const publish = parsed.jobs?.['publish-ghcr'];
   assert.ok(publish, 'publish-ghcr job is missing');
+  assert.deepEqual(verifier?.needs, ['publish-ghcr']);
+  assert.match(
+    String(verifier?.if).replace(/\s+/g, ' ').trim(),
+    /^always\(\) && github\.event_name == 'push' && github\.ref == 'refs\/heads\/master' && needs\.publish-ghcr\.result == 'success'$/,
+    'verify-ghcr-release must not inherit skipped-ancestor propagation from publish prerequisites',
+  );
   const publishSteps = publish.steps ?? [];
   const buildIndex = publishSteps.findIndex((step) => step.id === 'build');
   assert.ok(buildIndex >= 0, 'publish-ghcr build step is missing');

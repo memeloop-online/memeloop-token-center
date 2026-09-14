@@ -8,7 +8,7 @@ import { createIsolatedFixtureServer as createServer } from './support/isolated-
 import { fixtureAssets } from './support/fixture-assets.js';
 
 const routes = [
-  { name: 'operator-overview', ready: '.overview-trend-card canvas', surface: '.overview-trend-card', action: '.overview-trend-data > summary' },
+  { name: 'operator-overview', ready: '.overview-trend-card canvas', surface: '.overview-trend-card', action: '.overview-trend-card [role="tab"][id$="-data-tab"]' },
   { name: 'request-diagnostics', ready: '.request-diagnostics', surface: '.request-diagnostics', action: '.request-diagnostic-session' },
   { name: 'upstream-availability', ready: '.provider-availability', surface: '.provider-availability', action: '.provider-attempt-link' },
   { name: 'operator-form-sections', ready: '.mtc-form-section', surface: '.mtc-form-section, .form-journey-disclosure', action: '.form-journey-disclosure button[aria-expanded]' },

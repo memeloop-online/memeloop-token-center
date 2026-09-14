@@ -10,8 +10,16 @@ test('route grant identity, candidate count and unavailable reasons are independ
   const input = [route('one', { candidate_upstream_account_ids: ['a'] }), route('two', { candidate_upstream_account_ids: ['b'] }), route('many', { candidate_upstream_account_ids: ['a', 'b'] }), route('off', { enabled: false, candidate_upstream_account_ids: [] }), route('empty', { candidate_upstream_account_ids: [] }), route('unknown')];
   const options = credentialRouteOptions([...input, input[0]], accounts, providers, 'zh-CN');
   assert.deepEqual(options.map(option => option.value), input.map(value => value.id));
-  assert.notEqual(options[0].label, options[1].label);
-  assert.match(options[2].description!, /此路由含 2 个账号/);
+  assert.equal(options[0].label, 'Sol');
+  assert.equal(options[1].label, 'Sol');
+  assert.equal(options[2].label, 'Sol', 'single and shared scope descriptions do not need route ID suffixes');
+  assert.notEqual(options[0].description, options[1].description, 'distinct accounts stay identifiable in secondary text');
+  assert.match(options[2].description!, /共享候选 · 2 个账号/);
+  assert.match(options[0].chipDescription, /单账号/);
+  assert.match(options[0].label, /^Sol/);
+  assert.equal(options[2].label.includes('Same name'), false, 'model is the primary label, not the account chain');
+  assert.match(options[2].details, /提供商: Kimi; 账号: Same name/);
+  assert.match(options[2].details, /上游模型: sol/);
   assert.match(options[3].description!, /已停用/);
   assert.match(options[4].description!, /无可用候选账号/);
   assert.match(options[5].description!, /候选目录未知/);
@@ -30,4 +38,25 @@ test('technical IDs are tooltip details and duplicate labels use collision-safe 
     assert.equal(option.description.includes(option.value), false);
     assert.ok(option.details.includes(option.value));
   }
+  const inactiveDuplicate = credentialRouteOptions([route(first), route(second, { enabled: false })], [], [], 'zh-CN');
+  assert.equal(inactiveDuplicate[0].label, 'Sol', 'inactive history does not disambiguate the sole available route');
+  assert.equal(inactiveDuplicate[1].disabled, true);
+  assert.ok(inactiveDuplicate[1].details.includes(second), 'inactive identity stays available to existing grant previews');
+});
+
+test('same candidate scope is order independent, while inactive copies do not rename active choices', () => {
+  const accounts = [{ id: 'a', name: 'Personal', driver: 'kimi' }, { id: 'b', name: 'Team', driver: 'kimi' }] as UpstreamAccount[];
+  const input = [route('scope-one', { candidate_upstream_account_ids: ['a', 'b'] }), route('scope-two', { candidate_upstream_account_ids: ['b', 'a'] })];
+  const same = credentialRouteOptions(input, accounts, [], 'zh-CN');
+  assert.notEqual(same[0].label, same[1].label, 'genuinely equal active scopes require stable disambiguation');
+  assert.notEqual(same[0].label, 'Sol');
+  assert.notEqual(same[1].label, 'Sol');
+  const technicalDifference = credentialRouteOptions([input[0], { ...input[1], protocol: 'anthropic', upstream_model: 'another-upstream' }], accounts, [], 'zh-CN');
+  assert.notEqual(technicalDifference[0].label, technicalDifference[1].label, 'technical details do not distinguish identical visible model/account scopes');
+  const inactive = credentialRouteOptions([input[0], { ...input[1], enabled: false }], accounts, [], 'zh-CN');
+  assert.equal(inactive[0].label, 'Sol');
+  assert.equal(inactive[1].value, 'scope-two');
+  const unknown = credentialRouteOptions([input[0], route('unknown-scope', { upstream_account_ids: ['a', 'b'] })], accounts, [], 'zh-CN');
+  assert.equal(unknown[0].label, 'Sol', 'unknown catalog scope is not conflated with confirmed candidates');
+  assert.equal(unknown[1].label, 'Sol');
 });

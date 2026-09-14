@@ -1,0 +1,29 @@
+{
+  "id": "mtc-preferred-account",
+  "version": "1.0.0",
+  "wit_version": "0.2.0",
+  "wasm": "plugin.wasm",
+  "capabilities": [],
+  "contributions": {
+    "group_routing": {
+      "version": "group-routing-v1",
+      "health_policy": "native",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["preferred_account_ids"],
+        "properties": {
+          "preferred_account_ids": {
+            "title": "Preferred accounts, in priority order",
+            "description": "Only already-authorized healthy candidates are promoted. This does not read quota or reset times.",
+            "type": "array",
+            "maxItems": 128,
+            "uniqueItems": true,
+            "items": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\\u0000-\\u001f\\u007f]+$" }
+          }
+        }
+      },
+      "default": { "preferred_account_ids": [] }
+    }
+  }
+}

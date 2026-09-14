@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { installerEnvironment } from '../../ops/ci/resolve-first-party-plugin-installer.ts';
 import { checkedCommandOutput } from '../../ops/ci/first-party-plugin-command-output.ts';
+import { firstPartyPackage, packageEnvironment } from '../../ops/ci/first-party-plugin-package.ts';
 
 const root = new URL('../../', import.meta.url).pathname;
 const hash = (bytes: Buffer) => `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
@@ -38,9 +39,27 @@ test('installer executable selection is master-reviewed, unavailable by default 
   for (const line of workflow.split('\n').filter((line) => /^\s*(?:-\s+)?uses:/.test(line))) {
     assert.match(line, /uses:\s+(?:\.\/\S+|\S+@[0-9a-fA-F]{40}\s+#\s+\S+)/);
   }
-  assert.doesNotMatch(workflow, /inputs\.|installer_digest:/);
+  assert.doesNotMatch(workflow, /inputs\.(?!package\s*\}\})|installer_digest:/);
   assert(workflow.indexOf('resolve-first-party-plugin-installer.ts') < workflow.indexOf('docker/login-action@'));
   assert(workflow.indexOf('actual_revision=$(docker image inspect') < workflow.indexOf('docker run --rm'));
+});
+
+test('dispatch selects only a closed first-party package, never execution-sensitive values', () => {
+  for (const name of ['model-guard', 'preferred-account']) {
+    const item = firstPartyPackage(name);
+    assert.equal(item.id, `mtc-${name}`);
+    assert.equal(item.crate, `plugin-sources/${name}`);
+    assert.equal(item.source, `ghcr.io/memeloop-online/mtc-${name}`);
+    assert.equal(packageEnvironment(name), `PLUGIN_ID=${item.id}\nPLUGIN_CRATE=${item.crate}\nPLUGIN_WASM=${item.wasm}\nPLUGIN_SOURCE=${item.source}\nPLUGIN_HOST_TEST=${item.hostTest}\n`);
+  }
+  for (const value of [undefined, '', '../preferred-account', '__proto__', 'constructor', 'preferred-account\nPLUGIN_ID=bad', {}, ['model-guard']]) {
+    assert.throws(() => firstPartyPackage(value));
+  }
+  const workflow = readFileSync(join(root, '.github/workflows/publish-first-party-plugin.yml'), 'utf8');
+  assert(workflow.indexOf('first-party-plugin-package.ts') < workflow.indexOf('docker/login-action@'));
+  assert.match(workflow, /MTC_PREFERRED_ACCOUNT_PACKAGE:/);
+  assert.match(workflow, /cargo test --locked --all-features --test "\$PLUGIN_HOST_TEST" -- --ignored/);
+  assert.match(workflow, /if \[\[ "\$PLUGIN_ID" == "mtc-preferred-account" \]\]; then\s+cargo test --locked --all-features --lib preferred_account_real_gateway -- --ignored/);
 });
 
 test('Model Guard default has no rewrite, provider, or host capability', () => {
@@ -51,6 +70,14 @@ test('Model Guard default has no rewrite, provider, or host capability', () => {
   assert.equal(manifest.contributions.request_rewrite, false);
   assert.deepEqual(manifest.contributions.configuration.default, { blocked_models: [] });
   assert.equal(manifest.contributions.configuration.schema.additionalProperties, false);
+});
+
+test('Model Guard component exports do not enter the native test cdylib', () => {
+  const source = readFileSync(join(root, 'plugin-sources/model-guard/src/lib.rs'), 'utf8');
+  assert.match(source, /#\[cfg\(target_arch = "wasm32"\)\]\s*export!\(ModelGuard\);/);
+  const workflow = readFileSync(join(root, '.github/workflows/publish-first-party-plugin.yml'), 'utf8');
+  assert.match(workflow, /cargo test --locked --manifest-path "\$PLUGIN_CRATE\/Cargo.toml"/);
+  assert.match(workflow, /cargo build --locked --release --target wasm32-unknown-unknown --manifest-path "\$PLUGIN_CRATE\/Cargo.toml"/);
 });
 
 test('unbuilt plugin sources do not pollute the existing loadable plugin root', () => {
@@ -78,15 +105,16 @@ test('keyless Helm mode omits signing-key Secrets but keeps host-owned policy', 
   assert.notEqual(legacy.status, 0, 'default public-key mode must still require its Secret');
 });
 
-test('release evidence binds manifest and component bytes and rejects tampering', () => {
+for (const name of ['model-guard', 'preferred-account']) test(`${name} release evidence binds manifest and component bytes and rejects tampering`, () => {
   // Synthetic unit-test data only; never published or offered as a release.
   const directory = mkdtempSync(join(tmpdir(), 'mtc-plugin-release-test-'));
   try {
-    const source = 'ghcr.io/memeloop-online/mtc-model-guard';
+    const selected = firstPartyPackage(name);
+    const source = selected.source;
     mkdirSync(join(directory, 'plugin-package'));
-    mkdirSync(join(directory, 'plugin-install/mtc-model-guard'), { recursive: true });
+    mkdirSync(join(directory, 'plugin-install', selected.id), { recursive: true });
     const files = [
-      ['plugin.json', readFileSync(join(root, 'plugin-sources/model-guard/plugin.json'))],
+      ['plugin.json', readFileSync(join(root, selected.crate, 'plugin.json'))],
       ['plugin.wasm', Buffer.from('synthetic test bytes')],
     ] as const;
     for (const [name, bytes] of files) writeFileSync(join(directory, 'plugin-package', name), bytes);
@@ -97,11 +125,11 @@ test('release evidence binds manifest and component bytes and rejects tampering'
     }));
     const digest = hash(manifestBytes);
     writeFileSync(join(directory, 'plugin-oci-manifest.json'), manifestBytes);
-    writeFileSync(join(directory, 'plugin-installation.json'), JSON.stringify({ id: 'mtc-model-guard', version: '1.0.0', digest, source }));
-    writeFileSync(join(directory, 'plugin-install/mtc-model-guard/.mtc-oci-install.json'), JSON.stringify({ signature_policy: 'cosign-keyless', digest, source }));
+    writeFileSync(join(directory, 'plugin-installation.json'), JSON.stringify({ id: selected.id, version: '1.0.0', digest, source }));
+    writeFileSync(join(directory, 'plugin-install', selected.id, '.mtc-oci-install.json'), JSON.stringify({ signature_policy: 'cosign-keyless', digest, source }));
     writeFileSync(join(directory, 'plugin-signature-verification.json'), JSON.stringify([{ critical: { image: { 'docker-manifest-digest': digest } } }]));
     const run = () => spawnSync(process.execPath, [join(root, 'ops/ci/first-party-plugin-release.ts'), directory], {
-      encoding: 'utf8', env: { ...process.env, PLUGIN_SOURCE: source, PLUGIN_DIGEST: digest },
+      encoding: 'utf8', env: { ...process.env, REQUESTED_PLUGIN_PACKAGE: name, PLUGIN_SOURCE: source, PLUGIN_DIGEST: digest },
     });
     assert.equal(run().status, 0);
     assert.equal(JSON.parse(readFileSync(join(directory, 'plugin-release.json'), 'utf8')).installation_verified, true);

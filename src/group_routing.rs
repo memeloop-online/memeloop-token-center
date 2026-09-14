@@ -243,6 +243,7 @@ async fn prepare_inner(
         }
         let config = members[0].2.config.clone();
         let plugin_id = members[0].2.plugin_id.clone();
+        let native_health = state.plugins.group_routing_uses_native_health(&plugin_id);
         let mut inputs = Vec::new();
         for (_, candidate, _, _) in &members {
             let health = match bindings
@@ -305,17 +306,19 @@ async fn prepare_inner(
                         directive.generation as i64,
                     );
                     ranks.insert(key, bucket_rank + position);
-                    policies.insert(
-                        key,
-                        CandidatePolicy {
-                            plugin_id: plugin_id.clone(),
-                            group_id: group_id.clone(),
-                            strategy_version: members[0].3,
-                            config: config.clone(),
-                            candidate,
-                            directive,
-                        },
-                    );
+                    if !native_health {
+                        policies.insert(
+                            key,
+                            CandidatePolicy {
+                                plugin_id: plugin_id.clone(),
+                                group_id: group_id.clone(),
+                                strategy_version: members[0].3,
+                                config: config.clone(),
+                                candidate,
+                                directive,
+                            },
+                        );
+                    }
                 }
                 tracing::info!(%request_id, %group_id, %plugin_id, strategy_version=members[0].3, stage="group_routing_plan", "group strategy snapshot applied");
             }

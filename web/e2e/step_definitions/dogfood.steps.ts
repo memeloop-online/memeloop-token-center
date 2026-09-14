@@ -408,7 +408,7 @@ Then('趋势下钻使用 UTC 毫秒完整闭区间', async function (this: Dogfo
   await page.getByRole('tab', { name: '趋势分析', exact: true }).click();
   const responsePromise = page.waitForResponse((response) => response.url().includes('/internal/v1/usage-analysis?') && response.url().includes('granularity=auto'));
   const chart = page.locator('.usage-chart-card').first();
-  await chart.locator('.usage-chart-table summary').click();
+  await chart.getByRole('tab', { name: '数据', exact: true }).click();
   await chart.locator('.usage-chart-table tbody button').first().click();
   const response = await responsePromise;
   assert.equal(response.status(), 200);
@@ -443,7 +443,7 @@ Then('中文指标显示万、亿、万亿、USD 与 CNY 并保留精确值', as
   await page.getByRole('tab', { name: '趋势分析', exact: true }).click();
   await assertCount(page.locator('.usage-chart-card .usage-echart canvas'), 3);
   const trendTable = page.locator('.usage-chart-card').first().locator('.usage-chart-table');
-  await trendTable.locator('summary').click();
+  await page.locator('.usage-chart-card').first().getByRole('tab', { name: '数据', exact: true }).click();
   await assertContains(trendTable, '1万亿');
   await assertContains(trendTable, '18.5 ms');
   await assertContains(trendTable, '25 ms');

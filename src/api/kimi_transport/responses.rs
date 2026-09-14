@@ -1,6 +1,6 @@
 use super::responses_request::{ToolIdentity, tools};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 const MAX_ACCUMULATED_BYTES: usize = 8 * 1024 * 1024;
@@ -48,17 +48,34 @@ impl Context {
         }
         item
     }
+
+    fn validate_custom_call(&self, call: &Value) -> Result<(), &'static str> {
+        let name = call["function"]["name"].as_str().unwrap_or("");
+        if self.tools.get(name).is_some_and(|tool| tool.custom) {
+            let args = call["function"]["arguments"].as_str().unwrap_or("");
+            let parsed = crate::api::sse::parse_unique_json(args.as_bytes())
+                .map_err(|_| "tool_arguments_invalid")?;
+            if parsed["input"].as_str().is_none() {
+                return Err("tool_arguments_invalid");
+            }
+        }
+        Ok(())
+    }
 }
 
-fn usage(value: &Value) -> Result<Value, ()> {
-    let input = value["prompt_tokens"].as_u64().ok_or(())?;
-    let output = value["completion_tokens"].as_u64().ok_or(())?;
-    let total = input.checked_add(output).ok_or(())?;
+fn usage(value: &Value) -> Result<Value, &'static str> {
+    let input = value["prompt_tokens"]
+        .as_u64()
+        .ok_or("usage_input_invalid")?;
+    let output = value["completion_tokens"]
+        .as_u64()
+        .ok_or("usage_output_invalid")?;
+    let total = input.checked_add(output).ok_or("usage_total_overflow")?;
     if value["total_tokens"]
         .as_u64()
         .is_some_and(|claimed| claimed != total)
     {
-        return Err(());
+        return Err("usage_total_mismatch");
     }
     let cached = value
         .pointer("/prompt_tokens_details/cached_tokens")
@@ -69,7 +86,7 @@ fn usage(value: &Value) -> Result<Value, ()> {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     if cached > input || reasoning > output {
-        return Err(());
+        return Err("usage_detail_exceeds_total");
     }
     Ok(
         json!({"input_tokens":input,"output_tokens":output,"total_tokens":total,
@@ -82,20 +99,83 @@ fn envelope(context: &Context, id: &str, created: i64, outputs: Vec<Value>, usag
         "status":"completed","error":null,"incomplete_details":null,"output":outputs,"usage":usage})
 }
 
-pub(in crate::api) fn buffered(context: &Context, value: &Value) -> Result<Value, ()> {
-    if value.get("error").is_some_and(|error| !error.is_null()) {
-        return Err(());
+fn finish_failure(reason: Option<&str>) -> &'static str {
+    match reason {
+        None => "finish_reason_missing",
+        Some("length") => "finish_reason_length",
+        Some("content_filter") => "finish_reason_content_filter",
+        Some(_) => "finish_reason_unsupported",
     }
-    let choices = value["choices"].as_array().ok_or(())?;
+}
+
+fn incomplete_reason(reason: Option<&str>) -> Option<&'static str> {
+    match reason {
+        Some("length") => Some("max_output_tokens"),
+        Some("content_filter") => Some("content_filter"),
+        _ => None,
+    }
+}
+
+fn terminal_envelope(mut value: Value, reason: Option<&str>) -> Value {
+    if let Some(reason) = incomplete_reason(reason) {
+        value["status"] = "incomplete".into();
+        value["incomplete_details"] = json!({"reason":reason});
+        if let Some(items) = value["output"].as_array_mut() {
+            for item in items {
+                if item.get("status").is_some() {
+                    item["status"] = "incomplete".into();
+                }
+            }
+        }
+    }
+    value
+}
+
+fn validate_tool_items(items: &[Value]) -> Result<(), &'static str> {
+    let mut ids = BTreeSet::new();
+    for item in items {
+        if !matches!(
+            item["type"].as_str(),
+            Some("function_call" | "custom_tool_call")
+        ) {
+            continue;
+        }
+        let id = item["call_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or("tool_call_id_missing")?;
+        if !ids.insert(id) {
+            return Err("tool_call_id_duplicate");
+        }
+        if item["name"].as_str().is_none_or(str::is_empty) {
+            return Err("tool_name_missing");
+        }
+        if item["type"] == "function_call" {
+            let arguments = item["arguments"].as_str().ok_or("tool_arguments_invalid")?;
+            let value = crate::api::sse::parse_unique_json(arguments.as_bytes())
+                .map_err(|_| "tool_arguments_invalid")?;
+            if !value.is_object() {
+                return Err("tool_arguments_invalid");
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(in crate::api) fn buffered(context: &Context, value: &Value) -> Result<Value, &'static str> {
+    if value.get("error").is_some_and(|error| !error.is_null()) {
+        return Err("provider_error");
+    }
+    let choices = value["choices"].as_array().ok_or("choices_missing")?;
     if choices.len() != 1 {
-        return Err(());
+        return Err("choice_count_invalid");
     }
     let choice = &choices[0];
     if !matches!(
         choice["finish_reason"].as_str(),
-        Some("stop" | "tool_calls" | "function_call")
+        Some("stop" | "tool_calls" | "function_call" | "length" | "content_filter")
     ) {
-        return Err(());
+        return Err(finish_failure(choice["finish_reason"].as_str()));
     }
     let message = &choice["message"];
     let id = format!("resp_{}", Uuid::now_v7().simple());
@@ -116,18 +196,34 @@ pub(in crate::api) fn buffered(context: &Context, value: &Value) -> Result<Value
     }
     if let Some(calls) = message["tool_calls"].as_array() {
         if calls.len() > MAX_ITEMS {
-            return Err(());
+            return Err("item_limit");
         }
         for (index, call) in calls.iter().enumerate() {
+            if incomplete_reason(choice["finish_reason"].as_str()).is_none() {
+                context.validate_custom_call(call)?;
+            }
             outputs.push(context.tool_item(call, &format!("fc_{id}_{index}")));
         }
     }
-    Ok(envelope(
-        context,
-        &id,
-        value["created"].as_i64().unwrap_or(0),
-        outputs,
-        usage(&value["usage"])?,
+    if incomplete_reason(choice["finish_reason"].as_str()).is_none() {
+        validate_tool_items(&outputs)?;
+        if matches!(
+            choice["finish_reason"].as_str(),
+            Some("tool_calls" | "function_call")
+        ) && message["tool_calls"].as_array().is_none_or(Vec::is_empty)
+        {
+            return Err("tool_calls_missing");
+        }
+    }
+    Ok(terminal_envelope(
+        envelope(
+            context,
+            &id,
+            value["created"].as_i64().unwrap_or(0),
+            outputs,
+            usage(&value["usage"])?,
+        ),
+        choice["finish_reason"].as_str(),
     ))
 }
 
@@ -168,17 +264,17 @@ impl Stream {
         }
     }
 
-    fn event(&mut self, name: &str, mut value: Value) -> Result<Vec<u8>, ()> {
+    fn event(&mut self, name: &str, mut value: Value) -> Result<Vec<u8>, &'static str> {
         value["type"] = name.into();
         value["sequence_number"] = self.sequence.into();
         self.sequence += 1;
-        let json = serde_json::to_string(&value).map_err(|_| ())?;
+        let json = serde_json::to_string(&value).map_err(|_| "event_serialization")?;
         Ok(format!("event: {name}\ndata: {json}\n\n").into_bytes())
     }
 
-    fn added(&mut self, item: Value, events: &mut Vec<Vec<u8>>) -> Result<usize, ()> {
+    fn added(&mut self, item: Value, events: &mut Vec<Vec<u8>>) -> Result<usize, &'static str> {
         if self.items.len() >= MAX_ITEMS {
-            return Err(());
+            return Err("item_limit");
         }
         let index = self.items.len();
         self.items.push(item.clone());
@@ -189,9 +285,9 @@ impl Stream {
         Ok(index)
     }
 
-    pub(in crate::api) fn observe(&mut self, chunk: &Value) -> Result<Vec<Vec<u8>>, ()> {
+    pub(in crate::api) fn observe(&mut self, chunk: &Value) -> Result<Vec<Vec<u8>>, &'static str> {
         if self.done {
-            return Err(());
+            return Err("event_after_completed");
         }
         let mut events = Vec::new();
         if !self.started {
@@ -211,13 +307,13 @@ impl Stream {
         if !chunk["usage"].is_null() {
             self.usage = Some(usage(&chunk["usage"])?);
         }
-        let choices = chunk["choices"].as_array().ok_or(())?;
+        let choices = chunk["choices"].as_array().ok_or("choices_missing")?;
         if choices.len() > 1 {
-            return Err(());
+            return Err("choice_count_invalid");
         }
         for choice in choices {
             if choice["index"].as_u64() != Some(0) {
-                return Err(());
+                return Err("choice_index_invalid");
             }
             if let Some(finish) = choice["finish_reason"].as_str() {
                 self.finish = Some(finish.into());
@@ -227,9 +323,12 @@ impl Stream {
                 let Some(text) = delta[field].as_str().filter(|text| !text.is_empty()) else {
                     continue;
                 };
-                self.bytes = self.bytes.checked_add(text.len()).ok_or(())?;
+                self.bytes = self
+                    .bytes
+                    .checked_add(text.len())
+                    .ok_or("accumulation_limit")?;
                 if self.bytes > MAX_ACCUMULATED_BYTES {
-                    return Err(());
+                    return Err("accumulation_limit");
                 }
                 let existing = if reasoning {
                     self.reasoning_index
@@ -269,7 +368,7 @@ impl Stream {
                 let content_field = if reasoning { "summary" } else { "content" };
                 let current = self.items[index][content_field][0]["text"]
                     .as_str()
-                    .ok_or(())?;
+                    .ok_or("assembled_content_invalid")?;
                 self.items[index][content_field][0]["text"] = format!("{current}{text}").into();
                 let name = if reasoning {
                     "response.reasoning_summary_text.delta"
@@ -284,7 +383,7 @@ impl Stream {
             }
             if let Some(calls) = delta["tool_calls"].as_array() {
                 for call in calls {
-                    let call_index = call["index"].as_u64().ok_or(())?;
+                    let call_index = call["index"].as_u64().ok_or("tool_index_invalid")?;
                     if !self.calls.contains_key(&call_index) {
                         let item_index = self.items.len();
                         let mut call = call.clone();
@@ -304,15 +403,21 @@ impl Stream {
                             ),
                         );
                     }
-                    let (index, assembled) = self.calls.get_mut(&call_index).ok_or(())?;
+                    let (index, assembled) = self
+                        .calls
+                        .get_mut(&call_index)
+                        .ok_or("assembled_tool_missing")?;
                     if let Some(id) = call["id"].as_str() {
                         assembled["id"] = id.into();
                     }
                     for field in ["name", "arguments"] {
                         if let Some(fragment) = call["function"][field].as_str() {
-                            self.bytes = self.bytes.checked_add(fragment.len()).ok_or(())?;
+                            self.bytes = self
+                                .bytes
+                                .checked_add(fragment.len())
+                                .ok_or("accumulation_limit")?;
                             if self.bytes > MAX_ACCUMULATED_BYTES {
-                                return Err(());
+                                return Err("accumulation_limit");
                             }
                             let old = assembled["function"][field].as_str().unwrap_or("");
                             assembled["function"][field] = format!("{old}{fragment}").into();
@@ -338,23 +443,43 @@ impl Stream {
         Ok(events)
     }
 
-    pub(in crate::api) fn finish(&mut self) -> Result<Vec<Vec<u8>>, ()> {
-        if self.done
-            || !self.started
-            || !matches!(
-                self.finish.as_deref(),
-                Some("stop" | "tool_calls" | "function_call")
-            )
-        {
-            return Err(());
+    pub(in crate::api) fn finish(&mut self) -> Result<Vec<Vec<u8>>, &'static str> {
+        if self.done {
+            return Err("event_after_completed");
         }
-        let usage = self.usage.take().ok_or(())?;
+        if !self.started {
+            return Err("empty_stream");
+        }
+        if !matches!(
+            self.finish.as_deref(),
+            Some("stop" | "tool_calls" | "function_call" | "length" | "content_filter")
+        ) {
+            return Err(finish_failure(self.finish.as_deref()));
+        }
+        let incomplete = incomplete_reason(self.finish.as_deref()).is_some();
+        if !incomplete {
+            validate_tool_items(&self.items)?;
+            if matches!(self.finish.as_deref(), Some("tool_calls" | "function_call"))
+                && self.calls.is_empty()
+            {
+                return Err("tool_calls_missing");
+            }
+            for (_, call) in self.calls.values() {
+                self.context.validate_custom_call(call)?;
+            }
+        }
+        let usage = self.usage.take().ok_or("usage_missing")?;
         self.done = true;
         let mut events = Vec::new();
         for index in 0..self.items.len() {
             let mut item = self.items[index].clone();
-            if item["type"] == "message" {
-                item["status"] = "completed".into();
+            if item.get("status").is_some() {
+                item["status"] = if incomplete {
+                    "incomplete"
+                } else {
+                    "completed"
+                }
+                .into();
             }
             match item["type"].as_str() {
                 Some("message" | "reasoning") => {
@@ -373,7 +498,7 @@ impl Stream {
                     events.push(self.event("response.custom_tool_call_input.done",
                         json!({"item_id":item["id"],"output_index":index,"input":item["input"]}))?);
                 }
-                _ => return Err(()),
+                _ => return Err("assembled_item_invalid"),
             }
             self.items[index] = item.clone();
             events.push(self.event(
@@ -381,14 +506,24 @@ impl Stream {
                 json!({"output_index":index,"item":item}),
             )?);
         }
-        let response = envelope(
-            &self.context,
-            &self.id,
-            self.created,
-            self.items.clone(),
-            usage,
+        let response = terminal_envelope(
+            envelope(
+                &self.context,
+                &self.id,
+                self.created,
+                self.items.clone(),
+                usage,
+            ),
+            self.finish.as_deref(),
         );
-        events.push(self.event("response.completed", json!({"response":response}))?);
+        events.push(self.event(
+            if incomplete {
+                "response.incomplete"
+            } else {
+                "response.completed"
+            },
+            json!({"response":response}),
+        )?);
         Ok(events)
     }
 }

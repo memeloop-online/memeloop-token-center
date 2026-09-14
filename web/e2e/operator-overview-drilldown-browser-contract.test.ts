@@ -50,8 +50,9 @@ test('Overview bucket drilldown navigates to Requests with the exact tenant-scop
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-overview-drilldown.html`);
-    const trendData = page.locator('.overview-trend-data');
-    await trendData.locator('summary').click();
+    const firstChart = page.locator('.overview-trend-card').first();
+    const trendData = firstChart.locator('.overview-trend-data');
+    await firstChart.getByRole('tab', { name: 'Data', exact: true }).click();
     await trendData.locator('tbody button').first().click();
     await page.getByText('drilled-model', { exact: true }).waitFor();
 

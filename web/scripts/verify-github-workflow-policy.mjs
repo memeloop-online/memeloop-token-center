@@ -119,6 +119,20 @@ function verifyPublisher(job) {
   }
 }
 
+function verifyReleaseVerifier(job) {
+  if (!isRecord(job)) {
+    fail('verify-ghcr-release job is missing');
+  }
+  if (!Array.isArray(job.needs) || job.needs.length !== 1 || job.needs[0] !== 'publish-ghcr') {
+    fail('verify-ghcr-release must depend only on publish-ghcr');
+  }
+  const gate = typeof job.if === 'string' ? job.if.replace(/\s+/gu, ' ').trim() : '';
+  const expectedGate = "always() && github.event_name == 'push' && github.ref == 'refs/heads/master' && needs.publish-ghcr.result == 'success'";
+  if (gate !== expectedGate) {
+    fail('verify-ghcr-release must run after skipped ancestors only when publish-ghcr succeeded');
+  }
+}
+
 function verifyWorkflow(workflow) {
   if (!isRecord(workflow)) {
     fail('workflow root must be a mapping');
@@ -132,9 +146,7 @@ function verifyWorkflow(workflow) {
   verifyPublisher(workflow.jobs['publish-ghcr']);
 
   const verifier = workflow.jobs['verify-ghcr-release'];
-  if (!isRecord(verifier)) {
-    fail('verify-ghcr-release job is missing');
-  }
+  verifyReleaseVerifier(verifier);
   assertExactPermissions(
     verifier.permissions,
     { contents: 'read', packages: 'read' },

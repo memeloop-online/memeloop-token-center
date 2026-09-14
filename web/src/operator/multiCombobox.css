@@ -11,6 +11,9 @@
 .multi-combobox .multi-combobox-control input { color: var(--picker-text); font-size: 14px; min-width: 0; }
 .multi-combobox .selection-chip { background: var(--picker-hover); border-color: var(--picker-border); border-radius: 6px; color: var(--picker-text); font-size: 12px; }
 .selection-chip-label { min-width: 0; overflow-wrap: anywhere; }
+.multi-combobox .selection-chip-hierarchy { display: grid; gap: 2px; max-width: 260px; }
+.multi-combobox .selection-chip-hierarchy > span { font-weight: 600; }
+.multi-combobox .selection-chip-hierarchy > small { color: var(--picker-muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .multi-combobox .selection-chip button { flex: 0 0 auto; min-height: 24px; min-width: 24px; }
 .multi-combobox-popover[popover] {
   background: var(--picker-surface); border: 1px solid var(--picker-border); border-radius: 8px;

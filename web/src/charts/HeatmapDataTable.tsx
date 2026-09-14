@@ -27,7 +27,7 @@ export function HeatmapDataTable({
     : metric === 'cost'
       ? (value: number) => format.cost(value, currency)
       : format.number;
-  return <details className="usage-chart-table usage-heatmap-table"><summary>{summary}</summary><div className="table-scroll"><table>
+  return <div className="usage-chart-table usage-heatmap-table" aria-label={summary}><div className="table-scroll"><table>
     <thead><tr><th scope="col">{timeZone}</th><th scope="col">{valueLabel}</th></tr></thead>
     <tbody>{values.map((value, index) => {
       const day = weekdays[Math.floor(value.hour_of_week / 24)] ?? '';
@@ -35,5 +35,5 @@ export function HeatmapDataTable({
       const label = `${day} ${hour}:00`;
       return <tr key={value.hour_of_week}><th scope="row">{onSelect ? <button type="button" className="table-link" onClick={() => onSelect(value, index)}>{label}</button> : label}</th><td>{valueFormat(heatmapValue(value, metric, currency))}</td></tr>;
     })}</tbody>
-  </table></div></details>;
+  </table></div></div>;
 }

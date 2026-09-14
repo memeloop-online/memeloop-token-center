@@ -71,6 +71,11 @@
           "required": ["version", "schema", "default"],
           "properties": {
             "version": { "const": "group-routing-v1" },
+            "health_policy": {
+              "enum": ["plugin", "native"],
+              "default": "plugin",
+              "description": "Native applies the validated order only; core admission, recovery and terminal health behavior are unchanged."
+            },
             "schema": {
               "type": "object",
               "description": "Object-root credential-free group strategy configuration schema; writeOnly fields are forbidden."

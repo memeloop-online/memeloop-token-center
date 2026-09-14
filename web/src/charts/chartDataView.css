@@ -1,0 +1,5 @@
+.chart-view-title { flex-wrap: wrap; gap: 8px; }
+.chart-view-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; }
+.chart-view-controls [role="tablist"] { flex-shrink: 0; }
+.chart-view-title ~ [role="tabpanel"] { min-width: 0; }
+.chart-view-title ~ [role="tabpanel"][hidden] { display: none; }

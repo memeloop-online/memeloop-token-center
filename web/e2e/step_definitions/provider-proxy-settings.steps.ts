@@ -39,10 +39,14 @@ When('管理员通过统一编辑工作区维护真实代理设置', async funct
   await proxy.fill(replacement);
   const outerSave = workspace.locator('.rjsf > button[type="submit"]');
   assert.equal(await outerSave.isEnabled(), false);
-  const proxySaved = page.waitForResponse(response => new URL(response.url()).pathname === `/internal/v1/upstreams/${account.id}/transport-proxy` && response.request().method() === 'PUT');
+  const proxyPath = `/internal/v1/upstreams/${account.id}/transport-proxy`;
+  const proxySaved = page.waitForResponse(response => new URL(response.url()).pathname === proxyPath && response.request().method() === 'PUT');
+  const proxyReloaded = page.waitForResponse(response => new URL(response.url()).pathname === proxyPath && response.request().method() === 'GET');
   await workspace.getByRole('button', { name: '保存网络代理', exact: true }).click();
   assert.equal((await proxySaved).status(), 200);
+  assert.equal((await proxyReloaded).status(), 200, 'the new credential generation reloads before leaving the proxy editor');
   await workspace.getByRole('button', { name: '配置网络代理', exact: true }).waitFor();
+  assert.equal(await workspace.locator('.provider-proxy-value input').inputValue(), replacement, 'the reloaded editor shows the saved proxy value');
   assert.equal(await name.inputValue(), 'Browser proxy settings renamed');
   const providerSaved = page.waitForResponse(response => new URL(response.url()).pathname === `/internal/v1/upstreams/${account.id}` && response.request().method() === 'PUT');
   await outerSave.click();

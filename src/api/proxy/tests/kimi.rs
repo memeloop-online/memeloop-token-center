@@ -1,6 +1,108 @@
 use super::*;
 
 #[tokio::test]
+async fn translated_kimi_clean_eof_and_done_settle_and_archive_once() {
+    for with_done in [false, true] {
+        let upstream = MockServer::start().await;
+        let bridge = MockServer::start().await;
+        let fixture = response_usage_fixture("kimi-terminal", &bridge, 0).await;
+        let mut wire = format!(
+            "data: {}\n\n",
+            json!({"id":"kimi-test","object":"chat.completion.chunk","model":"k3",
+            "choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}})
+        );
+        if with_done {
+            wire.push_str("data: [DONE]\n\n");
+        }
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(wire, "text/event-stream"))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let raw = reqwest::Client::new()
+            .post(upstream.uri())
+            .send()
+            .await
+            .unwrap();
+        let translated = routing::kimi::translate(
+            raw,
+            crate::api::kimi_transport::responses::Context::new(&json!({"model":fixture.model})),
+            true,
+        )
+        .unwrap();
+        let chunks = translated.bytes_stream().collect::<Vec<_>>().await;
+        assert!(chunks.iter().all(Result::is_ok));
+        let body = chunks
+            .into_iter()
+            .flat_map(Result::unwrap)
+            .collect::<Vec<_>>();
+        let mut capture = ResponsesSseCapture::for_responses();
+        capture.push(&body);
+        let ResponsesSseOutcome::Completed { response_id } = capture.finish_summary().outcome
+        else {
+            panic!("Kimi clean terminal must complete");
+        };
+        // Feed actual adapter output through the ordinary gateway delivery and
+        // settlement fixture, without weakening Kimi's production fixed origin.
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+            .expect(1)
+            .mount(&bridge)
+            .await;
+        let response = send_response_usage_request(
+            &fixture,
+            &json!({"model":fixture.model,
+            "input":"short fixture request", "stream":true,"max_output_tokens":16}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let delivered = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&delivered)
+                .matches("event: response.completed\n")
+                .count(),
+            1
+        );
+        wait_for_request_settlement(&fixture, 1).await;
+        let rows = fixture
+            .state
+            .db
+            .list_requests(fixture.key_id, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows[0].status_code, Some(200));
+        assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (5, 2));
+        assert_eq!(
+            rows[0].usage_basis,
+            Some(crate::model::RequestUsageBasis::ProviderReported)
+        );
+        assert_eq!(rows[0].cost.parse::<Decimal>().unwrap(), Decimal::new(7, 6));
+        assert_exactly_once_side_effects(&fixture, rows[0].request_id, response_id.as_deref())
+            .await;
+        drain_completed_response_archive(&fixture).await;
+        let refs = fixture
+            .state
+            .db
+            .request_archive_refs(fixture.key_id, rows[0].request_id)
+            .await
+            .unwrap();
+        let locator = refs.response_object.expect("complete archived response");
+        assert!(!locator.starts_with("gap://"));
+        let archived = fixture.state.archive.get(&locator).await.unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&archived)
+                .matches("event: response.completed\n")
+                .count(),
+            1
+        );
+        upstream.verify().await;
+        bridge.verify().await;
+    }
+}
+
+#[tokio::test]
 async fn kimi_translation_clears_length_and_uses_complete_unknown_length_memory_reservation() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
