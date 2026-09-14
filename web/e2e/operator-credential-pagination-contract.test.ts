@@ -40,6 +40,11 @@ function apiPage(rows: KeyView[], before?: KeyListCursor) {
 
 test('managed-key pages carry the exact public exclusive keyset cursor', () => {
   const initial = new URL(keyListPath('tenant-a'), 'https://operator.example.test');
+  const filtered = new URL(keyListPath('tenant-a', undefined, { search: '  100%_literal  ', status: 'active' }), 'https://operator.example.test');
+  assert.equal(filtered.searchParams.get('search'), '100%_literal');
+  assert.equal(filtered.searchParams.get('status'), 'active');
+  assert.equal(filtered.searchParams.get('tenant_external_id'), 'tenant-a');
+  assert.equal(new URL(keyListPath('tenant-a', undefined, { status: 'all' }), 'https://operator.example.test').searchParams.has('status'), false);
   assert.equal(initial.searchParams.get('tenant_external_id'), 'tenant-a');
   assert.equal(initial.searchParams.get('limit'), String(keyListPageSize + 1));
   assert.equal(initial.searchParams.get('before_created_at'), null);

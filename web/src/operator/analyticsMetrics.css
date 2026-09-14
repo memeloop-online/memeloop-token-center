@@ -18,6 +18,9 @@
 .analytics-metric .metric-label { text-transform: none; letter-spacing: 0; font-size: 12px; }
 .analytics-metric-note { display: block; color: #81949c; font-size: 11px; margin-top: 7px; }
 .analytics-metric-trend { position: absolute; inset: auto 0 0; width: 100%; height: 56%; fill: #40a59a; opacity: .15; z-index: 0; }
+.analytics-metric[role='slider'] { cursor: crosshair; touch-action: pan-y; }
+.analytics-metric[role='slider']:focus-visible { outline: 2px solid var(--colorStrokeFocus2, #40a59a); outline-offset: 2px; }
+.analytics-metric-cursor { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--colorBrandForeground1, #40a59a); opacity: .6; pointer-events: none; }
 .analytics-metric-ratio { position: absolute; inset: 0 auto 0 0; background: #40a59a; opacity: .10; z-index: 0; }
 .analytics-metric.negative :is(.analytics-metric-trend, .analytics-metric-ratio) { fill: #d95369; background: #d95369; }
 .operator-monitoring .monitoring-top-list { gap: 20px; }
