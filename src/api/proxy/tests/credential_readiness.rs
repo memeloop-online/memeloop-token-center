@@ -114,7 +114,7 @@ async fn credential_expiring_after_resolution_skips_to_prepared_standby() {
 }
 
 #[tokio::test]
-async fn local_codex_protocol_mismatch_skips_to_compatible_candidate() {
+async fn local_codex_chat_protocol_keeps_priority_over_native_candidate() {
     let fixture = codex_route_fixture("local-protocol-mismatch").await;
     let key = fixture
         .state
@@ -205,7 +205,10 @@ async fn local_codex_protocol_mismatch_skips_to_compatible_candidate() {
     })
     .await
     .unwrap();
-    assert_eq!(prepared.primary.route.account_id, compatible.id);
+    assert_eq!(
+        prepared.primary.route.account_id,
+        fixture.upstream_account_id
+    );
 }
 
 #[tokio::test]

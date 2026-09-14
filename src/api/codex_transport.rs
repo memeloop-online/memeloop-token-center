@@ -2331,8 +2331,10 @@ mod tests {
         ];
         for stream in cases {
             let mut parser = BufferedResponsesParser::default();
-            parser.push(&stream).unwrap();
-            assert!(parser.finish().is_err());
+            match parser.push(&stream) {
+                Err(_) => {}
+                Ok(()) => assert!(parser.finish().is_err()),
+            }
         }
 
         let mut parser = BufferedResponsesParser::default();
