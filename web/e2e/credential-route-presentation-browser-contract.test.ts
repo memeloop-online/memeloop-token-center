@@ -39,6 +39,8 @@ test('route models lead compact chips, scope remains visible, details do not cha
         assert.match(await tip.textContent() ?? '', /primary-account-with-long-name@example.test/);
         assert.match(await tip.textContent() ?? '', /secondary-account@example.test/);
         assert.match(await tip.textContent() ?? '', /提供商: Fixture provider/);
+        const bounds = await tip.boundingBox(); assert.ok(bounds);
+        assert.ok(bounds.x >= -1 && bounds.x + bounds.width <= width + 1, 'visible detail must fit the viewport');
         assert.equal(await page.getByTestId('grant-ids').textContent(), initial);
         await page.keyboard.press('Escape'); await tip.waitFor({ state: 'hidden' });
       }
