@@ -11,6 +11,7 @@ async fn early_rejections_return_server_correlation_without_creating_request_rec
     ] {
         let mut request = Request::post(path)
             .header(header::CONTENT_TYPE, "application/json")
+            .header("x-request-id", supplied_id.to_string())
             .header(REQUEST_ID_HEADER, supplied_id.to_string());
         if authorized {
             request = request.header(header::AUTHORIZATION, format!("Bearer {}", fixture.key));

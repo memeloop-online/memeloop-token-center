@@ -1,6 +1,6 @@
 # Proxy phase diagnostics
 
-Use the server-owned `x-request-id` returned by the gateway to correlate phase
+Use the server-owned `x-mtc-request-id` returned by the gateway to correlate phase
 logs with the durable request record. Failed authentication, body admission,
 JSON parsing, route preparation, and failed durable admission can return an ID
 without a request record: diagnostics deliberately do not make extra database

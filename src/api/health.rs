@@ -183,7 +183,7 @@ pub(super) async fn observe_http(
         let ingress_request_id = proxy_diagnostics::ingress_request_id(
             request
                 .headers()
-                .get(REQUEST_ID_HEADER)
+                .get("x-request-id")
                 .and_then(|value| value.to_str().ok()),
         );
         proxy_diagnostics::CONTEXT.scope(context, async move {
