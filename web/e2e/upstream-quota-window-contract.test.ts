@@ -30,6 +30,20 @@ test('Codex window cadence follows supplier duration before internal primary or 
   assert.equal(quotaWindowPresentation('openai-codex', { ...window, id: 'legacy-primary', label: 'Supplier feature' }).qualifier, 'Supplier feature');
 });
 
+test('Kimi weekly usage is named semantically while unknown limit cadence is not guessed from reset dates', () => {
+  const window: UpstreamQuotaSnapshot['windows'][number] = { id: 'limit-0', label: 'limit-0', used_percent: 0, remaining: 100, limit: null, reset_at: 1789428406870, period_seconds: null, source: 'kimi_usage', reset_is_estimated: false, allowed: null, limit_reached: null };
+  assert.deepEqual(quotaWindowPresentation('kimi-oauth', window), {
+    scopeKey: 'quota.scopeKimi', periodKey: 'quota.periodSupplier', supplierLabel: null, qualifier: null,
+  });
+  assert.equal(quotaWindowPresentation('kimi-oauth', { ...window, period_seconds: 18_000 }).periodKey, 'quota.periodFiveHour');
+  for (const reset_at of [1789655206870, 1789465086257]) {
+    const summary = { ...window, id: 'summary', label: 'summary', reset_at };
+    assert.equal(quotaWindowPresentation('kimi-oauth', summary).periodKey, 'quota.periodWeekly');
+    assert.equal(summary.reset_at, reset_at, 'presentation preserves the exact supplier reset date');
+  }
+  assert.equal(quotaWindowPresentation('other-provider', { ...window, id: 'summary', label: 'summary' }).periodKey, 'quota.periodSupplier');
+});
+
 test('quota observation state does not confuse a failed refresh or expired snapshot with current data', () => {
   const snapshot: UpstreamQuotaSnapshot = {
     contract_version: 'upstream_quota_v1', upstream_account_id: 'account', tenant_external_id: 'tenant', provider: 'openai-codex',

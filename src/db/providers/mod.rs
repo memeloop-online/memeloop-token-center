@@ -3,6 +3,8 @@ mod model_catalog;
 mod model_picker;
 mod native_oauth_imports;
 mod oauth;
+#[cfg(test)]
+mod route_counts;
 mod routes;
 
 pub use accounts::{CreateUpstreamAccountInput, UpdateUpstreamAccountInput};

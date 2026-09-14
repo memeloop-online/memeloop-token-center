@@ -442,6 +442,43 @@ pub struct AccountSettlementPage {
     pub next_cursor: Option<AccountSettlementCursor>,
 }
 
+/// Desired-state adjustment for one attributed settlement namespace.  Amounts
+/// are stored as integer micros so reconciliation is exact and does not depend
+/// on decimal serialization at the internal boundary.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReconcileSettlementAdjustmentInput {
+    pub account_id: Uuid,
+    pub settlement_id: Uuid,
+    pub namespace: String,
+    pub request_kind: AccountSettlementKind,
+    pub request_id: Uuid,
+    pub currency: String,
+    pub desired_rebate_micros: i64,
+    pub version: i64,
+    pub decision_digest: String,
+    pub source: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SettlementAdjustmentReconcileResult {
+    pub account_id: Uuid,
+    pub settlement_id: Uuid,
+    pub namespace: String,
+    pub request_kind: AccountSettlementKind,
+    pub request_id: Uuid,
+    pub currency: String,
+    pub desired_rebate_micros: i64,
+    pub applied_delta_micros: i64,
+    pub cumulative_rebate_micros: i64,
+    pub remaining_rebate_micros: i64,
+    pub version: i64,
+    pub adjustment_entry_id: Option<Uuid>,
+    pub event_id: Uuid,
+    pub created_at: i64,
+    pub replayed: bool,
+}
+
 /// Stable subscription identity plus the currently effective billing-cycle
 /// entitlement. Rotating downstream credentials never changes either ID.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
