@@ -85,6 +85,8 @@ pub(super) async fn create_text_settlement_with_id(
     let result = state
         .db
         .finish_proxy_request(FinishProxyRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
             request_id,
             tenant_id: key.tenant_id,
             reservation: &reservation,

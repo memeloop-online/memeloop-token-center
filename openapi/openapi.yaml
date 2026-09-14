@@ -7591,6 +7591,16 @@ components:
           description: Stable recorded route assignment; null when historical traffic has no route snapshot.
         status_code: { type: [integer, 'null'], format: int64 }
         duration_ms: { type: [integer, 'null'], format: int64 }
+        first_output_ms:
+          type: [integer, 'null']
+          format: int64
+          minimum: 0
+          description: Gateway-observed time from request start to the first nonempty output delta. Null for records without an observed delta.
+        generation_duration_ms:
+          type: [integer, 'null']
+          format: int64
+          minimum: 1
+          description: Gateway-observed interval from first output delta to successful protocol terminal, sampled before terminal settlement. Null for missing, failed, or zero-length observations; not supplier-internal decoding time.
         input_tokens: { type: [integer, 'null'], format: int64 }
         cached_input_tokens:
           type: [integer, 'null']

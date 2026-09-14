@@ -471,6 +471,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "group routing strategy",
         sql: include_str!("../../../migrations/common/0088_group_routing_strategy.sql"),
     },
+    Migration {
+        version: 89,
+        name: "request output timing",
+        sql: include_str!("../../../migrations/common/0089_request_output_timing.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -927,6 +932,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 88,
         name: "group routing strategy",
         sql: include_str!("../../../migrations/common/0088_group_routing_strategy.sql"),
+    },
+    Migration {
+        version: 89,
+        name: "request output timing",
+        sql: include_str!("../../../migrations/common/0089_request_output_timing.sql"),
     },
 ];
 

@@ -95,6 +95,8 @@ pub(super) async fn finish_proxy_request_with_archive_fallback<'a>(
     let fallback = finish_proxy_request_with_retry(
         database,
         FinishProxyRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
             response_object: gap_response,
             ..input
         },

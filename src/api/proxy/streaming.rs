@@ -5,6 +5,7 @@ mod lifecycle;
 mod terminal_delivery;
 #[cfg(test)]
 mod tests;
+mod timing;
 
 use delivery::{CapturedSseDelivery, capture_sse_delivery, downstream_stream_failure};
 use lifecycle::{StreamingFinalizationInput, finalize_streaming_lifecycle};
@@ -152,6 +153,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let mut delivered_billable = false;
             let mut terminal_delivery = ResponsesTerminalDelivery::default();
             let mut terminal_frames = delivery::TerminalFrames::default();
+            let mut output_timing = timing::OutputTiming::default();
             let mut terminal_memory = background_state
                 .metrics
                 .memory_usage(crate::metrics::MemoryComponent::StreamCapture, 0);
@@ -320,6 +322,10 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 break;
                             }
                         };
+                        let observed_ms = diagnostic_context.elapsed_millis_at(Instant::now());
+                        for frame in &delivery_frames {
+                            output_timing.observe(&frame.bytes, frame.terminal, observed_ms);
+                        }
                         if let Some(spool) = archive_sender.as_mut()
                             && !spool
                                 .append(delivery_frames.iter().map(|f| f.bytes.clone()).collect())
@@ -514,6 +520,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let terminal_phase =
                 proxy_diagnostics::Phase::new(diagnostic_context, "stream_terminal_settlement");
             finalize_streaming_lifecycle(StreamingFinalizationInput {
+                output_timing,
                 state: &background_state,
                 status_code,
                 protocol,

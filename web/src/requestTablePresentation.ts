@@ -23,6 +23,15 @@ export function averageRequestOutputTps(request: RequestView): number | null {
   return Number.isFinite(rate) ? rate : null;
 }
 
+/** Gateway-observed first output through successful terminal, excluding initial waiting. */
+export function generationRequestOutputTps(request: RequestView): number | null {
+  const duration = request.generation_duration_ms;
+  if (requestIsPending(request) || request.status_code! >= 400 || !tokenCount(request.output_tokens)
+    || !tokenCount(request.first_output_ms) || typeof duration !== 'number' || !Number.isFinite(duration) || duration <= 0) return null;
+  const rate = request.output_tokens * 1000 / duration;
+  return Number.isFinite(rate) ? rate : null;
+}
+
 export function requestCredentialLabel(request: RequestView, fallback: string | undefined): { label: string } | { key: 'request.unnamedCredential' | 'request.missingCredential' } {
   if (request.credential_identity) {
     const label = request.credential_identity.key_alias?.trim();

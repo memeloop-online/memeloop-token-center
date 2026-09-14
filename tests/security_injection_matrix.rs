@@ -154,6 +154,8 @@ async fn exercise_injection_matrix(database_url: String, backend: &str) {
         state
             .db
             .record_request_finished(FinishRequest {
+                first_output_ms: None,
+                generation_duration_ms: None,
                 request_id,
                 status_code: 502,
                 duration_ms: 1,

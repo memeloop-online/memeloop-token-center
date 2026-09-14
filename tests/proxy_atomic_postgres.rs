@@ -252,6 +252,8 @@ async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_wi
             finish_barrier.wait().await;
             database
                 .finish_proxy_request(FinishProxyRequest {
+                    first_output_ms: None,
+                    generation_duration_ms: None,
                     request_id,
                     tenant_id,
                     reservation: &reservation,
@@ -445,6 +447,8 @@ async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_
     };
     database
         .finish_proxy_request(FinishProxyRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
             request_id: root_request_id,
             tenant_id: key.tenant_id,
             reservation: &root_reservation,
@@ -542,6 +546,8 @@ async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_
             finish_barrier.wait().await;
             database
                 .finish_proxy_request(FinishProxyRequest {
+                    first_output_ms: None,
+                    generation_duration_ms: None,
                     request_id,
                     tenant_id: key.tenant_id,
                     reservation: &reservation,
@@ -735,6 +741,8 @@ async fn postgres_metered_unlimited_terminal_replay_is_exactly_once() {
             barrier.wait().await;
             database
                 .finish_proxy_request(FinishProxyRequest {
+                    first_output_ms: None,
+                    generation_duration_ms: None,
                     request_id,
                     tenant_id,
                     reservation: &reservation,
@@ -875,6 +883,8 @@ async fn postgres_prepaid_boundary_remains_fail_closed_under_parallel_admission(
         assert_eq!(
             database
                 .finish_proxy_request(FinishProxyRequest {
+                    first_output_ms: None,
+                    generation_duration_ms: None,
                     request_id,
                     tenant_id: key.tenant_id,
                     reservation: &reservation,
@@ -987,6 +997,8 @@ async fn postgres_conversation_projection_prematerializes_before_the_session_loc
     };
     database
         .finish_proxy_request(FinishProxyRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
             request_id,
             tenant_id: key.tenant_id,
             reservation: &reservation,
@@ -1264,6 +1276,8 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
         };
         finish_a_database
             .finish_proxy_request(FinishProxyRequest {
+                first_output_ms: None,
+                generation_duration_ms: None,
                 request_id: request_a,
                 tenant_id: finish_a_key.tenant_id,
                 reservation: &finish_a_reservation,
@@ -1359,6 +1373,8 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
             tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 database.finish_proxy_request(FinishProxyRequest {
+                    first_output_ms: None,
+                    generation_duration_ms: None,
                     request_id: request_b,
                     tenant_id: key.tenant_id,
                     reservation: reservation_b,
@@ -1439,6 +1455,8 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
     }]});
     let finish_b_result = database
         .finish_proxy_request(FinishProxyRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
             request_id: request_b,
             tenant_id: key.tenant_id,
             reservation: &reservation_b,
@@ -1636,6 +1654,8 @@ async fn postgres_proxy_terminal_owner_is_exactly_once() {
         database
             .finish_proxy_request_with_archive_staging(
                 FinishProxyRequest {
+                    first_output_ms: None,
+                    generation_duration_ms: None,
                     request_id,
                     tenant_id,
                     reservation: &reservation,
@@ -1723,6 +1743,8 @@ async fn postgres_proxy_terminal_owner_is_exactly_once() {
             let result = database
                 .finish_proxy_request_with_archive_staging(
                     FinishProxyRequest {
+                        first_output_ms: None,
+                        generation_duration_ms: None,
                         request_id,
                         tenant_id,
                         reservation: &reservation,

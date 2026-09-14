@@ -751,6 +751,8 @@ async fn completed_request_is_transactionally_reclassified_from_unlinked_session
         .state
         .db
         .record_request_finished(FinishRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
             request_id,
             status_code: 200,
             duration_ms: 42,
@@ -840,6 +842,8 @@ async fn many_completed_facts_move_into_one_session_without_projection_drift() {
             .state
             .db
             .record_request_finished(FinishRequest {
+                first_output_ms: None,
+                generation_duration_ms: None,
                 request_id,
                 status_code: if index % 8 == 0 { 500 } else { 200 },
                 duration_ms: 10 + index,
@@ -1045,6 +1049,8 @@ async fn conversation_and_unlinked_session_detail_preserve_completion_timestamps
         .state
         .db
         .record_request_finished(FinishRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
             request_id: live_request,
             status_code: 200,
             duration_ms: 12,
@@ -1186,6 +1192,8 @@ async fn logical_session_latest_metadata_keeps_complete_live_and_archive_totals(
             .state
             .db
             .record_request_finished(FinishRequest {
+                first_output_ms: None,
+                generation_duration_ms: None,
                 request_id,
                 status_code: if index == 0 { 500 } else { 200 },
                 duration_ms: 10,

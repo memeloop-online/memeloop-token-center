@@ -1,4 +1,4 @@
-import { useId, useLayoutEffect, useRef, useState } from 'react';
+import { useId, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { api } from '../api';
 import { Button, DetailTooltip } from '../design-system';
 import { useI18n } from '../i18n';
@@ -17,7 +17,7 @@ interface ProxyConnection {
   credential_generation: number;
 }
 
-function ProxyValue({ value, onChange, disabled = false, id, invalid = false, describedBy }: { value: string; onChange?: (value: string) => void; disabled?: boolean; id?: string; invalid?: boolean; describedBy?: string }) {
+function ProxyValue({ value, onChange, disabled = false, id, invalid = false, describedBy, actions }: { value: string; onChange?: (value: string) => void; disabled?: boolean; id?: string; invalid?: boolean; describedBy?: string; actions?: ReactNode }) {
   const { locale, t } = useI18n();
   const copy = providerConnectionCopy(locale);
   const input = useRef<HTMLInputElement>(null);
@@ -33,6 +33,7 @@ function ProxyValue({ value, onChange, disabled = false, id, invalid = false, de
     <input ref={input} id={id} type={visible ? 'text' : 'password'} readOnly={!onChange} required={Boolean(onChange)} disabled={disabled} aria-invalid={invalid} aria-describedby={describedBy} aria-label={t('connection.proxyUrl')} autoComplete="off" spellCheck={false} onChange={event => onChange?.(event.target.value)} />
     <Button type="button" appearance="secondary" disabled={disabled} aria-pressed={visible} onClick={() => setVisible(current => !current)}>{visible ? copy.hideProxy : copy.viewProxy}</Button>
     {value && !disabled && <CopyButton value={value} label={copy.copyProxy} />}
+    {actions}
   </div>;
 }
 
@@ -123,23 +124,24 @@ export function UpstreamConnection({ account, token, tenant, disabled, onChanged
     } catch { if (owner.current === scope && lifecycle.current === version) setError(true); }
     finally { saving.current = false; if (owner.current === scope && lifecycle.current === version) setBusy(false); }
   }
+  const readableProxy = connection && !editing && canEditProxy && !disabled && connection.proxy_url !== null;
+  const editProxyAction = canEditProxy && <Button appearance="secondary" type="button" disabled={disabled || busy} onClick={() => { setEditing(!editing); setProxy(editing ? '' : connection?.proxy_url ?? ''); setError(false); setSaved(false); }}>{t(editing ? 'common.cancel' : 'connection.editProxy')}</Button>;
   return <section className="upstream-connection" aria-label={t('connection.title')}>
     {!embedded && <h3>{t('connection.title')}</h3>}
     <dl>
       {(!embedded || codex) && <div><dt>{t('connection.baseUrl')}</dt><dd><code>{typeof account.config.base_url === 'string' ? account.config.base_url : '—'}</code>{typeof account.config.base_url === 'string' && <CopyButton value={account.config.base_url} label={copy.copyEndpoint} />}{codex && <span className="connection-endpoint-kind">{t('connection.fixed')}</span>}</dd></div>}
-      <div><dt>{t('connection.proxy')}</dt><dd><span className={`status ${account.has_proxy && account.proxy_scheme ? 'ok' : 'pending'}`}>{t(account.has_proxy === undefined ? 'connection.proxyUnknown' : account.has_proxy ? proxyState : codex ? proxyState : 'connection.directEgress')}</span>{account.proxy_scheme && <code>{account.proxy_scheme}</code>}{account.has_proxy && account.proxy_scheme && <span>{t(account.proxy_remote_dns ? 'connection.remoteDns' : 'connection.localDns')}</span>}</dd></div>
-      {account.proxy_fingerprint && <div><dt>{t('connection.proxyFingerprint')}</dt><dd><DetailTooltip content={account.proxy_fingerprint}><span tabIndex={0}>{t('providerDirectory.account')}</span></DetailTooltip></dd></div>}
+      {!readableProxy && !editing && <div><dt>{t('connection.proxy')}</dt><dd><span className={`status ${account.has_proxy && account.proxy_scheme ? 'ok' : 'pending'}`}>{t(account.has_proxy === undefined ? 'connection.proxyUnknown' : account.has_proxy ? proxyState : codex ? proxyState : 'connection.directEgress')}</span>{account.proxy_scheme && <code>{account.proxy_scheme}</code>}{account.has_proxy && account.proxy_scheme && <span>{t(account.proxy_remote_dns ? 'connection.remoteDns' : 'connection.localDns')}</span>}</dd></div>}
     </dl>
     {!embedded && <DetailTooltip content={t('connection.endpointHint')}><span tabIndex={0} className="connection-help">{t('connection.baseUrl')}</span></DetailTooltip>}
     {!canEditProxy && account.has_proxy && <p>{t('connection.proxyAdminOnly')}</p>}
     {!codex && <DetailTooltip content={t('connection.genericProxyHint')}><span tabIndex={0} className="connection-help">{t('connection.proxy')}</span></DetailTooltip>}
-    {connection && !editing && canEditProxy && !disabled && <>
-      {connection.proxy_url === null ? <p>{copy.noProxy}</p> : <ProxyValue value={connection.proxy_url} />}
-      {!canEditProxy && connection.proxy_url && <p>{copy.readOnlyProxy}</p>}
-    </>}
+    {readableProxy && connection.proxy_url !== null && <div className="provider-readable-proxy">
+      <span className="field-hint">{t('connection.proxyUrl')}</span>
+      <ProxyValue value={connection.proxy_url} actions={editProxyAction} />
+    </div>}
     {readError && <p role="status">{copy.readFailed}</p>}
     {!requested && !disabled && canEditProxy && <Button type="button" appearance="secondary" onClick={() => setRequested(true)}>{copy.viewProxy}</Button>}
-    {canEditProxy && <><Button appearance="secondary" type="button" disabled={disabled || busy} onClick={() => { setEditing(!editing); setProxy(editing ? '' : connection?.proxy_url ?? ''); setError(false); setSaved(false); }}>{t(editing ? 'common.cancel' : 'connection.editProxy')}</Button>
+    {canEditProxy && <>{!readableProxy && editProxyAction}
       {editing && <div className="upstream-proxy-editor" onKeyDown={(event) => { if (event.key === 'Enter' && event.target instanceof HTMLInputElement) { event.preventDefault(); void save(); } }}>
         <ProxyInput value={proxy} onChange={setProxy} disabled={busy} generic={!codex} plaintext />
         <Button className="provider-primary-action" appearance="primary" type="button" onClick={() => void save()} disabled={disabled || busy || !valid}>{t(busy ? 'common.loading' : 'connection.saveProxy')}</Button>

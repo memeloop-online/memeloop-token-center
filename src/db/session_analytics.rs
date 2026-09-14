@@ -809,12 +809,12 @@ impl Database {
             (filter.before_created_at, filter.before_request_id)
         {
             sqlx::query(
-                r#"SELECT id, created_at, completed_at, source_completed_at, protocol, model, status_code, duration_ms,
+                r#"SELECT id, created_at, completed_at, source_completed_at, protocol, model, status_code, duration_ms, first_output_ms, generation_duration_ms,
                           input_tokens, cached_input_tokens, cache_write_tokens, output_tokens,
                           cost_micros, currency, error_code, archive_state,
                           source_kind, provenance_kind, archive_source, external_request_id
                      FROM (
-                         SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.status_code, r.duration_ms,
+                         SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms,
                                 r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens,
                                 r.cost_micros, r.currency, r.error_code,
                                 CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state,
@@ -830,7 +830,7 @@ impl Database {
                           WHERE r.key_id = $1 AND r.conversation_cluster_id IS NULL
                          UNION ALL
                          SELECT archive_request_id, source_started_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model,
-                                status_code, duration_ms, input_tokens,
+                                status_code, duration_ms, CAST(NULL AS BIGINT) AS first_output_ms, CAST(NULL AS BIGINT) AS generation_duration_ms, input_tokens,
                                 CAST(0 AS BIGINT) AS cached_input_tokens,
                                 CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens,
                                 CAST(0 AS BIGINT), NULL AS currency, error_code,
@@ -853,12 +853,12 @@ impl Database {
             .await?
         } else {
             sqlx::query(
-                r#"SELECT id, created_at, completed_at, source_completed_at, protocol, model, status_code, duration_ms,
+                r#"SELECT id, created_at, completed_at, source_completed_at, protocol, model, status_code, duration_ms, first_output_ms, generation_duration_ms,
                           input_tokens, cached_input_tokens, cache_write_tokens, output_tokens,
                           cost_micros, currency, error_code, archive_state,
                           source_kind, provenance_kind, archive_source, external_request_id
                      FROM (
-                         SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.status_code, r.duration_ms,
+                         SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms,
                                 r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens,
                                 r.cost_micros, r.currency, r.error_code,
                                 CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state,
@@ -874,7 +874,7 @@ impl Database {
                           WHERE r.key_id = $1 AND r.conversation_cluster_id IS NULL
                          UNION ALL
                          SELECT archive_request_id, source_started_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model,
-                                status_code, duration_ms, input_tokens,
+                                status_code, duration_ms, CAST(NULL AS BIGINT) AS first_output_ms, CAST(NULL AS BIGINT) AS generation_duration_ms, input_tokens,
                                 CAST(0 AS BIGINT) AS cached_input_tokens,
                                 CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens,
                                 CAST(0 AS BIGINT), NULL AS currency, error_code,
@@ -919,6 +919,8 @@ impl Database {
                     );
                 Ok(ConversationRequestView {
                     request: RequestView {
+                        first_output_ms: row.try_get("first_output_ms")?,
+                        generation_duration_ms: row.try_get("generation_duration_ms")?,
                         request_id: parse_uuid(row.try_get("id")?)?,
                         created_at: row.try_get("created_at")?,
                         completed_at,

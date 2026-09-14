@@ -989,7 +989,9 @@ impl Database {
     }
 
     pub(super) async fn spool_transaction(&self) -> Result<(Transaction<'_, Any>, i64), AppError> {
+        let pool_started = Instant::now();
         let mut tx = self.begin_write_transaction().await?;
+        let pool_wait_ms = pool_started.elapsed().as_millis() as u64;
         // First for every accounting mutation, including GC. State-only
         // transactions may lock a spool row but never wait for this row, so no
         // transaction can hold a spool row while requesting the reverse order.
@@ -1001,7 +1003,26 @@ impl Database {
                 "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1"
             }
         };
+        let lock_started = Instant::now();
         let _: i64 = sqlx::query_scalar(lock).fetch_one(&mut *tx).await?;
+        let budget_wait_ms = lock_started.elapsed().as_millis() as u64;
+        // Per-append successes stay DEBUG. Slow acquisitions are independently
+        // visible without logging query values or adding per-chunk INFO I/O.
+        if pool_wait_ms >= 250 || budget_wait_ms >= 250 {
+            tracing::warn!(
+                phase = "archive_budget_acquire",
+                pool_wait_ms,
+                budget_wait_ms,
+                "slow archive budget acquisition"
+            );
+        } else {
+            tracing::debug!(
+                phase = "archive_budget_acquire",
+                pool_wait_ms,
+                budget_wait_ms,
+                "archive budget acquired"
+            );
+        }
         let now = archive_clock(&mut tx, self.backend).await?;
         Ok((tx, now))
     }

@@ -5,7 +5,7 @@ import { useI18n } from './i18n.js';
 import { formatCurrency, formatCurrencyDisplay, formatDurationDisplay, formatMetricDisplay, formatMetricNumber, formatMilliseconds, formatNumber } from './format.js';
 import { useAnchoredPopover } from './useAnchoredPopover.js';
 import { DetailTooltip } from './design-system';
-import { averageRequestOutputTps, nonCachedRequestInput, requestCredentialLabel, requestIsPending } from './requestTablePresentation';
+import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCredentialLabel, requestIsPending } from './requestTablePresentation';
 
 export function Shell({ children, operator = false }: { children: ReactNode; operator?: boolean }) {
   const { locale, setLocale, t } = useI18n();
@@ -169,6 +169,19 @@ function RequestSessionMetadata({ value }: { value: string }) {
  * portal and operator request drawer cannot drift or turn absent telemetry
  * into inferred values.
  */
+function RequestOutputRate({ request }: { request: RequestView }) {
+  const { locale, t } = useI18n();
+  const generation = generationRequestOutputTps(request);
+  const rate = generation ?? averageRequestOutputTps(request);
+  const label = t(generation === null ? 'request.averageTps' : 'request.generationTps');
+  const explanation = t(generation === null ? 'request.averageTpsHint' : 'request.generationTpsHint');
+  const first = request.first_output_ms;
+  const wait = typeof first === 'number' && Number.isFinite(first) && first >= 0
+    ? `${t('request.firstOutputWait')}: ${formatMilliseconds(first, locale)}` : t('request.firstOutputMissing');
+  const hint = `${rate === null ? t(requestIsPending(request) ? 'request.tpsRunning' : 'request.tpsMissing') : explanation} ${wait}`;
+  return <DetailTooltip content={hint}><span tabIndex={0} aria-label={`${label}: ${rate === null ? t('request.usageUnknown') : formatNumber(rate, locale, 2)}. ${hint}`}><small>{label}</small> {rate === null ? '—' : formatNumber(rate, locale, 2)}</span></DetailTooltip>;
+}
+
 export function RequestDiagnostics({
   request,
   currency,
@@ -194,6 +207,7 @@ export function RequestDiagnostics({
     <span><b>{t('request.status')}</b><i className={`status ${successful ? 'ok' : request.status_code ? 'bad' : 'pending'}`}>{request.status_code ?? t('common.running')}</i></span>
     <span><b>{t('request.protocol')}</b>{request.protocol}</span>
     <span><b>{t('request.duration')}</b>{formatMilliseconds(request.duration_ms, locale)}</span>
+    <span><RequestOutputRate request={request} /></span>
     <span><b>{t('request.upstreamId')}</b>{upstreamName && <small>{upstreamName}</small>}{request.upstream_account_id ?? '—'}</span>
     <span><b>{t('request.routeId')}</b>{request.route_id ?? '—'}</span>
     <span><b>{t('request.tokens')}</b>{formatNumber(request.input_tokens + request.output_tokens, locale)}
@@ -233,14 +247,13 @@ export function RequestTable({
   const showsSession = requests.some((request) => request.session_context !== undefined);
   const copy = {
     total: t('request.totalTokens'), input: t('request.uncachedInput'), output: t('request.outputTokens'),
-    unknown: t('request.usageUnknown'), averageTps: t('request.averageTps'), tpsHint: t('request.averageTpsHint'),
-    tpsMissing: t('request.tpsMissing'), tpsRunning: t('request.tpsRunning'),
+    unknown: t('request.usageUnknown'), tpsHint: `${t('request.generationTpsHint')} ${t('request.averageTpsHint')}`,
     cacheMissing: t('request.cacheMissing'), pendingUsage: t('request.pendingUsage'),
   };
   return (
     <div className="table-scroll request-table-scroll" role="region" aria-label={t('request.table')} tabIndex={0}>
       <table className="request-table">
-        <thead><tr><th>{t('request.receivedAt')}</th><th>{t('self.credential')}</th><th>{t('request.model')}</th><th>{t('request.tokens')}</th><th>{t('request.cost')}</th>{showsSession && <th>{t('request.session')}</th>}<th>{t('request.status')}</th><th>{t('request.duration')}</th><th><DetailTooltip content={copy.tpsHint}><span tabIndex={0}>{copy.averageTps}</span></DetailTooltip></th>{onSelect && <th><span className="visually-hidden">{t('request.actions')}</span></th>}</tr></thead>
+        <thead><tr><th>{t('request.receivedAt')}</th><th>{t('self.credential')}</th><th>{t('request.model')}</th><th>{t('request.tokens')}</th><th>{t('request.cost')}</th>{showsSession && <th>{t('request.session')}</th>}<th>{t('request.status')}</th><th>{t('request.duration')}</th><th><DetailTooltip content={copy.tpsHint}><span tabIndex={0}>TPS</span></DetailTooltip></th>{onSelect && <th><span className="visually-hidden">{t('request.actions')}</span></th>}</tr></thead>
         <tbody>
           {requests.map((request) => {
             const context = request.session_context;
@@ -264,8 +277,6 @@ export function RequestTable({
             const tokenDetails = pending ? copy.pendingUsage : requestTokenDetails(request, locale, t);
             const duration = formatDurationDisplay(request.duration_ms, locale);
             const uncachedInput = nonCachedRequestInput(request);
-            const averageTps = averageRequestOutputTps(request);
-            const rateHint = averageTps === null ? pending ? copy.tpsRunning : copy.tpsMissing : copy.tpsHint;
             const credential = requestCredentialLabel(request, credentialAlias);
             const credentialLabel = 'label' in credential ? credential.label : t(credential.key);
             const credentialDetails = request.credential_identity ? `${request.credential_identity.key_id} · ${request.credential_identity.principal_external_id}` : credentialLabel;
@@ -290,7 +301,7 @@ export function RequestTable({
               </td>}
               <td><span className={`status ${request.status_code && request.status_code < 400 ? 'ok' : request.status_code ? 'bad' : 'pending'}`} title={request.error_code ?? undefined} aria-label={request.error_code ? `${request.status_code ?? t('common.running')}: ${request.error_code}` : undefined}>{request.status_code ?? t('common.running')}</span>{request.error_code && <span className="visually-hidden">{request.error_code}</span>}</td>
               <td><span className="request-duration-info" title={[duration.title, durationSummary].filter(Boolean).join(' · ') || undefined} aria-label={[duration.text, duration.title, durationSummary].filter(Boolean).join(' · ') || undefined} tabIndex={duration.title || durationSummary ? 0 : undefined}>{duration.text}</span></td>
-              <td className="request-tps-cell"><DetailTooltip content={rateHint}><span tabIndex={0} aria-label={`${copy.averageTps}: ${averageTps === null ? copy.unknown : formatNumber(averageTps, locale, 2)}. ${rateHint}`}>{averageTps === null ? '—' : formatNumber(averageTps, locale, 2)}</span></DetailTooltip></td>
+              <td className="request-tps-cell"><RequestOutputRate request={request} /></td>
               {onSelect && <td><button className="secondary table-action" type="button" onClick={() => onSelect(request)} aria-label={t('request.openDetail', { model: request.model })}>{t('request.inspect')}</button></td>}
             </tr>
           })}
