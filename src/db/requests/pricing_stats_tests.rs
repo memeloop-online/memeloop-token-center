@@ -181,6 +181,26 @@ async fn parity(database: &Database) {
             .len(),
         100
     );
+    if matches!(database.backend, DatabaseBackend::Sqlite) {
+        // The production hot path is global and unfiltered. Keep a direct
+        // semantic comparison here, where this database is test-local and no
+        // concurrent fixture can alter the global total between reads.
+        let expected = database
+            .global_operator_stats_filtered(base.clone())
+            .await
+            .unwrap()
+            .by_model
+            .into_iter()
+            .map(|row| (row.name, row.requests, row.input_tokens, row.output_tokens))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            database
+                .pricing_model_usage(None, base.clone())
+                .await
+                .unwrap(),
+            expected
+        );
+    }
     // CI-only EXPLAIN for the actual projection SQL. The fixtures contain no
     // secret/user input; every value below remains a driver-bound parameter.
     let prefix = match database.backend {
@@ -189,24 +209,10 @@ async fn parity(database: &Database) {
     };
     let plan = sqlx::query(sqlx::AssertSqlSafe(format!(
         "{prefix}{}",
-        pricing_stats_sql(&base)
+        pricing_stats_sql(None, &base)
     )))
-    .bind(&tenant)
-    .bind(key.to_string())
     .bind(base.from_created_at.unwrap())
     .bind(base.to_created_at.unwrap())
-    .bind("")
-    .bind("")
-    .bind("")
-    .bind("")
-    .bind("")
-    .bind("")
-    .bind(-1_i64)
-    .bind(-1_i64)
-    .bind(-1_i64)
-    .bind(-1_i64)
-    .bind("")
-    .bind("")
     .bind(11 * DAY_MILLIS)
     .bind(12 * DAY_MILLIS)
     .fetch_all(&database.pool)
@@ -284,18 +290,30 @@ async fn postgres_pricing_model_projection_matches_existing_statistics() {
 
 #[test]
 fn pricing_query_has_only_model_projection_and_disjoint_indexable_edges() {
-    let query = pricing_stats_sql(&StatsFilter::default());
+    let query = pricing_stats_sql(None, &StatsFilter::default());
     assert!(!query.contains("GROUPING SETS"));
     assert!(!query.contains("MATERIALIZED"));
     assert!(!query.contains("DENSE_RANK"));
-    assert!(!query.contains(EDGE_PREDICATE));
-    assert_eq!(query.matches("AND f.created_at < $17").count(), 2);
+    assert!(!query.contains("JOIN key_records"));
+    assert!(!query.contains("JOIN principals"));
+    assert!(!query.contains("JOIN tenants"));
+    assert_eq!(query.matches("AND f.created_at < $3").count(), 2);
     assert_eq!(
         query
-            .matches("AND f.created_at >= $18 AND f.created_at >= $17")
+            .matches("AND f.created_at >= $4 AND f.created_at >= $3")
             .count(),
         2
     );
     assert!(query.contains("ORDER BY calls DESC, model ASC"));
     assert!(query.contains("LIMIT 100"));
+
+    let scoped_or_filtered = pricing_stats_sql(
+        Some("tenant-a"),
+        &StatsFilter {
+            model: Some("model-a".to_owned()),
+            ..StatsFilter::default()
+        },
+    );
+    assert!(scoped_or_filtered.contains("JOIN key_records"));
+    assert!(scoped_or_filtered.contains(EDGE_PREDICATE));
 }

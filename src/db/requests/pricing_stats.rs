@@ -7,6 +7,80 @@ use super::stats::{
 const DAY_MILLIS: i64 = 86_400_000;
 const EDGE_PREDICATE: &str = "  AND (f.created_at < $17 OR f.created_at >= $18)";
 
+// The pricing page normally asks for the global, unfiltered 30-day model
+// total.  That query does not need credential, principal, or tenant data:
+// the facts and rollups already carry the immutable model and usage fields.
+// Keeping it separate avoids six unnecessary relation joins on the hot path.
+// The four placeholders are deliberately consecutive so this statement has a
+// small bind set of its own; filtered and scoped requests retain the complete
+// operator-statistics source below.
+const GLOBAL_UNFILTERED_PRICING_ACTIVITY_SOURCE: &str = r#"
+SELECT a.model,
+       a.input_tokens,
+       a.output_tokens,
+       a.requests
+  FROM request_daily_aggregates a
+ WHERE a.day_bucket >= $3 / 86400000
+   AND a.day_bucket < $4 / 86400000
+UNION ALL
+SELECT f.model,
+       f.input_tokens,
+       f.output_tokens,
+       CAST(1 AS BIGINT) AS requests
+  FROM request_stats_facts f
+ WHERE f.created_at >= $1 AND f.created_at <= $2
+   AND f.created_at < $3
+UNION ALL
+SELECT f.model,
+       f.input_tokens,
+       f.output_tokens,
+       CAST(1 AS BIGINT) AS requests
+  FROM request_stats_facts f
+ WHERE f.created_at >= $1 AND f.created_at <= $2
+   AND f.created_at >= $4 AND f.created_at >= $3
+UNION ALL
+SELECT a.model,
+       CAST(0 AS BIGINT) AS input_tokens,
+       CAST(0 AS BIGINT) AS output_tokens,
+       a.requests
+  FROM generation_daily_aggregates a
+ WHERE a.day_bucket >= $3 / 86400000
+   AND a.day_bucket < $4 / 86400000
+UNION ALL
+SELECT f.model,
+       CAST(0 AS BIGINT) AS input_tokens,
+       CAST(0 AS BIGINT) AS output_tokens,
+       CAST(1 AS BIGINT) AS requests
+  FROM generation_stats_facts f
+ WHERE f.created_at >= $1 AND f.created_at <= $2
+   AND f.created_at < $3
+UNION ALL
+SELECT f.model,
+       CAST(0 AS BIGINT) AS input_tokens,
+       CAST(0 AS BIGINT) AS output_tokens,
+       CAST(1 AS BIGINT) AS requests
+  FROM generation_stats_facts f
+ WHERE f.created_at >= $1 AND f.created_at <= $2
+   AND f.created_at >= $4 AND f.created_at >= $3
+"#;
+
+fn is_global_unfiltered(tenant_external_id: Option<&str>, filter: &StatsFilter) -> bool {
+    tenant_external_id.is_none()
+        && filter.key_id.is_none()
+        && filter.model.is_none()
+        && filter.protocol.is_none()
+        && filter.status.is_none()
+        && filter.error_code.is_none()
+        && filter.upstream_account_id.is_none()
+        && filter.route_id.is_none()
+        && filter.min_duration_ms.is_none()
+        && filter.max_duration_ms.is_none()
+        && filter.min_cost_micros.is_none()
+        && filter.max_cost_micros.is_none()
+        && filter.key_alias.is_none()
+        && filter.principal.is_none()
+}
+
 fn pricing_activity_source(filter: &StatsFilter) -> String {
     if filter.status.as_deref() == Some("pending") {
         return FILTERED_ACTIVITY_SOURCE_PENDING.to_owned();
@@ -41,8 +115,12 @@ fn pricing_activity_source(filter: &StatsFilter) -> String {
         .join("\nUNION ALL\n")
 }
 
-fn pricing_stats_sql(filter: &StatsFilter) -> String {
-    let source = pricing_activity_source(filter);
+fn pricing_stats_sql(tenant_external_id: Option<&str>, filter: &StatsFilter) -> String {
+    let source = if is_global_unfiltered(tenant_external_id, filter) {
+        GLOBAL_UNFILTERED_PRICING_ACTIVITY_SOURCE.to_owned()
+    } else {
+        pricing_activity_source(filter)
+    };
     // No MATERIALIZED fence: PostgreSQL can prune unused cost/status columns
     // and plan the individual rollup/edge arms. Unlike the operator snapshot,
     // this endpoint needs neither four projections nor currency/window ranks.
@@ -80,33 +158,46 @@ impl Database {
             .div_euclid(DAY_MILLIS)
             .saturating_mul(DAY_MILLIS);
         // SQL is assembled exclusively from static internal source fragments.
-        // Every user filter remains a bound value.
-        let rows = sqlx::query(sqlx::AssertSqlSafe(pricing_stats_sql(&filter)))
-            .bind(tenant_external_id.unwrap_or_default())
-            .bind(filter.key_id.map(|id| id.to_string()).unwrap_or_default())
-            .bind(from)
-            .bind(to)
-            .bind(filter.model.as_deref().unwrap_or_default())
-            .bind(filter.protocol.as_deref().unwrap_or_default())
-            .bind(filter.status.as_deref().unwrap_or_default())
-            .bind(filter.error_code.as_deref().unwrap_or_default())
-            .bind(
-                filter
-                    .upstream_account_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_default(),
-            )
-            .bind(filter.route_id.map(|id| id.to_string()).unwrap_or_default())
-            .bind(filter.min_duration_ms.unwrap_or(-1))
-            .bind(filter.max_duration_ms.unwrap_or(-1))
-            .bind(filter.min_cost_micros.unwrap_or(-1))
-            .bind(filter.max_cost_micros.unwrap_or(-1))
-            .bind(search_prefix(filter.key_alias.as_deref()))
-            .bind(search_prefix(filter.principal.as_deref()))
-            .bind(full_day_from)
-            .bind(full_day_to)
-            .fetch_all(&self.pool)
-            .await?;
+        // Every non-default user filter remains a bound value. The global
+        // default has its own four time binds, so it cannot accidentally reuse
+        // a tenant- or credential-scoped query plan.
+        let sql = pricing_stats_sql(tenant_external_id, &filter);
+        let rows = if is_global_unfiltered(tenant_external_id, &filter) {
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(from)
+                .bind(to)
+                .bind(full_day_from)
+                .bind(full_day_to)
+                .fetch_all(&self.pool)
+                .await?
+        } else {
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(tenant_external_id.unwrap_or_default())
+                .bind(filter.key_id.map(|id| id.to_string()).unwrap_or_default())
+                .bind(from)
+                .bind(to)
+                .bind(filter.model.as_deref().unwrap_or_default())
+                .bind(filter.protocol.as_deref().unwrap_or_default())
+                .bind(filter.status.as_deref().unwrap_or_default())
+                .bind(filter.error_code.as_deref().unwrap_or_default())
+                .bind(
+                    filter
+                        .upstream_account_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_default(),
+                )
+                .bind(filter.route_id.map(|id| id.to_string()).unwrap_or_default())
+                .bind(filter.min_duration_ms.unwrap_or(-1))
+                .bind(filter.max_duration_ms.unwrap_or(-1))
+                .bind(filter.min_cost_micros.unwrap_or(-1))
+                .bind(filter.max_cost_micros.unwrap_or(-1))
+                .bind(search_prefix(filter.key_alias.as_deref()))
+                .bind(search_prefix(filter.principal.as_deref()))
+                .bind(full_day_from)
+                .bind(full_day_to)
+                .fetch_all(&self.pool)
+                .await?
+        };
         rows.into_iter()
             .map(|row| {
                 Ok((
