@@ -389,6 +389,7 @@ async fn rejected_capture_never_publishes_a_complete_prefix() {
 #[tokio::test]
 async fn late_begin_ack_is_fenced_as_gap_and_cannot_leave_a_capturing_spool() {
     let (_dir, state, pool, identity) = fixture().await;
+    let clock = capture_ack_clock_for_test(&state);
     let (entering, release) = pause_next_begin_ack_for_test(&state);
     let begin_state = state.clone();
     let begin =
@@ -405,13 +406,11 @@ async fn late_begin_ack_is_fenced_as_gap_and_cannot_leave_a_capturing_spool() {
             .unwrap();
     assert_eq!(state_before_timeout, "capturing");
 
-    // Freeze time only after the real SQLite transaction committed and the
-    // acknowledgement seam stopped the task from completing. No database I/O
-    // runs while Tokio is allowed to auto-advance the clock.
-    tokio::time::pause();
-    tokio::time::advance(ACK_TIMEOUT).await;
+    // Expire this fixture's ACK timer only after the transaction committed.
+    // The same controlled clock keeps unrelated byte-redaction tests independent
+    // of CI scheduler latency without relaxing production's 250 ms deadline.
+    clock.expire();
     assert!(begin.await.unwrap().is_none());
-    tokio::time::resume();
     release.send(()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
