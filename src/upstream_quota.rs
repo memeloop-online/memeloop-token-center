@@ -91,7 +91,60 @@ fn quota_transport_error_code(is_timeout: bool) -> &'static str {
     }
 }
 
+fn quota_reqwest_error_kind(
+    is_timeout: bool,
+    is_connect: bool,
+    is_body: bool,
+    is_request: bool,
+) -> &'static str {
+    if is_timeout {
+        "timeout"
+    } else if is_connect {
+        "connect"
+    } else if is_body {
+        "body"
+    } else if is_request {
+        "request"
+    } else {
+        "other"
+    }
+}
+
+fn quota_reqwest_error_code(is_timeout: bool) -> &'static str {
+    if is_timeout {
+        "quota_timeout"
+    } else {
+        "quota_transport_failed"
+    }
+}
+
 fn log_quota_request_error(
+    context: QuotaRequestContext,
+    phase: &'static str,
+    error: &reqwest::Error,
+    started: tokio::time::Instant,
+) {
+    // Do not log reqwest's error display/chain: it can include the complete
+    // URL, including proxy userinfo or request-derived credentials. These
+    // predicates are the deliberately allowlisted diagnostic surface.
+    tracing::warn!(
+        operation = "quota_supplier_read",
+        upstream_account_id = %context.account_id,
+        credential_generation = context.credential_generation,
+        endpoint_kind = context.endpoint_kind,
+        phase,
+        error_kind = quota_reqwest_error_kind(
+            error.is_timeout(),
+            error.is_connect(),
+            error.is_body(),
+            error.is_request(),
+        ),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "quota supplier request failed"
+    );
+}
+
+fn log_codex_quota_request_error(
     context: QuotaRequestContext,
     phase: &'static str,
     is_timeout: bool,
@@ -536,7 +589,7 @@ async fn read_codex(
         .ok_or("credential_invalid")?;
     let proxy_url = credential.proxy().map(|(url, _)| url);
     let (usage, reset) = tokio::join!(
-        get_json(
+        get_codex_json(
             &http,
             credential_header.clone(),
             credential_value.clone(),
@@ -546,7 +599,7 @@ async fn read_codex(
             QuotaRequestContext::for_account(account, "usage"),
             budget,
         ),
-        get_json(
+        get_codex_json(
             &http,
             credential_header,
             credential_value,
@@ -647,7 +700,40 @@ impl QuotaSnapshot {
     }
 }
 
-async fn get_json(
+async fn decode_response(
+    response: reqwest::Response,
+    context: QuotaRequestContext,
+    started: tokio::time::Instant,
+) -> Result<Value, &'static str> {
+    if !response.status().is_success() {
+        return Err(match response.status().as_u16() {
+            401 | 403 => "quota_not_authorized",
+            429 => "quota_rate_limited",
+            _ => "quota_upstream_error",
+        });
+    }
+    if response
+        .content_length()
+        .is_some_and(|len| len > BODY_LIMIT as u64)
+    {
+        return Err("quota_response_too_large");
+    }
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            log_quota_request_error(context, "body", &error, started);
+            quota_reqwest_error_code(error.is_timeout())
+        })?;
+        if bytes.len().saturating_add(chunk.len()) > BODY_LIMIT {
+            return Err("quota_response_too_large");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "quota_invalid_payload")
+}
+
+async fn get_codex_json(
     http: &wreq::Client,
     credential_header: http::HeaderName,
     credential_value: http::HeaderValue,
@@ -688,11 +774,11 @@ async fn get_json(
     let response = tokio::time::timeout_at(deadline, request.send())
         .await
         .map_err(|_| {
-            log_quota_request_error(context, "send", true, false, started);
+            log_codex_quota_request_error(context, "send", true, false, started);
             "quota_timeout"
         })?
         .map_err(|error| {
-            log_quota_request_error(
+            log_codex_quota_request_error(
                 context,
                 "send",
                 error.is_timeout(),
@@ -701,10 +787,10 @@ async fn get_json(
             );
             quota_transport_error_code(error.is_timeout())
         })?;
-    decode_response(response, context, started, deadline, budget.read).await
+    decode_codex_response(response, context, started, deadline, budget.read).await
 }
 
-async fn decode_response(
+async fn decode_codex_response(
     response: wreq::Response,
     context: QuotaRequestContext,
     started: tokio::time::Instant,
@@ -731,14 +817,14 @@ async fn decode_response(
         let chunk = tokio::time::timeout_at(read_deadline, stream.next())
             .await
             .map_err(|_| {
-                log_quota_request_error(context, "body", true, false, started);
+                log_codex_quota_request_error(context, "body", true, false, started);
                 "quota_timeout"
             })?;
         let Some(chunk) = chunk else {
             break;
         };
         let chunk = chunk.map_err(|error| {
-            log_quota_request_error(
+            log_codex_quota_request_error(
                 context,
                 "body",
                 error.is_timeout(),
@@ -843,6 +929,19 @@ mod tests {
 
     #[test]
     fn quota_transport_classification_keeps_timeouts_distinct_from_transport() {
+        assert_eq!(quota_reqwest_error_kind(true, true, true, true), "timeout");
+        assert_eq!(quota_reqwest_error_kind(false, true, true, true), "connect");
+        assert_eq!(quota_reqwest_error_kind(false, false, true, true), "body");
+        assert_eq!(
+            quota_reqwest_error_kind(false, false, false, true),
+            "request"
+        );
+        assert_eq!(
+            quota_reqwest_error_kind(false, false, false, false),
+            "other"
+        );
+        assert_eq!(quota_reqwest_error_code(true), "quota_timeout");
+        assert_eq!(quota_reqwest_error_code(false), "quota_transport_failed");
         assert_eq!(quota_transport_error_kind("send", true, true), "timeout");
         assert_eq!(quota_transport_error_kind("send", false, true), "connect");
         assert_eq!(quota_transport_error_kind("body", false, false), "body");
@@ -896,7 +995,7 @@ mod tests {
         };
         let url = format!("http://{}/usage", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
-            get_json(
+            get_codex_json(
                 &client,
                 http::header::AUTHORIZATION,
                 http::HeaderValue::from_static("Bearer fixture-token"),
@@ -993,7 +1092,7 @@ mod tests {
             ..usage_context
         };
         assert_eq!(
-            get_json(
+            get_codex_json(
                 &http,
                 credential_header.clone(),
                 credential_value.clone(),
@@ -1008,7 +1107,7 @@ mod tests {
             "pro"
         );
         assert_eq!(
-            get_json(
+            get_codex_json(
                 &http,
                 credential_header,
                 credential_value,
