@@ -70,7 +70,7 @@ impl Database {
         account_id: Uuid,
     ) -> Result<Vec<String>, AppError> {
         Ok(sqlx::query_scalar(
-            "SELECT DISTINCT upstream_model FROM model_route_upstream_accounts WHERE upstream_account_id = $1 ORDER BY upstream_model",
+            "SELECT DISTINCT association.upstream_model FROM model_route_upstream_accounts association JOIN model_routes route ON route.id = association.model_route_id AND route.tenant_id = association.tenant_id WHERE association.upstream_account_id = $1 AND route.archived_at IS NULL ORDER BY association.upstream_model",
         )
         .bind(account_id.to_string())
         .fetch_all(&self.pool)
