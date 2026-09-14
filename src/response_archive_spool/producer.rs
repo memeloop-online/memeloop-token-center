@@ -624,9 +624,8 @@ impl ResponseArchiveWriter {
             self.state.config.key_pepper.as_bytes(),
             super::BufferedArchivePurpose::Response,
             self.compression_enabled,
-        ).map_err(|error| {
+        ).inspect_err(|error| {
             tracing::warn!(request_id = %self.identity.request_id, phase = "response_spool_encrypt", error_category = error.diagnostic_category(), "response archive chunk encryption failed");
-            error
         })?;
         let byte_count = i64::try_from(bytes.len()).map_err(|_| AppError::Internal)?;
         let append_started = std::time::Instant::now();
