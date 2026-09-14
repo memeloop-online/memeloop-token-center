@@ -319,6 +319,29 @@ pub struct PluginInstallProvenance {
     pub signature_policy: String,
 }
 
+/// Host-owned exact GitHub Actions signing identity, never request input.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CosignKeylessIdentity {
+    pub issuer: String,
+    pub identity: String,
+}
+
+impl CosignKeylessIdentity {
+    pub fn valid(&self) -> bool {
+        self.issuer == "https://token.actions.githubusercontent.com"
+            && self.identity.starts_with("https://github.com/")
+            && self.identity.contains("/.github/workflows/")
+            && self.identity.contains("@refs/heads/")
+            && self.identity.len() <= 512
+            && !self
+                .identity
+                .bytes()
+                .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+            && !self.identity.contains(['*', '?', '[', ']'])
+    }
+}
+
 #[cfg(feature = "experimental-plugin-revisions")]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

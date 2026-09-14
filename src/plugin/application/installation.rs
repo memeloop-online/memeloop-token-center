@@ -23,7 +23,10 @@ static INSTALL_STORAGE_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
 struct InstallPolicy {
     plugin_root: PathBuf,
     allowed_sources: BTreeSet<String>,
+    #[serde(default)]
     cosign_public_keys: Vec<PathBuf>,
+    #[serde(default)]
+    cosign_keyless: Option<crate::plugin::CosignKeylessIdentity>,
     #[serde(default)]
     source_credentials: BTreeMap<String, CredentialFiles>,
 }
@@ -128,7 +131,11 @@ impl ApplicationPlugins {
             serde_json::from_slice(&bytes).map_err(|_| AppError::Forbidden)?;
         if !policy.plugin_root.is_absolute()
             || policy.allowed_sources.is_empty()
-            || policy.cosign_public_keys.is_empty()
+            || (policy.cosign_public_keys.is_empty() == policy.cosign_keyless.is_none())
+            || policy
+                .cosign_keyless
+                .as_ref()
+                .is_some_and(|identity| !identity.valid())
             || policy.cosign_public_keys.len() > 8
             || policy
                 .cosign_public_keys
@@ -371,6 +378,13 @@ impl ApplicationPlugins {
                 }
                 for key in &policy.cosign_public_keys {
                     command.arg("--cosign-public-key").arg(key);
+                }
+                if let Some(identity) = &policy.cosign_keyless {
+                    command
+                        .arg("--cosign-certificate-identity")
+                        .arg(&identity.identity)
+                        .arg("--cosign-certificate-oidc-issuer")
+                        .arg(&identity.issuer);
                 }
                 if let Some(credentials) = policy.credentials_for(reference) {
                     credentials.apply(&mut command);
@@ -703,7 +717,10 @@ async fn package_checkpoint(
                 serde_json::from_slice(&receipt).map_err(|_| AppError::Forbidden)?;
             if receipt.source != source
                 || receipt.digest != digest
-                || receipt.signature_policy != "cosign-public-key"
+                || !matches!(
+                    receipt.signature_policy.as_str(),
+                    "cosign-public-key" | "cosign-keyless"
+                )
             {
                 continue;
             }
@@ -810,9 +827,13 @@ async fn trust_digest(policy: &InstallPolicy) -> Result<String, AppError> {
         }
         keys.push(bytes);
     }
-    super::super::plugin_configuration_schema_digest(
-        &json!({"sources":policy.allowed_sources,"keys":keys}),
-    )
+    let mut trust = json!({"sources":policy.allowed_sources,"keys":keys});
+    // Preserve existing public-key review digests; keyless identities are part
+    // of the reviewed authority and invalidate checkpoints when changed.
+    if let Some(identity) = &policy.cosign_keyless {
+        trust["keyless"] = serde_json::to_value(identity).map_err(|_| AppError::Internal)?;
+    }
+    super::super::plugin_configuration_schema_digest(&trust)
 }
 
 async fn append_inventory_file(
@@ -899,6 +920,46 @@ mod tests {
         http::{Request, StatusCode, header},
     };
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn keyless_policy_is_exclusive_and_identity_changes_invalidate_review() {
+        let (directory, state, _, _) = fixture().await;
+        let authority = state.application_plugins.as_ref().unwrap();
+        let policy_path = directory.path().join("policy.json");
+        let mut value: Value =
+            serde_json::from_slice(&std::fs::read(&policy_path).unwrap()).unwrap();
+        let public_key_digest = trust_digest(&authority.install_policy().await.unwrap())
+            .await
+            .unwrap();
+        value["cosign_keyless"] = json!({
+            "issuer":"https://token.actions.githubusercontent.com",
+            "identity":"https://github.com/memeloop-online/memeloop-token-center/.github/workflows/publish-first-party-plugin.yml@refs/heads/master"
+        });
+        std::fs::write(&policy_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(
+            authority.install_policy().await.is_err(),
+            "mixed policy must fail closed"
+        );
+        value["cosign_public_keys"] = json!([]);
+        std::fs::write(&policy_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let first = trust_digest(&authority.install_policy().await.unwrap())
+            .await
+            .unwrap();
+        assert_ne!(first, public_key_digest);
+        value["cosign_keyless"]["identity"] = json!(
+            "https://github.com/memeloop-online/memeloop-token-center/.github/workflows/other.yml@refs/heads/master"
+        );
+        std::fs::write(&policy_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_ne!(
+            first,
+            trust_digest(&authority.install_policy().await.unwrap())
+                .await
+                .unwrap()
+        );
+        value["cosign_keyless"]["issuer"] = json!("https://untrusted.example");
+        std::fs::write(&policy_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(authority.install_policy().await.is_err());
+    }
 
     async fn fixture() -> (tempfile::TempDir, AppState, InstallationRecord, String) {
         let directory = tempfile::tempdir().unwrap();

@@ -1,0 +1,70 @@
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import test from 'node:test';
+
+const root = new URL('../../', import.meta.url).pathname;
+const hash = (bytes: Buffer) => `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+
+test('Model Guard default has no rewrite, provider, or host capability', () => {
+  const manifest = JSON.parse(readFileSync(join(root, 'plugins/first-party/model-guard/plugin.json'), 'utf8'));
+  assert.deepEqual(manifest.capabilities, []);
+  assert.deepEqual(manifest.contributions.providers, []);
+  assert.equal(manifest.contributions.traffic_policy, true);
+  assert.equal(manifest.contributions.request_rewrite, false);
+  assert.deepEqual(manifest.contributions.configuration.default, { blocked_models: [] });
+  assert.equal(manifest.contributions.configuration.schema.additionalProperties, false);
+});
+
+test('keyless Helm mode omits signing-key Secrets but keeps host-owned policy', () => {
+  const flags = ['template', 'plugin-keyless', join(root, 'charts/memeloop-token-center'),
+    '--set', 'plugins.runtimeInventory.enabled=true',
+    '--set', 'plugins.runtimeInventory.existingClaim=reviewed-rwx',
+    '--set', 'plugins.runtimeInventory.installationEnabled=true',
+    '--set', 'plugins.runtimeInventory.policyConfigMap=reviewed-policy'];
+  const keyless = spawnSync('helm', [...flags, '--set', 'plugins.runtimeInventory.signaturePolicy=cosign-keyless'], { encoding: 'utf8' });
+  assert.equal(keyless.status, 0, keyless.stderr);
+  assert.match(keyless.stdout, /plugin-runtime-policy/);
+  assert.doesNotMatch(keyless.stdout, /plugin-runtime-trust/);
+  const legacy = spawnSync('helm', flags, { encoding: 'utf8' });
+  assert.notEqual(legacy.status, 0, 'default public-key mode must still require its Secret');
+});
+
+test('release evidence binds manifest and component bytes and rejects tampering', () => {
+  // Synthetic unit-test data only; never published or offered as a release.
+  const directory = mkdtempSync(join(tmpdir(), 'mtc-plugin-release-test-'));
+  try {
+    const source = 'ghcr.io/memeloop-online/mtc-model-guard';
+    mkdirSync(join(directory, 'plugin-package'));
+    mkdirSync(join(directory, 'plugin-install/mtc-model-guard'), { recursive: true });
+    const files = [
+      ['plugin.json', readFileSync(join(root, 'plugins/first-party/model-guard/plugin.json'))],
+      ['plugin.wasm', Buffer.from('synthetic test bytes')],
+    ] as const;
+    for (const [name, bytes] of files) writeFileSync(join(directory, 'plugin-package', name), bytes);
+    const manifestBytes = Buffer.from(JSON.stringify({
+      artifactType: 'application/vnd.memeloop.token-center.plugin.v1',
+      config: { mediaType: 'application/vnd.memeloop.token-center.plugin.config.v1+json' },
+      layers: files.map(([name, bytes]) => ({ digest: hash(bytes), size: bytes.length, annotations: { 'org.opencontainers.image.title': name } })),
+    }));
+    const digest = hash(manifestBytes);
+    writeFileSync(join(directory, 'plugin-oci-manifest.json'), manifestBytes);
+    writeFileSync(join(directory, 'plugin-installation.json'), JSON.stringify({ id: 'mtc-model-guard', version: '1.0.0', digest, source }));
+    writeFileSync(join(directory, 'plugin-install/mtc-model-guard/.mtc-oci-install.json'), JSON.stringify({ signature_policy: 'cosign-keyless', digest, source }));
+    writeFileSync(join(directory, 'plugin-signature-verification.json'), JSON.stringify([{ critical: { image: { 'docker-manifest-digest': digest } } }]));
+    const run = () => spawnSync(process.execPath, [join(root, 'ops/ci/first-party-plugin-release.ts'), directory], {
+      encoding: 'utf8', env: { ...process.env, PLUGIN_SOURCE: source, PLUGIN_DIGEST: digest },
+    });
+    assert.equal(run().status, 0);
+    assert.equal(JSON.parse(readFileSync(join(directory, 'plugin-release.json'), 'utf8')).installation_verified, true);
+    writeFileSync(join(directory, 'plugin-package/plugin.wasm'), 'changed bytes');
+    assert.notEqual(run().status, 0);
+    writeFileSync(join(directory, 'plugin-oci-manifest.json'), '{}');
+    assert.notEqual(run().status, 0);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

@@ -15,8 +15,10 @@
 {{- end -}}
 {{- if $runtime.installationEnabled -}}
 {{- $_ := required "runtimeInventory installation requires policyConfigMap" $runtime.policyConfigMap -}}
+{{- if ne ($runtime.signaturePolicy | default "cosign-public-key") "cosign-keyless" -}}
 {{- $_ := required "runtimeInventory installation requires cosignPublicKeysSecret.name" $runtime.cosignPublicKeysSecret.name -}}
 {{- if not $runtime.cosignPublicKeysSecret.keys -}}{{- fail "runtimeInventory installation requires public-key items" -}}{{- end -}}
+{{- end -}}
 {{- end -}}
 
 {{- else if $runtime.installationEnabled -}}
@@ -51,9 +53,11 @@
 - name: plugin-runtime-policy
   mountPath: /var/run/mtc-plugin-policy
   readOnly: true
+{{- if ne ($runtime.signaturePolicy | default "cosign-public-key") "cosign-keyless" }}
 - name: plugin-runtime-trust
   mountPath: /var/run/mtc-plugin-trust
   readOnly: true
+{{- end }}
 - name: plugin-runtime-tmp
   mountPath: /tmp
 {{- range $index, $secret := $runtime.registrySecrets }}
@@ -77,6 +81,7 @@
   configMap:
     name: {{ $runtime.policyConfigMap | quote }}
     items: [{key: policy.json, path: policy.json}]
+{{- if ne ($runtime.signaturePolicy | default "cosign-public-key") "cosign-keyless" }}
 - name: plugin-runtime-trust
   secret:
     secretName: {{ $runtime.cosignPublicKeysSecret.name | quote }}
@@ -86,6 +91,7 @@
       - key: {{ . | quote }}
         path: {{ . | quote }}
       {{- end }}
+{{- end }}
 - name: plugin-runtime-tmp
   emptyDir:
     sizeLimit: {{ $runtime.tmpSizeLimit | quote }}

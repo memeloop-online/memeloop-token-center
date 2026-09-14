@@ -442,7 +442,10 @@ pub(super) fn validate_grants(
                 && plugin.identity == grant.identity
                 && grant.identity.provenance.as_ref().is_some_and(|receipt| {
                     receipt.format_version == 1
-                        && receipt.signature_policy == "cosign-public-key"
+                        && matches!(
+                            receipt.signature_policy.as_str(),
+                            "cosign-public-key" | "cosign-keyless"
+                        )
                         && !receipt.source.is_empty()
                         && valid_digest(&receipt.digest)
                 })

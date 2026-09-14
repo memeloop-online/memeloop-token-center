@@ -79,6 +79,70 @@ pub struct InstallPluginOptions {
     pub allowed_sources: BTreeSet<String>,
     pub credentials: RegistryCredentials,
     pub cosign_public_keys: Vec<Vec<u8>>,
+    pub cosign_keyless: Option<CosignKeylessIdentity>,
+}
+
+pub use crate::plugin::CosignKeylessIdentity;
+
+struct CosignKeylessSignatureVerifier<'a> {
+    identity: &'a CosignKeylessIdentity,
+    runner: &'a dyn CosignRunner,
+}
+
+#[async_trait]
+impl SignatureVerifier for CosignKeylessSignatureVerifier<'_> {
+    async fn verify(
+        &self,
+        reference: &str,
+        expected_digest: &str,
+        credentials: &RegistryCredentials,
+    ) -> Result<(), PluginDistributionError> {
+        if !self.identity.valid() {
+            return Err(PluginDistributionError::SignatureVerification);
+        }
+        let image: Reference = reference
+            .parse()
+            .map_err(|_| PluginDistributionError::SignatureVerification)?;
+        if image.digest() != Some(expected_digest) {
+            return Err(PluginDistributionError::SignatureVerification);
+        }
+        let workspace = CosignWorkspace::new(image.registry(), credentials, &[])
+            .map_err(|_| PluginDistributionError::SignatureVerification)?;
+        let version = self
+            .runner
+            .run(&cosign_version_command(&workspace))
+            .await
+            .map_err(|_| PluginDistributionError::SignatureVerification)?;
+        if !version.success || !cosign_version_matches(&version.stdout) {
+            return Err(PluginDistributionError::SignatureVerification);
+        }
+        let mut command = cosign_base_command(&workspace);
+        command.arguments = vec![
+            "verify".into(),
+            "--certificate-oidc-issuer".into(),
+            self.identity.issuer.clone().into(),
+            "--certificate-identity".into(),
+            self.identity.identity.clone().into(),
+            format!(
+                "{}/{}@{expected_digest}",
+                image.registry(),
+                image.repository()
+            )
+            .into(),
+        ];
+        // Keep certificate chain, identity, Rekor inclusion, SCT and claims
+        // checks enabled. Never inherit COSIGN_* environment overrides.
+        let outcome = self
+            .runner
+            .run(&command)
+            .await
+            .map_err(|_| PluginDistributionError::SignatureVerification)?;
+        if outcome.success {
+            Ok(())
+        } else {
+            Err(PluginDistributionError::SignatureVerification)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -402,6 +466,20 @@ pub async fn install_plugin_oci(
     options: &InstallPluginOptions,
 ) -> Result<InstalledPlugin, PluginDistributionError> {
     let runner = SystemCosignRunner;
+    if let Some(identity) = &options.cosign_keyless {
+        if !options.cosign_public_keys.is_empty() {
+            return Err(PluginDistributionError::SignatureVerification);
+        }
+        return install_plugin_oci_with_verifier(
+            options,
+            &CosignKeylessSignatureVerifier {
+                identity,
+                runner: &runner,
+            },
+            false,
+        )
+        .await;
+    }
     let verifier = CosignPublicKeySignatureVerifier {
         keys: &options.cosign_public_keys,
         runner: &runner,
@@ -495,7 +573,17 @@ async fn install_plugin_oci_with_verifier(
     let package = validate_plugin_package(&staging_path)
         .map_err(|error| PluginDistributionError::InvalidPackage(error.to_string()))?;
     validate_manifest_layer_relationships(&package, &files)?;
-    write_receipt(&staging_path, &source, expected_digest).await?;
+    write_receipt(
+        &staging_path,
+        &source,
+        expected_digest,
+        if options.cosign_keyless.is_some() {
+            "cosign-keyless"
+        } else {
+            "cosign-public-key"
+        },
+    )
+    .await?;
     sync_directory(&staging_path).await?;
 
     let target = options.plugin_root.join(&package.id);
@@ -839,12 +927,13 @@ async fn write_receipt(
     staging: &Path,
     source: &str,
     digest: &str,
+    signature_policy: &'static str,
 ) -> Result<(), PluginDistributionError> {
     let bytes = serde_json::to_vec_pretty(&InstallReceipt {
         format_version: 1,
         source,
         digest,
-        signature_policy: "cosign-public-key",
+        signature_policy,
     })
     .map_err(|_| PluginDistributionError::Storage)?;
     let receipt = staging.join(".mtc-oci-install.json");

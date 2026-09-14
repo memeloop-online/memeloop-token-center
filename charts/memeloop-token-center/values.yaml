@@ -208,6 +208,9 @@ plugins:
     installationEnabled: false
     # Host-owned policy.json; paths refer to the mounts documented in the guide.
     policyConfigMap: ""
+    # Explicit keyless mode omits the public-key Secret; policy.json must then
+    # contain an exact reviewed GitHub Actions issuer and workflow identity.
+    signaturePolicy: cosign-public-key
     cosignPublicKeysSecret:
       name: ""
       keys: []

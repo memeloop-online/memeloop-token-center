@@ -290,15 +290,18 @@
                 }
               }
             },
+            "signaturePolicy": { "type": "string", "enum": ["cosign-public-key", "cosign-keyless"] },
             "tmpSizeLimit": { "$ref": "#/definitions/resourceQuantity" }
           },
           "allOf": [
             { "if": { "properties": { "installationEnabled": { "const": true } } },
               "then": { "properties": {
                 "enabled": { "const": true },
-                "policyConfigMap": { "minLength": 1 },
-                "cosignPublicKeysSecret": { "properties": { "name": { "minLength": 1 }, "keys": { "minItems": 1 } } }
-              } } }
+                "policyConfigMap": { "minLength": 1 }
+              } } },
+            { "if": { "properties": { "installationEnabled": { "const": true } },
+                        "not": { "required": ["signaturePolicy"], "properties": { "signaturePolicy": { "const": "cosign-keyless" } } } },
+              "then": { "properties": { "cosignPublicKeysSecret": { "properties": { "name": { "minLength": 1 }, "keys": { "minItems": 1 } } } } } }
           ]
         },
         "ociInstaller": {
