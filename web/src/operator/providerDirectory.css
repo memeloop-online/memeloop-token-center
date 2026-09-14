@@ -17,6 +17,8 @@
 .provider-detail-workspace .upstream-connection dl { max-width: 760px; }
 .provider-detail-workspace .upstream-quota { margin: 0; padding: 20px 0; }
 .provider-detail-workspace .account-meta { display: block; width: 100%; }
+.provider-detail-workspace .fui-AccordionHeader__button { justify-content: flex-start; min-height: 44px; }
+.provider-detail-workspace .account-meta > .fui-Accordion:last-child .fui-AccordionHeader__button { color: var(--form-danger); }
 .provider-detail-workspace .row-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .provider-detail-workspace .provider-availability, .provider-detail-workspace .upstream-quota-window { background: transparent; border: 0; border-radius: 0; }
 @media (max-width: 1100px) {
