@@ -51,6 +51,8 @@ test('same candidate scope is order independent, while inactive copies do not re
   assert.notEqual(same[0].label, same[1].label, 'genuinely equal active scopes require stable disambiguation');
   assert.notEqual(same[0].label, 'Sol');
   assert.notEqual(same[1].label, 'Sol');
+  const technicalDifference = credentialRouteOptions([input[0], { ...input[1], protocol: 'anthropic', upstream_model: 'another-upstream' }], accounts, [], 'zh-CN');
+  assert.notEqual(technicalDifference[0].label, technicalDifference[1].label, 'technical details do not distinguish identical visible model/account scopes');
   const inactive = credentialRouteOptions([input[0], { ...input[1], enabled: false }], accounts, [], 'zh-CN');
   assert.equal(inactive[0].label, 'Sol');
   assert.equal(inactive[1].value, 'scope-two');
