@@ -180,7 +180,7 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     await lifecycle.getByRole('dialog').getByRole('button', { name: 'Cancel', exact: true }).click();
     assert.equal((await calls(lifecycle)).some(call => call === '/internal/v1/keys/delete'), false, 'cancel never submits deletion');
     await lifecycle.getByRole('button', { name: 'Delete selected (2)', exact: true }).click();
-    await lifecycle.getByRole('dialog').getByRole('button', { name: 'Continue', exact: true }).click();
+    await lifecycle.getByRole('dialog').getByRole('button', { name: 'Confirm and continue', exact: true }).click();
     await lifecycle.getByRole('status').filter({ hasText: '2 credentials deleted.' }).waitFor();
     assert.equal(await lifecycle.getByText('Manual workspace', { exact: true }).count(), 0);
     const deletions = await lifecycle.evaluate(() => window.credentialFixture.requests.filter(request => request.path === '/internal/v1/keys/delete'));
