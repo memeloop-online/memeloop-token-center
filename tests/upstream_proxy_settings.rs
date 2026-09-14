@@ -270,5 +270,36 @@ async fn explicit_proxy_read_preserves_full_url_but_excludes_other_secrets_and_r
                 .0,
             StatusCode::CONFLICT
         );
+        // A later configuration change makes fresh transport validation fail
+        // deterministically (public scope cannot reach private addresses). A committed
+        // replay must still return its original result without that validation.
+        state
+            .db
+            .update_upstream_account(
+                account.id,
+                "proxy-tenant",
+                memeloop_token_center::db::UpdateUpstreamAccountInput {
+                    name: stored_account.name.clone(),
+                    config: json!({"base_url": "https://10.1.2.3", "network_scope": "public"}),
+                    expected_updated_at: stored_account.updated_at,
+                },
+            )
+            .await
+            .unwrap();
+        let replay = put(&state, edit_path, &tokens[0], "edit-1", &update).await;
+        assert_eq!(replay.0, StatusCode::OK);
+        assert_eq!(replay.1, edited);
+        assert_eq!(
+            put(&state, edit_path, &tokens[0], "fresh-denied", &update)
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            put(&state, edit_path, &tokens[2], "edit-1", &update)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
     }
 }
