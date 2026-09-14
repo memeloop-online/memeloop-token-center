@@ -4,6 +4,8 @@ import type { RequestView, StatsBucket } from './types.js';
 import { useI18n } from './i18n.js';
 import { formatCurrency, formatCurrencyDisplay, formatDurationDisplay, formatMetricDisplay, formatMetricNumber, formatMilliseconds, formatNumber } from './format.js';
 import { useAnchoredPopover } from './useAnchoredPopover.js';
+import { DetailTooltip } from './design-system';
+import { averageRequestOutputTps, nonCachedRequestInput, requestCredentialLabel, requestIsPending } from './requestTablePresentation';
 
 export function Shell({ children, operator = false }: { children: ReactNode; operator?: boolean }) {
   const { locale, setLocale, t } = useI18n();
@@ -229,10 +231,16 @@ export function RequestTable({
   const { locale, t } = useI18n();
   if (!requests.length) return <div className="empty">{t('common.noRequests')}</div>;
   const showsSession = requests.some((request) => request.session_context !== undefined);
+  const copy = {
+    total: t('request.totalTokens'), input: t('request.uncachedInput'), output: t('request.outputTokens'),
+    unknown: t('request.usageUnknown'), averageTps: t('request.averageTps'), tpsHint: t('request.averageTpsHint'),
+    tpsMissing: t('request.tpsMissing'), tpsRunning: t('request.tpsRunning'),
+    cacheMissing: t('request.cacheMissing'), pendingUsage: t('request.pendingUsage'),
+  };
   return (
     <div className="table-scroll request-table-scroll" role="region" aria-label={t('request.table')} tabIndex={0}>
       <table className="request-table">
-        <thead><tr><th>{t('request.receivedAt')}</th><th>{t('self.credential')}</th><th>{t('request.model')}</th><th>{t('request.tokens')}</th><th>{t('request.cost')}</th>{showsSession && <th>{t('request.session')}</th>}<th>{t('request.status')}</th><th>{t('request.duration')}</th>{onSelect && <th><span className="visually-hidden">{t('request.actions')}</span></th>}</tr></thead>
+        <thead><tr><th>{t('request.receivedAt')}</th><th>{t('self.credential')}</th><th>{t('request.model')}</th><th>{t('request.tokens')}</th><th>{t('request.cost')}</th>{showsSession && <th>{t('request.session')}</th>}<th>{t('request.status')}</th><th>{t('request.duration')}</th><th><DetailTooltip content={copy.tpsHint}><span tabIndex={0}>{copy.averageTps}</span></DetailTooltip></th>{onSelect && <th><span className="visually-hidden">{t('request.actions')}</span></th>}</tr></thead>
         <tbody>
           {requests.map((request) => {
             const context = request.session_context;
@@ -250,15 +258,25 @@ export function RequestTable({
             const durationSummary = request.completed_at != null
               ? `${t('request.completedAt')}: ${new Date(request.completed_at).toLocaleString(locale)}`
               : '';
-            const cost = currencyForRequest ? formatCurrencyDisplay(request.cost, currencyForRequest, locale) : { text: '—' };
+            const pending = requestIsPending(request);
+            const cost = pending ? { text: '—', title: copy.pendingUsage } : currencyForRequest ? formatCurrencyDisplay(request.cost, currencyForRequest, locale) : { text: '—' };
             const tokenDisplay = formatMetricDisplay(request.input_tokens + request.output_tokens, locale);
-            const tokenDetails = requestTokenDetails(request, locale, t);
+            const tokenDetails = pending ? copy.pendingUsage : requestTokenDetails(request, locale, t);
             const duration = formatDurationDisplay(request.duration_ms, locale);
+            const uncachedInput = nonCachedRequestInput(request);
+            const averageTps = averageRequestOutputTps(request);
+            const rateHint = averageTps === null ? pending ? copy.tpsRunning : copy.tpsMissing : copy.tpsHint;
+            const credential = requestCredentialLabel(request, credentialAlias);
+            const credentialLabel = 'label' in credential ? credential.label : t(credential.key);
+            const credentialDetails = request.credential_identity ? `${request.credential_identity.key_id} · ${request.credential_identity.principal_external_id}` : credentialLabel;
+            const upstreamName = request.upstream_account_id ? upstreamNames?.get(request.upstream_account_id) : undefined;
             return <tr key={request.request_id}>
               <td className="request-time-cell"><time>{new Date(request.created_at).toLocaleString(locale)}</time><RequestIdentifier requestId={request.request_id} compact /></td>
-              <td className="request-credential-cell"><strong>{request.credential_identity?.key_alias ?? credentialAlias ?? t('common.none')}</strong>{technicalSummary && <button type="button" className="request-technical-info" title={technicalSummary} aria-label={technicalSummary}>ⓘ</button>}</td>
-              <td className="request-model-cell"><code>{request.model}</code></td>
-              <td className="request-token-cell"><span className="request-value-info" title={tokenDetails} aria-label={`${tokenDisplay.text} (${tokenDetails})`} tabIndex={0}>{tokenDisplay.text}</span></td>
+              <td className="request-credential-cell"><DetailTooltip content={credentialDetails}><strong tabIndex={0}>{credentialLabel}</strong></DetailTooltip></td>
+              <td className="request-model-cell"><DetailTooltip content={technicalSummary}><span className="request-routing-info" tabIndex={0}><code>{request.model}</code>{upstreamName && <small className="request-upstream-name">{upstreamName}</small>}</span></DetailTooltip></td>
+              <td className="request-token-cell"><DetailTooltip content={tokenDetails}><span className="request-value-info request-token-total" aria-label={pending ? copy.pendingUsage : `${copy.total} ${tokenDisplay.text} (${tokenDetails})`} tabIndex={0}>{pending ? t('common.running') : <>{copy.total} <span>{tokenDisplay.text}</span></>}</span></DetailTooltip>
+                <span className="request-token-primary"><span>{copy.input} <b>{uncachedInput === null ? <DetailTooltip content={pending ? copy.pendingUsage : copy.cacheMissing}><span tabIndex={0}>—</span></DetailTooltip> : formatMetricDisplay(uncachedInput, locale).text}</b></span><span>{copy.output} <b>{pending ? '—' : formatMetricDisplay(request.output_tokens, locale).text}</b></span></span>
+              </td>
               <td className="request-cost-cell"><span className="request-value-info" title={cost.title} aria-label={cost.title ? `${cost.text} (${cost.title})` : undefined} tabIndex={cost.title ? 0 : undefined}>{cost.text}</span></td>
               {showsSession && <td className="request-session-cell">
                 {!context
@@ -272,6 +290,7 @@ export function RequestTable({
               </td>}
               <td><span className={`status ${request.status_code && request.status_code < 400 ? 'ok' : request.status_code ? 'bad' : 'pending'}`} title={request.error_code ?? undefined} aria-label={request.error_code ? `${request.status_code ?? t('common.running')}: ${request.error_code}` : undefined}>{request.status_code ?? t('common.running')}</span>{request.error_code && <span className="visually-hidden">{request.error_code}</span>}</td>
               <td><span className="request-duration-info" title={[duration.title, durationSummary].filter(Boolean).join(' · ') || undefined} aria-label={[duration.text, duration.title, durationSummary].filter(Boolean).join(' · ') || undefined} tabIndex={duration.title || durationSummary ? 0 : undefined}>{duration.text}</span></td>
+              <td className="request-tps-cell"><DetailTooltip content={rateHint}><span tabIndex={0} aria-label={`${copy.averageTps}: ${averageTps === null ? copy.unknown : formatNumber(averageTps, locale, 2)}. ${rateHint}`}>{averageTps === null ? '—' : formatNumber(averageTps, locale, 2)}</span></DetailTooltip></td>
               {onSelect && <td><button className="secondary table-action" type="button" onClick={() => onSelect(request)} aria-label={t('request.openDetail', { model: request.model })}>{t('request.inspect')}</button></td>}
             </tr>
           })}

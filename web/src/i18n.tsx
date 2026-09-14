@@ -4,6 +4,14 @@ export type Locale = 'zh-CN' | 'en';
 type Variables = Record<string, string | number>;
 
 const zh = {
+  'request.totalTokens': '总量', 'request.uncachedInput': '非缓存输入', 'request.outputTokens': '输出',
+  'request.usageUnknown': '未记录', 'request.unnamedCredential': '未命名凭据', 'request.missingCredential': '未记录凭据',
+  'request.averageTps': '平均 TPS',
+  'request.averageTpsHint': '输出 Token ÷ 请求总耗时（秒），包含等待与首字延迟，不代表纯生成速度。',
+  'request.tpsMissing': '缺少有效的输出 Token 或请求耗时，无法计算。',
+  'request.tpsRunning': '请求进行中，完成后计算。',
+  'request.cacheMissing': '缓存明细缺失或不一致，无法确定非缓存输入；完整已知用量见详情。',
+  'request.pendingUsage': '请求进行中，用量与费用尚未结算。',
   'secret.show': '显示', 'secret.hide': '隐藏', 'secret.showField': '显示{{field}}', 'secret.hideField': '隐藏{{field}}', 'secret.value': '敏感值', 'secret.invalidJson': '请输入有效 JSON；敏感内容不会显示在错误中。',
   'schema.Connect timeout (ms)': '连接超时（毫秒）',
   'schema.Read inactivity timeout (ms)': '读取无数据超时（毫秒）',
@@ -513,6 +521,14 @@ const zh = {
 } as const;
 
 const en = {
+  'request.totalTokens': 'Total', 'request.uncachedInput': 'Uncached input', 'request.outputTokens': 'Output',
+  'request.usageUnknown': 'Not recorded', 'request.unnamedCredential': 'Unnamed credential', 'request.missingCredential': 'Credential not recorded',
+  'request.averageTps': 'Average TPS',
+  'request.averageTpsHint': 'Output tokens ÷ total request seconds, including waiting and first-token latency; not pure decoding speed.',
+  'request.tpsMissing': 'Valid output tokens or request duration are missing; the rate cannot be calculated.',
+  'request.tpsRunning': 'Calculated when the request finishes.',
+  'request.cacheMissing': 'Cache telemetry is missing or inconsistent, so uncached input is unknown. Known usage remains in details.',
+  'request.pendingUsage': 'The request is running; usage and cost have not been settled.',
   'secret.show': 'Show', 'secret.hide': 'Hide', 'secret.showField': 'Show {{field}}', 'secret.hideField': 'Hide {{field}}', 'secret.value': 'Secret value', 'secret.invalidJson': 'Enter valid JSON. Secret contents are not shown in errors.',
   'schema.Connect timeout (ms)': 'Connect timeout (ms)',
   'schema.Read inactivity timeout (ms)': 'Read inactivity timeout (ms)',
