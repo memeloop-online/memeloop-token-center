@@ -100,6 +100,11 @@ test('independent proxy save updates concurrency metadata without dropping the p
     await page.evaluate(() => window.releaseFormProxyRead());
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
     assert.equal(await workspace.locator('.provider-proxy-value input').inputValue(), 'socks5h://10.0.0.40:1080', 'a late old-generation read cannot restore the previous proxy');
+    await page.goto(`${origin}/e2e/fixtures/form-journey.html?workflows&proxy-no-authority`);
+    await row.getByRole('button', { name: '编辑', exact: true }).click();
+    assert.equal(await workspace.locator('.provider-proxy-value input').count(), 0);
+    assert.equal(await workspace.getByRole('button', { name: '查看代理地址', exact: true }).count(), 0);
+    assert.equal(await page.evaluate(() => window.formJourneyReads.filter(path => path.endsWith('/transport-proxy')).length), 0, 'an account without management capability never requests the original');
     // Credential-generation change invalidates both the cached summary and
     // reset capability. Unknown discovery remains visible, but cannot prepare
     // a reset. These reads and the proxy update are in-memory only; no reset
