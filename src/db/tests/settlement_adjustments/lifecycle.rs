@@ -8,6 +8,8 @@ struct LifecycleEntitlement {
     cycle_id: Uuid,
     external_subscription_id: String,
     external_cycle_id: String,
+    period_start: i64,
+    period_end: i64,
 }
 
 async fn establish_consumed_entitlement(
@@ -17,6 +19,8 @@ async fn establish_consumed_entitlement(
     let now = unix_millis();
     let external_subscription_id = format!("lifecycle-subscription-{suffix}");
     let external_cycle_id = format!("lifecycle-cycle-{suffix}");
+    let period_start = now - 1;
+    let period_end = now + 86_400_000;
     let reconciled = fixture
         .database
         .reconcile_entitlement(
@@ -26,8 +30,8 @@ async fn establish_consumed_entitlement(
                 provider: "lifecycle-test".to_owned(),
                 external_subscription_id: external_subscription_id.clone(),
                 external_cycle_id: external_cycle_id.clone(),
-                period_start: now - 1,
-                period_end: now + 86_400_000,
+                period_start,
+                period_end,
                 currency: "USD".to_owned(),
                 desired_micros: 100,
                 version: 1,
@@ -72,6 +76,8 @@ async fn establish_consumed_entitlement(
         cycle_id,
         external_subscription_id,
         external_cycle_id,
+        period_start,
+        period_end,
     }
 }
 
@@ -166,7 +172,6 @@ async fn rebate_then_cancel_matches_cancel_then_late_rebate() {
 async fn active_desired_reduction_after_consumption_reduces_funding_at_rebate_threshold() {
     let fixture = fixture().await;
     let entitlement = establish_consumed_entitlement(&fixture, "active-reduction").await;
-    let now = unix_millis();
     fixture
         .database
         .reconcile_entitlement(
@@ -176,8 +181,8 @@ async fn active_desired_reduction_after_consumption_reduces_funding_at_rebate_th
                 provider: "lifecycle-test".to_owned(),
                 external_subscription_id: entitlement.external_subscription_id.clone(),
                 external_cycle_id: entitlement.external_cycle_id.clone(),
-                period_start: now - 1,
-                period_end: now + 86_400_000,
+                period_start: entitlement.period_start,
+                period_end: entitlement.period_end,
                 currency: "USD".to_owned(),
                 desired_micros: 40,
                 version: 2,
