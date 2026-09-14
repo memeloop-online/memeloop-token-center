@@ -13,6 +13,7 @@ test('conversation content precedes optional operational timelines', () => {
   assert.match(view, /formatMetricDisplay/);
   assert.match(view, /formatCurrencyDisplay/);
   assert.match(view, /formatDurationDisplay/);
+  assert.doesNotMatch(view, /className="session-detail" role=\{onClose/);
 });
 
 test('request inspection retains the selected conversation', () => {

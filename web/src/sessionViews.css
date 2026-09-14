@@ -1,7 +1,8 @@
 /* Session browsing is intentionally separate from the shared shell.  It can be
  * embedded by either the operator console or a credential's self-service view. */
 .panel.sessions-page { border: 0; box-shadow: none; padding: 0; background: transparent; }
-.sessions-page .session-controls > label { min-width: 0; }
+.sessions-page .session-controls > label { display: grid; gap: 4px; min-width: 0; }
+.sessions-page .session-controls .fui-Combobox { min-width: 0; width: 100%; }
 .sessions-page .session-controls [role='combobox'] { min-width: 0; width: 100%; }
 .session-workspace {
   display: grid;
@@ -211,6 +212,7 @@
 :root[data-theme='light'] .session-actor small { color: #526c67; }
 .session-detail .session-replay { border: 0; border-radius: 0; padding: 0; background: transparent; }
 .session-detail-heading h2 { overflow-wrap: anywhere; font-size: 24px; }
+.session-detail .fui-AccordionHeader__button { justify-content: flex-start; min-height: 40px; }
 .session-detail .session-replay-feed { max-height: 65vh; overflow: auto; overscroll-behavior: contain; }
 :root[data-theme='light'] .session-analysis[open] > summary,
 :root[data-theme='light'] .session-relationships[open] > summary { border-color: #dce7e4; }
@@ -227,6 +229,8 @@
 }
 
 @media (width <= 560px) {
+  .sessions-page .session-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .sessions-page .session-controls .filter-actions { grid-column: 1 / -1; }
   .session-workspace { gap: 12px; }
   .session-list-sidebar { grid-template-columns: minmax(0, 1fr); }
   .session-sidebar-item { border-right: 0; }
