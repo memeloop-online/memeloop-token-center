@@ -32,7 +32,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   const [filters, setFilters] = useState<TypedFilterAst>(emptyTypedFilterAst);
   const [loading, setLoading] = useState(false);
   const [hasOlder, setHasOlder] = useState(false);
-  const [detail, setDetail] = useState<RequestDetail>();
+  const [detailResult, setDetail] = useState<{ value: RequestDetail; token: string; tenant: string; requestId: string }>();
   const [error, setError] = useState('');
   const [upstreamError, setUpstreamError] = useState('');
   const [olderFilteredResultsStale, setOlderFilteredResultsStale] = useState(false);
@@ -56,6 +56,10 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   const detailAbort = useRef<AbortController | null>(null);
   const selectedRequestId = useRef<string | undefined>(undefined);
   const refreshedTerminalEvent = useRef<string | undefined>(undefined);
+  // Gate during render: effects must not expose a previous credential/tenant's
+  // detail for even the first commit after a scope change.
+  const detail = detailResult?.token === token && detailResult.tenant === tenant
+    && detailResult.requestId === selectedRequestId.current ? detailResult.value : undefined;
   // The initial snapshot and the live stream resolve independently. Keep the
   // latest event map available to an in-flight snapshot so an event received
   // before the snapshot completes cannot be overwritten by that stale result.
@@ -244,7 +248,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
       errorSource.current = undefined;
       setError('');
       const next = await api<RequestDetail>(`/internal/v1/requests/${requestId}${queryForTenant(tenant)}`, token, { signal: controller.signal });
-      if (requestSequence === detailSequence.current && selectedRequestId.current === requestId && !controller.signal.aborted) setDetail(next);
+      if (requestSequence === detailSequence.current && selectedRequestId.current === requestId && !controller.signal.aborted) setDetail({ value: next, token, tenant, requestId });
     } catch (reason) {
       if (requestSequence === detailSequence.current && !controller.signal.aborted) {
         errorSource.current = 'detail';
