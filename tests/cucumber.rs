@@ -5906,8 +5906,21 @@ async fn disconnect_cursor_oauth_before_reauthorization(world: &mut TokenCenterW
         .send()
         .await
         .expect("disconnect Cursor OAuth before reauthorization");
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
     let value: Value = response.json().await.expect("disconnected Cursor account");
+    // Do not print the response/account or credential-bearing database errors.
+    let safe_error_code = match value.pointer("/error/code").and_then(Value::as_str) {
+        Some("internal_error") => "internal_error",
+        Some("conflict") => "conflict",
+        Some("forbidden") => "forbidden",
+        Some("bad_request") => "bad_request",
+        _ => "other_or_absent",
+    };
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "Cursor disconnect: {safe_error_code}"
+    );
     let account = &value["account"];
     assert_eq!(account["id"], account_id.to_string());
     assert_eq!(account["status"], "disabled");

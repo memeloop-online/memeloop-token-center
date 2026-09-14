@@ -157,7 +157,7 @@ impl Database {
         .map(Some)
     }
 
-    async fn begin_upstream_oauth_refresh_write_transaction(
+    async fn begin_upstream_oauth_write_transaction(
         &self,
         account_id: Uuid,
         phase: OAuthRefreshWritePhase,
@@ -396,7 +396,11 @@ impl Database {
         key_material: &[u8],
     ) -> Result<(UpstreamAccountView, String, UpstreamCredential), AppError> {
         let now = unix_millis();
-        let mut tx = self.pool.begin().await?;
+        // Reserve SQLite's writer before reading the generation/CAS snapshot.
+        // A deferred read transaction cannot safely upgrade during worker writes.
+        let mut tx = self
+            .begin_upstream_oauth_write_transaction(account_id, OAuthRefreshWritePhase::Disconnect)
+            .await?;
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT a.auth_kind, a.oauth_session_id, a.oauth_driver, a.updated_at, c.credential_ciphertext, c.revoked_at FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation WHERE a.id = $1 AND t.external_id = $2 FOR UPDATE OF a, c"
@@ -749,10 +753,7 @@ impl Database {
             credential_rotation_request_hash(UPSTREAM_OAUTH_REFRESH_RESOURCE, account_id);
         let expires_at = now.saturating_add(CREDENTIAL_ROTATION_REPLAY_TTL_MILLIS);
         let mut tx = self
-            .begin_upstream_oauth_refresh_write_transaction(
-                account_id,
-                OAuthRefreshWritePhase::Claim,
-            )
+            .begin_upstream_oauth_write_transaction(account_id, OAuthRefreshWritePhase::Claim)
             .await?;
         let replay = claim_credential_rotation(
             &mut tx,
@@ -911,7 +912,7 @@ impl Database {
         let idempotency_key = idempotency_key.trim();
         let now = unix_millis();
         let mut tx = self
-            .begin_upstream_oauth_refresh_write_transaction(
+            .begin_upstream_oauth_write_transaction(
                 account_id,
                 OAuthRefreshWritePhase::RequestStart,
             )
@@ -991,10 +992,7 @@ impl Database {
             return Ok(view);
         }
         let mut tx = self
-            .begin_upstream_oauth_refresh_write_transaction(
-                account_id,
-                OAuthRefreshWritePhase::Finalize,
-            )
+            .begin_upstream_oauth_write_transaction(account_id, OAuthRefreshWritePhase::Finalize)
             .await?;
         let replay_row = sqlx::query(
             "SELECT resource_kind, resource_id, request_hash, response_ciphertext, expires_at FROM credential_rotation_replays WHERE idempotency_key = $1",
@@ -1082,10 +1080,7 @@ impl Database {
         key_material: &[u8],
     ) -> Result<Option<UpstreamAccountView>, AppError> {
         let mut tx = self
-            .begin_upstream_oauth_refresh_write_transaction(
-                account_id,
-                OAuthRefreshWritePhase::Stage,
-            )
+            .begin_upstream_oauth_write_transaction(account_id, OAuthRefreshWritePhase::Stage)
             .await?;
         let replay = sqlx::query(
             "SELECT resource_kind, resource_id, request_hash, response_ciphertext, expires_at FROM credential_rotation_replays WHERE idempotency_key = $1",
@@ -1143,10 +1138,7 @@ impl Database {
         idempotency_key: &str,
     ) -> Result<(), AppError> {
         let mut tx = self
-            .begin_upstream_oauth_refresh_write_transaction(
-                account_id,
-                OAuthRefreshWritePhase::Abort,
-            )
+            .begin_upstream_oauth_write_transaction(account_id, OAuthRefreshWritePhase::Abort)
             .await?;
         sqlx::query(
             "DELETE FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND idempotency_key = $2 AND pending_credential_ciphertext IS NULL AND request_started_at IS NULL",
@@ -1444,6 +1436,164 @@ mod tests {
             resume: std::sync::Arc::new(tokio::sync::Mutex::new(resumes)),
         });
         (phases, resume)
+    }
+
+    #[tokio::test]
+    async fn sqlite_oauth_disconnect_reserves_writer_before_reading_and_preserves_cas() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory
+                .path()
+                .join("oauth-disconnect-writer.db")
+                .display()
+        );
+        let state = AppState::initialize(Config::for_test(database_url.clone()))
+            .await
+            .unwrap();
+        let competing_writer = Database::connect_with_max(&database_url, 1).await.unwrap();
+        let credential = |token: &str| UpstreamCredential::OAuth {
+            access_token: token.into(),
+            refresh_token: Some("disconnect-refresh".into()),
+            expires_at: Some(4_102_444_800_000),
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            adapter_state: None,
+            proxy_url: None,
+            proxy_network_scope: None,
+        };
+        let original = state
+            .db
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: "disconnect-writer".into(),
+                    name: "cursor-disconnect".into(),
+                    driver: "http-json".into(),
+                    config: json!({"base_url": "https://api.example.test"}),
+                    credential: credential("disconnect-v1"),
+                    oauth_session_id: Some(Uuid::from_u128(1)),
+                    oauth_driver: Some("cursor".into()),
+                    oauth_refresh_url: Some("https://oauth.example.test/refresh".into()),
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let rotated = state
+            .db
+            .rotate_upstream_credential(
+                original.id,
+                credential("disconnect-v2"),
+                "disconnect-writer-rotation",
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rotated.credential_generation, 2);
+        assert!(matches!(
+            state
+                .db
+                .disconnect_upstream_oauth(
+                    original.id,
+                    "disconnect-writer",
+                    original.updated_at,
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        let still_active = state
+            .db
+            .upstream_account_with_credential(original.id, state.config.key_pepper.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(still_active.0.credential_generation, 2);
+        assert_eq!(still_active.0.status, "active");
+
+        // A failure in the second write must also roll back credential revocation.
+        sqlx::query(
+            "CREATE TRIGGER reject_disconnect BEFORE UPDATE OF status ON upstream_accounts WHEN NEW.status = 'disabled' BEGIN SELECT RAISE(ABORT, 'test disconnect rollback'); END",
+        )
+        .execute(&state.db.pool)
+        .await
+        .unwrap();
+        assert!(matches!(
+            state
+                .db
+                .disconnect_upstream_oauth(
+                    rotated.id,
+                    "disconnect-writer",
+                    rotated.updated_at,
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await,
+            Err(AppError::Internal)
+        ));
+        let after_rollback = state
+            .db
+            .upstream_account_with_credential(original.id, state.config.key_pepper.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(after_rollback.0.status, "active");
+        assert_eq!(after_rollback.0.credential_generation, 2);
+        sqlx::query("DROP TRIGGER reject_disconnect")
+            .execute(&state.db.pool)
+            .await
+            .unwrap();
+
+        sqlx::query("PRAGMA busy_timeout = 0")
+            .execute(&competing_writer.pool)
+            .await
+            .unwrap();
+        let (mut phases, resume) = arm_refresh_phase_seam(&state.db, original.id).await;
+        let disconnect_state = state.clone();
+        let disconnect = tokio::spawn(async move {
+            disconnect_state
+                .db
+                .disconnect_upstream_oauth(
+                    rotated.id,
+                    "disconnect-writer",
+                    rotated.updated_at,
+                    disconnect_state.config.key_pepper.as_bytes(),
+                )
+                .await
+        });
+        // The account-scoped barrier runs immediately after BEGIN, before any
+        // SELECT. A deferred BEGIN lets this competing writer acquire its lock
+        // and fails this assertion deterministically; no scheduling sleep is used.
+        pause_at_refresh_phase(
+            &mut phases,
+            &resume,
+            &competing_writer,
+            OAuthRefreshWritePhase::Disconnect,
+        )
+        .await;
+        let (disconnected, driver, _) = tokio::time::timeout(Duration::from_secs(10), disconnect)
+            .await
+            .expect("disconnect must finish after write admission resumes")
+            .unwrap()
+            .unwrap();
+        *state.db.oauth_refresh_write_phase_seam.lock().await = None;
+        assert_eq!(driver, "cursor");
+        assert_eq!(disconnected.id, original.id);
+        assert_eq!(disconnected.credential_generation, 2);
+        assert_eq!(disconnected.status, "disabled");
+        assert!(disconnected.can_reauthorize);
+        assert!(
+            state
+                .db
+                .upstream_account_with_credential(original.id, state.config.key_pepper.as_bytes())
+                .await
+                .is_err()
+        );
+        // The reservation is released on commit, rather than leaked by the seam.
+        competing_writer
+            .begin_write_transaction()
+            .await
+            .unwrap()
+            .rollback()
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
