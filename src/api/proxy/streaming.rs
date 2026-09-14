@@ -460,6 +460,21 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         }
                         if transport_error.is_some() {
                             drop(archive_sender.take());
+                            if transport_error == Some("downstream_disconnected")
+                                && responses_streaming_sanitizer
+                                    .as_ref()
+                                    .is_some_and(|sanitizer| sanitizer.has_pending_delivery())
+                            {
+                                // The receiver can disappear after the poll
+                                // snapshot, while an earlier part of this same
+                                // raw chunk is being delivered. Preserve a
+                                // success terminal already held from the rest
+                                // of the chunk under the same immediate-ready
+                                // and byte-bounded rule used above.
+                                downstream_closed_observed = true;
+                                transport_error = None;
+                                continue;
+                            }
                             if transport_error == Some("delivery_state") {
                                 let _ = tokio::time::timeout(
                                     MAX_DOWNSTREAM_SEND_WAIT,
