@@ -39,6 +39,12 @@ test('independent proxy save updates concurrency metadata without dropping the p
       await page.screenshot({ path: `${artifacts}/list-${theme}-${width}.png`, fullPage: true });
       await row.getByRole('button', { name: '查看详情', exact: true }).click();
       await page.locator('.provider-detail-workspace').waitFor();
+      const endpointLabel = page.locator('.provider-detail-workspace .upstream-connection').getByText('上游 API 地址（Base URL）', { exact: true });
+      assert.equal(await endpointLabel.count(), 1, 'endpoint help belongs to its field label, not a duplicate row');
+      await endpointLabel.focus();
+      await page.getByRole('tooltip').waitFor();
+      assert.match(await page.getByRole('tooltip').innerText(), /不是网络代理/);
+      await page.keyboard.press('Escape');
       assert.equal(await page.locator('.provider-directory details').count(), 0);
       assert.equal(await page.evaluate(() => window.formJourneyWrites), 0);
       await page.screenshot({ path: `${artifacts}/detail-${theme}-${width}.png`, fullPage: true });

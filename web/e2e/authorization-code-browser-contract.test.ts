@@ -50,7 +50,7 @@ test('plugin OAuth uses default client, full callback once, safe errors and isol
     await page.getByRole('button', { name: '完成授权', exact: true }).click();
     await page.getByRole('alert').waitFor();
     assert.equal(completes, 1); assert.doesNotMatch(await page.locator('body').innerText(), /must-not-display|fixture-code|fixture-session-secret/);
-    assert.match(await page.locator('body').innerText(), /已签发登录结果的恢复截止时间/);
+    assert.match(await page.locator('body').innerText(), /可继续接入至/);
     assert.equal(await page.getByRole('button', { name: '完成授权', exact: true }).count(), 0);
     const artifacts = `${root}/e2e-artifacts/oauth-authorization-code`; await mkdir(artifacts, { recursive: true });
     await page.screenshot({ path: `${artifacts}/mobile-safe-error.png`, fullPage: true });
@@ -64,7 +64,7 @@ test('plugin OAuth uses default client, full callback once, safe errors and isol
     await page.getByRole('button', { name: '完成授权', exact: true }).click();
     await page.getByText('账号已保存，但暂时无法刷新账号列表。请重试读取列表，无需重新登录或再次提交授权码。', { exact: true }).waitFor();
     assert.equal(reads, 1, 'successful account creation automatically refreshes the account list');
-    assert.match(await page.locator('body').innerText(), /已签发登录结果的恢复截止时间/);
+    assert.match(await page.locator('body').innerText(), /可继续接入至/);
     assert.equal(completes, 2);
     await page.getByRole('button', { name: '检查账号列表', exact: true }).click();
     await page.getByTestId('account-reads').filter({ hasText: '2' }).waitFor();
@@ -75,7 +75,7 @@ test('plugin OAuth uses default client, full callback once, safe errors and isol
     await page.getByRole('button', { name: '完成授权', exact: true }).click();
     await page.getByText('服务器仍在处理登录。不会自动重发；请稍后检查账号列表。', { exact: true }).waitFor();
     assert.equal(reads, 2, 'pending exchange leaves account refresh to an explicit read-only check');
-    assert.match(await page.locator('body').innerText(), /已签发登录结果的恢复截止时间/);
+    assert.match(await page.locator('body').innerText(), /可继续接入至/);
     assert.equal(completes, 3);
     await page.getByRole('button', { name: '检查账号列表', exact: true }).click();
     await page.getByTestId('account-reads').filter({ hasText: '1' }).waitFor();
