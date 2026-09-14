@@ -107,7 +107,18 @@ fn fraction(value: &Value) -> Result<Option<f64>, &'static str> {
     }
     value
         .as_f64()
-        .or_else(|| value.as_str()?.parse().ok())
+        .or_else(|| {
+            // CPA builders passes remainingFraction through normalizeQuotaFraction.
+            // Support its explicit percent notation, retaining our finite/range bounds.
+            let text = value.as_str()?.trim();
+            if text.len() > 160 {
+                return None;
+            }
+            match text.strip_suffix('%') {
+                Some(percent) => percent.trim().parse::<f64>().ok().map(|n| n / 100.0),
+                None => text.parse().ok(),
+            }
+        })
         .filter(|number| number.is_finite() && (0.0..=1.0).contains(number))
         .map(Some)
         .ok_or("quota_invalid_payload")
@@ -242,6 +253,29 @@ mod tests {
             windows(&json!({"groups":[group("A"),group("A")]})).unwrap_err(),
             "quota_duplicate_window"
         );
+    }
+
+    #[test]
+    fn supplier_percentage_strings_are_bounded_and_normalized() {
+        for (input, used) in [
+            ("0%", 100.0),
+            ("25%", 75.0),
+            (" 50 % ", 50.0),
+            ("100%", 0.0),
+        ] {
+            let rows = windows(&json!({"groups":[{"buckets":[{
+                "remainingFraction":input
+            }]}]}))
+            .unwrap();
+            assert_eq!(rows[0].used_percent, Some(used));
+        }
+        for input in ["-1%", "101%", "NaN%", "Infinity%", "%", "25%%", "bad%"] {
+            assert_eq!(
+                fraction(&json!(input)).unwrap_err(),
+                "quota_invalid_payload"
+            );
+        }
+        assert!(fraction(&json!(format!("{}%", "0".repeat(160)))).is_err());
     }
 
     #[test]

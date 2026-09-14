@@ -65,7 +65,8 @@ Implementing that requires a separately reviewed native metadata/import contract
 
 Reference: the official CPA management panel's
 [endpoint constants](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/blob/c12997e1a544374336ea385d5e9a9bbabe1e4767/src/utils/quota/constants.ts)
-and [group/bucket parser](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/blob/c12997e1a544374336ea385d5e9a9bbabe1e4767/src/utils/quota/builders.ts).
+and [group/bucket parser](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/blob/c12997e1a544374336ea385d5e9a9bbabe1e4767/src/utils/quota/builders.ts),
+which passes remaining fractions to the [fraction normalizer](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/blob/c12997e1a544374336ea385d5e9a9bbabe1e4767/src/utils/quota/parsers.ts).
 The adapter sends one POST to the account's configured `base_url` plus
 `/v1internal:retrieveUserQuotaSummary`, with only `{"project": project_id}` as
 the JSON body. It uses the existing OAuth credential, validated native request
@@ -77,10 +78,15 @@ credential returns `credential_invalid` without refreshing it.
 
 The `groups[].buckets[]` projection supports camelCase and snake_case fields.
 Remaining fraction becomes percent used, never an invented token count.
+Numeric fractions and numeric strings must be finite and within 0–1; explicit
+percentage strings such as `25%` are divided by 100 and bounded to 0–100%.
 Only explicit `5h`/`five-hour`/`five_hour` or `weekly`/`week` metadata establishes
 a window period. A reset timestamp does not establish cadence; missing or
 unrecognized dates and periods remain null. Group/bucket identifiers are scoped
 and bounded, duplicate identifiers and malformed fractions fail closed.
+When supplier group labels or bucket identifiers/window metadata are absent,
+ordinal fallback IDs depend on response ordering; anonymous rows are not promised
+stable identity across reordering.
 This provider never supplies inferred routing health, subscription expiry or
 reset credits. Quota reading is available; reset implementation and preparation
 remain unavailable. Supplier-side reset support itself is unknown, not asserted
