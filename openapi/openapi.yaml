@@ -2064,6 +2064,74 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '502': { $ref: '#/components/responses/UpstreamError' }
 
+  /internal/v1/oauth/authorization-code/start:
+    post:
+      tags: [Upstream providers]
+      operationId: startProviderAuthorizationCode
+      summary: Start standard PKCE authorization for a provider contribution
+      security: [{ serviceBearer: [] }]
+      x-required-scope: oauth:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StartProviderAuthorizationCodeRequest' }
+      responses:
+        '200':
+          description: Authorization URL and encrypted revision-bound session; global operator only.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [driver, login_url, session_token, expires_at, recovery_expires_at]
+                properties:
+                  driver: { type: string }
+                  login_url: { type: string, format: uri }
+                  session_token: { type: string, writeOnly: true }
+                  expires_at: { type: integer, format: int64 }
+                  recovery_expires_at: { type: integer, format: int64, description: Deadline for already-issued result finalization only; does not extend code exchange. }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /internal/v1/oauth/authorization-code/complete:
+    post:
+      tags: [Upstream providers]
+      operationId: completeProviderAuthorizationCode
+      summary: Complete a revision-bound standard OAuth session
+      security: [{ serviceBearer: [] }]
+      x-required-scope: oauth:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [session_token, callback_url]
+              properties:
+                session_token: { type: string, writeOnly: true }
+                callback_url: { type: string, format: uri, writeOnly: true }
+      responses:
+        '200':
+          description: Completed session replay.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
+        '201':
+          description: Upstream account created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
+        '202':
+          description: Another completion owns the session lease.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthPending' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
   /internal/v1/oauth/claude/start:
     post:
       tags: [Upstream providers]
@@ -2398,6 +2466,113 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/GenerationQuarantineResolution' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/image-generation-quarantine:
+    get:
+      tags: [Generation quarantine]
+      operationId: listImageGenerationQuarantine
+      summary: List a tenant's uncertain synchronous image submissions
+      description: |
+        Requires a persistent service credential bound to exactly the requested tenant.
+        Bootstrap, global credentials, client keys and cross-tenant access are rejected.
+        Returns metadata only, ordered by request_id ascending; continue with after_id.
+        No credentials, source images, prompts, request bodies or routing snapshots are exposed.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: generations:quarantine:read
+      x-persistent-service-only: true
+      parameters:
+        - $ref: '#/components/parameters/RequiredTenant'
+        - name: limit
+          in: query
+          schema: { type: integer, format: int64, minimum: 1, maximum: 100, default: 100 }
+        - name: after_id
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Bounded unresolved quarantine metadata page.
+          content:
+            application/json:
+              schema:
+                type: array
+                maxItems: 100
+                items: { $ref: '#/components/schemas/ImageGenerationQuarantine' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/image-generation-quarantine/{request_id}:
+    get:
+      tags: [Generation quarantine]
+      operationId: getImageGenerationQuarantine
+      summary: Read an image quarantine and its reconciliation revision or receipt
+      description: |
+        Requires a persistent service credential bound to exactly the requested tenant;
+        bootstrap and global credentials are rejected. A resolved request remains readable
+        with status resolved and its immutable resolution receipt, rather than returning 404.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: generations:quarantine:read
+      x-persistent-service-only: true
+      parameters:
+        - $ref: '#/components/parameters/RequiredTenant'
+        - name: request_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Safe metadata; use its revision when resolving.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImageGenerationQuarantine' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/image-generation-quarantine/{request_id}/resolve:
+    post:
+      tags: [Generation quarantine]
+      operationId: resolveImageGenerationQuarantine
+      summary: Audit and settle an uncertain image submission without resending
+      description: |
+        Requires a persistent service actor bound to exactly the requested tenant and
+        generations:reconcile. Bootstrap, global credentials, client keys and cross-tenant
+        access are rejected. Exactly one visible ASCII Idempotency-Key is mandatory.
+        not_delivered requires confirmed_cost_micros=0. settle_confirmed settles the
+        original reservation using the independently confirmed nonnegative cost. Currency
+        must match the original account currency. evidence_digest is the lowercase SHA-256
+        of independently retained evidence, never raw evidence or credentials.
+        A revision CAS, immutable audit receipt and original reservation settlement commit
+        together. Exact same-actor replay returns the original receipt; changed payloads,
+        stale revisions and competing decisions return 409. Neither action contacts an
+        upstream, retries a submission, fabricates an image, nor marks the request successful.
+        The request closes as failed even when a confirmed provider charge is settled.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: generations:reconcile
+      x-persistent-service-only: true
+      parameters:
+        - name: request_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ResolveImageGenerationQuarantine' }
+      responses:
+        '200':
+          description: Immutable reconciliation receipt, including exact idempotent replay.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImageGenerationQuarantineResolution' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -6345,6 +6520,27 @@ components:
           maxLength: 2048
           writeOnly: true
           description: Required for a new account and must be a private IP-literal SOCKS5H endpoint. Reauthorization must omit it and reuses the existing encrypted account proxy.
+    StartProviderAuthorizationCodeRequest:
+      type: object
+      additionalProperties: false
+      required: [account_name, provider_driver, provider_config]
+      properties:
+        tenant_external_id: { type: string, default: default }
+        account_name: { type: string, minLength: 1, maxLength: 200 }
+        provider_driver: { type: string }
+        provider_config: { type: object }
+        proxy_url: { type: string, writeOnly: true }
+        proxy_network_scope: { type: string, enum: [private] }
+        client:
+          type: object
+          additionalProperties: false
+          required: [client_id, redirect_uri, scopes]
+          description: Overrides deployment Secret defaults from MTC_PROVIDER_OAUTH_CLIENT_DEFAULTS_JSON.
+          properties:
+            client_id: { type: string }
+            redirect_uri: { type: string, format: uri }
+            scopes: { type: array, items: { type: string }, minItems: 1, maxItems: 32 }
+            client_secret: { type: string, writeOnly: true }
     StartClaudeOAuthRequest:
       type: object
       additionalProperties: false
@@ -8353,6 +8549,61 @@ components:
           maxItems: 168
           description: Missing UTC hour-of-week coordinates mean zero activity.
           items: { $ref: '#/components/schemas/UsageAnalysisHeatmapBucket' }
+    ResolveImageGenerationQuarantine:
+      type: object
+      additionalProperties: false
+      required: [tenant_external_id, expected_revision, action, confirmed_cost_micros, currency, evidence_digest]
+      properties:
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+        expected_revision: { type: string, pattern: '^[0-9a-f]{64}$' }
+        action: { type: string, enum: [not_delivered, settle_confirmed] }
+        confirmed_cost_micros: { type: integer, format: int64, minimum: 0, maximum: 9007199254740991 }
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
+        evidence_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
+      allOf:
+        - if:
+            properties:
+              action: { const: not_delivered }
+          then:
+            properties:
+              confirmed_cost_micros: { const: 0 }
+
+    ImageGenerationQuarantine:
+      type: object
+      additionalProperties: false
+      required: [request_id, tenant_external_id, model, currency, reserved_micros, submission_started_at, submission_uncertain_at, revision, status, resolution]
+      properties:
+        request_id: { type: string, format: uuid }
+        tenant_external_id: { type: string }
+        model: { type: string }
+        currency: { type: string }
+        reserved_micros: { type: integer, format: int64 }
+        submission_started_at: { type: integer, format: int64 }
+        submission_uncertain_at: { type: integer, format: int64 }
+        revision: { type: string, pattern: '^[0-9a-f]{64}$' }
+        status: { type: string, enum: [awaiting_confirmation, resolved] }
+        resolution:
+          description: Null while awaiting confirmation; the immutable receipt after resolution. List results contain only awaiting_confirmation entries.
+          oneOf:
+            - $ref: '#/components/schemas/ImageGenerationQuarantineResolution'
+            - type: 'null'
+
+    ImageGenerationQuarantineResolution:
+      type: object
+      additionalProperties: false
+      required: [resolution_id, request_id, tenant_external_id, action, confirmed_cost_micros, currency, evidence_digest, resolved_by_service_id, resulting_status, created_at]
+      properties:
+        resolution_id: { type: string, format: uuid }
+        request_id: { type: string, format: uuid }
+        tenant_external_id: { type: string }
+        action: { type: string, enum: [not_delivered, settle_confirmed] }
+        confirmed_cost_micros: { type: integer, format: int64, minimum: 0, maximum: 9007199254740991 }
+        currency: { type: string }
+        evidence_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
+        resolved_by_service_id: { type: string, format: uuid }
+        resulting_status: { type: string, enum: [failed] }
+        created_at: { type: integer, format: int64 }
+
     GenerationQuarantine:
       type: object
       additionalProperties: false

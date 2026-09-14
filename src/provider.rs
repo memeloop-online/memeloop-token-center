@@ -1,3 +1,4 @@
+pub mod antigravity;
 mod catalog;
 mod cbcnx;
 mod credential;
@@ -15,6 +16,7 @@ pub use credential::{
 };
 pub(crate) use credential::{
     open_private_json, seal_private_json, seal_private_json_with_nonce, validate_codex_proxy_url,
+    validate_proxy_url,
 };
 pub(crate) use transport_policy::CodexTransportPolicy;
 pub use types::{

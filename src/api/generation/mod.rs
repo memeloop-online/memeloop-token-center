@@ -1,3 +1,4 @@
+mod antigravity_image;
 mod assets;
 mod jobs;
 mod openai_image_response;

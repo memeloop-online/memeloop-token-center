@@ -79,8 +79,18 @@ pub(super) async fn image_idempotency_replay_response(
         SynchronousImageIdempotencyClaim::Pending { request_id } => Err(AppError::Conflict(
             format!("image request {request_id} with this Idempotency-Key is still in progress"),
         )),
+        SynchronousImageIdempotencyClaim::Uncertain { request_id } => {
+            Ok(uncertain_image_response(request_id, None))
+        }
         SynchronousImageIdempotencyClaim::Claimed => Err(AppError::Internal),
     }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ImageResponseFormat {
+    OpenAi,
+    ResponsesTool,
+    Antigravity,
 }
 
 pub(super) struct SyncImageRequest<'a> {
@@ -92,6 +102,111 @@ pub(super) struct SyncImageRequest<'a> {
     pub(super) expected_image_count: i64,
     pub(super) key_id: Uuid,
     pub(super) idempotency_key: Option<&'a str>,
+    pub(super) tenant_id: Uuid,
+    pub(super) arm_state: std::sync::atomic::AtomicU8,
+    pub(super) invalid_response: std::sync::atomic::AtomicBool,
+    pub(super) confirmed_rejection: std::sync::atomic::AtomicBool,
+}
+
+pub(super) const ARM_NOT_STARTED: u8 = 0;
+pub(super) const ARM_PENDING: u8 = 1;
+pub(super) const ARM_CONFIRMED: u8 = 2;
+
+pub(super) async fn submission_may_have_started(
+    context: &SyncImageRequest<'_>,
+) -> Result<bool, AppError> {
+    use std::sync::atomic::Ordering;
+    match context.arm_state.load(Ordering::Acquire) {
+        ARM_NOT_STARTED => Ok(false),
+        ARM_CONFIRMED => Ok(true),
+        _ => match context
+            .state
+            .db
+            .confirm_synchronous_image_submission_started(
+                context.key_id,
+                context.request_id,
+                context.reservation.id,
+            )
+            .await
+        {
+            Ok(started) => {
+                context.arm_state.store(
+                    if started {
+                        ARM_CONFIRMED
+                    } else {
+                        ARM_NOT_STARTED
+                    },
+                    Ordering::Release,
+                );
+                Ok(started)
+            }
+            // Missing/changed ownership is not ours to refund or quarantine.
+            // Preserve that explicit conflict instead of inventing uncertainty
+            // for a request now owned or already settled by another worker.
+            Err(error @ (AppError::NotFound | AppError::Conflict(_))) => Err(error),
+            Err(error) => {
+                tracing::warn!(request_id=%context.request_id, error_category=error.diagnostic_category(),
+                    "image arm outcome could not be established; retaining uncertainty");
+                Ok(true)
+            }
+        },
+    }
+}
+
+fn uncertain_image_response(request_id: Uuid, reconciliation_available: Option<bool>) -> Response {
+    let body = serde_json::to_vec(&json!({"error": {
+        "code": "image_submission_uncertain",
+        "message": if reconciliation_available == Some(true) {
+            "Image submission may have executed; automatic retry is disabled. The request is recorded for reconciliation."
+        } else {
+            "Image submission may have executed; automatic retry is disabled. Check request status and reconcile once the request is listed."
+        },
+        "retryable": false,
+        "reconciliation_available": reconciliation_available
+    }})).expect("static uncertainty response");
+    Response::builder()
+        .status(StatusCode::CONFLICT)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(REQUEST_ID_HEADER, request_id.to_string())
+        .body(Body::from(body))
+        .expect("static uncertainty headers")
+}
+
+fn image_submission_state_unavailable(request_id: Uuid) -> Response {
+    let body = serde_json::to_vec(&json!({"error": {
+        "code": "image_submission_state_unavailable",
+        "message": "Submission state could not be confirmed or published. Do not resubmit. No refund or resubmission was initiated by this recovery attempt. Check this request after storage recovers; reconciliation availability is not confirmed.",
+        "retryable": false,
+        "reconciliation_available": false
+    }})).expect("static submission-state response");
+    Response::builder()
+        .status(StatusCode::CONFLICT)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(REQUEST_ID_HEADER, request_id.to_string())
+        .body(Body::from(body))
+        .expect("static submission-state headers")
+}
+
+async fn quarantine_image_request(context: &SyncImageRequest<'_>) -> Response {
+    if let Err(error) = context
+        .state
+        .db
+        .quarantine_synchronous_image_submission(
+            context.key_id,
+            context.idempotency_key,
+            context.request_id,
+            context.reservation.id,
+        )
+        .await
+    {
+        // A pending arm is not proof that a quarantine row exists. Preserve
+        // the reservation and prohibit resubmission, but do not advertise a
+        // reconciliation action whose durable publication was not confirmed.
+        tracing::warn!(request_id=%context.request_id, error_category=error.diagnostic_category(),
+            "image uncertainty publication unavailable; this recovery attempt will not release or resubmit without authoritative verification");
+        return image_submission_state_unavailable(context.request_id);
+    }
+    uncertain_image_response(context.request_id, Some(true))
 }
 
 pub(super) async fn execute_synchronous_image_request(
@@ -100,7 +215,7 @@ pub(super) async fn execute_synchronous_image_request(
     staged_request_object: &str,
     route: &crate::provider::ResolvedUpstream,
     request: reqwest::RequestBuilder,
-    responses_tool_mode: bool,
+    response_format: ImageResponseFormat,
 ) -> Result<Response, AppError> {
     let state = context.state;
     let request_id = context.request_id;
@@ -160,6 +275,42 @@ pub(super) async fn execute_synchronous_image_request(
     if !renew_image_request_claim(context).await? {
         return Ok(replayed_image_failure(request_id, "idempotency_claim_lost"));
     }
+    let mut attempt =
+        match crate::generation::group_routing::admit(state, context.tenant_id, request_id, route)
+            .await
+        {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                // No request has been sent: ordinary terminal cleanup is safe.
+                let _ = fail_image_request(context, "upstream_unavailable").await?;
+                return Err(error);
+            }
+        };
+    // Archival/admission may have waited since preparation. Recheck expiry
+    // before arming, while a local credential failure is still non-dispatched.
+    // Preparation already attached the credential. Revalidate its lifetime,
+    // without appending a second Authorization (or custom API-key) header.
+    if route.credential.validate(unix_millis()).is_err() {
+        return fail_image_request(context, "upstream_credential_invalid").await;
+    }
+    // Pending is not proof of dispatch. After an error/cancelled wait, resolve
+    // this state through the serialized authoritative DB query before deciding
+    // whether zero-cost cleanup is safe. Only an acknowledged arm permits send.
+    context
+        .arm_state
+        .store(ARM_PENDING, std::sync::atomic::Ordering::Release);
+    state
+        .db
+        .arm_synchronous_image_submission(
+            context.key_id,
+            context.idempotency_key,
+            request_id,
+            context.reservation.id,
+        )
+        .await?;
+    context
+        .arm_state
+        .store(ARM_CONFIRMED, std::sync::atomic::Ordering::Release);
     let _upstream_activity = state.metrics.active_upstream(&route.driver, "image");
     let upstream_result = request.send().await;
     state.metrics.observe_upstream(
@@ -177,16 +328,79 @@ pub(super) async fn execute_synchronous_image_request(
                 is_connect = error.is_connect(),
                 "synchronous image upstream request failed"
             );
+            let terminal = if error.is_connect() {
+                crate::api::MediaAttemptTerminal::Failed {
+                    kind: crate::db::UpstreamFailureKind::Connection,
+                    reason: crate::metrics::UpstreamHealthReason::Connection,
+                }
+            } else {
+                crate::api::MediaAttemptTerminal::Inconclusive
+            };
+            attempt.complete(terminal).await;
             return fail_image_request(context, "upstream_connection").await;
         }
     };
     let upstream_status = upstream.status();
+    // A complete explicit client rejection is non-execution evidence, except
+    // timeout/too-early/rate-limit responses whose semantics remain uncertain.
+    // Record it immediately from headers, before awaiting hooks/body/settlement.
+    // This only permits zero-cost settlement; it never permits another POST.
+    if upstream_status.is_client_error() && !matches!(upstream_status.as_u16(), 408 | 425 | 429) {
+        context
+            .confirmed_rejection
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    if upstream_status == StatusCode::TOO_MANY_REQUESTS {
+        let kind = crate::api::classify_media_rate_limit(upstream).await;
+        attempt
+            .complete(crate::api::MediaAttemptTerminal::Failed {
+                kind,
+                reason: crate::metrics::UpstreamHealthReason::RateLimited,
+            })
+            .await;
+        return fail_image_request(context, "upstream_http_429").await;
+    }
+    let failure = if matches!(
+        upstream_status,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+    ) {
+        Some((
+            crate::db::UpstreamFailureKind::Authentication,
+            crate::metrics::UpstreamHealthReason::Unavailable,
+        ))
+    } else if upstream_status.is_server_error() {
+        Some((
+            crate::db::UpstreamFailureKind::Unavailable,
+            crate::metrics::UpstreamHealthReason::Unavailable,
+        ))
+    } else {
+        None
+    };
+    if let Some((kind, reason)) = failure {
+        attempt
+            .complete(crate::api::MediaAttemptTerminal::Failed { kind, reason })
+            .await;
+    }
+    if !upstream_status.is_success() {
+        drop(upstream);
+        return fail_image_request(
+            context,
+            &format!("upstream_http_{}", upstream_status.as_u16()),
+        )
+        .await;
+    }
     let response_bytes = match read_image_response_bounded(upstream).await {
         Ok(bytes) => bytes,
         Err(ImageResponseReadError::Transport) => {
+            attempt
+                .complete(crate::api::MediaAttemptTerminal::invalid_response())
+                .await;
             return fail_image_request(context, "upstream_stream").await;
         }
         Err(ImageResponseReadError::TooLarge) => {
+            attempt
+                .complete(crate::api::MediaAttemptTerminal::invalid_response())
+                .await;
             // No archive writer is created before the cumulative limit has
             // been checked, so an oversized body can never become a partial
             // or apparently successful archive.
@@ -196,11 +410,31 @@ pub(super) async fn execute_synchronous_image_request(
     if !renew_image_request_claim(context).await? {
         return Ok(replayed_image_failure(request_id, "idempotency_claim_lost"));
     }
-    if responses_tool_mode {
-        finish_responses_tool_image(context, upstream_status, response_bytes).await
-    } else {
-        finish_openai_image_response(context, route, upstream_status, response_bytes).await
+    let result = match response_format {
+        ImageResponseFormat::ResponsesTool | ImageResponseFormat::Antigravity => {
+            finish_responses_tool_image(context, upstream_status, response_bytes, response_format)
+                .await
+        }
+        ImageResponseFormat::OpenAi => {
+            finish_openai_image_response(context, route, upstream_status, response_bytes).await
+        }
+    };
+    if result
+        .as_ref()
+        .is_ok_and(|response| response.status().is_success())
+    {
+        attempt
+            .complete_committed(crate::api::MediaAttemptTerminal::Succeeded)
+            .await;
+    } else if context
+        .invalid_response
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        attempt
+            .complete(crate::api::MediaAttemptTerminal::invalid_response())
+            .await;
     }
+    result
 }
 
 async fn renew_image_request_claim(context: &SyncImageRequest<'_>) -> Result<bool, AppError> {
@@ -323,6 +557,37 @@ async fn fail_image_request_with_staging(
     error_code: &str,
     result_lease: Option<&crate::archive_staging::ArchiveStagingWriteLease>,
 ) -> Result<Response, AppError> {
+    if submission_may_have_started(context).await?
+        && !context
+            .confirmed_rejection
+            .load(std::sync::atomic::Ordering::Acquire)
+    {
+        if matches!(
+            error_code,
+            "upstream_image_invalid_json"
+                | "upstream_image_invalid_payload"
+                | "upstream_image_response_too_large"
+                | "upstream_image_too_large"
+        ) {
+            context
+                .invalid_response
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        // An unusable result never becomes a published asset. Hand its owned
+        // staging attempt to durable cleanup without deleting bytes here or
+        // interpreting this local cleanup as permission to refund/resubmit.
+        if let Some(lease) = result_lease
+            && let Err(error) = context
+                .state
+                .db
+                .abandon_archive_staging_attempt(lease)
+                .await
+        {
+            tracing::warn!(request_id=%context.request_id, error_category=error.diagnostic_category(),
+                "uncertain image result cleanup publication failed; lease expiry retains recovery");
+        }
+        return Ok(quarantine_image_request(context).await);
+    }
     let state = context.state;
     let request_id = context.request_id;
     let response_object = format!("gap://{request_id}/response");
@@ -702,6 +967,7 @@ async fn finish_responses_tool_image(
     context: &SyncImageRequest<'_>,
     upstream_status: StatusCode,
     bytes: Bytes,
+    response_format: ImageResponseFormat,
 ) -> Result<Response, AppError> {
     let state = context.state;
     let request_id = context.request_id;
@@ -710,7 +976,10 @@ async fn finish_responses_tool_image(
         let error_code = format!("upstream_http_{}", upstream_status.as_u16());
         return fail_image_request(context, &error_code).await;
     }
-    let parsed = match super::responses_tool_image::parse_responses_tool_image(&bytes) {
+    let parsed = match match response_format {
+        ImageResponseFormat::Antigravity => super::antigravity_image::parse(&bytes),
+        _ => super::responses_tool_image::parse_responses_tool_image(&bytes),
+    } {
         Ok(parsed) => parsed,
         Err(super::responses_tool_image::ResponsesToolImageParseError::InvalidJson) => {
             return fail_image_request(context, "upstream_image_invalid_json").await;

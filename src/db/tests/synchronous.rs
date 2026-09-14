@@ -1,5 +1,8 @@
 use super::super::*;
 
+mod reconcile;
+mod submission;
+
 #[tokio::test]
 async fn expired_synchronous_image_early_claim_is_read_only() {
     let directory = tempfile::tempdir().unwrap();
@@ -150,6 +153,7 @@ async fn synchronous_image_early_claim_start_and_expired_takeover_refund_are_ato
     ));
     let first_reservation = match database
         .start_synchronous_image_request(StartSynchronousImageRequest {
+            routing_snapshot: None,
             request_id: first_request_id,
             key: &key,
             price: &price,
@@ -182,6 +186,7 @@ async fn synchronous_image_early_claim_start_and_expired_takeover_refund_are_ato
     let second_request_id = Uuid::now_v7();
     let second_reservation = match database
         .start_synchronous_image_request(StartSynchronousImageRequest {
+            routing_snapshot: None,
             request_id: second_request_id,
             key: &key,
             price: &price,
@@ -279,6 +284,7 @@ async fn synchronous_image_terminal_crash_is_recovered_without_second_charge() {
     let request_id = Uuid::now_v7();
     let reservation = match database
         .start_synchronous_image_request(StartSynchronousImageRequest {
+            routing_snapshot: None,
             request_id,
             key: &key,
             price: &price,
@@ -331,6 +337,7 @@ async fn synchronous_image_terminal_crash_is_recovered_without_second_charge() {
     assert!(matches!(
         database
             .start_synchronous_image_request(StartSynchronousImageRequest {
+            routing_snapshot: None,
                 request_id: recovery_request_id,
                 key: &key,
                 price: &price,
@@ -396,6 +403,7 @@ async fn synchronous_image_without_idempotency_has_atomic_start_and_terminal_wri
     assert!(
         database
             .start_synchronous_image_request(StartSynchronousImageRequest {
+                routing_snapshot: None,
                 request_id: conflicting_request_id,
                 key: &key,
                 price: &price,
@@ -422,6 +430,7 @@ async fn synchronous_image_without_idempotency_has_atomic_start_and_terminal_wri
     let failed_request_id = Uuid::now_v7();
     let failed_reservation = match database
         .start_synchronous_image_request(StartSynchronousImageRequest {
+            routing_snapshot: None,
             request_id: failed_request_id,
             key: &key,
             price: &price,
@@ -471,6 +480,7 @@ async fn synchronous_image_without_idempotency_has_atomic_start_and_terminal_wri
     let success_request_id = Uuid::now_v7();
     let success_reservation = match database
         .start_synchronous_image_request(StartSynchronousImageRequest {
+            routing_snapshot: None,
             request_id: success_request_id,
             key: &key,
             price: &price,
@@ -612,6 +622,7 @@ async fn synchronous_image_reaper_failure_allows_same_hash_takeover() {
     let old_request_id = Uuid::now_v7();
     let old_reservation = match database
         .start_synchronous_image_request(StartSynchronousImageRequest {
+            routing_snapshot: None,
             request_id: old_request_id,
             key: &key,
             price: &price,
@@ -669,6 +680,7 @@ async fn synchronous_image_reaper_failure_allows_same_hash_takeover() {
     assert!(matches!(
         database
             .start_synchronous_image_request(StartSynchronousImageRequest {
+                routing_snapshot: None,
                 request_id: new_request_id,
                 key: &key,
                 price: &price,
@@ -692,6 +704,7 @@ async fn synchronous_image_reaper_failure_allows_same_hash_takeover() {
     assert!(matches!(
         database
             .start_synchronous_image_request(StartSynchronousImageRequest {
+                routing_snapshot: None,
                 request_id: Uuid::now_v7(),
                 key: &key,
                 price: &price,
@@ -752,6 +765,7 @@ async fn generic_reaper_skips_active_synchronous_image_lease() {
     };
     let reservation = match database
         .start_synchronous_image_request(StartSynchronousImageRequest {
+            routing_snapshot: None,
             request_id,
             key: &key,
             price: &price,

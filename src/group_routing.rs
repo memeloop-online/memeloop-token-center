@@ -1,4 +1,5 @@
 //! Request-owned group policy. Authorization and health leases stay in core.
+pub(crate) mod durable;
 #[cfg(test)]
 pub(crate) mod test_observe_gate;
 use crate::{
@@ -82,9 +83,12 @@ fn sort_plan_candidates(selection_seed: Uuid, directives: &mut [GroupRoutingDire
     });
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CandidatePolicy {
     plugin_id: String,
+    group_id: String,
+    strategy_version: i64,
     config: serde_json::Value,
     candidate: GroupRoutingCandidate,
     directive: GroupRoutingDirective,
@@ -305,6 +309,8 @@ async fn prepare_inner(
                         key,
                         CandidatePolicy {
                             plugin_id: plugin_id.clone(),
+                            group_id: group_id.clone(),
+                            strategy_version: members[0].3,
                             config: config.clone(),
                             candidate,
                             directive,

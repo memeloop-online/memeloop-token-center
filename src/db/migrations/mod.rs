@@ -476,6 +476,16 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "request output timing",
         sql: include_str!("../../../migrations/common/0089_request_output_timing.sql"),
     },
+    Migration {
+        version: 90,
+        name: "durable media group routing and submission fence",
+        sql: include_str!("../../../migrations/common/0090_media_group_routing.sql"),
+    },
+    Migration {
+        version: 91,
+        name: "standard authorization code OAuth",
+        sql: include_str!("../../../migrations/sqlite/0091_authorization_code_oauth.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -937,6 +947,16 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 89,
         name: "request output timing",
         sql: include_str!("../../../migrations/common/0089_request_output_timing.sql"),
+    },
+    Migration {
+        version: 90,
+        name: "durable media group routing and submission fence",
+        sql: include_str!("../../../migrations/common/0090_media_group_routing.sql"),
+    },
+    Migration {
+        version: 91,
+        name: "standard authorization code OAuth",
+        sql: include_str!("../../../migrations/postgres/0091_authorization_code_oauth.sql"),
     },
 ];
 

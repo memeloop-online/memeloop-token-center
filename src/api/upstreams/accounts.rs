@@ -375,7 +375,7 @@ pub(in crate::api) async fn update_upstream(
         .require_upstream_tenant(account_id, &body.tenant_external_id)
         .await?;
     let driver = state.db.upstream_driver(account_id).await?;
-    let (current, current_credential, credential_active, _) = state
+    let (current, current_credential, credential_active, oauth_driver) = state
         .db
         .upstream_account_with_current_credential(account_id, state.config.key_pepper.as_bytes())
         .await?;
@@ -383,7 +383,42 @@ pub(in crate::api) async fn update_upstream(
         .providers
         .get(&driver)
         .ok_or_else(|| AppError::BadRequest("unknown provider driver".into()))?;
-    super::config_secrets::preserve(&provider.config_schema, &current.config, &mut body.config)?;
+    let mut previous_config = current.config.clone();
+    if driver == crate::provider::antigravity::DRIVER {
+        crate::provider::antigravity::authorize_config_update(
+            &current.config,
+            &body.config,
+            service.tenant_external_id.is_none(),
+        )?;
+        if body
+            .config
+            .get("request_headers")
+            .and_then(Value::as_object)
+            .is_some_and(serde_json::Map::is_empty)
+        {
+            // Explicit operator clearing is different from omission/preservation.
+            if let Some(config) = previous_config.as_object_mut() {
+                config.remove("request_headers");
+            }
+            if let Some(config) = body.config.as_object_mut() {
+                config.remove("request_headers");
+            }
+        }
+    }
+    if oauth_driver.as_deref() == Some(crate::oauth::authorization_code::FLOW) {
+        super::config_secrets::preserve_managed_oauth(
+            &provider.config_schema,
+            &previous_config,
+            &mut body.config,
+            service.tenant_external_id.is_none(),
+        )?;
+    } else {
+        super::config_secrets::preserve(
+            &provider.config_schema,
+            &previous_config,
+            &mut body.config,
+        )?;
+    }
     validate_provider_config_schema(&state, &driver, &body.config)?;
     validate_upstream_destination(&driver, &body.config, &service, &state).await?;
     let should_sync_models = driver != crate::oauth::codex_device::PROVIDER_DRIVER

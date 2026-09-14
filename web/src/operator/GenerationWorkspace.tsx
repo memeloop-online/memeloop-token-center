@@ -1,4 +1,5 @@
 import { useConfirmDialog } from '../useConfirmDialog';
+import { ImageGenerationQuarantine } from './ImageGenerationQuarantine';
 import { useEffect, useRef, useState } from 'react';
 import { ApiError, api } from '../api';
 import { DrawerFrame } from '../components';
@@ -104,6 +105,7 @@ export function GenerationWorkspace({ token, tenant, writeTenant = tenant }: { t
   const canManage = (job: OperatorGenerationJob) => Boolean(writeTenant) && job.tenant_external_id === writeTenant;
 
   return <>{confirmationDialog}
+    <ImageGenerationQuarantine token={token} tenant={tenant} writeTenant={writeTenant} />
     {!detail && error && <div className="notice error" role="alert">{error}</div>}
     {!detail && message && <div className="notice success" role="status">{message}</div>}
     <article className="panel operator-generations">

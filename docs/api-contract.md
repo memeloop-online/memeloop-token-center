@@ -323,3 +323,25 @@ network topology.
 The release process verifies the OpenAPI route boundary table, schema references
 and version metadata in GitHub Actions. Migration generations are discovered from
 the registered migration set rather than copied into this document.
+# Standard provider OAuth and native Antigravity
+
+`POST /internal/v1/oauth/authorization-code/start` requires `oauth:write` and a
+global operator. Body: `tenant_external_id`, `account_name`, `provider_driver`,
+`provider_config`, optional `client` (`client_id`, `redirect_uri`, `scopes`,
+`client_secret`), and optional paired `proxy_url`/`proxy_network_scope`.
+Deployment Secret `MTC_PROVIDER_OAUTH_CLIENT_DEFAULTS_JSON` supplies per-provider
+desktop client defaults when `client` is omitted; no private credentials are bundled.
+The response contains `driver`, `login_url`, sealed `session_token`, `expires_at`.
+`POST /internal/v1/oauth/authorization-code/complete` accepts `session_token` and
+the complete `callback_url`, returning 202 pending, 201 newly created account,
+or 200 replay. Client overrides, tokens and proxy URLs remain encrypted and are
+not account configuration. Session scope is checked before restoring the
+startup/historical application plugin revision; token/state/ready revision must
+agree. Plugin contributions declare `authorization_code_pkce` with the existing
+`oauth-adapter-v1` endpoint envelope. Refresh uses the normal upstream refresh API.
+
+The `google-antigravity` plugin's generation routes accept the existing
+`POST /v1/images/generations` envelope with `n=1`. Requests use native Google
+`image_gen` wire envelopes; inline output follows the shared durable media
+submission, archive, settlement and replay path. No CPA endpoint/account import
+is involved. See `plugins/google-antigravity/README.md` for scope and provenance.

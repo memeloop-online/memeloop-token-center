@@ -264,6 +264,8 @@ async fn codex_catalog_uses_native_contract_and_persists_context_window_reservat
             "codex-tui/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.146.0)",
         ))
         .and(matches_header("chatgpt-account-id", "account-123"))
+        .and(matches_header("accept", "application/json"))
+        .and(matches_header("accept-encoding", "identity"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "models": [
                 {"slug": "gpt-codex", "supported_in_api": true, "visibility": "list", "context_window": 272000},
@@ -847,9 +849,38 @@ async fn catalog_generation_cas_lease_and_account_deletion_are_safe() {
     assert!(
         state
             .db
-            .claim_upstream_model_catalog_sync(account.id, "cas-tenant", 1, first_lease)
+            .claim_upstream_model_catalog_sync_with_timeout(
+                account.id,
+                "cas-tenant",
+                1,
+                first_lease,
+                1_260_001,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        state
+            .db
+            .claim_upstream_model_catalog_sync_with_timeout(
+                account.id,
+                "cas-tenant",
+                1,
+                first_lease,
+                60_000
+            )
             .await
             .unwrap()
+    );
+    let mut observer = sqlx::AnyConnection::connect(&state.config.database_url)
+        .await
+        .unwrap();
+    let lease_budget: i64 = sqlx::query_scalar(
+        "SELECT sync_lease_expires_at - last_attempt_at FROM upstream_model_catalog_state WHERE upstream_account_id = $1",
+    ).bind(account.id.to_string()).fetch_one(&mut observer).await.unwrap();
+    assert_eq!(
+        lease_budget, 82_000,
+        "configured directory deadline cannot outlive its lease"
     );
     assert!(
         !state

@@ -741,6 +741,13 @@ async fn running_authority_admits_new_contract_and_pins_history_without_restart(
         .clone()
         .with_pinned_application_plugins(authority.pin_historical(1).await.unwrap());
     let nested = resumed.pin_application_plugins().await.unwrap();
+    assert!(Arc::ptr_eq(
+        &state.image_response_permits,
+        &nested.image_response_permits,
+    ));
+    let image_budget = state.image_response_permits.acquire_many(2).await.unwrap();
+    assert!(nested.image_response_permits.try_acquire().is_err());
+    drop(image_budget);
     assert_eq!(
         nested
             .pinned_application_plugins

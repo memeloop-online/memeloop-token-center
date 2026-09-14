@@ -237,6 +237,7 @@ fn start_input(
     request_hash: &str,
 ) -> StartGenerationJobInput {
     StartGenerationJobInput {
+        routing_snapshot: None,
         job_id,
         key: key.clone(),
         model_route_id: Uuid::now_v7(),
@@ -299,13 +300,16 @@ async fn accepted_generation_job_keeps_its_route_candidate_snapshot() {
     );
     input.model_route_id = selected_route.id;
     input.upstream_model = "workflow-frozen".to_owned();
+    let routing_snapshot =
+        json!({"version": 1, "selected_route": selected_route.id, "selected_account": upstream_id});
+    input.routing_snapshot = Some(routing_snapshot.clone());
     let CreateGenerationJobResult::Created(preparing) =
         database.start_generation_job(input, None).await.unwrap()
     else {
         panic!("a new generation request must be admitted");
     };
     let persisted = sqlx::query(
-        "SELECT model_route_id, upstream_account_id, upstream_model, driver FROM generation_jobs WHERE id = $1",
+        "SELECT model_route_id, upstream_account_id, upstream_model, driver, routing_snapshot FROM generation_jobs WHERE id = $1",
     )
     .bind(preparing.job_id.to_string())
     .fetch_one(&inspection)
@@ -324,6 +328,11 @@ async fn accepted_generation_job_keeps_its_route_candidate_snapshot() {
         "workflow-frozen"
     );
     assert_eq!(persisted.get::<String, _>("driver"), "comfyui");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&persisted.get::<String, _>("routing_snapshot"))
+            .unwrap(),
+        routing_snapshot
+    );
 
     let AttachGenerationJobResult::Attached(_) = database
         .attach_generation_job_request(
@@ -346,6 +355,7 @@ async fn accepted_generation_job_keeps_its_route_candidate_snapshot() {
     assert_eq!(work.upstream_account_id, upstream_id);
     assert_eq!(work.upstream_model, "workflow-frozen");
     assert_eq!(work.driver, "comfyui");
+    assert_eq!(work.routing_snapshot, Some(routing_snapshot));
 
     // Operator changes apply only to future admissions. The accepted job does
     // not re-run route, group, priority, or public-model selection.
