@@ -899,11 +899,6 @@ async fn postgres_claim_cancelled_inside_commit_is_reclaimed_with_new_fence() {
         .fetch_one(&mut *expiry_blocker)
         .await
         .unwrap();
-    sqlx::query("UPDATE response_archive_spools SET lease_expires_at = CAST(FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000) AS BIGINT) + 1000 WHERE request_id = $1")
-        .bind(fixture.id.request_id.to_string())
-        .execute(&mut *expiry_blocker)
-        .await
-        .unwrap();
     let heartbeat_db = fixture.db.clone();
     let heartbeat_task = recovered.clone();
     let heartbeat = tokio::spawn(async move {
@@ -926,7 +921,14 @@ async fn postgres_claim_cancelled_inside_commit_is_reclaimed_with_new_fence() {
     })
     .await
     .expect("heartbeat must wait on the real spool row lock");
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    // Set expiry only after the waiter has captured any pre-lock timestamp.
+    // The broken ordering accepts this lease; the lock-then-clock ordering
+    // observes a clock greater than or equal to this committed expiry.
+    sqlx::query("UPDATE response_archive_spools SET lease_expires_at = CAST(FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000) AS BIGINT) WHERE request_id = $1")
+        .bind(fixture.id.request_id.to_string())
+        .execute(&mut *expiry_blocker)
+        .await
+        .unwrap();
     expiry_blocker.commit().await.unwrap();
     assert!(
         !tokio::time::timeout(Duration::from_secs(5), heartbeat)
