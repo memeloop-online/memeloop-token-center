@@ -5,7 +5,7 @@ import { useI18n } from '../i18n';
 import { quotaReadErrorMessage, quotaUsedPercent, upstreamQuotaPath, type UpstreamQuotaSnapshot } from './upstreamQuota';
 import './upstreamQuota.css';
 import { UpstreamQuotaReset } from './UpstreamQuotaReset';
-import { Disclosure } from '../design-system';
+import { Disclosure, DetailTooltip } from '../design-system';
 
 export function UpstreamQuotaDetails({ snapshot }: { snapshot: UpstreamQuotaSnapshot }) {
   const { locale, t } = useI18n();
@@ -43,7 +43,7 @@ export function UpstreamQuotaDetails({ snapshot }: { snapshot: UpstreamQuotaSnap
         {window.remaining !== null && <p>{t('quota.remaining', { amount: formatNumber(window.remaining, locale), limit: window.limit === null ? '—' : formatNumber(window.limit, locale) })}</p>}
         <p>{window.reset_at === null ? t('quota.resetTimeUnknown') : t(window.reset_is_estimated ? 'quota.estimatedResetAt' : 'quota.resetAt', { time: new Date(window.reset_at).toLocaleString(locale) })}</p>
         {window.reset_at !== null && <span>{window.reset_at <= now ? t('quota.resetElapsed') : t('quota.resetIn', { time: formatElapsedTime(window.reset_at - now, locale) })}</span>}
-        <small>{t('quota.source', { source: window.source })}</small>
+        <DetailTooltip content={t('quota.source', { source: window.source })}><small tabIndex={0}>{t('quota.sourceLabel')}</small></DetailTooltip>
       </section>;
     })}</div>
     <div className="upstream-quota-reset">
@@ -57,8 +57,8 @@ export function UpstreamQuotaDetails({ snapshot }: { snapshot: UpstreamQuotaSnap
 
 /** User-triggered read: never starts one upstream request per card on page load. */
 export function UpstreamQuota({ accountId, accountName = accountId, tenant, token, onSnapshot, initialSnapshot }: { accountId: string; accountName?: string; tenant: string; token: string; onSnapshot?: (snapshot: UpstreamQuotaSnapshot) => void; initialSnapshot?: UpstreamQuotaSnapshot }) {
-  const { t, locale } = useI18n();
-  const [snapshot, setSnapshot] = useState<UpstreamQuotaSnapshot>();
+  const { t } = useI18n();
+  const [snapshot, setSnapshot] = useState<UpstreamQuotaSnapshot | undefined>(initialSnapshot);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<'quota.readFailed' | 'quota.errorPermission'>();
   const scope = `${token}\0${tenant}\0${accountId}`;
@@ -93,6 +93,6 @@ export function UpstreamQuota({ accountId, accountName = accountId, tenant, toke
     {!snapshot && busy && <div className="upstream-quota-loading" role="status"><span>{t('common.loading')}</span><div className="upstream-quota-skeleton" aria-hidden="true"><i /><i /></div></div>}
     {!snapshot && !busy && !error && <p>{t(tenant ? 'quota.notLoaded' : 'quota.selectTenant')}</p>}
     {snapshot && <UpstreamQuotaDetails snapshot={snapshot} />}
-    {snapshot && snapshot.reset_capability.provider_supported === true && snapshot.reset_capability.implementation_available && <Disclosure title={locale.startsWith('zh') ? '额度重置选项' : 'Quota reset options'}><p>{t('quota.resetWarning')}</p><UpstreamQuotaReset key={scope} accountId={accountId} accountName={accountName} tenant={tenant} token={token} snapshot={snapshot} /></Disclosure>}
+    {snapshot && snapshot.reset_capability.provider_supported === true && snapshot.reset_capability.implementation_available && <Disclosure title={t('quota.resetOptions')}><p>{t('quota.resetWarning')}</p><UpstreamQuotaReset key={scope} accountId={accountId} accountName={accountName} tenant={tenant} token={token} snapshot={snapshot} /></Disclosure>}
   </section>;
 }

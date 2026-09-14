@@ -58,7 +58,7 @@ export function UpstreamConnection({ account, token, tenant, disabled, onChanged
     <dl>
       <div><dt>{t('connection.baseUrl')}</dt><dd><code>{typeof account.config.base_url === 'string' ? account.config.base_url : '—'}</code>{codex && <span className="connection-endpoint-kind">{t('connection.fixed')}</span>}</dd></div>
       <div><dt>{t('connection.proxy')}</dt><dd><span className={`status ${account.has_proxy && account.proxy_scheme ? 'ok' : 'pending'}`}>{t(account.has_proxy === undefined ? 'connection.proxyUnknown' : account.has_proxy ? proxyState : codex ? proxyState : 'connection.directEgress')}</span>{account.proxy_scheme && <code>{account.proxy_scheme}</code>}{account.has_proxy && account.proxy_scheme && <span>{t(account.proxy_remote_dns ? 'connection.remoteDns' : 'connection.localDns')}</span>}</dd></div>
-      {account.proxy_fingerprint && <div><dt>{t('connection.proxyFingerprint')}</dt><dd><code>{account.proxy_fingerprint}</code></dd></div>}
+      {account.proxy_fingerprint && <div><dt>{t('connection.proxyFingerprint')}</dt><dd><DetailTooltip content={account.proxy_fingerprint}><span tabIndex={0}>{t('providerDirectory.account')}</span></DetailTooltip></dd></div>}
     </dl>
     <DetailTooltip content={t('connection.endpointHint')}><span tabIndex={0} className="connection-help">{t('connection.baseUrl')}</span></DetailTooltip>
     {codex && !canEditProxy && <p>{t('connection.proxyAdminOnly')}</p>}

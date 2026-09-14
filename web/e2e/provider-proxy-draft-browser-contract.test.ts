@@ -52,7 +52,6 @@ test('independent proxy save updates concurrency metadata without dropping the p
     await page.getByRole('button', { name: '取消', exact: true }).click();
     await row.getByRole('button', { name: '收起详情', exact: true }).click();
     await page.setViewportSize({ width: 1440, height: 1000 });
-    await page.getByText('账号设置与授权操作', { exact: true }).click();
     await page.getByRole('button', { name: '编辑', exact: true }).click();
     const workspace = page.locator('.provider-edit-workspace');
     const name = workspace.getByLabel('上游名称', { exact: false });

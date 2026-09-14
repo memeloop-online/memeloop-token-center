@@ -66,7 +66,6 @@ test('AppShell workspaces retain failed drafts, return after success, and priori
     await page.setViewportSize({ width: 1440, height: 1000 });
     await page.getByRole('link', { name: '上游服务', exact: true }).click();
     await page.getByText('研发订阅', { exact: true }).waitFor();
-    await page.getByText('账号设置与授权操作', { exact: true }).click();
     await page.getByRole('button', { name: '编辑', exact: true }).click();
     for (const theme of ['light', 'dark']) for (const width of [320, 1440]) {
       await page.evaluate(theme => { document.documentElement.dataset.theme = theme; }, theme);

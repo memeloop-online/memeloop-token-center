@@ -251,34 +251,34 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
         const currentReadiness = deletionReadiness[value.id];
         const deletionBlockers = currentReadiness ? deletionMessages(currentReadiness) : [];
         const detailOpen = providerDetail === value.id;
-        const providerName = providers.find(provider => provider.id === value.driver)?.display_name ?? (locale.startsWith('zh') ? '其他服务' : 'Other service');
-        const facts = availabilityWindow && availabilityWindow.tenant_external_id === value.tenant_external_id ? availabilityWindow.accounts.find(account => account.upstream_account_id === value.id) : undefined;
+        const providerName = providers.find(provider => provider.id === value.driver)?.display_name ?? t('providerDirectory.other');
+        const facts = availabilityWindow && availabilityWindow.tenant_external_id === (value.tenant_external_id ?? tenant) ? availabilityWindow.accounts.find(account => account.upstream_account_id === value.id) : undefined;
         const terminal = facts ? facts.metrics.successful_requests + facts.metrics.failed_requests : 0;
         const quota = quotaSummaries[value.id];
         const quotaPercents = quota?.windows.map(quotaUsedPercent).filter((percent): percent is number => percent !== null) ?? [];
-        const quotaText = !quota ? (locale.startsWith('zh') ? '尚未读取' : 'Not checked')
-          : quota.status === 'unsupported' ? (locale.startsWith('zh') ? '暂不支持查询' : 'Not supported')
-          : quota.status === 'error' ? (locale.startsWith('zh') ? '读取失败' : 'Read failed')
-          : quotaPercents.length ? (locale.startsWith('zh') ? `最高已用 ${formatPercent(Math.max(...quotaPercents) / 100, locale)}` : `Up to ${formatPercent(Math.max(...quotaPercents) / 100, locale)} used`)
-          : (locale.startsWith('zh') ? '暂无用量数据' : 'Usage unavailable');
+        const quotaText = !quota ? t('providerDirectory.notChecked')
+          : quota.status === 'unsupported' ? t('providerDirectory.unsupported')
+          : quota.status === 'error' ? t('providerDirectory.readFailed')
+          : quotaPercents.length ? t('providerDirectory.used', { percent: formatPercent(Math.max(...quotaPercents) / 100, locale) })
+          : t('providerDirectory.usageUnavailable');
         return <div className="account provider-account" data-upstream-id={value.id} key={value.id}>
           <div className="provider-directory-row">
             <div className="provider-directory-identity">
             <DetailTooltip content={`${providerName} · ${value.driver} · ID: ${value.id}${value.tenant_external_id ? ` · ${value.tenant_external_id}` : ''}`}><b tabIndex={0}>{value.name}</b></DetailTooltip>
-            <span>{providerName} · {enumLabel(t, 'auth', value.connection_method)}</span>
+            <span>{providerName} · {value.auth_kind === 'oauth' ? t('providers.oauth') : enumLabel(t, 'auth', value.connection_method)}</span>
             {memberships.length > 0 && <div className="table-chip-list provider-group-summary" aria-label={t('groups.provider.title')}>{memberships.map((group) => <span key={group.id}>{group.name}</span>)}</div>}
             {!providerAvailable && <span className="pill">{t('providers.retired')}</span>}
             </div>
             <div className="provider-directory-summary"><span className={`status ${value.status === 'active' ? 'ok' : 'pending'}`}>{enumLabel(t, 'status', value.status)}</span><span>{t('providers.routes', { count: formatNumber(value.route_count, locale) })}</span></div>
-            <div className="provider-directory-summary"><small>{t('providers.recentAvailability')}</small><span>{availabilityLoading ? t('common.loading') : !facts ? (locale.startsWith('zh') ? '暂无可用数据' : 'Unavailable') : terminal > 0 ? `${formatPercent(facts.metrics.successful_requests / terminal, locale)} ${locale.startsWith('zh') ? '成功' : 'successful'}` : locale.startsWith('zh') ? '暂无请求记录' : 'No recent requests'}</span></div>
+            <div className="provider-directory-summary"><small>{t('providers.recentAvailability')}</small><span>{availabilityLoading ? t('common.loading') : !facts ? t('providerDirectory.unavailable') : terminal > 0 ? t('providerDirectory.successful', { percent: formatPercent(facts.metrics.successful_requests / terminal, locale) }) : t('providerDirectory.noRequests')}</span></div>
             <div className="provider-directory-summary"><small>{t('quota.title')}</small><span>{quotaText}</span>{quota && (quota.stale || (quota.stale_after !== null && quota.stale_after <= Date.now())) && <small>{t('quota.stale')}</small>}</div>
             <div className="provider-directory-actions">
-              <Button appearance="secondary" type="button" aria-expanded={detailOpen} disabled={Boolean(busy) || proxyEditorOpen} onClick={() => setProviderDetail(detailOpen ? undefined : value.id)}>{detailOpen ? (locale.startsWith('zh') ? '收起详情' : 'Close details') : (locale.startsWith('zh') ? '查看详情' : 'View details')}</Button>
+              <Button appearance="secondary" type="button" aria-expanded={detailOpen} aria-controls={`provider-details-${value.id}`} disabled={Boolean(busy) || proxyEditorOpen} onClick={() => setProviderDetail(detailOpen ? undefined : value.id)}>{t(detailOpen ? 'providerDirectory.close' : 'providerDirectory.open')}</Button>
               {providerAvailable && <Button appearance="subtle" type="button" data-inline-edit-trigger={value.id} disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={(event) => { rememberTrigger(value.id, event.currentTarget); setProviderDetail(undefined); setProviderEditDraft(undefined); setEditing(value); }}>{t('providers.edit')}</Button>}
             </div>
           </div>
-          {detailOpen && <section className="provider-detail-workspace" aria-label={locale.startsWith('zh') ? `${value.name} · 详情` : `${value.name} · Details`}>
-            <div className="provider-detail-heading"><h3>{value.name}</h3><DetailTooltip content={`ID: ${value.id} · ${t('providers.generation')} ${value.credential_generation}`}><span tabIndex={0}>{locale.startsWith('zh') ? '账户信息' : 'Account information'}</span></DetailTooltip></div>
+          {detailOpen && <section id={`provider-details-${value.id}`} className="provider-detail-workspace" aria-label={t('providerDirectory.details', { name: value.name })}>
+            <div className="provider-detail-heading"><h3>{value.name}</h3><DetailTooltip content={`ID: ${value.id} · ${t('providers.generation')} ${value.credential_generation}`}><span tabIndex={0}>{t('providerDirectory.account')}</span></DetailTooltip></div>
             <div className="account-main">
             <UpstreamConnection key={`connection\0${token}\0${writeTenant}\0${value.id}`} account={value} token={token} tenant={writeTenant} disabled={!manageable || Boolean(busy)} onChanged={onChanged} onEditingChange={setProxyEditorOpen} />
             {value.credential_expires_at && <small>{t('providers.expires')}: {new Date(value.credential_expires_at).toLocaleString(locale)}</small>}
