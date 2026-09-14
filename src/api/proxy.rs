@@ -1496,7 +1496,7 @@ pub(in crate::api) async fn proxy_with_identity(
         let selected_output_token_ceiling = buffered_request.output_token_ceiling;
         return finish_non_sse_proxy_response(NonSseProxyResponseInput {
             buffered_request: &buffered_request,
-            selected_driver: route_driver,
+            selected_driver: active_route.route.driver.as_str(),
             upstream,
             status,
             content_type,

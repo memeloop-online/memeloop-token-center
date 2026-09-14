@@ -29,29 +29,26 @@ pub(super) fn extract_buffered_usage_checked(
     let Ok(mut usage) = crate::api::kimi_transport::usage::normalize(usage) else {
         return ExtractedUsage::Invalid;
     };
-    // A top-level cache count alone is not evidence of prompt/completion
-    // counts. Require the native complete counters, including their sum.
-    let count = |name| {
-        usage
-            .get(name)
-            .and_then(Value::as_i64)
-            .filter(|n| (0..=MAX_REPORTED_TOKENS).contains(n))
-    };
-    let (Some(input), Some(output), Some(total)) = (
-        count("prompt_tokens"),
-        count("completion_tokens"),
-        count("total_tokens"),
-    ) else {
-        return ExtractedUsage::Invalid;
-    };
-    if input.checked_add(output) != Some(total) {
-        return ExtractedUsage::Invalid;
-    }
+    // The shared normalizer owns field, range and total validation for every
+    // Kimi transport. This boundary only checks conservation after conversion.
+    let input = usage["prompt_tokens"]
+        .as_i64()
+        .expect("validated prompt count");
+    let output = usage["completion_tokens"]
+        .as_i64()
+        .expect("validated completion count");
     if usage.get("prompt_tokens_details") == Some(&Value::Null) {
         usage
             .as_object_mut()
             .expect("normalizer returns object")
             .remove("prompt_tokens_details");
+    }
+    if let Some(details) = usage
+        .get_mut("prompt_tokens_details")
+        .and_then(Value::as_object_mut)
+        && details.get("cached_tokens") == Some(&Value::Null)
+    {
+        details.remove("cached_tokens");
     }
     let cached = usage
         .pointer("/prompt_tokens_details/cached_tokens")
@@ -407,6 +404,17 @@ mod kimi_buffered_tests {
             parse(Value::Null, kimi, Protocol::OpenAiChat),
             ExtractedUsage::Missing
         ));
+        for cached in [Value::Null, serde_json::json!(MAX_REPORTED_TOKENS)] {
+            let boundary = serde_json::json!({"prompt_tokens":MAX_REPORTED_TOKENS,"completion_tokens":1,
+                "total_tokens":MAX_REPORTED_TOKENS+1,"prompt_tokens_details":{"cached_tokens":cached}});
+            assert!(
+                matches!(
+                    parse(boundary, kimi, Protocol::OpenAiChat),
+                    ExtractedUsage::Valid(_)
+                ),
+                "valid per-dimension counts must not acquire a separate buffered total limit"
+            );
+        }
         let anthropic = serde_json::json!({"input_tokens":4,"output_tokens":2,"cache_read_input_tokens":6,"cache_creation_input_tokens":3});
         let ExtractedUsage::Valid(result) = parse(anthropic, kimi, Protocol::AnthropicMessages)
         else {
