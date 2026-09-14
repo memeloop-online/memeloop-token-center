@@ -32,3 +32,16 @@ Cooldown and replay permission remain separate decisions: a dispatched HTTP
 503 can affect health without authorizing another execution. This diagnostic
 event changes neither the existing 429 failover rules nor the no-replay boundary
 for ambiguous delivery, visible output, or dispatched 503 responses.
+
+The live candidate loop also emits `upstream_attempt_observed` with closed
+outcomes: local candidate/credential preparation, connection non-delivery,
+transport delivery unknown, outer deadline delivery unknown, response delivery
+unknown, explicit HTTP status, or explicit rejected request. An outer deadline
+does not prove bytes were sent or not sent: delivery remains unknown and cannot
+authorize replay. HTTP status is numeric; error details never cross this event.
+Request/transaction admission and candidate-selection failures instead report
+`local_admission` plus the existing closed AppError category (including storage
+and overloaded), never raw database or configuration errors. Budget expiry
+during selection explicitly records that this candidate was not dispatched;
+it says nothing about earlier candidates. These fields add no metrics labels
+and change no HTTP response, health classification, retry policy, or timeout.

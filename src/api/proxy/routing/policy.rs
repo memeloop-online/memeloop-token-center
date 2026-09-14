@@ -94,7 +94,7 @@ impl RequestAttemptBudget {
             // Cancellation after dispatch is ambiguous. It never grants another send.
             Some(deadline) => tokio::time::timeout_at(deadline, send)
                 .await
-                .unwrap_or(Err(ProxySendError::NonRetryableTransport)),
+                .unwrap_or(Err(ProxySendError::OuterDeadline)),
             None => send.await,
         }
     }
@@ -231,7 +231,7 @@ mod tests {
             Some("upstream_attempts_exhausted")
         );
         let result = budget.send(std::future::pending()).await;
-        assert!(matches!(result, Err(ProxySendError::NonRetryableTransport)));
+        assert!(matches!(result, Err(ProxySendError::OuterDeadline)));
         assert_eq!(
             budget.terminal_reason(1),
             Some("upstream_failover_deadline")

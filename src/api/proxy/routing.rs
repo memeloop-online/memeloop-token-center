@@ -5,6 +5,7 @@ mod admission;
 mod candidates;
 mod clock;
 mod codex;
+pub(super) mod diagnostics;
 mod http;
 pub(super) mod kimi;
 mod outcome;
