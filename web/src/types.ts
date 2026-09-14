@@ -103,7 +103,6 @@ export type RequestEventKind = 'started' | 'finished' | 'projected' | 'archive_b
 export type RequestArchiveState = 'capturing' | 'pending' | 'uploading' | 'bound' | 'gap';
 
 export interface RequestEvent {
-  /** Explicit client context-compaction evidence only; absent/null is unknown. */
   compaction?: true | null;
   first_output_ms?: number | null;
   generation_duration_ms?: number | null;

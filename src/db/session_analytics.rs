@@ -919,6 +919,7 @@ impl Database {
                     );
                 Ok(ConversationRequestView {
                     request: RequestView {
+                        compaction: None,
                         first_output_ms: row.try_get("first_output_ms")?,
                         generation_duration_ms: row.try_get("generation_duration_ms")?,
                         request_id: parse_uuid(row.try_get("id")?)?,

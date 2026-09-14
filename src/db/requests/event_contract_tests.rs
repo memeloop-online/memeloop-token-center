@@ -43,6 +43,14 @@ async fn assert_event_enrichment(database: &Database) {
     .execute(&database.pool)
     .await
     .unwrap();
+    let principal = Uuid::now_v7().to_string();
+    let account = Uuid::now_v7().to_string();
+    sqlx::query("INSERT INTO principals (id, tenant_id, external_id, created_at) VALUES ($1, $2, 'compaction-fixture', $3)")
+        .bind(&principal).bind(&tenant).bind(now).execute(&database.pool).await.unwrap();
+    sqlx::query("INSERT INTO credit_accounts (id, tenant_id, principal_id, currency, available_micros, reserved_micros, created_at, updated_at) VALUES ($1, $2, $3, 'USD', 0, 0, $4, $4)")
+        .bind(&account).bind(&tenant).bind(&principal).bind(now).execute(&database.pool).await.unwrap();
+    sqlx::query("INSERT INTO key_records (id, tenant_id, principal_id, account_id, alias, currency, policy_json, status, credential_generation, created_at, updated_at) VALUES ($1, $2, $3, $4, 'compaction-fixture', 'USD', '{}', 'active', 1, $5, $5)")
+        .bind(&key).bind(&tenant).bind(&principal).bind(&account).bind(now).execute(&database.pool).await.unwrap();
     sqlx::query("INSERT INTO request_record_locators (id, created_at, tenant_id, key_id) VALUES ($1, $2, $3, $4)")
         .bind(&request).bind(now).bind(&tenant).bind(&key)
         .execute(&database.pool).await.unwrap();
@@ -108,6 +116,84 @@ async fn assert_event_enrichment(database: &Database) {
     assert!(foreign[0].session_context.is_none());
     let foreign_json = serde_json::to_value(&foreign[0]).unwrap();
     assert!(foreign_json["cached_input_tokens"].is_null());
+    // Reuse the same persisted request and bounded read paths. A long request
+    // and a legacy default-zero observation are not proof of compaction.
+    sqlx::query(
+        "UPDATE request_records SET duration_ms = 287000 WHERE id = $1 AND created_at = $2",
+    )
+    .bind(&request)
+    .bind(now)
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let key_id = Uuid::parse_str(&key).unwrap();
+    let request_id = Uuid::parse_str(&request).unwrap();
+    for marker in [0_i64, 1, 0] {
+        sqlx::query("UPDATE conversation_observations SET compaction = $1 WHERE request_id = $2 AND key_id = $3")
+            .bind(marker).bind(&request).bind(&key).execute(&database.pool).await.unwrap();
+        let expected = (marker == 1).then_some(true);
+        let list = database.list_requests(key_id, 10).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].compaction, expected);
+        let operator_list = database.list_all_requests(&external, 10).await.unwrap();
+        assert_eq!(operator_list.len(), 1);
+        assert_eq!(operator_list[0].compaction, expected);
+        let global_list = database
+            .list_global_requests_filtered(RequestListFilter {
+                key_id: Some(key_id),
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(global_list.len(), 1);
+        assert_eq!(global_list[0].compaction, expected);
+        let detail = database
+            .request_archive_refs(key_id, request_id)
+            .await
+            .unwrap();
+        assert_eq!(detail.view.compaction, expected);
+        let events = database
+            .request_events_after(&external, now, None, 500)
+            .await
+            .unwrap();
+        assert_eq!(events[0].compaction, expected);
+        for value in [
+            serde_json::to_value(&list[0]).unwrap(),
+            serde_json::to_value(&detail.view).unwrap(),
+            serde_json::to_value(&events[0]).unwrap(),
+        ] {
+            assert_eq!(value["compaction"], serde_json::to_value(expected).unwrap());
+            assert_ne!(value["compaction"], serde_json::json!(false));
+        }
+        let foreign = database
+            .request_events_after(&foreign_external, now, None, 500)
+            .await
+            .unwrap();
+        assert!(
+            foreign[0].compaction.is_none(),
+            "a foreign-tenant event cannot inherit even a true marker"
+        );
+    }
+    // A missing observation is also unknown, independently of the legacy zero.
+    sqlx::query("UPDATE conversation_observations SET cluster_id = 'unmatched-compaction-fixture' WHERE request_id = $1 AND key_id = $2")
+        .bind(&request).bind(&key).execute(&database.pool).await.unwrap();
+    assert!(
+        database.list_requests(key_id, 10).await.unwrap()[0]
+            .compaction
+            .is_none()
+    );
+    assert!(
+        database
+            .request_archive_refs(key_id, request_id)
+            .await
+            .unwrap()
+            .view
+            .compaction
+            .is_none()
+    );
+    sqlx::query("UPDATE conversation_observations SET cluster_id = 'recorded-session' WHERE request_id = $1 AND key_id = $2")
+        .bind(&request).bind(&key).execute(&database.pool).await.unwrap();
     // Exercise the same terminal UPDATE used by production, independently of
     // the event fixture's deliberately different event/receipt timestamps.
     let mut transaction = database.pool.begin().await.unwrap();
