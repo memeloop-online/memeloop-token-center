@@ -373,7 +373,7 @@ table.request-table .request-token-cell { min-width: 10rem; }
 .request-token-total > span { text-decoration: line-through; }
 .request-tps-cell { min-width: 5.5rem; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .request-routing-info { display: block; cursor: help; }
-.request-upstream-name { display: block; margin-top: 4px; color: var(--muted, #82979e); font-size: 0.75rem; overflow-wrap: anywhere; }
+.request-upstream-name { display: block; inline-size: 13rem; max-inline-size: 100%; margin-top: 4px; color: var(--muted, #82979e); font-size: 0.75rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .request-table :is(.request-routing-info, .request-credential-cell strong, .request-tps-cell span)[tabindex='0']:focus-visible {
   outline: 2px solid var(--colorStrokeFocus2, #08796e); outline-offset: 3px; border-radius: 3px;
 }

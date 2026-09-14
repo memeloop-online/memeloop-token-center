@@ -136,6 +136,7 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     await recordedRow.locator('.request-routing-info').focus();
     await page.getByRole('tooltip').filter({ hasText: upstreamId }).waitFor();
     assert.match(await page.getByRole('tooltip').filter({ hasText: upstreamId }).innerText(), /Production Codex.*e82ea007/, 'keyboard focus on model/account identity exposes the precise routing metadata');
+    assert.ok((await page.getByRole('tooltip').filter({ hasText: upstreamId }).innerText()).includes('Production Codex · csil.ai.automation@example.test'), 'the tooltip retains the complete account even when its row label truncates');
     assert.match(await recordedRow.locator('.request-token-primary').innerText(), /Uncached input\s*100[\s\S]*Output\s*32/);
     assert.equal(await recordedRow.locator('.request-token-total > span').evaluate(element => getComputedStyle(element).textDecorationLine), 'line-through');
     assert.equal(await recordedRow.locator('.request-token-primary b').first().evaluate(element => getComputedStyle(element).textDecorationLine), 'none');
@@ -175,7 +176,7 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
 
     for (const theme of ['dark', 'light'] as const) {
       await stage(`set ${theme} theme`, () => page!.evaluate((value) => { document.documentElement.dataset.theme = value; }, theme), history, current);
-      for (const width of [320, 390, 768]) {
+      for (const width of [320, 390, 768, 1440, 1920]) {
         await stage(`${theme} ${width}px set viewport`, () => page!.setViewportSize({ width, height: 900 }), history, current);
         await stage(`${theme} ${width}px wait paint`, () => page!.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))), history, current);
         const layout = await stage(`${theme} ${width}px read layout`, () => page!.evaluate(() => {
@@ -197,6 +198,18 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
           };
         }), history, current);
         assert.ok(layout.documentScrollWidth <= layout.documentClientWidth, `${theme} ${width}px fixture must not create page overflow`);
+        const accountDisplay = await recordedRow.locator('.request-upstream-name').evaluate(element => {
+          const style = getComputedStyle(element);
+          return { text: element.textContent, height: element.getBoundingClientRect().height, lineHeight: parseFloat(style.lineHeight), clientWidth: element.clientWidth, scrollWidth: element.scrollWidth, whiteSpace: style.whiteSpace, ellipsis: style.textOverflow, overflow: style.overflow };
+        });
+        assert.equal(accountDisplay.text, 'Production Codex · csil.ai.automation@example.test');
+        assert.equal(accountDisplay.whiteSpace, 'nowrap');
+        assert.equal(accountDisplay.ellipsis, 'ellipsis');
+        assert.equal(accountDisplay.overflow, 'hidden');
+        assert.ok(accountDisplay.height <= accountDisplay.lineHeight + 1, `${theme} ${width}px account never wraps an orphan letter`);
+        assert.ok(accountDisplay.scrollWidth > accountDisplay.clientWidth, 'long fixture account uses real truncation, not a shortened value');
+        assert.equal(await recordedRow.locator('.request-model-cell code').textContent(), 'fixture-long-model-name-for-request-observability');
+        assert.equal(await recordedRow.locator('.request-credential-cell strong').textContent(), 'Research key');
         if (width < 600) assert.equal(layout.summaryColumns, 2, `${theme} ${width}px summary keeps six metrics in three rows`);
         assert.ok(layout.tableScrollWidth >= layout.tableClientWidth, `${theme} ${width}px table remains in its own scroll container`);
         assert.ok(layout.compactIdScrollWidth >= layout.compactIdClientWidth, `${theme} ${width}px request ID remains safely clipped in its cell`);
