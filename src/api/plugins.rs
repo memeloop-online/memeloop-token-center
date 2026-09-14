@@ -54,11 +54,16 @@ pub(in crate::api) async fn get_plugin_service_data(
         return Err(AppError::Forbidden);
     }
     let tenant_external_id = management_tenant(&service, query.tenant_external_id)?;
-    Ok(Json(
-        state
-            .plugins
-            .service_data(&plugin_id, &endpoint_id, tenant_external_id.as_deref())
-            .await?,
+    let data = state
+        .plugins
+        .service_data(&plugin_id, &endpoint_id, tenant_external_id.as_deref())
+        .await?;
+    state
+        .plugins
+        .validate_ui_projection(&plugin_id, &endpoint_id, &data.data)?;
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "private, no-store")],
+        Json(data),
     ))
 }
 
