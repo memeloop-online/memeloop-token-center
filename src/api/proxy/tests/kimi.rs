@@ -6,15 +6,14 @@ async fn translated_kimi_clean_eof_and_done_settle_and_archive_once() {
         let upstream = MockServer::start().await;
         let bridge = MockServer::start().await;
         let fixture = response_usage_fixture("kimi-terminal", &bridge, 0).await;
-        let mut wire = format!(
-            "data: {}\n\n",
-            json!({"id":"kimi-test","object":"chat.completion.chunk","model":"k3",
-            "choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}],
-            "usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}})
-        );
-        if with_done {
-            wire.push_str("data: [DONE]\n\n");
-        }
+        // Official Kimi Chat streaming example, including its top-level cache
+        // count. See docs/kimi-response-failure-diagnostics.md for provenance.
+        let documented = include_str!("../../kimi_transport/fixtures/documented-chat-stream.sse");
+        let wire = if with_done {
+            documented.to_owned()
+        } else {
+            documented.replace("data: [DONE]\n\n", "")
+        };
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_raw(wire, "text/event-stream"))
             .expect(1)
@@ -73,12 +72,18 @@ async fn translated_kimi_clean_eof_and_done_settle_and_archive_once() {
             .await
             .unwrap();
         assert_eq!(rows[0].status_code, Some(200));
-        assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (5, 2));
+        assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (7, 13));
+        assert_eq!(rows[0].cached_input_tokens, 12);
         assert_eq!(
             rows[0].usage_basis,
             Some(crate::model::RequestUsageBasis::ProviderReported)
         );
-        assert_eq!(rows[0].cost.parse::<Decimal>().unwrap(), Decimal::new(7, 6));
+        // Fixture prices use $1/M for both input and output, including cached
+        // input fallback: 7 uncached + 12 cached + 13 output, each exactly once.
+        assert_eq!(
+            rows[0].cost.parse::<Decimal>().unwrap(),
+            Decimal::new(32, 6)
+        );
         assert_exactly_once_side_effects(&fixture, rows[0].request_id, response_id.as_deref())
             .await;
         drain_completed_response_archive(&fixture).await;

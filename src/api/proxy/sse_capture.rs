@@ -118,6 +118,14 @@ impl ResponsesSseCapture {
         }
     }
 
+    pub(super) fn for_kimi_chat_usage() -> Self {
+        Self {
+            chat_usage: Some(ChatSseUsageState::for_kimi()),
+            delivery: Some(SseDeliveryState::default()),
+            ..Self::default()
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn push(&mut self, chunk: &[u8]) {
         let _ = self.push_framed(chunk);

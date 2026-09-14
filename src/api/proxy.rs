@@ -1515,6 +1515,7 @@ pub(in crate::api) async fn proxy_with_identity(
         is_codex_route,
         codex_retry,
         strict_openai_chat_usage,
+        is_kimi_route: active_route.route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER,
         upstream_attempt,
         upstream_activity,
         request_id,

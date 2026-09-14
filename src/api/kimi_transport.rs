@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 mod messages;
 pub(in crate::api) mod responses;
 mod responses_request;
+pub(in crate::api) mod usage;
 
 pub(super) fn supports(protocol: Protocol) -> bool {
     matches!(

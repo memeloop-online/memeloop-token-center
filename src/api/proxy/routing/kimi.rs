@@ -98,6 +98,9 @@ impl StreamState {
                 } else {
                     "choice"
                 };
+                if !self.usage.valid_so_far() {
+                    return Err(self.usage.invalid_reason().unwrap_or("chat_chunk_schema"));
+                }
                 let events = self.translator.observe(&value)?;
                 self.pending
                     .extend(events.into_iter().map(|event| Ok(Bytes::from(event))));
