@@ -43,7 +43,7 @@ function checkedOutPushDiff(): { input: string; base: string } | undefined {
   const git = (...args: string[]): string => execFileSync('git', ['--no-replace-objects', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024 });
   try {
     if (git('rev-parse', '--verify', 'HEAD').trim() !== checkout.toLowerCase()) return undefined;
-    git('rev-parse', '--verify', before);
+    git('rev-parse', '--verify', `${before}^{commit}`);
     const input = git('diff', '--name-status', '--find-renames=100%', '--diff-filter=ACDMRT', '-z', before, checkout);
     return input === '' ? undefined : { input, base: before };
   } catch { return undefined; }
