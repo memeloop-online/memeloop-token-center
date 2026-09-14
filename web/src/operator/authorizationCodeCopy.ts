@@ -1,0 +1,31 @@
+export function authorizationCodeCopy(locale: string) {
+  return locale.startsWith('zh') ? {
+    help: '使用部署提供的登录客户端，无需自行创建 Google OAuth 项目。配置仅在当前页面内保留；离开页面会清除登录草稿。',
+    admin: '管理员尚未正确配置此提供商的默认 OAuth 客户端。请在部署 Secret MTC_PROVIDER_OAUTH_CLIENT_DEFAULTS_JSON 中配置后重试。',
+    forbidden: '此登录流程目前仅允许全局管理员操作。请联系管理员。',
+    failed: '登录请求未完成。草稿已保留；请检查配置后手动重试。',
+    uncertain: '尚未确认账号是否创建成功。不会自动重新兑换授权码；请先检查上游账号列表，再决定是否重新登录。',
+    pending: '服务器仍在处理登录。不会自动重发；请稍后检查账号列表。',
+    reauthorize: '此流程暂不支持原账号重新授权；请勿用新建登录代替，以免创建重复账号。',
+    network: '登录网络', direct: '直接连接', proxy: '使用代理', proxyScope: '代理网络范围', public: '公网', private: '私网',
+    callback: '完整回调地址', callbackHelp: '在新标签页完成登录后，复制地址栏中的完整回调 URL（包含 code 和 state）。即使本机回调页无法打开，也请复制地址栏。不要粘贴到聊天或工单。',
+    invalid: '请输入包含 code 和 state 的完整 HTTP 或 HTTPS 回调地址。',
+    waiting: '等待你在提供商页面完成登录', expires: '登录有效期至', config: '提供商连接配置', reset: '清除登录草稿',
+    abandon: '清除当前登录草稿？此操作不会撤销提供商已授予的授权，也不会删除已创建的账号。',
+    check: '检查账号列表', saved: '账号已创建；可在上游列表查看状态和代理配置。',
+  } : {
+    help: 'Use the deployment-provided login client; no Google OAuth project setup is required. Drafts stay only on this page and are cleared when you leave.',
+    admin: 'The default OAuth client for this provider is missing or invalid. Ask an administrator to configure deployment Secret MTC_PROVIDER_OAUTH_CLIENT_DEFAULTS_JSON.',
+    forbidden: 'This login flow currently requires a global administrator. Contact your administrator.',
+    failed: 'Login could not start. Your draft is preserved; check the configuration before retrying manually.',
+    uncertain: 'Account creation is not confirmed. The authorization code will not be exchanged again automatically. Check the upstream account list before starting another login.',
+    pending: 'The server is still processing login. No request will be resent automatically; check the account list shortly.',
+    reauthorize: 'This flow does not yet support reauthorizing an existing account. Starting a new login could create a duplicate account.',
+    network: 'Login network', direct: 'Direct connection', proxy: 'Use a proxy', proxyScope: 'Proxy network scope', public: 'Public', private: 'Private',
+    callback: 'Complete callback URL', callbackHelp: 'After signing in in the new tab, copy the complete callback URL from its address bar, including code and state. Copy it even if the local callback page cannot open. Do not paste it into chats or support tickets.',
+    invalid: 'Enter a complete HTTP or HTTPS callback URL containing code and state.',
+    waiting: 'Waiting for you to sign in with the provider', expires: 'Login expires', config: 'Provider connection settings', reset: 'Clear login draft',
+    abandon: 'Clear this login draft? This does not revoke provider authorization or delete an account already created.',
+    check: 'Check account list', saved: 'Account created. View its status and proxy settings in the upstream list.',
+  };
+}

@@ -1,0 +1,21 @@
+import { createRoot } from 'react-dom/client';
+import { useState } from 'react';
+import { I18nProvider } from '../../src/i18n';
+import { MtcFluentProvider } from '../../src/design-system';
+import { AuthorizationCodeConnection } from '../../src/operator/AuthorizationCodeConnection';
+import type { ProviderType } from '../../src/types';
+import '../../src/styles.css';
+import '../../src/theme.css';
+import '../../src/operator/operator.css';
+
+const provider: ProviderType = {
+  id: 'fixture-plugin', display_name: 'Fixture OAuth', source: 'plugin', protocols: ['openai'], modalities: ['text'],
+  config_schema: { type: 'object', properties: { base_url: { type: 'string', default: 'https://api.example.invalid' } } }, credential_schema: {},
+  oauth_adapter: { api_version: 'oauth-adapter-v1', flow_kind: 'authorization_code_pkce', login_url: 'https://login.example.invalid', poll_url: '', refresh_url: 'https://token.example.invalid' },
+};
+function Fixture() {
+  const [tenant, setTenant] = useState('fixture-a');
+  const [, setLocked] = useState(false);
+  return <main style={{ maxWidth: 720, margin: 'auto', padding: 16 }}><button onClick={() => setTenant('fixture-b')}>Switch scope</button><AuthorizationCodeConnection key={tenant} token="fixture-token" tenant={tenant} provider={provider} onLock={setLocked} onChanged={async () => {}} /></main>;
+}
+createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><Fixture /></MtcFluentProvider></I18nProvider>);

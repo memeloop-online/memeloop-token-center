@@ -33,6 +33,7 @@ import { quotaSummaryPresentation, type UpstreamQuotaSnapshot } from '../upstrea
 import { connectionSchema, isPrivateProxyUrl, ProxyInput, UpstreamConnection } from '../UpstreamConnection';
 import { upstreamFormTemplates } from '../UpstreamFormTemplates';
 import { providerEditSchema } from '../providerEditSchema';
+import { AuthorizationCodeConnection } from '../AuthorizationCodeConnection';
 import { providerConnectionCopy } from '../providerConnectionCopy';
 import { providerFormWidgets } from '../ProviderFormWidgets';
 import { appHref } from '../../app/routes';
@@ -371,6 +372,8 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
   const existingOAuthProvider = oauthProviders.find((provider) => provider.id === existing?.driver);
   const initialProvider = existingOAuthProvider ?? oauthProviders[0];
   const [providerChoice, setProviderChoice] = useState(initialProvider?.id ?? '');
+  const [nativeLocked, setNativeLocked] = useState(false);
+  useEffect(() => { setNativeLocked(false); }, [token, tenant]);
   const selectedProvider = oauthProviders.find((provider) => provider.id === providerChoice);
   const [name, setName] = useState(existing?.name ?? initialProvider?.display_name ?? '');
   const [session, setSession] = useState<{ login_url?: string; verification_url?: string; user_code?: string; session_token: string; expires_at?: number; poll_after_seconds?: number }>();
@@ -432,7 +435,8 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
   return <div className="authorization-form"><p className="muted">{t('providers.oauthSecurity')}</p>
     {error && <div className="notice error" role="alert">{error}</div>}
     {oauthProviders.length === 0 ? <div className="empty">{t('providers.noAdapter')}</div> : <>
-    <ModelPicker label={t('providers.provider')} disabled={Boolean(existing) || authorizing || Boolean(session)} value={providerChoice} onChange={(next) => { setProviderChoice(next); setName(oauthProviders.find(value => value.id === next)?.display_name ?? ''); reset(); }} options={oauthProviders.map(value => ({ key: value.id, value: value.id, label: value.display_name, provider: value.display_name, upstream: '', capabilities: value.protocols }))} />
+    <ModelPicker label={t('providers.provider')} disabled={Boolean(existing) || authorizing || Boolean(session) || nativeLocked} value={providerChoice} onChange={(next) => { setProviderChoice(next); setName(oauthProviders.find(value => value.id === next)?.display_name ?? ''); reset(); }} options={oauthProviders.map(value => ({ key: value.id, value: value.id, label: value.display_name, provider: value.display_name, upstream: '', capabilities: value.protocols }))} />
+    {selectedProvider?.oauth_adapter?.flow_kind === 'authorization_code_pkce' ? <AuthorizationCodeConnection key={`${token}\0${tenant}\0${selectedProvider.id}`} token={token} tenant={tenant} provider={selectedProvider} existing={existing} onChanged={onChanged} onLock={setNativeLocked} /> : <>
     <label>{t('providers.name')} · {t('connection.required')}<input required maxLength={200} readOnly={Boolean(existing)} disabled={authorizing || Boolean(session)} value={name} onChange={(event) => setName(event.target.value)} /></label>
     {selectedProvider?.oauth_adapter?.flow_kind === 'openai_device' && !session && <section className="upstream-connection">
       <h3>{t('connection.title')}</h3>
@@ -445,6 +449,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
     {existing && selectedProvider?.oauth_adapter?.flow_kind === 'openai_device' && !session && <p>{t('connection.reauthorizationProxy')}</p>}
     {session?.user_code && <div className="device-authorization" role="status"><p>{t('providers.codexSecurity')}</p><b>{t('providers.deviceCode')}</b><code>{session.user_code}</code></div>}
     {message && <div className="notice success" role="status">{message}</div>}
+    </>}
     </>}
   </div>;
 }

@@ -662,7 +662,7 @@ export interface ProviderType {
   credential_schema: Record<string, unknown>;
   oauth_adapter?: {
     api_version: 'oauth-adapter-v1';
-    flow_kind: 'cursor_pkce' | 'openai_device' | 'claude_manual_pkce' | 'github_device_copilot';
+    flow_kind: 'cursor_pkce' | 'openai_device' | 'claude_manual_pkce' | 'github_device_copilot' | 'authorization_code_pkce';
     login_url: string;
     poll_url: string;
     refresh_url: string;
