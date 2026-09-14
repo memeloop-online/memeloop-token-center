@@ -138,8 +138,18 @@ impl Database {
         let replacement = current_credential
             .clone()
             .with_transport_proxy(proxy_url.clone())?;
-        let old_metadata = current_credential.proxy_metadata(key_material)?;
-        let new_metadata = replacement.proxy_metadata(key_material)?;
+        let (old_metadata, new_metadata) = if driver == crate::oauth::codex_device::PROVIDER_DRIVER
+        {
+            (
+                current_credential.codex_proxy_metadata(key_material)?,
+                replacement.codex_proxy_metadata(key_material)?,
+            )
+        } else {
+            (
+                current_credential.proxy_metadata(key_material)?,
+                replacement.proxy_metadata(key_material)?,
+            )
+        };
         let mut view = upstream_account_view(row)?;
 
         if proxy_changed {
