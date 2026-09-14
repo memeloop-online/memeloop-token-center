@@ -15,6 +15,9 @@ import type {} from '../support/form-journey-globals';
 window.formJourneyReads = []; window.formJourneyWrites = 0;
 window.failNextFormWrite = false;
 window.deferNextFormQuotaRead = false;
+window.deferNextFormProxyRead = false;
+let releaseProxy: (() => void) | undefined;
+window.releaseFormProxyRead = () => { if (!releaseProxy) throw new Error('No pending proxy read'); releaseProxy(); releaseProxy = undefined; };
 let releaseQuota: (() => void) | undefined;
 window.releaseFormQuotaRead = () => { if (!releaseQuota) throw new Error('No pending quota read'); releaseQuota(); releaseQuota = undefined; };
 const workflows = new URLSearchParams(location.search).has('workflows');
@@ -55,7 +58,14 @@ window.fetch = async (input, init) => {
   window.formJourneyReads.push(path);
   if (path === '/internal/v1/upstreams/account-native/transport-proxy') {
     if (init?.cache !== 'no-store') throw new Error('Proxy reads must not be cached');
-    return new Response(JSON.stringify({ account_id: account.id, proxy_url: proxyUrl, supported: true, proxy_network_scope: 'private', updated_at: account.updated_at, credential_generation: account.credential_generation }), { headers: { 'Cache-Control': 'private, no-store' } });
+    const snapshot = JSON.stringify({ account_id: account.id, proxy_url: proxyUrl, supported: true, proxy_network_scope: 'private', updated_at: account.updated_at, credential_generation: account.credential_generation });
+    if (window.deferNextFormProxyRead) {
+      window.deferNextFormProxyRead = false;
+      // Ignore AbortSignal to prove a late response cannot re-publish a prior
+      // credential generation's original URL after a successful save.
+      return new Promise<Response>(resolve => { releaseProxy = () => resolve(new Response(snapshot)); });
+    }
+    return new Response(snapshot, { headers: { 'Cache-Control': 'private, no-store' } });
   }
   if (new URLSearchParams(location.search).has('quota-generation') && path === '/internal/v1/upstreams/account-native/quota') {
     const generation = account.credential_generation;

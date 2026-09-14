@@ -87,6 +87,16 @@ test('independent proxy save updates concurrency metadata without dropping the p
     await save.click();
     await page.locator('.provider-list').getByText('保留名称草稿', { exact: true }).waitFor();
     assert.equal(await page.evaluate(() => window.formJourneyWrites), 2, 'provider save succeeds against the new revision without retries');
+    await page.evaluate(() => { window.deferNextFormProxyRead = true; });
+    await row.getByRole('button', { name: '编辑', exact: true }).click();
+    await page.waitForFunction(() => !window.deferNextFormProxyRead);
+    await workspace.getByRole('button', { name: '配置网络代理', exact: true }).click();
+    await workspace.locator('.upstream-proxy-editor input').fill('socks5h://10.0.0.40:1080');
+    await workspace.getByRole('button', { name: '保存网络代理', exact: true }).click();
+    await workspace.locator('.provider-proxy-value input').waitFor();
+    await page.evaluate(() => window.releaseFormProxyRead());
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    assert.equal(await workspace.locator('.provider-proxy-value input').inputValue(), 'socks5h://10.0.0.40:1080', 'a late old-generation read cannot restore the previous proxy');
     // Credential-generation change invalidates both the cached summary and
     // reset capability. Unknown discovery remains visible, but cannot prepare
     // a reset. These reads and the proxy update are in-memory only; no reset

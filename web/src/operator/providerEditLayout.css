@@ -21,6 +21,13 @@
 .provider-edit-workspace .form-panel .fui-Input input:focus-visible { outline: 0; }
 .provider-edit-workspace .fui-Button { min-height: 40px; font-size: 14px; font-family: inherit; }
 .provider-edit-workspace .rjsf > .fui-Button { margin-top: 24px; }
+.provider-edit-workspace .form-panel .upstream-form-sections { gap: 24px; }
+.provider-edit-workspace .form-panel .upstream-form-sections fieldset.mtc-form-section { margin: 0; padding: 0; }
+.provider-edit-workspace .mtc-form-fields { gap: 12px; }
+.provider-edit-workspace .mtc-form-fields > p { margin: 0; }
+.provider-edit-workspace .mtc-form-fields > .fui-Button { justify-self: start; }
+.provider-edit-workspace .form-panel button { margin-top: 0; }
+.provider-edit-workspace .form-panel label { margin-block: 0 8px; }
 .provider-edit-workspace .upstream-form-sections > .mtc-form-section { border: 0; border-radius: 0; background: transparent; padding: 16px 0; }
 .provider-edit-workspace .upstream-form-sections > .mtc-form-section + .mtc-form-section { border-top: 1px solid var(--picker-border); }
 .provider-config-value { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; }

@@ -62,7 +62,9 @@ export function UpstreamConnection({ account, token, tenant, disabled, onChanged
   const [saved, setSaved] = useState(false);
   const [connection, setConnection] = useState<ProxyConnection>();
   const [readError, setReadError] = useState(false);
-  const [requested, setRequested] = useState(embedded);
+  // The list capability already reflects the current service authority. Do
+  // not automatically issue a privileged read for a tenant-only editor.
+  const [requested, setRequested] = useState(embedded && account.can_update_transport_proxy === true);
   const scope = `${token}\0${tenant}\0${account.id}\0${account.credential_generation}`;
   const owner = useRef(scope);
   owner.current = scope;
@@ -84,7 +86,7 @@ export function UpstreamConnection({ account, token, tenant, disabled, onChanged
       cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer', signal: controller.signal,
     }).then(result => {
       if (controller.signal.aborted || owner.current !== scope || readEpoch.current !== epoch) return;
-      if (result.account_id !== account.id || result.credential_generation !== account.credential_generation) {
+      if (result.account_id !== account.id || result.credential_generation !== account.credential_generation || result.updated_at !== account.updated_at) {
         setReadError(true); return;
       }
       setConnection(result);
@@ -108,7 +110,7 @@ export function UpstreamConnection({ account, token, tenant, disabled, onChanged
     try {
       const updated = await api<UpstreamAccount>(`/internal/v1/upstreams/${encodeURIComponent(account.id)}/transport-proxy`, token, {
         method: 'PUT', headers: { 'Idempotency-Key': crypto.randomUUID() },
-        body: JSON.stringify({ tenant_external_id: tenant, proxy_url: proxy.trim(), expected_updated_at: connection?.updated_at ?? account.updated_at, expected_credential_generation: account.credential_generation }),
+        body: JSON.stringify({ tenant_external_id: tenant, proxy_url: proxy.trim(), expected_updated_at: account.updated_at, expected_credential_generation: account.credential_generation }),
       });
       if (owner.current !== scope || lifecycle.current !== version) return;
       setConnection({ account_id: updated.id, proxy_url: proxy.trim(), updated_at: updated.updated_at, credential_generation: updated.credential_generation });
@@ -126,13 +128,13 @@ export function UpstreamConnection({ account, token, tenant, disabled, onChanged
       <div><dt>{t('connection.proxy')}</dt><dd><span className={`status ${account.has_proxy && account.proxy_scheme ? 'ok' : 'pending'}`}>{t(account.has_proxy === undefined ? 'connection.proxyUnknown' : account.has_proxy ? proxyState : codex ? proxyState : 'connection.directEgress')}</span>{account.proxy_scheme && <code>{account.proxy_scheme}</code>}{account.has_proxy && account.proxy_scheme && <span>{t(account.proxy_remote_dns ? 'connection.remoteDns' : 'connection.localDns')}</span>}</dd></div>
       {account.proxy_fingerprint && <div><dt>{t('connection.proxyFingerprint')}</dt><dd><DetailTooltip content={account.proxy_fingerprint}><span tabIndex={0}>{t('providerDirectory.account')}</span></DetailTooltip></dd></div>}
     </dl>
-    <DetailTooltip content={t('connection.endpointHint')}><span tabIndex={0} className="connection-help">{t('connection.baseUrl')}</span></DetailTooltip>
+    {!embedded && <DetailTooltip content={t('connection.endpointHint')}><span tabIndex={0} className="connection-help">{t('connection.baseUrl')}</span></DetailTooltip>}
     {codex && !canEditProxy && <p>{t('connection.proxyAdminOnly')}</p>}
     {!codex && <DetailTooltip content={t('connection.genericProxyHint')}><span tabIndex={0} className="connection-help">{t('connection.proxy')}</span></DetailTooltip>}
-    {connection && !editing && <div className="provider-proxy-value">
+    {connection && !editing && <>
       {connection.proxy_url === null ? <p>{copy.noProxy}</p> : <ProxyValue value={connection.proxy_url} />}
       {!canEditProxy && connection.proxy_url && <p>{copy.readOnlyProxy}</p>}
-    </div>}
+    </>}
     {readError && <p role="status">{copy.readFailed}</p>}
     {!requested && !disabled && <Button type="button" appearance="secondary" onClick={() => setRequested(true)}>{copy.viewProxy}</Button>}
     {canEditProxy && <><Button appearance="secondary" type="button" disabled={disabled || busy} onClick={() => { setEditing(!editing); setProxy(editing ? '' : connection?.proxy_url ?? ''); setError(false); setSaved(false); }}>{t(editing ? 'common.cancel' : 'connection.editProxy')}</Button>

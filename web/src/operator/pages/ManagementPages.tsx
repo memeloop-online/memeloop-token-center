@@ -250,6 +250,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   }
   const providerFormContext = editing ? {
     providerEdit: true,
+    providerIdentityTitle: connectionCopy.identity,
     providerConnectionTitle: connectionCopy.network,
     providerConnection: <>
       <UpstreamConnection key={`${token}\0${writeTenant}\0${editing.id}\0${editing.credential_generation}`} embedded account={editing} token={token} tenant={writeTenant} disabled={!canManage(editing) || Boolean(busy)} onChanged={onChanged} onEditingChange={setProxyEditorOpen} onSaved={updated => setEditing(current => current?.id === updated.id ? { ...updated, name: current.name, config: current.config } : current)} />
