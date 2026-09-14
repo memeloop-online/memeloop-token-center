@@ -4,6 +4,219 @@ use uuid::Uuid;
 use super::super::super::*;
 use super::{fixture, input};
 
+struct LifecycleEntitlement {
+    cycle_id: Uuid,
+    external_subscription_id: String,
+    external_cycle_id: String,
+}
+
+async fn establish_consumed_entitlement(
+    fixture: &super::AdjustmentFixture,
+    suffix: &str,
+) -> LifecycleEntitlement {
+    let now = unix_millis();
+    let external_subscription_id = format!("lifecycle-subscription-{suffix}");
+    let external_cycle_id = format!("lifecycle-cycle-{suffix}");
+    let reconciled = fixture
+        .database
+        .reconcile_entitlement(
+            EntitlementOperation::Reconcile(ReconcileEntitlementInput {
+                tenant_external_id: "adjustments".to_owned(),
+                account_id: fixture.account_id,
+                provider: "lifecycle-test".to_owned(),
+                external_subscription_id: external_subscription_id.clone(),
+                external_cycle_id: external_cycle_id.clone(),
+                period_start: now - 1,
+                period_end: now + 86_400_000,
+                currency: "USD".to_owned(),
+                desired_micros: 100,
+                version: 1,
+                source: "lifecycle-test".to_owned(),
+                proration_json: None,
+            }),
+            "lifecycle:reconcile",
+        )
+        .await
+        .unwrap();
+    // The shared fixture's generic grant is deliberately replaced with the
+    // real entitlement grant before attributing the synthetic settled usage.
+    fixture
+        .database
+        .reverse_grant(
+            fixture.account_id,
+            "adjustment-fixture:funding",
+            "lifecycle-replaces-generic-funding",
+            "lifecycle:reverse-generic",
+        )
+        .await
+        .unwrap();
+    let cycle_id = reconciled.entitlement.cycle_id;
+    sqlx::query(
+        "UPDATE entitlement_cycles SET consumed_micros = 100 WHERE id = $1 AND funded_micros = 100",
+    )
+    .bind(cycle_id.to_string())
+    .execute(&fixture.database.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO entitlement_usage_allocations (id, entitlement_cycle_id, usage_ledger_entry_id, amount_micros, created_at) VALUES ($1, $2, $3, 100, $4)",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(cycle_id.to_string())
+    .bind(fixture.settlement_id.to_string())
+    .bind(now)
+    .execute(&fixture.database.pool)
+    .await
+    .unwrap();
+    LifecycleEntitlement {
+        cycle_id,
+        external_subscription_id,
+        external_cycle_id,
+    }
+}
+
+async fn cancel_entitlement(
+    fixture: &super::AdjustmentFixture,
+    entitlement: &LifecycleEntitlement,
+) {
+    fixture
+        .database
+        .reconcile_entitlement(
+            EntitlementOperation::Cancel(CancelEntitlementInput {
+                tenant_external_id: "adjustments".to_owned(),
+                provider: "lifecycle-test".to_owned(),
+                external_subscription_id: entitlement.external_subscription_id.clone(),
+                external_cycle_id: Some(entitlement.external_cycle_id.clone()),
+                version: 2,
+                source: "lifecycle-test-cancel".to_owned(),
+            }),
+            "lifecycle:cancel",
+        )
+        .await
+        .unwrap();
+}
+
+async fn account_cycle_ledger_snapshot(
+    fixture: &super::AdjustmentFixture,
+    cycle_id: Uuid,
+) -> (i64, i64, i64, i64) {
+    let available: i64 =
+        sqlx::query_scalar("SELECT available_micros FROM credit_accounts WHERE id = $1")
+            .bind(fixture.account_id.to_string())
+            .fetch_one(&fixture.database.pool)
+            .await
+            .unwrap();
+    let (funded, consumed): (i64, i64) = sqlx::query_as(
+        "SELECT funded_micros, consumed_micros FROM entitlement_cycles WHERE id = $1",
+    )
+    .bind(cycle_id.to_string())
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    let ledger_total: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(amount_micros), 0) FROM ledger_entries WHERE account_id = $1",
+    )
+    .bind(fixture.account_id.to_string())
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    (available, funded, consumed, ledger_total)
+}
+
+#[tokio::test]
+async fn rebate_then_cancel_matches_cancel_then_late_rebate() {
+    let before_cancel = fixture().await;
+    let after_cancel = fixture().await;
+    let before_entitlement = establish_consumed_entitlement(&before_cancel, "before").await;
+    let after_entitlement = establish_consumed_entitlement(&after_cancel, "after").await;
+
+    before_cancel
+        .database
+        .reconcile_settlement_adjustment(input(
+            &before_cancel,
+            "memeloop-cloud:usage-discount",
+            20,
+            1,
+            "lifecycle:rebate-before-cancel",
+        ))
+        .await
+        .unwrap();
+    cancel_entitlement(&before_cancel, &before_entitlement).await;
+
+    cancel_entitlement(&after_cancel, &after_entitlement).await;
+    after_cancel
+        .database
+        .reconcile_settlement_adjustment(input(
+            &after_cancel,
+            "memeloop-cloud:usage-discount",
+            20,
+            1,
+            "lifecycle:rebate-after-cancel",
+        ))
+        .await
+        .unwrap();
+
+    let before = account_cycle_ledger_snapshot(&before_cancel, before_entitlement.cycle_id).await;
+    let after = account_cycle_ledger_snapshot(&after_cancel, after_entitlement.cycle_id).await;
+    assert_eq!(before, after);
+    assert_eq!(before, (0, 80, 80, 0));
+}
+
+#[tokio::test]
+async fn active_desired_reduction_after_consumption_reduces_funding_at_rebate_threshold() {
+    let fixture = fixture().await;
+    let entitlement = establish_consumed_entitlement(&fixture, "active-reduction").await;
+    let now = unix_millis();
+    fixture
+        .database
+        .reconcile_entitlement(
+            EntitlementOperation::Reconcile(ReconcileEntitlementInput {
+                tenant_external_id: "adjustments".to_owned(),
+                account_id: fixture.account_id,
+                provider: "lifecycle-test".to_owned(),
+                external_subscription_id: entitlement.external_subscription_id.clone(),
+                external_cycle_id: entitlement.external_cycle_id.clone(),
+                period_start: now - 1,
+                period_end: now + 86_400_000,
+                currency: "USD".to_owned(),
+                desired_micros: 40,
+                version: 2,
+                source: "lifecycle-test-reduce".to_owned(),
+                proration_json: None,
+            }),
+            "lifecycle:reduce-desired",
+        )
+        .await
+        .unwrap();
+    let result = fixture
+        .database
+        .reconcile_settlement_adjustment(input(
+            &fixture,
+            "memeloop-cloud:usage-discount",
+            50,
+            1,
+            "lifecycle:rebate-after-reduce",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(result.applied_delta_micros, 50);
+    assert_eq!(
+        account_cycle_ledger_snapshot(&fixture, entitlement.cycle_id).await,
+        (0, 50, 50, 0)
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT amount_micros FROM settlement_adjustment_entitlement_funding_reductions WHERE event_id = $1 AND entitlement_cycle_id = $2",
+        )
+        .bind(result.event_id.to_string())
+        .bind(entitlement.cycle_id.to_string())
+        .fetch_one(&fixture.database.pool)
+        .await
+        .unwrap(),
+        50,
+    );
+}
+
 #[tokio::test]
 async fn settlement_adjustment_restores_only_entitlement_tail() {
     let fixture = fixture().await;
