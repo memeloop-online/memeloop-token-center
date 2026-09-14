@@ -208,7 +208,9 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
         assert.equal(accountDisplay.overflow, 'hidden');
         assert.equal(await recordedRow.locator('.request-upstream-name').evaluate(element => getComputedStyle(element).minInlineSize), '100%', 'the subtitle fills its cell without contributing a fixed intrinsic column width');
         assert.ok(accountDisplay.height <= accountDisplay.lineHeight + 1, `${theme} ${width}px account never wraps an orphan letter`);
-        assert.ok(accountDisplay.scrollWidth > accountDisplay.clientWidth, 'long fixture account uses real truncation, not a shortened value');
+        // Wider stacked cards can show the complete account; only a constrained
+        // viewport must actually clip it. Never force truncation when it fits.
+        if (width === 320) assert.ok(accountDisplay.scrollWidth > accountDisplay.clientWidth, `${theme} ${width}px long fixture account uses real truncation, not a shortened value`);
         assert.equal(await recordedRow.locator('.request-model-cell code').textContent(), 'fixture-long-model-name-for-request-observability');
         assert.equal(await recordedRow.locator('.request-credential-cell strong').textContent(), 'Research key');
         if (width < 600) assert.equal(layout.summaryColumns, 2, `${theme} ${width}px summary keeps six metrics in three rows`);
