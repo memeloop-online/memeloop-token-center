@@ -15,6 +15,7 @@ test('native OAuth creates with the chosen proxy, preserves direct choice, and r
     { id: 'openai-codex', display_name: 'Codex', flow_kind: 'openai_device', endpoint: 'codex' },
     { id: 'cursor', display_name: 'Cursor', flow_kind: 'cursor_pkce', endpoint: 'cursor' },
     { id: 'github-copilot', display_name: 'Copilot', flow_kind: 'github_device_copilot', endpoint: 'copilot' },
+    { id: 'kimi-oauth', display_name: 'Kimi', flow_kind: 'kimi_device', endpoint: 'kimi' },
   ];
   const screenshotRoot = fileURLToPath(new URL('../e2e-artifacts/upstream-availability', import.meta.url));
   await mkdir(screenshotRoot, { recursive: true });

@@ -350,7 +350,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     <CreateJourney className={editing ? 'provider-edit-workspace' : ''} title={editing ? t('providers.editFor', { name: editing.name }) : rotating ? t('providers.rotateFor', { name: rotating.name }) : reauthorizing ? t('providers.reauthorizeFor', { name: reauthorizing.name }) : t('providers.add')} description={t('providers.description')} open={providerWorkspaceActive} busy={Boolean(busy) || proxyEditorOpen} onOpenChange={(open) => { if (proxyEditorOpen) return; setProviderWorkspaceOpen(open); if (open) setProviderDetail(undefined); if (!open) { setEditing(undefined); setRotating(undefined); setReauthorizing(undefined); } }}>
       {error && <div className="notice error" role="alert">{error}</div>}
       {editing || rotating ? providerEditors : reauthorizing ? <>
-      <AuthorizationConnection key={`reauthorize-${reauthorizing.id}`} token={token} tenant={writeTenant} providers={providers} existing={reauthorizing} onChanged={async () => { setReauthorizing(undefined); setMessage(t('providers.reauthorized', { name: reauthorizing.name })); await onChanged(); }} />
+      <AuthorizationConnection key={`reauthorize-${reauthorizing.id}`} token={token} tenant={writeTenant} providers={providers} existing={reauthorizing} onChanged={async () => { await onChanged(); setReauthorizing(undefined); setMessage(t('providers.reauthorized', { name: reauthorizing.name })); }} />
     </> : <>
       <div className="segmented" role="group" aria-label={t('providers.method')}><button type="button" aria-pressed={method === 'direct'} className={method === 'direct' ? 'active' : ''} onClick={() => setMethod('direct')}>{t('providers.direct')}</button><button type="button" aria-pressed={method === 'authorization'} className={method === 'authorization' ? 'active' : ''} onClick={() => setMethod('authorization')}>{t('providers.oauth')}</button></div>
       {method === 'direct' ? <>
@@ -379,9 +379,24 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
   const needsProxy = !existing && (proxyMode === 'required' || (proxyMode === 'optional' && useProxy));
   const proxyValid = !needsProxy || isPrivateProxyUrl(proxyUrl.trim());
   const [authorizing, setAuthorizing] = useState(false);
+  const [polling, setPolling] = useState(false);
+  const [nextPollAt, setNextPollAt] = useState(0);
+  const [now, setNow] = useState(Date.now);
+  const [listRetry, setListRetry] = useState(false);
+  const scopeVersion = useRef(0);
+  useEffect(() => () => { scopeVersion.current += 1; }, [token, tenant]);
+  const isKimi = selectedProvider?.source === 'builtin' && selectedProvider.id === 'kimi-oauth' && selectedProvider.oauth_adapter?.flow_kind === 'kimi_device';
+  const expired = Boolean(isKimi && session?.expires_at && now >= session.expires_at);
+  const waitSeconds = isKimi ? Math.max(0, Math.ceil((nextPollAt - now) / 1000)) : 0;
+  useEffect(() => {
+    if (!isKimi || !session) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [isKimi, session]);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
-  const reset = () => { setSession(undefined); setManualCode(''); setProxyUrl(''); setUseProxy(false); setMessage(''); setError(''); };
+  const reset = () => { setSession(undefined); setManualCode(''); setProxyUrl(''); setUseProxy(false); setMessage(''); setError(''); setNextPollAt(0); setListRetry(false); setAuthorizing(false); setPolling(false); };
   useEffect(() => { reset(); }, [token, tenant]);
   const start = async (providerConfig?: unknown) => {
     if (!tenant || !selectedProvider || !name.trim() || authorizing || session || !proxyValid) return;
@@ -390,39 +405,63 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
       if (existing && (existing.has_proxy === false || (existing.has_proxy === true && existing.proxy_scheme !== 'socks5h'))) { setError(t('connection.reauthorizationProxy')); return; }
     }
     setAuthorizing(true);
+    const attempt = scopeVersion.current;
+    const begin = async (response: Promise<NonNullable<typeof session>>) => {
+      const result = await response;
+      if (scopeVersion.current === attempt) {
+        setNow(Date.now());
+        if (isKimi) setNextPollAt(Date.now() + (result.poll_after_seconds ?? 0) * 1000);
+        setSession(result);
+      }
+    };
     try {
       const target = existing ? { upstream_account_id: existing.id } : {};
       const proxy = needsProxy ? { proxy_url: proxyUrl.trim() } : {};
       const flow = selectedProvider.oauth_adapter?.flow_kind;
       if (flow === 'openai_device') {
-        setSession(await api('/internal/v1/oauth/codex/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, ...(!existing ? { proxy_url: proxyUrl.trim() } : {}), ...target }) }));
-        setProxyUrl('');
+        await begin(api('/internal/v1/oauth/codex/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, ...(!existing ? { proxy_url: proxyUrl.trim() } : {}), ...target }) }));
       } else if (flow === 'claude_manual_pkce') {
-        setSession(await api('/internal/v1/oauth/claude/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, ...target }) }));
+        await begin(api('/internal/v1/oauth/claude/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, ...target }) }));
       } else if (flow === 'github_device_copilot') {
-        setSession(await api('/internal/v1/oauth/copilot/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, ...proxy, ...target }) }));
+        await begin(api('/internal/v1/oauth/copilot/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, ...proxy, ...target }) }));
+      } else if (isKimi) {
+        await begin(api('/internal/v1/oauth/kimi/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, ...proxy, ...target }) }));
       } else if (flow === 'cursor_pkce' && selectedProvider.source === 'builtin') {
-        setSession(await api('/internal/v1/oauth/cursor/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, provider_driver: selectedProvider.id, provider_config: existing?.config ?? { base_url: 'https://api2.cursor.sh', network_scope: 'public' }, ...proxy, ...target }) }));
+        await begin(api('/internal/v1/oauth/cursor/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, provider_driver: selectedProvider.id, provider_config: existing?.config ?? { base_url: 'https://api2.cursor.sh', network_scope: 'public' }, ...proxy, ...target }) }));
       } else {
-        setSession(await api('/internal/v1/oauth/provider-adapter/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, provider_driver: selectedProvider.id, provider_config: existing?.config ?? providerConfig, ...target }) }));
+        await begin(api('/internal/v1/oauth/provider-adapter/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, provider_driver: selectedProvider.id, provider_config: existing?.config ?? providerConfig, ...target }) }));
       }
+      if (scopeVersion.current !== attempt) return;
       setProxyUrl(''); setMessage(''); setError('');
-    } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
-    finally { setAuthorizing(false); }
+    } catch (reason) { if (scopeVersion.current === attempt) setError(messageOf(reason, t('common.requestFailed'))); }
+    finally { if (scopeVersion.current === attempt) setAuthorizing(false); }
+  };
+  const reloadList = async () => {
+    const attempt = scopeVersion.current;
+    try { await onChanged(); if (scopeVersion.current === attempt) { setListRetry(false); setError(''); } }
+    catch { if (scopeVersion.current === attempt) { setListRetry(true); setError(locale.startsWith('zh') ? '账号已保存，但列表暂时无法读取。请重试读取，无需重新登录。' : 'The account is saved, but the list could not be loaded. Retry loading; no new login is needed.'); } }
   };
   const poll = async () => {
-    if (!session) return;
+    if (!session || polling || expired || (isKimi && Date.now() < nextPollAt)) return;
     if (!selectedProvider) return;
     const flow = selectedProvider.oauth_adapter?.flow_kind;
     const path = flow === 'openai_device' ? '/internal/v1/oauth/codex/poll'
       : flow === 'github_device_copilot' ? '/internal/v1/oauth/copilot/poll'
+      : isKimi ? '/internal/v1/oauth/kimi/poll'
       : flow === 'cursor_pkce' && selectedProvider.source === 'builtin' ? '/internal/v1/oauth/cursor/poll'
       : '/internal/v1/oauth/provider-adapter/poll';
+    setPolling(true); setError('');
+    const attempt = scopeVersion.current;
     try {
-      const result = await api<UpstreamAccount | { status: string; message?: string }>(path, token, { method: 'POST', body: JSON.stringify({ session_token: session.session_token }) });
-      if ('id' in result) { setMessage(t(existing ? 'providers.reauthorized' : 'providers.ready', existing ? { name: result.name } : { id: result.id })); setSession(undefined); await onChanged(); }
-      else setMessage(result.message ?? t('providers.waiting'));
-    } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
+      const result = await api<UpstreamAccount | { status: string; message?: string; retry_after_seconds?: number }>(path, token, { method: 'POST', body: JSON.stringify({ session_token: session.session_token }) });
+      if (scopeVersion.current !== attempt) return;
+      if ('id' in result) { setMessage(t(existing ? 'providers.reauthorized' : 'providers.ready', existing ? { name: result.name } : { id: result.id })); setSession(undefined); await reloadList(); }
+      else {
+        if (isKimi) { setNextPollAt(Date.now() + (result.retry_after_seconds ?? session.poll_after_seconds ?? 5) * 1000); setNow(Date.now()); }
+        setMessage(result.message ?? t('providers.waiting'));
+      }
+    } catch (reason) { if (scopeVersion.current === attempt) setError(messageOf(reason, t('common.requestFailed'))); }
+    finally { if (scopeVersion.current === attempt) setPolling(false); }
   };
   const complete = async () => {
     if (!session || selectedProvider?.oauth_adapter?.flow_kind !== 'claude_manual_pkce') return;
@@ -447,11 +486,22 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
       {!existing && proxyMode === 'optional' && !useProxy && <p className="field-hint">{t('connection.directEgress')}</p>}
       {proxyMode === 'required' && <><p><b>{t('connection.baseUrl')}</b> · {t('connection.fixed')}</p><code>https://chatgpt.com/backend-api/codex</code></>}
     </section>}
-    {selectedProvider && selectedProvider.source !== 'builtin' && !session ? <Form key={`${selectedProvider.id}-${locale}`} schema={localizeSchema(selectedProvider.config_schema as RJSFSchema, locale)} formData={existing?.config} readonly={Boolean(existing)} validator={validator} templates={schemaFormTemplates} widgets={fluentFormWidgets} onSubmit={({ formData }) => void start(formData)}><button type="submit" disabled={!tenant || authorizing || !proxyValid}>{t('common.startLogin')}</button></Form> : <div className="button-row"><button type="button" onClick={() => void start()} disabled={!tenant || !name.trim() || authorizing || Boolean(session) || !proxyValid}>{t(authorizing ? 'common.loading' : 'common.startLogin')}</button>{session && <><a className="button secondary" href={session.verification_url ?? session.login_url} target="_blank" rel="noreferrer">{t('common.openAuthorization')}</a>{selectedProvider?.oauth_adapter?.flow_kind !== 'claude_manual_pkce' && <button type="button" onClick={() => void poll()}>{t('common.checkAuthorization')}</button>}</>}</div>}
+    {selectedProvider && selectedProvider.source !== 'builtin' && !session ? <Form key={`${selectedProvider.id}-${locale}`} schema={localizeSchema(selectedProvider.config_schema as RJSFSchema, locale)} formData={existing?.config} readonly={Boolean(existing)} validator={validator} templates={schemaFormTemplates} widgets={fluentFormWidgets} onSubmit={({ formData }) => void start(formData)}><button type="submit" disabled={!tenant || authorizing || !proxyValid}>{t('common.startLogin')}</button></Form> : <div className="button-row">
+      <button type="button" onClick={() => void start()} disabled={!tenant || !name.trim() || authorizing || Boolean(session) || listRetry || !proxyValid}>{t(authorizing ? 'common.loading' : 'common.startLogin')}</button>
+      {session && !expired && <>
+        <a className="button secondary" href={session.verification_url ?? session.login_url} target="_blank" rel="noreferrer">{t('common.openAuthorization')}</a>
+        {selectedProvider?.oauth_adapter?.flow_kind !== 'claude_manual_pkce' && <button type="button" disabled={polling || waitSeconds > 0} onClick={() => void poll()}>{polling ? t('common.loading') : waitSeconds > 0 ? (locale.startsWith('zh') ? `${waitSeconds} 秒后可检查` : `Check in ${waitSeconds}s`) : t('common.checkAuthorization')}</button>}
+      </>}
+      {expired && <button type="button" disabled={polling} onClick={reset}>{locale.startsWith('zh') ? '返回登录设置' : 'Back to login setup'}</button>}
+      {listRetry && <button type="button" onClick={() => void reloadList()}>{locale.startsWith('zh') ? '重新读取账号列表' : 'Reload account list'}</button>}
+    </div>}
     {session && selectedProvider?.oauth_adapter?.flow_kind === 'claude_manual_pkce' && <div className="manual-authorization"><label>{t('providers.manualCode')}<input value={manualCode} onChange={(event) => setManualCode(event.target.value)} placeholder={t('providers.manualCodeHint')} /></label><button type="button" disabled={!manualCode.includes('#')} onClick={() => void complete()}>{t('providers.completeAuthorization')}</button></div>}
     {existing && selectedProvider?.oauth_adapter?.flow_kind === 'openai_device' && !session && <p>{t('connection.reauthorizationProxy')}</p>}
-    {session?.user_code && <div className="device-authorization" role="status"><p>{t('providers.codexSecurity')}</p><b>{t('providers.deviceCode')}</b><code>{session.user_code}</code></div>}
-    {message && <div className="notice success" role="status">{message}</div>}
+    {session?.user_code && !expired && <div className="device-authorization" role="status"><p>{selectedProvider?.oauth_adapter?.flow_kind === 'openai_device' ? t('providers.codexSecurity') : locale.startsWith('zh') ? `仅当这次登录由你刚刚发起时，才在 ${selectedProvider?.display_name} 页面确认。请勿把验证码提供给任何人。` : `Confirm on ${selectedProvider?.display_name} only if you just started this login. Never share this code.`}</p><b>{t('providers.deviceCode')}</b><code>{session.user_code}</code></div>}
+    {isKimi && session && <p role="status">{expired
+      ? (locale.startsWith('zh') ? '本次登录已过期。请返回登录设置后重新开始。' : 'This login expired. Return to login setup to start again.')
+      : (locale.startsWith('zh') ? `请在 Kimi 页面完成确认，再检查授权结果。有效期至 ${new Date(session.expires_at ?? now).toLocaleTimeString(locale)}。` : `Confirm on Kimi, then check authorization. Valid until ${new Date(session.expires_at ?? now).toLocaleTimeString(locale)}.`)}</p>}
+    {message && !expired && <div className={session ? 'notice' : 'notice success'} role="status">{message}</div>}
     </>}
     </>}
   </div>;
