@@ -107,13 +107,16 @@ test('Overview keeps current sections visible through independent endpoint failu
       '/internal/v1/usage-analysis/trends': 1,
     }, 'beta renders its trends from one projection request and never calls the complete analysis endpoint configured to return 500');
 
-    const trendData = page.locator('.overview-trend-data');
-    assert.equal(await trendData.getAttribute('open'), null, 'the exact UTC table starts collapsed');
-    await trendData.locator('summary').click();
+    const firstChart = page.locator('.overview-trend-card').first();
+    const trendData = firstChart.locator('.overview-trend-data');
+    assert.equal(await trendData.isVisible(), false, 'the chart is the initial view');
+    assert.equal(await page.locator('.overview-trends details, .overview-trends summary').count(), 0);
+    await firstChart.getByRole('tab', { name: 'Data', exact: true }).click();
     await trendData.locator('tbody tr').nth(2).waitFor();
     assert.match(await trendData.locator('thead').textContent() ?? '', /UTC/);
     assert.equal(await trendData.getByRole('columnheader', { name: 'Total cost', exact: true }).count(), 1);
-    assert.equal(await trendData.locator('tbody tr').count(), 3, 'the expanded table exposes the exact returned points, not derived rows');
+    assert.equal(await trendData.locator('tbody tr').count(), 3, 'the data view exposes the exact returned points, not derived rows');
+    assert.deepEqual(await endpointCounts(page, 'tenant-beta'), { '/internal/v1/monitoring-snapshot': 1, '/internal/v1/requests': 1, '/internal/v1/usage-analysis/trends': 1 }, 'view switching does not re-fetch data');
     await trendData.locator('tbody button').nth(1).click();
     assert.deepEqual(await page.evaluate(() => window.overviewFixture.drilldowns.at(-1)), {
       logical_operator: 'and',

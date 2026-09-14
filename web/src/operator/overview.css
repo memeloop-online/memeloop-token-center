@@ -34,11 +34,6 @@
   color: var(--muted);
 }
 
-.overview-trend-data summary {
-  cursor: pointer;
-  padding: 8px;
-}
-
 .overview-trend-data td {
   white-space: nowrap;
   font-variant-numeric: tabular-nums lining-nums;

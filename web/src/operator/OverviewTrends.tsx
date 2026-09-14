@@ -1,3 +1,4 @@
+import { ChartDataView } from '../charts/ChartDataView';
 import { displayTimeZone, bucketTimeZoneNote } from '../charts/displayTimeZone';
 import { lazy, Suspense, useMemo } from 'react';
 import { api } from '../api';
@@ -62,6 +63,16 @@ export function OverviewTrends({ state, onDrilldown }: { state: ResourceState<Op
     if (ast) onDrilldown(ast);
   };
 
+  const table = stats && <div className="overview-trend-data" aria-label={t('usage.trendData')}>
+        <div className="table-scroll"><table>
+          <thead><tr><th>{t('request.time')} · {displayTimeZone()}</th><th>{copy.success}</th><th>{copy.failures}</th><th>{copy.averageLatency}</th><th>{copy.p95Latency}</th><th>{copy.cost}</th></tr></thead>
+          <tbody>{stats.time_series.map((point) => <tr key={point.bucket_start}>
+            <td>{onDrilldown ? <button type="button" className="table-link overview-trend-bucket" onClick={() => drillDown(point.bucket_start)}>{format.bucket(point.bucket_start)}</button> : format.bucket(point.bucket_start)}</td><td>{format.number(point.success)}</td><td>{format.number(point.failed)}</td>
+            <td title={analyticsDuration(point.avg_duration_ms, locale).title}>{analyticsDuration(point.avg_duration_ms, locale).text}</td><td title={histogramP95(point.p95_duration_ms, point.p95_is_capped, locale).title}>{histogramP95(point.p95_duration_ms, point.p95_is_capped, locale).text}</td><td><CostLines costs={point.costs} locale={locale} /></td>
+          </tr>)}</tbody>
+        </table></div>
+      </div>;
+
   return <section className="overview-trends" aria-label={t('usage.trend')}>
     {state.kind === 'failed' && <div className="notice error" role="alert">{state.message}</div>}
     {state.kind === 'ready' && state.refreshError && <div className="notice error" role="alert">{state.refreshError}</div>}
@@ -71,7 +82,7 @@ export function OverviewTrends({ state, onDrilldown }: { state: ResourceState<Op
       <p className="analytics-p95-note">{locale === 'zh-CN' ? 'P95为直方图区间上界；超出最高档或旧版无法确定的值不绘制为精确延迟。' : 'P95 uses histogram upper bounds. Overflow and ambiguous legacy values leave gaps instead of exact latency points.'}</p>
       <div className="overview-trend-grid">
         {trendCards.map(({ id, title, option }) => <article className={`panel overview-trend-card${id === 'throughput' ? ' overview-trend-primary' : ''}`} key={id}>
-          <div className="panel-title"><h2>{title}</h2><span>{displayTimeZone()}</span></div>
+          <ChartDataView title={title} metadata={<span>{displayTimeZone()}</span>} data={table}>
           {stats.time_series.length === 0 ? <div className="empty">{t('usage.noData')}</div>
             : <Suspense fallback={<div className="empty">{t('common.loading')}</div>}>
               <EChart ariaLabel={title} locale={locale} option={option} timeZone={displayTimeZone()} onClick={({ dataIndex }) => {
@@ -79,18 +90,10 @@ export function OverviewTrends({ state, onDrilldown }: { state: ResourceState<Op
                 if (point) drillDown(point.bucket_start);
               }} />
             </Suspense>}
+          </ChartDataView>
         </article>)}
       </div>
-      <details className="overview-trend-data">
-        <summary>{t('usage.trendData')}</summary>
-        <div className="table-scroll"><table>
-          <thead><tr><th>{t('request.time')} · {displayTimeZone()}</th><th>{copy.success}</th><th>{copy.failures}</th><th>{copy.averageLatency}</th><th>{copy.p95Latency}</th><th>{copy.cost}</th></tr></thead>
-          <tbody>{stats.time_series.map((point) => <tr key={point.bucket_start}>
-            <td>{onDrilldown ? <button type="button" className="table-link overview-trend-bucket" onClick={() => drillDown(point.bucket_start)}>{format.bucket(point.bucket_start)}</button> : format.bucket(point.bucket_start)}</td><td>{format.number(point.success)}</td><td>{format.number(point.failed)}</td>
-            <td title={analyticsDuration(point.avg_duration_ms, locale).title}>{analyticsDuration(point.avg_duration_ms, locale).text}</td><td title={histogramP95(point.p95_duration_ms, point.p95_is_capped, locale).title}>{histogramP95(point.p95_duration_ms, point.p95_is_capped, locale).text}</td><td><CostLines costs={point.costs} locale={locale} /></td>
-          </tr>)}</tbody>
-        </table></div>
-      </details>
+
     </>}
   </section>;
 }

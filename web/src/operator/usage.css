@@ -12,18 +12,15 @@
 .usage-chart-card { min-width: 0; overflow: hidden; }
 .usage-echart { height: 330px; min-width: 0; width: 100%; }
 .usage-echart-heatmap { height: 430px; min-width: 0; width: 100%; }
-.usage-chart-table { border-top: 1px solid #20343a; color: #82979e; font-size: 11px; margin-top: 6px; padding-top: 10px; }
-.usage-chart-table summary { cursor: pointer; width: max-content; }
-.usage-chart-table[open] summary { margin-bottom: 10px; }
+.usage-chart-table { color: var(--colorNeutralForeground1); font-size: 12px; }
 .usage-chart-table td, .usage-chart-table th { font-variant-numeric: tabular-nums; }
 .usage-dimension-picker { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
 .usage-dimension-picker button { font-size: 11px; padding: 7px 11px; }
 .usage-dimension-picker button.active { background: #173b37; border-color: #397f74; color: #8ce8d9; }
 .usage-heatmap-panel { min-width: 0; overflow: hidden; }
-.usage-heatmap-title { align-items: flex-end; gap: 16px; }
-.usage-heatmap-title > div { display: flex; flex-wrap: wrap; gap: 8px; }
-.usage-heatmap-title label { color: #82979e; font-size: 10px; min-width: 140px; }
-.usage-heatmap-title select { margin-top: 4px; }
+.usage-heatmap-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.usage-heatmap-controls label { color: var(--colorNeutralForeground2); font-size: 12px; min-width: 140px; }
+.usage-heatmap-controls select { margin-top: 4px; }
 .usage-heatmap-selection { background: #102521; border-left: 3px solid #64d8c4; color: #a9d8cf; font-size: 12px; margin-top: 8px; padding: 9px 11px; }
 .usage-heatmap-table { margin-top: 12px; }
 .usage-heatmap-table th[scope='row'] { font-weight: 500; white-space: nowrap; }
