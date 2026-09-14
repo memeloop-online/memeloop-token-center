@@ -251,6 +251,25 @@ impl Database {
         Ok(())
     }
 
+    /// Replace encrypted flow state only while the same poll lease still owns it.
+    /// Standard code exchange uses this for its durable no-replay send boundary.
+    pub async fn replace_oauth_login_poll_state(
+        &self,
+        session_id: Uuid,
+        lease_owner: Uuid,
+        state_ciphertext: String,
+    ) -> Result<(), AppError> {
+        if state_ciphertext.is_empty() || state_ciphertext.len() > 256 * 1024 {
+            return Err(AppError::BadRequest("OAuth state exceeds bounds".into()));
+        }
+        let changed = sqlx::query("UPDATE oauth_login_sessions SET state_ciphertext = $1 WHERE id = $2 AND status = 'polling' AND lease_owner = $3")
+            .bind(state_ciphertext).bind(session_id.to_string()).bind(lease_owner.to_string()).execute(&self.pool).await?;
+        if changed.rows_affected() != 1 {
+            return Err(AppError::Conflict("OAuth login poll lease changed".into()));
+        }
+        Ok(())
+    }
+
     pub async fn fail_oauth_login_poll(
         &self,
         session_id: Uuid,

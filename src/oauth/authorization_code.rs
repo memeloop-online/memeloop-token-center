@@ -93,6 +93,8 @@ struct Session {
 
 #[derive(Serialize, Deserialize)]
 struct LoginState {
+    #[serde(default)]
+    exchange_started: bool,
     input: StartInput,
     state: String,
     verifier: String,
@@ -229,6 +231,7 @@ pub async fn start(
         operator_service_id: session.operator_service_id,
         state_ciphertext: seal_private_json(
             &LoginState {
+                exchange_started: false,
                 input,
                 state,
                 verifier,
@@ -305,10 +308,17 @@ pub async fn complete(
             state_ciphertext,
         } => (lease_owner, state_ciphertext),
     };
-    let login: LoginState = open_private_json(&ciphertext, key, STATE_AAD)?;
+    let mut login: LoginState = open_private_json(&ciphertext, key, STATE_AAD)?;
     if login.input.application_plugin_revision != session.application_plugin_revision {
         return Err(AppError::Conflict(
             "OAuth application revision binding changed".into(),
+        ));
+    }
+    if login.exchange_started {
+        db.fail_oauth_login_poll(session.session_id, lease_owner, now)
+            .await?;
+        return Err(AppError::Conflict(
+            "OAuth code exchange outcome is unknown; start a new login".into(),
         ));
     }
     let code = match callback_code(callback_url, &login.input.client.redirect_uri, &login.state) {
@@ -326,6 +336,16 @@ pub async fn complete(
         ("code_verifier", login.verifier.clone()),
     ];
     add_client(&mut form, &login.input.client);
+    // A reclaimed lease may not replay an authorization code after a crash.
+    // This one-way marker is encrypted with the existing session state and
+    // becomes durable before any token request can be dispatched.
+    login.exchange_started = true;
+    db.replace_oauth_login_poll_state(
+        session.session_id,
+        lease_owner,
+        seal_private_json(&login, key, STATE_AAD)?,
+    )
+    .await?;
     let tokens = token_request(
         http,
         &login.input.adapter.poll_url,
