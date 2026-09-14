@@ -1,6 +1,8 @@
 //! Bounded encrypted spool. Mutations and GC serialize budget-first; uploads
 //! read bounded snapshot batches. No transaction encompasses object-storage I/O.
 use crate::response_archive_spool::BufferedArchivePurpose;
+mod hold_diagnostics;
+pub(crate) use hold_diagnostics::BudgetHold;
 
 use std::time::{Duration, Instant};
 
@@ -60,11 +62,14 @@ impl Database {
         purpose: BufferedArchivePurpose,
         chunks: &[ArchiveSpoolChunk],
     ) -> Result<bool, AppError> {
-        let (mut tx, now) = self.spool_transaction().await?;
+        let (mut tx, now, mut hold) = self
+            .tracked_spool_transaction("buffered_capture", Some(identity.request_id))
+            .await?;
+        hold.phase("capture");
         let captured = self
             .capture_buffered_archive_spool_in_transaction(&mut tx, now, identity, purpose, chunks)
             .await?;
-        tx.commit().await?;
+        hold.commit(tx).await?;
         Ok(captured)
     }
 
@@ -326,7 +331,10 @@ impl Database {
         identity: ArchiveSpoolIdentity,
     ) -> Result<bool, AppError> {
         let purpose = BufferedArchivePurpose::Response;
-        let (mut tx, now) = self.spool_transaction().await?;
+        let (mut tx, now, mut hold) = self
+            .tracked_spool_transaction("response_begin", Some(identity.request_id))
+            .await?;
+        hold.phase("request_and_spool_owner");
         // The response writer is owned independently from the proxy lifecycle.
         // A short stream may therefore finalize its request before the writer's
         // begin transaction acquires the global spool budget. The canonical gap
@@ -370,7 +378,7 @@ impl Database {
             .bind(identity.reservation_id.to_string()).bind(now).bind(now + CAPTURE_TTL)
             .bind(SPOOL_OVERHEAD)
             .execute(&mut *tx).await?;
-        tx.commit().await?;
+        hold.commit(tx).await?;
         Ok(true)
     }
 
@@ -390,7 +398,10 @@ impl Database {
         {
             return Ok(spool_write_rejected(identity, "append", "invalid_chunk"));
         }
-        let (mut tx, now) = self.spool_transaction().await?;
+        let (mut tx, now, mut hold) = self
+            .tracked_spool_transaction("response_append", Some(identity.request_id))
+            .await?;
+        hold.phase("spool_owner_and_append");
         let Some(row) = locked_spool_row(&mut tx, self.backend, identity, purpose).await? else {
             return Ok(spool_write_rejected(
                 identity,
@@ -445,7 +456,7 @@ impl Database {
             .bind(identity.request_id.to_string()).bind(seq).bind(ciphertext).bind(byte_count).execute(&mut *tx).await?;
         sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET chunk_count = chunk_count + 1, byte_count = byte_count + $1, cipher_bytes = cipher_bytes + $2, updated_at = $3, expires_at = $4 WHERE request_id = $5")))
             .bind(byte_count).bind(cipher_bytes).bind(now).bind(now + CAPTURE_TTL).bind(identity.request_id.to_string()).execute(&mut *tx).await?;
-        tx.commit().await?;
+        hold.commit(tx).await?;
         Ok(true)
     }
 
@@ -845,7 +856,8 @@ impl Database {
         // Use the producer lock order and the connection's bounded lock
         // timeout. PostgreSQL's lock queue prevents sustained admissions from
         // starving GC; each transaction still deletes at most 64 chunks/1 MiB.
-        let (mut tx, _) = self.spool_transaction().await?;
+        let (mut tx, _, mut hold) = self.tracked_spool_transaction("cleanup", None).await?;
+        hold.phase("gc_select_and_delete");
         let row = match self.backend {
             DatabaseBackend::PostgreSql => {
                 // Each indexed class contributes its oldest unlocked row, and
@@ -984,33 +996,61 @@ impl Database {
             )
             .await?;
         }
-        tx.commit().await?;
+        hold.commit(tx).await?;
         Ok(Some(cleaned))
     }
 
+    #[cfg(test)]
     pub(super) async fn spool_transaction(&self) -> Result<(Transaction<'_, Any>, i64), AppError> {
+        let (tx, now, _hold) = self.tracked_spool_transaction("test_capture", None).await?;
+        Ok((tx, now))
+    }
+
+    pub(super) async fn tracked_spool_transaction(
+        &self,
+        operation: &'static str,
+        request_id: Option<Uuid>,
+    ) -> Result<(Transaction<'_, Any>, i64, BudgetHold), AppError> {
         let pool_started = Instant::now();
-        let mut tx = self.begin_write_transaction().await?;
+        let mut tx = self.begin_write_transaction().await.map_err(|error| {
+            tracing::warn!(phase = "archive_budget_acquire", operation,
+                request_id = ?request_id, outcome = "transaction_acquire_failed",
+                pool_wait_ms = pool_started.elapsed().as_millis() as u64,
+                "archive transaction acquisition failed before budget ownership");
+            error
+        })?;
         let pool_wait_ms = pool_started.elapsed().as_millis() as u64;
         // First for every accounting mutation, including GC. State-only
         // transactions may lock a spool row but never wait for this row, so no
         // transaction can hold a spool row while requesting the reverse order.
         let lock = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1 FOR UPDATE"
+                "SELECT cipher_bytes, CAST(pg_backend_pid() AS BIGINT) AS backend_pid FROM response_archive_spool_budget WHERE singleton = 1 FOR UPDATE"
             }
             DatabaseBackend::Sqlite => {
-                "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1"
+                "SELECT cipher_bytes, CAST(NULL AS BIGINT) AS backend_pid FROM response_archive_spool_budget WHERE singleton = 1"
             }
         };
         let lock_started = Instant::now();
-        let _: i64 = sqlx::query_scalar(lock).fetch_one(&mut *tx).await?;
+        let row = sqlx::query(lock)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| {
+                tracing::warn!(phase = "archive_budget_acquire", operation,
+                request_id = ?request_id, outcome = "budget_lock_failed", pool_wait_ms,
+                budget_wait_ms = lock_started.elapsed().as_millis() as u64,
+                "archive budget acquisition failed without confirmed ownership");
+                error
+            })?;
+        let backend_pid: Option<i64> = row.try_get("backend_pid")?;
+        let mut hold = BudgetHold::new(operation, request_id, backend_pid);
         let budget_wait_ms = lock_started.elapsed().as_millis() as u64;
         // Per-append successes stay DEBUG. Slow acquisitions are independently
         // visible without logging query values or adding per-chunk INFO I/O.
         if pool_wait_ms >= 250 || budget_wait_ms >= 250 {
             tracing::warn!(
                 phase = "archive_budget_acquire",
+                operation, request_id = ?request_id, backend_pid = ?backend_pid,
                 pool_wait_ms,
                 budget_wait_ms,
                 "slow archive budget acquisition"
@@ -1024,7 +1064,8 @@ impl Database {
             );
         }
         let now = archive_clock(&mut tx, self.backend).await?;
-        Ok((tx, now))
+        hold.phase("owned_work");
+        Ok((tx, now, hold))
     }
 
     /// State and lease transitions do not change global archive accounting.
