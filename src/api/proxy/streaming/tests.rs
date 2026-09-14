@@ -1,6 +1,42 @@
 use super::*;
 
 #[tokio::test]
+async fn ready_upstream_evidence_wins_once_when_downstream_is_already_closed() {
+    let (body_sender, body_receiver) = tokio::sync::mpsc::channel(1);
+    drop(body_receiver);
+
+    match poll_upstream_or_downstream_closed(&body_sender, std::future::ready("terminal")).await {
+        DownstreamAwarePoll::Upstream {
+            value,
+            downstream_closed,
+        } => {
+            assert_eq!(value, "terminal");
+            assert!(
+                downstream_closed,
+                "the caller must stop after preserving the one ready item"
+            );
+        }
+        DownstreamAwarePoll::DownstreamClosed => {
+            panic!("an already-ready terminal item must win the cancellation race")
+        }
+    }
+}
+
+#[tokio::test]
+async fn downstream_close_interrupts_a_pending_upstream_poll() {
+    let (body_sender, body_receiver) = tokio::sync::mpsc::channel(1);
+    drop(body_receiver);
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(100),
+        poll_upstream_or_downstream_closed(&body_sender, std::future::pending::<()>()),
+    )
+    .await
+    .expect("receiver closure must wake the blocked poll without a wall-clock wait");
+    assert!(matches!(result, DownstreamAwarePoll::DownstreamClosed));
+}
+
+#[tokio::test]
 async fn archive_eof_owner_keeps_the_body_open_until_settlement_handoff_finishes() {
     let (body_sender, body_receiver) = tokio::sync::mpsc::channel(1);
     let (settlement_sender, settlement_receiver) = tokio::sync::oneshot::channel();

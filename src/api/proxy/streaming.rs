@@ -11,6 +11,30 @@ use delivery::{CapturedSseDelivery, capture_sse_delivery, downstream_stream_fail
 use lifecycle::{StreamingFinalizationInput, finalize_streaming_lifecycle};
 use terminal_delivery::{ResponsesTerminalDelivery, TerminalEof};
 
+enum DownstreamAwarePoll<T> {
+    Upstream { value: T, downstream_closed: bool },
+    DownstreamClosed,
+}
+
+async fn poll_upstream_or_downstream_closed<T>(
+    body_sender: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    upstream: impl std::future::Future<Output = T>,
+) -> DownstreamAwarePoll<T> {
+    tokio::select! {
+        // If both sides became ready before this poll, retain one already
+        // available upstream item. It may contain the authoritative completed
+        // usage needed for settlement. The caller observes `is_closed` and
+        // stops after that single item, so a continuously ready upstream can
+        // never turn cancellation into an unbounded drain.
+        biased;
+        value = upstream => DownstreamAwarePoll::Upstream {
+            value,
+            downstream_closed: body_sender.is_closed(),
+        },
+        _ = body_sender.closed() => DownstreamAwarePoll::DownstreamClosed,
+    }
+}
+
 pub(super) struct StreamingResponse<'a> {
     pub(super) state: &'a AppState,
     pub(super) upstream: UpstreamResponse,
@@ -159,14 +183,31 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 .memory_usage(crate::metrics::MemoryComponent::StreamCapture, 0);
             loop {
                 let mut flushing_terminal = false;
+                let mut downstream_closed_after_poll = false;
                 let next = if let Some(chunk) = terminal_delivery.take_pending() {
                     flushing_terminal = true;
                     Some(Ok(chunk))
                 } else if !terminal_delivery.upstream_poll_allowed() {
                     break;
                 } else {
-                    match tokio::time::timeout_at(stream_deadline, upstream_stream.next()).await {
-                        Ok(next) => next,
+                    match tokio::time::timeout_at(
+                        stream_deadline,
+                        poll_upstream_or_downstream_closed(&body_sender, upstream_stream.next()),
+                    )
+                    .await
+                    {
+                        Ok(DownstreamAwarePoll::Upstream {
+                            value: next,
+                            downstream_closed,
+                        }) => {
+                            downstream_closed_after_poll = downstream_closed;
+                            next
+                        }
+                        Ok(DownstreamAwarePoll::DownstreamClosed) => {
+                            transport_error = Some("downstream_disconnected");
+                            drop(archive_sender.take());
+                            break;
+                        }
                         Err(_) => {
                             transport_error = Some("upstream_timeout");
                             drop(archive_sender.take());
@@ -185,6 +226,11 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                     }
                 };
                 let Some(next) = next else {
+                    if downstream_closed_after_poll {
+                        transport_error = Some("downstream_disconnected");
+                        drop(archive_sender.take());
+                        break;
+                    }
                     match terminal_delivery.finish_at_eof(responses_streaming_sanitizer.as_mut()) {
                         TerminalEof::Flush => continue,
                         TerminalEof::Complete => break,
@@ -287,6 +333,11 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         // SSE event. Empty partial output must not occupy the
                         // bounded archive channel or cancel a healthy archive.
                         if chunk.is_empty() {
+                            if downstream_closed_after_poll {
+                                transport_error = Some("downstream_disconnected");
+                                drop(archive_sender.take());
+                                break;
+                            }
                             continue;
                         }
                         if capture_json_usage {
@@ -390,6 +441,11 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 )
                                 .await;
                             }
+                            break;
+                        }
+                        if downstream_closed_after_poll {
+                            transport_error = Some("downstream_disconnected");
+                            drop(archive_sender.take());
                             break;
                         }
                         if strict_chat_terminal_ready {
