@@ -926,7 +926,7 @@ mod tests {
         let (directory, state, _, _) = fixture().await;
         let authority = state.application_plugins.as_ref().unwrap();
         let policy_path = directory.path().join("policy.json");
-        let mut value: Value =
+        let mut value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&policy_path).unwrap()).unwrap();
         let public_key_digest = trust_digest(&authority.install_policy().await.unwrap())
             .await

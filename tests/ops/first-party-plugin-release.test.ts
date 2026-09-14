@@ -6,9 +6,21 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { installerEnvironment } from '../../ops/ci/resolve-first-party-plugin-installer.ts';
+import { checkedCommandOutput } from '../../ops/ci/first-party-plugin-command-output.ts';
 
 const root = new URL('../../', import.meta.url).pathname;
 const hash = (bytes: Buffer) => `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+
+test('typed command-output helper accepts only the reviewed version and an exact digest', () => {
+  assert.equal(checkedCommandOutput('cosign-version', { gitVersion: 'v3.1.3-mtc.3' }), '');
+  assert.throws(() => checkedCommandOutput('cosign-version', { gitVersion: 'v3.1.3' }));
+  const digest = `sha256:${'a'.repeat(64)}`;
+  assert.equal(checkedCommandOutput('oras-push', { digest }), digest);
+  for (const value of [null, [], {}, { digest: 'latest' }, { digest: `${digest}\nBAD=value` }]) {
+    assert.throws(() => checkedCommandOutput('oras-push', value));
+  }
+  assert.throws(() => checkedCommandOutput('unknown', { digest }));
+});
 
 test('installer executable selection is master-reviewed, unavailable by default and not dispatch-controlled', () => {
   const trust = JSON.parse(readFileSync(join(root, '.github/first-party-plugin-installer-trust.json'), 'utf8'));
