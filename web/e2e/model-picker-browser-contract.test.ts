@@ -29,6 +29,25 @@ test('filters are non-modal themed popovers and model selection is searchable by
     const editableOption = page.getByRole('option', { name: 'Editable model option', exact: true });
     await editableOption.waitFor({ state: 'visible' });
     assert.equal(await editableModel.getAttribute('aria-expanded'), 'true', 'the first pointer click must not open on focus and immediately light-dismiss its own popup');
+    for (const width of [390, 1440]) {
+      await page.setViewportSize({ width, height: 900 });
+      await editableModel.fill('Editable');
+      for (let click = 0; click < 2; click++) {
+        await editableModel.click();
+        await editableOption.waitFor({ state: 'visible' });
+        assert.equal(await page.locator('.shared-model-popover:popover-open').count(), 1, 'clicking the same editable anchor reopens one native panel');
+        assert.equal(await editableModel.getAttribute('aria-expanded'), 'true');
+      }
+      await page.locator('[data-outside]').click();
+      await editableOption.waitFor({ state: 'hidden' });
+      await editableModel.click();
+      await editableOption.waitFor({ state: 'visible' });
+      await editableModel.press('Escape');
+      await editableOption.waitFor({ state: 'hidden' });
+      await editableModel.press('ArrowDown');
+      await editableOption.waitFor({ state: 'visible' });
+      assert.equal(await page.locator('.shared-model-popover:popover-open').count(), 1, 'keyboard reopening must not leave a second panel behind');
+    }
     await editableModel.press('Escape');
     await editableOption.waitFor({ state: 'hidden' });
     assert.equal(await editableModel.evaluate(element => document.activeElement === element), true);
