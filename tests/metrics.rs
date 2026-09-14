@@ -161,6 +161,8 @@ async fn health_version_and_metrics_contract_is_operational() {
     assert!(metrics.contains("process_resident_memory_bytes"));
     assert!(metrics.contains("process_cpu_seconds_total"));
     assert!(metrics.contains("memeloop_token_center_allocator_bytes{state=\"allocated\"}"));
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    assert!(metrics.contains("memeloop_token_center_native_allocator_bytes{state=\"allocated\"}"));
     assert!(!metrics.contains("private-user-value"));
     assert!(!metrics.contains("credential-123"));
     assert!(!metrics.contains("test-service-token"));
