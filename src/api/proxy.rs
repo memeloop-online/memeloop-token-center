@@ -621,7 +621,7 @@ async fn execute_component_primary(
             tracing::warn!(
                 request_id = %request.request_id,
                 upstream_account_id = %primary.route.account_id,
-                error = %error,
+                error_category = error.diagnostic_category(),
                 "current upstream credential is invalid"
             );
             return finish_proxy_failure(&request, "upstream_credential_invalid").await;
@@ -747,7 +747,7 @@ pub(super) async fn proxy(
     let primary = route_plan.primary_route();
     // Freeze before reservation and archive work: later candidates/reloads may
     // change account transport settings, never replenish the request budget.
-    let attempt_budget = routing::RequestAttemptBudget::from_primary(primary)?;
+    let attempt_budget = routing::RequestAttemptBudget::from_primary(primary, request_id)?;
     let recovery_wait_deadline =
         attempt_budget.recovery_wait_deadline(state.config.upstream_health);
     let upstream_account_id = Some(primary.account_id);
@@ -783,7 +783,7 @@ pub(super) async fn proxy(
     {
         Ok(reservation) => reservation,
         Err(error) => {
-            tracing::error!(%request_id, stage = "request_transaction_admission", "proxy request admission failed");
+            tracing::error!(%request_id, stage = "request_transaction_admission", failure_domain = "local_admission", error_category = error.diagnostic_category(), "proxy request admission failed");
             return Err(error);
         }
     };
@@ -907,7 +907,9 @@ pub(super) async fn proxy(
             Err(error) => {
                 tracing::warn!(
                     %request_id,
-                    error = %error,
+                    error_category = error.diagnostic_category(),
+                    failure_domain = "local_admission",
+                    stage = "upstream_candidate_selection",
                     "proxy candidate selection failed"
                 );
                 return finish_proxy_failure(&buffered_request, "upstream_candidate_invalid").await;
@@ -922,6 +924,9 @@ pub(super) async fn proxy(
         // Selection may have waited for database admission; do not dispatch
         // when the original deadline expired during that wait.
         if let Some(reason) = attempt_budget.terminal_reason(outbound_attempts) {
+            tracing::warn!(%request_id, outbound_attempts, stage = reason,
+                failure_domain = "local_admission", delivery_evidence = "candidate_not_dispatched",
+                "proxy request budget expired during candidate selection");
             upstream_attempt
                 .complete(UpstreamAttemptTerminal::Inconclusive)
                 .await;
@@ -958,6 +963,12 @@ pub(super) async fn proxy(
             last_dispatch = Some((active_route.route.account_id, active_route.route.route_id));
         }
         let failure = routing::classify_attempt_failure(&result, rate_limit);
+        routing::diagnostics::observe_send(
+            request_id,
+            selected_candidate_rank,
+            outbound_attempt,
+            &result,
+        );
         let candidate_unavailable = matches!(
             &result,
             Err(ProxySendError::CandidateUnavailable | ProxySendError::CredentialUnavailable)
@@ -1080,7 +1091,7 @@ pub(super) async fn proxy(
                     .await;
                 return finish_proxy_failure(&buffered_request, error_code).await;
             }
-            Err(ProxySendError::NonRetryableTransport) => {
+            Err(ProxySendError::NonRetryableTransport | ProxySendError::OuterDeadline) => {
                 upstream_attempt
                     .complete(UpstreamAttemptTerminal::Inconclusive)
                     .await;

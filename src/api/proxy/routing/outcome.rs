@@ -77,6 +77,7 @@ pub(in crate::api::proxy) fn classify_attempt_failure(
             | ProxySendError::AmbiguousResponse(_)
             | ProxySendError::CandidateUnavailable
             | ProxySendError::NonRetryableTransport
+            | ProxySendError::OuterDeadline
             | ProxySendError::CredentialUnavailable
             | ProxySendError::Credential,
         ) => None,
@@ -108,6 +109,7 @@ mod tests {
         }
         for error in [
             ProxySendError::NonRetryableTransport,
+            ProxySendError::OuterDeadline,
             ProxySendError::AmbiguousResponse("visible_output"),
             ProxySendError::RetryableCodexBadRequest,
             ProxySendError::CodexBadRequest,

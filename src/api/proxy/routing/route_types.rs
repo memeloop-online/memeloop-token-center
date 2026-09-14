@@ -73,6 +73,7 @@ pub(in crate::api::proxy) enum ProxySendError {
     CandidateUnavailable,
     AmbiguousResponse(&'static str),
     NonRetryableTransport,
+    OuterDeadline,
     CredentialUnavailable,
     Credential,
 }
