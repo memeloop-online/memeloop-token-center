@@ -40,7 +40,8 @@ import { providerConnectionCopy } from '../providerConnectionCopy';
 import { providerFormWidgets } from '../ProviderFormWidgets';
 import { appHref } from '../../app/routes';
 import { credentialFormTemplates } from '../CredentialFormTemplates';
-import { CredentialAuthorizationFields } from '../CredentialAuthorizationFields';
+import { CredentialRouteAuthorization } from '../CredentialRouteAuthorization';
+import { credentialRouteOptions } from '../credentialRouteOptions';
 import { Button, Checkbox, Combobox, Input, Option, Select, DetailTooltip, Disclosure, FormSection } from '../../design-system';
 import { JourneyDisclosure as AdvancedFormSection } from '../JourneyDisclosure';
 import { formJourneyCopy } from '../formJourneyCopy';
@@ -937,7 +938,7 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
     </CreateJourney>
   </section><section className="routing-group-managers">
     <GroupManager kind="provider" token={token} tenant={writeTenant} groups={providerGroups.groups} resources={scopedUpstreams.map((value) => ({ value: value.id, label: value.name, description: value.driver }))} onChanged={providerGroups.load} />
-    <GroupManager kind="route" token={token} tenant={writeTenant} groups={routeGroups.groups} resources={routes.filter(canManage).map((route) => ({ value: route.id, label: route.public_model, description: route.protocol }))} onChanged={async () => { await Promise.all([routeGroups.load(), load()]); }} />
+    <GroupManager kind="route" token={token} tenant={writeTenant} groups={routeGroups.groups} resources={credentialRouteOptions(routes.filter(canManage), scopedUpstreams, providers, locale)} onChanged={async () => { await Promise.all([routeGroups.load(), load()]); }} />
   </section></>;
 }
 
@@ -1229,8 +1230,8 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
       if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) finishSecretOperation(operation);
     }
   };
-  const routeOptions = routes.filter((route) => route.tenant_external_id === writeTenant).map((route) => ({ value: route.id, label: route.public_model, description: route.protocol }));
-  const routeGroupOptions = routeGroups.groups.map((group) => ({ value: group.id, label: group.name, description: t('groups.memberCount', { count: formatNumber(group.member_count, locale) }) }));
+  const routeOptions = routes.filter((route) => route.tenant_external_id === writeTenant);
+  const routeGroupOptions = routeGroups.groups;
   const openRouting = async (value: KeyView) => {
     if (editingRouting === value.key_id) { setEditingRouting(undefined); setRoutingDraft(undefined); return; }
     setError('');
@@ -1286,7 +1287,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
           {workspace?.kind === 'limits' && (limitSnapshots[value.key_id] ? <LimitSnapshot value={limitSnapshots[value.key_id]} /> : <p role="status">{t('common.loading')}</p>)}
           {editingPolicy === value.key_id && policyFormSchema && <div className="inline-editor form-panel"><h3>{t('credentials.policyFor', { alias: value.alias })}</h3><CredentialPolicySummary policy={value.policy} currency={value.currency} /><Form key={value.key_id} schema={localizeSchema(policyFormSchema as RJSFSchema, locale)} formData={policyDrafts[value.key_id] ?? value.policy} onChange={({ formData }) => setPolicyDrafts(current => ({ ...current, [value.key_id]: formData }))} uiSchema={credentialPolicyUiSchema} fields={credentialFormFields} validator={validator} templates={credentialFormTemplates} widgets={fluentFormWidgets} onSubmit={({ formData }) => void saveCredentialConfiguration(value, 'policy', formData, t('credentials.policySaved'))}><Button appearance="primary" type="submit" disabled={!canWrite || Boolean(busy)}>{t('common.save')}</Button></Form></div>}
           {editingRouting === value.key_id && routingDraft && <div className="inline-editor form-panel routing-editor"><h3>{t('credentials.routingFor', { alias: value.alias })}</h3><p className="muted">{t('credentials.routingHint')}</p>
-            <CredentialAuthorizationFields routes={routeOptions} groups={routeGroupOptions} routeIds={routingDraft.route_ids} groupIds={routingDraft.route_group_ids} onRoutes={route_ids => setRoutingDraft({ ...routingDraft, route_ids })} onGroups={route_group_ids => setRoutingDraft({ ...routingDraft, route_group_ids })} />
+            <CredentialRouteAuthorization token={token} tenant={writeTenant} routes={routeOptions} groups={routeGroupOptions} routeIds={routingDraft.route_ids} groupIds={routingDraft.route_group_ids} onRoutes={route_ids => setRoutingDraft({ ...routingDraft, route_ids })} onGroups={route_group_ids => setRoutingDraft({ ...routingDraft, route_group_ids })} />
             {routingDraft.effective_route_ids.length > 0 && <small className="field-hint">{t('credentials.effectiveRoutes', { count: formatNumber(routingDraft.effective_route_ids.length, locale) })}</small>}
             <Button appearance="primary" type="button" disabled={!canWrite || Boolean(busy)} onClick={() => void saveRouting(value, routingDraft)}>{t('common.save')}</Button>
           </div>}
@@ -1336,7 +1337,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
       {(error || routeError || routeGroups.error) && <div className="notice error" role="alert">{error || routeError || routeGroups.error}</div>}
       {activeCredential && credentialEditor(activeCredential)}
       <div hidden={workspace?.kind !== 'create'}>
-      {createFormSchema ? <Form key={`${tenant}-${writeTenant}`} schema={localizeSchema(createFormSchema as RJSFSchema, locale)} formData={createCredentialDraft} onChange={({ formData }) => setCreateCredentialDraft(formData)} uiSchema={{ ...credentialCreateUiSchema, principal_external_id: { 'ui:help': t('credentials.principalHelp') } }} formContext={{ authorizationFields: <FormSection title={formJourneyCopy(locale).access} description={t('credentials.createRoutingHint')}><CredentialAuthorizationFields routes={routeOptions} groups={routeGroupOptions} routeIds={newRouteIds} groupIds={newRouteGroupIds} onRoutes={setNewRouteIds} onGroups={setNewRouteGroupIds} /></FormSection> }} fields={credentialFormFields} validator={validator} widgets={fluentFormWidgets} templates={credentialFormTemplates} onSubmit={async ({ formData }) => {
+      {createFormSchema ? <Form key={`${tenant}-${writeTenant}`} schema={localizeSchema(createFormSchema as RJSFSchema, locale)} formData={createCredentialDraft} onChange={({ formData }) => setCreateCredentialDraft(formData)} uiSchema={{ ...credentialCreateUiSchema, principal_external_id: { 'ui:help': t('credentials.principalHelp') } }} formContext={{ authorizationFields: <FormSection title={formJourneyCopy(locale).access} description={t('credentials.createRoutingHint')}><CredentialRouteAuthorization token={token} tenant={writeTenant} routes={routeOptions} groups={routeGroupOptions} routeIds={newRouteIds} groupIds={newRouteGroupIds} onRoutes={setNewRouteIds} onGroups={setNewRouteGroupIds} /></FormSection> }} fields={credentialFormFields} validator={validator} widgets={fluentFormWidgets} templates={credentialFormTemplates} onSubmit={async ({ formData }) => {
         if (!writeTenant) return;
         const operation = beginSecretOperation();
         if (!operation) return;

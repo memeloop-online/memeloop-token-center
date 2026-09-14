@@ -7,6 +7,8 @@ export interface ComboboxOption {
   label: string;
   description?: string;
   created?: boolean;
+  disabled?: boolean;
+  details?: string;
 }
 
 interface MultiComboboxProps {
@@ -73,6 +75,7 @@ export function MultiCombobox({
   }, [expanded, activeIndex, id, panel]);
 
   const choose = (item: ComboboxOption) => {
+    if (item.disabled) return;
     onChange([...value, item]);
     setQuery('');
     onQueryChange?.('');
@@ -84,16 +87,22 @@ export function MultiCombobox({
   const onKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
     if (event.nativeEvent.isComposing) return;
     if (event.key === 'ArrowDown') {
-      event.preventDefault(); setOpen(true); setActiveIndex((current) => Math.min(current + 1, Math.max(rows.length - 1, 0)));
+      event.preventDefault(); setOpen(true); setActiveIndex((current) => {
+        const next = rows.findIndex((item, index) => index > current && !item.disabled);
+        return next >= 0 ? next : current;
+      });
     } else if (event.key === 'ArrowUp') {
-      event.preventDefault(); setOpen(true); setActiveIndex((current) => current < 0 ? rows.length - 1 : Math.max(current - 1, 0));
+      event.preventDefault(); setOpen(true); setActiveIndex((current) => {
+        for (let index = current < 0 ? rows.length - 1 : current - 1; index >= 0; index--) if (!rows[index].disabled) return index;
+        return current;
+      });
     } else if (event.key === 'Enter' && expanded) {
       // Enter belongs to the open picker even when a search has no matches.
       // Do not let an empty result accidentally submit an enclosing editor.
       event.preventDefault();
       // React may not have committed the input/open state before a fast keyboard user presses Enter.
       const currentRows = rowsForQuery(options, value, event.currentTarget.value, allowCreate);
-      const item = currentRows[activeIndex >= 0 ? activeIndex : 0];
+      const item = activeIndex >= 0 ? currentRows[activeIndex] : currentRows.find(item => !item.disabled);
       if (item) choose(item);
     } else if (event.key === 'Escape') {
       if (expanded) { event.preventDefault(); event.stopPropagation(); setOpen(false); }
@@ -107,7 +116,7 @@ export function MultiCombobox({
     {hint && <small className="field-hint" id={`${id}-hint`}>{hint}</small>}
     <div ref={anchor} className="multi-combobox-control" onClick={openFromControl}>
       {value.map((item) => <span className={`selection-chip${item.created ? ' pending' : ''}`} key={item.value}>
-        <span className="selection-chip-label">{item.label}</span>
+        <span className="selection-chip-label" title={item.details}>{item.label}</span>
         <button type="button" disabled={disabled} aria-label={removeLabel(item.label)} onClick={(event) => {
           event.stopPropagation(); onChange(value.filter((selectedItem) => selectedItem.value !== item.value));
           // The chip button unmounts after removal; retain a useful keyboard
@@ -150,11 +159,14 @@ export function MultiCombobox({
           role="option"
           tabIndex={-1}
           aria-selected={index === activeIndex}
+          aria-disabled={item.disabled || undefined}
+          disabled={item.disabled}
+          title={item.details}
           className={index === activeIndex ? 'active' : ''}
           id={`${id}-option-${index}`}
           key={item.value}
           onMouseDown={(event) => event.preventDefault()}
-          onMouseEnter={() => setActiveIndex(index)}
+          onMouseEnter={() => !item.disabled && setActiveIndex(index)}
           onClick={() => choose(item)}
         ><span>{item.created ? createLabel?.(item.label) ?? item.label : item.label}</span>{item.description && <small>{item.description}</small>}</button>)}
       </div>

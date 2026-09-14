@@ -527,7 +527,8 @@ Then('提供商组参与路由候选而路由组参与凭据授权', async funct
   await credential.getByRole('button', { name: '更多操作', exact: true }).click();
   await page.getByRole('menuitem', { name: '路由权限', exact: true }).click();
   await assertContains(selectedRouteGroups, '默认路由');
-  await assertContains(routing, '当前共可使用');
+  await assertContains(routing, '已保存授权关联');
+  await assertContains(routing, '不代表当前可用');
 
   const credentialRoutingPath = `/internal/v1/keys/${seed.clientKeyId}/routing?tenant_external_id=${encodeURIComponent(tenant)}`;
   const current = await requestJson<{ route_ids: string[]; route_group_ids: string[]; grant_revision: number }>(credentialRoutingPath, { credential: seed.serviceCredential });
@@ -611,7 +612,8 @@ Then('凭据组只用于分类且不改变凭据授权或可用模型', async fu
   await page.getByRole('menuitem', { name: '路由权限', exact: true }).click();
   const routing = page.locator('.credential-active-editor .routing-editor');
   await assertVisible(routing);
-  await assertContains(routing, '当前共可使用');
+  await assertContains(routing, '已保存授权关联');
+  await assertContains(routing, '不代表当前可用');
   await assertContains(routing, '默认路由');
   await assertNotContains(routing, '测试凭据');
   const routeGroupInput = routing.getByRole('combobox', { name: '路由组', exact: true });

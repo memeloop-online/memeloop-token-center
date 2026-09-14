@@ -499,6 +499,7 @@ export interface ModelRouteView {
   public_model: string;
   upstream_account_id?: string;
   upstream_account_ids?: string[];
+  candidate_upstream_account_ids?: string[];
   included_provider_group_ids?: string[];
   excluded_provider_group_ids?: string[];
   route_group_ids?: string[];

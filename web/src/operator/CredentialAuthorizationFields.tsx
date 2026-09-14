@@ -7,7 +7,7 @@ export function CredentialAuthorizationFields({ routes, groups, routeIds, groupI
   onRoutes: (ids: string[]) => void; onGroups: (ids: string[]) => void;
 }) {
   const { t } = useI18n();
-  const selected = (ids: string[], options: ComboboxOption[]) => ids.map(value => options.find(option => option.value === value) ?? { value, label: value });
+  const selected = (ids: string[], options: ComboboxOption[]) => ids.map(value => options.find(option => option.value === value) ?? { value, label: `…${value.slice(-6)}`, details: value });
   return <div className="credential-authorization-fields">
     <MultiCombobox label={t('credentials.routeGroups')} options={groups} value={selected(groupIds, groups)} onChange={items => onGroups(items.map(item => item.value))} placeholder={t('credentials.searchRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={name => t('groups.removeMember', { name })} hint={t('credentials.existingGroupsOnly')} />
     <JourneyDisclosure action title={t('credentials.additionalRoutes', { count: routeIds.length })} description={t('credentials.additionalRoutesHint')}>

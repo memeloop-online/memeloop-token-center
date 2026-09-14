@@ -252,7 +252,7 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
       const client = await browser.newPage({ viewport: { width: 390, height: 844 } });
       client.setDefaultTimeout(5_000);
       await client.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
-      await client.goto(fixture('client-form'));
+      await client.goto(`${fixture('client-form')}&account-catalog-failure`);
       const english = locale === 'en';
       const modeLabel = english ? 'Metering and limit mode' : '计量与限额模式';
       await client.getByText(english ? 'Research workspace' : '研发工作区', { exact: true }).waitFor();
@@ -273,14 +273,45 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
       assert.equal(JSON.parse(policyRequest.body!).enforcement_mode, editedMode);
       assert.equal(JSON.parse(policyRequest.body!).daily_budget, null);
 
+      await client.getByRole('button', { name: english ? 'More actions' : '更多操作', exact: true }).click();
+      await client.getByRole('menuitem', { name: english ? 'Route access' : '路由权限', exact: true }).click();
+      const existingRouting = client.locator('.routing-editor');
+      await existingRouting.getByRole('region', { name: english ? 'Authorization scope preview' : '授权范围预览' }).getByText(/Spark disabled/, { exact: false }).waitFor();
+      await existingRouting.getByRole('button', { name: english ? 'Individual model grants (1)' : '单独授权模型（1）', exact: true }).click();
+      assert.match(await existingRouting.locator('.selection-chip').innerText(), /Spark disabled/, 'an unavailable existing grant stays selected');
+      await existingRouting.getByRole('button', { name: english ? 'Save' : '保存', exact: true }).click();
+      await client.waitForFunction(() => window.credentialFixture.requests.some(request => request.method === 'PUT' && request.path.endsWith('/key-form/routing')));
+      const savedRouting = await client.evaluate(() => window.credentialFixture.requests.find(request => request.method === 'PUT' && request.path.endsWith('/key-form/routing'))!);
+      assert.deepEqual(JSON.parse(savedRouting.body!).route_ids, ['00000000-0000-4000-8000-000000000004'], 'saving does not silently drop unavailable existing grants');
+
       const create = client.locator('.create-journey');
       await create.locator(':scope > .journey-heading [data-workspace-toggle]').click();
+      const retryCatalog = create.getByRole('button', { name: english ? 'Retry account catalog' : '重试读取目录', exact: true });
+      await retryCatalog.waitFor();
+      // Restore the mock service only after the visible editor shows failure.
+      // Earlier editor mounts must not consume a one-shot failure intended here.
+      await client.evaluate(() => { document.documentElement.dataset.accountCatalogAvailable = 'true'; });
+      await retryCatalog.click();
+      await retryCatalog.waitFor({ state: 'hidden' });
       const routes = create.getByRole('combobox', { name: english ? 'Specific routes' : '具体路由', exact: true });
       const groups = create.getByRole('combobox', { name: english ? 'Route groups' : '路由组', exact: true });
       await groups.waitFor();
       assert.equal(await routes.isVisible(), false, 'route groups are the primary authorization choice; direct model grants remain available on demand');
       await create.getByRole('button', { name: english ? 'Individual model grants (0)' : '单独授权模型（0）', exact: true }).click();
+      await routes.fill('Spark disabled');
+      assert.equal(await client.getByRole('option').filter({ hasText: 'Spark disabled' }).isDisabled(), true);
+      await routes.press('Enter');
+      assert.equal(await create.locator('.selection-chip').count(), 0, 'disabled routes cannot become implicit new grants');
+      await client.mouse.move(0, 0);
+      await routes.fill('');
+      await routes.press('ArrowUp');
+      assert.match(await routes.evaluate(input => document.getElementById(input.getAttribute('aria-activedescendant')!)?.textContent ?? ''), /Team Kimi/, 'ArrowUp skips trailing disabled candidates');
+      await routes.press('ArrowDown');
+      assert.match(await routes.evaluate(input => document.getElementById(input.getAttribute('aria-activedescendant')!)?.textContent ?? ''), /Team Kimi/, 'ArrowDown never parks on a disabled candidate');
       await routes.fill('Research model');
+      await client.getByRole('option').filter({ hasText: 'Personal Kimi' }).waitFor();
+      assert.equal(await client.getByRole('option').count(), 2, 'equal model names on different account routes remain separate');
+      await routes.fill('Personal Kimi');
       await routes.press('ArrowDown');
       await routes.press('Enter');
       await routes.press('Escape');
@@ -288,6 +319,13 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
       await groups.press('ArrowDown');
       await groups.press('Enter');
       await groups.press('Escape');
+      const preview = create.getByRole('region', { name: english ? 'Authorization scope preview' : '授权范围预览' });
+      await preview.getByText('Kimi → Personal Kimi → Research model', { exact: true }).waitFor();
+      assert.equal(await preview.getByRole('listitem').count(), 1, 'direct and group grants share one preview row with both sources');
+      assert.match(await preview.innerText(), /Research group/);
+      assert.match(await preview.innerText(), english ? /Direct grant/ : /直接授权/);
+      assert.equal(await preview.getByText(/Team Kimi/).count(), 0, 'a dedicated route and its group must not authorize the other account');
+      assert.equal(await create.getByRole('link', { name: /dedicated route|专用路由/ }).getAttribute('href'), '/operator?view=routes');
       assert.equal(await create.locator('.schema-array').count(), 0, 'routing IDs have one named control each');
       assert.equal(await create.getByText('Unsupported field schema', { exact: false }).count(), 0);
       await create.locator('#root_principal_external_id').fill('fixture-principal');
@@ -309,6 +347,12 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
       const artifacts = fileURLToPath(new URL('../e2e-artifacts/upstream-availability', import.meta.url));
       mkdirSync(artifacts, { recursive: true });
       await create.screenshot({ path: `${artifacts}/credential-workspace-${locale}-mobile.png` });
+      await client.setViewportSize({ width: 1440, height: 900 });
+      for (const theme of ['light', 'dark']) {
+        await client.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
+        assert.equal(await client.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+        await create.screenshot({ path: `${artifacts}/credential-route-scope-${locale}-${theme}-wide.png` });
+      }
       await create.locator('button[type="submit"]').click();
       await client.getByText('mts_fixture_created', { exact: true }).waitFor();
       const createRequests = await client.evaluate(() => window.credentialFixture.requests.filter(request => request.method === 'POST' && request.path === '/internal/v1/keys'));
