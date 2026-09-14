@@ -33,6 +33,15 @@ test('request detail follows terminal events and fences late responses after sel
     await page.locator('.drawer .request-outcome').focus();
     await ownedTooltip.waitFor();
     assert.match(await page.locator('.drawer .request-diagnostics').first().innerText(), /Awaiting settlement/);
+    const modelDetails = page.locator('.drawer .request-detail-wide .request-metadata-trigger').first();
+    await modelDetails.tap();
+    const metadata = page.locator('.request-metadata-surface');
+    await metadata.waitFor({ state: 'visible' });
+    assert.equal(await metadata.evaluate(element => !!element.closest('.drawer-owned-portals') && !element.closest('[inert], [aria-hidden="true"]')), true, 'technical metadata belongs to the current accessible drawer');
+    await metadata.getByRole('button').first().focus();
+    await page.keyboard.press('Escape');
+    await metadata.waitFor({ state: 'detached' });
+    assert.equal(await page.locator('.drawer').count(), 1, 'Escape closes the supplemental metadata, not the request drawer');
     await page.evaluate(() => window.requestLifecycleFixture.finish());
     await page.locator('.drawer [data-outcome="completed"]').waitFor();
     assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 2);

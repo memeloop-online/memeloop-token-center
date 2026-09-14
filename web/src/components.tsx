@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
-import { PortalMountNodeProvider } from '@fluentui/react-components';
+import { Popover, PopoverSurface, PopoverTrigger, PortalMountNodeProvider } from '@fluentui/react-components';
 import { CopyButton } from './CopyButton.js';
 import type { RequestView, StatsBucket } from './types.js';
 import { useI18n } from './i18n.js';
@@ -184,6 +184,20 @@ function RequestOutputRate({ request }: { request: RequestView }) {
   return <DetailTooltip content={hint}><span tabIndex={0} aria-label={`${label}: ${rate === null ? t('request.usageUnknown') : formatNumber(rate, locale, 2)}. ${hint}`}><small>{label}</small> {rate === null ? '—' : formatNumber(rate, locale, 2)}</span></DetailTooltip>;
 }
 
+/** Technical values remain available on touch and keyboard without occupying a column. */
+function RequestMetadata({ label, fields }: { label: string; fields: [string, string | null | undefined][] }) {
+  const { locale, t } = useI18n();
+  const [open, setOpen] = useState(false);
+  const recorded = fields.filter((field): field is [string, string] => Boolean(field[1]));
+  if (!recorded.length) return <span>{label}</span>;
+  return <Popover positioning="below-start" trapFocus open={open} onOpenChange={(_, data) => setOpen(data.open)}>
+    <PopoverTrigger disableButtonEnhancement><button type="button" className="table-link request-metadata-trigger" onKeyDown={(event) => { if (event.key === 'Escape' && open) event.stopPropagation(); }} aria-label={`${label} · ${locale === 'zh-CN' ? '详细信息' : 'Details'}`}>{label}</button></PopoverTrigger>
+    <PopoverSurface className="request-metadata-surface" aria-label={label} onKeyDown={(event) => { if (event.key === 'Escape') event.stopPropagation(); }}>
+      <dl>{recorded.map(([name, value]) => <div key={name}><dt>{name}</dt><dd><code>{value}</code><CopyButton value={value} label={`${t('common.copy')} ${name}`} /></dd></div>)}</dl>
+    </PopoverSurface>
+  </Popover>;
+}
+
 export function RequestDiagnostics({
   request,
   currency,
@@ -200,31 +214,41 @@ export function RequestDiagnostics({
   const currencyForRequest = recordedCurrency(request, currency);
   const context = request.session_context;
   const sessionLabel = context?.session_name ?? t('sessions.reportedNameMissing');
-  const sessionMetadata = [context?.task_kind, context?.agent_id].filter(Boolean).join(' · ');
+  const zh = locale === 'zh-CN';
+  const missing = zh ? '未记录' : 'Not recorded';
+  const credential = requestCredentialLabel(request, undefined);
+  const credentialLabel = 'label' in credential ? credential.label : t(credential.key);
+  const duration = formatDurationDisplay(request.duration_ms, locale);
+  const cost = currencyForRequest ? formatCurrencyDisplay(request.cost, currencyForRequest, locale) : { text: missing };
+  const settlement = <DetailTooltip content={t('request.pendingUsage')}><span tabIndex={0}>{zh ? '待结算' : 'Awaiting settlement'}</span></DetailTooltip>;
 
-  return <div className="request-diagnostics request-detail-surface">
-    <span><b>{t('request.request')}</b><RequestIdentifier requestId={request.request_id} /></span>
-    <span><b>{t('request.receivedAt')}</b>{new Date(request.created_at).toLocaleString(locale)}</span>
-    <span><b>{t('request.completedAt')}</b>{request.completed_at === null || request.completed_at === undefined ? '—' : new Date(request.completed_at).toLocaleString(locale)}</span>
-    <span><b>{t('request.status')}</b><RequestStatus request={request} /></span>
-    <span><b>{t('request.protocol')}</b>{request.protocol}</span>
-    <span><b>{t('request.duration')}</b>{formatMilliseconds(request.duration_ms, locale)}</span>
-    <span><RequestOutputRate request={request} /></span>
-    <span><b>{t('request.upstreamId')}</b>{upstreamName && <small>{upstreamName}</small>}{request.upstream_account_id ?? '—'}</span>
-    <span><b>{t('request.routeId')}</b>{request.route_id ?? '—'}</span>
-    <span><b>{t('request.tokens')}</b>{pending ? <DetailTooltip content={t('request.pendingUsage')}><span tabIndex={0}>{locale === 'zh-CN' ? '待结算' : 'Awaiting settlement'}</span></DetailTooltip> : <>{formatNumber(request.input_tokens + request.output_tokens, locale)}<RequestTokenSummary request={request} /></>}
-    </span>
-    <span><b>{t('request.cost')}</b>{pending ? <DetailTooltip content={t('request.pendingUsage')}><span tabIndex={0}>{locale === 'zh-CN' ? '待结算' : 'Awaiting settlement'}</span></DetailTooltip> : currencyForRequest ? formatCurrency(request.cost, currencyForRequest, locale) : '—'}</span>
-    <span><b>{t('request.error')}</b>{request.error_code ?? '—'}</span>
-    {context && <span><b>{t('request.session')}</b>
+  return <div className="request-diagnostics request-detail-surface request-detail-summary">
+    <section className="request-detail-group" aria-label={zh ? '请求身份' : 'Request identity'}>
+      <div className="request-detail-wide"><b>{t('request.model')}</b><RequestMetadata label={request.model} fields={[[t('request.routeId'), request.route_id], [t('request.protocol'), request.protocol]]} /></div>
+      <div><b>{zh ? '凭据' : 'Credential'}</b><RequestMetadata label={credentialLabel} fields={[[zh ? '凭据 ID' : 'Credential ID', request.credential_identity?.key_id], [zh ? '主体' : 'Principal', request.credential_identity?.principal_external_id], [zh ? '租户' : 'Tenant', request.credential_identity?.tenant_external_id]]} /></div>
+      <div><b>{zh ? '最终上游' : 'Final upstream'}</b><RequestMetadata label={upstreamName || (request.upstream_account_id ? (zh ? '未命名上游' : 'Unnamed upstream') : missing)} fields={[[t('request.upstreamId'), request.upstream_account_id]]} /></div>
+      <div><b>{t('request.status')}</b><RequestStatus request={request} /></div>
+      <div><b>{t('request.request')}</b><RequestMetadata label={zh ? '记录标识' : 'Record identifiers'} fields={[[zh ? '请求 ID' : 'Request ID', request.request_id]]} /></div>
+      {request.error_code && <div className="request-detail-wide"><b>{t('request.error')}</b>{request.error_code}</div>}
+    </section>
+    <section className="request-detail-group" aria-label={zh ? '时间与性能' : 'Timing and performance'}>
+      <div><b>{t('request.duration')}</b><DetailTooltip content={duration.title ?? missing}><span tabIndex={0}>{duration.text === '—' ? missing : duration.text}</span></DetailTooltip></div>
+      <div><RequestOutputRate request={request} /></div>
+      <div><b>{t('request.receivedAt')}</b><time>{new Date(request.created_at).toLocaleString(locale)}</time></div>
+      <div><b>{t('request.completedAt')}</b>{request.completed_at == null ? (pending ? (zh ? '尚未结束' : 'Still running') : missing) : <time>{new Date(request.completed_at).toLocaleString(locale)}</time>}</div>
+    </section>
+    <section className="request-detail-group" aria-label={zh ? '用量与费用' : 'Usage and cost'}>
+      <div><b>{t('request.tokens')}</b>{pending ? settlement : <><strong>{formatNumber(request.input_tokens + request.output_tokens, locale)}</strong><RequestTokenSummary request={request} /></>}</div>
+      <div><b>{t('request.cost')}</b>{pending ? settlement : <DetailTooltip content={cost.title ?? missing}><span tabIndex={0}>{cost.text}</span></DetailTooltip>}</div>
+    </section>
+    {context && <section className="request-detail-group request-detail-session" aria-label={t('request.session')}><div className="request-detail-wide"><b>{t('request.session')}</b>
       {context.association === 'confirmed'
         ? context.session_id && onOpenSession
           ? <button type="button" className="table-link request-diagnostic-session" onClick={() => onOpenSession(context.session_id!)}>{sessionLabel}</button>
           : <span>{sessionLabel}</span>
         : <span className="request-session-unlinked">{t('sessions.unlinkedRequests')}</span>}
-      {context.association === 'confirmed' && context.session_id && <small><code className="break-anywhere">{context.session_id}</code>{sessionMetadata && ` · ${sessionMetadata}`}</small>}
-      {context.association === 'unlinked' && sessionMetadata && <small>{sessionMetadata}</small>}
-    </span>}
+      <RequestMetadata label={zh ? '会话信息' : 'Session details'} fields={[[zh ? '会话 ID' : 'Session ID', context.session_id], [zh ? '任务类型' : 'Task kind', context.task_kind], [zh ? '代理 ID' : 'Agent ID', context.agent_id]]} />
+    </div></section>}
   </div>;
 }
 
