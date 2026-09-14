@@ -34,7 +34,9 @@ fn capture(operation: impl FnOnce()) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn poll<B: HttpBody + Unpin>(body: &mut B) -> Poll<Option<Result<Frame<B::Data>, B::Error>>> {
+type FramePoll<B> = Poll<Option<Result<Frame<<B as HttpBody>::Data>, <B as HttpBody>::Error>>>;
+
+fn poll<B: HttpBody + Unpin>(body: &mut B) -> FramePoll<B> {
     Pin::new(body).poll_frame(&mut TaskContext::from_waker(
         futures_util::task::noop_waker_ref(),
     ))
