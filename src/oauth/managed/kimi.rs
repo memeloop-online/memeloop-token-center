@@ -492,12 +492,27 @@ mod tests {
 
             let mut request = [0_u8; 4];
             client.read_exact(&mut request).await.unwrap();
-            assert_eq!(&request, &[5, 1, 0, 3]);
-            let mut hostname_length = [0_u8; 1];
-            client.read_exact(&mut hostname_length).await.unwrap();
-            let mut hostname = vec![0_u8; usize::from(hostname_length[0])];
-            client.read_exact(&mut hostname).await.unwrap();
-            assert_eq!(hostname, b"localhost");
+            assert_eq!(&request[..3], &[5, 1, 0]);
+            match request[3] {
+                1 => {
+                    let mut address = [0_u8; 4];
+                    client.read_exact(&mut address).await.unwrap();
+                    assert!(std::net::Ipv4Addr::from(address).is_loopback());
+                }
+                3 => {
+                    let mut hostname_length = [0_u8; 1];
+                    client.read_exact(&mut hostname_length).await.unwrap();
+                    let mut hostname = vec![0_u8; usize::from(hostname_length[0])];
+                    client.read_exact(&mut hostname).await.unwrap();
+                    assert_eq!(hostname, b"localhost");
+                }
+                4 => {
+                    let mut address = [0_u8; 16];
+                    client.read_exact(&mut address).await.unwrap();
+                    assert!(std::net::Ipv6Addr::from(address).is_loopback());
+                }
+                value => panic!("unexpected SOCKS5 address type {value}"),
+            }
             let mut port = [0_u8; 2];
             client.read_exact(&mut port).await.unwrap();
             assert_eq!(u16::from_be_bytes(port), target_address.port());
