@@ -1608,21 +1608,65 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
 
   /internal/v1/upstreams/{account_id}/transport-proxy:
-    put:
+    get:
       tags: [Upstream providers]
-      operationId: rotateOpenAiCodexTransportProxy
-      summary: Replace only the transport proxy of an existing OpenAI Codex OAuth account
+      operationId: getUpstreamTransportProxySettings
+      summary: Read the selected account's full proxy URL for management editing and copying
       security: [{ serviceBearer: [] }]
       x-required-scope: providers:write
       description: |
-        Requires a global operator authorized for the tenant, an existing Codex
-        OAuth credential, `Idempotency-Key`, and exact account/credential
+        Requires the same global operator authority as editing private transport
+        proxies and verifies the explicitly selected tenant owns the account.
+        Returns only credential-backed proxy settings and account CAS revisions,
+        including proxy username and password where configured. Never returns
+        API keys, OAuth access/refresh tokens, adapter state or configuration.
+        Works for supported OAuth and API-key proxy credentials. An unconfigured
+        proxy is null. Ordinary account lists remain sanitized. No upstream
+        connection, probe, refresh or mutation is performed.
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/RequiredTenant'
+      responses:
+        '200':
+          description: Explicit management-only proxy settings; private, no-store.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, no-store' }
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [account_id, proxy_url, proxy_network_scope, updated_at, credential_generation, supported]
+                properties:
+                  account_id: { type: string, format: uuid }
+                  proxy_url: { type: [string, 'null'] }
+                  proxy_network_scope: { type: [string, 'null'], enum: [private, null] }
+                  updated_at: { type: integer, format: int64 }
+                  credential_generation: { type: integer, format: int64 }
+                  supported: { type: boolean, description: Whether this credential has an OAuth or proxied API-key container supported by the transport editor. }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Upstream providers]
+      operationId: rotateOpenAiCodexTransportProxy
+      summary: Replace only the transport proxy of a supported existing upstream credential
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      description: |
+        Requires a global operator authorized for the tenant, an existing OAuth
+        or proxied API-key credential, `Idempotency-Key`, and exact account/credential
         compare-and-swap values.
-        The operation preserves all OAuth material and the fixed official Codex
-        base URL, installs a new encrypted credential generation, and records an
-        audit row containing only keyed fingerprints and schemes. Only a private
-        IP-literal `socks5h` URL is accepted so target DNS is resolved remotely.
-        The full proxy URL, credentials, and endpoint are never returned.
+        The operation preserves all non-proxy credential material and account
+        configuration, installs a new encrypted credential generation, and records an
+        audit row containing only keyed fingerprints and schemes. Codex retains
+        its fixed official endpoint and private IP-literal socks5h requirement.
+        Generic socks5 endpoints must resolve only to private addresses; socks5h
+        requires a private IP literal. Unsupported credential containers reject
+        the edit. PUT returns sanitized metadata; only the explicit GET above
+        returns the proxy original value.
       parameters:
         - $ref: '#/components/parameters/AccountId'
         - $ref: '#/components/parameters/RequiredIdempotencyKey'
@@ -5857,11 +5901,11 @@ components:
         tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
         proxy_url:
           type: string
-          pattern: '^socks5h://'
+          pattern: '^socks5h?://'
           minLength: 1
           maxLength: 2048
           writeOnly: true
-          description: Private IPv4 or bracketed IPv6 literal SOCKS5H endpoint. May contain proxy authentication; never returned.
+          description: Private SOCKS endpoint. Codex and remote-DNS socks5h require a private IP literal; generic socks5 may use a hostname resolving only to private addresses. Proxy authentication is returned only by the explicit management GET, never ordinary metadata.
         expected_updated_at: { type: integer, format: int64 }
         expected_credential_generation: { type: integer, format: int64, minimum: 1 }
     UpstreamProvider:
@@ -5888,7 +5932,7 @@ components:
         proxy_remote_dns: { type: boolean, description: True only for socks5h. No proxy endpoint or credential is exposed. }
         proxy_label: { type: [string, 'null'], description: Server-generated generic label without host, port, username, or password. }
         proxy_fingerprint: { type: [string, 'null'], pattern: '^proxy_[0-9a-f]{16}$', description: Pepper-keyed non-reversible comparison fingerprint. }
-        can_update_transport_proxy: { type: boolean, description: True only for a global operator viewing an OpenAI Codex OAuth account supported by the explicit transport operation. }
+        can_update_transport_proxy: { type: boolean, description: True only for a global operator viewing a current OAuth or proxied API-key credential supported by the explicit transport operation. }
         import_source_identity_hash: { type: [string, 'null'], pattern: '^[0-9a-f]{64}$', description: Opaque operator-HMAC provenance for a native OAuth import; null for other accounts. }
         import_source_document_sha256: { type: [string, 'null'], pattern: '^[0-9a-f]{64}$', description: Canonical source-document digest for a native OAuth import; null for other accounts. }
         can_refresh: { type: boolean, description: Managed OAuth refresh is available for the active generation. }

@@ -327,11 +327,26 @@ impl UpstreamCredential {
         })
     }
 
-    /// Replace only the transport proxy on an existing OAuth credential.
-    /// Token, refresh, expiry, header and identity state are retained exactly.
-    pub(crate) fn with_oauth_proxy(self, proxy_url: String) -> Result<Self, AppError> {
-        validate_codex_proxy_url(&proxy_url)?;
+    pub(crate) fn supports_transport_proxy(&self) -> bool {
+        matches!(self, Self::OAuth { .. } | Self::ProxiedApiKey { .. })
+    }
+
+    /// Replace only a proxy container, preserving all other credential fields.
+    pub(crate) fn with_transport_proxy(self, proxy_url: String) -> Result<Self, AppError> {
+        validate_proxy_url(&proxy_url)?;
         match self {
+            Self::ProxiedApiKey {
+                value,
+                header,
+                prefix,
+                ..
+            } => Ok(Self::ProxiedApiKey {
+                value,
+                header,
+                prefix,
+                proxy_url,
+                proxy_network_scope: OutboundScope::Private,
+            }),
             Self::OAuth {
                 access_token,
                 refresh_token,
@@ -351,7 +366,7 @@ impl UpstreamCredential {
                 proxy_network_scope: Some(OutboundScope::Private),
             }),
             _ => Err(AppError::BadRequest(
-                "transport proxy updates require an existing OAuth credential".into(),
+                "this credential type does not support transport proxy updates".into(),
             )),
         }
     }

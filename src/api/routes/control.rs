@@ -182,7 +182,7 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         )
         .route(
             "/internal/v1/upstreams/{account_id}/transport-proxy",
-            put(rotate_codex_transport_proxy),
+            get(get_upstream_proxy_settings).put(rotate_codex_transport_proxy),
         )
         .route(
             "/internal/v1/upstreams/{account_id}/deletion-readiness",
