@@ -1,7 +1,6 @@
-import type { ModelRouteView, ProviderType, UpstreamAccount } from '../types';
-import type { ComboboxOption } from './MultiCombobox';
+import type { ModelRouteView, ProviderType, UpstreamAccount } from '../types.js';
 
-export function credentialRouteOptions(routes: ModelRouteView[], accounts: UpstreamAccount[], providers: ProviderType[], locale: string): ComboboxOption[] {
+export function credentialRouteOptions(routes: ModelRouteView[], accounts: UpstreamAccount[], providers: ProviderType[], locale: string) {
   const zh = locale.startsWith('zh');
   // Only stable route IDs identify grants; equal model or account names do not.
   const options = [...new Map(routes.map(route => [route.id, route])).values()].map(route => {
