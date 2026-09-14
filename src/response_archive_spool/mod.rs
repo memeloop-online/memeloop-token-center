@@ -23,9 +23,11 @@ pub(crate) use producer::fail_next_append_for_test;
 #[cfg(test)]
 pub(crate) use producer::pause_next_begin_ack_for_test;
 #[cfg(test)]
+pub(crate) use producer::pause_next_begin_for_test;
+#[cfg(test)]
 pub(crate) use producer::pause_next_request_preseal_for_test;
 pub(crate) use producer::{BufferedArchive, PreparedArchiveBatch};
-pub(crate) use producer::{ResponseArchiveProducer, mark_gap};
+pub(crate) use producer::{ResponseArchiveProducer, ResponseArchiveSettlement, mark_gap};
 pub(crate) use upload::run;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +54,12 @@ impl BufferedArchivePurpose {
 
 pub(crate) const CHUNK_BYTES: usize = 64 * 1024;
 pub(crate) const CAPTURE_INSERT_BATCH_CHUNKS: usize = 16;
+// One partial chunk remains in the proxy task, at most three complete chunks
+// wait in the channel, and the writer owns at most one database-bound chunk.
+// The full five-chunk envelope is charged to the request's existing memory
+// reservation before the writer starts.
+const CAPTURE_QUEUE_CHUNKS: usize = 3;
+const CAPTURE_MEMORY_BYTES: usize = CHUNK_BYTES * 5;
 const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 struct OwnedTask<T: Send + 'static> {
@@ -86,6 +94,13 @@ where
                 None
             }
         }
+    }
+
+    /// Keep an already accepted operation running if its current observer is
+    /// cancelled. Drop still transfers the JoinHandle to the runtime
+    /// supervisor, but no longer invalidates the operation's active fence.
+    fn continue_on_drop(&mut self) {
+        self.active.take();
     }
 }
 
@@ -165,9 +180,6 @@ where
         () = deadline => None,
     }
 }
-
-#[cfg(test)]
-pub(crate) use producer::capture_ack_clock_for_test;
 
 async fn await_owned_unbounded<T>(
     operation: impl Future<Output = Result<T, AppError>> + Send + 'static,

@@ -290,9 +290,16 @@ impl Database {
     ) -> Result<bool, AppError> {
         let purpose = BufferedArchivePurpose::Response;
         let (mut tx, now) = self.spool_transaction().await?;
-        let valid: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND completed_at IS NULL")))
+        // The response writer is owned independently from the proxy lifecycle.
+        // A short stream may therefore finalize its request before the writer's
+        // begin transaction acquires the global spool budget. The canonical gap
+        // locator is the exact, fenced placeholder that finalization writes
+        // until the worker binds a durable object; no other completed request
+        // may be reopened for capture.
+        let gap_locator = format!("gap://{}/response", identity.request_id);
+        let valid: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND (completed_at IS NULL OR response_object = $4)")))
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
-            .bind(identity.reservation_id.to_string()).fetch_one(&mut *tx).await?;
+            .bind(identity.reservation_id.to_string()).bind(gap_locator).fetch_one(&mut *tx).await?;
         if valid != 1 {
             return Ok(false);
         }

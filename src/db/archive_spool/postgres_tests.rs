@@ -147,6 +147,97 @@ async fn postgres_request_preseal_finishes_before_the_budget_transaction() {
 }
 
 #[tokio::test]
+async fn postgres_response_writer_does_not_block_streaming_on_the_budget_lock() {
+    use crate::{AppState, config::Config, response_archive_spool::ResponseArchiveProducer};
+
+    let Some(fixture) = PgFixture::new_with_schema(true).await else {
+        return;
+    };
+    let application_name = format!("response-writer-{}", Uuid::new_v4());
+    let mut scoped_url = url::Url::parse(&fixture.url).unwrap();
+    scoped_url.query_pairs_mut().append_pair(
+        "options",
+        &format!(
+            "-csearch_path={} -capplication_name={application_name}",
+            fixture.schema
+        ),
+    );
+    let mut config = Config::for_test(scoped_url.to_string());
+    config.run_migrations_on_start = false;
+    let state = AppState::initialize(config).await.unwrap();
+    let now: i64 = sqlx::query_scalar(
+        "SELECT CAST(FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000) AS BIGINT)",
+    )
+    .fetch_one(&fixture.db.pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, input_tokens, output_tokens, cost_micros, request_object, reservation_id) VALUES ($1, $2, $3, $4, 'responses', 'owned-writer', 0, 0, 0, $5, $6)")
+        .bind(fixture.id.request_id.to_string())
+        .bind(fixture.id.tenant_id.to_string())
+        .bind(Uuid::new_v4().to_string())
+        .bind(now)
+        .bind(format!("gap://{}/request", fixture.id.request_id))
+        .bind(fixture.id.reservation_id.to_string())
+        .execute(&fixture.db.pool)
+        .await
+        .unwrap();
+
+    let mut budget_holder = fixture.db.pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1 FOR UPDATE",
+    )
+    .execute(&mut *budget_holder)
+    .await
+    .unwrap();
+    let memory = state.proxy_memory_budget.reservation();
+    let mut producer = ResponseArchiveProducer::begin(&state, fixture.id, memory).unwrap();
+    assert!(producer.append(vec![
+        bytes::Bytes::from(vec![b'x'; crate::response_archive_spool::CHUNK_BYTES]),
+        bytes::Bytes::from_static(b"tail"),
+    ]));
+    let settlement = producer
+        .seal()
+        .expect("terminal handoff must not wait for the writer's budget lock");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock' AND query LIKE 'SELECT cipher_bytes FROM response_archive_spool_budget%FOR UPDATE%'",
+            )
+            .bind(&application_name)
+            .fetch_one(&fixture.admin)
+            .await
+            .unwrap();
+            if waiting == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the owned writer must independently wait at the real budget barrier");
+
+    budget_holder.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), settlement.wait())
+        .await
+        .expect("the supervised writer must finish after the budget barrier is released");
+    let row = sqlx::query(
+        "SELECT state, chunk_count, byte_count FROM response_archive_spools WHERE request_id = $1",
+    )
+    .bind(fixture.id.request_id.to_string())
+    .fetch_one(&fixture.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("state"), "pending");
+    assert_eq!(row.get::<i64, _>("chunk_count"), 2);
+    assert_eq!(
+        row.get::<i64, _>("byte_count"),
+        crate::response_archive_spool::CHUNK_BYTES as i64 + 4
+    );
+    state.db.close().await;
+    fixture.finish().await;
+}
+
+#[tokio::test]
 async fn postgres_request_admission_lost_commit_ack_never_dispatches_and_orphan_settles_once() {
     use crate::db::{CreateKeyInput, StartProxyRequest};
     let Some(mut fixture) = PgFixture::new_with_schema(true).await else {
