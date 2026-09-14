@@ -6,5 +6,7 @@ declare global {
     formJourneyReads: string[];
     formJourneyWrites: number;
     failNextFormWrite: boolean;
+    deferNextFormQuotaRead: boolean;
+    releaseFormQuotaRead: () => void;
   }
 }

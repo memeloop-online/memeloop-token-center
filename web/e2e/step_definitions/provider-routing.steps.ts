@@ -169,8 +169,9 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   const providerAccount = page.locator(`.provider-account[data-upstream-id="${seed.upstreamId}"]`);
   await assertContains(providerAccount, 'API 凭据');
   await assertContains(providerAccount, '1 条路由');
-  await providerAccount.locator('.upstream-health-details > summary').click();
-  await providerAccount.locator('.upstream-secondary-actions > summary').click();
+  await providerAccount.getByRole('button', { name: '查看详情', exact: true }).click();
+  await providerAccount.getByRole('button', { name: '近期可用性', exact: true }).click();
+  await providerAccount.getByRole('button', { name: '账号设置与授权操作', exact: true }).click();
   await providerAccount.getByRole('button', { name: '主动健康检查' }).click();
   await assertContains(providerAccount, '连接正常');
   const disabledProvider = page.waitForResponse((response) => {
@@ -178,13 +179,13 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
     return response.request().method() === 'PATCH'
       && url.pathname === `/internal/v1/upstreams/${seed.upstreamId}`;
   });
-  await providerAccount.locator('.upstream-danger-zone > summary').click();
+  await providerAccount.getByRole('button', { name: '危险操作', exact: true }).click();
   await providerAccount.getByRole('button', { name: '停用', exact: true }).click();
   assert.equal((await disabledProvider).status(), 200);
   await page.locator('[data-resource-list-status-filter]').getByRole('button', { name: /显示非正常状态/ }).click();
   await assertContains(providerAccount, '已停用');
   await assertNotContains(providerAccount, '连接正常');
-  await providerAccount.locator('.upstream-danger-zone:not([open]) > summary').click();
+  await providerAccount.getByRole('button', { name: '危险操作', exact: true }).click();
   await providerAccount.getByRole('button', { name: '启用', exact: true }).click();
   await assertContains(providerAccount, '正常');
   await onboarding.locator('[data-workspace-toggle]').click();

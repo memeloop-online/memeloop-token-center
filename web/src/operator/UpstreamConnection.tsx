@@ -1,6 +1,6 @@
 import { useId, useLayoutEffect, useState } from 'react';
 import { api } from '../api';
-import { Button } from '../design-system';
+import { Button, DetailTooltip } from '../design-system';
 import { useI18n } from '../i18n';
 import type { UpstreamAccount } from '../types';
 import { isPrivateProxyUrl } from './upstreamConnectionPolicy';
@@ -58,11 +58,11 @@ export function UpstreamConnection({ account, token, tenant, disabled, onChanged
     <dl>
       <div><dt>{t('connection.baseUrl')}</dt><dd><code>{typeof account.config.base_url === 'string' ? account.config.base_url : '—'}</code>{codex && <span className="connection-endpoint-kind">{t('connection.fixed')}</span>}</dd></div>
       <div><dt>{t('connection.proxy')}</dt><dd><span className={`status ${account.has_proxy && account.proxy_scheme ? 'ok' : 'pending'}`}>{t(account.has_proxy === undefined ? 'connection.proxyUnknown' : account.has_proxy ? proxyState : codex ? proxyState : 'connection.directEgress')}</span>{account.proxy_scheme && <code>{account.proxy_scheme}</code>}{account.has_proxy && account.proxy_scheme && <span>{t(account.proxy_remote_dns ? 'connection.remoteDns' : 'connection.localDns')}</span>}</dd></div>
-      {account.proxy_fingerprint && <div><dt>{t('connection.proxyFingerprint')}</dt><dd><code>{account.proxy_fingerprint}</code></dd></div>}
+      {account.proxy_fingerprint && <div><dt>{t('connection.proxyFingerprint')}</dt><dd><DetailTooltip content={account.proxy_fingerprint}><span tabIndex={0}>{t('providerDirectory.account')}</span></DetailTooltip></dd></div>}
     </dl>
-    <p className="muted">{t('connection.endpointHint')}</p>
+    <DetailTooltip content={t('connection.endpointHint')}><span tabIndex={0} className="connection-help">{t('connection.baseUrl')}</span></DetailTooltip>
     {codex && !canEditProxy && <p>{t('connection.proxyAdminOnly')}</p>}
-    {!codex && <p>{t('connection.genericProxyHint')}</p>}
+    {!codex && <DetailTooltip content={t('connection.genericProxyHint')}><span tabIndex={0} className="connection-help">{t('connection.proxy')}</span></DetailTooltip>}
     {canEditProxy && <><Button appearance="secondary" type="button" disabled={disabled || busy} onClick={() => { setEditing(!editing); setProxy(''); setError(false); setSaved(false); }}>{t(editing ? 'common.cancel' : 'connection.editProxy')}</Button>
       {editing && <form className="upstream-proxy-editor" onSubmit={(event) => { event.preventDefault(); void save(); }}>
         <ProxyInput value={proxy} onChange={setProxy} disabled={busy} />

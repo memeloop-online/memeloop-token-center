@@ -28,7 +28,6 @@ test('mobile navigation closes before editing and uses an opaque surface', { tim
     await page.waitForFunction(() => document.querySelector('.app-sidebar')!.getBoundingClientRect().right <= 0);
     assert.equal(await page.locator('.app-sidebar').evaluate(element => getComputedStyle(element).visibility), 'hidden');
     assert.equal(await page.locator('.app-stage').evaluate(element => (element as HTMLElement).inert), false);
-    await page.getByText('账号设置与授权操作', { exact: true }).click();
     await page.getByRole('button', { name: '编辑', exact: true }).click();
     assert.equal(await page.getByRole('heading', { name: '编辑 研发订阅', exact: true }).count(), 1);
     assert.equal(await page.locator('.create-journey input:not([type="hidden"])').evaluateAll(elements => elements.filter(element => (element as HTMLInputElement).value.includes('chatgpt.com')).length), 0);
