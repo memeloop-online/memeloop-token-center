@@ -129,7 +129,7 @@ async fn require_members_tenant(
             "SELECT COUNT(*) AS found FROM upstream_accounts WHERE tenant_id = $1 AND id IN "
         }
         "model_routes" => {
-            "SELECT COUNT(*) AS found FROM model_routes WHERE tenant_id = $1 AND id IN "
+            "SELECT COUNT(*) AS found FROM model_routes WHERE archived_at IS NULL AND tenant_id = $1 AND id IN "
         }
         "key_records" => {
             "SELECT COUNT(*) AS found FROM key_records WHERE tenant_id = $1 AND id IN "

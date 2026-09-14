@@ -29,7 +29,7 @@ pub(super) async fn find_equivalent_route_in_transaction(
 ) -> Result<Option<ModelRouteView>, AppError> {
     let rows = sqlx::query(
         "SELECT id, tenant_id, public_model, upstream_account_id, upstream_model, protocol, priority, enabled, created_at, updated_at \
-         FROM model_routes WHERE tenant_id = $1 AND public_model = $2 AND upstream_model = $3 \
+         FROM model_routes WHERE archived_at IS NULL AND tenant_id = $1 AND public_model = $2 AND upstream_model = $3 \
            AND protocol = $4 AND priority = $5 AND enabled = $6 ORDER BY created_at, id LIMIT 101",
     )
     .bind(tenant_id)

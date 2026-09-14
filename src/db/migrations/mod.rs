@@ -451,6 +451,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "copyable credential plaintext",
         sql: include_str!("../../../migrations/common/0084_copyable_credential_plaintext.sql"),
     },
+    Migration {
+        version: 85,
+        name: "model route archive",
+        sql: include_str!("../../../migrations/common/0085_model_route_archive.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -887,6 +892,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 84,
         name: "copyable credential plaintext",
         sql: include_str!("../../../migrations/common/0084_copyable_credential_plaintext.sql"),
+    },
+    Migration {
+        version: 85,
+        name: "model route archive",
+        sql: include_str!("../../../migrations/common/0085_model_route_archive.sql"),
     },
 ];
 
