@@ -282,6 +282,7 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
       assert.equal(await client.getByRole('option').filter({ hasText: 'Spark disabled' }).isDisabled(), true);
       await routes.press('Enter');
       assert.equal(await create.locator('.selection-chip').count(), 0, 'disabled routes cannot become implicit new grants');
+      await client.mouse.move(0, 0);
       await routes.fill('');
       await routes.press('ArrowUp');
       assert.match(await routes.evaluate(input => document.getElementById(input.getAttribute('aria-activedescendant')!)?.textContent ?? ''), /Team Kimi/, 'ArrowUp skips trailing disabled candidates');

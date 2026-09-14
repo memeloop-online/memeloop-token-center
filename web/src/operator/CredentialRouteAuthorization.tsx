@@ -40,7 +40,7 @@ export function CredentialRouteAuthorization({ token, tenant, routes, groups, ro
     <section style={{ overflowWrap: 'anywhere' }} aria-label={zh ? '授权范围预览' : 'Authorization scope preview'}>
       <h4>{zh ? '授权范围预览' : 'Authorization scope preview'}</h4>
       {selectedGroups.some(group => !group) && <small>{zh ? '部分路由组目录不可用' : 'Some route groups are unavailable in the catalog'}</small>}
-      <ul>{effectiveIds.map(id => {
+      <ul style={{ color: 'var(--colorNeutralForeground1)' }}>{effectiveIds.map(id => {
         const option = describe(id);
         const sources = [...(routeIds.includes(id) ? [zh ? '直接授权' : 'Direct grant'] : []), ...selectedGroups.filter(group => group?.member_ids.includes(id)).map(group => group!.name)];
         return <li key={id}><DetailTooltip content={option?.details ?? id}><span tabIndex={0}>{option?.label ?? `${zh ? '未知路由' : 'Unknown route'} …${id.slice(-6)}`}</span></DetailTooltip><p className="field-hint">{option?.description ?? (zh ? '路由目录未知' : 'Route catalog unknown')} · {sources.join(' / ')}</p></li>;
