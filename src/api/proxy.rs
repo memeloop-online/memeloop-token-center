@@ -577,7 +577,7 @@ async fn execute_component_primary(
             tracing::warn!(
                 request_id = %request.request_id,
                 upstream_account_id = %primary.route.account_id,
-                error = %error,
+                error_category = error.diagnostic_category(),
                 "current upstream credential is invalid"
             );
             return finish_proxy_failure(&request, "upstream_credential_invalid").await;
