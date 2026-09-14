@@ -1057,7 +1057,7 @@ async fn pending_image_arm_uses_durable_truth_and_preserves_unknown_query_failur
 #[tokio::test]
 async fn non_connect_image_send_timeout_keeps_health_unchanged_and_reservation_uncertain() {
     use super::super::synchronous_image::{
-        ARM_NOT_STARTED, SyncImageRequest, execute_synchronous_image_request,
+        ARM_NOT_STARTED, ImageResponseFormat, SyncImageRequest, execute_synchronous_image_request,
     };
     use std::sync::atomic::{AtomicBool, AtomicU8};
     let upstream = MockServer::start().await;
@@ -1155,7 +1155,7 @@ async fn non_connect_image_send_timeout_keeps_health_unchanged_and_reservation_u
         &placeholder,
         &route,
         request,
-        false,
+        ImageResponseFormat::OpenAi,
     )
     .await
     .unwrap();

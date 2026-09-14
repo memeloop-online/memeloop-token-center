@@ -86,6 +86,13 @@ pub(super) async fn image_idempotency_replay_response(
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ImageResponseFormat {
+    OpenAi,
+    ResponsesTool,
+    Antigravity,
+}
+
 pub(super) struct SyncImageRequest<'a> {
     pub(super) state: &'a AppState,
     pub(super) reservation: &'a crate::model::UsageReservation,
@@ -208,7 +215,7 @@ pub(super) async fn execute_synchronous_image_request(
     staged_request_object: &str,
     route: &crate::provider::ResolvedUpstream,
     request: reqwest::RequestBuilder,
-    responses_tool_mode: bool,
+    response_format: ImageResponseFormat,
 ) -> Result<Response, AppError> {
     let state = context.state;
     let request_id = context.request_id;
@@ -403,10 +410,14 @@ pub(super) async fn execute_synchronous_image_request(
     if !renew_image_request_claim(context).await? {
         return Ok(replayed_image_failure(request_id, "idempotency_claim_lost"));
     }
-    let result = if responses_tool_mode {
-        finish_responses_tool_image(context, upstream_status, response_bytes).await
-    } else {
-        finish_openai_image_response(context, route, upstream_status, response_bytes).await
+    let result = match response_format {
+        ImageResponseFormat::ResponsesTool | ImageResponseFormat::Antigravity => {
+            finish_responses_tool_image(context, upstream_status, response_bytes, response_format)
+                .await
+        }
+        ImageResponseFormat::OpenAi => {
+            finish_openai_image_response(context, route, upstream_status, response_bytes).await
+        }
     };
     if result
         .as_ref()
@@ -956,6 +967,7 @@ async fn finish_responses_tool_image(
     context: &SyncImageRequest<'_>,
     upstream_status: StatusCode,
     bytes: Bytes,
+    response_format: ImageResponseFormat,
 ) -> Result<Response, AppError> {
     let state = context.state;
     let request_id = context.request_id;
@@ -964,7 +976,10 @@ async fn finish_responses_tool_image(
         let error_code = format!("upstream_http_{}", upstream_status.as_u16());
         return fail_image_request(context, &error_code).await;
     }
-    let parsed = match super::responses_tool_image::parse_responses_tool_image(&bytes) {
+    let parsed = match match response_format {
+        ImageResponseFormat::Antigravity => super::antigravity_image::parse(&bytes),
+        _ => super::responses_tool_image::parse_responses_tool_image(&bytes),
+    } {
         Ok(parsed) => parsed,
         Err(super::responses_tool_image::ResponsesToolImageParseError::InvalidJson) => {
             return fail_image_request(context, "upstream_image_invalid_json").await;

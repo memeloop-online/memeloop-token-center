@@ -79,6 +79,33 @@ impl Database {
         now: i64,
         poll_interval_seconds: u64,
     ) -> Result<OAuthLoginClaim, AppError> {
+        self.claim_oauth_login_poll_impl(reference, now, poll_interval_seconds, false)
+            .await
+    }
+
+    /// Only already-issued code-flow results may recover during the existing
+    /// 24-hour session cleanup retention. Expired pending exchanges stay closed.
+    pub async fn claim_oauth_code_ready_recovery(
+        &self,
+        reference: &OAuthLoginSessionReference,
+        now: i64,
+    ) -> Result<OAuthLoginClaim, AppError> {
+        if reference.flow_kind != "generic_authorization_code"
+            || now >= reference.expires_at.saturating_add(24 * 60 * 60 * 1000)
+        {
+            return Err(AppError::BadRequest("OAuth login recovery expired".into()));
+        }
+        self.claim_oauth_login_poll_impl(reference, now, 1, true)
+            .await
+    }
+
+    async fn claim_oauth_login_poll_impl(
+        &self,
+        reference: &OAuthLoginSessionReference,
+        now: i64,
+        poll_interval_seconds: u64,
+        allow_ready_recovery: bool,
+    ) -> Result<OAuthLoginClaim, AppError> {
         if poll_interval_seconds == 0 {
             return Err(AppError::BadRequest(
                 "OAuth login poll interval must be positive".into(),
@@ -131,7 +158,17 @@ impl Database {
         .ok_or(AppError::Forbidden)?;
         require_matching_reference(&row, reference)?;
         let expires_at: i64 = row.try_get("expires_at")?;
-        if expires_at <= now {
+        let recoverable = allow_ready_recovery
+            && matches!(
+                row.try_get::<String, _>("status")?.as_str(),
+                "ready" | "finalizing" | "consumed"
+            );
+        if expires_at <= now && !recoverable {
+            if allow_ready_recovery {
+                // A finalization/status check must not mutate an expired
+                // pending exchange into failed or attempt a token request.
+                return Err(AppError::BadRequest("OAuth login session expired".into()));
+            }
             let _ = sqlx::query(
                 "UPDATE oauth_login_sessions SET status = 'failed', lease_owner = NULL, lease_expires_at = NULL, updated_at = $1 WHERE id = $2 AND status IN ('pending', 'polling')",
             )
@@ -251,6 +288,25 @@ impl Database {
         Ok(())
     }
 
+    /// Replace encrypted flow state only while the same poll lease still owns it.
+    /// Standard code exchange uses this for its durable no-replay send boundary.
+    pub async fn replace_oauth_login_poll_state(
+        &self,
+        session_id: Uuid,
+        lease_owner: Uuid,
+        state_ciphertext: String,
+    ) -> Result<(), AppError> {
+        if state_ciphertext.is_empty() || state_ciphertext.len() > 256 * 1024 {
+            return Err(AppError::BadRequest("OAuth state exceeds bounds".into()));
+        }
+        let changed = sqlx::query("UPDATE oauth_login_sessions SET state_ciphertext = $1 WHERE id = $2 AND status = 'polling' AND lease_owner = $3")
+            .bind(state_ciphertext).bind(session_id.to_string()).bind(lease_owner.to_string()).execute(&self.pool).await?;
+        if changed.rows_affected() != 1 {
+            return Err(AppError::Conflict("OAuth login poll lease changed".into()));
+        }
+        Ok(())
+    }
+
     pub async fn fail_oauth_login_poll(
         &self,
         session_id: Uuid,
@@ -361,6 +417,7 @@ fn validate_session_scope(
     if !matches!(
         flow_kind,
         "openai_codex_device"
+            | "generic_authorization_code"
             | "cursor_pkce"
             | "provider_adapter_cursor_pkce"
             | "claude_manual_pkce"
