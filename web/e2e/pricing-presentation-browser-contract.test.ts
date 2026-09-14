@@ -80,5 +80,19 @@ test('pricing comparison, deferred usage, provenance and editor drafts remain tr
     await page.getByRole('alert').filter({ hasText: 'Request statistics are unavailable' }).waitFor();
     assert.equal(await page.locator('.token-pricing-table tbody tr').count(), 2);
     assert.doesNotMatch(await page.locator('.token-pricing-table').innerText(), /No requests/);
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/pricing-presentation.html?table-states`);
+    await page.getByLabel('Show', { exact: true }).selectOption('used');
+    assert.equal(await page.locator('.token-pricing-table tbody tr').count(), 1);
+    await page.getByRole('button', { name: 'Reload usage', exact: true }).click();
+    assert.equal(await page.locator('.token-pricing-table tbody tr').count(), 0, 'active used filter never silently expands during reload');
+    await page.getByRole('button', { name: 'Reject usage', exact: true }).click();
+    await page.getByRole('status').filter({ hasText: 'used-model filter cannot be applied' }).waitFor();
+    assert.equal(await page.getByLabel('Show', { exact: true }).inputValue(), 'used');
+    assert.equal(await page.locator('.token-pricing-table tbody tr').count(), 0);
+    await page.getByRole('button', { name: 'Clear filters', exact: true }).click();
+    await page.getByRole('button', { name: 'Reload prices', exact: true }).click();
+    assert.doesNotMatch(await page.locator('.token-pricing-table').innerText(), /Missing/);
+    await page.getByLabel('Show', { exact: true }).selectOption('missing');
+    assert.equal(await page.locator('.token-pricing-table tbody tr').count(), 0, 'unresolved price pages do not prove missing prices');
   } finally { await browser.close(); await server.close(); }
 });

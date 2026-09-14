@@ -1,6 +1,7 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { MtcFluentProvider } from '../../src/design-system';
 import { PricingPage } from '../../src/operator/pages/ManagementPages';
+import { PricingTable } from '../../src/operator/PricingTable';
 import { createRoot } from 'react-dom/client';
 import { I18nProvider } from '../../src/i18n';
 import { CredentialPolicySummary } from '../../src/operator/CredentialPolicySummary';
@@ -12,6 +13,20 @@ import '../../src/theme.css';
 
 const policy = { requests_per_minute: 4294967295, tokens_per_minute: 9007199254740991, max_concurrency: 4294967295, daily_budget: null, weekly_budget: '1234567', lifetime_budget: null };
 const workspace = new URLSearchParams(location.search).has('workspace');
+const tableStates = new URLSearchParams(location.search).has('table-states');
+function TableStates() {
+  const [usageState, setUsageState] = useState('ready');
+  const [loading, setLoading] = useState(false);
+  return <main className="pricing-page" style={{ padding: 16 }}>
+    <button onClick={() => setUsageState('loading')}>Reload usage</button>
+    <button onClick={() => setUsageState('failed')}>Reject usage</button>
+    <button onClick={() => setLoading(true)}>Reload prices</button>
+    <PricingTable currency="USD" loading={loading} usageLoading={usageState === 'loading'} usageFailed={usageState === 'failed'} rows={[
+      { model: 'used-model', usage: { model: 'used-model', calls: 7, input_tokens: 0, output_tokens: 0 } },
+      { model: 'unused-model' },
+    ]} />
+  </main>;
+}
 let releaseUsage: ((response: Response) => void) | undefined;
 const respond = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
 if (workspace) {
@@ -31,7 +46,7 @@ if (workspace) {
     return respond({ error: { code: 'fixture_unexpected_request', message: path } }, 400);
   };
 }
-createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider>{workspace ? <main style={{ padding: 16 }}>
+createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider>{tableStates ? <TableStates /> : workspace ? <main style={{ padding: 16 }}>
   <button onClick={() => releaseUsage?.(respond({ models: [{ model: 'active-model', calls: 7, input_tokens: 100, output_tokens: 20 }, { model: 'missing-model', calls: 2, input_tokens: 20, output_tokens: 5 }] }))}>Complete usage</button>
   <button onClick={() => releaseUsage?.(respond({ error: { code: 'unavailable', message: 'Fixture usage unavailable' } }, 503))}>Fail usage</button>
   <PricingPage token="fixture-operator" tenant="fixture" writeTenant="fixture" />

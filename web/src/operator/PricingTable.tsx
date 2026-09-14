@@ -20,7 +20,8 @@ export function PricingTable({ rows, currency, loading, usageLoading, usageFaile
   const usageReady = !usageLoading && !usageFailed;
   const query = search.trim().toLocaleLowerCase(locale);
   const filtered = rows.filter(row => (!query || `${row.model} ${row.tier?.source ?? ''}`.toLocaleLowerCase(locale).includes(query))
-    && (filter === 'all' || filter === 'missing' && !row.tier || filter === 'used' && (!usageReady || (row.usage?.calls ?? 0) > 0)));
+    && (filter === 'all' || filter === 'missing' && !loading && !row.tier || filter === 'used' && usageReady && (row.usage?.calls ?? 0) > 0));
+  const unavailableFilter = filter === 'used' && !usageReady;
   const tierLabel = (tier: string) => tier === 'default' ? t('pricing.tierDefault') : tier === 'priority' ? t('pricing.tierPriority') : tier === 'flex' ? t('pricing.tierFlex') : tier;
   return <section className="pricing-catalog">
     <div className="pricing-list-controls">
@@ -37,10 +38,10 @@ export function PricingTable({ rows, currency, loading, usageLoading, usageFaile
           <td><strong className="pricing-model-name">{row.model}</strong>{row.tier && <small>{tierLabel(row.tier.service_tier)}</small>}</td>
           <td><DetailTooltip content={t(usageLoading ? 'pricing.usageLoading' : usageFailed ? 'pricing.usageUnavailable' : 'pricing.callsHint')}><span tabIndex={0}>{usageLoading ? t('pricing.loadingShort') : usageFailed ? '—' : row.usage ? formatNumber(row.usage.calls, locale) : t('pricing.noCalls')}</span></DetailTooltip></td>
           {(['input_per_million', 'cached_input_per_million', 'cache_write_per_million', 'output_per_million'] as const).map(field => <td key={field}>{row.tier ? <>{formatCurrency(row.tier[field], currency, locale)}{row.tier.cache_price_estimated && (field === 'cached_input_per_million' || field === 'cache_write_per_million') && <DetailTooltip content={t('pricing.estimatedHint')}><small tabIndex={0}>{t('pricing.estimated')}</small></DetailTooltip>}</> : '—'}</td>)}
-          <td>{row.tier ? <><PriceSource source={row.tier.source} /><DetailTooltip content={`${t('pricing.updated')}: ${new Date(row.tier.updated_at).toLocaleString(locale)}`}><time tabIndex={0} dateTime={new Date(row.tier.updated_at).toISOString()}>{new Date(row.tier.updated_at).toLocaleDateString(locale)}</time></DetailTooltip></> : <span>{t('pricing.missing')}</span>}</td>
+          <td>{row.tier ? <><PriceSource source={row.tier.source} /><DetailTooltip content={`${t('pricing.updated')}: ${new Date(row.tier.updated_at).toLocaleString(locale)}`}><time tabIndex={0} dateTime={new Date(row.tier.updated_at).toISOString()}>{new Date(row.tier.updated_at).toLocaleDateString(locale)}</time></DetailTooltip></> : <span>{loading ? t('pricing.loadingPrices') : t('pricing.missing')}</span>}</td>
         </tr>)}</tbody>
       </table>
-      {!filtered.length && <div className="empty">{loading ? t('pricing.loadingPrices') : search || filter !== 'all' ? t('pricing.noMatches') : t('pricing.noPricesForCurrency', { currency })}</div>}
+      {!filtered.length && <div className="empty" role="status">{unavailableFilter ? t(usageLoading ? 'pricing.usageLoading' : 'pricing.usedFilterUnavailable') : loading ? t('pricing.loadingPrices') : search || filter !== 'all' ? t('pricing.noMatches') : t('pricing.noPricesForCurrency', { currency })}</div>}
     </div>
   </section>;
 }
