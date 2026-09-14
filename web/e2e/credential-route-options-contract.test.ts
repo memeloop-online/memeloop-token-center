@@ -36,7 +36,7 @@ test('technical IDs are tooltip details and duplicate labels use collision-safe 
     assert.ok(option.details.includes(option.value));
   }
   const inactiveDuplicate = credentialRouteOptions([route(first), route(second, { enabled: false })], [], [], 'zh-CN');
-  assert.equal(inactiveDuplicate[0].label, '未找到候选账号 → Sol', 'inactive history does not disambiguate the sole available route');
+  assert.equal(inactiveDuplicate[0].label, 'Sol', 'inactive history does not disambiguate the sole available route');
   assert.equal(inactiveDuplicate[1].disabled, true);
   assert.ok(inactiveDuplicate[1].details.includes(second), 'inactive identity stays available to existing grant previews');
 });
