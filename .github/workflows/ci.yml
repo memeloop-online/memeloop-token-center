@@ -681,7 +681,9 @@ jobs:
           retention-days: 30
 
   verify-ghcr-release:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    if: >-
+      always() && github.event_name == 'push' && github.ref == 'refs/heads/master' &&
+      needs.publish-ghcr.result == 'success'
     needs: [publish-ghcr]
     runs-on: ubuntu-latest
     timeout-minutes: 20
