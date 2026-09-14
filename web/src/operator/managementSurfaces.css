@@ -1,0 +1,78 @@
+/* Management composition only. Leave controls, focus rings, data separators,
+   quota surfaces, analytics, installation behavior and request drawers alone.
+   Include the theme selector so the legacy light .panel rule cannot re-card
+   an intentionally flat workspace. */
+:root[data-theme] .app-main-content[data-surface='operator']:is(
+  [data-route='providers'], [data-route='routes'], [data-route='pricing'],
+  [data-route='credentials'], [data-route='plugins'], [data-route='settings']
+) :is(
+  .provider-layout > .panel,
+  .management-layout > .panel,
+  .pricing-page > .panel,
+  .settings-access-card.panel,
+  .system-settings .settings-card
+) {
+  background: transparent;
+  border-inline: 0;
+  border-top: 0;
+  border-radius: 0;
+  box-shadow: none;
+  padding-inline: 0;
+}
+
+/* Rows are separated once, not boxed inside an already grouped list. */
+:root[data-theme] .app-main-content[data-surface='operator']:is(
+  [data-route='routes'], [data-route='credentials'], [data-route='plugins']
+) .managed-resource {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  padding: var(--spacingVerticalL) 0;
+}
+:root[data-theme] .app-main-content[data-surface='operator']:is(
+  [data-route='routes'], [data-route='credentials'], [data-route='plugins']
+) .managed-resource + .managed-resource {
+  border-top: 1px solid var(--colorNeutralStroke2);
+}
+
+:root[data-theme] .app-main-content[data-surface='operator'][data-route='plugins'] .panel {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  padding-inline: 0;
+}
+:root[data-theme] .app-main-content[data-surface='operator'][data-route='plugins'] .managed-resource > .inline-editor,
+:root[data-theme] .app-main-content[data-surface='operator'][data-route='plugins'] .managed-resource > .inline-editor fieldset {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  padding: var(--spacingVerticalM) 0 0;
+}
+
+/* Old schema sections can out-specificity the existing flat journey styles.
+   Preserve fieldset/legend semantics, replace the extra frame with spacing. */
+:root[data-theme] .app-main-content[data-surface='operator']:is(
+  [data-route='providers'], [data-route='routes'], [data-route='pricing'], [data-route='credentials']
+) .create-journey :is(.operator-form-section, .operator-form-advanced, .upstream-advanced) {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  padding: 0;
+}
+
+/* Group managers already have a heading and a list. A second outer panel adds
+   no information; keep the row/table separators and focus outlines within. */
+:root[data-theme] .app-main-content[data-surface='operator']:is(
+  [data-route='routes'], [data-route='credentials']
+) .group-manager.panel {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  padding-inline: 0;
+  margin-top: var(--spacingVerticalXXL);
+}

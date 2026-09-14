@@ -208,15 +208,6 @@ async fn refresh_at(
     request_guard: &dyn OAuthRefreshRequestGuard,
 ) -> Result<UpstreamCredential, AppError> {
     validate_credential(credential)?;
-    let UpstreamCredential::OAuth {
-        refresh_token: Some(refresh_token),
-        expires_at,
-        adapter_state,
-        ..
-    } = credential
-    else {
-        return Err(invalid());
-    };
     let client = network::client_for_config_url(
         http,
         endpoint,
@@ -226,6 +217,24 @@ async fn refresh_at(
     )
     .await
     .map_err(|_| failed())?;
+    refresh_with_client(&client, credential, endpoint, request_guard).await
+}
+
+async fn refresh_with_client(
+    client: &reqwest::Client,
+    credential: &UpstreamCredential,
+    endpoint: &str,
+    request_guard: &dyn OAuthRefreshRequestGuard,
+) -> Result<UpstreamCredential, AppError> {
+    let UpstreamCredential::OAuth {
+        refresh_token: Some(refresh_token),
+        expires_at,
+        adapter_state,
+        ..
+    } = credential
+    else {
+        return Err(invalid());
+    };
     let form = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("client_id", CLIENT_ID)
         .append_pair("grant_type", "refresh_token")
@@ -289,11 +298,27 @@ async fn refresh_at(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{body_string_contains, header, method, path},
     };
+
+    struct RecordingRequestGuard(AtomicBool);
+
+    #[async_trait::async_trait]
+    impl OAuthRefreshRequestGuard for RecordingRequestGuard {
+        async fn mark_request_started(&self) -> Result<(), AppError> {
+            self.0.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     fn credential(device_id: &str) -> UpstreamCredential {
         UpstreamCredential::OAuth {
@@ -311,6 +336,19 @@ mod tests {
             proxy_url: None,
             proxy_network_scope: None,
         }
+    }
+
+    fn with_proxy(mut credential: UpstreamCredential, proxy_url: String) -> UpstreamCredential {
+        if let UpstreamCredential::OAuth {
+            proxy_url: stored_url,
+            proxy_network_scope,
+            ..
+        } = &mut credential
+        {
+            *stored_url = Some(proxy_url);
+            *proxy_network_scope = Some(crate::network::OutboundScope::Private);
+        }
+        credential
     }
 
     fn native_document(expired: &str) -> Value {
@@ -422,6 +460,115 @@ mod tests {
             assert!(value["expires_at"].as_i64().unwrap() > crate::db::unix_millis());
             server.verify().await;
         }
+    }
+
+    #[tokio::test]
+    async fn refresh_request_uses_socks5h_remote_dns_and_preserves_account_proxy() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(header("x-msh-device-id", "fixture-device"))
+            .and(header("content-type", "application/x-www-form-urlencoded"))
+            .and(body_string_contains(format!("client_id={CLIENT_ID}")))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("refresh_token=fixture-refresh"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("connection", "close")
+                    .set_body_json(json!({
+                        "access_token": "proxy-refreshed-access",
+                        "refresh_token": "proxy-refreshed-token",
+                        "expires_in": 3600,
+                        "token_type": "Bearer"
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = listener.local_addr().unwrap();
+        let target_address = *server.address();
+        let proxy = tokio::spawn(async move {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let mut greeting = [0_u8; 2];
+            client.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting[0], 5);
+            let mut methods = vec![0_u8; usize::from(greeting[1])];
+            client.read_exact(&mut methods).await.unwrap();
+            assert!(methods.contains(&0));
+            client.write_all(&[5, 0]).await.unwrap();
+
+            let mut request = [0_u8; 4];
+            client.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, &[5, 1, 0, 3]);
+            let mut hostname_length = [0_u8; 1];
+            client.read_exact(&mut hostname_length).await.unwrap();
+            let mut hostname = vec![0_u8; usize::from(hostname_length[0])];
+            client.read_exact(&mut hostname).await.unwrap();
+            assert_eq!(hostname, b"kimi-refresh.test");
+            let mut port = [0_u8; 2];
+            client.read_exact(&mut port).await.unwrap();
+            assert_eq!(u16::from_be_bytes(port), target_address.port());
+
+            let mut upstream = TcpStream::connect(target_address).await.unwrap();
+            client
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                .await
+                .unwrap();
+        });
+
+        let proxy_url = format!("socks5h://{proxy_address}");
+        let current = with_proxy(credential("fixture-device"), proxy_url.clone());
+        // The production network layer passes the same account proxy URL to
+        // `reqwest::Proxy::all` after validating the fixed Kimi destination.
+        // Keep this hostname absent from local DNS so this request can succeed
+        // only when the SOCKS5H client sends the original name to the proxy.
+        let client = crate::build_explicit_proxy_http_client(&proxy_url, &[]).unwrap();
+        let refreshed = refresh_with_client(
+            &client,
+            &current,
+            &format!("http://kimi-refresh.test:{}/token", target_address.port()),
+            &crate::oauth::TEST_OAUTH_REFRESH_REQUEST_GUARD,
+        )
+        .await
+        .unwrap();
+        let rendered = serde_json::to_value(refreshed).unwrap();
+        assert_eq!(rendered["access_token"], "proxy-refreshed-access");
+        assert_eq!(rendered["refresh_token"], "proxy-refreshed-token");
+        assert_eq!(rendered["adapter_state"]["device_id"], "fixture-device");
+        assert_eq!(rendered["proxy_url"], proxy_url);
+        assert_eq!(rendered["proxy_network_scope"], "private");
+        tokio::time::timeout(Duration::from_secs(2), proxy)
+            .await
+            .unwrap()
+            .unwrap();
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_refresh_proxy_fails_before_the_request_fence() {
+        let current = with_proxy(
+            credential("fixture-device"),
+            "socks5h://8.8.8.8:1080".to_owned(),
+        );
+        let guard = RecordingRequestGuard(AtomicBool::new(false));
+        let error = refresh_at(
+            &crate::build_http_client().unwrap(),
+            &current,
+            true,
+            "http://localhost:9/token",
+            &guard,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, AppError::Upstream(message) if message == "Kimi OAuth refresh failed")
+        );
+        assert!(!guard.0.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

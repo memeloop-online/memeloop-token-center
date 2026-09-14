@@ -20,7 +20,7 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
   onChanged: () => Promise<void>; onLock: (locked: boolean) => void;
 }) {
   const { locale, t } = useI18n();
-  const copy = authorizationCodeCopy(locale);
+  const copy = authorizationCodeCopy(locale, provider.id);
   const { confirm, confirmationDialog } = useConfirmDialog([token, tenant, provider.id]);
   const [name, setName] = useState(provider.display_name);
   const [config, setConfig] = useState<Record<string, unknown>>({});

@@ -223,6 +223,8 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
   const generationDuration = event.generation_duration_ms ?? previous?.generation_duration_ms;
   if (firstOutput !== undefined) request.first_output_ms = firstOutput;
   if (generationDuration !== undefined) request.generation_duration_ms = generationDuration;
+  const compaction = event.compaction ?? previous?.compaction;
+  if (compaction !== undefined) request.compaction = compaction;
   if (credentialIdentity !== undefined) request.credential_identity = credentialIdentity;
   return request;
 }

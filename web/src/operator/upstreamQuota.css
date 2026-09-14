@@ -20,3 +20,5 @@
 .upstream-quota-skeleton i { background: var(--picker-hover); border-radius: 10px; display: block; min-height: 96px; }
 .upstream-quota .upstream-quota-reset-action button { min-height: 42px; }
 @media (max-width: 600px) { .upstream-quota-skeleton { grid-template-columns: 1fr; } .upstream-quota-heading button { min-height: 44px; } }
+.quota-read-toolbar { flex-wrap: wrap; gap: 12px; margin-block: 12px; }
+.provider-directory-summary [data-reset-credit-expiry] { overflow-wrap: anywhere; font-size: 12px; }
