@@ -34,7 +34,11 @@ async fn blocked_snapshot_with_maximum_candidates_cannot_extend_frozen_deadline(
     )
     .await
     .unwrap();
-    assert_eq!(tokio::time::Instant::now(), deadline);
+    // Tokio's timer wheel rounds a deadline up to the next millisecond tick,
+    // even with paused time; this is not additional policy/DB wait budget.
+    let completed = tokio::time::Instant::now();
+    assert!(completed >= deadline);
+    assert!(completed <= deadline + Duration::from_millis(1));
     assert_eq!(candidates, before);
     assert!(state.group_routing.is_none());
     drop(held);
