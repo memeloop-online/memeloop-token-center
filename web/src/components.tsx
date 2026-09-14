@@ -5,6 +5,7 @@ import { useI18n } from './i18n.js';
 import { formatCurrency, formatCurrencyDisplay, formatDurationDisplay, formatMetricDisplay, formatMetricNumber, formatMilliseconds, formatNumber } from './format.js';
 import { useAnchoredPopover } from './useAnchoredPopover.js';
 import { DetailTooltip } from './design-system';
+import { RequestStatus } from './RequestStatus';
 import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCredentialLabel, requestIsPending } from './requestTablePresentation';
 
 export function Shell({ children, operator = false }: { children: ReactNode; operator?: boolean }) {
@@ -194,26 +195,25 @@ export function RequestDiagnostics({
   upstreamName?: string;
 }) {
   const { locale, t } = useI18n();
-  const successful = request.status_code !== null && request.status_code < 400;
+  const pending = requestIsPending(request);
   const currencyForRequest = recordedCurrency(request, currency);
   const context = request.session_context;
   const sessionLabel = context?.session_name ?? t('sessions.reportedNameMissing');
   const sessionMetadata = [context?.task_kind, context?.agent_id].filter(Boolean).join(' · ');
 
-  return <div className="request-diagnostics">
+  return <div className="request-diagnostics request-detail-surface">
     <span><b>{t('request.request')}</b><RequestIdentifier requestId={request.request_id} /></span>
     <span><b>{t('request.receivedAt')}</b>{new Date(request.created_at).toLocaleString(locale)}</span>
     <span><b>{t('request.completedAt')}</b>{request.completed_at === null || request.completed_at === undefined ? '—' : new Date(request.completed_at).toLocaleString(locale)}</span>
-    <span><b>{t('request.status')}</b><i className={`status ${successful ? 'ok' : request.status_code ? 'bad' : 'pending'}`}>{request.status_code ?? t('common.running')}</i></span>
+    <span><b>{t('request.status')}</b><RequestStatus request={request} /></span>
     <span><b>{t('request.protocol')}</b>{request.protocol}</span>
     <span><b>{t('request.duration')}</b>{formatMilliseconds(request.duration_ms, locale)}</span>
     <span><RequestOutputRate request={request} /></span>
     <span><b>{t('request.upstreamId')}</b>{upstreamName && <small>{upstreamName}</small>}{request.upstream_account_id ?? '—'}</span>
     <span><b>{t('request.routeId')}</b>{request.route_id ?? '—'}</span>
-    <span><b>{t('request.tokens')}</b>{formatNumber(request.input_tokens + request.output_tokens, locale)}
-      <RequestTokenSummary request={request} />
+    <span><b>{t('request.tokens')}</b>{pending ? <DetailTooltip content={t('request.pendingUsage')}><span tabIndex={0}>{locale === 'zh-CN' ? '待结算' : 'Awaiting settlement'}</span></DetailTooltip> : <>{formatNumber(request.input_tokens + request.output_tokens, locale)}<RequestTokenSummary request={request} /></>}
     </span>
-    <span><b>{t('request.cost')}</b>{currencyForRequest ? formatCurrency(request.cost, currencyForRequest, locale) : '—'}</span>
+    <span><b>{t('request.cost')}</b>{pending ? <DetailTooltip content={t('request.pendingUsage')}><span tabIndex={0}>{locale === 'zh-CN' ? '待结算' : 'Awaiting settlement'}</span></DetailTooltip> : currencyForRequest ? formatCurrency(request.cost, currencyForRequest, locale) : '—'}</span>
     <span><b>{t('request.error')}</b>{request.error_code ?? '—'}</span>
     {context && <span><b>{t('request.session')}</b>
       {context.association === 'confirmed'
@@ -286,7 +286,7 @@ export function RequestTable({
               <td className="request-credential-cell"><DetailTooltip content={credentialDetails}><strong tabIndex={0}>{credentialLabel}</strong></DetailTooltip></td>
               <td className="request-model-cell"><DetailTooltip content={technicalSummary}><span className="request-routing-info" tabIndex={0}><code>{request.model}</code>{upstreamName && <small className="request-upstream-name">{upstreamName}</small>}</span></DetailTooltip></td>
               <td className="request-token-cell"><DetailTooltip content={tokenDetails}><span className="request-value-info request-token-total" aria-label={pending ? copy.pendingUsage : `${copy.total} ${tokenDisplay.text} (${tokenDetails})`} tabIndex={0}>{pending ? t('common.running') : <>{copy.total} <span>{tokenDisplay.text}</span></>}</span></DetailTooltip>
-                <span className="request-token-primary"><span>{copy.input} <b>{uncachedInput === null ? <DetailTooltip content={pending ? copy.pendingUsage : copy.cacheMissing}><span tabIndex={0}>—</span></DetailTooltip> : formatMetricDisplay(uncachedInput, locale).text}</b></span><span>{copy.output} <b>{pending ? '—' : formatMetricDisplay(request.output_tokens, locale).text}</b></span></span>
+                {pending ? <DetailTooltip content={copy.pendingUsage}><span className="request-token-pending" tabIndex={0}>{locale === 'zh-CN' ? '用量待结算' : 'Usage pending settlement'}</span></DetailTooltip> : <span className="request-token-primary"><span>{copy.input} <b>{uncachedInput === null ? <DetailTooltip content={copy.cacheMissing}><span tabIndex={0}>{copy.unknown}</span></DetailTooltip> : formatMetricDisplay(uncachedInput, locale).text}</b></span><span>{copy.output} <b>{formatMetricDisplay(request.output_tokens, locale).text}</b></span></span>}
               </td>
               <td className="request-cost-cell"><span className="request-value-info" title={cost.title} aria-label={cost.title ? `${cost.text} (${cost.title})` : undefined} tabIndex={cost.title ? 0 : undefined}>{cost.text}</span></td>
               {showsSession && <td className="request-session-cell">
@@ -299,7 +299,7 @@ export function RequestTable({
                     : <span className="request-session-unlinked">{t('sessions.unlinkedRequests')}</span>}
                 {sessionMeta && <RequestSessionMetadata value={sessionMeta} />}
               </td>}
-              <td><span className={`status ${request.status_code && request.status_code < 400 ? 'ok' : request.status_code ? 'bad' : 'pending'}`} title={request.error_code ?? undefined} aria-label={request.error_code ? `${request.status_code ?? t('common.running')}: ${request.error_code}` : undefined}>{request.status_code ?? t('common.running')}</span>{request.error_code && <span className="visually-hidden">{request.error_code}</span>}</td>
+              <td><RequestStatus request={request} />{request.error_code && <span className="visually-hidden">{request.error_code}</span>}</td>
               <td><span className="request-duration-info" title={[duration.title, durationSummary].filter(Boolean).join(' · ') || undefined} aria-label={[duration.text, duration.title, durationSummary].filter(Boolean).join(' · ') || undefined} tabIndex={duration.title || durationSummary ? 0 : undefined}>{duration.text}</span></td>
               <td className="request-tps-cell"><RequestOutputRate request={request} /></td>
               {onSelect && <td><button className="secondary table-action" type="button" onClick={() => onSelect(request)} aria-label={t('request.openDetail', { model: request.model })}>{t('request.inspect')}</button></td>}
