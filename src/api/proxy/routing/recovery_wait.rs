@@ -36,6 +36,30 @@ enum Check<T> {
     Stop,
 }
 
+struct WaitObservation {
+    request_id: Uuid,
+    started: Instant,
+    checks: u64,
+    check_ms: u64,
+    sleep_ms: u64,
+    outcome: &'static str,
+}
+
+impl Drop for WaitObservation {
+    fn drop(&mut self) {
+        tracing::info!(
+            request_id = %self.request_id,
+            phase = "candidate_recovery_wait",
+            outcome = self.outcome,
+            elapsed_ms = self.started.elapsed().as_millis() as u64,
+            checks = self.checks,
+            check_ms = self.check_ms,
+            sleep_ms = self.sleep_ms,
+            "unsent candidate recovery wait summary"
+        );
+    }
+}
+
 #[cfg(test)]
 async fn bounded_wait<T, F, Fut>(
     deadline: Instant,
@@ -47,7 +71,15 @@ where
     F: FnMut(Arc<OwnedSemaphorePermit>) -> Fut,
     Fut: Future<Output = Result<Check<T>, AppError>>,
 {
-    bounded_wait_with_recheck(deadline, RECHECK, permits, metrics, check).await
+    bounded_wait_with_recheck(
+        deadline,
+        RECHECK,
+        permits,
+        metrics,
+        crate::api::proxy_diagnostics::Context::current().request_id,
+        check,
+    )
+    .await
 }
 
 async fn bounded_wait_with_recheck<T, F, Fut>(
@@ -55,13 +87,23 @@ async fn bounded_wait_with_recheck<T, F, Fut>(
     recheck: Duration,
     permits: Arc<Semaphore>,
     metrics: Option<&crate::metrics::Metrics>,
+    request_id: Uuid,
     mut check: F,
 ) -> Result<Option<T>, AppError>
 where
     F: FnMut(Arc<OwnedSemaphorePermit>) -> Fut,
     Fut: Future<Output = Result<Check<T>, AppError>>,
 {
+    let mut observation = WaitObservation {
+        request_id,
+        started: Instant::now(),
+        checks: 0,
+        check_ms: 0,
+        sleep_ms: 0,
+        outcome: "not_completed",
+    };
     let Ok(permit) = permits.try_acquire_owned() else {
+        observation.outcome = "capacity_rejected";
         if let Some(metrics) = metrics {
             metrics.observe_upstream_health(
                 UpstreamHealthEvent::Skipped,
@@ -73,19 +115,39 @@ where
     let permit = Arc::new(permit);
     loop {
         if Instant::now() >= deadline {
+            observation.outcome = "deadline";
             return Ok(None);
         }
         // DB queries/transactions finish before the timer; no DB transaction
         // spans a sleep. Cancellation drops a Ready value's attempt guard.
-        let checked = match tokio::time::timeout_at(deadline, check(permit.clone())).await {
-            Ok(checked) => checked?,
-            Err(_) => return Ok(None),
+        observation.checks += 1;
+        let started = Instant::now();
+        let checked = tokio::time::timeout_at(deadline, check(permit.clone())).await;
+        observation.check_ms += started.elapsed().as_millis() as u64;
+        let checked = match checked {
+            Ok(Ok(checked)) => checked,
+            Ok(Err(error)) => {
+                observation.outcome = "check_error";
+                return Err(error);
+            }
+            Err(_) => {
+                observation.outcome = "deadline";
+                return Ok(None);
+            }
         };
         match checked {
-            Check::Ready(value) => return Ok(Some(value)),
-            Check::Stop => return Ok(None),
+            Check::Ready(value) => {
+                observation.outcome = "ready";
+                return Ok(Some(value));
+            }
+            Check::Stop => {
+                observation.outcome = "ineligible";
+                return Ok(None);
+            }
             Check::Retry => {
-                tokio::time::sleep_until((Instant::now() + recheck).min(deadline)).await
+                let started = Instant::now();
+                tokio::time::sleep_until((Instant::now() + recheck).min(deadline)).await;
+                observation.sleep_ms += started.elapsed().as_millis() as u64;
             }
         }
     }
@@ -121,6 +183,7 @@ pub(in crate::api::proxy) async fn wait(
         recheck,
         WAITERS.clone(),
         Some(&state.metrics),
+        request_id,
         |permit| {
             let mut route = route.clone();
             let state = state.clone();
@@ -199,6 +262,64 @@ pub(in crate::api::proxy) async fn wait(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Clone, Default)]
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_summary_separates_database_check_and_timer_without_poll_logs() {
+        use tracing::instrument::WithSubscriber;
+        let writer = LogWriter::default();
+        let sink = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(move || sink.clone())
+            .finish();
+        let request_id = Uuid::new_v4();
+        let mut checks = 0;
+        let result = bounded_wait_with_recheck(
+            Instant::now() + Duration::from_secs(5),
+            RECHECK,
+            Arc::new(Semaphore::new(1)),
+            None,
+            request_id,
+            |_| {
+                checks += 1;
+                let ready = checks == 2;
+                async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Ok(if ready { Check::Ready(7) } else { Check::Retry })
+                }
+            },
+        )
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+        assert_eq!(result, Some(7));
+        let bytes = writer.0.lock().unwrap();
+        let lines: Vec<_> = std::str::from_utf8(&bytes).unwrap().lines().collect();
+        assert_eq!(lines.len(), 1);
+        let event: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let fields = &event["fields"];
+        assert_eq!(fields["request_id"], request_id.to_string());
+        assert_eq!(fields["outcome"], "ready");
+        assert_eq!(fields["checks"], 2);
+        assert_eq!(fields["check_ms"], 200);
+        assert_eq!(fields["sleep_ms"], 250);
+        assert_eq!(fields["elapsed_ms"], 450);
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]

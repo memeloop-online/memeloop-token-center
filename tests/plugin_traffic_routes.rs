@@ -991,7 +991,17 @@ async fn malicious_denial_reason_is_absent_from_logs_and_http_response() {
     );
     assert!(logs.contains("post_auth"), "{logs}");
     assert!(logs.contains("returned"), "{logs}");
-    assert!(logs.len() < 4_096, "guest reason amplified log output");
+    // Host request-phase diagnostics may grow independently. Bound only the
+    // guest-attributed denial event, while retaining the whole-log canary check.
+    let denials: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("policy_denied_invalid_metadata"))
+        .collect();
+    assert_eq!(denials.len(), 1, "one host-owned denial per guest decision");
+    assert!(
+        denials[0].len() < 4_096,
+        "guest reason amplified its denial event"
+    );
 }
 
 #[tokio::test]
@@ -1085,7 +1095,21 @@ async fn log_capability_emits_only_bounded_host_owned_fields() {
         .find(|line| line.contains("plugin_invocation") && line.contains("plugin_log_emitted"))
         .unwrap();
     assert!(guest.contains(id), "{logs}");
-    assert!(logs.len() < 4_096, "guest message amplified log output");
+    let guest_events: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("plugin_log_emitted"))
+        .collect();
+    // The fixture deliberately invokes the plugin once directly and once
+    // through the gateway. Each guest invocation requests exactly one log.
+    assert_eq!(
+        guest_events.len(),
+        2,
+        "guest log count must remain invocation-bounded"
+    );
+    assert!(
+        guest_events.iter().all(|line| line.len() < 4_096),
+        "guest message amplified its attributed event"
+    );
     let metrics = state.metrics.render(&Default::default());
     let observations: Vec<_> = metrics
         .lines()

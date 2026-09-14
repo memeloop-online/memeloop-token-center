@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
-import { api } from '../../api';
+import { api, apiDiagnosticMessage } from '../../api';
 import { DrawerFrame, Metric, NumberMetric, RequestDiagnostics, RequestTable } from '../../components';
 import { formatDurationDisplay, formatPercent } from '../../format';
 import { useI18n } from '../../i18n';
 import type { RequestDetail, RequestEvent, RequestListResponse, RequestView, TypedFilterAst, UpstreamAccount } from '../../types';
 import type { SessionStreamState } from '../SessionMonitor';
-import { messageOf, queryForTenant } from '../scope/operatorShared';
+import { queryForTenant } from '../scope/operatorShared';
 import { TypedFilterBuilder } from '../TypedFilterBuilder';
 import {
   emptyTypedFilterAst, filteredRequestRefreshDelay, mergeLiveRequestEvents, mergeRefreshedRequestPage,
@@ -27,6 +27,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   onRequestDrilldownHandled?: (revision: number) => void;
 }) {
   const { t } = useI18n();
+  const diagnosticLabels = { requestId: t('request.correlationId'), streamInterrupted: t('request.streamInterrupted') };
   const [requests, setRequests] = useState<RequestView[]>([]);
   const [upstreams, setUpstreams] = useState<UpstreamAccount[]>([]);
   const [filters, setFilters] = useState<TypedFilterAst>(emptyTypedFilterAst);
@@ -140,7 +141,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
     } catch (reason) {
       if (!controller.signal.aborted && state.requestSequence === requestSequence && state.scopeSequence === scopeSequence) {
         errorSource.current = 'refresh';
-        setError(messageOf(reason, t('common.requestFailed')));
+        setError(apiDiagnosticMessage(reason, t('common.requestFailed'), diagnosticLabels));
       }
     } finally {
       if (state.requestSequence !== requestSequence || state.scopeSequence !== scopeSequence) return;
@@ -187,7 +188,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
       if (request === sequence.current && !controller.signal.aborted) {
         if (!older) { setRequests([]); setHasOlder(false); }
         errorSource.current = 'load';
-        setError(messageOf(reason, t('common.requestFailed')));
+        setError(apiDiagnosticMessage(reason, t('common.requestFailed'), diagnosticLabels));
       }
     } finally {
       if (request === sequence.current && loadAbort.current === controller) {
@@ -211,7 +212,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
     const upstreamRequest = ++upstreamSequence.current;
     void api<UpstreamAccount[]>(`/internal/v1/upstreams${queryForTenant(tenant)}`, token)
       .then((values) => { if (upstreamRequest === upstreamSequence.current) { setUpstreams(values); setUpstreamError(''); } })
-      .catch((reason) => { if (upstreamRequest === upstreamSequence.current) { setUpstreams([]); setUpstreamError(messageOf(reason, t('common.requestFailed'))); } });
+      .catch((reason) => { if (upstreamRequest === upstreamSequence.current) { setUpstreams([]); setUpstreamError(apiDiagnosticMessage(reason, t('common.requestFailed'), diagnosticLabels)); } });
     void load(emptyTypedFilterAst);
     return () => { cancelFilteredRefresh(); loadAbort.current?.abort(); };
   }, [tenant, token]);
@@ -252,7 +253,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
     } catch (reason) {
       if (requestSequence === detailSequence.current && !controller.signal.aborted) {
         errorSource.current = 'detail';
-        setError(messageOf(reason, t('traffic.detailFailed')));
+        setError(apiDiagnosticMessage(reason, t('traffic.detailFailed'), diagnosticLabels));
       }
     } finally { if (detailAbort.current === controller) detailAbort.current = null; }
   }
@@ -294,9 +295,9 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   }, [requestDrilldown?.revision, tenant, token]);
 
   return <>
-    {error && <div className="notice error" role="alert">{error}</div>}
-    {upstreamError && <div className="notice error" role="alert">{upstreamError}</div>}
-    {streamError && <div className="notice error" role="alert">{streamError}</div>}
+    {error && <div className="notice error" role="alert">{t(errorSource.current === 'detail' ? 'request.detail' : 'request.listSource')}: {error}</div>}
+    {upstreamError && <div className="notice error" role="alert">{t('request.upstreamSource')}: {upstreamError}</div>}
+    {streamError && <div className="notice error" role="alert">{t('request.streamSource')}: {streamError}</div>}
     <RequestsPanel requests={requests} upstreams={upstreams} filters={filters} loading={loading} hasOlder={hasOlder} streamState={streamState} token={token} tenant={tenant} olderFilteredResultsStale={olderFilteredResultsStale}
       onApply={(next) => { setFilters(next); scope.current = { token, tenant, filters: next }; void load(next); }}
       onClear={() => { setFilters(emptyTypedFilterAst); scope.current = { token, tenant, filters: emptyTypedFilterAst }; void load(emptyTypedFilterAst); }}

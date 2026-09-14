@@ -139,6 +139,10 @@ async fn prepare_authorized_proxy_routes(
         candidates,
     } = input;
     let protocol = request.protocol;
+    let candidate_preparation = proxy_diagnostics::Phase::new(
+        proxy_diagnostics::Context::for_request(request.request_id),
+        "authorized_candidate_preparation",
+    );
     let request_json = request.request_json;
     let openai_chat_choice_count = matches!(protocol, Protocol::OpenAiChat)
         .then(|| openai_chat_choice_count(request_json))
@@ -160,6 +164,7 @@ async fn prepare_authorized_proxy_routes(
         // missing route must never fall back to unscoped process secrets.
         return Err(exhausted_candidate_error(protocol, request_json, &summary)?);
     };
+    candidate_preparation.finish("completed", None, None);
     let (input_token_ceiling, output_token_ceiling) =
         candidate_reservation_bounds(&primary, original_body_length, output_choice_count)?;
     Ok(AuthorizedProxyRoutes {
@@ -803,7 +808,10 @@ pub(in crate::api) async fn proxy_with_identity(
     let _request_buffer = state
         .metrics
         .memory_usage(crate::metrics::MemoryComponent::RequestBuffer, body.len());
+    let plugin_snapshot =
+        proxy_diagnostics::Phase::new(diagnostic_context, "application_plugin_snapshot");
     let mut state = state.pin_application_plugins().await?;
+    plugin_snapshot.finish("completed", None, None);
     let proxy_lifecycle_permit = state
         .proxy_lifecycle_permits
         .clone()
@@ -815,10 +823,14 @@ pub(in crate::api) async fn proxy_with_identity(
             .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Json);
         return Err(AppError::Overloaded);
     }
+    let json_parse = proxy_diagnostics::Phase::new(diagnostic_context, "request_json_parse");
     let original_request_json: Value = serde_json::from_slice(&body)
         .map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))?;
+    json_parse.finish("completed", None, Some(body.len()));
     let conversation_hints = conversation_hints(&headers, &original_request_json);
     tracing::info!(%request_id, phase = "request_shape", bytes = body.len(), compaction_hint = conversation_hints.compaction, "proxy request metadata");
+    let traffic_policy =
+        proxy_diagnostics::Phase::new(diagnostic_context, "request_traffic_policy");
     let applied = super::traffic::apply_traffic_policy_with_memory(
         &state,
         &key,
@@ -827,6 +839,7 @@ pub(in crate::api) async fn proxy_with_identity(
         memory.clone(),
     )
     .await?;
+    traffic_policy.finish("completed", None, None);
     if pinned_route.is_some() && applied.changes_pinned_envelope(&original_request_json) {
         // Pinned internal callers establish their own reviewed request
         // envelope. Traffic policy may still deny it or rank an already
@@ -845,6 +858,8 @@ pub(in crate::api) async fn proxy_with_identity(
     preparation.finish("completed", None, Some(body.len()));
     let route_preparation = proxy_diagnostics::Phase::new(diagnostic_context, "route_preparation");
     let selection_seed = routing_selection_seed(&key, request_id, &conversation_hints);
+    let candidate_query =
+        proxy_diagnostics::Phase::new(diagnostic_context, "authorized_candidate_query");
     let mut candidates = state
         .db
         .list_authorized_upstream_candidates_with_hint(
@@ -858,6 +873,7 @@ pub(in crate::api) async fn proxy_with_identity(
             },
         )
         .await?;
+    candidate_query.finish("completed", None, None);
     retain_pinned_text_candidates(&state, pinned_route, &mut candidates)?;
     let strategy_candidates =
         crate::group_routing::candidate_snapshot_if_enabled(&state, &candidates);
@@ -882,6 +898,8 @@ pub(in crate::api) async fn proxy_with_identity(
     let recovery_wait_deadline =
         attempt_budget.recovery_wait_deadline(state.config.upstream_health);
     if let Some(mut candidates) = strategy_candidates {
+        let strategy =
+            proxy_diagnostics::Phase::new(diagnostic_context, "group_routing_preparation");
         crate::group_routing::prepare(
             &mut state,
             key.tenant_id,
@@ -891,6 +909,7 @@ pub(in crate::api) async fn proxy_with_identity(
             &mut candidates,
         )
         .await?;
+        strategy.finish("completed", None, None);
         if state.group_routing.is_some() {
             route_plan = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
                 request: ProxyRequestContext {
@@ -918,7 +937,9 @@ pub(in crate::api) async fn proxy_with_identity(
     let primary = route_plan.primary_route();
     let upstream_account_id = Some(primary.account_id);
     let model_route_id = Some(primary.route_id);
+    let price_lookup = proxy_diagnostics::Phase::new(diagnostic_context, "model_price_lookup");
     let price = state.db.model_price(&model, &key.currency).await?;
+    price_lookup.finish("completed", None, None);
     let input_token_ceiling = route_plan.input_token_ceiling;
     let output_token_ceiling = route_plan.output_token_ceiling;
     let requested_service_tier = requested_service_tier(&request_json, &price)?;

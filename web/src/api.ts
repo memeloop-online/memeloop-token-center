@@ -3,9 +3,25 @@ export class ApiError extends Error {
     message: string,
     public readonly status: number,
     public readonly code?: string,
+    public readonly requestId?: string,
   ) {
     super(message);
   }
+}
+
+function responseRequestId(response: Response): string | undefined {
+  const value = response.headers.get('x-mtc-request-id');
+  return value && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+    ? value : undefined;
+}
+
+/** Safe transport evidence; never include a URL, credentials or response text. */
+export function apiDiagnosticMessage(reason: unknown, fallback: string, labels: { requestId: string; streamInterrupted: string }): string {
+  if (!(reason instanceof ApiError)) return reason instanceof Error ? reason.message : fallback;
+  const status = `HTTP ${reason.status}`;
+  const detail = reason.code === 'sse_response_interrupted' ? labels.streamInterrupted : reason.message;
+  const message = detail.includes(status) ? detail : `${detail} (${status})`;
+  return reason.requestId ? `${message} · ${labels.requestId}: ${reason.requestId}` : message;
 }
 
 export async function api<T>(
@@ -21,18 +37,19 @@ export async function api<T>(
       ...init.headers,
     },
   });
+  const requestId = responseRequestId(response);
   const text = await response.text();
   let body: T | { error?: { code?: string; message?: string } } = {} as T;
   if (text) {
     try { body = JSON.parse(text) as T | { error?: { code?: string; message?: string } }; }
     catch {
-      if (!response.ok) throw new ApiError(`HTTP ${response.status}`, response.status);
-      throw new ApiError(`HTTP ${response.status}: invalid JSON response`, response.status);
+      if (!response.ok) throw new ApiError(`HTTP ${response.status}`, response.status, undefined, requestId);
+      throw new ApiError(`HTTP ${response.status}: invalid JSON response`, response.status, undefined, requestId);
     }
   }
   if (!response.ok) {
     const error = typeof body === 'object' && body && 'error' in body ? body.error : undefined;
-    throw new ApiError(error?.message ?? `HTTP ${response.status}`, response.status, error?.code);
+    throw new ApiError(error?.message ?? `HTTP ${response.status}`, response.status, error?.code, requestId);
   }
   return body as T;
 }
@@ -139,7 +156,7 @@ export async function streamSse<T>(
     headers: { Authorization: `Bearer ${credential}` },
     signal,
   });
-  if (!response.ok) throw new ApiError(`HTTP ${response.status}`, response.status);
+  if (!response.ok) throw new ApiError(`HTTP ${response.status}`, response.status, undefined, responseRequestId(response));
   if (!response.body) throw new Error('浏览器不支持流式响应');
   onOpen?.();
   const reader = response.body.getReader();
@@ -158,6 +175,9 @@ export async function streamSse<T>(
         boundary = buffered.indexOf('\n\n');
       }
     }
+  } catch (reason) {
+    if (signal.aborted) throw reason;
+    throw new ApiError('SSE response interrupted or invalid', response.status, 'sse_response_interrupted', responseRequestId(response));
   } finally {
     try { await reader.cancel(); } catch { /* Abort and remote close can already release the reader. */ }
     reader.releaseLock();

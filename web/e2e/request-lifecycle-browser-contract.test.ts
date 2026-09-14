@@ -76,5 +76,25 @@ test('request detail follows terminal events and fences late responses after sel
       const surface = await page.locator('.request-page-surface').evaluate((element) => ({ border: getComputedStyle(element).borderTopWidth, shadow: getComputedStyle(element).boxShadow }));
       assert.deepEqual(surface, { border: '0px', shadow: 'none' });
     }
+    // A directory failure must not become a request-list failure or hide rows.
+    // Exercise the actual fetch/catch/render path, not the implementation's helper name.
+    const localized = await browser.newPage();
+    await localized.addInitScript(() => localStorage.setItem('mtc-locale', 'zh-CN'));
+    await localized.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/request-lifecycle.html?directory-error`);
+    await localized.getByRole('alert').waitFor();
+    await localized.locator('tbody tr').first().waitFor();
+    const alert = await localized.getByRole('alert').innerText();
+    assert.match(alert, /上游目录: HTTP 503/);
+    assert.match(alert, /关联请求 ID: 01900000-0000-7000-8000-000000000001/);
+    assert.doesNotMatch(alert, /请求列表:|secret-directory-body-canary|request ID:/);
+    assert.equal(await localized.locator('tbody tr').count(), 2);
+    await localized.locator('tbody tr').first().locator('.table-action').click();
+    await localized.getByRole('dialog').waitFor();
+    assert.equal(await localized.getByRole('alert').count(), 0, 'the background directory alert must remain isolated by the modal');
+    assert.equal(await localized.getByRole('alert', { includeHidden: true }).textContent(), alert, 'opening a successful detail must not relabel or clear the background directory error');
+    await localized.getByRole('dialog').getByRole('button', { name: '关闭', exact: true }).click();
+    await localized.getByRole('alert').waitFor();
+    assert.equal(await localized.getByRole('alert').innerText(), alert, 'closing the modal restores access to the same directory error');
+    await localized.close();
   } finally { await browser.close(); await server.close(); }
 });
