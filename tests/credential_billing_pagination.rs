@@ -621,6 +621,160 @@ async fn exercise_filtered_credential_pages(state: &AppState) {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+async fn exercise_credential_deletion(state: &AppState) {
+    let tenant = format!("delete-{}", Uuid::now_v7());
+    let body = json!({ "tenant_external_id": tenant, "principal_external_id": "manual-owner", "alias": "Preserved historical name", "creation_source": "manual", "initial_balance": "7" });
+    let (status, issued) = json_request(
+        state,
+        "POST",
+        "/internal/v1/keys",
+        BOOTSTRAP_TOKEN,
+        None,
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let key_id = Uuid::parse_str(issued["key_id"].as_str().unwrap()).unwrap();
+    let account_id = Uuid::parse_str(issued["account_id"].as_str().unwrap()).unwrap();
+    let identity = state
+        .db
+        .authenticate_key(
+            issued["key"].as_str().unwrap(),
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let before_ledger = state.db.list_account_ledger(account_id, 10).await.unwrap();
+    let (status, manual) = json_request(
+        state,
+        "GET",
+        &format!("/internal/v1/keys?tenant_external_id={tenant}&creation_source=manual"),
+        BOOTSTRAP_TOKEN,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(manual.as_array().unwrap().len(), 1);
+    assert_eq!(manual[0]["creation_source"], "manual");
+    let (_, api_only) = json_request(
+        state,
+        "GET",
+        &format!("/internal/v1/keys?tenant_external_id={tenant}&creation_source=api"),
+        BOOTSTRAP_TOKEN,
+        None,
+        None,
+    )
+    .await;
+    assert!(api_only.as_array().unwrap().is_empty());
+    // A foreign identity makes the whole batch fail, even after a preceding
+    // valid row was locked. There is no partial cross-tenant deletion.
+    let foreign = create_credential(
+        state,
+        &format!("{tenant}-other"),
+        "other",
+        "Other tenant",
+        "0",
+        &format!("{tenant}-other"),
+    )
+    .await;
+    let mixed = json!({ "tenant_external_id": tenant, "key_ids": [key_id, foreign["key_id"]] });
+    let (status, _) = json_request(
+        state,
+        "POST",
+        "/internal/v1/keys/delete",
+        BOOTSTRAP_TOKEN,
+        None,
+        Some(&mixed),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        state
+            .db
+            .authenticate_key(
+                issued["key"].as_str().unwrap(),
+                state.config.key_pepper.as_bytes()
+            )
+            .await
+            .is_ok()
+    );
+    let bound_token = service_token(
+        &state.db,
+        state.config.key_pepper.as_bytes(),
+        format!("delete-reader-{tenant}"),
+        Some(format!("{tenant}-other")),
+    )
+    .await;
+    let selection = json!({ "tenant_external_id": tenant, "key_ids": [key_id] });
+    let (status, _) = json_request(
+        state,
+        "POST",
+        "/internal/v1/keys/delete",
+        &bound_token,
+        None,
+        Some(&selection),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    for _ in 0..2 {
+        let (status, deleted) = json_request(
+            state,
+            "POST",
+            "/internal/v1/keys/delete",
+            BOOTSTRAP_TOKEN,
+            None,
+            Some(&selection),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(deleted["deleted_key_ids"], json!([key_id]));
+    }
+    assert!(
+        state
+            .db
+            .authenticate_key(
+                issued["key"].as_str().unwrap(),
+                state.config.key_pepper.as_bytes()
+            )
+            .await
+            .is_err()
+    );
+    let (_, rows) = json_request(
+        state,
+        "GET",
+        &format!("/internal/v1/keys?tenant_external_id={tenant}&key_id={key_id}"),
+        BOOTSTRAP_TOKEN,
+        None,
+        None,
+    )
+    .await;
+    assert!(rows.as_array().unwrap().is_empty());
+    let historical = state.db.key_view(&identity).await.unwrap();
+    assert_eq!(historical.alias, "Preserved historical name");
+    assert_eq!(historical.available_balance, "7");
+    assert_eq!(
+        state
+            .db
+            .list_account_ledger(account_id, 10)
+            .await
+            .unwrap()
+            .len(),
+        before_ledger.len()
+    );
+    assert!(!before_ledger.is_empty());
+    let (status, _) = json_request(
+        state,
+        "POST",
+        &format!("/internal/v1/keys/{key_id}/credential-recovery/copy"),
+        BOOTSTRAP_TOKEN,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
 #[tokio::test]
 async fn sqlite_create_reconciliation_and_paginated_tenant_billing_are_stable() {
     let directory = tempfile::tempdir().unwrap();
@@ -632,6 +786,7 @@ async fn sqlite_create_reconciliation_and_paginated_tenant_billing_are_stable() 
         .await
         .unwrap();
     exercise_filtered_credential_pages(&state).await;
+    exercise_credential_deletion(&state).await;
     exercise_credential_and_ledger_acceptance(state, "sqlite").await;
 }
 
@@ -653,5 +808,6 @@ async fn postgres_create_reconciliation_and_paginated_tenant_billing_are_stable(
     .unwrap();
     assert_eq!(cursor_indexes, 4);
     exercise_filtered_credential_pages(&state).await;
+    exercise_credential_deletion(&state).await;
     exercise_credential_and_ledger_acceptance(state, "postgres").await;
 }

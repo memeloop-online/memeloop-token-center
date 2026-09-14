@@ -211,7 +211,7 @@ impl Database {
         .execute(&mut **tx)
         .await?;
         sqlx::query(
-            "INSERT INTO key_records (id, tenant_id, principal_id, account_id, alias, currency, policy_json, status, credential_generation, provisioning_idempotency_key, provisioning_request_hash, issued_key_ciphertext, created_at, updated_at) VALUES ($1, $2, $3, $4, 'MemeLoop Cloud', $5, $6, 'active', 1, $7, $8, $9, $10, $11)",
+            "INSERT INTO key_records (id, tenant_id, principal_id, account_id, alias, currency, policy_json, status, credential_generation, provisioning_idempotency_key, provisioning_request_hash, issued_key_ciphertext, created_at, updated_at, creation_source) VALUES ($1, $2, $3, $4, 'MemeLoop Cloud', $5, $6, 'active', 1, $7, $8, $9, $10, $11, 'api')",
         )
         .bind(key_id.to_string())
         .bind(&tenant_id)
@@ -279,6 +279,7 @@ impl Database {
             before,
             None,
             None,
+            None,
         )
         .await
     }
@@ -293,6 +294,7 @@ impl Database {
         before: Option<(i64, Uuid)>,
         search: Option<&str>,
         status: Option<&str>,
+        creation_source: Option<&str>,
     ) -> Result<Vec<ManagedKeyView>, AppError> {
         // Escape SQL wildcards: operator search is literal, not a LIKE DSL.
         let search = search
@@ -310,7 +312,7 @@ impl Database {
             // surrounding tenant/principal predicates still enforce the
             // caller's management scope, and cursor semantics remain intact.
             sqlx::query(
-                "SELECT k.id, k.account_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, k.alias, k.currency, k.status, k.credential_generation, (SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1) AS fingerprint, CASE WHEN k.status = 'active' AND EXISTS (SELECT 1 FROM key_credentials credential LEFT JOIN key_credential_recovery_secrets recovery ON recovery.credential_id = credential.id WHERE credential.key_id = k.id AND credential.generation = k.credential_generation AND credential.revoked_at IS NULL AND (credential.secret_plaintext IS NOT NULL OR recovery.credential_id IS NOT NULL)) THEN 1 ELSE 0 END AS credential_recovery_available, k.created_at, k.updated_at, k.policy_json, a.available_micros, a.reserved_micros FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN credit_accounts a ON a.id = k.account_id WHERE k.id = $1 AND ($2 = '' OR t.external_id = $2) AND ($3 = '' OR p.external_id = $3) AND (k.created_at < $4 OR (k.created_at = $4 AND k.id < $5)) AND (LOWER(k.alias) LIKE $7 ESCAPE '!' OR LOWER(p.external_id) LIKE $7 ESCAPE '!') AND ($8 = '' OR k.status = $8) ORDER BY k.created_at DESC, k.id DESC LIMIT $6",
+                "SELECT k.id, k.account_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, k.alias, k.currency, k.status, k.creation_source, k.archived_at, k.credential_generation, (SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1) AS fingerprint, CASE WHEN k.status = 'active' AND EXISTS (SELECT 1 FROM key_credentials credential LEFT JOIN key_credential_recovery_secrets recovery ON recovery.credential_id = credential.id WHERE credential.key_id = k.id AND credential.generation = k.credential_generation AND credential.revoked_at IS NULL AND (credential.secret_plaintext IS NOT NULL OR recovery.credential_id IS NOT NULL)) THEN 1 ELSE 0 END AS credential_recovery_available, k.created_at, k.updated_at, k.policy_json, a.available_micros, a.reserved_micros FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN credit_accounts a ON a.id = k.account_id WHERE k.id = $1 AND ($2 = '' OR t.external_id = $2) AND ($3 = '' OR p.external_id = $3) AND (k.created_at < $4 OR (k.created_at = $4 AND k.id < $5)) AND (LOWER(k.alias) LIKE $7 ESCAPE '!' OR LOWER(p.external_id) LIKE $7 ESCAPE '!') AND ($8 = '' OR k.status = $8) AND k.archived_at IS NULL AND ($9 = '' OR k.creation_source = $9 OR ($9 = 'manual_or_unknown' AND k.creation_source IN ('manual', 'unknown'))) ORDER BY k.created_at DESC, k.id DESC LIMIT $6",
             )
             .bind(key_id.to_string())
             .bind(tenant_external_id.unwrap_or_default())
@@ -320,11 +322,12 @@ impl Database {
             .bind(limit.clamp(1, 500))
             .bind(&search)
             .bind(status.unwrap_or_default())
+            .bind(creation_source.unwrap_or_default())
             .fetch_all(&self.pool)
             .await?
         } else {
             sqlx::query(
-                "SELECT k.id, k.account_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, k.alias, k.currency, k.status, k.credential_generation, (SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1) AS fingerprint, CASE WHEN k.status = 'active' AND EXISTS (SELECT 1 FROM key_credentials credential LEFT JOIN key_credential_recovery_secrets recovery ON recovery.credential_id = credential.id WHERE credential.key_id = k.id AND credential.generation = k.credential_generation AND credential.revoked_at IS NULL AND (credential.secret_plaintext IS NOT NULL OR recovery.credential_id IS NOT NULL)) THEN 1 ELSE 0 END AS credential_recovery_available, k.created_at, k.updated_at, k.policy_json, a.available_micros, a.reserved_micros FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN credit_accounts a ON a.id = k.account_id WHERE ($1 = '' OR t.external_id = $1) AND ($2 = '' OR p.external_id = $2) AND (k.created_at < $3 OR (k.created_at = $3 AND k.id < $4)) AND (LOWER(k.alias) LIKE $6 ESCAPE '!' OR LOWER(p.external_id) LIKE $6 ESCAPE '!') AND ($7 = '' OR k.status = $7) ORDER BY k.created_at DESC, k.id DESC LIMIT $5",
+                "SELECT k.id, k.account_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, k.alias, k.currency, k.status, k.creation_source, k.archived_at, k.credential_generation, (SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1) AS fingerprint, CASE WHEN k.status = 'active' AND EXISTS (SELECT 1 FROM key_credentials credential LEFT JOIN key_credential_recovery_secrets recovery ON recovery.credential_id = credential.id WHERE credential.key_id = k.id AND credential.generation = k.credential_generation AND credential.revoked_at IS NULL AND (credential.secret_plaintext IS NOT NULL OR recovery.credential_id IS NOT NULL)) THEN 1 ELSE 0 END AS credential_recovery_available, k.created_at, k.updated_at, k.policy_json, a.available_micros, a.reserved_micros FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN credit_accounts a ON a.id = k.account_id WHERE ($1 = '' OR t.external_id = $1) AND ($2 = '' OR p.external_id = $2) AND (k.created_at < $3 OR (k.created_at = $3 AND k.id < $4)) AND (LOWER(k.alias) LIKE $6 ESCAPE '!' OR LOWER(p.external_id) LIKE $6 ESCAPE '!') AND ($7 = '' OR k.status = $7) AND k.archived_at IS NULL AND ($8 = '' OR k.creation_source = $8 OR ($8 = 'manual_or_unknown' AND k.creation_source IN ('manual', 'unknown'))) ORDER BY k.created_at DESC, k.id DESC LIMIT $5",
             )
             .bind(tenant_external_id.unwrap_or_default())
             .bind(principal_external_id.unwrap_or_default())
@@ -333,6 +336,7 @@ impl Database {
             .bind(limit.clamp(1, 500))
             .bind(&search)
             .bind(status.unwrap_or_default())
+            .bind(creation_source.unwrap_or_default())
             .fetch_all(&self.pool)
             .await?
         };
@@ -403,6 +407,23 @@ impl Database {
         route_group_ids: &[Uuid],
         pepper: &[u8],
     ) -> Result<IssuedKey, AppError> {
+        self.create_key_with_source(input, route_ids, route_group_ids, pepper, "api")
+            .await
+    }
+
+    pub async fn create_key_with_source(
+        &self,
+        input: CreateKeyInput,
+        route_ids: &[Uuid],
+        route_group_ids: &[Uuid],
+        pepper: &[u8],
+        creation_source: &str,
+    ) -> Result<IssuedKey, AppError> {
+        if !matches!(creation_source, "manual" | "api") {
+            return Err(AppError::BadRequest(
+                "creation_source must be manual or api".into(),
+            ));
+        }
         validate_currency(&input.currency)?;
         validate_key_input(&input)?;
         let idempotency_key = input
@@ -430,7 +451,7 @@ impl Database {
             ));
         }
         let provisioning_request_hash = idempotency_key.map(|_| {
-            let canonical = serde_json::to_vec(&serde_json::json!({
+            let mut canonical = serde_json::json!({
                 "tenant_external_id": input.tenant_external_id.trim(),
                 "principal_external_id": input.principal_external_id.trim(),
                 "alias": input.alias.trim(),
@@ -439,8 +460,14 @@ impl Database {
                 "initial_balance": input.initial_balance.normalize().to_string()
                 ,"route_ids": route_ids
                 ,"route_group_ids": route_group_ids
-            }))
-            .expect("key provisioning request is JSON serializable");
+            });
+            // Preserve existing API idempotency hashes. Explicit manual
+            // creation is a different request, never a metadata rewrite.
+            if creation_source != "api" {
+                canonical["creation_source"] = creation_source.into();
+            }
+            let canonical = serde_json::to_vec(&canonical)
+                .expect("key provisioning request is JSON serializable");
             format!("{:x}", Sha256::digest(canonical))
         });
         let now = unix_millis();
@@ -559,7 +586,7 @@ impl Database {
             .map(|_| seal_private_json(&issued_key, pepper, KEY_PROVISIONING_AAD))
             .transpose()?;
         sqlx::query(
-            "INSERT INTO key_records (id, tenant_id, principal_id, account_id, alias, currency, policy_json, status, credential_generation, provisioning_idempotency_key, provisioning_request_hash, issued_key_ciphertext, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', 1, $8, $9, $10, $11, $12)",
+            "INSERT INTO key_records (id, tenant_id, principal_id, account_id, alias, currency, policy_json, status, credential_generation, provisioning_idempotency_key, provisioning_request_hash, issued_key_ciphertext, created_at, updated_at, creation_source) VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', 1, $8, $9, $10, $11, $12, $13)",
         )
         .bind(key_id.to_string())
         .bind(&tenant_id)
@@ -573,6 +600,7 @@ impl Database {
         .bind(issued_key_ciphertext)
         .bind(now)
         .bind(now)
+        .bind(creation_source)
         .execute(&mut *tx)
         .await?;
 
@@ -1240,6 +1268,8 @@ fn managed_key_view(row: AnyRow) -> Result<ManagedKeyView, AppError> {
         alias: row.try_get("alias")?,
         currency: row.try_get("currency")?,
         status: row.try_get("status")?,
+        creation_source: row.try_get("creation_source")?,
+        archived_at: row.try_get("archived_at")?,
         credential_generation: row.try_get("credential_generation")?,
         fingerprint: row.try_get("fingerprint")?,
         credential_recovery_available: row.try_get::<i64, _>("credential_recovery_available")? != 0,

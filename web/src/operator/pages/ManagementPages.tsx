@@ -39,7 +39,7 @@ import { providerFormWidgets } from '../ProviderFormWidgets';
 import { appHref } from '../../app/routes';
 import { credentialFormTemplates } from '../CredentialFormTemplates';
 import { CredentialAuthorizationFields } from '../CredentialAuthorizationFields';
-import { Button, Combobox, Input, Option, Select, DetailTooltip, Disclosure, FormSection } from '../../design-system';
+import { Button, Checkbox, Combobox, Input, Option, Select, DetailTooltip, Disclosure, FormSection } from '../../design-system';
 import { JourneyDisclosure as AdvancedFormSection } from '../JourneyDisclosure';
 import { formJourneyCopy } from '../formJourneyCopy';
 import { CreateJourney } from '../CreateJourney';
@@ -988,6 +988,9 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const [groupFilter, setGroupFilter] = useState('all');
   const [search, setSearch] = useState('');
   const [serverStatus, setServerStatus] = useState('active');
+  const [creationSource, setCreationSource] = useState(tenant === 'default' ? 'manual_or_unknown' : 'all');
+  const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
+  const deleteLock = useRef(false);
   const [nextCursor, setNextCursor] = useState<KeyListCursor>();
   const [keyListState, setKeyListState] = useState<KeyListLoadState>('idle');
   const [keyError, setKeyError] = useState('');
@@ -1070,7 +1073,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
     const request = startKeyRequest('initial-loading');
     setKeyError('');
     try {
-      const keyRows = await apiRead<KeyView[]>(keyListPath(loadTenant, undefined, { search, status: serverStatus }), loadToken, { signal: request.controller.signal });
+      const keyRows = await apiRead<KeyView[]>(keyListPath(loadTenant, undefined, { search, status: serverStatus, source: creationSource }), loadToken, { signal: request.controller.signal });
       if (!ownsKeyRequest(request) || request.controller.signal.aborted) return;
       const page = applyKeyPage([], keyRows);
       keyRequest.current = undefined;
@@ -1092,21 +1095,24 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
     setRenaming(undefined); setAliasDraft(''); setLimitSnapshots({}); setGranting(undefined); setGrant({ amount: '', source: '' }); setBusy('');
     setPolicyDrafts({}); setCreateCredentialDraft(undefined); setNewRouteIds([]); setNewRouteGroupIds([]); setGroupFilter('all'); setSearch(''); setNextCursor(undefined); setKeyListState('initial-loading'); setKeyError(''); setRouteError(''); setSecret(undefined); setMessage(''); setError('');
     void loadRoutes(token, tenant, scopeGeneration.current);
+    setCreationSource(tenant === 'default' ? 'manual_or_unknown' : 'all');
     return () => { keyRequest.current?.controller.abort(); routeRequest.current?.controller.abort(); secretRequest.current?.abort(); };
   }, [token, tenant, writeTenant]);
   useEffect(() => {
     setValues([]); setNextCursor(undefined); setKeyListState('initial-loading');
+    setSelectedKeys([]);
     keyRequest.current?.controller.abort();
     const timer = window.setTimeout(() => void load(), search.trim() ? 250 : 0);
     return () => { window.clearTimeout(timer); keyRequest.current?.controller.abort(); };
-  }, [token, tenant, writeTenant, search, serverStatus]);
+  }, [token, tenant, writeTenant, search, serverStatus, creationSource]);
+  useEffect(() => { setSelectedKeys([]); }, [groupFilter]);
   const loadMore = async () => {
     if (!canLoadMoreKeys(keyListState, Boolean(nextCursor), Boolean(keyRequest.current)) || !nextCursor || !token) return;
     const loadToken = token; const loadTenant = tenant; const cursor = nextCursor;
     const request = startKeyRequest('loading-more');
     setKeyError('');
     try {
-      const keyRows = await apiRead<KeyView[]>(keyListPath(loadTenant, cursor, { search, status: serverStatus }), loadToken, { signal: request.controller.signal });
+      const keyRows = await apiRead<KeyView[]>(keyListPath(loadTenant, cursor, { search, status: serverStatus, source: creationSource }), loadToken, { signal: request.controller.signal });
       if (!ownsKeyRequest(request) || request.controller.signal.aborted) return;
       const page = applyKeyPage(values, keyRows, cursor);
       keyRequest.current = undefined;
@@ -1134,6 +1140,26 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const canReadLimits = canReadCredentialLimits(token);
   const canWrite = canWriteCredential(writeTenant);
   const canManage = (value: KeyView) => canWrite && value.tenant_external_id === writeTenant;
+  const deleteKeys = async (keyIds: string[]) => {
+    if (!canWrite || deleteLock.current || !keyIds.length || keyIds.length > 100 || keyIds.some(id => !values.some(value => value.key_id === id && canManage(value)))) return;
+    const operationScope = renderScope.current.generation;
+    const current = () => renderScope.current.generation === operationScope;
+    deleteLock.current = true;
+    try {
+      if (!await confirm(t('credentials.deleteConfirmation', { count: formatNumber(keyIds.length, locale), tenant: writeTenant === 'default' ? t('operator.defaultTenant') : writeTenant })) || !current()) return;
+      setBusy('delete-credentials'); setError(''); setMessage('');
+      const result = await api<{ deleted_key_ids: string[] }>('/internal/v1/keys/delete', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: writeTenant, key_ids: keyIds }) });
+      if (!current()) return;
+      setSelectedKeys([]); setWorkspace(undefined);
+      await load();
+      if (current()) setMessage(t('credentials.deleted', { count: formatNumber(result.deleted_key_ids.length, locale) }));
+    } catch (reason) {
+      if (current()) setError(messageOf(reason, t('common.requestFailed')));
+    } finally {
+      deleteLock.current = false;
+      if (current()) setBusy('');
+    }
+  };
   const beginSecretOperation = () => {
     if (secretOperation.current || secretRef.current) return undefined;
     const operation = Symbol('credential-secret-operation');
@@ -1276,7 +1302,8 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   </div>;
   return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} />{visibleSecret && <div ref={secretPriority} tabIndex={-1} className="credential-secret-priority"><OneTimeSecret key={visibleSecret.displayId} value={visibleSecret.value} recovered={visibleSecret.recovered} recoveryAvailable={!visibleSecret.recovered} filename="client-credential.txt" onDismiss={dismissSecret} message={t(visibleSecret.recovered ? 'credentials.recoveredSecret' : 'credentials.oneTimeSecret')} /></div>}<section className="management-layout">
     <article className="panel"><div className="panel-title"><div><h2>{t('credentials.title')}</h2><p className="muted">{t('credentials.description')}</p></div><label>{t('request.status')}<Select aria-label={t('request.status')} value={serverStatus} onChange={event => setServerStatus(event.target.value)}><option value="active">{enumLabel(t, 'status', 'active')}</option><option value="all">{t('common.all')}</option><option value="suspended">{enumLabel(t, 'status', 'suspended')}</option><option value="revoked">{enumLabel(t, 'status', 'revoked')}</option></Select></label></div>
-      <div className="credential-list-controls"><label>{t('credentials.search')}<Input type="search" maxLength={200} value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t('credentials.searchPlaceholder')} /></label>{writeTenant && <label>{t('credentials.groupFilter')}<Select value={groupFilter} onChange={(event) => setGroupFilter(event.target.value)}><option value="all">{t('common.all')}</option><option value="unassigned">{t('credentials.ungrouped')}</option>{credentialGroups.groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</Select></label>}</div>
+      <div className="credential-list-controls"><label>{t('credentials.search')}<Input type="search" maxLength={200} value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t('credentials.searchPlaceholder')} /></label>{writeTenant && <label>{t('credentials.groupFilter')}<Select value={groupFilter} onChange={(event) => setGroupFilter(event.target.value)}><option value="all">{t('common.all')}</option><option value="unassigned">{t('credentials.ungrouped')}</option>{credentialGroups.groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</Select></label>}<label>{t('credentials.source')}<Select value={creationSource} onChange={event => setCreationSource(event.target.value)}><option value="manual_or_unknown">{t('credentials.sourceWorkspace')}</option><option value="manual">{t('credentials.sourceManual')}</option><option value="api">{t('credentials.sourceApi')}</option><option value="unknown">{t('credentials.sourceUnknown')}</option><option value="all">{t('common.all')}</option></Select></label></div>
+      {canWrite && <div className="row-actions"><Button appearance="subtle" disabled={Boolean(busy) || Boolean(visibleSecret) || !filteredValues.length} onClick={() => setSelectedKeys(filteredValues.filter(canManage).slice(-100).map(value => value.key_id))}>{t('credentials.selectPage')}</Button><Button appearance="subtle" disabled={Boolean(busy) || !selectedKeys.length} onClick={() => setSelectedKeys([])}>{t('credentials.clearSelection')}</Button><Button appearance="secondary" disabled={Boolean(busy) || Boolean(visibleSecret) || !selectedKeys.length} onClick={() => void deleteKeys(selectedKeys)}>{t(busy === 'delete-credentials' ? 'credentials.deleting' : 'credentials.deleteSelected', { count: formatNumber(selectedKeys.length, locale) })}</Button><span className="muted">{t('credentials.selectionHint')}</span></div>
       <p className="credential-list-summary" role="status">{listPresentation === 'loading' ? t('credentials.loadingList') : listPresentation === 'loading-more' ? t('credentials.loadingMore', { count: formatNumber(values.length, locale) }) : listPresentation === 'failed' ? t('credentials.loadFailed', { count: formatNumber(values.length, locale) }) : listPresentation === 'filtered' ? t('credentials.filteredLoaded', { shown: formatNumber(filteredValues.length, locale), loaded: formatNumber(values.length, locale) }) : listPresentation === 'more' ? t('credentials.loadedMore', { count: formatNumber(values.length, locale) }) : t('credentials.loadedComplete', { count: formatNumber(values.length, locale) })}</p>
       {keyError && <div className="notice error" role="alert">{keyError}</div>}{routeError && <div className="notice error" role="alert">{routeError}</div>}{error && <div className="notice error" role="alert">{error}</div>}{credentialGroups.error && <div className="notice error" role="alert">{credentialGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{message && <div ref={credentialSuccess} tabIndex={-1} className="notice success" role="status">{message}</div>}
       <div className="account-list credential-compact-list">{filteredValues.length === 0 && (loadingKeys ? <div className="empty">{t('common.loading')}</div> : keyListState === 'failed' ? <div className="empty">{t('credentials.loadFailed', { count: formatNumber(values.length, locale) })}</div> : <ResourceListStatusEmpty totalCount={values.length} normalLabel={t('status.active')} empty={values.length === 0 ? t('credentials.empty') : t('credentials.noFilterResults')} />)}{filteredValues.map((value) => {
@@ -1287,7 +1314,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
           t('credentials.principalHint', { principal: value.principal_external_id ?? t('common.unknownPrincipal') }),
           !tenant ? t('credentials.tenantHint', { tenant: value.tenant_external_id ?? '—' }) : '',
         ].filter(Boolean).join('\n');
-        return <div className="managed-resource credential-compact-row" key={value.key_id}><div className="managed-resource-header"><div><b title={technicalDetails}>{value.alias}</b><div className="credential-row-summary"><span className="credential-budget" title={budget.title}>{budget.text}</span>{!tenant && <span className="credential-group-summary">{t('credentials.tenant')}: {value.tenant_external_id ?? '—'}</span>}{memberships.length > 0 && <span className="credential-group-summary" title={memberships.map((group) => group.name).join('\n')}>{t('credentials.groupCount', { count: memberships.length })}</span>}</div></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="credential-generation">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div>
+        return <div className="managed-resource credential-compact-row" key={value.key_id}><div className="managed-resource-header">{canManage(value) && <Checkbox aria-label={t('credentials.selectCredential', { alias: value.alias })} checked={selectedKeys.includes(value.key_id)} disabled={Boolean(busy) || Boolean(visibleSecret) || (!selectedKeys.includes(value.key_id) && selectedKeys.length >= 100)} onChange={(_, data) => setSelectedKeys(current => data.checked ? [...new Set([...current, value.key_id])] : current.filter(id => id !== value.key_id))} />}<div><b title={technicalDetails}>{value.alias}</b><div className="credential-row-summary"><span className="credential-budget" title={budget.title}>{budget.text}</span>{!tenant && <span className="credential-group-summary">{t('credentials.tenant')}: {value.tenant_external_id ?? '—'}</span>}{memberships.length > 0 && <span className="credential-group-summary" title={memberships.map((group) => group.name).join('\n')}>{t('credentials.groupCount', { count: memberships.length })}</span>}</div></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="credential-generation">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div>
           <div className="credential-recovery-control credential-row-actions">
             {value.credential_recovery_available && value.status === 'active'
               ? <Button appearance="secondary" type="button" disabled={!canManage(value) || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void recoverCredential(value)}>{busy === `recover-${value.key_id}` ? t('common.loading') : t('credentials.copy')}</Button>
@@ -1295,6 +1322,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
           </div>
           <CredentialActionMenu label={locale.startsWith('zh') ? '更多操作' : 'More actions'} disabled={Boolean(busy) || Boolean(visibleSecret)} actions={[
             { id: 'rename', label: t('credentials.rename'), disabled: !canWrite, onSelect: () => { setRenaming(value.key_id); setAliasDraft(value.alias); } },
+            { id: 'delete', label: t('credentials.delete'), disabled: !canManage(value), onSelect: () => deleteKeys([value.key_id]) },
             { id: 'limits', label: t('credentials.viewLimits'), disabled: !canReadLimits, onSelect: async () => {
               activateEditor('limits', value.key_id); const generation = editorGeneration.current;
               try { const snapshot = await api<KeyLimitSnapshot>(`/internal/v1/keys/${value.key_id}/limits`, token); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || editorGeneration.current !== generation) return; setLimitSnapshots(current => ({ ...current, [value.key_id]: snapshot })); }
@@ -1325,7 +1353,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
         secretRequest.current?.abort();
         secretRequest.current = controller;
         try {
-          const created = await api<{ key: string; key_id: string }>('/internal/v1/keys', operationToken, { ...secretResponseRequestPolicy, method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: operationWriteTenant, route_ids: newRouteIds, route_group_ids: newRouteGroupIds }), signal: controller.signal });
+          const created = await api<{ key: string; key_id: string }>('/internal/v1/keys', operationToken, { ...secretResponseRequestPolicy, method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: operationWriteTenant, creation_source: 'manual', route_ids: newRouteIds, route_group_ids: newRouteGroupIds }), signal: controller.signal });
           if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
           setCreateCredentialDraft(undefined); setNewRouteIds([]); setNewRouteGroupIds([]); showSecret({ value: created.key, recovered: false, displayId: crypto.randomUUID() }); setMessage(t(newRouteIds.length || newRouteGroupIds.length ? 'credentials.created' : 'credentials.createdNoRoutes')); await load();
         } catch (reason) {

@@ -308,6 +308,8 @@ pub struct ManagedKeyView {
     pub alias: String,
     pub currency: String,
     pub status: String,
+    pub creation_source: String,
+    pub archived_at: Option<i64>,
     pub credential_generation: i64,
     pub fingerprint: Option<String>,
     pub credential_recovery_available: bool,

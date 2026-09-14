@@ -168,6 +168,26 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     assert.equal((await calls(filters)).filter(call => call.startsWith('/internal/v1/model-routes')).length, 1, 'search does not refetch unrelated route catalogs');
     await filters.close();
 
+    const lifecycle = await browser.newPage();
+    await lifecycle.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await lifecycle.goto(fixture('client-lifecycle'));
+    await lifecycle.getByText('Manual workspace', { exact: true }).waitFor();
+    assert.equal(await lifecycle.getByText('API workspace', { exact: true }).count(), 0, 'API-created populations are excluded from the default manual directory on the server');
+    await lifecycle.getByRole('combobox', { name: 'Created via', exact: true }).selectOption('all');
+    await lifecycle.getByText('API workspace', { exact: true }).waitFor();
+    await lifecycle.getByRole('button', { name: 'Select current page', exact: true }).click();
+    await lifecycle.getByRole('button', { name: 'Delete selected (2)', exact: true }).click();
+    await lifecycle.getByRole('dialog').getByRole('button', { name: 'Cancel', exact: true }).click();
+    assert.equal((await calls(lifecycle)).some(call => call === '/internal/v1/keys/delete'), false, 'cancel never submits deletion');
+    await lifecycle.getByRole('button', { name: 'Delete selected (2)', exact: true }).click();
+    await lifecycle.getByRole('dialog').getByRole('button', { name: 'Continue', exact: true }).click();
+    await lifecycle.getByRole('status').filter({ hasText: '2 credentials deleted.' }).waitFor();
+    assert.equal(await lifecycle.getByText('Manual workspace', { exact: true }).count(), 0);
+    const deletions = await lifecycle.evaluate(() => window.credentialFixture.requests.filter(request => request.path === '/internal/v1/keys/delete'));
+    assert.equal(deletions.length, 1);
+    assert.deepEqual(JSON.parse(deletions[0]!.body!), { tenant_external_id: 'default', key_ids: ['key-manual', 'key-api'] });
+    await lifecycle.close();
+
     const plaintext = await browser.newPage();
     plaintext.setDefaultTimeout(10_000);
     await plaintext.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
