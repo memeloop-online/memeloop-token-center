@@ -461,6 +461,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "immutable account settlement feed",
         sql: include_str!("../../../migrations/common/0086_account_settlement_feed.sql"),
     },
+    Migration {
+        version: 87,
+        name: "audited generation quarantine reconciliation",
+        sql: include_str!("../../../migrations/common/0087_generation_quarantine_resolutions.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -907,6 +912,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 86,
         name: "immutable account settlement feed",
         sql: include_str!("../../../migrations/common/0086_account_settlement_feed.sql"),
+    },
+    Migration {
+        version: 87,
+        name: "audited generation quarantine reconciliation",
+        sql: include_str!("../../../migrations/common/0087_generation_quarantine_resolutions.sql"),
     },
 ];
 

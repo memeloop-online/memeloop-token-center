@@ -24,6 +24,8 @@
           "credits:read",
           "requests:read",
           "generations:write",
+          "generations:quarantine:read",
+          "generations:reconcile",
           "providers:read",
           "providers:write",
           "plugins:read",
