@@ -115,7 +115,7 @@ async fn fixture_with_archive(
     let account=state.db.create_upstream_account(CreateUpstreamAccountInput {
         tenant_external_id:tenant_external.into(), name:"image mock".into(), driver:"http-json".into(),
         config:json!({"base_url":format!("{}/v1",upstream.uri()),"network_scope":"private"}),
-        credential:UpstreamCredential::None,oauth_session_id:None,oauth_driver:None,oauth_refresh_url:None,
+        credential:UpstreamCredential::ApiKey { value:"image-fixture-secret".into(),header:"authorization".into(),prefix:"Bearer ".into() },oauth_session_id:None,oauth_driver:None,oauth_refresh_url:None,
     },state.config.key_pepper.as_bytes()).await.unwrap();
     let route = state
         .db
@@ -684,6 +684,10 @@ async fn filesystem_staged_image_request_arms_once_and_replays_without_another_p
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/images/generations"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer image-fixture-secret",
+        ))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(json!({"created":1,"data":[{"b64_json":"bW9jay1wbmc="}]})),
