@@ -361,6 +361,8 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   </section></>;
 }
 
+type NativeAuthorizationSession = { login_url?: string; verification_url?: string; user_code?: string; session_token: string; expires_at?: number; poll_after_seconds?: number };
+
 function AuthorizationConnection({ token, tenant, providers, existing, onChanged }: { token: string; tenant: string; providers: ProviderType[]; existing?: UpstreamAccount; onChanged: () => Promise<void> }) {
   const { locale, t } = useI18n();
   const oauthProviders = providers.filter((provider) => provider.oauth_adapter);
@@ -371,7 +373,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
   useEffect(() => { setNativeLocked(false); }, [token, tenant]);
   const selectedProvider = oauthProviders.find((provider) => provider.id === providerChoice);
   const [name, setName] = useState(existing?.name ?? initialProvider?.display_name ?? '');
-  const [session, setSession] = useState<{ login_url?: string; verification_url?: string; user_code?: string; session_token: string; expires_at?: number; poll_after_seconds?: number }>();
+  const [session, setSession] = useState<NativeAuthorizationSession>();
   const [manualCode, setManualCode] = useState('');
   const [proxyUrl, setProxyUrl] = useState('');
   const [useProxy, setUseProxy] = useState(false);
@@ -406,7 +408,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
     }
     setAuthorizing(true);
     const attempt = scopeVersion.current;
-    const begin = async (response: Promise<NonNullable<typeof session>>) => {
+    const begin = async (response: Promise<NativeAuthorizationSession>) => {
       const result = await response;
       if (scopeVersion.current === attempt) {
         setNow(Date.now());
