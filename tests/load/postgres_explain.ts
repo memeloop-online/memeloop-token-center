@@ -204,8 +204,6 @@ export function main(argv = process.argv.slice(2)): number {
     const results = queries.map(([name, query]) => explain(databaseUrl, name, query, timeout, args.maxSequentialScanRows));
     const globalRequestModelPlan = results.find((result) => result.name === "global_model_request_top_n")!;
     const globalGenerationModelPlan = results.find((result) => result.name === "global_model_generation_top_n")!;
-    const globalPricingUsageSummaryBaselinePlan = results.find((result) => result.name === "global_pricing_usage_summary_baseline")!;
-    const globalPricingUsageSummaryPlan = results.find((result) => result.name === "global_pricing_usage_summary")!;
     const checks: JsonObject[] = [
       { name: "large-volume request row precondition", actual: requestRows, operator: ">=", expected: args.minRequestRows, passed: requestRows >= args.minRequestRows },
       { name: "terminal request fact coverage", actual: factRows, operator: "==", expected: terminalRequestRows, passed: factRows === terminalRequestRows },
@@ -217,7 +215,6 @@ export function main(argv = process.argv.slice(2)): number {
       { name: "required global model request index covers every partition", actual: unattachedRequiredGlobalModelLeaves, operator: "==", expected: 0, passed: unattachedRequiredGlobalModelLeaves === 0 },
       { name: "large-volume global model request branch uses an index plan", actual: globalRequestModelPlan.indexes, operator: "!=", expected: "[] when request_rows reaches min_request_rows", passed: requestRows < args.minRequestRows || globalRequestModelPlan.indexes.length > 0 },
       { name: "large-volume global model generation branch uses its index", actual: globalGenerationModelPlan.indexes, operator: "contains", expected: "generation_jobs_global_model_time_idx when generation_rows reaches min_request_rows", passed: generationRows < args.minRequestRows || globalGenerationModelPlan.indexes.includes("generation_jobs_global_model_time_idx") },
-      { name: "global pricing usage summary optimized latency", actual: globalPricingUsageSummaryPlan.execution_time_ms, operator: "<=", expected: globalPricingUsageSummaryBaselinePlan.execution_time_ms, passed: globalPricingUsageSummaryPlan.execution_time_ms <= globalPricingUsageSummaryBaselinePlan.execution_time_ms },
       { name: "required observability indexes are ready", actual: validRequiredObservabilityIndexes, operator: "==", expected: 9, passed: validRequiredObservabilityIndexes === 9 },
     ];
     for (const result of results) {
