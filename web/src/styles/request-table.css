@@ -111,16 +111,6 @@
   overflow-wrap: anywhere;
 }
 
-.request-technical-info {
-  color: #79dfcf;
-  background: transparent;
-  border: 0;
-  margin-left: 0.35rem;
-  padding: 0.1rem 0.25rem;
-}
-
-.request-technical-info:hover { color: #d9fff9; }
-
 .request-duration-info[tabindex='0'] {
   border-radius: 3px;
   outline: 0;
@@ -359,23 +349,22 @@ table.request-table .request-model-cell code {
   overflow-wrap: anywhere;
 }
 
-/* Routing identifiers remain available through the cell tooltip and the
- * request detail view, but do not compete with model, token, and cost facts
- * in the live request table. */
-.request-technical-cell {
-  color: var(--muted, #82979e);
-  max-width: 2rem;
-  padding-left: 2px;
-  padding-right: 2px;
-  text-align: center;
-  white-space: nowrap;
+/* Compare identities and measured work first. Technical metadata is attached
+   to the corresponding named cell, never an empty table column. */
+table.request-table .request-token-cell { min-width: 10rem; }
+.request-token-cell .request-token-primary { display: grid; gap: 4px; margin-top: 4px; }
+.request-token-primary > span { display: flex; justify-content: space-between; gap: 12px; }
+.request-token-primary b { color: inherit; font-weight: 500; text-decoration: none; }
+.request-token-total { color: var(--muted, #82979e); font-size: 0.75rem; }
+.request-token-total > span { text-decoration: line-through; }
+.request-tps-cell { min-width: 5.5rem; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.request-routing-info { display: block; cursor: help; }
+.request-upstream-name { display: block; margin-top: 4px; color: var(--muted, #82979e); font-size: 0.75rem; overflow-wrap: anywhere; }
+.request-table :is(.request-routing-info, .request-credential-cell strong, .request-tps-cell span)[tabindex='0']:focus-visible {
+  outline: 2px solid var(--colorStrokeFocus2, #08796e); outline-offset: 3px; border-radius: 3px;
 }
-
-.request-technical-heading {
-  color: transparent;
-  font-size: 0;
-  max-width: 2rem;
-  padding-left: 2px;
-  padding-right: 2px;
-  width: 2rem;
+@media (min-width: 1100px) {
+  table.request-table .request-credential-cell { min-width: 8rem; max-width: 11rem; }
+  table.request-table .request-model-cell { min-width: 9rem; max-width: 13rem; }
+  table.request-table .request-cost-cell { min-width: 5.5rem; }
 }

@@ -109,7 +109,18 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     assert.match(historicalGapText, /Final route ID—/);
     assert.doesNotMatch(historicalGapText, /Cache read|Cache write/, 'missing historical cache fields must remain absent rather than becoming zero-valued rows');
     assert.match(historicalGapText, /Input tokens: 160.*Output tokens: 32/, 'known input/output must remain visible when historical cache telemetry is missing');
-    assert.match(await recordedRow.locator('.request-technical-info').getAttribute('title') ?? '', /Production Codex.*e82ea007/, 'operator rows retain both the readable account name and durable ID in request metadata');
+    assert.equal(await recordedRow.locator('.request-credential-cell').innerText(), 'Research key');
+    assert.equal(await recordedRow.locator('.request-credential-cell').evaluate(cell => cell.nextElementSibling?.classList.contains('request-model-cell')), true, 'the credential alias is adjacent to the model');
+    assert.equal(await page.locator('.request-technical-cell, .request-technical-heading, .request-technical-info').count(), 0, 'technical data has no blank column or isolated information icon');
+    await recordedRow.locator('.request-routing-info').focus();
+    await page.getByRole('tooltip').filter({ hasText: upstreamId }).waitFor();
+    assert.match(await page.getByRole('tooltip').filter({ hasText: upstreamId }).innerText(), /Production Codex.*e82ea007/, 'keyboard focus on model/account identity exposes the precise routing metadata');
+    assert.match(await recordedRow.locator('.request-token-primary').innerText(), /Uncached input\s*100[\s\S]*Output\s*32/);
+    assert.equal(await recordedRow.locator('.request-token-total > span').evaluate(element => getComputedStyle(element).textDecorationLine), 'line-through');
+    assert.equal(await recordedRow.locator('.request-token-primary b').first().evaluate(element => getComputedStyle(element).textDecorationLine), 'none');
+    assert.equal(await recordedRow.locator('.request-tps-cell').innerText(), '25.93', '32 output tokens / 1.234 recorded seconds');
+    assert.equal(await page.locator('tbody tr').nth(1).locator('.request-tps-cell').innerText(), '—', 'missing duration never becomes zero TPS');
+    assert.match(await page.locator('tbody tr').nth(1).locator('.request-token-primary').innerText(), /Uncached input\s*—[\s\S]*Output\s*32/);
     assert.match(await page.locator('tbody tr').nth(1).locator('.request-token-cell .request-value-info').getAttribute('aria-label') ?? '', /Input tokens: 160.*Output tokens: 32/);
     assert.equal((await stage('read historical table currency', () => page!.locator('tbody tr').nth(1).locator('.request-cost-cell').textContent(), history, current))?.trim(), '—', 'an explicit historical null currency must not inherit the current credential currency');
 

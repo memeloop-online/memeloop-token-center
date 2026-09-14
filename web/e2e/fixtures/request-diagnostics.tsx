@@ -3,6 +3,7 @@ import { useState } from 'react';
 
 import { RequestDiagnostics, RequestTable } from '../../src/components';
 import { I18nProvider } from '../../src/i18n';
+import { MtcFluentProvider } from '../../src/design-system';
 import type { RequestView } from '../../src/types';
 import '../../src/styles.css';
 import '../../src/theme.css';
@@ -21,6 +22,7 @@ const request: RequestView = {
   cache_write_tokens: 20,
   output_tokens: 32,
   cost: '0.001234',
+  credential_identity: { tenant_external_id: 'fixture', key_id: 'fixture-key-id', key_alias: 'Research key', principal_external_id: 'research-team' },
   upstream_account_id: 'e82ea007-9b7f-4be9-bf18-6829426a94e5',
   route_id: 'a75fc2f6-e145-4596-bc94-9736271c6d7e',
   currency: 'USD',
@@ -42,7 +44,8 @@ const historicalGap: RequestView = {
   protocol: 'openai',
   model: 'fixture-long-model-name-for-request-observability',
   status_code: 429,
-  duration_ms: 1234,
+  duration_ms: null,
+  credential_identity: null,
   input_tokens: 160,
   output_tokens: 32,
   error_code: 'http_429',
@@ -71,4 +74,4 @@ function Fixture() {
   </main></div>;
 }
 
-createRoot(document.getElementById('root')!).render(<I18nProvider><Fixture /></I18nProvider>);
+createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><Fixture /></MtcFluentProvider></I18nProvider>);
