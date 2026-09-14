@@ -21,24 +21,6 @@ pub(super) async fn execute(
     protocol: &str,
     prompt: &str,
 ) -> Result<TypedFilterAst, AppError> {
-    // Refuse common pasted secrets before they can enter the request archive.
-    let lower = prompt.to_ascii_lowercase();
-    if [
-        "bearer ",
-        "sk-",
-        "access_token",
-        "refresh_token",
-        "socks5",
-        "http://",
-        "https://",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-    {
-        return Err(AppError::BadRequest(
-            "remove credentials and network addresses from the filter intent".into(),
-        ));
-    }
     let context = format!(
         "Current Unix milliseconds: {}. Filter intent: {}",
         crate::db::unix_millis(),

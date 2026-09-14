@@ -72,7 +72,10 @@ test('filters are non-modal themed popovers and model selection is searchable by
     await filter.getByRole('button', { name: 'Apply filters', exact: true }).click();
     assert.equal(await page.locator('[data-filter-model]').textContent(), 'production-model');
     context.diagnostic('checking settings provider/account autocomplete');
-    assert.match(await page.locator('.system-settings').getByRole('alert').textContent() ?? '', /configured route .friendly-custom-chat. lacks verifiable text-generation capability evidence/i);
+    const capabilityAlert = page
+      .locator('.system-settings p[role="alert"]')
+      .filter({ hasText: /configured route .friendly-custom-chat. lacks verifiable text-generation capability evidence/i });
+    assert.match(await capabilityAlert.textContent() ?? '', /configured route .friendly-custom-chat. lacks verifiable text-generation capability evidence/i);
     assert.doesNotMatch(await page.locator('.system-settings .model-picker-trigger').textContent() ?? '', /route-custom/, 'an unverified stored route must not leak a raw route ID into the picker');
     await page.locator('.system-settings .model-picker-trigger').click();
     const settingsCatalog = page.locator('.system-settings .shared-model-popover');

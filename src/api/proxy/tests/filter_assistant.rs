@@ -132,8 +132,13 @@ async fn assistant_invokes_selected_route_and_bills_explicit_key_then_rejects_di
         )
         .await
         .unwrap();
-    let body =
-        json!({"tenant_external_id":tenant,"prompt":"Find requests slower than 2750 milliseconds"});
+    // These are ordinary operator terms (model IDs and provider-error context),
+    // not instructions to fetch anything. The assistant receives only this
+    // user-provided intent and the fixed filter schema.
+    let body = json!({
+        "tenant_external_id": tenant,
+        "prompt": "Find requests slower than 2750 milliseconds for model sk-preview; include HTTP 404 reported at https://status.example.test through socks5"
+    });
     let denied = management_request_with_token(
         &fixture,
         "/internal/v1/filter-assistant/plan",
