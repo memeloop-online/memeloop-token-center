@@ -445,7 +445,7 @@ impl ResponseArchiveProducer {
                 self.pending.extend_from_slice(&remaining[..take]);
                 remaining = &remaining[take..];
                 if self.pending.len() == super::CHUNK_BYTES {
-                    let Some(sender) = self.sender.as_ref() else {
+                    let Some(sender) = self.sender.clone() else {
                         return false;
                     };
                     let permit = match sender.try_reserve() {
