@@ -934,7 +934,10 @@ async fn refresh_managed_upstream_oauth_impl(
 }
 
 fn supports_oauth_refresh_proxy(driver: &str) -> bool {
-    driver == crate::oauth::codex_device::OAUTH_DRIVER
+    matches!(
+        driver,
+        crate::oauth::codex_device::OAUTH_DRIVER | crate::oauth::managed::kimi::PROVIDER_DRIVER
+    )
 }
 
 #[cfg(test)]
@@ -942,9 +945,12 @@ mod oauth_proxy_tests {
     use super::supports_oauth_refresh_proxy;
 
     #[test]
-    fn only_codex_refresh_lifecycles_accept_private_proxy_credentials() {
+    fn only_proxy_aware_managed_refresh_lifecycles_accept_private_proxy_credentials() {
         assert!(supports_oauth_refresh_proxy(
             crate::oauth::codex_device::OAUTH_DRIVER
+        ));
+        assert!(supports_oauth_refresh_proxy(
+            crate::oauth::managed::kimi::PROVIDER_DRIVER
         ));
         for driver in [
             crate::oauth::claude::OAUTH_DRIVER,
