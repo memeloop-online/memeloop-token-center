@@ -17,7 +17,7 @@ test('overview discloses separate statistics and recent-request windows', () => 
   assert.match(page, /self-overview-caption.*usage.preset.24h/);
   assert.match(page, /All time/);
   assert.match(page, /requestsPath\(emptyRequestFilters/);
-  assert.match(page, /title=\{currentKey.key_id\}/);
+  assert.match(page, /DetailTooltip content=\{currentKey.key_id\}/);
   assert.doesNotMatch(page, /<code>\{currentKey.key_id\}/);
 });
 

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
+import { DetailTooltip } from '../design-system';
 import { Metric, NumberMetric, RequestTable } from '../components';
 import { formatCompactCurrency, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
@@ -68,11 +69,11 @@ export function OverviewPage({ credential, credentialView, onError, onOpenReques
       <Metric label={t('usage.successRate')} value={formatPercent(successRate, locale)} tone="positive" />
       <NumberMetric label={t('traffic.failure')} value={summary?.failed_requests} tone="negative" />
       <NumberMetric label={t('request.tokens')} value={summary ? summary.input_tokens + summary.output_tokens : undefined} />
-      <Metric label={t('traffic.cost')} value={<span title={cost.title}>{cost.text}</span>} />
+      <Metric label={t('traffic.cost')} value={<DetailTooltip content={cost.title ?? cost.text}><span tabIndex={0}>{cost.text}</span></DetailTooltip>} />
     </section>
     <article className="panel key-summary self-account-summary">
-      <div><span className="eyebrow">{t('self.stableCredential')}</span><h2 title={currentKey.key_id} tabIndex={0}>{currentKey.alias}</h2><span>{t(`enforcementMode.${currentKey.policy.enforcement_mode}`)}</span></div>
-      <Metric label={t('self.balance', { currency: currentKey.currency })} value={<span title={balance.title}>{balance.text}</span>} />
+      <div><span className="eyebrow">{t('self.stableCredential')}</span><DetailTooltip content={currentKey.key_id}><h2 tabIndex={0}>{currentKey.alias}</h2></DetailTooltip><span>{t(`enforcementMode.${currentKey.policy.enforcement_mode}`)}</span></div>
+      <Metric label={t('self.balance', { currency: currentKey.currency })} value={<DetailTooltip content={balance.title ?? balance.text}><span tabIndex={0}>{balance.text}</span></DetailTooltip>} />
     </article>
     {limits && <article className="panel self-limit-snapshot"><LimitSnapshot value={limits} enforcementMode={currentKey.policy.enforcement_mode} /></article>}
     <article className="panel self-history self-overview-recent">
