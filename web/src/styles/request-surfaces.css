@@ -90,3 +90,9 @@
   .request-metadata-surface .copy-control button { min-height: 44px; min-width: 44px; }
 }
 .request-compaction { display: inline-block; margin: 4px 0 0 8px; color: inherit; font-size: 11px; font-weight: 400; border-radius: 4px; padding: 2px 6px; background: color-mix(in srgb, currentColor 8%, transparent); }
+.request-token-cell .request-token-total,
+.request-token-cell .request-token-primary > span { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; width: 100%; }
+.request-token-cell .request-token-total > span,
+.request-token-cell .request-token-primary b { text-align: start; }
+.request-output-rates { display: grid; gap: 6px; }
+.request-output-rate { display: block; }

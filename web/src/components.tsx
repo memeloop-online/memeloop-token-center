@@ -180,14 +180,17 @@ function RequestSessionMetadata({ value }: { value: string }) {
 function RequestOutputRate({ request }: { request: RequestView }) {
   const { locale, t } = useI18n();
   const generation = generationRequestOutputTps(request);
-  const rate = generation ?? averageRequestOutputTps(request);
-  const label = t(generation === null ? 'request.averageTps' : 'request.generationTps');
-  const explanation = t(generation === null ? 'request.averageTpsHint' : 'request.generationTpsHint');
+  const average = averageRequestOutputTps(request);
   const first = request.first_output_ms;
   const wait = typeof first === 'number' && Number.isFinite(first) && first >= 0
     ? `${t('request.firstOutputWait')}: ${formatMilliseconds(first, locale)}` : t('request.firstOutputMissing');
-  const hint = `${rate === null ? t(requestIsPending(request) ? 'request.tpsRunning' : 'request.tpsMissing') : explanation} ${wait}`;
-  return <DetailTooltip content={hint}><span tabIndex={0} aria-label={`${label}: ${rate === null ? t('request.usageUnknown') : formatNumber(rate, locale, 2)}. ${hint}`}><small>{label}</small> {rate === null ? '—' : formatNumber(rate, locale, 2)}</span></DetailTooltip>;
+  return <span className="request-output-rates">{([
+    ['generation', generation, t('request.generationTps'), t('request.generationTpsHint')],
+    ['average', average, t('request.averageTps'), t('request.averageTpsHint')],
+  ] as const).map(([kind, rate, label, explanation]) => {
+    const hint = `${explanation} ${rate === null ? t(requestIsPending(request) ? 'request.tpsRunning' : 'request.tpsMissing') : ''} ${wait}`;
+    return <DetailTooltip key={kind} content={hint}><span className="request-output-rate" data-rate={kind} tabIndex={0} aria-label={`${label}: ${rate === null ? t('request.usageUnknown') : formatNumber(rate, locale, 2)}. ${hint}`}><small>{label}</small> {rate === null ? '—' : formatNumber(rate, locale, 2)}</span></DetailTooltip>;
+  })}</span>;
 }
 
 /** Technical values remain available on touch and keyboard without occupying a column. */
