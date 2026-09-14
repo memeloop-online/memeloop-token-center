@@ -251,11 +251,29 @@ async fn send_codex_attempt(
         deadline,
     } = context;
     for connect_attempt in 1..=transport_policy.connect_attempts {
-        match send_codex_attempt_once(
+        let phase = proxy_diagnostics::Phase::account(
+            proxy_diagnostics::Context::for_request(request_id),
+            "codex_transport_attempt",
+            Some(route.route.account_id),
+            Some(route.route.credential_generation),
+        );
+        let result = send_codex_attempt_once(
             state, headers, target_url, route, session_id, client, deadline,
         )
-        .await
-        {
+        .await;
+        phase.finish(
+            match &result {
+                Ok(_) => "response_headers",
+                Err(ProxySendError::RetryableConnection(_)) => "connect_not_delivered",
+                Err(_) => "failed",
+            },
+            result
+                .as_ref()
+                .ok()
+                .map(|(response, _)| response.status().as_u16()),
+            None,
+        );
+        match result {
             Err(ProxySendError::RetryableConnection(failure_stage))
                 if connect_attempt < transport_policy.connect_attempts =>
             {
