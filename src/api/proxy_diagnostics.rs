@@ -23,6 +23,13 @@ tokio::task_local! {
 }
 
 impl Context {
+    #[cfg(test)]
+    pub(super) fn with_started_for_test(request_id: Uuid, started: Instant) -> Self {
+        Self {
+            request_id,
+            started,
+        }
+    }
     pub(super) fn new() -> Self {
         Self {
             request_id: Uuid::now_v7(),

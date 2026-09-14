@@ -348,6 +348,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             };
                             match delivery::send_frame(
                                 delivery::FrameDelivery {
+                                    diagnostic_context,
                                     state: &background_state,
                                     sender: &body_sender,
                                     request_id,
@@ -474,6 +475,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 for frame in terminal_frames.take() {
                     match delivery::send_frame(
                         delivery::FrameDelivery {
+                            diagnostic_context,
                             state: &background_state,
                             sender: &body_sender,
                             request_id,

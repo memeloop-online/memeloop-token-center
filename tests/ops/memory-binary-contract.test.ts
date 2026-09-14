@@ -68,6 +68,8 @@ test('Docker-native service release inputs bind binary, runtime libraries, featu
     run(process.execPath, ['ops/ci/create-memory-binary-manifest.ts', join(exported, 'memeloop-token-center'), revision, artifact]);
     copyFileSync(join(exported, 'libgcc_s.so.1'), join(artifact, 'libgcc_s.so.1'));
     copyFileSync(join(exported, 'libstdc++.so.6'), join(artifact, 'libstdc++.so.6'));
+    writeFileSync(join(artifact, 'install-plugin-oci'), 'verified installer');
+    writeFileSync(join(artifact, 'cosign'), 'verified signature checker');
     run(process.execPath, ['ops/ci/create-release-service-input-manifest.ts', artifact, revision]);
     // GitHub artifact download normalizes file modes. The final Dockerfile
     // restores the executable bit while digest verification remains valid.

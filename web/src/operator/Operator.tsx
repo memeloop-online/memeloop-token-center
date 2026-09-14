@@ -4,6 +4,7 @@ import { useI18n } from '../i18n';
 import type { PluginManifest, TypedFilterAst, UsageAnalysisSessionBucket } from '../types';
 import { api } from '../api';
 import './operator.css';
+import './managementSurfaces.css';
 import '../plugins/pluginUiSlot.css';
 import type { SessionFocus } from './SessionMonitor';
 import type { RequestDrilldown } from './overviewDrilldown';

@@ -17,10 +17,14 @@ FROM ${RUNTIME_IMAGE}
 ENV LD_LIBRARY_PATH=/usr/local/lib \
     GLIBC_TUNABLES=glibc.malloc.mmap_threshold=65536
 COPY --chmod=0555 --from=release-input /memeloop-token-center /usr/local/bin/memeloop-token-center
+COPY --chmod=0555 --from=release-input /install-plugin-oci /usr/local/bin/install-plugin-oci
+COPY --chmod=0555 --from=release-input /cosign /usr/local/bin/cosign
 COPY --from=release-input /libgcc_s.so.1 /usr/local/lib/libgcc_s.so.1
 COPY --from=release-input /libstdc++.so.6 /usr/local/lib/libstdc++.so.6
 COPY --from=web-builder /build/web/dist /usr/share/memeloop-token-center/web
 RUN ["/usr/local/bin/memeloop-token-center", "--help"]
+RUN ["/usr/local/bin/install-plugin-oci", "--help"]
+RUN ["/usr/local/bin/cosign", "version", "--json"]
 USER 10001:10001
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/memeloop-token-center"]

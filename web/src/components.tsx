@@ -204,6 +204,12 @@ function RequestMetadata({ label, fields }: { label: string; fields: [string, st
   </Popover>;
 }
 
+function RequestCompaction({ request }: { request: RequestView }) {
+  const { locale } = useI18n();
+  if (request.compaction !== true) return null;
+  return <DetailTooltip content={locale === 'zh-CN' ? '客户端明确标记了本次请求用于上下文压缩。' : 'The client explicitly marked this request as context compaction.'}><span className="request-compaction" tabIndex={0}>{locale === 'zh-CN' ? '上下文压缩' : 'Context compaction'}</span></DetailTooltip>;
+}
+
 export function RequestDiagnostics({
   request,
   currency,
@@ -231,7 +237,7 @@ export function RequestDiagnostics({
 
   return <div className="request-diagnostics request-detail-surface request-detail-summary">
     <section className="request-detail-group request-detail-primary" aria-label={zh ? '模型与用量' : 'Model and usage'}>
-      <div className="request-detail-wide"><b>{t('request.model')}</b><RequestMetadata label={request.model} fields={[[t('request.routeId'), request.route_id], [t('request.protocol'), request.protocol]]} /></div>
+      <div className="request-detail-wide"><b>{t('request.model')}</b><RequestMetadata label={request.model} fields={[[t('request.routeId'), request.route_id], [t('request.protocol'), request.protocol]]} /><RequestCompaction request={request} /></div>
       <div className="request-detail-wide"><b>{zh ? '凭据' : 'Credential'}</b><RequestMetadata label={credentialLabel} fields={[[zh ? '凭据 ID' : 'Credential ID', request.credential_identity?.key_id], [zh ? '主体' : 'Principal', request.credential_identity?.principal_external_id], [zh ? '租户' : 'Tenant', request.credential_identity?.tenant_external_id]]} /></div>
       <div className="request-token-cell"><b>{t('request.tokens')}</b><RequestTokenSummary request={request} /></div>
       <div><b>{t('request.cost')}</b>{pending ? settlement : <DetailTooltip content={cost.title ?? missing}><span tabIndex={0}>{cost.text}</span></DetailTooltip>}</div>
@@ -308,7 +314,7 @@ export function RequestTable({
             return <tr key={request.request_id}>
               <td className="request-time-cell" data-label={t('request.receivedAt')}><time>{new Date(request.created_at).toLocaleString(locale)}</time><RequestIdentifier requestId={request.request_id} compact /></td>
               <td className="request-credential-cell" data-label={t('self.credential')}><DetailTooltip content={credentialDetails}><strong tabIndex={0}>{credentialLabel}</strong></DetailTooltip></td>
-              <td className="request-model-cell"><DetailTooltip content={technicalSummary}><span className="request-routing-info" tabIndex={0}><code>{request.model}</code>{upstreamName && <small className="request-upstream-name">{upstreamName}</small>}</span></DetailTooltip></td>
+              <td className="request-model-cell"><DetailTooltip content={technicalSummary}><span className="request-routing-info" tabIndex={0}><code>{request.model}</code>{upstreamName && <small className="request-upstream-name">{upstreamName}</small>}</span></DetailTooltip><RequestCompaction request={request} /></td>
               <td className="request-token-cell" data-label={t('request.tokens')}><RequestTokenSummary request={request} /></td>
               <td className="request-cost-cell" data-label={t('request.cost')}><span className="request-value-info" title={cost.title} aria-label={cost.title ? `${cost.text} (${cost.title})` : undefined} tabIndex={cost.title ? 0 : undefined}>{cost.text}</span></td>
               {showsSession && <td className="request-session-cell" data-label={t('request.session')}>
@@ -358,19 +364,40 @@ export function DrawerFrame({
     drawerRef.current?.focus();
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
-    const restoredBackground: Array<{ element: HTMLElement; inert: boolean; ariaHidden: string | null }> = [];
+    const restoredBackground = new Map<HTMLElement, { inert: boolean; ariaHidden: string | null }>();
+    const branches: Array<{ parent: HTMLElement; branch: HTMLElement }> = [];
     let branch: HTMLElement | null = drawerRef.current?.parentElement ?? null;
     while (branch?.parentElement) {
       const parent: HTMLElement = branch.parentElement;
-      for (const sibling of Array.from(parent.children)) {
-        if (!(sibling instanceof HTMLElement) || sibling === branch || sibling.tagName === 'SCRIPT') continue;
-        restoredBackground.push({ element: sibling, inert: sibling.inert, ariaHidden: sibling.getAttribute('aria-hidden') });
-        sibling.inert = true;
-        sibling.setAttribute('aria-hidden', 'true');
-      }
+      branches.push({ parent, branch });
       branch = parent;
       if (parent === document.body) break;
     }
+    const restore = (element: HTMLElement, previous: { inert: boolean; ariaHidden: string | null }) => {
+      element.inert = previous.inert;
+      if (previous.ariaHidden === null) element.removeAttribute('aria-hidden');
+      else element.setAttribute('aria-hidden', previous.ariaHidden);
+    };
+    const isolateBackground = () => {
+      const siblings = new Set<HTMLElement>();
+      for (const { parent, branch } of branches) for (const sibling of Array.from(parent.children)) {
+        if (sibling instanceof HTMLElement && sibling !== branch && sibling.tagName !== 'SCRIPT') siblings.add(sibling);
+      }
+      for (const [element, previous] of restoredBackground) if (!siblings.has(element)) {
+        restore(element, previous);
+        restoredBackground.delete(element);
+      }
+      for (const element of siblings) if (!restoredBackground.has(element)) {
+        restoredBackground.set(element, { inert: element.inert, ariaHidden: element.getAttribute('aria-hidden') });
+        element.inert = true;
+        element.setAttribute('aria-hidden', 'true');
+      }
+    };
+    isolateBackground();
+    // Only direct sibling insertions/removals matter: descendants inherit inert.
+    // No attribute observation, and drawer-owned portals are never siblings here.
+    const backgroundObserver = new MutationObserver(isolateBackground);
+    for (const { parent } of branches) backgroundObserver.observe(parent, { childList: true });
     const keydown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         event.preventDefault();
@@ -393,12 +420,10 @@ export function DrawerFrame({
     document.addEventListener('keydown', keydown);
     return () => {
       document.removeEventListener('keydown', keydown);
+      backgroundObserver.disconnect();
       document.body.style.overflow = previousOverflow;
-      for (const { element, inert, ariaHidden } of restoredBackground.reverse()) {
-        element.inert = inert;
-        if (ariaHidden === null) element.removeAttribute('aria-hidden');
-        else element.setAttribute('aria-hidden', ariaHidden);
-      }
+      for (const [element, previous] of restoredBackground) restore(element, previous);
+      restoredBackground.clear();
       if (previousFocus.current?.isConnected) previousFocus.current.focus();
     };
   }, []);

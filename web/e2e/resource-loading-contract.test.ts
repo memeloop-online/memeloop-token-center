@@ -24,7 +24,9 @@ test('one credential-scoped plugin catalog feeds shell registration and the plug
   assert.match(shell, /scope\.activeCredential,\s*\(signal\)/);
   assert.match(shell, /catalog=\{pluginCatalog\.state\}/);
   const pluginPage = pages.slice(pages.indexOf('export function PluginsPage'));
-  assert.doesNotMatch(pluginPage, /\/internal\/v1\/plugins/);
+  // The page may read self capabilities below /plugins/, but it must reuse
+  // the shell's exact catalog collection instead of fetching it again.
+  assert.doesNotMatch(pluginPage, /['"]\/internal\/v1\/plugins(?:\?[^'"]*)?['"]/);
   assert.match(pluginPage, /catalog\.scopeKey !== token/);
 });
 

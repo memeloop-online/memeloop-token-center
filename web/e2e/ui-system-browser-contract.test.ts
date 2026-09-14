@@ -194,6 +194,10 @@ test('shared surfaces contain long content and retain keyboard actions across lo
           if (theme === 'light') assert.equal(await action.evaluate(element => getComputedStyle(element).color), 'rgb(8, 121, 110)', `${label}: accessible light-theme link token`);
           const requestIdentifiers = page.locator('[data-fixture-request="recorded"] .request-diagnostics').getByRole('button', { name: locale === 'en' ? 'Record identifiers · Details' : '记录标识 · 详细信息', exact: true });
           assert.equal(await page.locator('.request-metadata-surface').count(), 0, `${label}: request identifiers are supplemental, not permanent rows`);
+          // Measure the trigger while it is an interactive accessibility-tree
+          // member. The open trapFocus popover intentionally hides background
+          // controls from role queries until it closes.
+          if (width <= 390) assert.ok(await requestIdentifiers.evaluate(element => element.getBoundingClientRect().height >= 44), `${label}: request metadata touch target`);
           await requestIdentifiers.focus();
           await page.keyboard.press('Enter');
           const requestMetadata = page.locator('.request-metadata-surface');
@@ -202,7 +206,6 @@ test('shared surfaces contain long content and retain keyboard actions across lo
           assert.equal(await requestMetadata.locator('code').textContent(), requestId, `${label}: complete request ID remains available`);
           const requestCopy = requestMetadata.getByRole('button', { name: locale === 'en' ? 'Copy Request ID' : '复制 请求 ID', exact: true });
           if (width <= 390) {
-            assert.ok(await requestIdentifiers.evaluate(element => element.getBoundingClientRect().height >= 44), `${label}: request metadata touch target`);
             assert.ok(await requestCopy.evaluate(element => element.getBoundingClientRect().height >= 44), `${label}: request ID copy target`);
           }
           await requestCopy.focus();

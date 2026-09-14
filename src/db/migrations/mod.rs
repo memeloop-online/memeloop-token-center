@@ -486,6 +486,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "standard authorization code OAuth",
         sql: include_str!("../../../migrations/sqlite/0091_authorization_code_oauth.sql"),
     },
+    Migration {
+        version: 92,
+        name: "plugin installation tasks and actor audit",
+        sql: include_str!("../../../migrations/common/0092_plugin_installation_audit.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -957,6 +962,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 91,
         name: "standard authorization code OAuth",
         sql: include_str!("../../../migrations/postgres/0091_authorization_code_oauth.sql"),
+    },
+    Migration {
+        version: 92,
+        name: "plugin installation tasks and actor audit",
+        sql: include_str!("../../../migrations/common/0092_plugin_installation_audit.sql"),
     },
 ];
 

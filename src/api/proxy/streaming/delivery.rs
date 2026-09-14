@@ -9,6 +9,7 @@ pub(super) struct FrameDelivery<'a> {
     pub state: &'a AppState,
     pub sender: &'a tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
     pub request_id: Uuid,
+    pub diagnostic_context: proxy_diagnostics::Context,
     pub tenant_id: Uuid,
     pub reservation: &'a crate::model::UsageReservation,
     pub input_token_ceiling: i64,
@@ -33,7 +34,7 @@ pub(super) async fn send_frame(
             .map_err(|_| "downstream_backpressure")?
             .map_err(|_| "downstream_disconnected")?;
         if let Err(error) = observe_delivery_transition(
-            input.request_id,
+            input.diagnostic_context,
             "delivery_prepare",
             prepare_proxy_delivery_with_retry(
                 &input.state.db,
@@ -51,7 +52,7 @@ pub(super) async fn send_frame(
             return Err("delivery_state");
         }
         if let Err(error) = observe_delivery_transition(
-            input.request_id,
+            input.diagnostic_context,
             "delivery_confirm",
             confirm_proxy_delivery_with_retry(
                 &input.state.db,
@@ -80,17 +81,17 @@ pub(super) async fn send_frame(
 }
 
 async fn observe_delivery_transition<T, F>(
-    request_id: Uuid,
+    context: proxy_diagnostics::Context,
     phase_name: &'static str,
     operation: F,
 ) -> Result<T, AppError>
 where
     F: std::future::Future<Output = Result<T, AppError>>,
 {
-    let phase = proxy_diagnostics::Phase::new(
-        proxy_diagnostics::Context::for_request(request_id),
-        phase_name,
-    );
+    // Spawned owners do not inherit task-local request clocks. The frame owner
+    // passes the original ingress context, for ordinary and held terminal frames.
+    let request_id = context.request_id;
+    let phase = proxy_diagnostics::Phase::new(context, phase_name);
     let result = tracing::Instrument::instrument(
         operation,
         tracing::info_span!(
@@ -179,15 +180,16 @@ mod delivery_log_tests {
             .with_writer(capture.clone())
             .finish();
         let request_id = Uuid::now_v7();
+        let context = proxy_diagnostics::Context::for_request(request_id);
         tracing::subscriber::with_default(subscriber, || {
-            let success = observe_delivery_transition(request_id, "delivery_prepare", async {
+            let success = observe_delivery_transition(context, "delivery_prepare", async {
                 Ok::<_, AppError>(false)
             })
             .now_or_never()
             .unwrap()
             .unwrap();
             assert!(!success, "observing a database result must not change it");
-            let failure = observe_delivery_transition(request_id, "delivery_confirm", async {
+            let failure = observe_delivery_transition(context, "delivery_confirm", async {
                 Err::<(), _>(AppError::Conflict("SECRET_PHASE_CANARY".into()))
             })
             .now_or_never()
@@ -195,7 +197,7 @@ mod delivery_log_tests {
             assert!(matches!(failure, Err(AppError::Conflict(_))));
             assert!(
                 observe_delivery_transition(
-                    request_id,
+                    context,
                     "delivery_prepare",
                     std::future::pending::<Result<(), AppError>>()
                 )
@@ -209,6 +211,53 @@ mod delivery_log_tests {
         assert!(rendered.contains("state_conflict"));
         assert!(rendered.contains("not_completed"));
         assert!(!rendered.contains("SECRET_PHASE_CANARY"));
+    }
+
+    #[tokio::test]
+    async fn owned_delivery_keeps_ingress_clock_without_task_local_inheritance() {
+        use tracing::instrument::WithSubscriber;
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(capture.clone())
+            .finish();
+        let started = Instant::now() - Duration::from_secs(5);
+        let context = proxy_diagnostics::Context::with_started_for_test(Uuid::now_v7(), started);
+        let expected_id = context.request_id;
+        // The owner is spawned without a task-local scope, just like the real
+        // response stream. No sleeps or scheduler-dependent latency threshold.
+        tokio::spawn(
+            async move {
+                assert!(proxy_diagnostics::CONTEXT.try_with(|_| ()).is_err());
+                assert_eq!(
+                    context.elapsed_millis_at(started + Duration::from_secs(5)),
+                    5000
+                );
+                for name in ["delivery_prepare", "delivery_confirm"] {
+                    observe_delivery_transition(context, name, async { Ok::<_, AppError>(()) })
+                        .await
+                        .unwrap();
+                }
+            }
+            .with_subscriber(subscriber),
+        )
+        .await
+        .unwrap();
+        let rendered = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let events: Vec<serde_json::Value> = rendered
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 4);
+        for event in events {
+            let fields = &event["fields"];
+            assert_eq!(fields["request_id"], expected_id.to_string());
+            assert!(
+                fields["request_elapsed_ms"].as_u64().unwrap() >= 5000,
+                "delivery must retain the supplied five seconds of ingress history"
+            );
+        }
     }
 
     #[test]
