@@ -282,7 +282,7 @@ pub(super) fn prepare_request_with_id(
             "Codex OAuth routes do not accept client output-token limits".into(),
         ));
     }
-    validate_service_tier(object.get("service_tier"))?;
+    validate_service_tier(object.get("service_tier"), protocol)?;
     let output_token_ceiling = trusted_reservation_token_bound(config, upstream_model)?;
     if let Some(controls) = chat_controls.as_ref()
         && controls
@@ -691,7 +691,7 @@ fn reservation_bounds(config: &Value) -> Option<&Map<String, Value>> {
     }
 }
 
-fn validate_service_tier(value: Option<&Value>) -> Result<(), AppError> {
+fn validate_service_tier(value: Option<&Value>, protocol: Protocol) -> Result<(), AppError> {
     match value {
         None => Ok(()),
         Some(Value::String(tier))
@@ -701,6 +701,14 @@ fn validate_service_tier(value: Option<&Value>) -> Result<(), AppError> {
             ) =>
         {
             Ok(())
+        }
+        Some(Value::String(tier))
+            if matches!(protocol, Protocol::OpenAiChat)
+                && matches!(tier.as_str(), "flex" | "scale" | "batch") =>
+        {
+            Err(AppError::BadRequest(format!(
+                "Codex text Chat does not support service_tier={tier}"
+            )))
         }
         Some(_) => Err(AppError::BadRequest(
             "Codex OAuth service_tier must be default, auto, standard_only, or priority".into(),

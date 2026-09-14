@@ -2690,6 +2690,21 @@ fn assert_codex_chat_wire(request: &wiremock::Request, upstream_model: &str) {
 #[tokio::test]
 async fn unsupported_codex_protocol_and_chat_shapes_fail_before_side_effects() {
     let fixture = codex_route_fixture("preadmission").await;
+    fixture
+        .state
+        .db
+        .upsert_model_price_tier(
+            &fixture.model,
+            "USD",
+            "flex",
+            Decimal::ONE,
+            Decimal::ONE,
+            Decimal::ONE,
+            Decimal::ONE,
+            false,
+        )
+        .await
+        .unwrap();
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(500))
@@ -2749,6 +2764,15 @@ async fn unsupported_codex_protocol_and_chat_shapes_fail_before_side_effects() {
             json!({
                 "model": fixture.model,
                 "messages": [{"role": "user", "content": "hello"}],
+                "service_tier": "flex"
+            }),
+            Some("service_tier"),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({
+                "model": fixture.model,
+                "messages": [{"role": "user", "content": "hello"}],
                 "stream": false,
                 "stream_options": {"include_usage": true}
             }),
@@ -2794,6 +2818,21 @@ async fn unsupported_codex_protocol_and_chat_shapes_fail_before_side_effects() {
 #[tokio::test]
 async fn codex_specific_chat_limits_skip_to_a_compatible_native_candidate() {
     let fixture = codex_route_fixture("chat-fallback").await;
+    fixture
+        .state
+        .db
+        .upsert_model_price_tier(
+            &fixture.model,
+            "USD",
+            "flex",
+            Decimal::ONE,
+            Decimal::ONE,
+            Decimal::ONE,
+            Decimal::ONE,
+            false,
+        )
+        .await
+        .unwrap();
     let upstream = MockServer::start().await;
     let (native_account_id, native_route_id) =
         add_native_chat_standby_route(&fixture, "codex-route-chat-fallback", &upstream.uri()).await;
@@ -2805,12 +2844,36 @@ async fn codex_specific_chat_limits_skip_to_a_compatible_native_candidate() {
         .await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
+        .and(body_partial_json(json!({"temperature": 0.7})))
         .respond_with(successful_chat_response())
-        .expect(2)
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(json!({"max_tokens": 63})))
+        .respond_with(successful_chat_response())
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(json!({"service_tier": "flex"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-resilient",
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+            "service_tier": "flex"
+        })))
+        .expect(1)
         .mount(&upstream)
         .await;
 
-    for extra in [json!({"temperature": 0.7}), json!({"max_tokens": 63})] {
+    for extra in [
+        json!({"temperature": 0.7}),
+        json!({"max_tokens": 63}),
+        json!({"service_tier": "flex"}),
+    ] {
         let mut request = json!({
             "model": fixture.model,
             "messages": [{"role": "user", "content": "translate"}],
@@ -2827,14 +2890,14 @@ async fn codex_specific_chat_limits_skip_to_a_compatible_native_candidate() {
             .unwrap();
     }
 
-    wait_for_request_settlement(&fixture, 2).await;
+    wait_for_request_settlement(&fixture, 3).await;
     let rows = fixture
         .state
         .db
         .list_requests(fixture.key_id, 10)
         .await
         .unwrap();
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3);
     for row in rows {
         assert_eq!(row.upstream_account_id, Some(native_account_id));
         assert_eq!(row.route_id, Some(native_route_id));
