@@ -61,7 +61,7 @@ pub(super) async fn rollback_entitlement_tail(
             ));
         }
         let cycle = sqlx::query(
-            "SELECT desired_micros, funded_micros, consumed_micros, status, currency FROM entitlement_cycles WHERE id = $1",
+            "SELECT desired_micros, funded_micros, consumed_micros, status, currency, period_end FROM entitlement_cycles WHERE id = $1",
         )
         .bind(&cycle_id)
         .fetch_optional(&mut **tx)
@@ -71,7 +71,8 @@ pub(super) async fn rollback_entitlement_tail(
         let funded_micros: i64 = cycle.try_get("funded_micros")?;
         let consumed_micros: i64 = cycle.try_get("consumed_micros")?;
         let status: String = cycle.try_get("status")?;
-        let target_funded_micros = if status == "active" {
+        let period_end: i64 = cycle.try_get("period_end")?;
+        let target_funded_micros = if status == "active" && period_end > now {
             desired_micros.max(consumed_micros)
         } else {
             consumed_micros

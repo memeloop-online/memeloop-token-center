@@ -223,6 +223,59 @@ async fn active_desired_reduction_after_consumption_reduces_funding_at_rebate_th
 }
 
 #[tokio::test]
+async fn late_rebate_does_not_restore_expired_entitlement_as_generic_credit() {
+    let fixture = fixture().await;
+    let entitlement = establish_consumed_entitlement(&fixture, "expired-late-rebate").await;
+    // Model wall-clock expiry deterministically without sleeping. Entitlement
+    // cycles remain stored as active until a later subscription reconciliation.
+    let expired_at = entitlement.period_start.saturating_add(1);
+    sqlx::query("UPDATE entitlement_cycles SET period_end = $1 WHERE id = $2")
+        .bind(expired_at)
+        .bind(entitlement.cycle_id.to_string())
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
+
+    let result = fixture
+        .database
+        .reconcile_settlement_adjustment(input(
+            &fixture,
+            "memeloop-cloud:usage-discount",
+            20,
+            1,
+            "lifecycle:rebate-after-expiry",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        account_cycle_ledger_snapshot(&fixture, entitlement.cycle_id).await,
+        (0, 80, 80, 0),
+        "expired entitlement funding must absorb the late rebate instead of creating generic credit",
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM entitlement_cycles WHERE id = $1")
+            .bind(entitlement.cycle_id.to_string())
+            .fetch_one(&fixture.database.pool)
+            .await
+            .unwrap(),
+        "active",
+        "the time boundary, not a pre-updated status, must prevent funding restoration",
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT amount_micros FROM settlement_adjustment_entitlement_funding_reductions WHERE event_id = $1 AND entitlement_cycle_id = $2",
+        )
+        .bind(result.event_id.to_string())
+        .bind(entitlement.cycle_id.to_string())
+        .fetch_one(&fixture.database.pool)
+        .await
+        .unwrap(),
+        20,
+    );
+}
+
+#[tokio::test]
 async fn settlement_adjustment_restores_only_entitlement_tail() {
     let fixture = fixture().await;
     let now = unix_millis();
