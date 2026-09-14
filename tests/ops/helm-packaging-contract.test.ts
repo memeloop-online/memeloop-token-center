@@ -3,6 +3,7 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { parseAllDocuments } from 'yaml';
 import test from 'node:test';
 import { occurrences, read, repository, run } from './contract-helpers.ts';
 
@@ -11,6 +12,27 @@ const helm = process.env.HELM_BIN ?? 'helm';
 const reviewed = `sha256:${'a'.repeat(64)}`;
 const installer = `sha256:${'c'.repeat(64)}`;
 const artifact = `sha256:${'d'.repeat(64)}`;
+const runtimeFlags = [
+  '--set', 'plugins.runtimeInventory.enabled=true',
+  '--set', 'plugins.runtimeInventory.existingClaim=shared-plugin-inventories',
+  '--set', 'plugins.runtimeInventory.installationEnabled=true',
+  '--set', 'plugins.runtimeInventory.policyConfigMap=plugin-install-policy',
+  '--set', 'plugins.runtimeInventory.cosignPublicKeysSecret.name=publisher-trust',
+  '--set', 'plugins.runtimeInventory.cosignPublicKeysSecret.keys[0]=publisher.pem',
+  '--set', 'plugins.runtimeInventory.registrySecrets[0].name=private-registry-auth',
+  '--set', 'plugins.runtimeInventory.registrySecrets[0].keys[0]=username',
+  '--set', 'plugins.runtimeInventory.registrySecrets[0].keys[1]=password',
+];
+
+interface RuntimeDeployment {
+  kind: string;
+  spec: { template: { metadata: { labels: Record<string, string> }; spec: {
+    securityContext: { runAsUser: number; runAsGroup: number; fsGroup: number };
+    containers: Array<{ env: Array<{ name: string }>; volumeMounts: Array<{ name: string; readOnly?: boolean; subPath?: string }> }>;
+    initContainers: Array<{ name: string; args: string[]; volumeMounts: Array<{ readOnly?: boolean }> }>;
+    volumes: Array<{ name: string; persistentVolumeClaim?: { claimName: string; readOnly: boolean }; secret?: { secretName: string } }>;
+  } } };
+}
 
 test('Helm chart packaging, security, ingress, and schema contracts', () => {
   const workspace = mkdtempSync(join(tmpdir(), 'mtc-helm-contract-'));
@@ -20,6 +42,9 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     const render = (name: string, flags: string[] = []): string => run(helm, ['template', `token-center-${name}`, chart, '--namespace', 'token-center', ...flags]);
     const output: Record<string, string> = {
       default: render('default'),
+      runtime: render('runtime', runtimeFlags),
+      runtimeReaders: render('runtime-readers', runtimeFlags.slice(0, 4)),
+      runtimeCreated: render('runtime-created', ['--set', 'plugins.runtimeInventory.enabled=true', '--set', 'plugins.runtimeInventory.persistence.create=true', '--set', 'plugins.runtimeInventory.persistence.storageClass=reviewed-rwx']),
       dev: render('dev', ['--values', join(chart, 'values-dev.yaml')]),
       observed: render('observed', ['--set', 'serviceMonitor.enabled=true', '--set', 'roles.gateway.autoscaling.enabled=true']),
       gatewayMetrics: render('gateway-metrics', ['--show-only', 'templates/servicemonitor.yaml', '--set', 'serviceMonitor.enabled=true', '--set', 'roles.control.enabled=false']),
@@ -54,6 +79,37 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     const has = (key: string, needle: string): void => assert.ok(output[key]!.includes(needle), `${key} render lacks ${needle}`);
     const lacks = (key: string, pattern: string | RegExp): void => assert.ok(typeof pattern === 'string' ? !output[key]!.includes(pattern) : !pattern.test(output[key]!), `${key} render contains forbidden ${String(pattern)}`);
     const count = (key: string, pattern: string | RegExp, expected: number): void => assert.equal(occurrences(output[key]!, pattern), expected, `${key} count for ${String(pattern)}`);
+
+    count('runtime', 'name: MTC_PLUGIN_INVENTORY_FILE', 3);
+    count('runtime', 'name: MTC_PLUGIN_INSTALL_POLICY_FILE', 1);
+    count('runtimeReaders', 'name: MTC_PLUGIN_INSTALL_POLICY_FILE', 0);
+    lacks('runtimeReaders', 'secretName:');
+    lacks('runtime', 'subPath:');
+    lacks('runtime', 'MTC_PLUGIN_DIR');
+    has('runtimeCreated', 'accessModes: [ReadWriteMany]');
+    has('runtimeCreated', 'helm.sh/resource-policy: keep');
+    has('runtimeCreated', 'storage: "1Gi"');
+    has('runtimeCreated', 'storageClassName: "reviewed-rwx"');
+    for (const deployment of parseAllDocuments(output.runtime!).map(document => document.toJSON() as RuntimeDeployment).filter(document => document?.kind === 'Deployment')) {
+      const role = deployment.spec.template.metadata.labels['app.kubernetes.io/component'];
+      const writer = role === 'control';
+      const pod = deployment.spec.template.spec;
+      const container = pod.containers[0]!;
+      assert.equal(pod.securityContext.runAsUser, 10001);
+      assert.equal(pod.securityContext.runAsGroup, 10001);
+      assert.equal(pod.securityContext.fsGroup, 10001);
+      const mount = container.volumeMounts.find(item => item.name === 'plugin-runtime-inventory')!;
+      assert.equal(mount.readOnly, !writer, `${role}: live service write boundary`);
+      const volume = pod.volumes.find(item => item.name === 'plugin-runtime-inventory')!;
+      assert.equal(volume.persistentVolumeClaim?.claimName, 'shared-plugin-inventories');
+      assert.equal(volume.persistentVolumeClaim?.readOnly, !writer);
+      const prepare = pod.initContainers.find(item => item.name === 'prepare-plugin-inventory')!;
+      assert.equal(prepare.args.includes('--read-only'), !writer, `${role}: readers never initialize`);
+      assert.equal(prepare.volumeMounts[0]!.readOnly, !writer);
+      assert.equal(pod.volumes.some(item => item.secret?.secretName === 'publisher-trust'), writer);
+      assert.equal(pod.volumes.some(item => item.secret?.secretName === 'private-registry-auth'), writer);
+      assert.equal(container.env.some(item => item.name === 'MTC_PLUGIN_INSTALL_POLICY_FILE'), writer);
+    }
 
     has('default', 'kind: NetworkPolicy'); has('default', 'kind: PodDisruptionBudget');
     count('default', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "268435456"/, 3);
@@ -111,6 +167,14 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     assert.ok(!chartSources.includes('kubectl.kubernetes.io/last-applied-configuration'));
 
     const invalid: string[][] = [
+      ['plugins.runtimeInventory.enabled=true'],
+      ['plugins.runtimeInventory.enabled=true','plugins.runtimeInventory.persistence.create=true'],
+      ['plugins.runtimeInventory.enabled=true','plugins.runtimeInventory.existingClaim=shared','plugins.runtimeInventory.persistence.create=true','plugins.runtimeInventory.persistence.storageClass=rwx'],
+      ['plugins.runtimeInventory.enabled=true','plugins.runtimeInventory.existingClaim=shared','plugins.runtimeInventory.installationEnabled=true'],
+      ['plugins.runtimeInventory.enabled=true','plugins.runtimeInventory.existingClaim=shared','plugins.enabled=true','plugins.existingConfigMap=legacy'],
+      ['plugins.runtimeInventory.enabled=true','plugins.runtimeInventory.existingClaim=shared','roles.control.enabled=false'],
+      ['plugins.runtimeInventory.cosignPublicKeysSecret.keys[0]=../escape'],
+      ['plugins.runtimeInventory.registrySecrets[0].name=registry','plugins.runtimeInventory.registrySecrets[0].keys[0]=../escape'],
       ['networkPolicy.egress.clusterDependencies.enabled=true'], ['config.archiveBackend=filesystem'], ['config.archiveBackend=memory'], ['image.digest=sha256:abc123'], ['probes.readiness.timeoutSeconds=6'], [`image.digest=sha256:${'A'.repeat(64)}`],
       ['plugins.enabled=true'], ['plugins.enabled=true','plugins.existingConfigMap=x','plugins.existingClaim=x'], ['plugins.ociInstaller.enabled=true'],
       ['roles.gateway.replicaCounnt=2'], ['ingress.gateway.classname=nginx'], ['ingress.enabled=true'], ['ingress.gateway.enabled=true'], ['ingress.control.enabled=true'],

@@ -50,6 +50,15 @@ enum Command {
         role: RuntimeRole,
     },
     Migrate,
+    /// Initialize an empty shared inventory without replacing existing data.
+    #[cfg(feature = "experimental-plugin-revisions")]
+    PreparePluginInventory {
+        #[arg(long)]
+        directory: std::path::PathBuf,
+        /// Reader roles validate the file without creating it.
+        #[arg(long)]
+        read_only: bool,
+    },
 }
 
 #[tokio::main]
@@ -81,9 +90,30 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), &'static str> {
     let cli = Cli::parse();
+    #[cfg(feature = "experimental-plugin-revisions")]
+    if let Command::PreparePluginInventory {
+        directory,
+        read_only,
+    } = &cli.command
+    {
+        return if *read_only {
+            memeloop_token_center::plugin::application::prepare::check_inventory_directory(
+                directory,
+            )
+        } else {
+            memeloop_token_center::plugin::application::prepare::prepare_inventory_directory(
+                directory,
+            )
+        }
+        .map_err(|_| "plugin_inventory_preparation_failed");
+    }
     let config = Config::from_env().map_err(|_| "configuration_invalid")?;
 
     match cli.command {
+        #[cfg(feature = "experimental-plugin-revisions")]
+        Command::PreparePluginInventory { .. } => {
+            unreachable!("handled before configuration loading")
+        }
         Command::Migrate => {
             let database = Database::connect_for_migration(
                 &config.database_url,

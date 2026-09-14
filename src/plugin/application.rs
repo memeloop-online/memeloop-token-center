@@ -19,6 +19,7 @@ use crate::{db::Database, error::AppError, provider::ProviderCatalog};
 
 const CACHED_REVISIONS: usize = 2;
 pub mod installation;
+pub mod prepare;
 const ADMISSION_WAIT: Duration = Duration::from_secs(5);
 const COMPILATION_DEADLINE: Duration = Duration::from_secs(35);
 const PIN_DEADLINE: Duration = Duration::from_secs(45);
