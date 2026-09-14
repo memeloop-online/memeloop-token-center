@@ -210,6 +210,9 @@ test('shared surfaces contain long content and retain keyboard actions across lo
           assert.equal(await page.evaluate(() => navigator.clipboard.readText()), requestId, `${label}: keyboard copies the complete request ID`);
           await page.keyboard.press('Escape');
           await requestMetadata.waitFor({ state: 'detached' });
+          // Fluent/Tabster restores focus asynchronously after the surface is
+          // removed. DOM detachment alone does not mean restoration has run.
+          await page.waitForFunction(element => document.activeElement === element, await requestIdentifiers.elementHandle(), { timeout: 5_000 });
           assert.equal(await requestIdentifiers.evaluate(element => document.activeElement === element), true, `${label}: request metadata restores keyboard focus`);
         }
         if (width === 390 || width === 1440) await page.screenshot({ path: `${artifacts}/${route.name}-${locale}-${theme}-${width}.png`, fullPage: true });
