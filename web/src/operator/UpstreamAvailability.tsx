@@ -9,6 +9,11 @@ export function manualHealthLabel(health: UpstreamHealth) {
     case 'quota_exhausted': return 'providers.healthQuotaExhausted';
     case 'rate_limited': return 'providers.healthRateLimited';
     case 'upstream_unavailable': return 'providers.healthUnavailable';
+    case 'health_state_unavailable': return 'providers.healthStateUnavailable';
+    case 'proxy_destination_invalid': return 'providers.healthProxyDestinationInvalid';
+    case 'proxy_connection_failed': return 'providers.healthProxyConnectionFailed';
+    case 'destination_invalid': return 'providers.healthDestinationInvalid';
+    case 'connection_failed': return 'providers.healthConnectionFailed';
     default: return health.status === 'healthy' ? 'providers.healthy' : 'providers.unhealthy';
   }
 }
@@ -24,6 +29,7 @@ function ManualHealthCheck({ health }: { health?: UpstreamHealth }) {
       {health.latency_ms !== undefined && <span>{formatMilliseconds(health.latency_ms, locale)}</span>}
       {health.retry_at !== undefined && <span>{t('providers.healthRetryAt', { time: new Date(health.retry_at).toLocaleString(locale) })}</span>}
       {health.source === 'routing_state' && <span>{t('providers.healthSuppressed')}</span>}
+      {health.source === 'local_state' && <span>{t('providers.healthStateNotChecked')}</span>}
       {health.status === 'healthy' && <span>{t('providers.healthConnectionOnly')}</span>}
       {health.error_code && <code>{health.error_code}</code>}
     </div>}
