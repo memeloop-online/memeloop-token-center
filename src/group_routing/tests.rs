@@ -187,6 +187,8 @@ fn snapshot() -> RequestGroupRouting {
 
 fn policy(tenant: Uuid, route: Uuid, account: Uuid) -> CandidatePolicy {
     CandidatePolicy {
+        group_id: "test-group".into(),
+        strategy_version: 1,
         plugin_id: "test-policy".into(),
         config: serde_json::json!({}),
         candidate: GroupRoutingCandidate {

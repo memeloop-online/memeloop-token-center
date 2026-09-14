@@ -3644,22 +3644,235 @@ async fn openai_url_image_is_archived(world: &mut TokenCenterWorld) {
     assert_eq!(stats["summary"]["total_cost"], "0.3");
 }
 
-#[then("the empty URL image is rejected unbilled without exposing the signed URL")]
+/// A malformed successful POST cannot prove that the provider did not charge.
+/// Exercise the operator API, durable receipt, and same-key non-replay before
+/// retaining the scenario-specific privacy/archive assertions below.
+async fn confirm_unknown_image_not_delivered(world: &TokenCenterWorld, kind: &str) {
+    assert_eq!(world.status, Some(StatusCode::CONFLICT));
+    assert_eq!(
+        world.response["error"]["code"],
+        "image_submission_uncertain"
+    );
+    assert_eq!(world.response["error"]["retryable"], false);
+    assert_eq!(world.response["error"]["reconciliation_available"], true);
+    assert!(!world.response.to_string().contains("must-not-leak"));
+    let request_id = world
+        .synchronous_request_id
+        .expect("unknown image request id");
+    let (idempotency, payload, reserved) = match kind {
+        "aggregate" => (
+            "openai-image-aggregate-budget",
+            json!({"model":"gpt-image-public","prompt":"ten bounded icons","n":10,"size":"1024x1024"}),
+            3_000_000_i64,
+        ),
+        "codex" => (
+            "codex-image-stable-1",
+            json!({"model":"codex-image-public","prompt":"a compact token loop icon","n":1,"size":"1024x1024","quality":"medium","output_format":"png"}),
+            400_000,
+        ),
+        _ => (
+            "openai-image-stable-1",
+            json!({"model":"gpt-image-public","prompt":"a compact token loop icon","n":1,"size":"1024x1024"}),
+            300_000,
+        ),
+    };
+    let replay_request = || {
+        world
+            .client
+            .post(format!("{}/v1/images/generations", world.service_url))
+            .bearer_auth(&world.current_key)
+            .header("idempotency-key", idempotency)
+            .json(&payload)
+    };
+    let post_count = || async {
+        world
+            .mock
+            .as_ref()
+            .expect("mock server")
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.method == "POST")
+            .count()
+    };
+    assert_eq!(post_count().await, 1);
+    let state = world.state.as_ref().expect("test application state");
+    let pool = AnyPool::connect(&state.config.database_url).await.unwrap();
+    let pending = sqlx::query("SELECT r.status, r.reserved_micros, q.completed_at, q.submission_started_at, q.submission_uncertain_at, q.response_object FROM usage_reservations r JOIN request_records q ON q.reservation_id = r.id WHERE q.id = $1")
+        .bind(request_id.to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!(pending.get::<String, _>("status"), "reserved");
+    assert_eq!(pending.get::<i64, _>("reserved_micros"), reserved);
+    assert!(
+        pending
+            .get::<Option<String>, _>("response_object")
+            .is_none(),
+        "invalid provider bytes must not be archived before manual resolution"
+    );
+    assert!(
+        state
+            .db
+            .synchronous_generation_assets(request_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "partial or invalid assets must not be published"
+    );
+    assert!(pending.get::<Option<i64>, _>("completed_at").is_none());
+    assert!(
+        pending
+            .get::<Option<i64>, _>("submission_started_at")
+            .is_some()
+    );
+    assert!(
+        pending
+            .get::<Option<i64>, _>("submission_uncertain_at")
+            .is_some()
+    );
+    let key: Value = world
+        .client
+        .get(format!("{}/self/v1/key", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        key["available_balance"],
+        if kind == "codex" { "9.6" } else { "0" },
+        "unknown POST must not refund automatically"
+    );
+    let replay = replay_request().send().await.unwrap();
+    assert_eq!(replay.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        replay
+            .headers()
+            .get("x-mtc-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        request_id.to_string()
+    );
+    let replay: Value = replay.json().await.unwrap();
+    assert_eq!(replay["error"]["code"], "image_submission_uncertain");
+    assert_eq!(replay["error"]["retryable"], false);
+    assert!(replay["error"]["reconciliation_available"].is_null());
+    assert_eq!(post_count().await, 1);
+    let token = create_matrix_service_token(
+        world,
+        "image-evidence-reviewer",
+        &["generations:quarantine:read", "generations:reconcile"],
+        Some("default"),
+    )
+    .await;
+    let base = format!(
+        "{}/internal/v1/image-generation-quarantine",
+        world.service_url
+    );
+    let listed = world
+        .client
+        .get(&base)
+        .query(&[("tenant_external_id", "default")])
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed: Value = listed.json().await.unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["request_id"], request_id.to_string());
+    assert_eq!(listed[0]["reserved_micros"], reserved);
+    let decision = json!({"tenant_external_id":"default", "expected_revision":listed[0]["revision"], "action":"not_delivered", "confirmed_cost_micros":0, "currency":"USD", "evidence_digest":blake3::hash(b"mock provider confirms no delivery and no charge").to_hex().to_string()});
+    let resolve = || {
+        world
+            .client
+            .post(format!("{base}/{request_id}/resolve"))
+            .bearer_auth(&token)
+            .header("idempotency-key", "confirmed-image-no-delivery")
+            .json(&decision)
+    };
+    let response = resolve().send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let receipt: Value = response.json().await.unwrap();
+    assert_eq!(receipt["action"], "not_delivered");
+    assert_eq!(receipt["confirmed_cost_micros"], 0);
+    assert_eq!(receipt["evidence_digest"], decision["evidence_digest"]);
+    assert!(receipt["resolved_by_service_id"].as_str().is_some());
+    let repeated = resolve().send().await.unwrap();
+    assert_eq!(repeated.status(), StatusCode::OK);
+    assert_eq!(repeated.json::<Value>().await.unwrap(), receipt);
+    let detail = world
+        .client
+        .get(format!("{base}/{request_id}"))
+        .query(&[("tenant_external_id", "default")])
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(detail.status(), StatusCode::OK);
+    assert_eq!(detail.json::<Value>().await.unwrap()["resolution"], receipt);
+    let settled = sqlx::query("SELECT r.status, r.actual_micros, q.completed_at FROM usage_reservations r JOIN request_records q ON q.reservation_id = r.id WHERE q.id = $1")
+        .bind(request_id.to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!(settled.get::<String, _>("status"), "settled");
+    assert_eq!(settled.get::<i64, _>("actual_micros"), 0);
+    assert!(settled.get::<Option<i64>, _>("completed_at").is_some());
+    let receipts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM image_generation_quarantine_resolutions WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        receipts, 1,
+        "repeated confirmation must not duplicate audit or settlement"
+    );
+    let replay = replay_request().send().await.unwrap();
+    assert_eq!(replay.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        post_count().await,
+        1,
+        "manual resolution must never resubmit the POST"
+    );
+    let key: Value = world
+        .client
+        .get(format!("{}/self/v1/key", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        key["available_balance"],
+        match kind {
+            "aggregate" => "3",
+            "codex" => "10",
+            _ => "0.3",
+        }
+    );
+    pool.close().await;
+}
+
+#[then("the empty URL image is quarantined and reconciled without exposing the signed URL")]
 async fn empty_openai_url_image_is_rejected(world: &mut TokenCenterWorld) {
-    assert_eq!(world.status, Some(StatusCode::BAD_GATEWAY));
-    assert_eq!(world.response["error"]["code"], "upstream_error");
+    confirm_unknown_image_not_delivered(world, "openai").await;
     assert!(!world.response.to_string().contains("must-not-leak"));
     let request_id = world
         .synchronous_request_id
         .expect("empty URL image request id");
     let replay = replay_openai_compatible_image(world).await;
     assert_eq!(replay.status(), StatusCode::BAD_GATEWAY);
-    assert_eq!(
-        replay
+    assert!(
+        !replay
             .json::<Value>()
             .await
-            .expect("empty URL image replay JSON"),
-        world.response
+            .unwrap()
+            .to_string()
+            .contains("must-not-leak")
     );
     let detail = world
         .client
@@ -3675,7 +3888,7 @@ async fn empty_openai_url_image_is_rejected(world: &mut TokenCenterWorld) {
         .await
         .expect("empty URL image detail JSON");
     assert_eq!(detail["status_code"], 502);
-    assert_eq!(detail["error_code"], "upstream_image_asset");
+    assert_eq!(detail["error_code"], "image_not_delivered_confirmed");
     assert_eq!(detail["cost"], "0");
     assert!(detail["response_body"].is_null());
     assert_eq!(detail["archive_complete"], false);
@@ -3691,10 +3904,11 @@ async fn empty_openai_url_image_is_rejected(world: &mut TokenCenterWorld) {
     );
 }
 
-#[then("the ten image request is refunded and leaves no staged assets")]
+#[then(
+    "the ten image request is quarantined until audited confirmation and leaves no published assets"
+)]
 async fn aggregate_openai_images_are_refunded_and_cleaned(world: &mut TokenCenterWorld) {
-    assert_eq!(world.status, Some(StatusCode::BAD_GATEWAY));
-    assert_eq!(world.response["error"]["code"], "upstream_error");
+    confirm_unknown_image_not_delivered(world, "aggregate").await;
     let request_id = world
         .synchronous_request_id
         .expect("aggregate image request id");
@@ -3748,7 +3962,7 @@ async fn aggregate_openai_images_are_refunded_and_cleaned(world: &mut TokenCente
         .await
         .expect("aggregate image detail JSON");
     assert_eq!(detail["status_code"], 502);
-    assert_eq!(detail["error_code"], "upstream_image_asset");
+    assert_eq!(detail["error_code"], "image_not_delivered_confirmed");
     assert_eq!(detail["cost"], "0");
     let key = world
         .client
@@ -3774,8 +3988,9 @@ async fn aggregate_openai_images_are_refunded_and_cleaned(world: &mut TokenCente
     assert_eq!(downloads, 10);
 }
 
-#[then("the oversized image is unbilled and has no partial response archive")]
+#[then("the oversized image is quarantined and reconciled with no partial response archive")]
 async fn oversized_openai_image_is_unbilled(world: &mut TokenCenterWorld) {
+    confirm_unknown_image_not_delivered(world, "openai").await;
     let request_id = world
         .synchronous_request_id
         .expect("oversized synchronous image request id");
@@ -3803,7 +4018,7 @@ async fn oversized_openai_image_is_unbilled(world: &mut TokenCenterWorld) {
     let detail: Value = detail.json().await.expect("oversized image detail JSON");
     assert_eq!(detail["status_code"], 502);
     assert_eq!(detail["cost"], "0");
-    assert_eq!(detail["error_code"], "upstream_image_too_large");
+    assert_eq!(detail["error_code"], "image_not_delivered_confirmed");
     assert!(detail["response_body"].is_null());
     assert_eq!(detail["archive_complete"], false);
     let key: Value = world
@@ -4098,10 +4313,11 @@ async fn codex_image_is_archived_and_metered(world: &mut TokenCenterWorld) {
     assert_eq!(stats["summary"]["total_cost"], "0.4");
 }
 
-#[then("the invalid Codex image payload is sanitized and never archived")]
+#[then(
+    "the invalid Codex image payload is quarantined and reconciled without archiving provider details"
+)]
 async fn invalid_codex_image_is_sanitized(world: &mut TokenCenterWorld) {
-    assert_eq!(world.status, Some(StatusCode::BAD_GATEWAY));
-    assert_eq!(world.response["error"]["code"], "upstream_error");
+    confirm_unknown_image_not_delivered(world, "codex").await;
     assert!(!world.response.to_string().contains("must-not-leak"));
     let request_id = world
         .synchronous_request_id
@@ -4123,12 +4339,13 @@ async fn invalid_codex_image_is_sanitized(world: &mut TokenCenterWorld) {
         .await
         .expect("replay invalid Codex image");
     assert_eq!(replay.status(), StatusCode::BAD_GATEWAY);
-    assert_eq!(
-        replay
+    assert!(
+        !replay
             .json::<Value>()
             .await
-            .expect("invalid Codex image replay JSON"),
-        world.response
+            .unwrap()
+            .to_string()
+            .contains("must-not-leak")
     );
     let detail = world
         .client
@@ -4144,7 +4361,7 @@ async fn invalid_codex_image_is_sanitized(world: &mut TokenCenterWorld) {
         .await
         .expect("invalid Codex image detail JSON");
     assert_eq!(detail["status_code"], 502);
-    assert_eq!(detail["error_code"], "upstream_image_invalid_payload");
+    assert_eq!(detail["error_code"], "image_not_delivered_confirmed");
     assert_eq!(detail["cost"], "0");
     assert!(detail["response_body"].is_null());
     assert_eq!(detail["archive_complete"], false);

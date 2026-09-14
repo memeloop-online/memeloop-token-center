@@ -7,7 +7,9 @@ use futures_util::StreamExt;
 use reqwest::Response;
 use serde_json::{Map, Value};
 
+mod attempt;
 mod comfyui_schema;
+pub(crate) mod group_routing;
 mod siliconflow_video_schema;
 pub use comfyui_schema::{
     effective_parameter_schema as comfyui_parameter_schema,
@@ -408,6 +410,8 @@ async fn process_claimed(
     worker_id: &str,
     job: &GenerationJobWork,
 ) -> Result<(), AppError> {
+    let restored = group_routing::restore(state, job).await?;
+    let state = &restored;
     // Manual proof of a previously unknown delivery starts one bounded polling
     // window. Preserve admission time and every ordinary job's timeout policy.
     let deadline = job
@@ -563,6 +567,21 @@ async fn submit(
     job: &GenerationJobWork,
     route: &ResolvedUpstream,
 ) -> Result<(), AppError> {
+    let mut attempt = attempt::Attempt::new(state, worker_id, job, route);
+    // Admission precedes even the durable submitting transition: an unsent
+    // cooldown rejection must remain safely queued, never delivery-unknown.
+    attempt.admit().await?;
+    let result = submit_attempt(state, worker_id, job, route, &mut attempt).await;
+    attempt.finish(result).await
+}
+
+async fn submit_attempt(
+    state: &AppState,
+    worker_id: &str,
+    job: &GenerationJobWork,
+    route: &ResolvedUpstream,
+    attempt: &mut attempt::Attempt<'_>,
+) -> Result<(), AppError> {
     let capabilities = generation_driver_capabilities(&route.driver);
     let submission_nonce = if job.status == "submitting" {
         if !capabilities.provable_submit_idempotency {
@@ -668,10 +687,12 @@ async fn submit(
         response_result.as_ref().ok().map(reqwest::Response::status),
         upstream_started.elapsed(),
     );
-    let response = response_result
-        .map_err(|error| sanitized_http_error(&error, "generation submit request"))?;
+    let response = response_result.map_err(|error| {
+        attempt.transport_error(&error);
+        sanitized_http_error(&error, "generation submit request")
+    })?;
     let status = response.status();
-    let body = bounded_json(response).await;
+    let body = attempt.json(response).await;
     if !status.is_success() {
         if status.is_client_error() && !matches!(status.as_u16(), 408 | 425 | 429) {
             // Consume the bounded response but never persist the provider envelope: it may
@@ -690,6 +711,7 @@ async fn submit(
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::Upstream("generation submit response has no job id".into()))?;
     let upstream_job_id = validated_upstream_job_id(upstream_job_id)?;
+    attempt.valid = true;
     state
         .db
         .mark_generation_submitted(job.job_id, worker_id, submission_nonce, upstream_job_id)
@@ -748,14 +770,19 @@ async fn poll(
     route: &ResolvedUpstream,
     upstream_job_id: &str,
 ) -> Result<(), AppError> {
-    match route.driver.as_str() {
-        "volcengine-seedance" => poll_seedance(state, worker_id, job, route, upstream_job_id).await,
-        "comfyui" => poll_comfy(state, worker_id, job, route, upstream_job_id).await,
+    let mut attempt = attempt::Attempt::new(state, worker_id, job, route);
+    let result = match route.driver.as_str() {
+        "volcengine-seedance" => {
+            poll_seedance(state, worker_id, job, route, upstream_job_id, &mut attempt).await
+        }
+        "comfyui" => poll_comfy(state, worker_id, job, route, upstream_job_id, &mut attempt).await,
         "http-json" if is_siliconflow_video_profile(&route.config, &job.upstream_model) => {
-            poll_siliconflow_video(state, worker_id, job, route, upstream_job_id).await
+            poll_siliconflow_video(state, worker_id, job, route, upstream_job_id, &mut attempt)
+                .await
         }
         _ => Err(AppError::Upstream("unsupported generation driver".into())),
-    }
+    };
+    attempt.finish(result).await
 }
 
 async fn poll_siliconflow_video(
@@ -764,6 +791,7 @@ async fn poll_siliconflow_video(
     job: &GenerationJobWork,
     route: &ResolvedUpstream,
     upstream_job_id: &str,
+    attempt: &mut attempt::Attempt<'_>,
 ) -> Result<(), AppError> {
     let poll_url = generation_url(&route.base_url, &["video", "status"])?;
     let outbound_http = route_http(state, route, &poll_url).await?;
@@ -774,17 +802,21 @@ async fn poll_siliconflow_video(
         .metrics
         .active_upstream(&route.driver, "generation_poll");
     let upstream_started = std::time::Instant::now();
-    let response_result = route.credential.apply(request, unix_millis())?.send().await;
+    let request = route.credential.apply(request, unix_millis())?;
+    attempt.admit().await?;
+    let response_result = request.send().await;
     state.metrics.observe_upstream(
         &route.driver,
         "generation_poll",
         response_result.as_ref().ok().map(reqwest::Response::status),
         upstream_started.elapsed(),
     );
-    let response = response_result
-        .map_err(|error| sanitized_http_error(&error, "SiliconFlow video poll request"))?;
+    let response = response_result.map_err(|error| {
+        attempt.transport_error(&error);
+        sanitized_http_error(&error, "SiliconFlow video poll request")
+    })?;
     let status = response.status();
-    let body = bounded_json(response).await?;
+    let body = attempt.json(response).await?;
     if !status.is_success() {
         return Err(AppError::Upstream(format!(
             "SiliconFlow video poll returned HTTP {}",
@@ -793,6 +825,7 @@ async fn poll_siliconflow_video(
     }
     match body.get("status").and_then(Value::as_str) {
         Some("InQueue" | "InProgress") => {
+            attempt.valid = true;
             state
                 .db
                 .reschedule_generation_job(
@@ -803,7 +836,10 @@ async fn poll_siliconflow_video(
                 )
                 .await
         }
-        Some("Failed") => terminal_failure(state, worker_id, job, "siliconflow_video_failed").await,
+        Some("Failed") => {
+            attempt.valid = true;
+            terminal_failure(state, worker_id, job, "siliconflow_video_failed").await
+        }
         Some("Succeed") => {
             let Some(videos) = body.pointer("/results/videos").and_then(Value::as_array) else {
                 return terminal_failure(state, worker_id, job, "siliconflow_video_missing_asset")
@@ -826,6 +862,7 @@ async fn poll_siliconflow_video(
                 return terminal_failure(state, worker_id, job, "siliconflow_video_missing_asset")
                     .await;
             };
+            attempt.envelope_valid();
             let attempt_nonce = uuid::Uuid::now_v7();
             let mut staging_lease = begin_generation_staging_attempt(
                 state,
@@ -870,6 +907,7 @@ async fn poll_siliconflow_video(
                 }
             };
             if !archived_asset.mime_type.starts_with("video/") {
+                attempt.invalid_response();
                 state
                     .db
                     .abandon_archive_staging_attempt(&staging_lease)
@@ -877,6 +915,7 @@ async fn poll_siliconflow_video(
                 return terminal_failure(state, worker_id, job, "siliconflow_video_invalid_asset")
                     .await;
             }
+            attempt.valid = true;
             persist_staged_generation_success(
                 state,
                 worker_id,
@@ -906,6 +945,7 @@ async fn poll_seedance(
     job: &GenerationJobWork,
     route: &ResolvedUpstream,
     upstream_job_id: &str,
+    attempt: &mut attempt::Attempt<'_>,
 ) -> Result<(), AppError> {
     let poll_url = generation_url(
         &route.base_url,
@@ -924,17 +964,21 @@ async fn poll_seedance(
         .metrics
         .active_upstream(&route.driver, "generation_poll");
     let upstream_started = std::time::Instant::now();
-    let response_result = route.credential.apply(request, unix_millis())?.send().await;
+    let request = route.credential.apply(request, unix_millis())?;
+    attempt.admit().await?;
+    let response_result = request.send().await;
     state.metrics.observe_upstream(
         &route.driver,
         "generation_poll",
         response_result.as_ref().ok().map(reqwest::Response::status),
         upstream_started.elapsed(),
     );
-    let response =
-        response_result.map_err(|error| sanitized_http_error(&error, "Seedance poll request"))?;
+    let response = response_result.map_err(|error| {
+        attempt.transport_error(&error);
+        sanitized_http_error(&error, "Seedance poll request")
+    })?;
     let status = response.status();
-    let body = bounded_json(response).await?;
+    let body = attempt.json(response).await?;
     if !status.is_success() {
         return Err(AppError::Upstream(format!(
             "Seedance poll returned HTTP {}",
@@ -943,12 +987,14 @@ async fn poll_seedance(
     }
     match body.get("status").and_then(Value::as_str) {
         Some("queued" | "running") | None => {
+            attempt.valid = body.get("status").and_then(Value::as_str).is_some();
             state
                 .db
                 .reschedule_generation_job(job.job_id, worker_id, 2_000, None)
                 .await
         }
         Some("failed" | "cancelled") => {
+            attempt.valid = true;
             terminal_failure(state, worker_id, job, "seedance_generation_failed").await
         }
         Some("succeeded") => {
@@ -971,6 +1017,7 @@ async fn poll_seedance(
             let Some(video_url) = body.pointer("/content/video_url").and_then(Value::as_str) else {
                 return terminal_failure(state, worker_id, job, "seedance_missing_asset").await;
             };
+            attempt.envelope_valid();
             let attempt_nonce = uuid::Uuid::now_v7();
             let mut staging_lease = begin_generation_staging_attempt(
                 state,
@@ -1019,8 +1066,10 @@ async fn poll_seedance(
                     .db
                     .abandon_archive_staging_attempt(&staging_lease)
                     .await?;
+                attempt.invalid_response();
                 return terminal_failure(state, worker_id, job, "seedance_invalid_asset").await;
             }
+            attempt.valid = true;
             persist_staged_generation_success(
                 state,
                 worker_id,
@@ -1044,6 +1093,7 @@ async fn poll_comfy(
     job: &GenerationJobWork,
     route: &ResolvedUpstream,
     upstream_job_id: &str,
+    attempt: &mut attempt::Attempt<'_>,
 ) -> Result<(), AppError> {
     let prefix = comfy_prefix(route)?;
     if prefix == "/api" {
@@ -1051,19 +1101,24 @@ async fn poll_comfy(
             state,
             route,
             generation_url(&route.base_url, &["api", "job", upstream_job_id, "status"])?,
+            attempt,
         )
         .await?;
         match status_body.get("status").and_then(Value::as_str) {
             Some("pending" | "in_progress") | None => {
+                attempt.valid = status_body.get("status").and_then(Value::as_str).is_some();
                 return state
                     .db
                     .reschedule_generation_job(job.job_id, worker_id, 2_000, None)
                     .await;
             }
             Some("failed" | "cancelled") => {
+                attempt.valid = true;
                 return terminal_failure(state, worker_id, job, "comfyui_failed").await;
             }
-            Some("completed") => {}
+            Some("completed") => {
+                attempt.next_http().await?;
+            }
             Some(_) => {
                 return Err(unknown_generation_status("comfyui"));
             }
@@ -1074,12 +1129,13 @@ async fn poll_comfy(
     } else {
         generation_url(&route.base_url, &["history", upstream_job_id])?
     };
-    let history = authenticated_json(state, route, history_path).await?;
+    let history = authenticated_json(state, route, history_path, attempt).await?;
     let entry = if let Some(entry) = history.get(upstream_job_id) {
         entry.clone()
     } else if prefix == "/api" {
         history.clone()
     } else {
+        attempt.valid = history.is_object();
         return state
             .db
             .reschedule_generation_job(job.job_id, worker_id, 2_000, None)
@@ -1090,6 +1146,7 @@ async fn poll_comfy(
         .and_then(Value::as_str)
         .is_some_and(|status| status == "error")
     {
+        attempt.valid = true;
         return terminal_failure(state, worker_id, job, "comfyui_execution_error").await;
     }
     let mut assets = Vec::new();
@@ -1100,9 +1157,11 @@ async fn poll_comfy(
     if assets.len() > MAX_COMFY_ASSETS {
         return terminal_failure(state, worker_id, job, "comfyui_asset_limit_exceeded").await;
     }
+    attempt.envelope_valid();
     let billed_units = match comfyui_billed_pixels(state, job, assets.len()).await? {
         Some(units) if units > 0 && units <= job.estimated_units => units,
         _ => {
+            attempt.invalid_response();
             return terminal_failure_billed(
                 state,
                 worker_id,
@@ -1165,6 +1224,7 @@ async fn poll_comfy(
         };
         archived_assets.push(archived);
     }
+    attempt.valid = true;
     persist_staged_generation_success(
         state,
         worker_id,
@@ -1183,6 +1243,7 @@ async fn authenticated_json(
     state: &AppState,
     route: &ResolvedUpstream,
     url: String,
+    attempt: &mut attempt::Attempt<'_>,
 ) -> Result<Value, AppError> {
     let outbound_http = route_http(state, route, &url).await?;
     let request = route
@@ -1192,6 +1253,7 @@ async fn authenticated_json(
         .metrics
         .active_upstream(&route.driver, "generation_poll");
     let upstream_started = std::time::Instant::now();
+    attempt.admit().await?;
     let response_result = request.send().await;
     state.metrics.observe_upstream(
         &route.driver,
@@ -1199,10 +1261,12 @@ async fn authenticated_json(
         response_result.as_ref().ok().map(reqwest::Response::status),
         upstream_started.elapsed(),
     );
-    let response =
-        response_result.map_err(|error| sanitized_http_error(&error, "generation poll request"))?;
+    let response = response_result.map_err(|error| {
+        attempt.transport_error(&error);
+        sanitized_http_error(&error, "generation poll request")
+    })?;
     let status = response.status();
-    let body = bounded_json(response).await?;
+    let body = attempt.json(response).await?;
     if status.is_success() {
         Ok(body)
     } else {

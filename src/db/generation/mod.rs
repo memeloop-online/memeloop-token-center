@@ -22,7 +22,8 @@ pub use reconcile::{
 };
 pub use synchronous::{
     AttachSynchronousImageRequestObject, FinishSynchronousImageRequest,
-    FinishSynchronousImageResult, GenerationJobIdempotency, StartSynchronousImageRequest,
+    FinishSynchronousImageResult, GenerationJobIdempotency, ImageGenerationQuarantineResolution,
+    ImageGenerationQuarantineView, ResolveImageGenerationQuarantine, StartSynchronousImageRequest,
     StartSynchronousImageResult, SynchronousImageIdempotencyClaim,
 };
 

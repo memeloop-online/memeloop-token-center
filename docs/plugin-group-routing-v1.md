@@ -52,9 +52,10 @@ core health admission entirely. Native selection and ordering remain unchanged,
 but an unconfigured component account with known hard isolation evidence is now
 correctly blocked by the existing native health policy, just like direct providers.
 
-Asynchronous media jobs and the media synchronous-entry path are not wired to
-this contract yet; their durable strategy/revision pinning is separate pending
-work, not covered by this text-proxy implementation.
+Asynchronous media jobs and synchronous images use the same contract, with
+durable strategy/revision receipts and send fencing described in
+[Media group routing](media-group-routing.md). Unknown image submissions have
+an audited confirmation workflow in the existing generation workspace.
 
 ## ABI
 

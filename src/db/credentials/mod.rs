@@ -10,6 +10,7 @@ pub(crate) use keys::{
 };
 pub use keys::{CreateKeyInput, ProvisionedCloudCredential};
 pub use service_tokens::CreateServiceTokenInput;
+pub(crate) use service_tokens::validate_service_scopes;
 
 fn authenticated_key_from_row(
     row: AnyRow,

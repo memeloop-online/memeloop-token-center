@@ -321,6 +321,9 @@ pub struct ManagedKeyView {
 #[derive(Clone, Debug)]
 pub struct AuthenticatedService {
     pub service_id: Option<Uuid>,
+    /// Exact credential which authenticated this request; evidence-bearing
+    /// mutations fence this generation again inside their transaction.
+    pub credential_generation: Option<i64>,
     pub scopes: Vec<String>,
     pub tenant_external_id: Option<String>,
 }
@@ -329,6 +332,7 @@ impl AuthenticatedService {
     pub fn bootstrap() -> Self {
         Self {
             service_id: None,
+            credential_generation: None,
             scopes: vec!["*".to_owned()],
             tenant_external_id: None,
         }
@@ -351,6 +355,7 @@ mod authenticated_service_tests {
 
         let managed = AuthenticatedService {
             service_id: Some(uuid::Uuid::now_v7()),
+            credential_generation: Some(1),
             scopes: vec!["*".to_owned(), "keys:*".to_owned(), "keys:read".to_owned()],
             tenant_external_id: None,
         };
@@ -1397,6 +1402,7 @@ pub struct OperatorGenerationJobView {
 
 #[derive(Clone, Debug)]
 pub struct GenerationJobWork {
+    pub routing_snapshot: Option<serde_json::Value>,
     pub job_id: Uuid,
     pub created_at: i64,
     /// Only evidence-confirmed quarantines receive a fresh, bounded poll window.
