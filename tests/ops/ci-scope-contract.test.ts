@@ -25,15 +25,21 @@ function scopes(event: 'pull_request' | 'push', changes: readonly Change[]): Rec
   }
 }
 
-const webOnly = { rust: 'false', migration: 'false', memory: 'false', plugin_installer: 'false' };
-const full = { rust: 'true', migration: 'true', memory: 'true', plugin_installer: 'false' };
+const webOnly = { rust: 'false', web: 'true', migration: 'false', memory: 'false', plugin_installer: 'false' };
+const staticContractsOnly = { rust: 'false', web: 'false', migration: 'false', memory: 'false', plugin_installer: 'false' };
+const full = { rust: 'true', web: 'true', migration: 'true', memory: 'true', plugin_installer: 'false' };
 const fullPlugin = { ...full, plugin_installer: 'true' };
 
-test('scope matrix permits only web-only pull requests to skip Rust and migration gates', () => {
+test('scope matrix skips expensive service gates only for web or static-contract pull requests', () => {
   const matrix: readonly [label: string, changes: readonly Change[], expected: Record<string, string>][] = [
     ['PR 66-shaped web source and browser contract', [['M', 'web/src/useAnchoredPopover.ts'], ['A', 'web/e2e/popover-width-browser-contract.test.ts']], webOnly],
     ['web deletion', [['D', 'web/e2e/obsolete-browser-contract.test.ts']], webOnly],
     ['web-only rename', [['R100', 'web/src/old.tsx', 'web/src/new.tsx']], webOnly],
+    ['PR 115-shaped source module static contract', [['M', 'tests/ops/source-module-size-contract.test.ts']], staticContractsOnly],
+    ['static contract helper', [['M', 'tests/ops/contract-helpers.ts']], staticContractsOnly],
+    ['static contract plus runtime source', [['M', 'tests/ops/source-module-size-contract.test.ts'], ['M', 'src/api/routes/control.rs']], fullPlugin],
+    ['web build script', [['M', 'web/scripts/verify-github-workflow-policy.mjs']], webOnly],
+    ['CI scope script', [['M', 'ops/ci/detect-expensive-ci-scopes.ts']], full],
     ['production renamed into web', [['R100', 'src/api/routes.rs', 'web/src/routes.ts']], fullPlugin],
     ['web renamed into production', [['R100', 'web/src/routes.ts', 'src/api/routes.rs']], fullPlugin],
     ['shared manifest', [['M', 'package-lock.json']], full],
@@ -48,7 +54,7 @@ test('scope matrix permits only web-only pull requests to skip Rust and migratio
 test('known documentation and ordinary test paths preserve existing memory policy but not Rust or migration coverage', () => {
   assert.deepEqual(
     scopes('pull_request', [['M', 'docs/performance.md'], ['M', 'tests/route_management.rs']]),
-    { rust: 'true', migration: 'true', memory: 'false', plugin_installer: 'false' },
+    { rust: 'true', web: 'true', migration: 'true', memory: 'false', plugin_installer: 'false' },
   );
 });
 
