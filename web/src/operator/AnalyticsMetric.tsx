@@ -15,7 +15,7 @@ export function AnalyticsMetric({ label, value, title, tone = '', trend, ratio, 
   const interactive = Boolean(trend?.length && timestamps?.length === trend.length);
   const selected = index === undefined ? 0 : Math.min(index, (trend?.length ?? 1) - 1);
   const sample = trend?.[selected];
-  const sampleText = formatSample ? formatSample(sample ?? null, selected) : sample == null || !Number.isFinite(sample) ? '—' : formatNumber(sample, locale, 6);
+  const sampleText = interactive && formatSample ? formatSample(sample ?? null, selected) : sample == null || !Number.isFinite(sample) ? '—' : formatNumber(sample, locale, 6);
   const time = timestamps?.[selected];
   const detail = `${time === undefined ? '' : new Date(time).toLocaleString(locale, { timeZone })}${timeZone ? ` ${timeZone}` : ''} · ${label}: ${sampleText}`;
   const area = trend ? metricArea(trend) : undefined;
