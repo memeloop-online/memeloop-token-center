@@ -38,23 +38,12 @@ pub(super) fn seal(
     bytes: &[u8],
     pepper: &[u8],
 ) -> Result<String, AppError> {
-    seal_with_compression(identity, seq, bytes, pepper, false)
-}
-
-pub(super) fn seal_with_compression(
-    identity: ArchiveSpoolIdentity,
-    seq: i64,
-    bytes: &[u8],
-    pepper: &[u8],
-    compression_enabled: bool,
-) -> Result<String, AppError> {
-    seal_for_purpose_with_compression(
+    seal_for_purpose(
         identity,
         seq,
         bytes,
         pepper,
         super::BufferedArchivePurpose::Response,
-        compression_enabled,
     )
 }
 
