@@ -58,6 +58,14 @@ impl<'a> Attempt<'a> {
         }
     }
 
+    pub(super) fn envelope_valid(&mut self) {
+        self.terminal = MediaAttemptTerminal::Inconclusive;
+    }
+
+    pub(super) fn invalid_response(&mut self) {
+        self.terminal = MediaAttemptTerminal::invalid_response();
+    }
+
     pub(super) async fn json(&mut self, response: Response) -> Result<Value, AppError> {
         let (parsed, terminal) = classified_json(response).await;
         self.terminal = terminal;
@@ -103,6 +111,8 @@ impl<'a> Attempt<'a> {
             } else {
                 let terminal = if result.is_ok() && self.valid {
                     MediaAttemptTerminal::Succeeded
+                } else if self.valid {
+                    MediaAttemptTerminal::Inconclusive
                 } else {
                     self.terminal
                 };
@@ -135,7 +145,7 @@ async fn classified_json(response: Response) -> (Result<Value, AppError>, MediaA
         _ => MediaAttemptTerminal::Inconclusive,
     };
     let parsed = bounded_json(response).await;
-    if status.is_success() && parsed.is_err() {
+    if status.is_success() {
         terminal = MediaAttemptTerminal::invalid_response();
     }
     (parsed, terminal)
@@ -213,7 +223,13 @@ mod tests {
     async fn successful_headers_or_json_alone_never_heal_a_probe() {
         let (body, terminal) = classified_json(response(200, "{}").await).await;
         assert!(body.is_ok());
-        assert!(matches!(terminal, MediaAttemptTerminal::Inconclusive));
+        assert!(matches!(
+            terminal,
+            MediaAttemptTerminal::Failed {
+                kind: UpstreamFailureKind::InvalidResponse,
+                ..
+            }
+        ));
         let (body, terminal) = classified_json(response(200, "invalid json").await).await;
         assert!(body.is_err());
         assert!(matches!(

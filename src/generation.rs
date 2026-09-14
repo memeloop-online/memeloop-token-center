@@ -862,6 +862,7 @@ async fn poll_siliconflow_video(
                 return terminal_failure(state, worker_id, job, "siliconflow_video_missing_asset")
                     .await;
             };
+            attempt.envelope_valid();
             let attempt_nonce = uuid::Uuid::now_v7();
             let mut staging_lease = begin_generation_staging_attempt(
                 state,
@@ -906,6 +907,7 @@ async fn poll_siliconflow_video(
                 }
             };
             if !archived_asset.mime_type.starts_with("video/") {
+                attempt.invalid_response();
                 state
                     .db
                     .abandon_archive_staging_attempt(&staging_lease)
@@ -1015,6 +1017,7 @@ async fn poll_seedance(
             let Some(video_url) = body.pointer("/content/video_url").and_then(Value::as_str) else {
                 return terminal_failure(state, worker_id, job, "seedance_missing_asset").await;
             };
+            attempt.envelope_valid();
             let attempt_nonce = uuid::Uuid::now_v7();
             let mut staging_lease = begin_generation_staging_attempt(
                 state,
@@ -1063,6 +1066,7 @@ async fn poll_seedance(
                     .db
                     .abandon_archive_staging_attempt(&staging_lease)
                     .await?;
+                attempt.invalid_response();
                 return terminal_failure(state, worker_id, job, "seedance_invalid_asset").await;
             }
             attempt.valid = true;
@@ -1153,9 +1157,11 @@ async fn poll_comfy(
     if assets.len() > MAX_COMFY_ASSETS {
         return terminal_failure(state, worker_id, job, "comfyui_asset_limit_exceeded").await;
     }
+    attempt.envelope_valid();
     let billed_units = match comfyui_billed_pixels(state, job, assets.len()).await? {
         Some(units) if units > 0 && units <= job.estimated_units => units,
         _ => {
+            attempt.invalid_response();
             return terminal_failure_billed(
                 state,
                 worker_id,

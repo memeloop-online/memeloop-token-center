@@ -168,6 +168,13 @@ async fn fixture(upstream: &MockServer) -> Fixture {
         )
         .await
         .unwrap();
+    let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+    sqlx::query("INSERT INTO model_route_included_provider_groups (tenant_id,model_route_id,provider_group_id,created_at) VALUES ($1,$2,$3,1)")
+        .bind(group.tenant_id.to_string())
+        .bind(route.id.to_string())
+        .bind(group.id.to_string())
+        .execute(&pool).await.unwrap();
+    pool.close().await;
     state
         .db
         .update_group_routing_strategy(
@@ -194,7 +201,7 @@ async fn fixture(upstream: &MockServer) -> Fixture {
     let package = root.join("image-routing");
     fs::create_dir_all(&package).unwrap();
     fs::write(package.join("plugin.json"),serde_json::to_vec(&json!({"id":"image-routing","version":"1.0.0","wit_version":"0.2.0","wasm":"plugin.wasm","capabilities":[],
-        "contributions":{"group_routing":{"version":"group-routing-v1","schema":{"type":"object","additionalProperties":false},"default":{}}}})).unwrap()).unwrap();
+        "contributions":{"group_routing":{"version":"group-routing-v1","schema":{"type":"object","additionalProperties":false,"properties":{"tag":{"type":"string","maxLength":32}}},"default":{}}}})).unwrap()).unwrap();
     fs::write(
         package.join("plugin.wasm"),
         component(&json!({"candidates":[directive(0)]}), &directive(12345)),

@@ -71,9 +71,28 @@ pub(crate) async fn restore(
     state: &AppState,
     job: &crate::model::GenerationJobWork,
 ) -> Result<AppState, AppError> {
+    restore_selected(
+        state,
+        job.routing_snapshot.as_ref(),
+        job.tenant_id,
+        job.model_route_id,
+        job.upstream_account_id,
+        job.job_id,
+    )
+    .await
+}
+
+pub(crate) async fn restore_selected(
+    state: &AppState,
+    value: Option<&serde_json::Value>,
+    tenant_id: Uuid,
+    model_route_id: Option<Uuid>,
+    upstream_account_id: Uuid,
+    job_id: Uuid,
+) -> Result<AppState, AppError> {
     let mut restored = state.clone();
     restored.group_routing = None;
-    let Some(value) = job.routing_snapshot.as_ref() else {
+    let Some(value) = value else {
         return Ok(restored);
     };
     if serde_json::to_vec(value)
@@ -86,7 +105,7 @@ pub(crate) async fn restore(
     let stored: DurablePlan =
         serde_json::from_value(value.clone()).map_err(|_| AppError::Internal)?;
     if stored.version != 1
-        || stored.tenant_id != job.tenant_id
+        || stored.tenant_id != tenant_id
         || stored.policies.len() > 1024
         || stored.deadline_at < stored.started_at
     {
@@ -121,7 +140,7 @@ pub(crate) async fn restore(
     let mut policies = BTreeMap::new();
     for policy in stored.policies {
         let input = GroupRoutingInput {
-            tenant_id: job.tenant_id.to_string(),
+            tenant_id: tenant_id.to_string(),
             seed: stored.seed,
             remaining_deadline_ms: total_budget,
             config: policy.config.clone(),
@@ -136,7 +155,7 @@ pub(crate) async fn restore(
         let route = Uuid::parse_str(&policy.candidate.route_id).map_err(|_| AppError::Internal)?;
         let account =
             Uuid::parse_str(&policy.candidate.account_id).map_err(|_| AppError::Internal)?;
-        if job.model_route_id != Some(route) || account != job.upstream_account_id {
+        if model_route_id != Some(route) || account != upstream_account_id {
             continue;
         }
         let fingerprint = stored.fingerprints.get(&policy.plugin_id);
@@ -144,7 +163,7 @@ pub(crate) async fn restore(
             || fingerprint.is_none()
             || available.get(&policy.plugin_id) != fingerprint
         {
-            tracing::warn!(job_id = %job.job_id, stage = "media_group_routing_revision_unavailable", "pinned strategy unavailable; native health policy retained without running replacement code");
+            tracing::warn!(%job_id, stage = "media_group_routing_revision_unavailable", "pinned strategy unavailable; native health policy retained without running replacement code");
             continue;
         }
         let generation =
@@ -160,7 +179,7 @@ pub(crate) async fn restore(
     let instant = tokio::time::Instant::now();
     let elapsed = Duration::from_millis(now.saturating_sub(stored.started_at).max(0) as u64);
     restored.group_routing = Some(Arc::new(RequestGroupRouting {
-        tenant_id: job.tenant_id,
+        tenant_id,
         seed: stored.seed,
         started: instant.checked_sub(elapsed).unwrap_or(instant),
         deadline: instant
