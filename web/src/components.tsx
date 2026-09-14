@@ -69,8 +69,7 @@ export function NumberMetric({
   const formatted = formatMetricNumber(value, locale);
   return <Metric label={label} tone={tone} value={
     <span className={`metric-number${showCompact && formatted.compact ? ' has-compact' : ''}`}>
-      <span className="metric-exact" title={formatted.text}>{formatted.text}</span>
-      {showCompact && formatted.compact && <small className="metric-compact" aria-hidden="true">{formatted.compact}</small>}
+      <span className="metric-exact" title={formatted.text}>{showCompact && formatted.compact ? formatted.compact : formatted.text}</span>
     </span>
   } />;
 }
@@ -228,7 +227,7 @@ export function RequestTable({
   return (
     <div className="table-scroll request-table-scroll" role="region" aria-label={t('request.table')} tabIndex={0}>
       <table className="request-table">
-        <thead><tr><th>{t('request.receivedAt')}</th>{showRoutingDetails && <th>{t('request.completedAt')}</th>}<th>{t('request.model')}</th>{showsSession && <th>{t('request.session')}</th>}<th>{t('request.protocol')}</th>{showRoutingDetails && <><th className="request-technical-heading">{t('request.upstreamId')}</th><th className="request-technical-heading">{t('request.routeId')}</th></>}<th>{t('request.status')}</th><th>{t('request.duration')}</th><th className="request-secondary-heading">{t('request.tokens')}</th><th className="request-secondary-heading">{t('request.cost')}</th><th>{t('request.error')}</th>{onSelect && <th><span className="visually-hidden">{t('request.actions')}</span></th>}</tr></thead>
+        <thead><tr><th>{t('request.receivedAt')}</th><th>{t('request.model')}</th><th>{t('request.tokens')}</th><th>{t('request.cost')}</th>{showRoutingDetails && <th>{t('request.completedAt')}</th>}{showsSession && <th>{t('request.session')}</th>}<th>{t('request.protocol')}</th>{showRoutingDetails && <><th className="request-technical-heading">{t('request.upstreamId')}</th><th className="request-technical-heading">{t('request.routeId')}</th></>}<th>{t('request.status')}</th><th>{t('request.duration')}</th><th>{t('request.error')}</th>{onSelect && <th><span className="visually-hidden">{t('request.actions')}</span></th>}</tr></thead>
         <tbody>
           {requests.map((request) => {
             const context = request.session_context;
@@ -238,8 +237,10 @@ export function RequestTable({
             const currencyForRequest = recordedCurrency(request, currency);
             return <tr key={request.request_id}>
               <td className="request-time-cell"><time>{new Date(request.created_at).toLocaleString(locale)}</time><RequestIdentifier requestId={request.request_id} compact /></td>
+              <td className="request-model-cell"><code>{request.model}</code></td>
+              <td className="request-token-cell"><span title={formatMetricDisplay(request.input_tokens + request.output_tokens, locale).title}>{formatMetricDisplay(request.input_tokens + request.output_tokens, locale).text}</span><RequestTokenSummary request={request} /></td>
+              <td className="request-cost-cell" title={currencyForRequest ? `${request.cost} ${currencyForRequest}` : undefined}>{currencyForRequest ? formatCurrency(request.cost, currencyForRequest, locale) : '—'}</td>
               {showRoutingDetails && <td className="request-completed-cell">{request.completed_at == null ? '—' : <time>{new Date(request.completed_at).toLocaleString(locale)}</time>}</td>}
-              <td className="request-model-cell"><code>{request.model}</code><span className="request-model-facts"><span title={formatMetricDisplay(request.input_tokens + request.output_tokens, locale).title}>{formatMetricDisplay(request.input_tokens + request.output_tokens, locale).text} {t('request.tokenUnit')}</span><span title={currencyForRequest ? `${request.cost} ${currencyForRequest}` : undefined}>{currencyForRequest ? formatCurrency(request.cost, currencyForRequest, locale) : '—'}</span></span></td>
               {showsSession && <td className="request-session-cell">
                 {!context
                   ? '—'
@@ -254,8 +255,6 @@ export function RequestTable({
               {showRoutingDetails && <><td className="request-upstream-cell request-technical-cell" title={request.upstream_account_id ? `${upstreamNames?.get(request.upstream_account_id) ?? t('request.upstreamId')}: ${request.upstream_account_id}` : undefined}><span aria-hidden="true">ⓘ</span><span className="visually-hidden">{request.upstream_account_id && upstreamNames?.get(request.upstream_account_id) ? `${upstreamNames.get(request.upstream_account_id)} ${request.upstream_account_id}` : request.upstream_account_id ?? '—'}</span></td><td className="request-route-cell request-technical-cell" title={request.route_id ? `${t('request.routeId')}: ${request.route_id}` : undefined}><span aria-hidden="true">ⓘ</span><span className="visually-hidden">{request.route_id ?? '—'}</span></td></>}
               <td><span className={`status ${request.status_code && request.status_code < 400 ? 'ok' : request.status_code ? 'bad' : 'pending'}`}>{request.status_code ?? t('common.running')}</span></td>
               <td>{request.duration_ms === null ? '—' : `${formatNumber(request.duration_ms, locale, 2)} ms`}</td>
-              <td className="request-token-cell"><span title={formatMetricDisplay(request.input_tokens + request.output_tokens, locale).title}>{formatMetricDisplay(request.input_tokens + request.output_tokens, locale).text}</span><RequestTokenSummary request={request} /></td>
-              <td className="request-cost-cell" title={currencyForRequest ? `${request.cost} ${currencyForRequest}` : undefined}>{currencyForRequest ? formatCurrency(request.cost, currencyForRequest, locale) : '—'}</td>
               <td>{request.error_code ? <code className="error-code">{request.error_code}</code> : '—'}</td>
               {onSelect && <td><button className="secondary table-action" type="button" onClick={() => onSelect(request)} aria-label={t('request.openDetail', { model: request.model })}>{t('request.inspect')}</button></td>}
             </tr>

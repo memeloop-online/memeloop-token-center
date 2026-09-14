@@ -63,17 +63,10 @@
 /* Dense analytics surfaces lead with the localized compact value while the
    exact grouped value remains in the DOM for copy, accessibility, and tests. */
 .metric-number.has-compact {
-  position: relative;
+  align-items: baseline;
 }
 
 .metric-number.has-compact .metric-exact {
-  opacity: 0;
-  position: absolute;
-  inset: 0 auto auto 0;
-  pointer-events: none;
-}
-
-.metric-number.has-compact .metric-compact {
   color: inherit;
   font: inherit;
   font-variant-numeric: inherit;
