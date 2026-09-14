@@ -31,7 +31,7 @@ test('real Codex config shapes keep proxy primary and preserve advanced edits an
       await advanced.focus(); await page.keyboard.press('Enter');
       await workspace.getByLabel('网络访问范围', { exact: false }).waitFor();
       const model = shape === 'csil' ? 'gpt-5.3-codex-spark' : 'gpt-5.5';
-      const bound = workspace.getByRole('spinbutton', { name: model, exact: true });
+      const bound = workspace.getByRole('textbox', { name: model, exact: true });
       await bound.fill('72000');
       assert.equal(await workspace.getByRole('button', { name: `删除字段：${model}`, exact: true }).count(), 1);
       assert.equal(await workspace.getByRole('textbox', { name: `字段名称：${model}`, exact: true }).count(), 1);
@@ -49,7 +49,7 @@ test('real Codex config shapes keep proxy primary and preserve advanced edits an
       await page.getByRole('button', { name: '编辑', exact: true }).click();
       await advanced.click();
       assert.equal(await bound.inputValue(), '72000');
-      assert.equal(await workspace.getByRole('spinbutton', { name: 'gpt-6-astra', exact: true }).inputValue(), '64000');
+      assert.equal(await workspace.getByRole('textbox', { name: 'gpt-6-astra', exact: true }).inputValue(), '64000');
       assert.equal(await workspace.getByRole('textbox', { name: 'future_setting', exact: true }).inputValue(), 'preserve-unknown-field');
       assert.equal(await page.evaluate(() => window.formJourneyWrites), 1);
       await page.locator('.create-journey [data-workspace-toggle]').click();
