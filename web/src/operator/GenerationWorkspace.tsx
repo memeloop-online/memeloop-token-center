@@ -5,6 +5,7 @@ import { ApiError, api } from '../api';
 import { DrawerFrame } from '../components';
 import { formatCurrency, formatNumber } from '../format';
 import { useI18n } from '../i18n';
+import { tenantDisplayName } from '../tenantDisplayName';
 import type { GenerationAsset, OperatorGenerationJob } from '../types';
 
 function tenantQuery(tenant: string) {
@@ -114,7 +115,7 @@ export function GenerationWorkspace({ token, tenant, writeTenant = tenant }: { t
         <thead><tr><th>{t('request.time')}</th><th>{t('operator.tenant')}</th><th>{t('generations.credential')}</th><th>{t('request.model')}</th><th>{t('generations.driver')}</th><th>{t('request.status')}</th><th>{t('generations.units')}</th><th>{t('request.cost')}</th><th>{t('request.actions')}</th></tr></thead>
         <tbody>{jobs.map((job) => <tr key={job.job_id}>
           <td>{new Date(job.created_at).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN')}</td>
-          <td>{job.tenant_external_id}</td><td><button type="button" className="table-link" onClick={() => void select(job)}>{job.key_alias}</button><small className="break-anywhere">{job.key_id}</small></td>
+          <td>{tenantDisplayName(job.tenant_external_id, locale)}</td><td><button type="button" className="table-link" onClick={() => void select(job)}>{job.key_alias}</button><small className="break-anywhere">{job.key_id}</small></td>
           <td><code>{job.model}</code></td><td>{job.driver}</td><td><span className={'status ' + (job.status === 'succeeded' ? 'ok' : job.status === 'failed' || job.status === 'cancelled' ? 'bad' : 'pending')}>{t('status.' + job.status)}</span></td>
           <td>{formatNumber(job.billed_units ?? job.estimated_units, locale)} · {t('billingUnit.' + job.billing_unit)}</td>
           <td>{formatCurrency(job.cost, job.currency, locale)}</td>
@@ -125,7 +126,7 @@ export function GenerationWorkspace({ token, tenant, writeTenant = tenant }: { t
     {detail && <DrawerFrame title={detail.model} eyebrow={t('generations.detailTitle')} onClose={() => setDetail(undefined)}>
       {error && <div className="notice error" role="alert">{error}</div>}
       {message && <div className="notice success" role="status">{message}</div>}
-      <p className="muted break-anywhere">{detail.job_id} · {detail.tenant_external_id} · {detail.key_alias}</p>
+      <p className="muted break-anywhere">{detail.job_id} · {tenantDisplayName(detail.tenant_external_id, locale)} · {detail.key_alias}</p>
       <h3>{t('request.status')}</h3><pre>{detail.status}</pre>
       <h3>{t('generations.units')}</h3><pre>{JSON.stringify({ estimated: detail.estimated_units, billed: detail.billed_units, billing_unit: detail.billing_unit, cost: detail.cost, currency: detail.currency }, null, 2)}</pre>
       <h3>{t('request.error')}</h3><pre>{detail.error_code ?? t('common.none')}</pre>

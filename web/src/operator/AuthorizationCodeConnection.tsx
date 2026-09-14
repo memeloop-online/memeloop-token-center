@@ -4,6 +4,7 @@ import type { RJSFSchema } from '@rjsf/utils';
 import { api } from '../api';
 import { Button, Checkbox, Input } from '../design-system';
 import { localizeSchema, useI18n } from '../i18n';
+import { tenantDisplayName } from '../tenantDisplayName';
 import { schemaFormTemplates } from '../SchemaTemplates';
 import { safeValidator } from '../safeValidator';
 import { useConfirmDialog } from '../useConfirmDialog';
@@ -82,7 +83,7 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
 
   return <section className="authorization-form">
     {confirmationDialog}<p className="field-hint">{copy.help}</p>
-    <p>{t('providers.provider')}: {provider.display_name} · {t('operator.tenant')}: {tenant}</p>
+    <p>{t('providers.provider')}: {provider.display_name} · {t('operator.tenant')}: {tenantDisplayName(tenant, locale)}</p>
     <label>{t('providers.name')}<Input required maxLength={200} disabled={busy || Boolean(session) || submitted} value={name} onChange={event => setName(event.target.value)} /></label>
     <p>{copy.network}: {useProxy ? `${copy.proxy} · ${copy.private}` : copy.direct}</p>
     {!session && !submitted && <>

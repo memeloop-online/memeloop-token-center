@@ -431,11 +431,11 @@ Then('中文指标显示万、亿、万亿、USD 与 CNY 并保留精确值', as
   const exactMetric = (label: string) => metric(page, label).locator('.metric-exact');
   await assertExactText(metric(page, '请求数'), '11.12万');
   await assertAttribute(exactMetric('请求数'), 'title', '111,227');
-  await assertExactText(metric(page, '总 Token'), '1万亿');
-  await assertAttribute(exactMetric('总 Token'), 'title', '1,000,100,111,227');
+  await assertExactText(metric(page, '总词元'), '1万亿');
+  await assertAttribute(exactMetric('总词元'), 'title', '1,000,100,111,227');
   await assertExactText(metric(page, '生成计费单位'), '1.23万');
   await assertAttribute(exactMetric('生成计费单位'), 'title', '12,345');
-  await assertExactText(metric(page, '缓存 Token'), '0');
+  await assertExactText(metric(page, '缓存词元'), '0');
   const costs = page.locator('.usage-cost-lines');
   await assertContains(costs, '¥2.5');
   await assertContains(costs, 'US$1.25');
