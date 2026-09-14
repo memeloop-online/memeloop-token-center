@@ -151,6 +151,23 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     assert.equal(cursorCalls.length, 1, 'the stale scope cannot release the active cursor request for a second load');
     await Promise.all([allTenants.close(), routeFailure.close(), recovery.close(), race.close(), lock.close()]);
 
+    const filters = await browser.newPage();
+    await filters.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await filters.goto(fixture('client-filter'));
+    await filters.getByText('Recent client', { exact: true }).waitFor();
+    await filters.getByRole('searchbox').fill('100%_literal');
+    await filters.getByText('Matching older client', { exact: true }).waitFor();
+    assert.equal(await filters.getByText('Recent client', { exact: true }).count(), 0, 'search replaces the page with a server-filtered result, not a local match');
+    await filters.getByRole('combobox', { name: 'Status', exact: true }).selectOption('revoked');
+    await filters.waitForFunction(() => window.credentialFixture.calls.some(call => new URL(call, location.origin).searchParams.get('status') === 'revoked'));
+    await filters.getByRole('combobox', { name: 'Status', exact: true }).selectOption('all');
+    await filters.waitForFunction(() => window.credentialFixture.calls.some(call => {
+      const url = new URL(call, location.origin);
+      return url.pathname === '/internal/v1/keys' && url.searchParams.get('search') === '100%_literal' && !url.searchParams.has('status');
+    }));
+    assert.equal((await calls(filters)).filter(call => call.startsWith('/internal/v1/model-routes')).length, 1, 'search does not refetch unrelated route catalogs');
+    await filters.close();
+
     const plaintext = await browser.newPage();
     plaintext.setDefaultTimeout(10_000);
     await plaintext.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));

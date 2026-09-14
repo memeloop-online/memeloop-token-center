@@ -186,6 +186,14 @@ paths:
           in: query
           description: Return only the exact stable credential identity. This never searches secret values.
           schema: { type: string, format: uuid }
+        - name: search
+          in: query
+          description: Case-insensitive literal substring of alias or principal, applied before pagination. Never searches secrets.
+          schema: { type: string, maxLength: 200 }
+        - name: status
+          in: query
+          description: Status filter applied before pagination.
+          schema: { type: string, enum: [active, suspended, revoked] }
         - $ref: '#/components/parameters/CredentialListLimit500'
         - $ref: '#/components/parameters/BeforeCreatedAt'
         - $ref: '#/components/parameters/BeforeId'

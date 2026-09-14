@@ -75,6 +75,8 @@ pub(in crate::api) struct KeysQuery {
     tenant_external_id: Option<String>,
     principal_external_id: Option<String>,
     key_id: Option<Uuid>,
+    search: Option<String>,
+    status: Option<String>,
     #[serde(default = "default_key_list_limit")]
     limit: i64,
     before_created_at: Option<i64>,
@@ -94,6 +96,25 @@ pub(in crate::api) async fn list_keys(
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "keys:read").await?;
     let tenant = management_tenant(&service, query.tenant_external_id)?;
+    let search = query
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if search.is_some_and(|value| value.len() > 200 || value.chars().any(char::is_control)) {
+        return Err(AppError::BadRequest(
+            "search must contain at most 200 non-control characters".into(),
+        ));
+    }
+    if query
+        .status
+        .as_deref()
+        .is_some_and(|value| !matches!(value, "active" | "suspended" | "revoked"))
+    {
+        return Err(AppError::BadRequest(
+            "status must be active, suspended, or revoked".into(),
+        ));
+    }
     let principal = query
         .principal_external_id
         .as_deref()
@@ -113,12 +134,14 @@ pub(in crate::api) async fn list_keys(
     Ok(Json(
         state
             .db
-            .list_managed_keys_page(
+            .list_managed_keys_filtered_page(
                 tenant.as_deref(),
                 principal,
                 query.key_id,
                 query.limit,
                 before,
+                search,
+                query.status.as_deref(),
             )
             .await?,
     ))
