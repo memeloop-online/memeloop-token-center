@@ -919,6 +919,7 @@ impl Database {
                     );
                 Ok(ConversationRequestView {
                     request: RequestView {
+                        usage_basis: None,
                         compaction: None,
                         first_output_ms: row.try_get("first_output_ms")?,
                         generation_duration_ms: row.try_get("generation_duration_ms")?,

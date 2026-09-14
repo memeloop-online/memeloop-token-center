@@ -25,6 +25,7 @@ test('independent proxy save updates concurrency metadata without dropping the p
     // mutation, real proxy connection, OAuth, quota action or model request runs.
     await page.goto(`${origin}/e2e/fixtures/form-journey.html?workflows&proxy-workflow`);
     const row = page.locator('.provider-directory-row');
+    const quotaDetails = page.locator('.provider-detail-workspace .upstream-quota');
     await row.waitFor();
     assert.doesNotMatch(await row.innerText(), /account-native|openai-codex|credential_generation/);
     assert.match(await row.innerText(), /尚未读取/);
@@ -39,6 +40,12 @@ test('independent proxy save updates concurrency metadata without dropping the p
       await page.screenshot({ path: `${artifacts}/list-${theme}-${width}.png`, fullPage: true });
       await row.getByRole('button', { name: '查看详情', exact: true }).click();
       await page.locator('.provider-detail-workspace').waitFor();
+      const endpointLabel = page.locator('.provider-detail-workspace .upstream-connection').getByText('上游 API 地址（Base URL）', { exact: true });
+      assert.equal(await endpointLabel.count(), 1, 'endpoint help belongs to its field label, not a duplicate row');
+      await endpointLabel.focus();
+      await page.getByRole('tooltip').waitFor();
+      assert.match(await page.getByRole('tooltip').innerText(), /不是网络代理/);
+      await page.keyboard.press('Escape');
       assert.equal(await page.locator('.provider-directory details').count(), 0);
       assert.equal(await page.evaluate(() => window.formJourneyWrites), 0);
       await page.screenshot({ path: `${artifacts}/detail-${theme}-${width}.png`, fullPage: true });
@@ -110,8 +117,10 @@ test('independent proxy save updates concurrency metadata without dropping the p
     // a reset. These reads and the proxy update are in-memory only; no reset
     // endpoint (not even preparation) is allowed by this fixture.
     await page.goto(`${origin}/e2e/fixtures/form-journey.html?workflows&proxy-workflow&quota-generation`);
+    await row.getByRole('button', { name: '刷新额度', exact: true }).click();
+    await page.waitForFunction(() => window.formJourneyReads.filter(path => path.endsWith('/quota')).length === 1);
+    assert.equal(await page.locator('.provider-detail-workspace').count(), 0, 'list quota refresh does not require opening account details');
     await row.getByRole('button', { name: '查看详情', exact: true }).click();
-    await page.getByRole('button', { name: '查看额度', exact: true }).click();
     await page.getByText('Codex 附加用量（代次 1 额度） · 供应商窗口', { exact: true }).waitFor();
     assert.match(await row.innerText(), /75/);
     await page.getByRole('button', { name: '额度重置选项', exact: true }).click();
@@ -120,12 +129,12 @@ test('independent proxy save updates concurrency metadata without dropping the p
     await row.getByRole('button', { name: '查看详情', exact: true }).click();
     await page.getByText('Codex 附加用量（代次 1 额度） · 供应商窗口', { exact: true }).waitFor();
     await page.evaluate(() => { window.deferNextFormQuotaRead = true; });
-    await page.getByRole('button', { name: '刷新额度', exact: true }).click();
+    await quotaDetails.getByRole('button', { name: '刷新额度', exact: true }).click();
     await page.waitForFunction(() => window.formJourneyReads.filter(path => path.endsWith('/quota')).length === 2);
     await page.getByRole('button', { name: '配置网络代理', exact: true }).click();
     await page.locator('.upstream-proxy-editor input').fill('socks5h://10.0.0.30:1080');
     await page.getByRole('button', { name: '保存网络代理', exact: true }).click();
-    await page.getByRole('button', { name: '查看额度', exact: true }).waitFor();
+    await quotaDetails.getByRole('button', { name: '查看额度', exact: true }).waitFor();
     assert.match(await row.innerText(), /尚未读取/);
     assert.equal(await page.getByText('Codex 附加用量（代次 1 额度） · 供应商窗口', { exact: true }).count(), 0);
     await page.getByRole('button', { name: '额度重置选项', exact: true }).click();
@@ -134,7 +143,7 @@ test('independent proxy save updates concurrency metadata without dropping the p
       false,
       'unknown capability must not allow reset preparation after a credential-generation change',
     );
-    await page.getByRole('button', { name: '查看额度', exact: true }).click();
+    await quotaDetails.getByRole('button', { name: '查看额度', exact: true }).click();
     await page.getByText('Codex 附加用量（代次 2 额度） · 供应商窗口', { exact: true }).waitFor();
     await page.evaluate(() => window.releaseFormQuotaRead());
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));

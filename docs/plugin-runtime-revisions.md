@@ -71,8 +71,9 @@ Application publication is implemented behind the feature and explicit host
 inventory opt-in. The signed OCI installer can append reviewed new inventories
 at runtime; Control supports discovery, staging, CAS publication and rollback.
 New provider/OAuth contracts and supported declarative UI contributions need no
-restart. A browser installation/upload surface and revision-log UI are not
-delivered by these primitives. The following remain required boundaries:
+restart. The [Operator workflow](operator-plugin-installation.md) adds signed
+reference installation, exact approval, revision history and audit UI; arbitrary
+browser uploads remain unsupported. The following remain required boundaries:
 
 - A separately provisioned, host-authorized grant document and verification
   keys, mounted independently of candidate packages. The installer must verify

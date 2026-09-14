@@ -31,7 +31,10 @@ test('plugin installer image is patched, pinned, and non-root', (context) => {
   ]) contains(dockerfile, needle);
   excludes(dockerfile, 'github.com/sigstore/cosign/releases/download/');
   excludes(dockerfile, /^ARG\s+COSIGN_(?:VERSION|SHA|DIGEST|COMMIT)/m);
-  excludes('Dockerfile', '/usr/local/bin/cosign');
+  contains('Dockerfile', '/usr/local/bin/cosign');
+  contains('Dockerfile', '/usr/local/bin/install-plugin-oci');
+  contains('src/plugin_distribution/mod.rs', 'COSIGN_VERIFIER_VERSION: &str = "v3.1.3-mtc.3"');
+  contains(dockerfile, '--features plugin-distribution,experimental-plugin-revisions');
   excludes('Cargo.toml', /^sigstore\s*=/m);
   contains('packaging/cosign/v3.1.3-security.patch', '+\tgoogle.golang.org/grpc v1.83.2 // indirect');
   contains('packaging/cosign/v3.1.3-security.patch', '+google.golang.org/grpc v1.83.2 h1:EManeRomTObA0BU7I8vXgg/78uE5MJ9M8B39EX2WscU=');
@@ -61,7 +64,9 @@ test('plugin installer image is patched, pinned, and non-root', (context) => {
     const version = JSON.parse(run('docker', ['run', '--rm', '--entrypoint', '/usr/local/bin/cosign', image, 'version', '--json'])) as { gitVersion?: string; goVersion?: string };
     assert.equal(version.gitVersion, 'v3.1.3-mtc.3');
     assert.equal(version.goVersion, 'go1.26.7');
-    run('docker', ['run', '--rm', image, '--help']);
+    const help = run('docker', ['run', '--rm', image, '--help']);
+    assert.match(help, /--inventory-file/);
+    assert.match(help, /--inventory-entry-file/);
   } finally {
     cleanupOwnedImage(image, providedImage);
   }

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { quotaObservationState, quotaSummaryPresentation, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaPath, type UpstreamQuotaSnapshot } from '../src/operator/upstreamQuota.js';
+import { quotaObservationState, quotaResetCreditExpiry, quotaSummaryPresentation, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaPath, type UpstreamQuotaSnapshot } from '../src/operator/upstreamQuota.js';
 
 test('quota URL requires and preserves explicit account and tenant identity', () => {
   const url = new URL(upstreamQuotaPath('account/one', 'tenant & one'), 'https://example.test');
@@ -46,4 +46,9 @@ test('quota observation state does not confuse a failed refresh or expired snaps
   const zeroWindow = { id: 'code:primary_window', label: 'code:primary_window', used_percent: 0, remaining: null, limit: null, reset_at: null, period_seconds: 18_000, source: 'codex_usage', reset_is_estimated: false, allowed: true, limit_reached: false };
   assert.deepEqual(quotaSummaryPresentation({ ...snapshot, windows: [zeroWindow], error_code: 'quota_transport_failed' }, 1_500), { key: 'providerDirectory.refreshFailedUsed', usedPercent: 0 });
   assert.deepEqual(quotaSummaryPresentation({ ...snapshot, status: 'error', observed_at: null, windows: [zeroWindow] }, 1_500), { key: 'providerDirectory.readFailed', usedPercent: null });
+  const credit = { status: 'available', granted_at: 1000, expires_at: 9000, source: 'codex_reset_credits' };
+  assert.deepEqual(quotaResetCreditExpiry({ ...snapshot, reset_credits: [credit, { ...credit, expires_at: 5000 }, { ...credit, status: 'used', expires_at: 2000 }] }, 1500), { state: 'known', at: 5000 });
+  assert.deepEqual(quotaResetCreditExpiry({ ...snapshot, reset_credits: [credit, { ...credit, expires_at: null }] }, 1500), { state: 'unknown' }, 'incomplete evidence cannot establish the earliest expiry');
+  assert.deepEqual(quotaResetCreditExpiry(snapshot, 1500), { state: 'unknown' }, 'window reset dates cannot substitute for absent credit expiry');
+  assert.deepEqual(quotaResetCreditExpiry({ ...snapshot, reset_credits: [credit] }, 10000), { state: 'none' }, 'expired credits never count as upcoming opportunities');
 });

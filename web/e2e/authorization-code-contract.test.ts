@@ -3,6 +3,15 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { ApiError } from '../src/api.js';
 import { authorizationStartError, validAuthorizationCallback } from '../src/operator/authorizationCode.js';
+import { authorizationCodeCopy } from '../src/operator/authorizationCodeCopy.js';
+
+test('generic OAuth help does not assume Google and continuation uses user-facing wording', () => {
+  for (const locale of ['zh-CN', 'en']) {
+    assert.doesNotMatch(authorizationCodeCopy(locale, 'fixture-plugin').help, /Google/);
+    assert.match(authorizationCodeCopy(locale, 'google-antigravity').help, /Google/);
+    assert.doesNotMatch(authorizationCodeCopy(locale).recoveryExpires, /已签发|恢复截止|Issued|recovery/);
+  }
+});
 
 test('complete callback requires an unambiguous full URL, not a code fragment', () => {
   assert.equal(validAuthorizationCallback('http://localhost:8080/callback?code=fixture&state=fixture'), true);

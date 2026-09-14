@@ -13,7 +13,7 @@ pub(super) async fn finish_unavailable(
             b"{\"error\":{\"message\":\"no healthy upstream is currently available\",\"type\":\"upstream_error\"}}",
         ),
         "application/json",
-        TokenUsage::default(),
+        (TokenUsage::default(), crate::model::RequestUsageBasis::NotObserved),
         Some(error_code.to_owned()),
         ProxyRequestUpstreamAttribution::LastDispatched(last_dispatched_upstream),
     )

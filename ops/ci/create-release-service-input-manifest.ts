@@ -8,7 +8,7 @@ const [directoryValue = '', revisionValue = ''] = process.argv.slice(2);
 if (directoryValue === '' || revisionValue === '') fail(SCOPE, 'directory and revision are required');
 const directory = requireCanonicalDirectory(resolve(directoryValue), SCOPE, 'release input directory');
 const revision = requireRevision(revisionValue, SCOPE);
-const files = ['memeloop-token-center', 'libgcc_s.so.1', 'libstdc++.so.6'] as const;
+const files = ['memeloop-token-center', 'install-plugin-oci', 'cosign', 'libgcc_s.so.1', 'libstdc++.so.6'] as const;
 const digests: Record<string, string> = {};
 for (const name of files) {
   const path = join(directory, name);
@@ -21,7 +21,7 @@ for (const name of files) {
 }
 writeFileSync(
   join(directory, 'release-service-input.json'),
-  `${JSON.stringify({ schema_version: 1, revision, platform: 'linux/amd64', features: ['experimental-plugin-revisions'], files: digests })}\n`,
+  `${JSON.stringify({ schema_version: 1, revision, platform: 'linux/amd64', features: ['experimental-plugin-revisions', 'plugin-distribution'], files: digests })}\n`,
   { encoding: 'utf8', flag: 'wx', mode: 0o600 },
 );
 console.log(`Sealed Docker-native service release input for ${revision}`);

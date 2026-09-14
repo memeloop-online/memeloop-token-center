@@ -75,6 +75,7 @@ pub struct ProxyConversationInput<'a> {
 
 #[derive(Clone)]
 pub struct FinishProxyRequest<'a> {
+    pub usage_basis: Option<crate::model::RequestUsageBasis>,
     pub first_output_ms: Option<i64>,
     pub generation_duration_ms: Option<i64>,
     pub request_id: Uuid,
@@ -667,6 +668,7 @@ impl Database {
         };
         let response_object = format!("gap://{request_id}/response");
         self.finish_proxy_request(FinishProxyRequest {
+            usage_basis: Some(crate::model::RequestUsageBasis::NotObserved),
             first_output_ms: None,
             generation_duration_ms: None,
             request_id,
@@ -1184,7 +1186,14 @@ impl Database {
                 ));
             }
         };
-        let finished = record_request_finished_in_transaction(
+        let usage_basis = if input.charge_contract_ceiling {
+            Some(crate::model::RequestUsageBasis::ContractCeiling)
+        } else if usage_invalid {
+            Some(crate::model::RequestUsageBasis::NotObserved)
+        } else {
+            input.usage_basis
+        };
+        let finished = record_request_finished_with_basis_in_transaction(
             &mut transaction,
             &FinishRequest {
                 first_output_ms: input.first_output_ms,
@@ -1205,6 +1214,7 @@ impl Database {
             trusted_reservation
                 .enforcement_mode
                 .enforces_prepaid_limits(),
+            usage_basis,
         )
         .await?;
         if !finished {
@@ -1571,6 +1581,23 @@ pub(crate) async fn record_request_finished_in_transaction(
     completed_at: i64,
     project_aggregates: bool,
 ) -> Result<bool, AppError> {
+    record_request_finished_with_basis_in_transaction(
+        tx,
+        request,
+        completed_at,
+        project_aggregates,
+        None,
+    )
+    .await
+}
+
+async fn record_request_finished_with_basis_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    request: &FinishRequest,
+    completed_at: i64,
+    project_aggregates: bool,
+    usage_basis: Option<crate::model::RequestUsageBasis>,
+) -> Result<bool, AppError> {
     let request_id = request.request_id.to_string();
     let locator = sqlx::query(
         "SELECT created_at, tenant_id, key_id FROM request_record_locators WHERE id = $1",
@@ -1585,7 +1612,7 @@ pub(crate) async fn record_request_finished_in_transaction(
     let tenant_id: String = locator.try_get("tenant_id")?;
     let key_id: String = locator.try_get("key_id")?;
     let updated = sqlx::query(
-        "UPDATE request_records SET status_code = $1, duration_ms = $2, input_tokens = $3, cached_input_tokens = $4, cache_write_tokens = $5, output_tokens = $6, service_tier = $7, cost_micros = $8, error_code = $9, response_object = $10, completed_at = $11, first_output_ms = $14, generation_duration_ms = $15 WHERE id = $12 AND created_at = $13 AND completed_at IS NULL",
+        "UPDATE request_records SET status_code = $1, duration_ms = $2, input_tokens = $3, cached_input_tokens = $4, cache_write_tokens = $5, output_tokens = $6, service_tier = $7, cost_micros = $8, error_code = $9, response_object = $10, completed_at = $11, first_output_ms = $14, generation_duration_ms = $15, usage_basis = $16 WHERE id = $12 AND created_at = $13 AND completed_at IS NULL",
     )
     .bind(request.status_code)
     .bind(request.duration_ms)
@@ -1602,6 +1629,7 @@ pub(crate) async fn record_request_finished_in_transaction(
     .bind(created_at)
     .bind(request.first_output_ms)
     .bind(request.generation_duration_ms)
+    .bind(usage_basis.map(crate::model::RequestUsageBasis::as_str))
     .execute(&mut **tx)
     .await?;
     if updated.rows_affected() == 0 {
