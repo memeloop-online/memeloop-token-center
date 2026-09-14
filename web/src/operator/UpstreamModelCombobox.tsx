@@ -202,6 +202,7 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
       {syncAccountIds.length > 0 && <button type="button" className="secondary" disabled={loading} onClick={() => void sync()}>{t('routes.syncModels')}</button>}
     </div>
     {needsCustomConfirmation && customAllowed && <div className="notice warning compact">{t('routes.catalogUnverified')}{hasExplicitCodexOAuth && <> {t('routes.codexCapabilityHint')}</>}</div>}
+    {needsCustomConfirmation && hasExplicitCodexOAuth && <p className="field-hint">{locale === 'zh-CN' ? '自定义模型可以保存，但不会自动生成计费预留上限。缺少该模型的可信上限时不会发起请求；请先同步上游模型目录，或在上游配置中填写经核实的同模型上限。预留金额不是已结算费用。' : 'Custom models can be saved without inventing a billing reservation bound. Requests cannot use an account without a verified bound for that exact model. Sync its model catalog or configure a verified model bound. Reserved funds are not settled charges.'}</p>}
     {needsCustomConfirmation && <div className={`custom-model-confirm${customAllowed ? '' : ' disabled'}`}>
       {customAllowed ? <label><input type="checkbox" checked={customConfirmed} onChange={(event) => setCustomConfirmed(event.target.checked)} />{t('routes.confirmCustomModel', { model: value.trim() })}</label> : <span>{t('routes.customUnavailableForGroups')}</span>}
     </div>}
