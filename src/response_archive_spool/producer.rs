@@ -322,6 +322,20 @@ impl ResponseArchiveSettlement {
             );
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn pending_for_test(released: tokio::sync::oneshot::Receiver<()>) -> Self {
+        Self {
+            writer: super::OwnedTask::spawn(
+                async move {
+                    released.await.map_err(|_| AppError::Internal)?;
+                    Ok(())
+                },
+                "response_spool_writer_test",
+                None,
+            ),
+        }
+    }
 }
 
 pub(super) struct ResponseArchiveWriter {
