@@ -39,10 +39,13 @@ if (workspace) {
     })));
     if (path === '/internal/v1/generation-prices') return respond([]);
     if (path === '/internal/v1/schemas') return respond({
-      model_price: { type: 'object', required: ['input_per_million', 'output_per_million'], properties: { input_per_million: { type: 'string', title: 'Input / million tokens', pattern: '^[0-9]+(\\.[0-9]+)?$' }, output_per_million: { type: 'string', title: 'Output / million tokens', pattern: '^[0-9]+(\\.[0-9]+)?$' } } },
+      model_price: { type: 'object', required: ['input_per_million', 'output_per_million'], properties: { service_tier: { type: 'string', default: 'default', enum: ['default', 'priority', 'flex'] }, input_per_million: { type: 'string', title: 'Input / million tokens', pattern: '^[0-9]+(\\.[0-9]+)?$' }, output_per_million: { type: 'string', title: 'Output / million tokens', pattern: '^[0-9]+(\\.[0-9]+)?$' } } },
       generation_price: { type: 'object', properties: { price_per_unit: { type: 'string', title: 'Unit price' } } },
     });
-    if (options?.method === 'POST' && path.startsWith('/internal/v1/prices/')) return respond({ error: { code: 'conflict', message: 'Fixture price rejected; draft retained' } }, 409);
+    if (options?.method === 'POST' && path.startsWith('/internal/v1/prices/')) {
+      if (JSON.parse(String(options.body)).service_tier !== 'default') return respond({ error: { code: 'fixture_invalid_tier', message: 'Localized labels must preserve the default API value' } }, 400);
+      return respond({ error: { code: 'conflict', message: 'Fixture price rejected; draft retained' } }, 409);
+    }
     return respond({ error: { code: 'fixture_unexpected_request', message: path } }, 400);
   };
 }

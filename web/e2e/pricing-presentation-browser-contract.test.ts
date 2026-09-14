@@ -62,6 +62,7 @@ test('pricing comparison, deferred usage, provenance and editor drafts remain tr
     const input = manual.getByLabel('Input / million tokens*', { exact: true });
     const output = manual.getByLabel('Output / million tokens*', { exact: true });
     await input.fill('2'); await output.fill('8');
+    assert.equal(await manual.getByRole('option', { name: 'Standard', exact: true }).count(), 1);
     await manual.getByRole('button', { name: 'Close', exact: true }).click();
     await manual.getByRole('button', { name: 'Set model prices', exact: true }).click();
     assert.equal(await model.inputValue(), 'fixture-edit');
