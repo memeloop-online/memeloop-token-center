@@ -16,7 +16,7 @@ export function isPrivateProxyUrl(value: string) {
 }
 
 /** Generic SOCKS5 hostnames are resolved and checked for private IPs by the server. */
-export function isGenericPrivateProxyUrl(value: string) {
+export function isGenericProxyUrlInput(value: string) {
   if (isPrivateProxyUrl(value)) return true;
   try {
     const url = new URL(value);

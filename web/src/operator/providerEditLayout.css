@@ -20,6 +20,17 @@
 .provider-edit-workspace .form-panel .fui-Input:focus-within { outline: 2px solid var(--form-focus); outline-offset: 2px; }
 .provider-edit-workspace .form-panel .fui-Input input:focus-visible { outline: 0; }
 .provider-edit-workspace .fui-Button { min-height: 40px; font-size: 14px; font-family: inherit; }
+.provider-edit-workspace :is(.fui-Button[type='button']:not(.provider-primary-action), .copy-control button):not(:disabled) {
+  color: var(--colorNeutralForeground1);
+  background: var(--colorNeutralBackground1);
+  border: 1px solid var(--colorNeutralStroke1);
+  box-shadow: var(--shadow2);
+}
+.provider-edit-workspace :is(.fui-Button[type='button']:not(.provider-primary-action), .copy-control button):not(:disabled):hover {
+  background: var(--colorNeutralBackground1Hover);
+  border-color: var(--colorNeutralStroke1Hover);
+}
+.provider-edit-workspace .copy-control button { min-height: 40px; font-size: 14px; font-family: inherit; }
 .provider-edit-workspace .rjsf > .fui-Button { margin-top: 24px; }
 .provider-edit-workspace .form-panel .upstream-form-sections { gap: 24px; }
 .provider-edit-workspace .form-panel .upstream-form-sections fieldset.mtc-form-section { margin: 0; padding: 0; }

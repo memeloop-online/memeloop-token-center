@@ -26,6 +26,7 @@ When('管理员通过统一编辑工作区维护真实代理设置', async funct
   const current = workspace.locator('.provider-proxy-value input');
   await current.waitFor();
   assert.ok(await current.inputValue() === original, 'the editor shows the original proxy value');
+  assert.equal(await current.getAttribute('type'), 'text', 'authorized management values are directly visible');
   assert.equal(await current.getAttribute('value'), null);
   await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
   await workspace.getByRole('button', { name: '复制代理地址', exact: true }).click();
