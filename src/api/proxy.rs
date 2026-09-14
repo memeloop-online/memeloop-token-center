@@ -1780,6 +1780,8 @@ async fn finish_buffered_request_with_upstream_attribution(
             upstream_response_id: response_id.as_deref(),
         });
     let terminal = FinishProxyRequest {
+        first_output_ms: None,
+        generation_duration_ms: None,
         request_id,
         tenant_id: request.tenant_id,
         reservation: &request.reservation,

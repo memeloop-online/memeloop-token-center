@@ -1345,6 +1345,8 @@ async fn sqlite_request_lifecycle_uses_locators_for_finish_detail_and_events() {
 
     database
         .record_request_finished(FinishRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
             request_id,
             status_code: 200,
             duration_ms: 12,

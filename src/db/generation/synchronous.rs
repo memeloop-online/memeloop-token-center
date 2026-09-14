@@ -682,6 +682,8 @@ impl Database {
         let finished = record_request_finished_in_transaction(
             &mut transaction,
             &FinishRequest {
+                first_output_ms: None,
+                generation_duration_ms: None,
                 request_id: input.request_id,
                 status_code: input.status_code,
                 duration_ms: input.duration_ms,
@@ -1102,6 +1104,8 @@ async fn recover_expired_synchronous_image_owner(
         record_request_finished_in_transaction(
             tx,
             &FinishRequest {
+                first_output_ms: None,
+                generation_duration_ms: None,
                 request_id,
                 status_code: 502,
                 duration_ms: now.saturating_sub(created_at),
@@ -1145,6 +1149,8 @@ async fn recover_expired_synchronous_image_owner(
     record_request_finished_in_transaction(
         tx,
         &FinishRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
             request_id,
             status_code: 502,
             duration_ms: now.saturating_sub(created_at),

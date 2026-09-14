@@ -210,6 +210,10 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
     session_context: mergeSessionContext(previous?.session_context, event),
   };
   const credentialIdentity = event.credential_identity ?? previous?.credential_identity;
+  const firstOutput = event.first_output_ms ?? previous?.first_output_ms;
+  const generationDuration = event.generation_duration_ms ?? previous?.generation_duration_ms;
+  if (firstOutput !== undefined) request.first_output_ms = firstOutput;
+  if (generationDuration !== undefined) request.generation_duration_ms = generationDuration;
   if (credentialIdentity !== undefined) request.credential_identity = credentialIdentity;
   return request;
 }

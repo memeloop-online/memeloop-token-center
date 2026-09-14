@@ -129,6 +129,8 @@ async fn request_projection_preserves_source_truth_scope_and_cross_source_cursor
     state
         .db
         .record_request_finished(FinishRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
             request_id: text_id,
             status_code: 200,
             duration_ms: 12,
@@ -679,6 +681,8 @@ async fn record(
     state
         .db
         .record_request_finished(FinishRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
             request_id,
             status_code: request.status_code,
             duration_ms: request.duration_ms,

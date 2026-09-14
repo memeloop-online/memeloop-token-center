@@ -175,6 +175,8 @@ async fn completed_session(
     state
         .db
         .record_request_finished(FinishRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
             request_id,
             status_code,
             duration_ms: 40,
@@ -583,6 +585,8 @@ async fn finish_unlinked(
     state
         .db
         .record_request_finished(FinishRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
             request_id,
             status_code: 200,
             duration_ms: 20,

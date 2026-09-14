@@ -471,6 +471,8 @@ pub struct EntitlementReconcileResult {
 
 #[derive(Clone, Debug)]
 pub struct RequestView {
+    pub first_output_ms: Option<i64>,
+    pub generation_duration_ms: Option<i64>,
     pub request_id: Uuid,
     pub created_at: i64,
     /// Time at which terminal accounting was committed. A missing value is a
@@ -535,7 +537,7 @@ impl Serialize for RequestView {
         use serde::ser::SerializeStruct;
 
         let tokens = self.usage.tokens.as_ref();
-        let mut state = serializer.serialize_struct("RequestView", 23)?;
+        let mut state = serializer.serialize_struct("RequestView", 25)?;
         state.serialize_field("request_id", &self.request_id)?;
         state.serialize_field("created_at", &self.created_at)?;
         state.serialize_field("completed_at", &self.completed_at)?;
@@ -546,6 +548,8 @@ impl Serialize for RequestView {
         state.serialize_field("upstream_account_id", &self.upstream_account_id)?;
         state.serialize_field("route_id", &self.route_id)?;
         state.serialize_field("status_code", &self.status_code)?;
+        state.serialize_field("first_output_ms", &self.first_output_ms)?;
+        state.serialize_field("generation_duration_ms", &self.generation_duration_ms)?;
         state.serialize_field("duration_ms", &self.duration_ms)?;
         state.serialize_field("input_tokens", &tokens.and_then(|value| value.input_tokens))?;
         state.serialize_field(
@@ -698,6 +702,8 @@ impl RequestSessionContext {
 
 #[derive(Clone, Debug)]
 pub struct RequestEventView {
+    pub first_output_ms: Option<i64>,
+    pub generation_duration_ms: Option<i64>,
     pub event_id: Uuid,
     pub request_id: Uuid,
     pub event_at: i64,
@@ -736,7 +742,7 @@ impl Serialize for RequestEventView {
         use serde::ser::SerializeStruct;
 
         let tokens = self.usage.tokens.as_ref();
-        let mut state = serializer.serialize_struct("RequestEventView", 27)?;
+        let mut state = serializer.serialize_struct("RequestEventView", 29)?;
         state.serialize_field("event_id", &self.event_id)?;
         state.serialize_field("request_id", &self.request_id)?;
         state.serialize_field("event_at", &self.event_at)?;
@@ -761,6 +767,8 @@ impl Serialize for RequestEventView {
         state.serialize_field("protocol", &self.protocol)?;
         state.serialize_field("model", &self.model)?;
         state.serialize_field("status_code", &self.status_code)?;
+        state.serialize_field("first_output_ms", &self.first_output_ms)?;
+        state.serialize_field("generation_duration_ms", &self.generation_duration_ms)?;
         state.serialize_field("duration_ms", &self.duration_ms)?;
         state.serialize_field("input_tokens", &tokens.and_then(|value| value.input_tokens))?;
         state.serialize_field(

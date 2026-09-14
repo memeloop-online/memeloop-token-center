@@ -53,6 +53,8 @@ async fn assert_event_enrichment(database: &Database) {
     sqlx::query("INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, atom_hashes_json, created_at, inference_version, session_name, task_kind, agent_id, metadata_source) VALUES ($1, 'recorded-session', $2, $3, '[]', $4, 1, 'recorded-name', 'task', 'agent', 'declared')")
         .bind(Uuid::now_v7().to_string()).bind(&request).bind(&key).bind(now)
         .execute(&database.pool).await.unwrap();
+    sqlx::query("UPDATE request_records SET first_output_ms = 5, generation_duration_ms = 15 WHERE id = $1 AND created_at = $2")
+        .bind(&request).bind(now).execute(&database.pool).await.unwrap();
     // The foreign event deliberately references the same request/key. It must
     // never inherit the first tenant's routing or conversation fields.
     for event_tenant in [&tenant, &foreign_tenant] {
@@ -72,6 +74,11 @@ async fn assert_event_enrichment(database: &Database) {
     assert_eq!(event.upstream_account_id, Some(upstream));
     assert_eq!(event.route_id, Some(route));
     assert_eq!(event.currency.as_deref(), Some("USD"));
+    assert_eq!(event.first_output_ms, Some(5));
+    assert_eq!(event.generation_duration_ms, Some(15));
+    let serialized = serde_json::to_value(event).unwrap();
+    assert_eq!(serialized["first_output_ms"], 5);
+    assert_eq!(serialized["generation_duration_ms"], 15);
     assert_eq!(event.cached_input_tokens, 30);
     assert_eq!(event.cache_write_tokens, 10);
     let context = event.session_context.as_ref().unwrap();
@@ -83,6 +90,8 @@ async fn assert_event_enrichment(database: &Database) {
         .unwrap();
     assert_eq!(foreign.len(), 1);
     assert!(foreign[0].created_at.is_none());
+    assert!(foreign[0].first_output_ms.is_none());
+    assert!(foreign[0].generation_duration_ms.is_none());
     assert!(foreign[0].upstream_account_id.is_none());
     assert!(foreign[0].route_id.is_none());
     assert!(foreign[0].currency.is_none());
@@ -99,6 +108,41 @@ async fn assert_event_enrichment(database: &Database) {
     assert!(foreign[0].session_context.is_none());
     let foreign_json = serde_json::to_value(&foreign[0]).unwrap();
     assert!(foreign_json["cached_input_tokens"].is_null());
+    // Exercise the same terminal UPDATE used by production, independently of
+    // the event fixture's deliberately different event/receipt timestamps.
+    let mut transaction = database.pool.begin().await.unwrap();
+    sqlx::query("UPDATE request_records SET completed_at = NULL WHERE id = $1 AND created_at = $2")
+        .bind(&request)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    crate::db::requests::lifecycle::record_request_finished_in_transaction(
+        &mut transaction,
+        &FinishRequest {
+            request_id: Uuid::parse_str(&request).unwrap(),
+            first_output_ms: Some(7),
+            generation_duration_ms: Some(11),
+            status_code: 200,
+            duration_ms: 25,
+            input_tokens: 100,
+            cached_input_tokens: 30,
+            cache_write_tokens: 10,
+            output_tokens: 20,
+            service_tier: None,
+            cost_micros: 1000000,
+            error_code: None,
+            response_object: "gap://fixture".to_owned(),
+        },
+        now + 25,
+        false,
+    )
+    .await
+    .unwrap();
+    let timing: (Option<i64>, Option<i64>) = sqlx::query_as("SELECT first_output_ms, generation_duration_ms FROM request_records WHERE id = $1 AND created_at = $2")
+        .bind(&request).bind(now).fetch_one(&mut *transaction).await.unwrap();
+    assert_eq!(timing, (Some(7), Some(11)));
+    transaction.rollback().await.unwrap();
     // The SQLite fixture owns its pool. PostgreSQL CI shares its database
     // with concurrent high-volume tests, so a global first page is not ours.
     if matches!(database.backend, DatabaseBackend::Sqlite) {

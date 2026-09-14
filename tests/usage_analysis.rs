@@ -225,6 +225,8 @@ async fn finish(state: &AppState, key: &AuthenticatedKey, sample: UsageSample<'_
     state
         .db
         .record_request_finished(FinishRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
             request_id,
             status_code: sample.status_code,
             duration_ms: sample.duration_ms,

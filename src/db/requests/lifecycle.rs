@@ -22,6 +22,8 @@ pub struct NewRequest {
 }
 
 pub struct FinishRequest {
+    pub first_output_ms: Option<i64>,
+    pub generation_duration_ms: Option<i64>,
     pub request_id: Uuid,
     pub status_code: i64,
     pub duration_ms: i64,
@@ -73,6 +75,8 @@ pub struct ProxyConversationInput<'a> {
 
 #[derive(Clone)]
 pub struct FinishProxyRequest<'a> {
+    pub first_output_ms: Option<i64>,
+    pub generation_duration_ms: Option<i64>,
     pub request_id: Uuid,
     pub tenant_id: Uuid,
     pub reservation: &'a UsageReservation,
@@ -663,6 +667,8 @@ impl Database {
         };
         let response_object = format!("gap://{request_id}/response");
         self.finish_proxy_request(FinishProxyRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
             request_id,
             tenant_id,
             reservation,
@@ -1177,6 +1183,8 @@ impl Database {
         let finished = record_request_finished_in_transaction(
             &mut transaction,
             &FinishRequest {
+                first_output_ms: input.first_output_ms,
+                generation_duration_ms: input.generation_duration_ms,
                 request_id: input.request_id,
                 status_code,
                 duration_ms: input.duration_ms.max(0),
@@ -1573,7 +1581,7 @@ pub(crate) async fn record_request_finished_in_transaction(
     let tenant_id: String = locator.try_get("tenant_id")?;
     let key_id: String = locator.try_get("key_id")?;
     let updated = sqlx::query(
-        "UPDATE request_records SET status_code = $1, duration_ms = $2, input_tokens = $3, cached_input_tokens = $4, cache_write_tokens = $5, output_tokens = $6, service_tier = $7, cost_micros = $8, error_code = $9, response_object = $10, completed_at = $11 WHERE id = $12 AND created_at = $13 AND completed_at IS NULL",
+        "UPDATE request_records SET status_code = $1, duration_ms = $2, input_tokens = $3, cached_input_tokens = $4, cache_write_tokens = $5, output_tokens = $6, service_tier = $7, cost_micros = $8, error_code = $9, response_object = $10, completed_at = $11, first_output_ms = $14, generation_duration_ms = $15 WHERE id = $12 AND created_at = $13 AND completed_at IS NULL",
     )
     .bind(request.status_code)
     .bind(request.duration_ms)
@@ -1588,6 +1596,8 @@ pub(crate) async fn record_request_finished_in_transaction(
     .bind(completed_at)
     .bind(&request_id)
     .bind(created_at)
+    .bind(request.first_output_ms)
+    .bind(request.generation_duration_ms)
     .execute(&mut **tx)
     .await?;
     if updated.rows_affected() == 0 {

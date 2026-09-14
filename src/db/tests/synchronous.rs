@@ -301,6 +301,8 @@ async fn synchronous_image_terminal_crash_is_recovered_without_second_charge() {
     assert_eq!(cost_micros, 1_000);
     database
         .record_request_finished(FinishRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
             request_id,
             status_code: 200,
             duration_ms: 50,
@@ -631,6 +633,8 @@ async fn synchronous_image_reaper_failure_allows_same_hash_takeover() {
     database.settle_usage(&old_reservation, 0, 0).await.unwrap();
     database
         .record_request_finished(FinishRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
             request_id: old_request_id,
             status_code: 504,
             duration_ms: 1_800_001,
