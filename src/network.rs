@@ -285,13 +285,13 @@ async fn config_url_client(
 
     let proxy = checked_proxy_url(proxy_url)?;
     let proxy_resolves_target = proxy.scheme() == "socks5h";
-    if proxy_resolves_target && !has_safe_private_ip_literal_host(&proxy) {
+    let (proxy_host, proxy_addresses, proxy_test_loopback) =
+        validated_endpoint(&proxy, proxy_scope, allow_test_loopback).await?;
+    if proxy_resolves_target && !has_safe_private_ip_literal_host(&proxy) && !proxy_test_loopback {
         return Err(AppError::BadRequest(
             "remote-DNS SOCKS5 proxies must use an explicitly private IP endpoint".into(),
         ));
     }
-    let (proxy_host, proxy_addresses, proxy_test_loopback) =
-        validated_endpoint(&proxy, proxy_scope, allow_test_loopback).await?;
     let private_proxy = proxy_scope == OutboundScope::Private
         && proxy_addresses
             .iter()
