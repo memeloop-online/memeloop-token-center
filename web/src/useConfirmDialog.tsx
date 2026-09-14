@@ -1,4 +1,5 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useI18n } from './i18n';
 import './confirm-dialog.css';
 
@@ -7,6 +8,7 @@ type Confirmation = {
   revision: number;
   resolve: (accepted: boolean) => void;
   trigger: HTMLElement | null;
+  mountNode: HTMLElement | null;
 };
 
 /** Confirmation is invalidated when its authority or resource scope changes. */
@@ -56,9 +58,13 @@ export function useConfirmDialog(scope: readonly unknown[]) {
     if (!mounted.current || current.current || renderedRevision !== revision.current) return false;
     const requestedRevision = renderedRevision;
     const accepted = await new Promise<boolean>((resolve) => {
+      const trigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
       const pending = {
         message, revision: requestedRevision, resolve,
-        trigger: document.activeElement instanceof HTMLElement ? document.activeElement : null,
+        trigger,
+        // The hook can be owned by a page while activation comes from its
+        // drawer. Keep this exact confirmation in that initiating overlay.
+        mountNode: trigger?.closest('.drawer')?.querySelector<HTMLElement>('.drawer-owned-portals') ?? null,
       };
       current.current = pending;
       setConfirmation(pending);
@@ -68,6 +74,7 @@ export function useConfirmDialog(scope: readonly unknown[]) {
   const confirmationDialog = confirmation ? <dialog ref={dialogRef} className="app-confirm-dialog"
     aria-modal="true" aria-labelledby={`${id}-title`} aria-describedby={`${id}-description`}
     onKeyDown={(event) => {
+      if (event.key === 'Escape' || event.key === 'Tab') event.stopPropagation();
       if (event.key !== 'Tab') return;
       // showModal makes the background inert, but browsers may still move
       // boundary Tab focus to browser chrome. Keep this two-action dialog's
@@ -92,5 +99,5 @@ export function useConfirmDialog(scope: readonly unknown[]) {
       <button ref={proceedRef} type="button" className="danger" onClick={() => finish(true)}>{t('confirmation.proceed')}</button>
     </div>
   </dialog> : null;
-  return { confirm, confirmationDialog };
+  return { confirm, confirmationDialog: confirmationDialog && confirmation?.mountNode ? createPortal(confirmationDialog, confirmation.mountNode) : confirmationDialog };
 }
