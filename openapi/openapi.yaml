@@ -3742,15 +3742,15 @@ paths:
         Requires the dedicated `settlements:adjust` scope. `credits:write` alone does
         not authorize this operation. Tenant-scoped service credentials may act only on
         accounts in their own tenant; an unbound account or another tenant's account is
-        returned as 404. The idempotency namespace is the authenticated caller/tenant
-        and `Idempotency-Key`. An exact replay returns 200 with `replayed: true`; a new
+        returned as 404. The idempotency namespace is `(account_id, Idempotency-Key)`.
+        An exact replay returns 200 with `replayed: true`; a new
         reconciliation, including a higher desired version, returns 201. Reusing a key
         with a different canonical request, stale version, or an amount above the gross
         settlement returns 409.
       security: [{ serviceBearer: [] }]
       x-required-scope: settlements:adjust
       x-idempotency-contract:
-        namespace: authenticated-service-and-tenant
+        namespace: account-id-and-idempotency-key
         different-payload-status: 409
         exact-replay-status: 200
         new-or-higher-version-status: 201
@@ -7890,10 +7890,8 @@ components:
             - type: 'null'
     SettlementAdjustmentNamespace:
       type: string
-      minLength: 3
-      maxLength: 129
-      pattern: '^[a-z][a-z0-9-]{0,63}:[a-z][a-z0-9-]{0,63}$'
-      description: The initial Cloud namespace is `memeloop-cloud:usage-discount`; other restricted lower-case owner:name namespaces are reserved for independently versioned integrations.
+      const: memeloop-cloud:usage-discount
+      description: The only namespace accepted in the initial release. Future integration namespaces require explicit API authorization rather than generic owner:name acceptance.
     SettlementAdjustmentDecisionDigest:
       type: string
       pattern: '^[a-f0-9]{64}$'

@@ -127,28 +127,9 @@ fn validate_namespace(value: &str) -> Result<(), AppError> {
     if value == CLOUD_USAGE_DISCOUNT_NAMESPACE {
         return Ok(());
     }
-    let (owner, name) = value.split_once(':').ok_or_else(|| {
-        AppError::BadRequest(
-            "namespace must be memeloop-cloud:usage-discount or a restricted namespace".into(),
-        )
-    })?;
-    if value.matches(':').count() != 1
-        || !namespace_segment_is_valid(owner)
-        || !namespace_segment_is_valid(name)
-    {
-        return Err(AppError::BadRequest(
-            "namespace must be memeloop-cloud:usage-discount or a restricted namespace".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn namespace_segment_is_valid(value: &str) -> bool {
-    (1..=64).contains(&value.len())
-        && value.as_bytes()[0].is_ascii_lowercase()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    Err(AppError::BadRequest(
+        "namespace must be memeloop-cloud:usage-discount".into(),
+    ))
 }
 
 fn validate_decision_digest(value: &str) -> Result<(), AppError> {
@@ -178,18 +159,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn adjustment_namespace_is_narrow_and_stable() {
-        for valid in [
-            CLOUD_USAGE_DISCOUNT_NAMESPACE,
-            "cloud:rebate-v1",
-            "a:b",
-            "namespace-1:adjustment-2",
-        ] {
-            assert!(validate_namespace(valid).is_ok(), "{valid}");
-        }
+    fn adjustment_namespace_is_exact_and_stable() {
+        assert!(validate_namespace(CLOUD_USAGE_DISCOUNT_NAMESPACE).is_ok());
         for invalid in [
             "",
             "cloud",
+            "cloud:rebate-v1",
+            "a:b",
             "Cloud:rebate",
             "cloud:Rebate",
             "cloud:rebate:next",

@@ -41,9 +41,11 @@ as not found so the endpoint cannot become a tenant-discovery oracle.
 
 The request names the original `request_kind` and `request_id`, its immutable
 `currency`, a discount `namespace`, monotonically increasing `version`, and a
-non-negative `desired_rebate`. It also includes an opaque `decision_digest` and
-operator-safe `source`. `Idempotency-Key` is mandatory. The key is scoped to
-the authenticated service/tenant and canonical request: repeating the same
+non-negative `desired_rebate`. The only accepted initial namespace is
+`memeloop-cloud:usage-discount`; future namespaces need an explicit API
+authorization change. It also includes an opaque `decision_digest` and
+operator-safe `source`. `Idempotency-Key` is mandatory and scoped to
+`(account_id, Idempotency-Key)` plus the canonical request: repeating the same
 request returns the original event, while changing a request under an existing
 key, supplying a stale version, or exceeding the original settled cost returns
 409.

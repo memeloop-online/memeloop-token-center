@@ -189,7 +189,8 @@ test("settlement adjustments use a dedicated forward-only capability", () => {
   const request = document.components.schemas.ReconcileSettlementAdjustmentRequest;
   assert.equal(request.additionalProperties, false); assert.deepEqual(request.required, ["namespace", "request_kind", "request_id", "currency", "version", "desired_rebate", "decision_digest", "source"]);
   assert.equal(request.properties.namespace.$ref, "#/components/schemas/SettlementAdjustmentNamespace"); assert.equal(request.properties.request_kind.$ref, "#/components/schemas/AccountSettlementKind"); assert.equal(request.properties.decision_digest.$ref, "#/components/schemas/SettlementAdjustmentDecisionDigest");
-  assert.deepEqual(document.components.schemas.SettlementAdjustmentNamespace.pattern, "^[a-z][a-z0-9-]{0,63}:[a-z][a-z0-9-]{0,63}$"); assert.equal(document.components.schemas.SettlementAdjustmentDecisionDigest.pattern, "^[a-f0-9]{64}$");
+  assert.equal(operation["x-idempotency-contract"].namespace, "account-id-and-idempotency-key");
+  assert.equal(document.components.schemas.SettlementAdjustmentNamespace.const, "memeloop-cloud:usage-discount"); assert.equal(document.components.schemas.SettlementAdjustmentDecisionDigest.pattern, "^[a-f0-9]{64}$");
   const result = document.components.schemas.SettlementAdjustmentResult;
   assert.equal(result.additionalProperties, false); assert.deepEqual(result.required, ["adjustment_entry_id", "event_id", "account_id", "settlement_id", "namespace", "request_kind", "request_id", "currency", "desired_rebate", "applied_delta", "cumulative_rebate", "remaining_rebate", "version", "created_at", "replayed"]);
   for (const field of ["desired_rebate", "applied_delta", "cumulative_rebate", "remaining_rebate"]) assert.equal(result.properties[field].$ref, "#/components/schemas/NonNegativeMoney");
