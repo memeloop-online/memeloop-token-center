@@ -29,11 +29,13 @@ pub(super) struct StreamingResponse<'a> {
     /// rejections can be diagnosed without retaining or logging upstream
     /// content.
     pub(super) upstream_account_id: Uuid,
+    pub(super) credential_generation: i64,
     pub(super) buffered_request: BufferedRequest<'a>,
     pub(super) proxy_lifecycle_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Response, AppError> {
+    let diagnostic_context = proxy_diagnostics::Context::for_request(input.request_id);
     let StreamingResponse {
         state,
         upstream,
@@ -49,6 +51,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         upstream_activity,
         request_id,
         upstream_account_id,
+        credential_generation,
         buffered_request,
         proxy_lifecycle_permit,
     } = input;
@@ -70,6 +73,12 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         ..
     } = buffered_request;
     tokio::spawn(async move {
+        let stream_owner = proxy_diagnostics::Phase::account(
+            diagnostic_context,
+            "stream_owner",
+            Some(upstream_account_id),
+            Some(credential_generation),
+        );
         // Streaming responses outlive the handler response. Keep the workload
         // permit until proxy finalization or timeout reconciliation; accepted
         // archive tails have a separate bounded EOF owner below.
@@ -86,6 +95,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         let archive_eof_owner = tokio::spawn(hold_response_eof_until_archive_settles(
             archive_settlement_receiver,
             body_sender.clone(),
+            diagnostic_context,
         ));
         // The bounded lifecycle below owns these values. Keep exact copies for
         // the timeout convergence path, which must not infer delivery from a
@@ -96,6 +106,18 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         let deadline_tenant_id = tenant_id;
         let deadline_started = started;
         let lifecycle = async move {
+            let stream_phase = proxy_diagnostics::Phase::account(
+                diagnostic_context,
+                "upstream_stream",
+                Some(upstream_account_id),
+                Some(credential_generation),
+            );
+            let mut first_byte = Some(proxy_diagnostics::Phase::account(
+                diagnostic_context,
+                "stream_first_byte",
+                Some(upstream_account_id),
+                Some(credential_generation),
+            ));
             let mut upstream_stream = upstream.bytes_stream();
             let spool_identity = crate::db::ArchiveSpoolIdentity {
                 request_id,
@@ -193,6 +215,11 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 };
                 match next {
                     Ok(raw_chunk) => {
+                        if !raw_chunk.is_empty()
+                            && let Some(phase) = first_byte.take()
+                        {
+                            phase.finish("received", Some(status.as_u16()), Some(raw_chunk.len()));
+                        }
                         let chunk = if flushing_terminal {
                             raw_chunk
                         } else {
@@ -379,6 +406,14 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                     }
                 }
             }
+            stream_phase.finish(
+                transport_error.unwrap_or("completed"),
+                Some(status.as_u16()),
+                Some(response_bytes),
+            );
+            if let Some(phase) = first_byte.take() {
+                phase.finish("no_bytes", Some(status.as_u16()), Some(0));
+            }
             if transport_error.is_some() {
                 drop(archive_sender.take());
             }
@@ -395,6 +430,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             // Success terminals and EOF transfer the bounded capture to its
             // owned writer. The terminal frame does not wait for database
             // drain; the writer keeps the row capturing until seal commits.
+            let terminal_delivery_phase =
+                proxy_diagnostics::Phase::new(diagnostic_context, "terminal_delivery");
             let archive_settlement: Option<
                 crate::response_archive_spool::ResponseArchiveSettlement,
             > = match archive_sender.take() {
@@ -466,9 +503,16 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             drop(terminal_frames);
             terminal_memory.set_bytes(0);
             drop(body_sender);
+            terminal_delivery_phase.finish(
+                transport_error.unwrap_or("returned"),
+                Some(status.as_u16()),
+                None,
+            );
             let gap_response = format!("gap://{request_id}/response");
             let stored_response = gap_response.clone();
             let response_archive_attempt = None;
+            let terminal_phase =
+                proxy_diagnostics::Phase::new(diagnostic_context, "stream_terminal_settlement");
             finalize_streaming_lifecycle(StreamingFinalizationInput {
                 state: &background_state,
                 status_code,
@@ -493,6 +537,9 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 gap_response,
             })
             .await;
+            // This function handles its own database failures; returned means
+            // it settled its work, not proof that persistence succeeded.
+            terminal_phase.finish("returned", None, None);
         };
         if run_bounded_proxy_lifecycle(lifecycle_deadline, lifecycle)
             .await
@@ -548,6 +595,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 "response archive EOF owner failed"
             );
         }
+        stream_owner.finish("returned", Some(status.as_u16()), None);
     });
     let mut response = Response::builder()
         .status(status)
@@ -565,8 +613,16 @@ async fn hold_response_eof_until_archive_settles(
         Option<crate::response_archive_spool::ResponseArchiveSettlement>,
     >,
     _body_sender: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    diagnostic_context: proxy_diagnostics::Context,
 ) {
+    let handoff = proxy_diagnostics::Phase::new(diagnostic_context, "archive_terminal_handoff");
     if let Ok(Some(settlement)) = settlement.await {
+        handoff.finish("accepted", None, None);
+        let drain = proxy_diagnostics::Phase::new(diagnostic_context, "archive_eof_drain");
         settlement.wait().await;
+        // wait() reports writer errors separately. Never label this success.
+        drain.finish("returned", None, None);
+    } else {
+        handoff.finish("no_settlement", None, None);
     }
 }

@@ -54,12 +54,20 @@ pub(super) async fn read_bounded_upstream(
     } else {
         declared_maximum
     };
+    let diagnostic_context = proxy_diagnostics::Context::current();
+    let capacity = proxy_diagnostics::Phase::new(diagnostic_context, "buffered_response_memory");
     if !memory
         .reserve_buffered_response(reservation_maximum, deadline)
         .await
     {
+        capacity.finish("rejected", None, None);
         return Err(BoundedUpstreamError::MemoryCapacity);
     }
+    capacity.finish("completed", None, None);
+    let mut first_byte = Some(proxy_diagnostics::Phase::new(
+        diagnostic_context,
+        "buffered_first_byte",
+    ));
     let maximum = declared_maximum;
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
@@ -70,10 +78,18 @@ pub(super) async fn read_bounded_upstream(
         // Never retain or display reqwest's error: its URL can contain
         // credential-bearing upstream configuration.
         let chunk = chunk.map_err(|_| BoundedUpstreamError::Stream)?;
+        if !chunk.is_empty()
+            && let Some(phase) = first_byte.take()
+        {
+            phase.finish("received", None, Some(chunk.len()));
+        }
         if body.len().saturating_add(chunk.len()) > maximum {
             return Err(BoundedUpstreamError::ResponseTooLarge);
         }
         body.extend_from_slice(&chunk);
+    }
+    if let Some(phase) = first_byte.take() {
+        phase.finish("no_bytes", None, Some(0));
     }
     body.shrink_to_fit();
     if !memory.response_json_fits(&body) {

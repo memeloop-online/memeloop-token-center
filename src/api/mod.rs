@@ -49,6 +49,7 @@ mod monitoring_snapshot;
 mod plugin_execution;
 mod plugins;
 mod proxy;
+mod proxy_diagnostics;
 mod request_detail;
 mod router;
 mod routes;
