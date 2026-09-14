@@ -78,6 +78,7 @@ async function loadArchive(requestView: ConversationRequest, signal: AbortSignal
   });
   if (requestView.request_id === 'replay-r3' && requestView.archive_state === 'bound') return archive(requestView, null,
     { output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Late archive arrived' }] }] });
+  if (requestView.archive_state === 'gap') throw new Error('fixture archive no longer available');
   const value = archives.get(requestView.request_id);
   if (!value) throw new Error('fixture archive unavailable');
   return value;
@@ -93,6 +94,7 @@ function Fixture() {
   }, []);
   return <I18nProvider><main className="main" data-fixture-ready="session-replay">
     {liveFixture && <><button onClick={() => setScope('scope-b')}>Switch replay scope</button><button onClick={() => setCurrent(value => ({ ...value, requests: value.requests.map(request => request.request_id === 'replay-r3' ? { ...request, archive_state: 'bound' } : request) }))}>Finish late archive</button></>}
+    {liveFixture && <button onClick={() => setCurrent(value => ({ ...value, requests: value.requests.map(request => request.request_id === 'replay-r1' ? { ...request, archive_state: 'gap' } : request) }))}>Invalidate complete archive</button>}
     <SessionReplayPanel detail={current} scopeKey={scope} loadArchiveDetail={loadArchive} />
   </main></I18nProvider>;
 }

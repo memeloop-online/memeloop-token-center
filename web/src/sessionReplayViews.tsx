@@ -27,6 +27,10 @@ function requestOrder(left: RequestView, right: RequestView) {
   return left.created_at - right.created_at || left.request_id.localeCompare(right.request_id);
 }
 
+function archiveRevision(request: RequestView) {
+  return JSON.stringify([request.request_id, request.created_at, request.archive_state, request.status_code, request.completed_at, request.session_context?.association, request.session_context?.session_id]);
+}
+
 function unknownLabel(t: Translate, reason: ReplayUnknownReason | null, requestAndResponse = false) {
   switch (reason) {
     case 'archive_unavailable': return requestAndResponse ? t('sessionReplay.archiveUnavailableBoth') : t('sessionReplay.archiveUnavailable');
@@ -115,6 +119,7 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
   const [archivePage, setArchivePage] = useState<{ sessionId: string; scopeKey: string; loader?: SessionReplayArchiveLoader; values: RequestDetail[] }>({ sessionId: '', scopeKey: '', values: [] });
   const archiveDetails = archivePage.sessionId === detail.session_id && archivePage.scopeKey === scopeKey && archivePage.loader === loadArchiveDetail ? archivePage.values : [];
   const archiveCache = useRef(new Map<string, RequestDetail>());
+  const archiveRevisions = useRef(new Map<string, string>());
   const archiveOwner = useRef<{ sessionId: string; scopeKey: string; loader?: SessionReplayArchiveLoader }>({ sessionId: '', scopeKey: '' });
   const [mismatchedIds, setMismatchedIds] = useState<Set<string>>(new Set());
   const [archiveLoading, setArchiveLoading] = useState(Boolean(loadArchiveDetail));
@@ -123,7 +128,7 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
   const [selectedTurn, setSelectedTurn] = useState<number>();
 
   const orderedRequests = [...detail.requests].sort(requestOrder).slice(0, SESSION_REPLAY_MAX_REQUESTS);
-  const requestKey = JSON.stringify(orderedRequests.map((request) => [request.request_id, request.created_at, request.archive_state, request.status_code, request.completed_at, request.session_context?.association, request.session_context?.session_id]));
+  const requestKey = JSON.stringify(orderedRequests.map(archiveRevision));
   // Live list refreshes create fresh objects even when archive inputs are unchanged.
   // Keep the bounded read batch stable so a busy session cannot starve its replay.
   const sourceRequests = useMemo(() => orderedRequests, [requestKey]);
@@ -131,6 +136,7 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
   useEffect(() => {
     if (!loadArchiveDetail) {
       archiveCache.current.clear();
+      archiveRevisions.current.clear();
       setArchivePage({ sessionId: detail.session_id, scopeKey, values: [] });
       setArchiveLoading(false);
       return undefined;
@@ -139,10 +145,19 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
     const controller = new AbortController();
     if (archiveOwner.current.sessionId !== detail.session_id || archiveOwner.current.scopeKey !== scopeKey || archiveOwner.current.loader !== loadArchiveDetail) {
       archiveCache.current.clear();
+      archiveRevisions.current.clear();
       archiveOwner.current = { sessionId: detail.session_id, scopeKey, loader: loadArchiveDetail };
     }
     const activeIds = new Set(sourceRequests.map(request => request.request_id));
-    for (const id of archiveCache.current.keys()) if (!activeIds.has(id)) archiveCache.current.delete(id);
+    for (const id of archiveRevisions.current.keys()) if (!activeIds.has(id)) {
+      archiveCache.current.delete(id);
+      archiveRevisions.current.delete(id);
+    }
+    for (const request of sourceRequests) {
+      const revision = archiveRevision(request);
+      if (archiveRevisions.current.get(request.request_id) !== revision) archiveCache.current.delete(request.request_id);
+      archiveRevisions.current.set(request.request_id, revision);
+    }
     const publish = () => setArchivePage({ sessionId: detail.session_id, scopeKey, loader: loadArchiveDetail, values: [...archiveCache.current.values()] });
     publish();
     setMismatchedIds(new Set());

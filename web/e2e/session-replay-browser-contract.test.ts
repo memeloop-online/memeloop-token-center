@@ -58,6 +58,9 @@ test('slow replay reads survive live metadata refresh, publish incrementally and
     await page.getByText('Late archive arrived', { exact: true }).waitFor();
     assert.equal(await page.evaluate(() => window.sessionReplayReads['replay-r1']), 2, 'complete archives are reused inside the same bounded scope');
     assert.equal(await page.evaluate(() => window.sessionReplayReads['replay-r3']), 3, 'late availability refreshes an incomplete archive');
+    await page.getByRole('button', { name: 'Invalidate complete archive', exact: true }).click();
+    await page.waitForFunction(() => window.sessionReplayReads['replay-r1'] === 3);
+    assert.equal(await page.locator('.session-replay-entry.message.user').count(), 0, 'a changed archive revision invalidates even previously complete cached content');
   } finally { await browser.close(); await server.close(); }
 });
 
