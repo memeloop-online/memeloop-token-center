@@ -6,7 +6,7 @@ import { useI18n } from '../i18n';
 export function AdditionalPropertyTemplate(props: WrapIfAdditionalTemplateProps) {
   const { locale } = useI18n();
   const { id, label, schema, children, classNames, style, disabled, readonly, onKeyRenameBlur, onRemoveProperty } = props;
-  if (!(ADDITIONAL_PROPERTY_FLAG in schema)) return <div className={classNames} style={style}>{children}</div>;
+  if (!schema || typeof schema !== 'object' || !(ADDITIONAL_PROPERTY_FLAG in schema)) return <div className={classNames} style={style}>{children}</div>;
   const zh = locale.startsWith('zh');
   return <div className={`provider-additional-property ${classNames}`} style={style}>
     <div className="provider-property-key">

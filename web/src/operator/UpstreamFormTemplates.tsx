@@ -38,7 +38,7 @@ function UpstreamObjectTemplate(props: ObjectFieldTemplateProps) {
           {primary.map(field => field.content)}
           {props.registry.formContext.providerConnection}
         </FormSection>
-        {retries.length > 0 && <AdvancedFormSection title={zh ? '超时与重试' : 'Timeouts and retries'} description={zh ? '调整连接、读取和故障切换时限；日常修改代理无需调整。' : 'Connection, read and failover limits. Changing a proxy does not require adjusting these.'} invalid={retries.some(field => Boolean(props.errorSchema?.[field.name]))}>{retries.map(field => field.content)}</AdvancedFormSection>}
+        {retries.length > 0 && <AdvancedFormSection action title={zh ? '配置超时与重试' : 'Configure timeouts and retries'} description={zh ? '调整连接、读取和故障切换时限；日常修改代理无需调整。' : 'Connection, read and failover limits. Changing a proxy does not require adjusting these.'} invalid={retries.some(field => Boolean(props.errorSchema?.[field.name]))}>{retries.map(field => field.content)}</AdvancedFormSection>}
         {(advanced.length > 0 || canExpand(props.schema, props.uiSchema, props.formData)) && <AdvancedFormSection title={zh ? '高级配置与模型预留' : 'Advanced settings and model reservations'} description={zh ? '网络范围、模型预留及扩展配置。现有字段完整保留；仅在明确了解影响时修改。' : 'Network scope, model reservations and extensions. Existing fields are preserved; change only when you understand their effects.'} invalid={advanced.some(field => Boolean(props.errorSchema?.[field.name]))}><ObjectFieldTemplate {...props} title="" description={undefined} properties={advanced} /></AdvancedFormSection>}
       </div>;
     }

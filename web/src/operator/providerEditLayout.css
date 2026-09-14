@@ -44,7 +44,10 @@
 .provider-config-value { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; }
 .provider-config-value > .fui-Input { flex: 1 1 240px; min-width: 0; }
 .provider-proxy-value { display: flex; flex-wrap: wrap; gap: 8px; min-width: 0; margin-block: 12px; }
-.provider-proxy-value > input { flex: 1 1 100%; min-width: 0; width: 100%; }
+.provider-proxy-value > input { flex: 1 1 220px; min-width: 0; width: auto; }
+.provider-readable-proxy { margin-top: 14px; min-width: 0; }
+.provider-readable-proxy > .field-hint { display: block; }
+@media (max-width: 600px) { .provider-proxy-value > input { flex-basis: 100%; width: 100%; } }
 .provider-account { padding: 16px; gap: 12px; }
 .provider-account > .account-main { min-width: 0; }
 .provider-account > .account-main :is(b, span) { overflow-wrap: anywhere; }

@@ -26,8 +26,15 @@ test('real Codex config shapes keep proxy primary and preserve advanced edits an
       const advanced = workspace.getByRole('button', { name: '高级配置与模型预留', exact: true });
       assert.equal(await advanced.getAttribute('aria-expanded'), 'false');
       const proxy = workspace.getByRole('button', { name: '配置网络代理', exact: true });
+      await workspace.locator('.provider-proxy-value input').waitFor();
       assert.ok(await proxy.evaluate(element => element.getBoundingClientRect().bottom < innerHeight), 'proxy action is available in the initial desktop viewport');
-      assert.doesNotMatch(await workspace.innerText(), /reservation_token_bounds|Conservative token|network_scope/);
+      assert.doesNotMatch(await workspace.innerText(), /reservation_token_bounds|Conservative token|network_scope|代理标识|synthetic-diagnostic-fingerprint/);
+      assert.equal(await workspace.locator('.provider-readable-proxy').getByRole('button', { name: '配置网络代理', exact: true }).count(), 1, 'editing and copying sit beside the single authorized proxy value');
+      const retry = workspace.getByRole('button', { name: '配置超时与重试', exact: true });
+      assert.equal(await retry.getAttribute('aria-expanded'), 'false');
+      await retry.focus(); await page.keyboard.press('Enter');
+      await workspace.getByLabel('连接尝试次数').waitFor();
+      await retry.click();
       await advanced.focus(); await page.keyboard.press('Enter');
       await workspace.getByLabel('网络访问范围', { exact: false }).waitFor();
       const model = shape === 'csil' ? 'gpt-5.3-codex-spark' : 'gpt-5.5';
@@ -39,6 +46,7 @@ test('real Codex config shapes keep proxy primary and preserve advanced edits an
       for (const width of [390, 1440]) for (const theme of ['light', 'dark']) {
         await page.setViewportSize({ width, height: 1000 });
         await page.evaluate(theme => { document.documentElement.dataset.theme = theme; }, theme);
+        await page.waitForFunction(() => matchMedia('(min-width: 901px)').matches || document.querySelector('.app-sidebar')!.getBoundingClientRect().right <= 0);
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
       }
       await advanced.click(); await advanced.click();

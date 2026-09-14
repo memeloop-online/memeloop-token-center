@@ -26,7 +26,7 @@ const existingRoute = { id: 'route-existing', tenant_external_id: 'fixture', pub
 let routeRows = [existingRoute];
 const account = { id: 'account-native', tenant_external_id: 'fixture', name: '研发订阅', driver: 'openai-codex', auth_kind: 'oauth', connection_method: 'oauth', status: 'active', config: { base_url: 'https://chatgpt.com/backend-api/codex' }, has_proxy: true, proxy_scheme: 'socks5h', proxy_remote_dns: true, can_update_transport_proxy: !new URLSearchParams(location.search).has('proxy-no-authority'), credential_generation: 1, route_count: 1, updated_at: 1 };
 const editShape = providerEditShape(new URLSearchParams(location.search).get('provider-shape'));
-if (editShape) Object.assign(account.config, editShape.config);
+if (editShape) { Object.assign(account.config, editShape.config); Object.assign(account, { proxy_fingerprint: 'synthetic-diagnostic-fingerprint' }); }
 let proxyUrl = 'socks5h://fixture-user:fixture-password@10.0.0.15:1080';
 window.fetch = async (input, init) => {
   const path = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, location.origin).pathname;
