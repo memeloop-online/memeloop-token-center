@@ -705,12 +705,20 @@ pub(in crate::api) async fn rotate_codex_transport_proxy(
             &state, account,
         )?));
     }
-    let (current_account, credential, _, _) = state
+    let (current_account, credential, _, oauth_driver) = state
         .db
         .upstream_account_with_current_credential(account_id, state.config.key_pepper.as_bytes())
         .await?;
     if current_account.driver == crate::oauth::codex_device::PROVIDER_DRIVER {
         crate::provider::validate_codex_proxy_url(&body.proxy_url)?;
+    } else if matches!(
+        oauth_driver.as_deref(),
+        Some("cursor") | Some(crate::oauth::copilot::OAUTH_DRIVER)
+    ) {
+        crate::provider::validate_oauth_remote_dns_proxy_url(
+            &body.proxy_url,
+            state.config.allow_oauth_loopback,
+        )?;
     }
     let replacement = credential.with_transport_proxy(body.proxy_url.clone())?;
     validate_upstream_proxy(
