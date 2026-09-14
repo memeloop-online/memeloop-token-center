@@ -186,7 +186,9 @@ async fn attributed_settlement_adjustment_is_scope_bound_idempotent_and_sanitize
     let (status, _, settlement_page) =
         get_json(&fixture.state, &settlements_path, &fixture.target_token).await;
     assert_eq!(status, StatusCode::OK, "{settlement_page}");
-    let settlement_id = settlement_page["items"][0]["settlement_id"].as_str().unwrap();
+    let settlement_id = settlement_page["items"][0]["settlement_id"]
+        .as_str()
+        .unwrap();
     let path = format!(
         "/internal/v1/accounts/{}/settlements/{settlement_id}/adjustments",
         fixture.target.account_id
@@ -219,12 +221,9 @@ async fn attributed_settlement_adjustment_is_scope_bound_idempotent_and_sanitize
         .unwrap();
         let status = response.status();
         let headers = response.headers().clone();
-        let response: Value = serde_json::from_slice(
-            &to_bytes(response.into_body(), 1024 * 1024)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        let response: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
         (status, headers, response)
     };
 

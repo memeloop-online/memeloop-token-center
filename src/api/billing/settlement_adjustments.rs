@@ -115,10 +115,7 @@ fn required_idempotency_key(headers: &HeaderMap) -> Result<&str, AppError> {
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| AppError::BadRequest("Idempotency-Key is required".into()))?;
-    if value.is_empty()
-        || value.len() > 200
-        || !value.bytes().all(|byte| byte.is_ascii_graphic())
-    {
+    if value.is_empty() || value.len() > 200 || !value.bytes().all(|byte| byte.is_ascii_graphic()) {
         return Err(AppError::BadRequest(
             "Idempotency-Key must contain 1 to 200 visible ASCII characters".into(),
         ));
