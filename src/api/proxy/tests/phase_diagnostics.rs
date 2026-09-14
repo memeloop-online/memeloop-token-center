@@ -12,7 +12,7 @@ async fn early_rejections_return_server_correlation_without_creating_request_rec
             "/v1/responses",
             true,
             r#"{"model":"unconfigured-diagnostic-model","input":"synthetic"}"#,
-            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::FORBIDDEN,
         ),
     ] {
         let mut request = Request::post(path)
@@ -42,6 +42,29 @@ async fn early_rejections_return_server_correlation_without_creating_request_rec
         );
     }
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    // Keep the enabled, granted model route: authorization must pass. Only
+    // remove the account from the candidate query's active-account set.
+    sqlx::query("UPDATE upstream_accounts SET status = 'disabled' WHERE id = $1")
+        .bind(fixture.upstream_account_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let response = router_for_role(fixture.state.clone(), RuntimeRole::Gateway)
+        .oneshot(
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key))
+                .header(REQUEST_ID_HEADER, supplied_id.to_string())
+                .body(Body::from(
+                    json!({"model": fixture.model, "input": "synthetic"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let id = Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
+    assert_ne!(id, supplied_id);
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records")
         .fetch_one(&pool)
         .await

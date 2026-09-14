@@ -77,7 +77,11 @@ test('request detail follows terminal events and fences late responses after sel
     assert.equal(await localized.locator('tbody tr').count(), 2);
     await localized.locator('tbody tr').first().locator('.table-action').click();
     await localized.getByRole('dialog').waitFor();
-    assert.equal(await localized.getByRole('alert').innerText(), alert, 'opening a successful detail must not relabel or clear the directory error');
+    assert.equal(await localized.getByRole('alert').count(), 0, 'the background directory alert must remain isolated by the modal');
+    assert.equal(await localized.getByRole('alert', { includeHidden: true }).textContent(), alert, 'opening a successful detail must not relabel or clear the background directory error');
+    await localized.getByRole('dialog').getByRole('button', { name: '关闭', exact: true }).click();
+    await localized.getByRole('alert').waitFor();
+    assert.equal(await localized.getByRole('alert').innerText(), alert, 'closing the modal restores access to the same directory error');
     await localized.close();
   } finally { await browser.close(); await server.close(); }
 });
