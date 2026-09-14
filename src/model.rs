@@ -471,6 +471,9 @@ pub struct EntitlementReconcileResult {
 
 #[derive(Clone, Debug)]
 pub struct RequestView {
+    /// Only an explicitly persisted context-compaction marker is true.
+    /// Absence (including legacy false/default observations) remains unknown.
+    pub compaction: Option<bool>,
     pub first_output_ms: Option<i64>,
     pub generation_duration_ms: Option<i64>,
     pub request_id: Uuid,
@@ -537,7 +540,8 @@ impl Serialize for RequestView {
         use serde::ser::SerializeStruct;
 
         let tokens = self.usage.tokens.as_ref();
-        let mut state = serializer.serialize_struct("RequestView", 25)?;
+        let mut state = serializer.serialize_struct("RequestView", 26)?;
+        state.serialize_field("compaction", &self.compaction.filter(|value| *value))?;
         state.serialize_field("request_id", &self.request_id)?;
         state.serialize_field("created_at", &self.created_at)?;
         state.serialize_field("completed_at", &self.completed_at)?;
@@ -702,6 +706,7 @@ impl RequestSessionContext {
 
 #[derive(Clone, Debug)]
 pub struct RequestEventView {
+    pub compaction: Option<bool>,
     pub first_output_ms: Option<i64>,
     pub generation_duration_ms: Option<i64>,
     pub event_id: Uuid,
@@ -742,7 +747,8 @@ impl Serialize for RequestEventView {
         use serde::ser::SerializeStruct;
 
         let tokens = self.usage.tokens.as_ref();
-        let mut state = serializer.serialize_struct("RequestEventView", 29)?;
+        let mut state = serializer.serialize_struct("RequestEventView", 30)?;
+        state.serialize_field("compaction", &self.compaction.filter(|value| *value))?;
         state.serialize_field("event_id", &self.event_id)?;
         state.serialize_field("request_id", &self.request_id)?;
         state.serialize_field("event_at", &self.event_at)?;
