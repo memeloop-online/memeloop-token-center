@@ -24,6 +24,19 @@ test('filters are non-modal themed popovers and model selection is searchable by
     await page.exposeFunction('recordModelPickerWrite', (path: string) => writes.push(path));
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/model-picker.html`);
+    const editableModel = page.getByRole('combobox', { name: 'Editable model', exact: true });
+    await editableModel.click();
+    const editableOption = page.getByRole('option', { name: 'Editable model option', exact: true });
+    await editableOption.waitFor({ state: 'visible' });
+    assert.equal(await editableModel.getAttribute('aria-expanded'), 'true', 'the first pointer click must not open on focus and immediately light-dismiss its own popup');
+    await editableModel.press('Escape');
+    await editableOption.waitFor({ state: 'hidden' });
+    assert.equal(await editableModel.evaluate(element => document.activeElement === element), true);
+    await editableModel.press('ArrowDown');
+    await editableOption.waitFor({ state: 'visible' });
+    await editableModel.press('Enter');
+    assert.equal(await editableModel.inputValue(), 'editable-model');
+    await editableOption.waitFor({ state: 'hidden' });
     for (const theme of ['light', 'dark']) {
       await page.evaluate((value) => { document.documentElement.dataset.theme = value; }, theme);
       for (const width of [320, 390, 768, 1024, 1440, 1920, 2560]) {

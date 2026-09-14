@@ -2,6 +2,7 @@ import { createRoot } from 'react-dom/client';
 import { useState } from 'react';
 import { I18nProvider, useI18n } from '../../src/i18n';
 import { MtcFluentProvider } from '../../src/design-system/MtcFluentProvider';
+import { ModelPicker } from '../../src/ModelPicker';
 import { TypedFilterBuilder } from '../../src/operator/TypedFilterBuilder';
 import { SystemSettingsPage } from '../../src/operator/pages/SystemSettingsPage';
 import type { ModelRouteView, TypedFilterAst, UpstreamAccount } from '../../src/types';
@@ -86,12 +87,14 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   return new Response(JSON.stringify(values[url.pathname] ?? {}), { status: Object.hasOwn(values, url.pathname) ? 200 : 404, headers: { 'Content-Type': 'application/json' } });
 };
 function Fixture() {
+  const [editableModel, setEditableModel] = useState('');
   const { locale, setLocale } = useI18n();
   const [ast, setAst] = useState<TypedFilterAst>({ logical_operator: 'and', conditions: [] });
   const [outside, setOutside] = useState(0);
   const [tenant, setTenant] = useState('tenant');
   return <main style={{ padding: 12 }}>
     <button type="button" data-outside onClick={() => setOutside((value) => value + 1)}>Outside {outside}</button>
+    <ModelPicker label="Editable model" editable value={editableModel} onChange={setEditableModel} options={[{ key: 'editable-model', value: 'editable-model', label: 'Editable model option', provider: 'Fixture provider', upstream: 'Fixture account' }]} />
     <TypedFilterBuilder ast={ast} onApply={setAst} onClear={() => setAst({ logical_operator: 'and', conditions: [] })} token="fixture" tenant="tenant" scope="requests" upstreams={accounts} />
     <output data-filter-model>{ast.conditions.find((condition) => condition.field === 'model')?.value.value}</output>
     <button data-switch-scope type="button" onClick={() => setTenant('other')}>Switch scope</button>

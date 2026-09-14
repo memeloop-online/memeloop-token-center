@@ -392,6 +392,7 @@ When('管理员用键盘创建提供商组和路由组', { timeout: 120_000 }, a
   const existingRoute = page.locator('tbody tr').filter({ hasText: model });
   await existingRoute.getByRole('button', { name: '编辑', exact: true }).click();
   const staleEditor = page.locator('.create-journey');
+  await staleEditor.getByRole('button', { name: /单独授权凭据/ }).click();
   const staleCredentialField = staleEditor.locator('.multi-combobox').filter({
     has: page.getByRole('combobox', { name: '授权给具体凭据', exact: true }),
   });
