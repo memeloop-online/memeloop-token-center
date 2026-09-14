@@ -1,3 +1,4 @@
+import { LocalSettlementNotice, localSettlementLabel } from '../LocalSettlementNotice';
 import { displayTimeZone, bucketTimeZoneNote } from '../charts/displayTimeZone';
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from '../api';
@@ -114,7 +115,7 @@ export function UsagePage({ credential, credentialView, onError }: {
       <NumberMetric label={t('usage.cacheWriteTokens')} value={stats.summary.cache_write_tokens} />
       <Metric label={t('usage.average')} value={formatMilliseconds(stats.summary.avg_duration_ms, locale)} />
       <Metric label={t('usage.p95Approx')} value={formatMilliseconds(stats.summary.p95_duration_ms, locale)} />
-      <Metric label={t('usage.cost')} value={<CostLines values={stats.summary.costs} />} />
+      <Metric label={localSettlementLabel(locale)} labelContent={<LocalSettlementNotice />} value={<CostLines values={stats.summary.costs} />} />
     </section>
     <Suspense fallback={<div className="empty">{t('common.loading')}</div>}>
       <section className="usage-chart-grid self-usage-charts">

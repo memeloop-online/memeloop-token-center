@@ -49,10 +49,10 @@ export function Shell({ children, operator = false }: { children: ReactNode; ope
   );
 }
 
-export function Metric({ label, value, tone }: { label: string; value: ReactNode; tone?: string }) {
+export function Metric({ label, labelContent, value, tone }: { label: string; labelContent?: ReactNode; value: ReactNode; tone?: string }) {
   return (
     <article className={`metric ${tone ?? ''}`}>
-      <span className="metric-label">{label}</span>
+      <span className="metric-label">{labelContent ?? label}</span>
       <strong className="metric-value">{value}</strong>
     </article>
   );
