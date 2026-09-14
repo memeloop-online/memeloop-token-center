@@ -2883,6 +2883,12 @@ async fn mock_empty_openai_image_url_generation(world: &mut TokenCenterWorld) {
 
 #[given("the mock OpenAI Images upstream returns ten assets over the aggregate budget")]
 async fn mock_openai_image_aggregate_limit(world: &mut TokenCenterWorld) {
+    // This scenario inspects the durable pre-reaper boundary. The worker's
+    // interval deliberately ticks immediately, so under a loaded test runner it
+    // may first be scheduled only after cleanup_pending has been published and
+    // race the object assertions below. Reaper deletion/fencing has dedicated
+    // coverage; stop it before the request instead of weakening those asserts.
+    stop_test_worker(world).await;
     let mock_url = world.mock.as_ref().expect("mock server").uri();
     let data = (0..10)
         .map(|index| json!({"url": format!("{mock_url}/generated/aggregate-{index}.png")}))

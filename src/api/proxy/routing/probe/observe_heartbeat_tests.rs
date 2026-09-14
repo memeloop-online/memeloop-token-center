@@ -1,5 +1,51 @@
 use super::*;
 
+const TEST_PROBE_LEASE_MILLIS: i64 = 1_000;
+const TEST_PROBE_HEARTBEAT_MILLIS: i64 = 25;
+
+async fn wait_for_heartbeat_beyond_deadline(
+    pool: &sqlx::AnyPool,
+    account: Uuid,
+    initial_deadline: i64,
+) -> i64 {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while unix_millis() <= initial_deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let post_deadline_lease = loop {
+            let now = unix_millis();
+            let lease_until: i64 = sqlx::query_scalar(
+                "SELECT probe_lease_until FROM upstream_account_health WHERE upstream_account_id=$1",
+            )
+            .bind(account.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if lease_until > now {
+                break lease_until;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        // Require another persisted renewal after the original deadline. A
+        // heartbeat that fires only once and then stops cannot satisfy this.
+        loop {
+            let lease_until: i64 = sqlx::query_scalar(
+                "SELECT probe_lease_until FROM upstream_account_health WHERE upstream_account_id=$1",
+            )
+            .bind(account.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if lease_until > post_deadline_lease && lease_until > unix_millis() {
+                return lease_until;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("probe heartbeat must remain live beyond the original lease deadline")
+}
+
 #[tokio::test]
 async fn terminal_observe_keeps_half_open_lease_alive_until_fenced_settlement() {
     let directory = tempfile::tempdir().unwrap();
@@ -10,8 +56,8 @@ async fn terminal_observe_keeps_half_open_lease_alive_until_fenced_settlement() 
     let mut config = crate::config::Config::for_test(url.clone());
     config.archive_backend = crate::config::ArchiveBackend::Filesystem;
     config.archive_path = Some(directory.path().join("archive").display().to_string());
-    config.upstream_health.probe_lease_millis = 100;
-    config.upstream_health.probe_heartbeat_millis = 10;
+    config.upstream_health.probe_lease_millis = TEST_PROBE_LEASE_MILLIS;
+    config.upstream_health.probe_heartbeat_millis = TEST_PROBE_HEARTBEAT_MILLIS;
     let state = AppState::initialize(config).await.unwrap();
     let peer = crate::db::Database::connect(&url).await.unwrap();
     let pool = sqlx::AnyPool::connect(&url).await.unwrap();
@@ -59,9 +105,15 @@ async fn terminal_observe_keeps_half_open_lease_alive_until_fenced_settlement() 
     tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified())
         .await
         .unwrap();
-    // Real time allows the 10 ms heartbeat to run; paused-time jumps could
-    // starve it and manufacture a lease expiry unrelated to the regression.
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let initial_deadline: i64 = sqlx::query_scalar(
+        "SELECT probe_lease_until FROM upstream_account_health WHERE upstream_account_id=$1",
+    )
+    .bind(account.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let renewed = wait_for_heartbeat_beyond_deadline(&pool, account, initial_deadline).await;
+    assert!(renewed > unix_millis());
     let competing = peer
         .claim_upstream_account_attempt_with_health_config(account, 1, state.config.upstream_health)
         .await
