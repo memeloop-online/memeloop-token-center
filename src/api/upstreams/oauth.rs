@@ -105,6 +105,7 @@ pub(in crate::api) async fn start_codex_oauth(
     Json(body): Json<StartCodexOAuthRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
+    let state = state.pin_application_plugins().await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
     if body.upstream_account_id.is_some() && body.proxy_url.is_some() {
         return Err(AppError::BadRequest(
@@ -205,6 +206,7 @@ pub(in crate::api) async fn poll_codex_oauth(
     Json(body): Json<PollCursorOAuthRequest>,
 ) -> Result<Response, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
+    let state = state.pin_application_plugins().await?;
     match poll_codex_device_login(
         &state.db,
         &state.http,
@@ -389,6 +391,7 @@ pub(in crate::api) async fn start_cursor_oauth(
     Json(mut body): Json<StartCursorOAuthRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
+    let state = state.pin_application_plugins().await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
     if !state.providers.is_public(&body.provider_driver) {
         return Err(AppError::BadRequest(format!(
@@ -458,6 +461,7 @@ pub(in crate::api) async fn start_provider_adapter_oauth(
     Json(mut body): Json<StartProviderAdapterOAuthRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
+    let state = state.pin_application_plugins().await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
     let provider = state.providers.get(&body.provider_driver).ok_or_else(|| {
         AppError::BadRequest(format!("unknown provider driver: {}", body.provider_driver))
@@ -530,6 +534,7 @@ pub(in crate::api) async fn poll_cursor_oauth(
     Json(body): Json<PollCursorOAuthRequest>,
 ) -> Result<Response, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
+    let state = state.pin_application_plugins().await?;
     match poll_cursor_login(
         &state.db,
         &state.providers,
@@ -674,6 +679,7 @@ pub(in crate::api) async fn refresh_upstream_oauth(
     Path(account_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
+    let state = state.pin_application_plugins().await?;
     let idempotency_key = headers
         .get("idempotency-key")
         .ok_or_else(|| AppError::BadRequest("Idempotency-Key is required".into()))?
@@ -704,6 +710,7 @@ pub(in crate::api) async fn disconnect_upstream_oauth(
     Json(body): Json<DisconnectUpstreamOAuthRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
+    let state = state.pin_application_plugins().await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
     let (mut account, oauth_driver, credential) = state
         .db
@@ -768,6 +775,8 @@ async fn refresh_managed_upstream_oauth_impl(
     idempotency_key: &str,
     blocking: Option<&crate::worker::BlockingTasks>,
 ) -> Result<crate::provider::UpstreamAccountView, AppError> {
+    let pinned = state.clone().pin_application_plugins().await?;
+    let state = &pinned;
     let (driver, refresh_url) = state.db.upstream_oauth_lifecycle(account_id).await?;
     if let Some(replay) = state
         .db

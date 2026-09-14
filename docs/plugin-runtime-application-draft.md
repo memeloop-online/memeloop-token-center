@@ -12,16 +12,19 @@ The file maps opaque inventory IDs to `{"root":"/absolute/revision/root",
 "digest":"sha256:<approved artifact digest>",
 "signature_policy":"cosign-public-key"}}}]}}`.
 Grants are independently approved host input, not values supplied by management
-requests. The complete inventory is read once at startup; replacing that file
-requires restarting processes, but publishing any already-provisioned version
-and rolling back do not require a binary rebuild or restart.
+requests. The inventory is re-read on discovery, staging and revision pinning.
+Atomically append new IDs to this file after installation on every replica;
+neither new contributions nor publication/rollback require a rebuild or restart.
+Observed IDs, grants and roots cannot be changed or removed. The file is bounded
+to 4 MiB and malformed updates fail closed without altering the database head.
 
 Absent configuration preserves the startup runtime. An empty `{}` inventory is
 valid and exposes an empty management status. Before the first publication,
 requests pin the startup runtime. After publication, failures never fall back to
 it. A configured malformed inventory fails startup; binaries built without the
 feature reject the inventory option rather than silently ignoring it.
-This is **not dynamic installation** or arbitrary contribution/schema replacement.
+Installation remains a trusted host/installer operation, not a browser upload or
+an arbitrary filesystem/URL management API.
 
 ## Authority and request ownership
 
@@ -46,22 +49,26 @@ prepare, candidate retries, and provider normalize. A second pin on the same
 request state retains the first snapshot. There is no notification dependency:
 another AppState/replica reads the database on its next request, even if it has
 missed every notification. Database failures, missing local inventory, identity
-mismatches, schema/provider-contract changes, and package/configuration validation
+mismatches and package/configuration validation
 failures stop admission once a head exists; no startup-runtime fallback is permitted.
 Control plugin manifests, provider types, service-data and configuration handlers
 pin the same runtime/catalog pair as execution, after authenticating the caller.
+Provider account management, OAuth adapter start/poll, model discovery and worker
+refresh also pin it. Durable work can pin an exact historical revision without
+substituting the latest catalog when that historical inventory is missing.
 
 ## Trusted inventory and management boundary
 
 Inventory is an independently provisioned host map from a bounded opaque ID to
 an absolute, read-only revision root and exact approved grants. Grants bind the
 manifest, capabilities, component digest, and signed-install provenance. The
-complete plugin set and all contribution contracts must match the original
-application baseline. Database publication additionally compares the candidate
-contract with the expected historical revision, preventing an incompatible
-replica baseline from widening the contract. Versions and approved executable
-identities may change; configuration schema, provider contract, capabilities,
-policy set, and other contributions may not.
+complete candidate set must match its independently approved grants. New package
+IDs, provider/OAuth contracts and supported declarative UI slots are permitted;
+there is no equality requirement with the startup catalog. Existing persisted
+configuration is validated before staging. Contract digests still bind each
+immutable candidate and historical receipt. Operators must retain providers and
+policies needed by their active accounts/workflows in each complete inventory;
+rollback does not migrate account data or configuration to an older schema.
 
 With the feature and host opt-in, the following control endpoints require a
 **global** service credential with `plugins:write`:
@@ -93,6 +100,22 @@ overwritten; signed OCI verification and atomic no-replace install remain in
 force. Provision the complete inventory before mounting its root read-only on
 every replica. Do not modify that root after publication. Keep historical roots
 available for in-flight requests, restart, and rollback.
+
+With both `plugin-distribution` and `experimental-plugin-revisions` enabled, the
+installer additionally accepts `--inventory-file /absolute/inventory.json` and
+`--inventory-entry-file /absolute/reviewed-entry.json` together with
+`--inventory-id ID`. The entry file is one reviewed `PreinstalledInventory`
+object, including the complete root and independent grants. Initialize the
+inventory file as `{}` first. On successful signed installation, the installer
+checks the installed source/digest/version against the reviewed entry and
+atomically appends that ID under an exclusive sibling file lock. It preserves
+file permissions and fsyncs publication. For a multi-package set, use these flags
+only on the final package install. Staging then verifies every package's manifest,
+component and provenance before publication; registration alone never activates
+code. Failed registration leaves the verified package installed but inactive;
+the host can correct and atomically append the reviewed entry separately.
+This PR supplies the CLI registration and existing Control activation chain;
+browser installation/upload and revision-log presentation are separate surfaces.
 
 ## Verification and remaining deployment gate
 

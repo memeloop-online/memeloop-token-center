@@ -139,14 +139,14 @@ impl AppState {
                 if !std::path::Path::new(path).is_absolute() {
                     return Err(InitializationError::Plugin);
                 }
-                let bytes = tokio::fs::read(path)
-                    .await
-                    .map_err(|_| InitializationError::Plugin)?;
-                let inventory =
-                    serde_json::from_slice(&bytes).map_err(|_| InitializationError::Plugin)?;
                 Some(Arc::new(
-                    plugin::application::ApplicationPlugins::new(db.clone(), inventory, &plugins)
-                        .map_err(|_| InitializationError::Plugin)?,
+                    plugin::application::ApplicationPlugins::from_inventory_file(
+                        db.clone(),
+                        path.into(),
+                        &plugins,
+                    )
+                    .await
+                    .map_err(|_| InitializationError::Plugin)?,
                 ))
             }
             None => None,

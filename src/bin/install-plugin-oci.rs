@@ -25,6 +25,17 @@ struct Arguments {
     #[arg(long)]
     inventory_id: Option<String>,
 
+    /// Atomically append the host-reviewed complete inventory after installation.
+    /// Requires experimental-plugin-revisions; existing IDs cannot be changed.
+    #[cfg(feature = "experimental-plugin-revisions")]
+    #[arg(long, requires_all = ["inventory_id", "inventory_entry_file"])]
+    inventory_file: Option<PathBuf>,
+
+    /// JSON PreinstalledInventory with independently reviewed roots and grants.
+    #[cfg(feature = "experimental-plugin-revisions")]
+    #[arg(long, requires = "inventory_file")]
+    inventory_entry_file: Option<PathBuf>,
+
     /// Exact allowed registry/repository, for example ghcr.io/memeloop/plugins.
     #[arg(
         long = "allowed-source",
@@ -76,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .collect::<Result<Vec<_>, _>>()?;
     let installed = install_plugin_oci(&InstallPluginOptions {
         reference: arguments.reference,
-        plugin_root,
+        plugin_root: plugin_root.clone(),
         allowed_sources: arguments
             .allowed_sources
             .into_iter()
@@ -85,7 +96,90 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         cosign_public_keys: public_keys,
     })
     .await?;
+    #[cfg(feature = "experimental-plugin-revisions")]
+    if let (Some(path), Some(entry), Some(id)) = (
+        &arguments.inventory_file,
+        &arguments.inventory_entry_file,
+        &arguments.inventory_id,
+    ) {
+        register_inventory(path, entry, id, &plugin_root, &installed)?;
+    }
     println!("{}", serde_json::to_string(&installed)?);
+    Ok(())
+}
+
+#[cfg(feature = "experimental-plugin-revisions")]
+fn register_inventory(
+    path: &std::path::Path,
+    entry_path: &std::path::Path,
+    id: &str,
+    root: &std::path::Path,
+    installed: &memeloop_token_center::plugin_distribution::InstalledPlugin,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use memeloop_token_center::plugin::application::PreinstalledInventory;
+    use std::{
+        collections::BTreeMap,
+        io::{Read, Write},
+    };
+    const MAX_BYTES: u64 = 4 * 1024 * 1024;
+    fn read_json(
+        path: &std::path::Path,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?
+            .take(MAX_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err("inventory file too large".into());
+        }
+        Ok(bytes)
+    }
+    if !path.is_absolute() || !root.is_absolute() {
+        return Err("absolute inventory paths required".into());
+    }
+    let entry: PreinstalledInventory = serde_json::from_slice(&read_json(entry_path)?)?;
+    if entry.root != root
+        || !entry.grants.get(&installed.id).is_some_and(|grants| {
+            grants.iter().any(|grant| {
+                grant.version == installed.version
+                    && grant.identity.provenance.as_ref().is_some_and(|receipt| {
+                        receipt.source == installed.source
+                            && receipt.digest == installed.digest
+                            && receipt.signature_policy == "cosign-public-key"
+                    })
+            })
+        })
+    {
+        return Err("installed package does not match reviewed inventory".into());
+    }
+    // Serialize appenders with a stable sibling lock inode across atomic rename.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path.with_extension("lock"))?;
+    lock.try_lock()?;
+    let mut inventory: BTreeMap<String, PreinstalledInventory> = match read_json(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(error) => return Err(error),
+    };
+    if inventory.contains_key(id) {
+        return Err("inventory ID already registered".into());
+    }
+    inventory.insert(id.to_owned(), entry);
+    let bytes = serde_json::to_vec_pretty(&inventory)?;
+    if bytes.len() as u64 > MAX_BYTES {
+        return Err("inventory file too large".into());
+    }
+    let parent = path.parent().ok_or("invalid inventory path")?;
+    let permissions = std::fs::metadata(path)?.permissions();
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.as_file().set_permissions(permissions)?;
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path)?;
+    std::fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -138,4 +232,40 @@ fn read_bounded_file(
         return Err(format!("{kind} file is empty, invalid, or too large").into());
     }
     Ok(std::fs::read(path)?)
+}
+
+#[cfg(all(test, feature = "experimental-plugin-revisions"))]
+mod inventory_tests {
+    use super::*;
+
+    #[test]
+    fn reviewed_registration_appends_once_and_rejects_wrong_artifact() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("inventory.json");
+        let entry_path = temporary.path().join("reviewed.json");
+        let root = temporary.path().join("new");
+        std::fs::write(&path, b"{}").unwrap();
+        let installed = memeloop_token_center::plugin_distribution::InstalledPlugin {
+            id: "new-plugin".into(),
+            version: "1.0.0".into(),
+            digest: format!("sha256:{}", "a".repeat(64)),
+            source: "ghcr.io/example/plugins".into(),
+            path: root.join("new-plugin"),
+        };
+        let entry = serde_json::json!({"root":root,"grants":{"new-plugin":[{
+            "version":"1.0.0","capabilities":[],"manifest_digest":"reviewed-manifest",
+            "identity":{"component_sha256":null,"provenance":{
+                "format_version":1,"source":installed.source,"digest":installed.digest,
+                "signature_policy":"cosign-public-key"
+            }}
+        }]}});
+        std::fs::write(&entry_path, serde_json::to_vec(&entry).unwrap()).unwrap();
+        register_inventory(&path, &entry_path, "new", &root, &installed).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        assert!(register_inventory(&path, &entry_path, "new", &root, &installed).is_err());
+        let mut wrong = installed;
+        wrong.digest = format!("sha256:{}", "b".repeat(64));
+        assert!(register_inventory(&path, &entry_path, "other", &root, &wrong).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
 }
