@@ -184,11 +184,7 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
     let status = control_get(&first, "/internal/v1/plugin-runtime").await;
     assert!(status["current"].is_null());
     assert_eq!(status["candidates"].as_array().unwrap().len(), 2);
-    assert!(
-        !status
-            .to_string()
-            .contains(directory.path().to_str().unwrap())
-    );
+    assert!(!status.to_string().contains(directory.to_str().unwrap()));
     assert_eq!(
         management_call(
             &first,
