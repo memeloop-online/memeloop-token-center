@@ -50,6 +50,7 @@ fn reversed_plan_retains_exact_generation_and_health_snapshot() {
     second.candidate.generation = 4;
     second.candidate.health = GroupRoutingHealth::Authentication;
     second.directive.generation = 4;
+    second.directive.allow_transient_probe = false;
     let input = GroupRoutingInput {
         tenant_id: tenant.to_string(),
         seed: 1,
@@ -93,7 +94,7 @@ fn failed_high_priority_bucket_keeps_slots_before_success_and_native_tail() {
     assert_eq!(reserve_native_bucket_ranks(&high, &mut ranks, &mut next), 0);
     // No valid plan for high: its native member order must stay reserved.
     assert_eq!(reserve_native_bucket_ranks(&low, &mut ranks, &mut next), 2);
-    let mut candidates = vec![member(99).1, member(3).1, member(1).1, member(2).1];
+    let mut candidates = [member(99).1, member(3).1, member(1).1, member(2).1];
     candidates.sort_by_key(|candidate| {
         ranks
             .get(&(
