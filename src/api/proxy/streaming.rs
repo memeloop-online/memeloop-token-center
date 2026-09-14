@@ -77,6 +77,7 @@ pub(super) struct StreamingResponse<'a> {
     pub(super) capture_json_usage: bool,
     pub(super) protocol: Protocol,
     pub(super) is_codex_route: bool,
+    pub(super) is_kimi_route: bool,
     pub(super) codex_retry: CodexRetryTerminalGuard,
     pub(super) codex_chat_model: Option<String>,
     pub(super) codex_chat_include_usage: bool,
@@ -105,6 +106,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         capture_json_usage,
         protocol,
         is_codex_route,
+        is_kimi_route,
         codex_retry,
         codex_chat_model,
         codex_chat_include_usage,
@@ -207,7 +209,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                     ResponsesSseCapture::for_codex_responses()
                 }
                 Protocol::OpenAiChat if strict_openai_chat_usage => {
-                    ResponsesSseCapture::for_openai_chat_usage()
+                    chat_usage_capture(is_kimi_route)
                 }
                 Protocol::OpenAiResponses if is_codex_route => {
                     ResponsesSseCapture::for_codex_responses()
@@ -821,6 +823,14 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
     response
         .body(Body::from_stream(ReceiverStream::new(body_receiver)))
         .map_err(|_| AppError::Internal)
+}
+
+fn chat_usage_capture(is_kimi_route: bool) -> ResponsesSseCapture {
+    if is_kimi_route {
+        ResponsesSseCapture::for_kimi_chat_usage()
+    } else {
+        ResponsesSseCapture::for_openai_chat_usage()
+    }
 }
 
 async fn hold_response_eof_until_archive_settles(

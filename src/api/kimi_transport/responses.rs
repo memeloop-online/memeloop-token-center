@@ -64,19 +64,16 @@ impl Context {
 }
 
 fn usage(value: &Value) -> Result<Value, &'static str> {
+    let value = super::usage::normalize(value)?;
     let input = value["prompt_tokens"]
         .as_u64()
         .ok_or("usage_input_invalid")?;
     let output = value["completion_tokens"]
         .as_u64()
         .ok_or("usage_output_invalid")?;
-    let total = input.checked_add(output).ok_or("usage_total_overflow")?;
-    if value["total_tokens"]
+    let total = value["total_tokens"]
         .as_u64()
-        .is_some_and(|claimed| claimed != total)
-    {
-        return Err("usage_total_mismatch");
-    }
+        .ok_or("kimi_usage_field_type")?;
     let cached = value
         .pointer("/prompt_tokens_details/cached_tokens")
         .and_then(Value::as_u64)
@@ -531,6 +528,34 @@ impl Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffered_documented_cache_alias_is_preserved_and_conflicts_fail() {
+        let context = Context::new(&json!({"model":"kimi-k3"}));
+        let mut value = json!({"choices":[{"finish_reason":"stop", "message":{"content":"Hello"}}],
+            "usage":{"prompt_tokens":19,"completion_tokens":13,"total_tokens":32,"cached_tokens":12}});
+        let response = buffered(&context, &value).unwrap();
+        assert_eq!(response["usage"]["input_tokens"], 19);
+        assert_eq!(
+            response["usage"]["input_tokens_details"]["cached_tokens"],
+            12
+        );
+        value["usage"]["prompt_tokens_details"] = json!({"cached_tokens":11});
+        assert_eq!(
+            buffered(&context, &value),
+            Err("kimi_cached_tokens_conflict")
+        );
+    }
+
+    #[test]
+    fn buffered_rejects_every_malformed_accounting_shape_before_completed() {
+        let context = Context::new(&json!({"model":"kimi-k3"}));
+        for usage in super::super::usage::invalid_examples() {
+            let value = json!({"choices":[{"finish_reason":"stop", "message":{"content":"Hello"}}],
+                "usage": usage});
+            assert!(buffered(&context, &value).is_err());
+        }
+    }
 
     #[test]
     fn buffered_custom_output_and_cached_reasoning_usage_are_preserved() {

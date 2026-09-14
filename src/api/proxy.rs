@@ -1567,6 +1567,7 @@ pub(in crate::api) async fn proxy_with_identity(
         codex_chat_model: (is_codex_route && matches!(protocol, Protocol::OpenAiChat))
             .then(|| model.clone()),
         codex_chat_include_usage,
+        is_kimi_route: active_route.route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER,
         upstream_attempt,
         upstream_activity,
         request_id,

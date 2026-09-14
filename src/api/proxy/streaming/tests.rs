@@ -1,5 +1,30 @@
 use super::*;
 
+#[test]
+fn native_kimi_chat_capture_preserves_documented_cache_usage_without_relaxing_openai() {
+    let wire = include_bytes!("../../kimi_transport/fixtures/documented-chat-stream.sse");
+    let mut kimi = chat_usage_capture(true);
+    kimi.push(wire);
+    let summary = kimi.finish_summary();
+    assert!(matches!(
+        summary.outcome,
+        ResponsesSseOutcome::Completed { .. }
+    ));
+    assert!(!summary.usage_invalid);
+    let usage = summary.usage.unwrap();
+    assert_eq!(
+        (
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.output_tokens
+        ),
+        (7, 12, 13)
+    );
+    let mut strict = chat_usage_capture(false);
+    strict.push(wire);
+    assert!(strict.finish_summary().usage_invalid);
+}
+
 #[tokio::test]
 async fn ready_upstream_evidence_wins_when_downstream_is_already_closed() {
     let (body_sender, body_receiver) = tokio::sync::mpsc::channel(1);
