@@ -2,6 +2,7 @@ mod accounts;
 mod model_catalog;
 mod model_picker;
 mod native_oauth_imports;
+mod native_oauth_sources;
 mod oauth;
 #[cfg(test)]
 mod route_counts;
@@ -22,6 +23,7 @@ pub use model_picker::{
 pub use native_oauth_imports::{
     NativeOAuthImportAccountInput, NativeOAuthImportApproval, NativeOAuthImportCohortResult,
 };
+pub use native_oauth_sources::{NativeCursorImportInput, NativeCursorImportResult};
 pub use oauth::{
     ClaimUpstreamOAuthRefreshResult, ClaimedUpstreamOAuthRefresh, ReauthorizeUpstreamAccountInput,
 };

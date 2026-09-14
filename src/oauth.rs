@@ -9,7 +9,7 @@ pub mod claude;
 pub mod codex_device;
 pub mod copilot;
 mod cursor;
-pub(crate) use cursor::cursor_login_application_revision;
+pub(crate) use cursor::{credential_from_cursor_auth_store, cursor_login_application_revision};
 mod endpoint;
 pub(crate) mod managed;
 
