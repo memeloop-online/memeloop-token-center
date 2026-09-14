@@ -27,6 +27,7 @@ const SUPPORTED_SERVICE_SCOPES: &[&str] = &[
     "providers:read",
     "providers:write",
     "requests:read",
+    "settlements:adjust",
     "routes:read",
     "routes:write",
     "schemas:read",

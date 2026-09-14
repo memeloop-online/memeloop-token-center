@@ -2,6 +2,7 @@ mod balances;
 mod entitlements;
 mod money;
 mod pricing;
+mod settlement_adjustments;
 mod settlements;
 
 pub(in crate::api) use balances::{grant_balance, list_account_ledger, reverse_grant_balance};
@@ -13,4 +14,5 @@ pub(in crate::api) use pricing::{
     list_generation_prices, list_model_prices, model_price_usage_summary, sync_model_prices,
     upsert_generation_price, upsert_price,
 };
+pub(in crate::api) use settlement_adjustments::reconcile_settlement_adjustment;
 pub(in crate::api) use settlements::list_account_settlements;

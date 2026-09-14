@@ -120,7 +120,12 @@ function quotaPeriodKey(periodSeconds: number | null, role: string | undefined) 
 export function quotaWindowPresentation(provider: string, window: UpstreamQuotaSnapshot['windows'][number]): QuotaWindowPresentation {
   const match = /^([^:]+):(primary_window|secondary_window)$/.exec(window.id);
   const role = match?.[2];
-  const periodKey = quotaPeriodKey(window.period_seconds, role);
+  // Kimi's usages API defines `usage` (normalized id `summary`) as the
+  // weekly allowance. Also applies to cached snapshots from older parsers;
+  // never infer the other window's duration from its remaining countdown.
+  const periodSeconds = provider === 'kimi-oauth' && window.id === 'summary' && window.period_seconds === null
+    ? 604_800 : window.period_seconds;
+  const periodKey = quotaPeriodKey(periodSeconds, role);
   if (provider === 'openai-codex') {
     const scopeKey = match?.[1] === 'code' ? 'quota.scopeCodex'
       : match?.[1] === 'code_review' ? 'quota.scopeCodexReview'

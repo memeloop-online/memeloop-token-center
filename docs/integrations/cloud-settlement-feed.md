@@ -30,6 +30,42 @@ request, account, key, model and currency.
   the Cloud consumer. An old writer does not publish feed rows; mixed versions
   are not a supported reconciliation cutover.
 
+## Attributed rebate adjustments
+
+Cloud may apply a post-settlement usage discount with
+`PUT /internal/v1/accounts/{account_id}/settlements/{settlement_id}/adjustments`.
+This is deliberately a separate, write-only capability: the caller needs
+`settlements:adjust`, not `credits:write`. A tenant-scoped service token is
+bound to the path account's tenant; an account outside that tenant is reported
+as not found so the endpoint cannot become a tenant-discovery oracle.
+
+The request names the original `request_kind` and `request_id`, its immutable
+`currency`, a discount `namespace`, monotonically increasing `version`, and a
+non-negative `desired_rebate`. The only accepted initial namespace is
+`memeloop-cloud:usage-discount`; future namespaces need an explicit API
+authorization change. It also includes an opaque `decision_digest` and
+operator-safe `source`. `Idempotency-Key` is mandatory and scoped to
+`(account_id, Idempotency-Key)` plus the canonical request: repeating the same
+request returns the original event, while changing a request under an existing
+key, supplying a stale version, or exceeding the original settled cost returns
+409.
+
+An adjustment never changes the gross settlement feed row, original usage
+amount, or settlement identity. It can only move the attributed rebate forward
+from zero up to that row's gross cost; an initial zero desired amount creates a
+durable no-op decision event, but a value cannot subsequently be lowered. It
+cannot make the usage charge negative.
+The response reports desired, delta, cumulative and remaining money amounts,
+plus opaque adjustment/event identifiers. A new reconciliation (including a
+higher desired version) returns 201; an exact idempotent replay returns 200.
+Responses are `Cache-Control: no-store` and expose no request payload,
+credentials, reservation data, or raw idempotency value.
+
+Discount reversal is intentionally not supported by this endpoint. A reversal
+requires a separately versioned protocol, a distinct authorization capability,
+and an explicit reference to the adjustment event being reversed; consumers
+must not emulate it by lowering `desired_rebate`.
+
 ## Transaction invariants
 
 Each terminal transaction reads the actual usage ledger and rejects an amount

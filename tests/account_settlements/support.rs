@@ -13,6 +13,8 @@ const PEPPER: &[u8] = b"account settlement feed test pepper is long enough";
 pub(super) struct Fixture {
     _directory: TempDir,
     pub(super) state: AppState,
+    pub(super) target_tenant: String,
+    pub(super) other_tenant: String,
     pub(super) target: AuthenticatedKey,
     pub(super) other: AuthenticatedKey,
     pub(super) target_token: String,
@@ -90,7 +92,7 @@ impl Fixture {
             &state,
             "settlement-other-reader",
             vec!["credits:read", "requests:read"],
-            Some(other_tenant),
+            Some(other_tenant.clone()),
         )
         .await;
         let credits_only_token = service_token(
@@ -104,7 +106,7 @@ impl Fixture {
             &state,
             "settlement-requests-only",
             vec!["requests:read"],
-            Some(target_tenant),
+            Some(target_tenant.clone()),
         )
         .await;
 
@@ -208,6 +210,8 @@ impl Fixture {
         Self {
             _directory: directory,
             state,
+            target_tenant,
+            other_tenant,
             target,
             other,
             target_token,

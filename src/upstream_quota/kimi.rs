@@ -138,21 +138,28 @@ fn row(id: String, item: &Value, now: i64) -> Result<QuotaWindow, &'static str> 
         .iter()
         .find_map(|value| value["timeUnit"].as_str())
         .unwrap_or("")
+        .trim()
         .to_ascii_uppercase();
+    // CPA's Kimi usages contract treats an omitted timeUnit as minutes.
+    // An explicitly unknown unit is not evidence for any particular period.
     let multiplier = match unit.trim_start_matches("TIME_UNIT_") {
         "SECOND" | "SECONDS" => Some(1),
-        "MINUTE" | "MINUTES" => Some(60),
+        "" | "MINUTE" | "MINUTES" => Some(60),
         "HOUR" | "HOURS" => Some(3600),
         "DAY" | "DAYS" => Some(86400),
         "WEEK" | "WEEKS" => Some(604800),
         _ => None,
     };
-    let period_seconds = metadata
+    let duration = metadata
         .iter()
         .find_map(|value| integer(&value["duration"]))
-        .filter(|value| *value > 0)
+        .filter(|value| *value > 0);
+    let period_seconds = duration
         .zip(multiplier)
-        .and_then(|(duration, multiplier)| duration.checked_mul(multiplier));
+        .and_then(|(duration, multiplier)| duration.checked_mul(multiplier))
+        // The usages API's top-level usage object is the weekly allowance;
+        // limits are additional windows. This is not inferred from reset_at.
+        .or_else(|| (id == "summary" && duration.is_none() && unit.is_empty()).then_some(604800));
     Ok(QuotaWindow {
         label: label(&item["name"])
             .or_else(|| label(&detail["name"]))
@@ -289,6 +296,45 @@ mod tests {
         assert!(rows[1].limit.is_none());
         assert!(rows[2].used.is_none());
         assert!(rows.iter().all(|row| row.allowed.is_none()));
+    }
+
+    #[test]
+    fn cpa_usage_contract_preserves_weekly_and_minute_windows_without_guessing_dates() {
+        // CPA's usages schema, not a captured production body. Absolute dates
+        // deliberately have different countdowns: they do not define cadence.
+        for (short_reset, weekly_reset) in [
+            (1789428406870_i64, 1789655206870_i64),
+            (1789432686257_i64, 1789465086257_i64),
+        ] {
+            let rows = windows(
+                &json!({
+                    "limits":[{"window":{"duration":300},
+                        "detail":{"limit":100,"remaining":100,"resetAt":short_reset}}],
+                    "usage":{"limit":100,"remaining":100,"resetAt":weekly_reset}
+                }),
+                1789417545115,
+            )
+            .unwrap();
+            assert_eq!(rows[0].period_seconds, Some(18000));
+            assert_eq!(rows[1].period_seconds, Some(604800));
+            assert_eq!(rows[0].reset_at, Some(short_reset));
+            assert_eq!(rows[1].reset_at, Some(weekly_reset));
+            assert!(rows.iter().all(|row| row.used_percent == Some(0.0)
+                && row.unit.is_none()
+                && !row.reset_is_estimated));
+        }
+        let rows = windows(
+            &json!({"limits":[
+                {"window":{"duration":300,"timeUnit":"UNKNOWN"}},
+                {"detail":{"resetAt":1789428406870_i64}},
+                {"window":{"duration":"300","timeUnit":" TIME_UNIT_MINUTE "}}
+            ]}),
+            1789410406870,
+        )
+        .unwrap();
+        assert_eq!(rows[0].period_seconds, None);
+        assert_eq!(rows[1].period_seconds, None);
+        assert_eq!(rows[2].period_seconds, Some(18000));
     }
 
     #[test]
