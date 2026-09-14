@@ -8,5 +8,7 @@ declare global {
     failNextFormWrite: boolean;
     deferNextFormQuotaRead: boolean;
     releaseFormQuotaRead: () => void;
+    deferNextFormProxyRead: boolean;
+    releaseFormProxyRead: () => void;
   }
 }

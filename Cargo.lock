@@ -2567,6 +2567,7 @@ dependencies = [
  "wit-parser",
  "wreq",
  "wreq-util",
+ "zstd",
 ]
 
 [[package]]

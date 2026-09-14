@@ -23,6 +23,76 @@ const FRESH_MS: i64 = 30_000;
 const STALE_MS: i64 = 300_000;
 const MAX_ENTRIES: usize = 128;
 const BODY_LIMIT: usize = 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct QuotaRequestContext {
+    account_id: Uuid,
+    credential_generation: i64,
+    endpoint_kind: &'static str,
+}
+
+impl QuotaRequestContext {
+    fn for_account(account: &UpstreamAccountView, endpoint_kind: &'static str) -> Self {
+        Self {
+            account_id: account.id,
+            credential_generation: account.credential_generation,
+            endpoint_kind,
+        }
+    }
+}
+
+fn quota_reqwest_error_kind(
+    is_timeout: bool,
+    is_connect: bool,
+    is_body: bool,
+    is_request: bool,
+) -> &'static str {
+    if is_timeout {
+        "timeout"
+    } else if is_connect {
+        "connect"
+    } else if is_body {
+        "body"
+    } else if is_request {
+        "request"
+    } else {
+        "other"
+    }
+}
+
+fn quota_reqwest_error_code(is_timeout: bool) -> &'static str {
+    if is_timeout {
+        "quota_timeout"
+    } else {
+        "quota_transport_failed"
+    }
+}
+
+fn log_quota_request_error(
+    context: QuotaRequestContext,
+    phase: &'static str,
+    error: &reqwest::Error,
+    started: tokio::time::Instant,
+) {
+    // Do not log reqwest's error display/chain: it can include the complete
+    // URL, including proxy userinfo or request-derived credentials. These
+    // predicates are the deliberately allowlisted diagnostic surface.
+    tracing::warn!(
+        operation = "quota_supplier_read",
+        upstream_account_id = %context.account_id,
+        credential_generation = context.credential_generation,
+        endpoint_kind = context.endpoint_kind,
+        phase,
+        error_kind = quota_reqwest_error_kind(
+            error.is_timeout(),
+            error.is_connect(),
+            error.is_body(),
+            error.is_request(),
+        ),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "quota supplier request failed"
+    );
+}
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct CacheKey {
     account: Uuid,
@@ -293,15 +363,31 @@ impl QuotaCache {
             return fallback("quota_busy");
         };
         // Includes DNS/proxy setup, both GETs and bounded body decoding.
-        let result = tokio::time::timeout(Duration::from_secs(8), async {
+        let refresh_started = tokio::time::Instant::now();
+        let result = match tokio::time::timeout(Duration::from_secs(8), async {
             if account.driver == "kimi-oauth" {
-                kimi::read(state, credential, empty(None)).await
+                kimi::read(state, account, credential, empty(None)).await
             } else {
                 read_codex(state, account, credential, empty(None)).await
             }
         })
         .await
-        .unwrap_or(Err("quota_timeout"));
+        {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!(
+                    operation = "quota_supplier_read",
+                    upstream_account_id = %account.id,
+                    credential_generation = account.credential_generation,
+                    endpoint_kind = "read",
+                    phase = "overall",
+                    error_kind = "timeout",
+                    elapsed_ms = refresh_started.elapsed().as_millis() as u64,
+                    "quota supplier request timed out"
+                );
+                Err("quota_timeout")
+            }
+        };
         let mut value = match result {
             Ok(mut value) => {
                 value.finalize_reset_capability();
@@ -390,10 +476,33 @@ async fn read_codex(
         false,
     )
     .await
-    .map_err(|_| "quota_destination_invalid")?;
+    .map_err(|_| {
+        tracing::warn!(
+            operation = "quota_supplier_read",
+            upstream_account_id = %account.id,
+            credential_generation = account.credential_generation,
+            endpoint_kind = "quota_client",
+            phase = "client",
+            error_kind = "destination_invalid",
+            "quota supplier client setup failed"
+        );
+        "quota_destination_invalid"
+    })?;
     let (usage, reset) = tokio::join!(
-        get_json(&http, credential, account_header.clone(), USAGE_URL, false),
-        get_json(&http, credential, account_header, CREDITS_URL, true),
+        get_json(
+            &http,
+            credential,
+            account_header.clone(),
+            USAGE_URL,
+            QuotaRequestContext::for_account(account, "usage"),
+        ),
+        get_json(
+            &http,
+            credential,
+            account_header,
+            CREDITS_URL,
+            QuotaRequestContext::for_account(account, "credits"),
+        ),
     );
     let observed_at = unix_millis();
     normalize::usage(&mut snapshot, &usage?, observed_at)?;
@@ -490,8 +599,9 @@ async fn get_json(
     credential: &UpstreamCredential,
     account: reqwest::header::HeaderValue,
     url: &str,
-    reset_credits: bool,
+    context: QuotaRequestContext,
 ) -> Result<Value, &'static str> {
+    let started = tokio::time::Instant::now();
     let mut request = http
         .get(url)
         .header(reqwest::header::ACCEPT, "application/json")
@@ -502,14 +612,14 @@ async fn get_json(
         .header("chatgpt-account-id", account)
         .header(
             "originator",
-            if reset_credits {
+            if context.endpoint_kind == "credits" {
                 "Codex Desktop"
             } else {
                 crate::oauth::managed::codex::ORIGINATOR
             },
         )
         .timeout(Duration::from_secs(6));
-    if reset_credits {
+    if context.endpoint_kind == "credits" {
         request = request.header("openai-beta", "codex-1");
     }
     let response = credential
@@ -517,11 +627,18 @@ async fn get_json(
         .map_err(|_| "credential_invalid")?
         .send()
         .await
-        .map_err(|_| "quota_transport_failed")?;
-    decode_response(response).await
+        .map_err(|error| {
+            log_quota_request_error(context, "send", &error, started);
+            quota_reqwest_error_code(error.is_timeout())
+        })?;
+    decode_response(response, context, started).await
 }
 
-async fn decode_response(response: reqwest::Response) -> Result<Value, &'static str> {
+async fn decode_response(
+    response: reqwest::Response,
+    context: QuotaRequestContext,
+    started: tokio::time::Instant,
+) -> Result<Value, &'static str> {
     if !response.status().is_success() {
         return Err(match response.status().as_u16() {
             401 | 403 => "quota_not_authorized",
@@ -538,7 +655,10 @@ async fn decode_response(response: reqwest::Response) -> Result<Value, &'static 
     let mut bytes = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| "quota_transport_failed")?;
+        let chunk = chunk.map_err(|error| {
+            log_quota_request_error(context, "body", &error, started);
+            quota_reqwest_error_code(error.is_timeout())
+        })?;
         if bytes.len().saturating_add(chunk.len()) > BODY_LIMIT {
             return Err("quota_response_too_large");
         }
@@ -632,6 +752,23 @@ mod tests {
         assert!(first_read_failure.workspace.is_none());
     }
 
+    #[test]
+    fn quota_reqwest_classification_keeps_timeouts_distinct_from_transport() {
+        assert_eq!(quota_reqwest_error_kind(true, true, true, true), "timeout");
+        assert_eq!(quota_reqwest_error_kind(false, true, true, true), "connect");
+        assert_eq!(quota_reqwest_error_kind(false, false, true, true), "body");
+        assert_eq!(
+            quota_reqwest_error_kind(false, false, false, true),
+            "request"
+        );
+        assert_eq!(
+            quota_reqwest_error_kind(false, false, false, false),
+            "other"
+        );
+        assert_eq!(quota_reqwest_error_code(true), "quota_timeout");
+        assert_eq!(quota_reqwest_error_code(false), "quota_transport_failed");
+    }
+
     #[tokio::test]
     async fn quota_transport_only_gets_and_does_not_publish_error_bodies() {
         let server = MockServer::start().await;
@@ -662,13 +799,22 @@ mod tests {
         };
         let http = crate::build_http_client().unwrap();
         let account = reqwest::header::HeaderValue::from_static("fixture-account");
+        let usage_context = QuotaRequestContext {
+            account_id: Uuid::from_u128(1),
+            credential_generation: 2,
+            endpoint_kind: "usage",
+        };
+        let credits_context = QuotaRequestContext {
+            endpoint_kind: "credits",
+            ..usage_context
+        };
         assert_eq!(
             get_json(
                 &http,
                 &credential,
                 account.clone(),
                 &format!("{}/usage", server.uri()),
-                false
+                usage_context
             )
             .await
             .unwrap()["plan_type"],
@@ -680,7 +826,7 @@ mod tests {
                 &credential,
                 account,
                 &format!("{}/credits", server.uri()),
-                true
+                credits_context
             )
             .await
             .unwrap_err(),

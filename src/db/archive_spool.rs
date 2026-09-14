@@ -236,17 +236,22 @@ impl Database {
             {
                 return Err(AppError::Internal);
             }
+            let mut actual_accounted = SPOOL_OVERHEAD;
             for (seq, bytes) in body
                 .chunks(crate::response_archive_spool::CHUNK_BYTES)
                 .enumerate()
             {
                 let ciphertext = archive.seal(seq)?;
+                add_chunk_accounting(&mut actual_accounted, &ciphertext)?;
                 let same: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT COUNT(*) FROM response_archive_spool_chunks WHERE request_id = $1 AND seq = $2 AND ciphertext = $3 AND byte_count = $4")))
                     .bind(identity.request_id.to_string()).bind(seq as i64).bind(&ciphertext)
                     .bind(bytes.len() as i64).fetch_one(&mut **tx).await?;
                 if same != 1 {
                     return Err(AppError::Internal);
                 }
+            }
+            if row.try_get::<i64, _>("cipher_bytes")? != actual_accounted {
+                return Err(AppError::Internal);
             }
             return Ok(true);
         }
@@ -258,8 +263,10 @@ impl Database {
         sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "INSERT INTO response_archive_spools (request_id, tenant_id, reservation_id, state, chunk_count, byte_count, cipher_bytes, next_attempt_at, created_at, updated_at, expires_at) VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $7, $7, $8)")))
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.reservation_id.to_string())
             .bind(chunk_count as i64).bind(byte_count).bind(accounted).bind(now).bind(now + RETENTION).execute(&mut **tx).await?;
+        let mut actual_accounted = SPOOL_OVERHEAD;
         let mut first_seq = 0;
         if let Some(chunks) = prepared_first_batch {
+            add_chunks_accounting(&mut actual_accounted, &chunks)?;
             insert_spool_chunks(tx, purpose, identity, &chunks).await?;
             first_seq = chunks.len();
             drop(chunks);
@@ -278,8 +285,38 @@ impl Database {
                     })
                 })
                 .collect::<Result<Vec<_>, AppError>>()?;
+            add_chunks_accounting(&mut actual_accounted, &chunks)?;
             insert_spool_chunks(tx, purpose, identity, &chunks).await?;
             first_seq = end_seq;
+        }
+        let refund = accounted
+            .checked_sub(actual_accounted)
+            .ok_or(AppError::Internal)?;
+        if refund > 0 {
+            let spool = sqlx::query(sqlx::AssertSqlSafe(spool_sql(
+                purpose,
+                "UPDATE response_archive_spools SET cipher_bytes = $1 WHERE request_id = $2 AND tenant_id = $3 AND reservation_id = $4 AND state = 'pending' AND cipher_bytes = $5",
+            )))
+            .bind(actual_accounted)
+            .bind(identity.request_id.to_string())
+            .bind(identity.tenant_id.to_string())
+            .bind(identity.reservation_id.to_string())
+            .bind(accounted)
+            .execute(&mut **tx)
+            .await?;
+            if spool.rows_affected() != 1 {
+                return Err(AppError::Internal);
+            }
+            let budget = sqlx::query(sqlx::AssertSqlSafe(spool_sql(
+                purpose,
+                "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes - $1 WHERE singleton = 1 AND cipher_bytes >= $1",
+            )))
+            .bind(refund)
+            .execute(&mut **tx)
+            .await?;
+            if budget.rows_affected() != 1 {
+                return Err(AppError::Internal);
+            }
         }
         Ok(true)
     }
@@ -1067,6 +1104,27 @@ async fn insert_spool_chunks(
             .bind(chunk.byte_count);
     }
     query.execute(&mut **tx).await?;
+    Ok(())
+}
+
+fn add_chunks_accounting(
+    accounted: &mut i64,
+    chunks: &[ArchiveSpoolChunk],
+) -> Result<(), AppError> {
+    for chunk in chunks {
+        add_chunk_accounting(accounted, &chunk.ciphertext)?;
+    }
+    Ok(())
+}
+
+fn add_chunk_accounting(accounted: &mut i64, ciphertext: &str) -> Result<(), AppError> {
+    if ciphertext.len() > CIPHER_CHUNK_LIMIT {
+        return Err(AppError::Internal);
+    }
+    let cipher_bytes = i64::try_from(ciphertext.len()).map_err(|_| AppError::Internal)?;
+    *accounted = accounted
+        .checked_add(cipher_bytes + CHUNK_OVERHEAD)
+        .ok_or(AppError::Internal)?;
     Ok(())
 }
 

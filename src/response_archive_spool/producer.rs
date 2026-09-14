@@ -12,6 +12,7 @@ use crate::{AppState, db::ArchiveSpoolIdentity, error::AppError};
 pub(crate) struct PreparedArchiveBatch {
     identity: ArchiveSpoolIdentity,
     purpose: super::BufferedArchivePurpose,
+    compression_enabled: bool,
     chunks: Vec<crate::db::ArchiveSpoolChunk>,
 }
 
@@ -20,7 +21,9 @@ impl PreparedArchiveBatch {
         self,
         archive: &BufferedArchive<'_>,
     ) -> Option<Vec<crate::db::ArchiveSpoolChunk>> {
-        (self.identity == archive.identity && self.purpose == archive.purpose)
+        (self.identity == archive.identity
+            && self.purpose == archive.purpose
+            && self.compression_enabled == archive.compression_enabled)
             .then_some(self.chunks)
     }
 }
@@ -32,6 +35,7 @@ pub(crate) struct BufferedArchive<'a> {
     purpose: super::BufferedArchivePurpose,
     body: &'a Bytes,
     pepper: &'a [u8],
+    compression_enabled: bool,
     nonces: Vec<[u8; 12]>,
 }
 
@@ -41,6 +45,7 @@ impl<'a> BufferedArchive<'a> {
         purpose: super::BufferedArchivePurpose,
         body: &'a Bytes,
         pepper: &'a [u8],
+        compression_enabled: bool,
     ) -> Result<Self, AppError> {
         if body.len() > 64 * 1024 * 1024 {
             return Err(AppError::Overloaded);
@@ -57,6 +62,7 @@ impl<'a> BufferedArchive<'a> {
             purpose,
             body,
             pepper,
+            compression_enabled,
             nonces,
         })
     }
@@ -84,15 +90,19 @@ impl<'a> BufferedArchive<'a> {
             .ok_or(AppError::Internal)?;
         let end = (start + super::CHUNK_BYTES).min(self.body.len());
         let bytes = self.body.get(start..end).ok_or(AppError::Internal)?;
-        let sealed = super::cipher::seal_for_purpose_with_nonce(
+        let sealed = super::cipher::seal_for_purpose_with_nonce_and_compression(
             self.identity,
             i64::try_from(seq).map_err(|_| AppError::Internal)?,
             bytes,
             self.pepper,
             self.purpose,
             nonce,
+            self.compression_enabled,
         )?;
-        debug_assert_eq!(Some(sealed.len()), self.sealed_len(bytes.len()));
+        debug_assert!(
+            self.sealed_len(bytes.len())
+                .is_some_and(|upper| sealed.len() <= upper)
+        );
         Ok(sealed)
     }
 
@@ -119,6 +129,7 @@ impl<'a> BufferedArchive<'a> {
         Ok(PreparedArchiveBatch {
             identity: self.identity,
             purpose: self.purpose,
+            compression_enabled: self.compression_enabled,
             chunks,
         })
     }
@@ -380,6 +391,7 @@ impl ResponseArchiveSettlement {
 pub(super) struct ResponseArchiveWriter {
     state: AppState,
     identity: ArchiveSpoolIdentity,
+    compression_enabled: bool,
     seq: i64,
     bytes: i64,
     append_attempts: u64,
@@ -581,6 +593,7 @@ impl ResponseArchiveWriter {
         state: AppState,
         identity: ArchiveSpoolIdentity,
     ) -> Result<Self, AppError> {
+        let compression_enabled = state.config.archive_spool_compression_enabled;
         if !observe_writer_database(
             identity,
             "response_spool_begin",
@@ -594,6 +607,7 @@ impl ResponseArchiveWriter {
         Ok(Self {
             state,
             identity,
+            compression_enabled,
             seq: 0,
             bytes: 0,
             append_attempts: 0,
@@ -603,11 +617,13 @@ impl ResponseArchiveWriter {
     }
 
     async fn append_chunk(&mut self, bytes: &[u8]) -> Result<(), AppError> {
-        let ciphertext = super::cipher::seal(
+        let ciphertext = super::cipher::seal_for_purpose_with_compression(
             self.identity,
             self.seq,
             bytes,
             self.state.config.key_pepper.as_bytes(),
+            super::BufferedArchivePurpose::Response,
+            self.compression_enabled,
         ).map_err(|error| {
             tracing::warn!(request_id = %self.identity.request_id, phase = "response_spool_encrypt", error_category = error.diagnostic_category(), "response archive chunk encryption failed");
             error
@@ -897,12 +913,19 @@ mod tests {
 
     #[test]
     fn buffered_archive_replays_its_body_but_new_captures_get_fresh_nonces() {
-        let body = Bytes::from_static(b"immutable private response");
+        let body = Bytes::from(
+            serde_json::to_vec(&vec![
+                serde_json::json!({"content":"synthetic repeat for fixed nonce replay"});
+                400
+            ])
+            .unwrap(),
+        );
         let first = BufferedArchive::new(
             identity(),
             super::super::BufferedArchivePurpose::Response,
             &body,
             b"archive-spool-test-pepper",
+            true,
         )
         .unwrap();
         let second = BufferedArchive::new(
@@ -910,10 +933,13 @@ mod tests {
             super::super::BufferedArchivePurpose::Response,
             &body,
             b"archive-spool-test-pepper",
+            true,
         )
         .unwrap();
 
-        assert_eq!(first.seal(0).unwrap(), first.seal(0).unwrap());
+        let replay = first.seal(0).unwrap();
+        assert!(replay.starts_with("zstd1."));
+        assert_eq!(replay, first.seal(0).unwrap());
         assert_ne!(first.seal(0).unwrap(), second.seal(0).unwrap());
     }
 

@@ -142,6 +142,10 @@ config:
   # never rendered for gateway or worker roles.
   runtimeProfiling:
     enabled: false
+  # Keep compressed spool writes disabled until every gateway/control/worker
+  # replica runs a reader that accepts both the legacy and compressed formats.
+  archiveSpoolCompression:
+    enabled: false
   databaseUrlSecret:
     name: memeloop-token-center-secrets
     key: database-url
