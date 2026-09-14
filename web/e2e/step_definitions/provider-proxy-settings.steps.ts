@@ -14,7 +14,7 @@ When('管理员通过统一编辑工作区维护真实代理设置', async funct
   const account = await requestJson<{ id: string }>('/internal/v1/upstreams', {
     method: 'POST', credential: seed.globalServiceCredential,
     body: { tenant_external_id: tenant, name: 'Browser proxy settings account', driver: 'http-json',
-      config: { base_url: 'https://example.invalid/v1' },
+      config: { base_url: 'https://93.184.216.34/v1', network_scope: 'public' },
       credential: { type: 'api_key_proxy', value: 'fixture-only-upstream-key', proxy_url: original, proxy_network_scope: 'private' } },
   });
   await connectOperator(this, 'light', seed.globalServiceCredential, 'visible');

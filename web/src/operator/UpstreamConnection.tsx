@@ -48,11 +48,12 @@ export function ProxyInput({ value, onChange, disabled = false, generic = false,
   </div>;
 }
 
-export function UpstreamConnection({ account, token, tenant, disabled, onChanged, onEditingChange, onSaved, embedded = false }: {
+export function UpstreamConnection({ account, token, tenant, disabled, onChanged, onEditingChange, onSaved, embedded = false, readOnOpen = false }: {
   account: UpstreamAccount; token: string; tenant: string; disabled: boolean; onChanged: () => Promise<void>;
   onEditingChange?: (editing: boolean) => void;
   onSaved?: (account: UpstreamAccount) => void;
   embedded?: boolean;
+  readOnOpen?: boolean;
 }) {
   const { t, locale } = useI18n();
   const copy = providerConnectionCopy(locale);
@@ -65,7 +66,7 @@ export function UpstreamConnection({ account, token, tenant, disabled, onChanged
   const [readError, setReadError] = useState(false);
   // The list capability already reflects the current service authority. Do
   // not automatically issue a privileged read for a tenant-only editor.
-  const [requested, setRequested] = useState(embedded && account.can_update_transport_proxy === true);
+  const [requested, setRequested] = useState((embedded || readOnOpen) && account.can_update_transport_proxy === true);
   const scope = `${token}\0${tenant}\0${account.id}\0${account.credential_generation}`;
   const owner = useRef(scope);
   owner.current = scope;
