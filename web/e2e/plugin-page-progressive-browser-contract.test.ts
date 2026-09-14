@@ -75,9 +75,11 @@ test('plugin catalog is usable without unrelated route code or unopened configur
     assert.equal(configurationReads, 0, 'catalog rendering does not fan out configuration reads');
 
     const configurationModuleRequested = page.waitForRequest((request) => new URL(request.url()).pathname.endsWith('/src/operator/PluginConfigurationForm.tsx'));
+    const configurationReadCompleted = page.waitForResponse((response) => new URL(response.url()).pathname === '/internal/v1/plugins/first/configuration');
     await plugin.locator('summary').click();
     await configurationModuleRequested;
-    assert.equal(configurationReads, 0, 'configuration data waits for its form module instead of racing every catalog row');
+    assert.equal((await configurationReadCompleted).status(), 200);
+    assert.equal(configurationReads, 1, 'one disclosure action owns one configuration read while schema code loads in parallel');
     releaseConfigurationForm();
     await plugin.getByLabel('Mode').waitFor();
     assert.equal(await plugin.getByLabel('Mode').inputValue(), 'ready');
