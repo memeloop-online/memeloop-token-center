@@ -129,14 +129,12 @@ export function UpstreamConnection({ account, token, tenant, disabled, onChanged
   return <section className="upstream-connection" aria-label={t('connection.title')}>
     {!embedded && <h3>{t('connection.title')}</h3>}
     <dl>
-      {(!embedded || codex) && <div><dt>{t('connection.baseUrl')}</dt><dd><code>{typeof account.config.base_url === 'string' ? account.config.base_url : '—'}</code>{typeof account.config.base_url === 'string' && <CopyButton value={account.config.base_url} label={copy.copyEndpoint} />}{codex && <span className="connection-endpoint-kind">{t('connection.fixed')}</span>}</dd></div>}
-      {!readableProxy && !editing && <div><dt>{t('connection.proxy')}</dt><dd><span className={`status ${account.has_proxy && account.proxy_scheme ? 'ok' : 'pending'}`}>{t(account.has_proxy === undefined ? 'connection.proxyUnknown' : account.has_proxy ? proxyState : codex ? proxyState : 'connection.directEgress')}</span>{account.proxy_scheme && <code>{account.proxy_scheme}</code>}{account.has_proxy && account.proxy_scheme && <span>{t(account.proxy_remote_dns ? 'connection.remoteDns' : 'connection.localDns')}</span>}</dd></div>}
+      {(!embedded || codex) && <div><dt>{!embedded ? <DetailTooltip content={t('connection.endpointHint')}><span tabIndex={0} className="connection-help">{t('connection.baseUrl')}</span></DetailTooltip> : t('connection.baseUrl')}</dt><dd><code>{typeof account.config.base_url === 'string' ? account.config.base_url : '—'}</code>{typeof account.config.base_url === 'string' && <CopyButton value={account.config.base_url} label={copy.copyEndpoint} />}{codex && <span className="connection-endpoint-kind">{t('connection.fixed')}</span>}</dd></div>}
+      {!readableProxy && !editing && <div><dt>{!codex ? <DetailTooltip content={t('connection.genericProxyHint')}><span tabIndex={0} className="connection-help">{t('connection.proxy')}</span></DetailTooltip> : t('connection.proxy')}</dt><dd><span className={`status ${account.has_proxy && account.proxy_scheme ? 'ok' : 'pending'}`}>{t(account.has_proxy === undefined ? 'connection.proxyUnknown' : account.has_proxy ? proxyState : codex ? proxyState : 'connection.directEgress')}</span>{account.proxy_scheme && <code>{account.proxy_scheme}</code>}{account.has_proxy && account.proxy_scheme && <span>{t(account.proxy_remote_dns ? 'connection.remoteDns' : 'connection.localDns')}</span>}</dd></div>}
     </dl>
-    {!embedded && <DetailTooltip content={t('connection.endpointHint')}><span tabIndex={0} className="connection-help">{t('connection.baseUrl')}</span></DetailTooltip>}
     {!canEditProxy && account.has_proxy && <p>{t('connection.proxyAdminOnly')}</p>}
-    {!codex && <DetailTooltip content={t('connection.genericProxyHint')}><span tabIndex={0} className="connection-help">{t('connection.proxy')}</span></DetailTooltip>}
     {readableProxy && connection.proxy_url !== null && <div className="provider-readable-proxy">
-      <span className="field-hint">{t('connection.proxyUrl')}</span>
+      {!codex ? <DetailTooltip content={t('connection.genericProxyHint')}><span tabIndex={0} className="field-hint connection-help">{t('connection.proxyUrl')}</span></DetailTooltip> : <span className="field-hint">{t('connection.proxyUrl')}</span>}
       <ProxyValue value={connection.proxy_url} actions={editProxyAction} />
     </div>}
     {readError && <p role="status">{copy.readFailed}</p>}
