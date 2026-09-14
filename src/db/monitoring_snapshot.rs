@@ -221,6 +221,10 @@ impl MetricsAccumulator {
             avg_duration_ms: (self.duration_count > 0)
                 .then(|| self.duration_sum_ms as f64 / self.duration_count as f64),
             p95_duration_ms: approximate_quantile(95, self.duration_count, &self.duration_buckets),
+            p95_is_capped: super::usage_analysis::histogram_p95_is_capped(
+                self.duration_count,
+                &self.duration_buckets,
+            ),
             costs: self
                 .costs
                 .into_iter()

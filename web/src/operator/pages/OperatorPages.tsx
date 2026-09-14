@@ -1,10 +1,10 @@
 import { api } from '../../api';
 import { RequestTable } from '../../components';
 import { useI18n } from '../../i18n';
-import type { OperatorMonitoringSnapshot, PluginManifest, RequestView, TypedFilterAst, UpstreamAccount, UsageAnalysisSessionBucket } from '../../types';
+import type { OperatorMonitoringSnapshot, PluginManifest, RequestView, TypedFilterAst, UpstreamAccount, UsageAnalysisSessionBucket, UsageAnalysisTimeBucket } from '../../types';
 import { GenerationWorkspace } from '../GenerationWorkspace';
 import { MonitoringSnapshot } from '../MonitoringSnapshot';
-import { OverviewTrends } from '../OverviewTrends';
+import { OverviewTrends, useOverviewTrendResource } from '../OverviewTrends';
 import { Plugins } from '../Plugins';
 import { UsageAnalysis } from '../UsageAnalysis';
 import { useOperatorResource } from '../hooks/useOperatorResource';
@@ -30,11 +30,11 @@ function monitoringSnapshotPath(tenant: string, now: number) {
   return `/internal/v1/monitoring-snapshot?${query}`;
 }
 
-function OverviewMonitoringSection({ state }: { state: ResourceState<OperatorMonitoringSnapshot> }) {
+function OverviewMonitoringSection({ state, points }: { state: ResourceState<OperatorMonitoringSnapshot>; points?: UsageAnalysisTimeBucket[] }) {
   const { t } = useI18n();
   if (state.kind === 'idle' || state.kind === 'loading') return <article className="panel"><div className="panel-title"><h2>{t('monitoring.title')}</h2></div><div className="empty">{t('common.loading')}</div></article>;
   if (state.kind === 'failed') return <article className="panel"><div className="panel-title"><h2>{t('monitoring.title')}</h2></div><div className="notice error" role="alert">{state.message}</div></article>;
-  return <>{state.refreshError && <div className="notice error" role="alert">{state.refreshError}</div>}<MonitoringSnapshot snapshot={state.value} /></>;
+  return <>{state.refreshError && <div className="notice error" role="alert">{state.refreshError}</div>}<MonitoringSnapshot snapshot={state.value} points={points} /></>;
 }
 
 function OverviewRecentRequestsSection({ state, onOpenSession }: { state: ResourceState<RequestView[]>; onOpenSession: (sessionId: string) => void }) {
@@ -65,9 +65,10 @@ export function OverviewPage({ token, tenant, onNavigate, onOpenSession, onReque
     () => api<OperatorMonitoringSnapshot>(monitoringSnapshotPath(tenant, Date.now()), token),
     t('common.requestFailed'),
   );
+  const trends = useOverviewTrendResource(token, tenant);
   return <div className="operator-overview-dashboard">
-    <OverviewMonitoringSection state={monitoringResource.state} />
-    <OverviewTrends token={token} tenant={tenant} onDrilldown={(ast) => { onRequestDrilldown(ast); onNavigate('requests'); }} />
+    <OverviewMonitoringSection state={monitoringResource.state} points={trends.state.kind === 'ready' ? trends.state.value.time_series : undefined} />
+    <OverviewTrends state={trends.state} onDrilldown={(ast) => { onRequestDrilldown(ast); onNavigate('requests'); }} />
     <OverviewRecentRequestsSection state={requestResource.state} onOpenSession={onOpenSession} />
   </div>;
 }

@@ -1,0 +1,54 @@
+.operator-overview-dashboard .panel,
+.usage-page .panel { border: 0; box-shadow: none; background: transparent; }
+:root[data-theme] .operator-overview-dashboard .panel,
+:root[data-theme] .usage-page .panel { border: 0; box-shadow: none; background: transparent; }
+.operator-monitoring > .panel { padding: 0; margin-bottom: 8px; }
+.operator-monitoring .monitoring-heading { margin-bottom: 20px; }
+.operator-monitoring .monitoring-heading h2 { margin-bottom: 6px; }
+.operator-monitoring .monitoring-heading .muted { font-size: 12px; }
+.metrics .analytics-metric {
+  position: relative; isolation: isolate; overflow: hidden; border: 0;
+  border-radius: 8px; min-height: 112px; padding: 18px 20px;
+  background: color-mix(in srgb, #6ab7bc 7%, transparent);
+}
+.analytics-metric .metric-label, .analytics-metric .metric-value, .analytics-metric-note { position: relative; z-index: 1; }
+.analytics-metric .metric-value { font-family: inherit; font-size: clamp(1.45rem, 2vw, 1.9rem); font-weight: 600; line-height: 1.25; white-space: nowrap; overflow-wrap: normal; }
+.operator-overview-dashboard .analytics-metric .metric-value,
+.usage-page .usage-metrics .analytics-metric .metric-value { font-size: clamp(1.125rem, 8cqw, 1.85rem); line-height: 1.25; }
+.analytics-metric .metric-label { text-transform: none; letter-spacing: 0; font-size: 12px; }
+.analytics-metric-note { display: block; color: #81949c; font-size: 11px; margin-top: 7px; }
+.analytics-metric-trend { position: absolute; inset: auto 0 0; width: 100%; height: 56%; fill: #40a59a; opacity: .15; z-index: 0; }
+.analytics-metric-ratio { position: absolute; inset: 0 auto 0 0; background: #40a59a; opacity: .10; z-index: 0; }
+.analytics-metric.negative :is(.analytics-metric-trend, .analytics-metric-ratio) { fill: #d95369; background: #d95369; }
+.operator-monitoring .monitoring-top-list { gap: 20px; }
+.operator-monitoring .monitoring-top-list > li,
+.operator-monitoring .monitoring-top-list > li:first-child { border: 0; background: transparent; padding: 0; border-radius: 0; }
+.operator-monitoring .monitoring-account-heading { border: 0; padding: 8px 0 12px; }
+.operator-monitoring .monitoring-account-heading code { color: #e3edf0; font-family: inherit; font-size: 17px; font-weight: 650; }
+.operator-monitoring .monitoring-account-models > li { padding: 16px; border: 0; border-radius: 8px; background: color-mix(in srgb, #6ab7bc 6%, transparent); }
+.operator-monitoring .monitoring-account-models > li + li { margin-top: 10px; }
+.operator-monitoring .monitoring-top-heading b { font-weight: 550; font-size: 13px; overflow-wrap: anywhere; cursor: help; }
+.operator-monitoring .monitoring-top-panel > .panel-title { align-items: flex-start; margin: 20px 0 8px; }
+.operator-monitoring .monitoring-top-panel > .panel-title > span { max-width: 42rem; line-height: 1.7; font-family: inherit; text-align: right; }
+.operator-monitoring .monitoring-outcomes { border: 0; margin-top: 14px; padding: 0; }
+.operator-monitoring .monitoring-outcomes > li { border: 0; padding: 4px 0; }
+.operator-monitoring .monitoring-cost-lines > span { white-space: nowrap; }
+.operator-monitoring .status { border: 0; border-radius: 4px; background: color-mix(in srgb, currentColor 8%, transparent); }
+.usage-page .usage-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.usage-page .usage-filter-disclosure { background: transparent; border: 0; border-bottom: 1px solid #27373c; }
+.usage-page .usage-overview-chart-grid > .panel,
+.operator-overview-dashboard .overview-trend-card { padding: 16px 0; }
+.analytics-p95-note { color: #81949c; font-size: 12px; margin: 8px 0 16px; line-height: 1.6; }
+:root[data-theme='light'] .metrics .analytics-metric,
+:root[data-theme='light'] .operator-monitoring .monitoring-account-models > li { background: #f3f7f8; }
+:root[data-theme='light'] .operator-monitoring .monitoring-top-list > li { background: transparent; border: 0; }
+:root[data-theme='light'] .operator-monitoring .monitoring-account-heading code { color: #173d4b; }
+:root[data-theme='light'] :is(.analytics-metric-note, .analytics-p95-note) { color: #536e79; }
+:root[data-theme='light'] .analytics-metric.positive .metric-value { color: #087d70; }
+:root[data-theme='light'] .analytics-metric.negative .metric-value { color: #b52f45; }
+@media (width <= 1150px) { .usage-page .usage-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (width <= 600px) {
+  .usage-page .usage-metrics { grid-template-columns: minmax(0, 1fr); }
+  .operator-monitoring .monitoring-top-panel > .panel-title { flex-direction: column; }
+  .operator-monitoring .monitoring-top-panel > .panel-title > span { text-align: left; }
+}

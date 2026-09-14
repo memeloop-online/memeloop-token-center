@@ -8,6 +8,7 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
 import { fixtureAssets } from './support/fixture-assets.js';
+import { metricArea } from '../src/operator/analyticsPresentation.js';
 
 declare global {
   interface Window {
@@ -95,6 +96,10 @@ test('Overview keeps current sections visible through independent endpoint failu
     await nextPaint(page);
     assert.equal(await page.getByText('alpha-stale-model', { exact: true }).count(), 0, 'a late response from the previous tenant must not replace beta data');
     assert.equal(await page.getByText('beta-current-model', { exact: true }).count(), 1);
+    const requestMetric = page.locator('.operator-monitoring-metrics .analytics-metric').first();
+    assert.equal(await requestMetric.locator('svg path').getAttribute('d'), metricArea([3, 5, 9]), 'background area must use the current tenant’s actual trend points');
+    assert.equal(await requestMetric.evaluate((element) => getComputedStyle(element).borderTopWidth), '0px', 'statistics use flat surfaces rather than nested card borders');
+    assert.equal(await page.locator('.operator-monitoring-metrics [data-ratio]').getAttribute('data-ratio'), String(15 / 17), 'success-rate background uses actual summary counts');
 
     assert.deepEqual(await endpointCounts(page, 'tenant-beta'), {
       '/internal/v1/monitoring-snapshot': 1,

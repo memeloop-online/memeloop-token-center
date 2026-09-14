@@ -1157,6 +1157,7 @@ impl UsageMetricsAccumulator {
             generation_units: self.generation_units,
             avg_duration_ms,
             p95_duration_ms,
+            p95_is_capped: histogram_p95_is_capped(self.duration_count, &self.duration_buckets),
             costs: self
                 .costs
                 .into_iter()
@@ -1182,6 +1183,7 @@ impl UsageMetricsAccumulator {
             generation_units: self.generation_units,
             avg_duration_ms,
             p95_duration_ms: None,
+            p95_is_capped: false,
             costs: self
                 .costs
                 .into_iter()
@@ -1272,6 +1274,16 @@ fn accumulate_usage_row(
     let cost = accumulator.costs.entry(currency).or_default();
     *cost = cost.saturating_add(cost_micros);
     Ok(())
+}
+
+pub(super) fn histogram_p95_is_capped(duration_count: i64, buckets: &[i64; 12]) -> bool {
+    let target = duration_count.saturating_mul(95).saturating_add(99) / 100;
+    duration_count > 0
+        && buckets[11] > 0
+        && buckets[..11]
+            .iter()
+            .fold(0_i64, |total, count| total.saturating_add(*count))
+            < target
 }
 
 fn approximate_p95(duration_count: i64, buckets: &[i64; 12]) -> Option<i64> {
