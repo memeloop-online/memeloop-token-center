@@ -54,17 +54,28 @@ pub(crate) async fn project_account_usage_in_transaction(
             "metered usage projection account no longer exists".into(),
         ));
     }
+    if actual_micros < 0 {
+        return Err(AppError::Conflict(
+            "metered usage projection amount must be non-negative".into(),
+        ));
+    }
+    let maximum_existing_usage = i64::MAX.checked_sub(actual_micros).ok_or_else(|| {
+        AppError::Conflict("metered usage projection would overflow account lifetime usage".into())
+    })?;
     ensure_account_usage_state(transaction, account_id, now).await?;
     let updated = sqlx::query(
-        "UPDATE account_usage_state SET settled_lifetime_micros = settled_lifetime_micros + $1, updated_at = $2 WHERE account_id = $3",
+        "UPDATE account_usage_state SET settled_lifetime_micros = settled_lifetime_micros + $1, updated_at = $2 WHERE account_id = $3 AND settled_lifetime_micros <= $4",
     )
     .bind(actual_micros)
     .bind(now)
     .bind(account_id)
+    .bind(maximum_existing_usage)
     .execute(&mut **transaction)
     .await?;
     if updated.rows_affected() != 1 {
-        return Err(AppError::Internal);
+        return Err(AppError::Conflict(
+            "metered usage projection would overflow account lifetime usage".into(),
+        ));
     }
     Ok(())
 }

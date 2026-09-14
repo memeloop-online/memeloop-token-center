@@ -222,6 +222,7 @@ async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_wi
     for admission in admissions {
         admitted.push(admission.await.unwrap());
     }
+    let overflow_reservation_id = admitted[0].1.id;
 
     let inspection = PgPool::connect(&database_url).await.unwrap();
     let admission_state: (i64, i64, i64, i64, i64) = sqlx::query_as(
@@ -319,8 +320,58 @@ async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_wi
         )
     );
 
+    sqlx::query(
+        "UPDATE account_usage_state SET settled_lifetime_micros = $1 WHERE account_id = $2",
+    )
+    .bind(i64::MAX - 1)
+    .bind(issued.account_id.to_string())
+    .execute(&inspection)
+    .await
+    .unwrap();
+    let overflow_projector = Uuid::now_v7();
+    let leased = sqlx::query(
+        "UPDATE metered_usage_projection_outbox SET lease_owner = $1, lease_expires_at = $2, attempts = attempts + 1 WHERE reservation_id = $3 AND projected_at IS NULL",
+    )
+    .bind(overflow_projector.to_string())
+    .bind(i64::MAX)
+    .bind(overflow_reservation_id.to_string())
+    .execute(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(leased.rows_affected(), 1);
+    let overflow = database
+        .project_claimed_metered_usage_projection_task(overflow_projector, overflow_reservation_id)
+        .await
+        .unwrap_err();
+    assert!(matches!(overflow, AppError::Conflict(_)));
+    let overflow_state: (i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT settled_lifetime_micros FROM account_usage_state WHERE account_id = $1),
+            (SELECT COUNT(*) FROM metered_usage_projection_outbox WHERE reservation_id = $2 AND projected_at IS NULL)",
+    )
+    .bind(issued.account_id.to_string())
+    .bind(overflow_reservation_id.to_string())
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(overflow_state, (i64::MAX - 1, 1));
+    sqlx::query("UPDATE account_usage_state SET settled_lifetime_micros = 0 WHERE account_id = $1")
+        .bind(issued.account_id.to_string())
+        .execute(&inspection)
+        .await
+        .unwrap();
+    assert!(
+        database
+            .project_claimed_metered_usage_projection_task(
+                overflow_projector,
+                overflow_reservation_id,
+            )
+            .await
+            .unwrap()
+    );
+
     let projector = Uuid::now_v7();
-    let mut projected = 0_usize;
+    let mut projected = 1_usize;
     loop {
         let tasks = database
             .claim_metered_usage_projection_tasks(projector, 32)

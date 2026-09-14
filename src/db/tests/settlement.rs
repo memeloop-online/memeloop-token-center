@@ -484,6 +484,14 @@ async fn metered_usage_projection_is_exactly_once_and_skips_prepaid_hot_rows() {
         assert!(public_event.get(forbidden).is_none());
     }
 
+    sqlx::query(
+        "UPDATE account_usage_state SET settled_lifetime_micros = $1 WHERE account_id = $2",
+    )
+    .bind(i64::MAX - 1)
+    .bind(issued.account_id.to_string())
+    .execute(&database.pool)
+    .await
+    .unwrap();
     let projector = Uuid::now_v7();
     let tasks = database
         .claim_metered_usage_projection_tasks(projector, 32)
@@ -491,6 +499,29 @@ async fn metered_usage_projection_is_exactly_once_and_skips_prepaid_hot_rows() {
         .unwrap();
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].reservation_id, reservation.id);
+    let overflow = database
+        .project_claimed_metered_usage_projection_task(projector, reservation.id)
+        .await
+        .unwrap_err();
+    assert!(matches!(overflow, AppError::Conflict(_)));
+    let overflow_state: (i64, String, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT settled_lifetime_micros FROM account_usage_state WHERE account_id = $1),
+            (SELECT typeof(settled_lifetime_micros) FROM account_usage_state WHERE account_id = $2),
+            (SELECT COUNT(*) FROM metered_usage_projection_outbox WHERE reservation_id = $3 AND projected_at IS NULL)",
+    )
+    .bind(issued.account_id.to_string())
+    .bind(issued.account_id.to_string())
+    .bind(reservation.id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(overflow_state, (i64::MAX - 1, "integer".to_owned(), 1));
+    sqlx::query("UPDATE account_usage_state SET settled_lifetime_micros = 0 WHERE account_id = $1")
+        .bind(issued.account_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
     assert!(
         database
             .project_claimed_metered_usage_projection_task(projector, reservation.id)
