@@ -868,7 +868,7 @@ paths:
       tags: [System]
       operationId: getApplicationPluginRuntime
       summary: Read the current installed-plugin revision and host-approved candidates
-      description: Service images include experimental-plugin-revisions. Requires host inventory configuration and a global plugins:read credential. An unpublished head is null. No filesystem roots, digests or provenance are exposed.
+      description: Service images include experimental-plugin-revisions. Requires a global plugins:read credential. Without host inventory configuration this read returns an empty status and history reports runtime_enabled false; mutations remain disabled. An unpublished head is null. No filesystem roots, digests or provenance are exposed.
       security: [{ serviceBearer: [] }]
       x-required-scope: plugins:read
       x-global-operator-only: true
@@ -5694,9 +5694,10 @@ components:
     PluginRuntimeHistory:
       type: object
       additionalProperties: false
-      required: [installation_enabled, installations, revisions, audit]
+      required: [runtime_enabled, installation_enabled, installations, revisions, audit]
       properties:
         installation_enabled: { type: boolean }
+        runtime_enabled: { type: boolean }
         installations: { type: array, maxItems: 100, items: { $ref: '#/components/schemas/PluginInstallation' } }
         revisions:
           type: array

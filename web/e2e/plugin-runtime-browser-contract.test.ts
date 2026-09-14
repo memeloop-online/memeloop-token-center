@@ -30,7 +30,7 @@ test('Operator plugin page installs, explicitly reviews, publishes and rolls bac
       assert.equal(request.headers().authorization, 'Bearer operator-test');
       const path = new URL(request.url()).pathname;
       if (request.method() === 'GET') {
-        if (path.endsWith('/history')) await route.fulfill({ json: { installation_enabled: true, revisions, installations: job ? [{ ...job, review: null }] : [], audit: [] } });
+        if (path.endsWith('/history')) await route.fulfill({ json: { runtime_enabled: true, installation_enabled: true, revisions, installations: job ? [{ ...job, review: null }] : [], audit: [] } });
         else if (path.endsWith('/installations/job')) await route.fulfill({ json: job });
         else await route.fulfill({ json: { current, candidates } });
         return;

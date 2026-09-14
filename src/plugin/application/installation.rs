@@ -345,10 +345,10 @@ impl ApplicationPlugins {
         .await?;
         for reference in &input.packages {
             bounded_install_phase(PACKAGE_DEADLINE, async {
-                if let Some(checkpoint) = checkpoints.get(reference) {
-                    if checkpoint_matches(&inventory_root, reference, &trust, checkpoint).await? {
-                        return Ok(());
-                    }
+                if let Some(checkpoint) = checkpoints.get(reference)
+                    && checkpoint_matches(&inventory_root, reference, &trust, checkpoint).await?
+                {
+                    return Ok(());
                 }
                 let mut command = tokio::process::Command::new(INSTALLER);
                 command
@@ -546,8 +546,7 @@ impl CredentialFiles {
         let basic = self.registry_username_file.is_some() && self.registry_password_file.is_some();
         let partial =
             self.registry_username_file.is_some() != self.registry_password_file.is_some();
-        !partial
-            && !(basic && self.registry_bearer_token_file.is_some())
+        !(partial || basic && self.registry_bearer_token_file.is_some())
             && [
                 &self.registry_username_file,
                 &self.registry_password_file,
@@ -1140,6 +1139,68 @@ mod tests {
                 .filter(|entry| entry["action"] == "approve")
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn unconfigured_runtime_has_readable_disabled_status_but_no_mutation_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::initialize(Config::for_test(format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("disabled.db").display()
+        )))
+        .await
+        .unwrap();
+        assert!(state.application_plugins.is_none());
+        let token = &state.config.service_token;
+        let (status, value) = call(
+            &state,
+            "GET",
+            "/internal/v1/plugin-runtime",
+            token,
+            json!({}),
+            "status",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value, json!({"current":null,"candidates":[]}));
+        let (status, history) = call(
+            &state,
+            "GET",
+            "/internal/v1/plugin-runtime/history",
+            token,
+            json!({}),
+            "history",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(history["runtime_enabled"], false);
+        assert_eq!(history["installation_enabled"], false);
+        assert_eq!(
+            call(
+                &state,
+                "POST",
+                "/internal/v1/plugin-runtime/publish",
+                token,
+                json!({"inventory_id":"missing","expected_revision":0}),
+                "publish"
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            call(
+                &state,
+                "GET",
+                "/internal/v1/plugin-runtime/history",
+                "invalid",
+                json!({}),
+                "history"
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
         );
     }
 

@@ -50,13 +50,16 @@ pub(in crate::api) async fn application_plugin_status(
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "plugins:read").await?;
     super::require_global_service(&service)?;
-    let authority = state
-        .application_plugins
-        .as_ref()
-        .ok_or(AppError::NotFound)?;
+    let status = match &state.application_plugins {
+        Some(authority) => authority.status().await?,
+        None => crate::plugin::application::ApplicationPluginStatus {
+            current: None,
+            candidates: Vec::new(),
+        },
+    };
     Ok((
         [(axum::http::header::CACHE_CONTROL, "private, no-store")],
-        Json(authority.status().await?),
+        Json(status),
     ))
 }
 
@@ -76,14 +79,11 @@ pub(super) async fn application_plugin_history(
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "plugins:read").await?;
     super::require_global_service(&service)?;
-    let authority = state
-        .application_plugins
-        .as_ref()
-        .ok_or(AppError::NotFound)?;
     Ok((
         [(axum::http::header::CACHE_CONTROL, "private, no-store")],
         Json(serde_json::json!({
-            "installation_enabled":authority.installation_enabled(),
+            "runtime_enabled":state.application_plugins.is_some(),
+            "installation_enabled":state.application_plugins.as_ref().is_some_and(|authority| authority.installation_enabled()),
             "revisions":state.db.application_plugin_history(query.before_revision).await?,
             "installations":state.db.plugin_installations().await?,
             "audit":state.db.plugin_audit(query.before_audit_id.as_deref()).await?,

@@ -12,7 +12,7 @@ interface Installation {
   failure_category: string | null; created_at: number; updated_at: number; completed_packages: number;
 }
 interface Audit { id: string; actor: string; action: string; inventory_id: string | null; revision: number | null; outcome: string; created_at: number }
-interface History { installation_enabled: boolean; installations: Installation[]; revisions: Revision[]; audit: Audit[] }
+interface History { runtime_enabled?: boolean; installation_enabled: boolean; installations: Installation[]; revisions: Revision[]; audit: Audit[] }
 
 const copy = {
   en: {
@@ -139,7 +139,7 @@ export function PluginRuntimeManager({ token, onPublished }: { token: string; on
     {error && <p className="notice error" role="alert">{error}</p>}
     {message && <p className="notice" role="status">{message}</p>}
     {unavailable ? <p className="muted">{text.unavailable}</p> : !status || !history ? <p>{text.loading}</p> : <>
-      <p>{text.current}: {status.current ? `${status.current.revision} · ${status.current.inventory_id}` : text.baseline}</p>
+      <p>{text.current}: {history.runtime_enabled === false ? text.unavailable : status.current ? `${status.current.revision} · ${status.current.inventory_id}` : text.baseline}</p>
       <p className="muted">{text.scope}</p>
       {!history.installation_enabled ? <p className="notice">{text.disabled}</p> : <form onSubmit={(event) => { event.preventDefault(); void mutate('/internal/v1/plugin-runtime/installations', { inventory_id: inventory.trim(), packages: packages.split('\n').map((line) => line.trim()).filter(Boolean) }); }}>
         <label>{text.inventory}<input required pattern="[A-Za-z0-9_-]{1,64}" value={inventory} onChange={(event) => setInventory(event.target.value)} disabled={busy} /></label>

@@ -16,7 +16,14 @@ installation API.
 
 Set `MTC_PLUGIN_INVENTORY_FILE` to an absolute inventory JSON path and
 `MTC_PLUGIN_INSTALL_POLICY_FILE` to an absolute host-owned policy path. Initialize
-the inventory as `{}` when there are no preinstalled candidates. A policy is:
+the inventory as `{}` when there are no preinstalled candidates.
+
+Without inventory configuration, authorized runtime-status reads return an empty
+status and history reports `runtime_enabled: false`, allowing the Plugins page to
+show disabled management without failed capability-probe requests. Write endpoints
+still reject requests when runtime authority is absent.
+
+A policy is:
 
 ```json
 {
