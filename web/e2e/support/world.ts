@@ -9,6 +9,7 @@ export class DogfoodWorld extends World {
   page?: Page;
   readonly consoleErrors: string[] = [];
   readonly failedRequests: string[] = [];
+  readonly serverErrorPaths: string[] = [];
 
   constructor(options: IWorldOptions) {
     super(options);
@@ -33,6 +34,12 @@ export class DogfoodWorld extends World {
       if (isExpectedResourceAbort(request.method(), request.url(), failure)) return;
       this.failedRequests.push(`${request.method()} ${request.url()}: ${failure}`);
     });
+    this.page.on('response', (response) => {
+      if (response.status() < 500) return;
+      // Keep CI diagnostics safe: a pathname carries neither query values,
+      // credentials, nor response content.
+      this.serverErrorPaths.push(new URL(response.url()).pathname);
+    });
   }
 
   requirePage(): Page {
@@ -55,6 +62,7 @@ export class DogfoodWorld extends World {
   }
 
   assertNoBrowserFailures(): void {
+    assert.deepEqual(this.serverErrorPaths, [], 'browser HTTP 5xx responses were observed');
     assert.deepEqual(this.consoleErrors, [], 'browser console or page errors were observed');
     assert.deepEqual(this.failedRequests, [], 'browser requests failed');
   }

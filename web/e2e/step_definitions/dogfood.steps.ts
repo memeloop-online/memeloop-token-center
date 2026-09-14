@@ -525,5 +525,8 @@ Then('页面呈现安全错误且不保留过期统计', async function (this: D
     message.includes('Failed to load resource') && message.includes('500 (Internal Server Error)'));
   assert.notEqual(expectedConsoleError, -1, 'the deliberately mocked HTTP 500 must be visible to the browser');
   this.consoleErrors.splice(expectedConsoleError, 1);
+  const expectedServerError = this.serverErrorPaths.indexOf('/internal/v1/usage-analysis');
+  assert.notEqual(expectedServerError, -1, 'the deliberately mocked HTTP 500 must retain its safe path diagnostic');
+  this.serverErrorPaths.splice(expectedServerError, 1);
   this.assertNoBrowserFailures();
 });

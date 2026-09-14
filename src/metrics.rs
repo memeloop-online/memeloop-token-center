@@ -172,6 +172,7 @@ impl UpstreamHealthEvent {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UpstreamHealthReason {
+    RecoveryWaitCapacity,
     RateLimited,
     Unavailable,
     InvalidResponse,
@@ -183,6 +184,7 @@ pub enum UpstreamHealthReason {
 impl UpstreamHealthReason {
     const fn label(self) -> &'static str {
         match self {
+            Self::RecoveryWaitCapacity => "recovery_wait_capacity",
             Self::RateLimited => "rate_limited",
             Self::Unavailable => "unavailable",
             Self::InvalidResponse => "invalid_response",
