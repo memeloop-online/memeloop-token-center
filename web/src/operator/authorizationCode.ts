@@ -5,6 +5,7 @@ export interface AuthorizationCodeSession {
   login_url: string;
   session_token: string;
   expires_at: number;
+  recovery_expires_at: number;
 }
 
 export function validAuthorizationCallback(value: string): boolean {

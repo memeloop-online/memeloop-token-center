@@ -29,6 +29,11 @@ test('host flow is catalog selected and has no replay, storage, or raw error dis
   assert.match(component, /saved\.current = true/);
   assert.match(component, /try \{ await onChanged\(\); \}/);
   assert.match(component, /copy\.savedButReadFailed/);
+  assert.match(component, /setRecoveryDeadline\(result\.recovery_expires_at\)/);
+  assert.match(component, /proxy_network_scope: 'private'/);
+  assert.match(component, /const callbackUrl = continueIssued \? '' : callback\.trim\(\)/);
+  assert.match(component, /Date\.now\(\) >= recoveryDeadline/);
+  assert.doesNotMatch(component, /proxy_network_scope: 'public'/);
   assert.doesNotMatch(component, /localStorage|sessionStorage|console\.|apiRead|setInterval|setTimeout|reason\.message/);
   assert.doesNotMatch(component, /google-antigravity|upstream_account_id|provider-adapter/);
 });

@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import RjsfForm from '@rjsf/core/lib/components/Form.js';
 import type { RJSFSchema } from '@rjsf/utils';
 import { api } from '../api';
-import { Button, Checkbox, Input, Select } from '../design-system';
+import { Button, Checkbox, Input } from '../design-system';
 import { localizeSchema, useI18n } from '../i18n';
 import { schemaFormTemplates } from '../SchemaTemplates';
 import { safeValidator } from '../safeValidator';
@@ -26,8 +26,8 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
   const [config, setConfig] = useState<Record<string, unknown>>({});
   const [useProxy, setUseProxy] = useState(false);
   const [proxy, setProxy] = useState('');
-  const [proxyScope, setProxyScope] = useState('public');
   const [session, setSession] = useState<AuthorizationCodeSession>();
+  const [recoveryDeadline, setRecoveryDeadline] = useState<number>();
   const [callback, setCallback] = useState('');
   const [busy, setBusy] = useState(false);
   const [submitted, setSubmitted] = useState(false);
@@ -48,19 +48,21 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
       const result = await api<AuthorizationCodeSession>('/internal/v1/oauth/authorization-code/start', token, {
         method: 'POST', cache: 'no-store', referrerPolicy: 'no-referrer',
         body: JSON.stringify({ tenant_external_id: tenant, account_name: name.trim(), provider_driver: provider.id,
-          provider_config: providerConfig, ...(useProxy ? { proxy_url: proxy.trim(), proxy_network_scope: proxyScope } : {}) }),
+          provider_config: providerConfig, ...(useProxy ? { proxy_url: proxy.trim(), proxy_network_scope: 'private' } : {}) }),
       });
       if (!live.current) return;
-      setSession(result); setProxy('');
+      setSession(result); setRecoveryDeadline(result.recovery_expires_at); setProxy('');
     } catch (reason) { if (live.current) setError(copy[authorizationStartError(reason)]); }
     finally { inFlight.current = false; if (live.current) setBusy(false); }
   }
 
-  async function complete() {
-    if (!session || inFlight.current || consumed.current) return;
-    if (!validAuthorizationCallback(callback)) { setError(copy.invalid); return; }
-    inFlight.current = true; consumed.current = true; setSubmitted(true); setBusy(true); setError('');
-    const callbackUrl = callback.trim(); setCallback('');
+  async function complete(continueIssued = false) {
+    if (!session || inFlight.current || (continueIssued ? !submitted : consumed.current)) return;
+    if (continueIssued && (recoveryDeadline === undefined || Date.now() >= recoveryDeadline)) { setError(copy.continueExpired); return; }
+    if (!continueIssued && !validAuthorizationCallback(callback)) { setError(copy.invalid); return; }
+    inFlight.current = true; consumed.current = true; setSubmitted(true); setBusy(true); setError(''); setNotice('');
+    // Explicit continuation can only complete already-issued server state. Never retain or replay a code.
+    const callbackUrl = continueIssued ? '' : callback.trim(); setCallback('');
     try {
       const result = await api<UpstreamAccount | { status: 'pending'; retry_after_seconds: number }>('/internal/v1/oauth/authorization-code/complete', token, {
         method: 'POST', cache: 'no-store', referrerPolicy: 'no-referrer',
@@ -74,7 +76,7 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
         catch { if (live.current) setError(copy.savedButReadFailed); }
       }
       else setNotice(copy.pending);
-    } catch { if (live.current) setError(copy.uncertain); }
+    } catch { if (live.current) setError(continueIssued ? copy.continueFailed : copy.uncertain); }
     finally { inFlight.current = false; if (live.current) setBusy(false); }
   }
 
@@ -82,10 +84,10 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
     {confirmationDialog}<p className="field-hint">{copy.help}</p>
     <p>{t('providers.provider')}: {provider.display_name} · {t('operator.tenant')}: {tenant}</p>
     <label>{t('providers.name')}<Input required maxLength={200} disabled={busy || Boolean(session) || submitted} value={name} onChange={event => setName(event.target.value)} /></label>
-    <p>{copy.network}: {useProxy ? `${copy.proxy} · ${proxyScope === 'private' ? copy.private : copy.public}` : copy.direct}</p>
+    <p>{copy.network}: {useProxy ? `${copy.proxy} · ${copy.private}` : copy.direct}</p>
     {!session && !submitted && <>
       <Checkbox label={copy.proxy} checked={useProxy} disabled={busy} onChange={(_, data) => setUseProxy(data.checked === true)} />
-      {useProxy && <><ProxyInput generic value={proxy} onChange={setProxy} disabled={busy} /><label>{copy.proxyScope}<Select value={proxyScope} disabled={busy} onChange={event => setProxyScope(event.target.value)}><option value="public">{copy.public}</option><option value="private">{copy.private}</option></Select></label></>}
+      {useProxy && <ProxyInput generic value={proxy} onChange={setProxy} disabled={busy} />}
       <h3>{copy.config}</h3>
       <RjsfForm schema={localizeSchema(provider.config_schema as RJSFSchema, locale)} formData={config} onChange={({ formData }) => setConfig(formData ?? {})} disabled={busy} validator={safeValidator} templates={schemaFormTemplates} widgets={fluentFormWidgets} onSubmit={({ formData }) => void start(formData ?? {})}>
         <Button appearance="primary" type="submit" disabled={!token || !tenant || !name.trim() || busy || (useProxy && !isGenericProxyUrlInput(proxy.trim()))}>{t(busy ? 'common.loading' : 'common.startLogin')}</Button>
@@ -98,7 +100,9 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
       <p className="field-hint">{copy.callbackHelp}</p>
       <Button appearance="primary" type="button" disabled={busy || !validAuthorizationCallback(callback)} onClick={() => void complete()}>{t('providers.completeAuthorization')}</Button>
     </>}
+    {recoveryDeadline !== undefined && <div className="field-hint"><p>{copy.recoveryExpires}: {new Date(recoveryDeadline).toLocaleString(locale)}</p>{!saved.current && <p>{copy.recoveryHint}</p>}</div>}
     {error && <p className="notice error" role="alert">{error}</p>}{notice && <p role="status">{notice}</p>}
+    {submitted && session && <><p className="field-hint">{copy.continueHelp}</p><Button type="button" appearance="secondary" disabled={busy} onClick={() => void complete(true)}>{copy.continueSetup}</Button></>}
     {submitted && <Button type="button" appearance="secondary" disabled={busy} onClick={async () => {
       if (inFlight.current) return;
       inFlight.current = true; setBusy(true); setError('');
@@ -108,7 +112,7 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
     }}>{copy.check}</Button>}
     <Button type="button" appearance="secondary" disabled={busy} onClick={async () => {
       if (!await confirm(copy.abandon) || !live.current) return;
-      setSession(undefined); setCallback(''); setProxy(''); setConfig({}); setSubmitted(false); consumed.current = false; saved.current = false; setError(''); setNotice('');
+      setSession(undefined); setRecoveryDeadline(undefined); setCallback(''); setProxy(''); setConfig({}); setSubmitted(false); consumed.current = false; saved.current = false; setError(''); setNotice('');
     }}>{copy.reset}</Button>
   </section>;
 }
