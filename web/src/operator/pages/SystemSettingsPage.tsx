@@ -79,6 +79,10 @@ export function SystemSettingsPage({ token, tenant }: { token: string; tenant: s
 
 function AssistantSettings({ token, tenant }: { token: string; tenant: string }) {
   const { t } = useI18n();
+  // Locale is presentation state, not the identity of these remote resources.
+  // Async completions still use the current locale without reloading drafts.
+  const translate = useRef(t);
+  translate.current = t;
   const [catalogItems, setCatalogItems] = useState<ModelPickerProjectionItem[]>([]);
   const [settings, setSettings] = useState<FilterAssistantSettings | null>();
   const [selectedRouteId, setSelectedRouteId] = useState('');
@@ -118,12 +122,12 @@ function AssistantSettings({ token, tenant }: { token: string; tenant: string })
       setSelectedBillingId(nextSettings?.billing_key_id ?? '');
     } catch (reason) {
       if (request !== loadSequence.current) return;
-      const nextError = messageOf(reason, t('common.requestFailed'));
+      const nextError = messageOf(reason, translate.current('common.requestFailed'));
       setLoadError(nextError);
     } finally {
       if (request === loadSequence.current) setLoading(false);
     }
-  }, [t, tenant, token]);
+  }, [tenant, token]);
 
   useEffect(() => {
     setSelectedRouteId('');
@@ -143,9 +147,9 @@ function AssistantSettings({ token, tenant }: { token: string; tenant: string })
       if (request !== billingSequence.current) return;
       setBillingChoices((current) => cursor ? [...current, ...page.data.filter((choice) => !current.some((previous) => previous.key_id === choice.key_id))] : page.data);
       setBillingCursor(page.next_cursor);
-    } catch (reason) { if (request === billingSequence.current) setBillingError(messageOf(reason, t('common.requestFailed'))); }
+    } catch (reason) { if (request === billingSequence.current) setBillingError(messageOf(reason, translate.current('common.requestFailed'))); }
     finally { if (request === billingSequence.current) setBillingLoading(false); }
-  }, [selectedRouteId, t, tenant, token]);
+  }, [selectedRouteId, tenant, token]);
 
   useEffect(() => { void loadBilling(); return () => { billingSequence.current += 1; }; }, [loadBilling]);
 
@@ -161,8 +165,8 @@ function AssistantSettings({ token, tenant }: { token: string; tenant: string })
       const next = await api<FilterAssistantSettings>('/internal/v1/filter-assistant/settings', token, {
         method: 'PUT', body: JSON.stringify({ tenant_external_id: tenant, model_route_id: selectedRouteId, billing_key_id: selectedBillingId, expected_updated_at: settings?.updated_at ?? null }),
       });
-      if (current()) { setSettings(next); setMessage(t('settings.filterAssistantSaved')); }
-    } catch (reason) { if (current()) setError(messageOf(reason, t('common.requestFailed'))); }
+      if (current()) { setSettings(next); setMessage(translate.current('settings.filterAssistantSaved')); }
+    } catch (reason) { if (current()) setError(messageOf(reason, translate.current('common.requestFailed'))); }
     finally { if (savingRequest.current === operation) savingRequest.current = null; if (current()) setSaving(false); }
   };
 

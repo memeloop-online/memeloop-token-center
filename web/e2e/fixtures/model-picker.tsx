@@ -1,6 +1,6 @@
 import { createRoot } from 'react-dom/client';
 import { useState } from 'react';
-import { I18nProvider } from '../../src/i18n';
+import { I18nProvider, useI18n } from '../../src/i18n';
 import { MtcFluentProvider } from '../../src/design-system/MtcFluentProvider';
 import { TypedFilterBuilder } from '../../src/operator/TypedFilterBuilder';
 import { SystemSettingsPage } from '../../src/operator/pages/SystemSettingsPage';
@@ -57,7 +57,7 @@ const projection = {
     { selection: { kind: 'route', route_id: 'route-custom' }, value: 'route-custom', label: 'friendly-custom-chat', sources: [source({ routeId: 'route-custom', accountId: 'a', accountLabel: 'Research account', providerId: 'provider-a', providerLabel: 'provider-a', status: 'never_observed', listed: false, upstreamModel: 'friendly-custom-chat' })] },
   ],
 };
-const control = { delaySave: false, delayBilling: false, pendingBilling: '', failBilling: false, writes: 0, releaseSave: () => {}, releaseBilling: () => {} };
+const control = { delaySave: false, delayBilling: false, pendingBilling: '', failBilling: false, writes: 0, settingsReads: 0, billingReads: 0, releaseSave: () => {}, releaseBilling: () => {} };
 Object.assign(window, { settingsFixture: control });
 globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url, location.origin);
@@ -68,11 +68,13 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     return Response.json({ ...JSON.parse(String(init.body)), updated_at: 99 });
   }
   if (url.pathname.endsWith('/billing-choices')) {
+    control.billingReads += 1;
     const route = url.searchParams.get('model_route_id');
     if (control.delayBilling) await new Promise<void>((resolve) => { control.pendingBilling = route ?? ''; control.releaseBilling = resolve; });
     if (control.failBilling) return Response.json({ error: { message: 'Billing unavailable' } }, { status: 503 });
     return Response.json({ data: [{ key_id: `key-${route}`, alias: `Budget ${route}`, principal: 'Research team' }], next_cursor: null });
   }
+  if (url.pathname.endsWith('/filter-assistant/settings')) control.settingsReads += 1;
   const values: Record<string, unknown> = {
     '/internal/v1/upstreams': accounts,
     '/internal/v1/model-routes': routes,
@@ -84,6 +86,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   return new Response(JSON.stringify(values[url.pathname] ?? {}), { status: Object.hasOwn(values, url.pathname) ? 200 : 404, headers: { 'Content-Type': 'application/json' } });
 };
 function Fixture() {
+  const { locale, setLocale } = useI18n();
   const [ast, setAst] = useState<TypedFilterAst>({ logical_operator: 'and', conditions: [] });
   const [outside, setOutside] = useState(0);
   const [tenant, setTenant] = useState('tenant');
@@ -92,6 +95,7 @@ function Fixture() {
     <TypedFilterBuilder ast={ast} onApply={setAst} onClear={() => setAst({ logical_operator: 'and', conditions: [] })} token="fixture" tenant="tenant" scope="requests" upstreams={accounts} />
     <output data-filter-model>{ast.conditions.find((condition) => condition.field === 'model')?.value.value}</output>
     <button data-switch-scope type="button" onClick={() => setTenant('other')}>Switch scope</button>
+    <button data-switch-locale type="button" onClick={() => setLocale(locale === 'en' ? 'zh-CN' : 'en')}>Switch language</button>
     <SystemSettingsPage token="fixture" tenant={tenant} />
   </main>;
 }
