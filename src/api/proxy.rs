@@ -587,12 +587,17 @@ async fn finish_non_sse_proxy_response(
     }
     let usage = if capture_json_usage {
         match extract_usage_checked(&response_body) {
-            ExtractedUsage::Valid(usage) => usage,
-            ExtractedUsage::Missing => TokenUsage {
-                input_tokens: input_token_ceiling,
-                output_tokens: output_token_ceiling,
-                ..TokenUsage::default()
-            },
+            ExtractedUsage::Valid(usage) => {
+                (usage, crate::model::RequestUsageBasis::ProviderReported)
+            }
+            ExtractedUsage::Missing => (
+                TokenUsage {
+                    input_tokens: input_token_ceiling,
+                    output_tokens: output_token_ceiling,
+                    ..TokenUsage::default()
+                },
+                crate::model::RequestUsageBasis::ContractCeiling,
+            ),
             ExtractedUsage::Invalid => {
                 let result = finish_proxy_failure(buffered_request, "upstream_invalid_usage").await;
                 upstream_attempt
@@ -602,11 +607,14 @@ async fn finish_non_sse_proxy_response(
             }
         }
     } else {
-        TokenUsage {
-            input_tokens: input_token_ceiling,
-            output_tokens: output_token_ceiling,
-            ..TokenUsage::default()
-        }
+        (
+            TokenUsage {
+                input_tokens: input_token_ceiling,
+                output_tokens: output_token_ceiling,
+                ..TokenUsage::default()
+            },
+            crate::model::RequestUsageBasis::ContractCeiling,
+        )
     };
     let result = finish_buffered_request(
         buffered_request,
@@ -1051,7 +1059,10 @@ pub(in crate::api) async fn proxy_with_identity(
                 b"{\"error\":{\"message\":\"gateway memory capacity unavailable\"}}",
             ),
             "application/json",
-            TokenUsage::default(),
+            (
+                TokenUsage::default(),
+                crate::model::RequestUsageBasis::NotObserved,
+            ),
             Some("proxy_memory_capacity".to_owned()),
         )
         .await?;
@@ -1321,7 +1332,10 @@ pub(in crate::api) async fn proxy_with_identity(
                         b"{\"error\":{\"message\":\"upstream rejected the request\",\"type\":\"upstream_error\"}}",
                     ),
                     "application/json",
-                    TokenUsage::default(),
+                    (
+                        TokenUsage::default(),
+                        crate::model::RequestUsageBasis::NotObserved,
+                    ),
                     Some("http_400".to_owned()),
                 )
                 .await;
@@ -1369,7 +1383,10 @@ pub(in crate::api) async fn proxy_with_identity(
                 b"{\"error\":{\"message\":\"upstream rejected the request\",\"type\":\"upstream_error\"}}",
             ),
             "application/json",
-            TokenUsage::default(),
+            (
+                TokenUsage::default(),
+                crate::model::RequestUsageBasis::NotObserved,
+            ),
             Some(format!("http_{}", status.as_u16())),
         )
         .await;
@@ -1428,7 +1445,10 @@ pub(in crate::api) async fn proxy_with_identity(
             StatusCode::OK,
             buffered.body,
             "application/json",
-            buffered.usage,
+            (
+                buffered.usage,
+                crate::model::RequestUsageBasis::ProviderReported,
+            ),
             None,
         )
         .await;
@@ -1713,7 +1733,10 @@ async fn execute_component_provider(
                 b"{\"error\":{\"message\":\"component provider rejected the request\"}}",
             ),
             "application/json",
-            TokenUsage::default(),
+            (
+                TokenUsage::default(),
+                crate::model::RequestUsageBasis::NotObserved,
+            ),
             Some(format!("http_{}", upstream_status.as_u16())),
         )
         .await;
@@ -1826,7 +1849,10 @@ async fn execute_component_provider(
                 b"{\"error\":{\"message\":\"component provider rejected the request\"}}",
             ),
             "application/json",
-            TokenUsage::default(),
+            (
+                TokenUsage::default(),
+                crate::model::RequestUsageBasis::NotObserved,
+            ),
             Some(format!("http_{}", status.as_u16())),
         )
         .await;
@@ -1850,13 +1876,23 @@ async fn execute_component_provider(
         tracing::debug!(request_id = %request.request_id, stage = "component_usage", "component provider reported estimated usage");
     }
     let usage = if status.is_success() {
-        TokenUsage {
-            input_tokens: input_tokens.unwrap_or_default(),
-            output_tokens: output_tokens.unwrap_or_default(),
-            ..TokenUsage::default()
-        }
+        (
+            TokenUsage {
+                input_tokens: input_tokens.unwrap_or_default(),
+                output_tokens: output_tokens.unwrap_or_default(),
+                ..TokenUsage::default()
+            },
+            if normalized.estimated {
+                crate::model::RequestUsageBasis::ProviderEstimated
+            } else {
+                crate::model::RequestUsageBasis::ProviderReported
+            },
+        )
     } else {
-        TokenUsage::default()
+        (
+            TokenUsage::default(),
+            crate::model::RequestUsageBasis::NotObserved,
+        )
     };
     let content_type = normalized
         .headers
@@ -1901,7 +1937,10 @@ async fn finish_component_provider_failure(
         StatusCode::BAD_GATEWAY,
         Bytes::from_static(b"{\"error\":{\"message\":\"component provider request failed\"}}"),
         "application/json",
-        TokenUsage::default(),
+        (
+            TokenUsage::default(),
+            crate::model::RequestUsageBasis::NotObserved,
+        ),
         Some(error_code.to_owned()),
     )
     .await
@@ -1925,7 +1964,10 @@ async fn finish_proxy_failure(
             b"{\"error\":{\"message\":\"upstream request failed\",\"type\":\"upstream_error\"}}",
         ),
         "application/json",
-        TokenUsage::default(),
+        (
+            TokenUsage::default(),
+            crate::model::RequestUsageBasis::NotObserved,
+        ),
         Some(error_code.to_owned()),
     )
     .await
@@ -1936,7 +1978,7 @@ async fn finish_buffered_request(
     status: StatusCode,
     body: Bytes,
     content_type: &str,
-    usage: TokenUsage,
+    usage: (TokenUsage, crate::model::RequestUsageBasis),
     error_code: Option<String>,
 ) -> Result<Response, AppError> {
     finish_buffered_request_with_upstream_attribution(
@@ -1956,11 +1998,12 @@ async fn finish_buffered_request_with_upstream_attribution(
     mut status: StatusCode,
     mut body: Bytes,
     content_type: &str,
-    usage: TokenUsage,
+    usage: (TokenUsage, crate::model::RequestUsageBasis),
     mut error_code: Option<String>,
     upstream_attribution: ProxyRequestUpstreamAttribution,
 ) -> Result<Response, AppError> {
     let request_id = request.request_id;
+    let (usage, mut usage_basis) = usage;
     let usage = match crate::db::normalize_proxy_usage(
         &usage,
         request.input_token_ceiling,
@@ -1974,6 +2017,7 @@ async fn finish_buffered_request_with_upstream_attribution(
                 b"{\"error\":{\"message\":\"upstream returned invalid usage\",\"type\":\"upstream_error\"}}",
             );
             error_code = Some("upstream_invalid_usage".to_owned());
+            usage_basis = crate::model::RequestUsageBasis::NotObserved;
             TokenUsage::default()
         }
         Err(error) => return Err(error),
@@ -2037,6 +2081,7 @@ async fn finish_buffered_request_with_upstream_attribution(
         status_code: i64::from(status.as_u16()),
         duration_ms: request.started.elapsed().as_millis() as i64,
         usage,
+        usage_basis: Some(usage_basis),
         charge_contract_ceiling: false,
         error_code: error_code.as_deref(),
         response_object: &stored_response,

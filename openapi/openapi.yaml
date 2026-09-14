@@ -7522,6 +7522,7 @@ components:
       enum: [text, generation]
     AccountSettlement:
       type: object
+      description: Local ledger settlements, not supplier invoices. Token provenance is unknown for historical rows without usage_basis; contract ceilings are not measured token consumption.
       additionalProperties: false
       required: [settlement_id, settlement_sequence, request_id, kind, account_id, key_id, model, cost, currency, settled_at, completed_at, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens]
       properties:
@@ -7540,6 +7541,10 @@ components:
         cached_input_tokens: { type: [integer, 'null'], format: int64 }
         cache_write_tokens: { type: [integer, 'null'], format: int64 }
         output_tokens: { type: [integer, 'null'], format: int64 }
+        usage_basis:
+          type: [string, 'null']
+          enum: [provider_reported, provider_estimated, contract_ceiling, not_observed, null]
+          description: Text-token provenance; null means historical or non-text provenance is unknown.
     AccountSettlementCursor:
       type: object
       additionalProperties: false
@@ -7764,6 +7769,10 @@ components:
       type: object
       required: [request_id, created_at, completed_at, source_completed_at, lifecycle_state, protocol, model, upstream_account_id, route_id, status_code, duration_ms, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, cost, currency, usage, billing, error_code, archive_state, credential_identity, session_context]
       properties:
+        usage_basis:
+          type: [string, 'null']
+          enum: [provider_reported, provider_estimated, contract_ceiling, not_observed, null]
+          description: Provenance of recorded token quantities. Contract ceiling is a conservative accounting bound, never observed generation throughput; null/absence is unknown historical provenance. Cost remains the amount settled in the local ledger, not a claim about the provider invoice.
         compaction:
           type: [boolean, 'null']
           enum: [true, null]
@@ -8295,6 +8304,7 @@ components:
           items: { $ref: '#/components/schemas/MonitoringUpstreamModel' }
     UsageAnalysisCost:
       type: object
+      description: Aggregated locally recorded settlement amounts, which can include conservative contract-ceiling charges; not a measurement of supplier cost or an invoice. Historical usage provenance is unknown.
       additionalProperties: false
       required: [currency, cost]
       properties:

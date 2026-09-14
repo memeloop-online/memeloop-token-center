@@ -387,6 +387,7 @@ async fn metered_usage_projection_is_exactly_once_and_skips_prepaid_hot_rows() {
     };
     database
         .finish_proxy_request(FinishProxyRequest {
+            usage_basis: None,
             first_output_ms: None,
             generation_duration_ms: None,
             request_id,

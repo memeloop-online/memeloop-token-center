@@ -39,7 +39,7 @@ impl Database {
             limit.saturating_add(1)
         };
         let rows = sqlx::query(
-            "SELECT settlement_id, settlement_sequence, request_id, request_kind, account_id, key_id, model, cost_micros, currency, settled_at, completed_at, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens FROM account_settlement_feed WHERE account_id = $1 AND (settlement_sequence > $2 OR (settlement_sequence = $2 AND settlement_id > $3)) AND ($4 = '' OR (request_kind = $4 AND request_id = $5)) ORDER BY settlement_sequence ASC, settlement_id ASC LIMIT $6",
+            "SELECT settlement_id, settlement_sequence, request_id, request_kind, account_id, key_id, model, cost_micros, currency, settled_at, completed_at, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, usage_basis FROM account_settlement_feed WHERE account_id = $1 AND (settlement_sequence > $2 OR (settlement_sequence = $2 AND settlement_id > $3)) AND ($4 = '' OR (request_kind = $4 AND request_id = $5)) ORDER BY settlement_sequence ASC, settlement_id ASC LIMIT $6",
         )
         .bind(account_id.to_string())
         .bind(after_sequence)
@@ -83,7 +83,7 @@ pub(crate) async fn publish_text_settlement_in_transaction(
     request_id: Uuid,
 ) -> Result<bool, AppError> {
     let row = sqlx::query(
-        "SELECT r.id AS request_id, 'text' AS request_kind, u.account_id, r.key_id, r.model, r.cost_micros, r.completed_at, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, u.enforcement_mode, l.id AS settlement_id, l.amount_micros, l.currency, l.created_at AS settled_at FROM request_records r JOIN usage_reservations u ON u.id = r.reservation_id LEFT JOIN ledger_entries l ON l.account_id = u.account_id AND l.key_id = u.key_id AND l.kind = 'usage' AND l.source = u.id WHERE r.id = $1 AND r.completed_at IS NOT NULL",
+        "SELECT r.id AS request_id, 'text' AS request_kind, u.account_id, r.key_id, r.model, r.cost_micros, r.completed_at, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.usage_basis, u.enforcement_mode, l.id AS settlement_id, l.amount_micros, l.currency, l.created_at AS settled_at FROM request_records r JOIN usage_reservations u ON u.id = r.reservation_id LEFT JOIN ledger_entries l ON l.account_id = u.account_id AND l.key_id = u.key_id AND l.kind = 'usage' AND l.source = u.id WHERE r.id = $1 AND r.completed_at IS NOT NULL",
     )
     .bind(request_id.to_string())
     .fetch_optional(&mut **tx)
@@ -96,7 +96,7 @@ pub(crate) async fn publish_generation_settlement_in_transaction(
     request_id: Uuid,
 ) -> Result<bool, AppError> {
     let row = sqlx::query(
-        "SELECT g.id AS request_id, 'generation' AS request_kind, u.account_id, g.key_id, g.public_model AS model, g.cost_micros, g.completed_at, CAST(NULL AS BIGINT) AS input_tokens, CAST(NULL AS BIGINT) AS cached_input_tokens, CAST(NULL AS BIGINT) AS cache_write_tokens, CAST(NULL AS BIGINT) AS output_tokens, u.enforcement_mode, l.id AS settlement_id, l.amount_micros, l.currency, l.created_at AS settled_at FROM generation_jobs g JOIN usage_reservations u ON u.id = g.reservation_id LEFT JOIN ledger_entries l ON l.account_id = u.account_id AND l.key_id = u.key_id AND l.kind = 'usage' AND l.source = u.id WHERE g.id = $1 AND g.completed_at IS NOT NULL",
+        "SELECT g.id AS request_id, 'generation' AS request_kind, u.account_id, g.key_id, g.public_model AS model, g.cost_micros, g.completed_at, CAST(NULL AS BIGINT) AS input_tokens, CAST(NULL AS BIGINT) AS cached_input_tokens, CAST(NULL AS BIGINT) AS cache_write_tokens, CAST(NULL AS BIGINT) AS output_tokens, CAST(NULL AS TEXT) AS usage_basis, u.enforcement_mode, l.id AS settlement_id, l.amount_micros, l.currency, l.created_at AS settled_at FROM generation_jobs g JOIN usage_reservations u ON u.id = g.reservation_id LEFT JOIN ledger_entries l ON l.account_id = u.account_id AND l.key_id = u.key_id AND l.kind = 'usage' AND l.source = u.id WHERE g.id = $1 AND g.completed_at IS NOT NULL",
     )
     .bind(request_id.to_string())
     .fetch_optional(&mut **tx)
@@ -159,7 +159,7 @@ async fn publish_settlement_row(
     .fetch_one(&mut **tx)
     .await?;
     let inserted = sqlx::query(
-        "INSERT INTO account_settlement_feed (settlement_id, account_id, settlement_sequence, request_id, request_kind, key_id, model, cost_micros, currency, settled_at, completed_at, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+        "INSERT INTO account_settlement_feed (settlement_id, account_id, settlement_sequence, request_id, request_kind, key_id, model, cost_micros, currency, settled_at, completed_at, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, usage_basis) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
     )
     .bind(settlement_id)
     .bind(account_id)
@@ -182,6 +182,7 @@ async fn publish_settlement_row(
     .bind(row.try_get::<Option<i64>, _>("cached_input_tokens")?)
     .bind(row.try_get::<Option<i64>, _>("cache_write_tokens")?)
     .bind(row.try_get::<Option<i64>, _>("output_tokens")?)
+    .bind(row.try_get::<Option<String>, _>("usage_basis")?)
     .execute(&mut **tx)
     .await?;
     if inserted.rows_affected() != 1 {
@@ -216,5 +217,9 @@ fn account_settlement_from_row(row: &AnyRow) -> Result<AccountSettlementView, Ap
         cached_input_tokens: row.try_get("cached_input_tokens")?,
         cache_write_tokens: row.try_get("cache_write_tokens")?,
         output_tokens: row.try_get("output_tokens")?,
+        usage_basis: row
+            .try_get::<Option<String>, _>("usage_basis")?
+            .map(|value| RequestUsageBasis::from_storage(&value).ok_or(AppError::Internal))
+            .transpose()?,
     })
 }

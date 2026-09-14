@@ -131,9 +131,23 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
         ..TokenUsage::default()
     };
     let mut charge_contract_ceiling = delivered_billable && error_code.is_some();
+    let mut usage_basis = crate::model::RequestUsageBasis::NotObserved;
+    // A downstream loss after the complete terminal was captured must not
+    // erase trustworthy provider usage. Incomplete/error frames are not proof;
+    // neither is an arbitrary buffered fragment. Keep the cancellation status.
+    let completed_usage = sse_summary.as_ref().filter(|summary| {
+        matches!(summary.outcome, ResponsesSseOutcome::Completed { .. })
+            && !summary.usage_invalid
+    }).and_then(|summary| summary.usage.clone());
     let mut usage = if error_code.is_some() {
         if delivered_billable {
-            full_contract_usage()
+            if let Some(usage) = completed_usage {
+                charge_contract_ceiling = false;
+                usage_basis = crate::model::RequestUsageBasis::ProviderReported;
+                usage
+            } else {
+                full_contract_usage()
+            }
         } else {
             TokenUsage::default()
         }
@@ -153,7 +167,10 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
             None => extract_usage_checked(&usage_capture),
         };
         match extracted_usage {
-            ExtractedUsage::Valid(usage) => usage,
+            ExtractedUsage::Valid(usage) => {
+                usage_basis = crate::model::RequestUsageBasis::ProviderReported;
+                usage
+            }
             ExtractedUsage::Missing => {
                 charge_contract_ceiling = delivered_billable;
                 if delivered_billable {
@@ -182,6 +199,7 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
     ) {
         Ok(normalized) => usage = normalized,
         Err(AppError::Upstream(_)) => {
+            usage_basis = crate::model::RequestUsageBasis::NotObserved;
             terminal_status = 502;
             error_code = Some("upstream_invalid_usage");
             charge_contract_ceiling = delivered_billable;
@@ -192,6 +210,7 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
             };
         }
         Err(_) => {
+            usage_basis = crate::model::RequestUsageBasis::NotObserved;
             terminal_status = 502;
             error_code = Some("upstream_invalid_usage");
             charge_contract_ceiling = delivered_billable;
@@ -201,6 +220,9 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
                 TokenUsage::default()
             };
         }
+    }
+    if charge_contract_ceiling {
+        usage_basis = crate::model::RequestUsageBasis::ContractCeiling;
     }
     let response_id =
         if (200..400).contains(&terminal_status) && matches!(protocol, Protocol::OpenAiResponses) {
@@ -253,6 +275,7 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
     let terminal_result = finish_proxy_request_with_archive_fallback(
         &state.db,
         FinishProxyRequest {
+            usage_basis: Some(usage_basis),
             first_output_ms,
             generation_duration_ms,
             request_id,

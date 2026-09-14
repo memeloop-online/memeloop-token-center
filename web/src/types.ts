@@ -1,4 +1,6 @@
 export interface RequestView {
+  /** Recorded token provenance; null/absence is historical unknown, not provider actual. */
+  usage_basis?: 'provider_reported' | 'provider_estimated' | 'contract_ceiling' | 'not_observed' | null;
   /** Explicit client context-compaction evidence only; absent/null is unknown. */
   compaction?: true | null;
   first_output_ms?: number | null;
@@ -103,6 +105,7 @@ export type RequestEventKind = 'started' | 'finished' | 'projected' | 'archive_b
 export type RequestArchiveState = 'capturing' | 'pending' | 'uploading' | 'bound' | 'gap';
 
 export interface RequestEvent {
+  usage_basis?: RequestView['usage_basis'];
   compaction?: true | null;
   first_output_ms?: number | null;
   generation_duration_ms?: number | null;
