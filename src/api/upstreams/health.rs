@@ -12,6 +12,15 @@ fn health_probe_error(driver: &str, status: StatusCode) -> Option<&'static str> 
     }
 }
 
+fn health_probe_transport_error(proxy_configured: bool, preparing: bool) -> &'static str {
+    match (proxy_configured, preparing) {
+        (true, true) => "proxy_destination_invalid",
+        (true, false) => "proxy_connection_failed",
+        (false, true) => "destination_invalid",
+        (false, false) => "connection_failed",
+    }
+}
+
 fn upstream_health_probe_url(driver: &str, config: &Value, base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
     match driver {
@@ -79,26 +88,52 @@ pub(in crate::api) async fn probe_upstream_health(
         })));
     }
     let checked_at = unix_millis();
-    if let Some((failure, retry_at)) = state
+    match state
         .db
         .upstream_manual_health_suppression(account_id, account.credential_generation, checked_at)
-        .await?
+        .await
     {
-        let error_code = match failure.as_str() {
-            "quota_exhausted" => "quota_exhausted",
-            "rate_limited" => "rate_limited",
-            _ => "upstream_unavailable",
-        };
-        return Ok(Json(json!({
-            "account_id": account_id,
-            "status": "unhealthy",
-            "error_code": error_code,
-            "retry_at": retry_at,
-            "source": "routing_state",
-            "checked_at": checked_at
-        })));
+        Ok(Some((failure, retry_at))) => {
+            let error_code = match failure.as_str() {
+                "quota_exhausted" => "quota_exhausted",
+                "rate_limited" => "rate_limited",
+                _ => "upstream_unavailable",
+            };
+            return Ok(Json(json!({
+                "account_id": account_id,
+                "status": "unhealthy",
+                "error_code": error_code,
+                "retry_at": retry_at,
+                "source": "routing_state",
+                "checked_at": checked_at
+            })));
+        }
+        Ok(None) => {}
+        Err(_) => {
+            // Do not send a probe when the current-generation routing state
+            // cannot be read: it may be suppressing traffic after a quota or
+            // capacity failure. The response is deliberately detail-free.
+            return Ok(Json(json!({
+                "account_id": account_id,
+                "status": "unhealthy",
+                "error_code": "health_state_unavailable",
+                "source": "local_state",
+                "checked_at": checked_at
+            })));
+        }
     }
-    let base_url = validate_config(&account.config)?;
+    let proxy_configured = credential.proxy().is_some();
+    let base_url = match validate_config(&account.config) {
+        Ok(base_url) => base_url,
+        Err(_) => {
+            return Ok(Json(json!({
+                "account_id": account_id,
+                "status": "unhealthy",
+                "error_code": "destination_invalid",
+                "checked_at": unix_millis()
+            })));
+        }
+    };
     let outbound = match if account.driver == "openai-codex" {
         network::client_for_codex_url(
             &state.http,
@@ -123,7 +158,7 @@ pub(in crate::api) async fn probe_upstream_health(
             return Ok(Json(json!({
                 "account_id": account_id,
                 "status": "unhealthy",
-                "error_code": "destination_invalid",
+                "error_code": health_probe_transport_error(proxy_configured, true),
                 "checked_at": unix_millis()
             })));
         }
@@ -189,7 +224,7 @@ pub(in crate::api) async fn probe_upstream_health(
         Err(_) => Ok(Json(json!({
             "account_id": account_id,
             "status": "unhealthy",
-            "error_code": "connection_failed",
+            "error_code": health_probe_transport_error(proxy_configured, false),
             "latency_ms": latency_ms,
             "checked_at": checked_at
         }))),
@@ -200,7 +235,15 @@ pub(in crate::api) async fn probe_upstream_health(
 mod tests {
     use serde_json::json;
 
-    use super::upstream_health_probe_url;
+    use super::{health_probe_transport_error, upstream_health_probe_url};
+
+    #[test]
+    fn probe_transport_errors_keep_proxy_and_direct_paths_distinct() {
+        assert_eq!(health_probe_transport_error(false, true), "destination_invalid");
+        assert_eq!(health_probe_transport_error(false, false), "connection_failed");
+        assert_eq!(health_probe_transport_error(true, true), "proxy_destination_invalid");
+        assert_eq!(health_probe_transport_error(true, false), "proxy_connection_failed");
+    }
 
     #[test]
     fn probe_rejections_are_not_reported_as_healthy() {
