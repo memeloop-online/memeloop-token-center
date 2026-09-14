@@ -296,6 +296,7 @@ async fn gateway_same_wasm_probe_cannot_resurrect_hard_quota() {
 #[tokio::test]
 async fn gateway_wasm_observe_sets_transient_cooldown_without_replaying_503() {
     let upstream = MockServer::start().await;
+    let standby = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(
@@ -306,7 +307,16 @@ async fn gateway_wasm_observe_sets_transient_cooldown_without_replaying_503() {
         .mount(&upstream)
         .await;
     let label = "group-observe-failure";
-    let mut fixture = resilient_route_fixture(label, &[(upstream.uri(), 0)]).await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices":[{"message":{"role":"assistant","content":"must not replay"}}],
+            "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+        })))
+        .expect(0)
+        .mount(&standby)
+        .await;
+    let mut fixture =
+        resilient_route_fixture(label, &[(upstream.uri(), 100), (standby.uri(), 0)]).await;
     let (tenant, generation) = install_strategy(&mut fixture, label, 12345).await;
     fixture
         .state
@@ -325,6 +335,10 @@ async fn gateway_wasm_observe_sets_transient_cooldown_without_replaying_503() {
         upstream.received_requests().await.unwrap().len(),
         1,
         "503 must never replay"
+    );
+    assert!(
+        standby.received_requests().await.unwrap().is_empty(),
+        "a confirmed POST response must not replay on the remaining authorized candidate"
     );
     let observed = health(&fixture, tenant, generation).await;
     assert_eq!(observed.last_failure_kind, "unavailable");

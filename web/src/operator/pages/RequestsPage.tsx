@@ -32,7 +32,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   const [filters, setFilters] = useState<TypedFilterAst>(emptyTypedFilterAst);
   const [loading, setLoading] = useState(false);
   const [hasOlder, setHasOlder] = useState(false);
-  const [detail, setDetail] = useState<RequestDetail>();
+  const [detailResult, setDetail] = useState<{ value: RequestDetail; token: string; tenant: string; requestId: string }>();
   const [error, setError] = useState('');
   const [upstreamError, setUpstreamError] = useState('');
   const [olderFilteredResultsStale, setOlderFilteredResultsStale] = useState(false);
@@ -54,6 +54,12 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   const upstreamSequence = useRef(0);
   const detailSequence = useRef(0);
   const detailAbort = useRef<AbortController | null>(null);
+  const selectedRequestId = useRef<string | undefined>(undefined);
+  const refreshedTerminalEvent = useRef<string | undefined>(undefined);
+  // Gate during render: effects must not expose a previous credential/tenant's
+  // detail for even the first commit after a scope change.
+  const detail = detailResult?.token === token && detailResult.tenant === tenant
+    && detailResult.requestId === selectedRequestId.current ? detailResult.value : undefined;
   // The initial snapshot and the live stream resolve independently. Keep the
   // latest event map available to an in-flight snapshot so an event received
   // before the snapshot completes cannot be overwritten by that stale result.
@@ -161,7 +167,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
     if (!older) {
       olderFilteredResultsVisible.current = false;
       setOlderFilteredResultsStale(false);
-      setRequests([]); setHasOlder(false); setDetail(undefined);
+      setRequests([]); setHasOlder(false); closeRequestDetail();
     }
     loadingRef.current = true;
     errorSource.current = undefined;
@@ -211,6 +217,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   }, [tenant, token]);
 
   useEffect(() => {
+    selectedRequestId.current = undefined; refreshedTerminalEvent.current = undefined;
     detailSequence.current += 1; detailAbort.current?.abort(); detailAbort.current = null; setDetail(undefined);
     return () => { detailSequence.current += 1; detailAbort.current?.abort(); };
   }, [tenant, token]);
@@ -233,13 +240,15 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   }, [loading]);
 
   async function openRequestDetail(requestId: string) {
+    if (selectedRequestId.current !== requestId) setDetail(undefined);
+    selectedRequestId.current = requestId;
     const requestSequence = ++detailSequence.current;
     detailAbort.current?.abort(); const controller = new AbortController(); detailAbort.current = controller;
     try {
       errorSource.current = undefined;
       setError('');
       const next = await api<RequestDetail>(`/internal/v1/requests/${requestId}${queryForTenant(tenant)}`, token, { signal: controller.signal });
-      if (requestSequence === detailSequence.current) setDetail(next);
+      if (requestSequence === detailSequence.current && selectedRequestId.current === requestId && !controller.signal.aborted) setDetail({ value: next, token, tenant, requestId });
     } catch (reason) {
       if (requestSequence === detailSequence.current && !controller.signal.aborted) {
         errorSource.current = 'detail';
@@ -249,8 +258,25 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   }
 
   async function selectRequest(request: RequestView) {
+    setDetail(undefined);
     await openRequestDetail(request.request_id);
   }
+
+  function closeRequestDetail() {
+    selectedRequestId.current = undefined;
+    detailSequence.current += 1;
+    detailAbort.current?.abort(); detailAbort.current = null;
+    setDetail(undefined);
+  }
+
+  useEffect(() => {
+    const requestId = selectedRequestId.current;
+    if (!requestId) return;
+    const event = liveEvents.get(requestId);
+    if (event?.event_kind !== 'finished' || event.event_id === refreshedTerminalEvent.current) return;
+    refreshedTerminalEvent.current = event.event_id;
+    void openRequestDetail(requestId);
+  }, [streamRevision]);
 
   useEffect(() => {
     if (!requestFocus) return;
@@ -275,7 +301,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
       onApply={(next) => { setFilters(next); scope.current = { token, tenant, filters: next }; void load(next); }}
       onClear={() => { setFilters(emptyTypedFilterAst); scope.current = { token, tenant, filters: emptyTypedFilterAst }; void load(emptyTypedFilterAst); }}
       onLoadOlder={() => void load(filters, true)} onRefreshFilteredResults={() => void load(filters)} onSelect={selectRequest} onOpenSessions={onOpenSessions} onOpenSession={onOpenSession} />
-    {detail && <RequestDrawer detail={detail} upstreamName={upstreams.find((account) => account.id === detail.upstream_account_id)?.name} onOpenSession={onOpenSession} onClose={() => setDetail(undefined)} />}
+    {detail && <RequestDrawer detail={detail} upstreamName={upstreams.find((account) => account.id === detail.upstream_account_id)?.name} onOpenSession={onOpenSession} onClose={closeRequestDetail} />}
   </>;
 }
 
@@ -300,7 +326,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   const { locale, t } = useI18n();
   const summary = summarizeVisibleRequests(requests);
   const averageDuration = formatDurationDisplay(summary.averageDurationMs, locale);
-  return <article className="panel"><div className="panel-title traffic-heading"><div><h2>{typedFiltersActive(filters) ? t('traffic.filtered') : t('traffic.live')}</h2><span>{typedFiltersActive(filters) ? t('traffic.filteredHint') : t('traffic.liveHint')}</span></div><div className="traffic-heading-actions"><div className={`request-live-state session-live-state ${streamState}`} role="status">{t(`sessions.live.${streamState}`)}</div><div className="segmented" role="group" aria-label={t('sessions.monitorMode')}><button type="button" className="active" aria-pressed="true">{t('sessions.requestsMode')}</button><button type="button" aria-pressed="false" onClick={onOpenSessions}>{t('sessions.sessionsMode')}</button></div></div></div>
+  return <article className="panel request-page-surface"><div className="panel-title traffic-heading"><div><h2>{typedFiltersActive(filters) ? t('traffic.filtered') : t('traffic.live')}</h2><span>{typedFiltersActive(filters) ? t('traffic.filteredHint') : t('traffic.liveHint')}</span></div><div className="traffic-heading-actions"><div className={`request-live-state session-live-state ${streamState}`} role="status">{t(`sessions.live.${streamState}`)}</div><div className="segmented" role="group" aria-label={t('sessions.monitorMode')}><button type="button" className="active" aria-pressed="true">{t('sessions.requestsMode')}</button><button type="button" aria-pressed="false" onClick={onOpenSessions}>{t('sessions.sessionsMode')}</button></div></div></div>
     <TypedFilterBuilder ast={filters} disabled={loading} onApply={onApply} onClear={onClear} scope="requests" token={token} tenant={tenant} upstreams={upstreams} />
     {olderFilteredResultsStale && <div className="notice warning" role="status">{t('traffic.olderFilteredResultsStale')}<button type="button" className="secondary" disabled={loading} onClick={onRefreshFilteredResults}>{t('traffic.refreshFilteredResults')}</button></div>}
     {requests.length > 0 && <section className="metrics request-traffic-metrics" aria-label={t('monitoring.summary')}>
@@ -308,10 +334,11 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
       <NumberMetric label={t('traffic.success')} value={summary.successful} tone="positive" />
       <NumberMetric label={t('traffic.failure')} value={summary.failed} tone="negative" />
       <NumberMetric label={t('common.running')} value={summary.running} tone={summary.running > 0 ? 'pending' : undefined} />
-      <Metric label={t('usage.successRate')} value={formatPercent(summary.successRate, locale)} tone="positive" />
+      {summary.unknown > 0 && <NumberMetric label={locale === 'zh-CN' ? '终态未知' : 'Outcome unknown'} value={summary.unknown} />}
+      <Metric label={t('usage.successRate')} value={<span title={locale === 'zh-CN' ? '仅当前已加载记录中终态明确的请求；不包含运行中或终态未知的历史记录。' : 'Only requests with known terminal outcomes in the loaded rows; excludes running and unknown historical outcomes.'}>{formatPercent(summary.successRate, locale)}</span>} tone="positive" />
       <Metric label={t('usage.average')} value={<span title={averageDuration.title}>{averageDuration.text}</span>} />
     </section>}
-    <RequestTable requests={requests} upstreamNames={new Map(upstreams.map((account) => [account.id, account.name]))} onSelect={(request) => void onSelect(request)} onOpenSession={onOpenSession} />
+    {loading && requests.length === 0 ? <div className="empty" role="status">{t('common.loading')}</div> : <RequestTable requests={requests} upstreamNames={new Map(upstreams.map((account) => [account.id, account.name]))} onSelect={(request) => void onSelect(request)} onOpenSession={onOpenSession} />}
     {hasOlder && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('traffic.loadOlder')}</button></div>}
   </article>;
 }
@@ -320,7 +347,7 @@ function RequestDrawer({ detail, upstreamName, onOpenSession, onClose }: { detai
   const { t } = useI18n();
   return <DrawerFrame title={detail.model} eyebrow={t('request.operatorDiagnosis')} onClose={onClose}>
     <RequestDiagnostics request={detail} onOpenSession={onOpenSession} upstreamName={upstreamName} />
-    <div className="request-diagnostics request-archive-diagnostics">
+    <div className="request-diagnostics request-detail-surface request-archive-diagnostics">
       <span><b>{t('self.archive')}</b>{detail.archive_complete ? t('request.archiveComplete') : t('request.archiveIncomplete')}</span>
       {detail.provenance && <span><b>{t('request.provenance')}</b>{detail.provenance.unlinked ? t('request.archiveOnly') : t('request.exactArchive')} · {detail.provenance.source}</span>}
     </div>

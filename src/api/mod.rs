@@ -42,6 +42,7 @@ mod generation;
 mod generation_quarantine;
 mod groups;
 mod health;
+mod image_generation_quarantine;
 mod kimi_transport;
 mod limits;
 mod model_picker;

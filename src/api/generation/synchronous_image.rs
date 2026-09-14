@@ -80,7 +80,7 @@ pub(super) async fn image_idempotency_replay_response(
             format!("image request {request_id} with this Idempotency-Key is still in progress"),
         )),
         SynchronousImageIdempotencyClaim::Uncertain { request_id } => {
-            Ok(uncertain_image_response(request_id))
+            Ok(uncertain_image_response(request_id, None))
         }
         SynchronousImageIdempotencyClaim::Claimed => Err(AppError::Internal),
     }
@@ -103,15 +103,66 @@ pub(super) struct SyncImageRequest<'a> {
     pub(super) key_id: Uuid,
     pub(super) idempotency_key: Option<&'a str>,
     pub(super) tenant_id: Uuid,
-    pub(super) submission_armed: std::sync::atomic::AtomicBool,
+    pub(super) arm_state: std::sync::atomic::AtomicU8,
     pub(super) invalid_response: std::sync::atomic::AtomicBool,
+    pub(super) confirmed_rejection: std::sync::atomic::AtomicBool,
 }
 
-fn uncertain_image_response(request_id: Uuid) -> Response {
+pub(super) const ARM_NOT_STARTED: u8 = 0;
+pub(super) const ARM_PENDING: u8 = 1;
+pub(super) const ARM_CONFIRMED: u8 = 2;
+
+pub(super) async fn submission_may_have_started(
+    context: &SyncImageRequest<'_>,
+) -> Result<bool, AppError> {
+    use std::sync::atomic::Ordering;
+    match context.arm_state.load(Ordering::Acquire) {
+        ARM_NOT_STARTED => Ok(false),
+        ARM_CONFIRMED => Ok(true),
+        _ => match context
+            .state
+            .db
+            .confirm_synchronous_image_submission_started(
+                context.key_id,
+                context.request_id,
+                context.reservation.id,
+            )
+            .await
+        {
+            Ok(started) => {
+                context.arm_state.store(
+                    if started {
+                        ARM_CONFIRMED
+                    } else {
+                        ARM_NOT_STARTED
+                    },
+                    Ordering::Release,
+                );
+                Ok(started)
+            }
+            // Missing/changed ownership is not ours to refund or quarantine.
+            // Preserve that explicit conflict instead of inventing uncertainty
+            // for a request now owned or already settled by another worker.
+            Err(error @ (AppError::NotFound | AppError::Conflict(_))) => Err(error),
+            Err(error) => {
+                tracing::warn!(request_id=%context.request_id, error_category=error.diagnostic_category(),
+                    "image arm outcome could not be established; retaining uncertainty");
+                Ok(true)
+            }
+        },
+    }
+}
+
+fn uncertain_image_response(request_id: Uuid, reconciliation_available: Option<bool>) -> Response {
     let body = serde_json::to_vec(&json!({"error": {
         "code": "image_submission_uncertain",
-        "message": "Image submission may have executed; automatic retry is disabled. Reconcile this request before creating another submission.",
-        "retryable": false
+        "message": if reconciliation_available == Some(true) {
+            "Image submission may have executed; automatic retry is disabled. The request is recorded for reconciliation."
+        } else {
+            "Image submission may have executed; automatic retry is disabled. Check request status and reconcile once the request is listed."
+        },
+        "retryable": false,
+        "reconciliation_available": reconciliation_available
     }})).expect("static uncertainty response");
     Response::builder()
         .status(StatusCode::CONFLICT)
@@ -119,6 +170,21 @@ fn uncertain_image_response(request_id: Uuid) -> Response {
         .header(REQUEST_ID_HEADER, request_id.to_string())
         .body(Body::from(body))
         .expect("static uncertainty headers")
+}
+
+fn image_submission_state_unavailable(request_id: Uuid) -> Response {
+    let body = serde_json::to_vec(&json!({"error": {
+        "code": "image_submission_state_unavailable",
+        "message": "Submission state could not be confirmed or published. Do not resubmit. No refund or resubmission was initiated by this recovery attempt. Check this request after storage recovers; reconciliation availability is not confirmed.",
+        "retryable": false,
+        "reconciliation_available": false
+    }})).expect("static submission-state response");
+    Response::builder()
+        .status(StatusCode::CONFLICT)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(REQUEST_ID_HEADER, request_id.to_string())
+        .body(Body::from(body))
+        .expect("static submission-state headers")
 }
 
 async fn quarantine_image_request(context: &SyncImageRequest<'_>) -> Response {
@@ -133,12 +199,14 @@ async fn quarantine_image_request(context: &SyncImageRequest<'_>) -> Response {
         )
         .await
     {
-        // The acknowledged/possibly committed arm remains the durable fence
-        // even if publishing the richer uncertainty diagnostic fails.
+        // A pending arm is not proof that a quarantine row exists. Preserve
+        // the reservation and prohibit resubmission, but do not advertise a
+        // reconciliation action whose durable publication was not confirmed.
         tracing::warn!(request_id=%context.request_id, error_category=error.diagnostic_category(),
-            "image uncertainty publication failed; send fence retained");
+            "image uncertainty publication unavailable; this recovery attempt will not release or resubmit without authoritative verification");
+        return image_submission_state_unavailable(context.request_id);
     }
-    uncertain_image_response(context.request_id)
+    uncertain_image_response(context.request_id, Some(true))
 }
 
 pub(super) async fn execute_synchronous_image_request(
@@ -224,12 +292,12 @@ pub(super) async fn execute_synchronous_image_request(
         Ok(request) => request,
         Err(_) => return fail_image_request(context, "upstream_credential_invalid").await,
     };
-    // Set before awaiting the transaction: cancellation while its commit is
-    // ambiguous must never run the pre-send refund path. Only an acknowledged
-    // arm permits the first and only network send.
+    // Pending is not proof of dispatch. After an error/cancelled wait, resolve
+    // this state through the serialized authoritative DB query before deciding
+    // whether zero-cost cleanup is safe. Only an acknowledged arm permits send.
     context
-        .submission_armed
-        .store(true, std::sync::atomic::Ordering::Release);
+        .arm_state
+        .store(ARM_PENDING, std::sync::atomic::Ordering::Release);
     state
         .db
         .arm_synchronous_image_submission(
@@ -239,6 +307,9 @@ pub(super) async fn execute_synchronous_image_request(
             context.reservation.id,
         )
         .await?;
+    context
+        .arm_state
+        .store(ARM_CONFIRMED, std::sync::atomic::Ordering::Release);
     let _upstream_activity = state.metrics.active_upstream(&route.driver, "image");
     let upstream_result = request.send().await;
     state.metrics.observe_upstream(
@@ -256,16 +327,28 @@ pub(super) async fn execute_synchronous_image_request(
                 is_connect = error.is_connect(),
                 "synchronous image upstream request failed"
             );
-            attempt
-                .complete(crate::api::MediaAttemptTerminal::Failed {
+            let terminal = if error.is_connect() {
+                crate::api::MediaAttemptTerminal::Failed {
                     kind: crate::db::UpstreamFailureKind::Connection,
                     reason: crate::metrics::UpstreamHealthReason::Connection,
-                })
-                .await;
+                }
+            } else {
+                crate::api::MediaAttemptTerminal::Inconclusive
+            };
+            attempt.complete(terminal).await;
             return fail_image_request(context, "upstream_connection").await;
         }
     };
     let upstream_status = upstream.status();
+    // A complete explicit client rejection is non-execution evidence, except
+    // timeout/too-early/rate-limit responses whose semantics remain uncertain.
+    // Record it immediately from headers, before awaiting hooks/body/settlement.
+    // This only permits zero-cost settlement; it never permits another POST.
+    if upstream_status.is_client_error() && !matches!(upstream_status.as_u16(), 408 | 425 | 429) {
+        context
+            .confirmed_rejection
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
     if upstream_status == StatusCode::TOO_MANY_REQUESTS {
         let kind = crate::api::classify_media_rate_limit(upstream).await;
         attempt
@@ -340,7 +423,7 @@ pub(super) async fn execute_synchronous_image_request(
         .is_ok_and(|response| response.status().is_success())
     {
         attempt
-            .complete(crate::api::MediaAttemptTerminal::Succeeded)
+            .complete_committed(crate::api::MediaAttemptTerminal::Succeeded)
             .await;
     } else if context
         .invalid_response
@@ -473,9 +556,10 @@ async fn fail_image_request_with_staging(
     error_code: &str,
     result_lease: Option<&crate::archive_staging::ArchiveStagingWriteLease>,
 ) -> Result<Response, AppError> {
-    if context
-        .submission_armed
-        .load(std::sync::atomic::Ordering::Acquire)
+    if submission_may_have_started(context).await?
+        && !context
+            .confirmed_rejection
+            .load(std::sync::atomic::Ordering::Acquire)
     {
         if matches!(
             error_code,

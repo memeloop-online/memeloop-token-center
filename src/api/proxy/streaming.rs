@@ -444,7 +444,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 Some(spool) => spool.seal(),
                 None => None,
             };
-            let archive_accepted = archive_settlement.is_some();
             if let Err(unowned) = archive_settlement_sender.send(archive_settlement)
                 && let Some(settlement) = unowned
             {
@@ -452,14 +451,11 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 // this is defensive. Retain ownership locally if it exited.
                 settlement.wait().await;
             }
-            if !archive_accepted {
-                crate::response_archive_spool::mark_gap(
-                    &background_state,
-                    spool_identity,
-                    "capture_failed",
-                )
-                .await;
-            }
+            // A spawned writer exclusively fences its failed/abandoned
+            // capture, including a begin that commits after cancellation.
+            // No writer means memory admission failed before any spool SQL;
+            // the request already has its gap locator. Do not duplicate the
+            // fence or put its database wait ahead of terminal delivery.
             let failed = matches!(
                 sse_summary.as_ref().map(|summary| &summary.outcome),
                 Some(ResponsesSseOutcome::Failed)

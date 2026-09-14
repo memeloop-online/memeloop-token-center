@@ -32,25 +32,33 @@ pub(super) async fn send_frame(
             .await
             .map_err(|_| "downstream_backpressure")?
             .map_err(|_| "downstream_disconnected")?;
-        if let Err(error) = prepare_proxy_delivery_with_retry(
-            &input.state.db,
+        if let Err(error) = observe_delivery_transition(
             input.request_id,
-            input.tenant_id,
-            input.reservation,
-            input.input_token_ceiling,
-            input.output_token_ceiling,
-            input.requested_service_tier,
+            "delivery_prepare",
+            prepare_proxy_delivery_with_retry(
+                &input.state.db,
+                input.request_id,
+                input.tenant_id,
+                input.reservation,
+                input.input_token_ceiling,
+                input.output_token_ceiling,
+                input.requested_service_tier,
+            ),
         )
         .await
         {
             log_delivery_state_failure(input.request_id, "delivery_prepare", &error);
             return Err("delivery_state");
         }
-        if let Err(error) = confirm_proxy_delivery_with_retry(
-            &input.state.db,
+        if let Err(error) = observe_delivery_transition(
             input.request_id,
-            input.tenant_id,
-            input.reservation,
+            "delivery_confirm",
+            confirm_proxy_delivery_with_retry(
+                &input.state.db,
+                input.request_id,
+                input.tenant_id,
+                input.reservation,
+            ),
         )
         .await
         {
@@ -69,6 +77,36 @@ pub(super) async fn send_frame(
         probe.delivered_validated_output().await;
     }
     Ok(billable)
+}
+
+async fn observe_delivery_transition<T, F>(
+    request_id: Uuid,
+    phase_name: &'static str,
+    operation: F,
+) -> Result<T, AppError>
+where
+    F: std::future::Future<Output = Result<T, AppError>>,
+{
+    let phase = proxy_diagnostics::Phase::new(
+        proxy_diagnostics::Context::for_request(request_id),
+        phase_name,
+    );
+    let result = tracing::Instrument::instrument(
+        operation,
+        tracing::info_span!(
+            "proxy_delivery_database", %request_id, phase = phase_name,
+        ),
+    )
+    .await;
+    phase.finish(
+        match &result {
+            Ok(_) => "completed",
+            Err(error) => delivery_error_class(error),
+        },
+        None,
+        None,
+    );
+    result
 }
 
 fn log_delivery_state_failure(request_id: Uuid, stage: &'static str, error: &AppError) {
@@ -129,6 +167,48 @@ mod delivery_log_tests {
         fn make_writer(&'writer self) -> Self::Writer {
             LogWriter(self.0.clone())
         }
+    }
+
+    #[test]
+    fn delivery_phase_preserves_results_and_records_cancelled_waits() {
+        use futures_util::FutureExt;
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(capture.clone())
+            .finish();
+        let request_id = Uuid::now_v7();
+        tracing::subscriber::with_default(subscriber, || {
+            let success = observe_delivery_transition(request_id, "delivery_prepare", async {
+                Ok::<_, AppError>(false)
+            })
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+            assert!(!success, "observing a database result must not change it");
+            let failure = observe_delivery_transition(request_id, "delivery_confirm", async {
+                Err::<(), _>(AppError::Conflict("SECRET_PHASE_CANARY".into()))
+            })
+            .now_or_never()
+            .unwrap();
+            assert!(matches!(failure, Err(AppError::Conflict(_))));
+            assert!(
+                observe_delivery_transition(
+                    request_id,
+                    "delivery_prepare",
+                    std::future::pending::<Result<(), AppError>>()
+                )
+                .now_or_never()
+                .is_none()
+            );
+        });
+        let rendered = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(rendered.contains(&request_id.to_string()));
+        assert!(rendered.contains("completed"));
+        assert!(rendered.contains("state_conflict"));
+        assert!(rendered.contains("not_completed"));
+        assert!(!rendered.contains("SECRET_PHASE_CANARY"));
     }
 
     #[test]

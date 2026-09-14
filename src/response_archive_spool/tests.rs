@@ -443,6 +443,7 @@ async fn rejected_capture_never_publishes_a_complete_prefix() {
 #[tokio::test]
 async fn cancelled_producer_fences_a_begin_that_committed_late() {
     let (_dir, state, pool, identity) = fixture().await;
+    let (fence_probe, fence_entered, release_fence) = fence_probe::install(&state);
     let (entering, release) = pause_next_begin_ack_for_test(&state);
     let memory = state.proxy_memory_budget.reservation();
     let producer = ResponseArchiveProducer::begin(&state, identity, memory).unwrap();
@@ -452,6 +453,12 @@ async fn cancelled_producer_fences_a_begin_that_committed_late() {
         .unwrap();
     drop(producer);
     release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), fence_entered)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fence_probe.calls(), 1);
+    release_fence.send(()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
             let row = sqlx::query(
@@ -470,6 +477,46 @@ async fn cancelled_producer_fences_a_begin_that_committed_late() {
     })
     .await
     .expect("a late committed begin must be fenced after producer cancellation");
+    assert_eq!(fence_probe.calls(), 1);
+}
+
+#[tokio::test]
+async fn cancelled_writer_returns_success_only_when_its_single_fence_succeeds() {
+    for fail_fence in [false, true] {
+        let (_dir, state, pool, identity) = fixture().await;
+        if fail_fence {
+            sqlx::query("CREATE TRIGGER reject_cancel_fence BEFORE UPDATE OF state ON response_archive_spools WHEN NEW.state = 'gap' BEGIN SELECT RAISE(ABORT, 'synthetic fence failure'); END")
+                .execute(&pool).await.unwrap();
+        }
+        let (probe, entered, release) = fence_probe::install(&state);
+        let memory = state.proxy_memory_budget.reservation();
+        let producer = ResponseArchiveProducer::begin(&state, identity, memory).unwrap();
+        let cancelled = tokio::spawn(producer.cancel_and_wait_for_test());
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(probe.calls(), 1);
+        release.send(()).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), cancelled)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("writer task must finish without a join failure");
+        assert_eq!(
+            result.is_err(),
+            fail_fence,
+            "cancellation is not a database error, but a failed fence is"
+        );
+        assert_eq!(probe.calls(), 1);
+        let spool_state: String =
+            sqlx::query_scalar("SELECT state FROM response_archive_spools WHERE request_id = $1")
+                .bind(identity.request_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(spool_state, if fail_fence { "capturing" } else { "gap" });
+    }
 }
 
 #[tokio::test]

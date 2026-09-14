@@ -32,9 +32,11 @@ An absent hint is not proof that the call was not client-side compaction.
 | buffered_archive_settlement / stream_terminal_settlement | Terminal archive/account settlement work |
 | archive_terminal_handoff / archive_eof_drain | Wait for terminal ownership, then writer drain holding HTTP EOF |
 | response_spool_begin / response_spool_append / response_spool_seal | Actual writer database operation, distinguishing acknowledged, rejected and database_error |
-| response_spool_gap_write / response_spool_failed_fence | Owned gap write and failed-writer fence, including late database completion |
+| response_spool_failed_fence | Sole owned cancellation/failed-writer fence, including late database completion |
 | stream_owner | Streaming owner through terminal reconciliation and archive EOF drain |
 | gateway_response_headers | Entry-to-handler response; **not** end-to-end streaming completion |
+| gateway_downstream_body | HTTP consumer polling through body EOS, error or drop; **not** a TCP/client acknowledgement |
+| delivery_prepare / delivery_confirm | First billable frame's durable delivery-state transitions, including existing retries |
 
 Phase events contain both phase `elapsed_ms` and `request_elapsed_ms` from the
 gateway entry. Overlapping phases are not additive. `started` allows an in-flight
@@ -43,6 +45,34 @@ proof of upstream delivery. `returned` means an owner returned after handling
 its own errors, not proof that persistence or network delivery succeeded.
 First-byte observations can be after bounded protocol sniffing/prefetching.
 None of these observations authorize retry, change billing, or set health.
+
+`gateway_downstream_body` emits one summary, not per-frame logs. `bytes` counts
+data returned by actual HTTP body polls; `frames` also counts forwarded trailers.
+`first_poll_ms` / `last_poll_ms` and `first_data_ms` / `last_data_ms` are measured
+from gateway ingress. `end_stream` means the consumer polled EOS or the final
+frame with `is_end_stream`; `body_error` preserves an error without logging its
+text; `dropped` means the consumer dropped an unfinished body. An already-empty
+body that is never polled reports `end_stream_unpolled`, not a disconnect.
+These observations preserve frame order, trailers, size hints, and the original
+EOF/permit owner. They prove neither socket flush nor client consumption. Join
+the request ID with validated ingress ID and ingress disconnect timing before
+attributing a `200 + downstream_remote_disconnect`.
+
+Delivery prepare/confirm phases retain safe SQLx classification in the
+`proxy_delivery_database` span and report cancellation as `not_completed`.
+Generic buffered reads preserve only the fixed `upstream_read_timeout` and
+`upstream_request_timeout` labels; other transport errors remain
+`upstream_stream`, never a provider error message.
+
+An automatic client compaction is not identifiable from duration alone. Obtain
+its client-side start/end and returned server request ID; otherwise an explicit
+compaction hint or independently matched request trace is needed. A normal
+`responses` request with no hint must not be relabeled by inspecting its body.
+Removing an ingress body cap does not remove application safeguards: Responses
+defaults to 16 MiB (configurable up to 64 MiB), request reads remain bounded to
+60 seconds, and responses/SSE products have independent caps. Inspect actual
+request byte counts, configured limits and 408/413 evidence before proposing
+limit changes; this diagnostics change adds or changes none.
 
 `archive_budget_acquire` separates `pool_wait_ms` (connection acquisition and
 transaction begin) from `budget_wait_ms` (the singleton budget row acquisition).
@@ -65,6 +95,21 @@ ownership.
 For a late `response_spool_writer` failure, first inspect correlated
 `response_spool_producer` and writer outcomes: `queue_capacity`, `queue_closed`,
 `terminal_sender_dropped` and `abandoned_before_*` are not database failures.
+An abandoned writer now completes successfully after its sole gap fence commits;
+an actual fence failure still returns an error. The stream no longer issues a
+second gap transaction or waits for its 250 ms ACK before terminal delivery.
+On older binaries, cancellation itself became `AppError::Internal`, producing
+a misleading `late archive database task failed` even after both gap writes
+acknowledged. Establish the preceding `upstream_stream` outcome first: a
+`downstream_disconnected` outcome followed by that sequence does not establish
+an archive/database-triggered disconnect.
+
+Ownership covers every admitted writer, including begin that commits after
+producer cancellation and failures before seal. Failed queue-memory admission
+starts no writer and performs no spool SQL; the request already retains its gap
+locator. Accepted terminal tails keep their existing EOF/drain owner. If the
+whole process dies before fencing, the unchanged capturing expiry/worker GC
+path fences and releases its budget without uploading an incomplete prefix.
 An acknowledged-false write has a `response_spool_write_rejected` event with a
 fixed reason (owner/state/expiry/replay/sequence/capacity). Actual SQLx errors
 retain the existing safe `error_kind` under the `response_archive_database`

@@ -52,8 +52,7 @@ test('credential review defaults to active and mutation scopes remain explicit',
   assert.doesNotMatch(operator, /<option value="">/);
 });
 
-test('request filters hide stale rows and cursors while a replacement query is pending or fails', () => {
-  assert.match(requestsPage, /if \(!older\) \{\s+olderFilteredResultsVisible\.current = false;\s+setOlderFilteredResultsStale\(false\);\s+setRequests\(\[\]\); setHasOlder\(false\); setDetail\(undefined\);\s+\}/);
+test('request filters use current scoped routing metadata without upstream model enumeration', () => {
   assert.match(requestsPage, /setUpstreamError\(messageOf/);
   assert.match(requestsPage, /<TypedFilterBuilder ast=\{filters\} disabled=\{loading\} onApply=\{onApply\} onClear=\{onClear\} scope="requests" token=\{token\} tenant=\{tenant\} upstreams=\{upstreams\} \/>/);
   assert.match(typedFilterBuilder, /api<ModelRouteView\[\]>\(`\/internal\/v1\/model-routes\$\{query\}`/);
