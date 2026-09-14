@@ -1472,7 +1472,7 @@ async fn credential_copy_is_explicit_authorized_and_never_part_of_the_key_list()
             .unwrap();
         assert_eq!(repeated.status(), StatusCode::OK);
     }
-    let limited = control
+    let repeated = control
         .oneshot(
             Request::post(copy_path)
                 .header(header::AUTHORIZATION, format!("Bearer {service_token}"))
@@ -1481,15 +1481,15 @@ async fn credential_copy_is_explicit_authorized_and_never_part_of_the_key_list()
         )
         .await
         .unwrap();
-    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(repeated.status(), StatusCode::OK);
     assert_eq!(
-        limited.headers().get(header::CACHE_CONTROL),
+        repeated.headers().get(header::CACHE_CONTROL),
         Some(&HeaderValue::from_static("no-store"))
     );
 }
 
 #[tokio::test]
-async fn credential_copy_hides_foreign_key_existence_and_atomically_limits_concurrent_replay() {
+async fn credential_copy_hides_foreign_key_existence_and_allows_concurrent_replay() {
     let (state, _directory) = test_state().await;
     let target = state
         .db
@@ -1591,8 +1591,8 @@ async fn credential_copy_hides_foreign_key_existence_and_atomically_limits_concu
             .await
             .unwrap()
     );
-    // Authorization precedes quota consumption: repeated probes must not turn
-    // a foreign-key denial into 429 while an unknown UUID remains 403.
+    // Repeated foreign probes remain indistinguishable from an unknown UUID
+    // and do not consume a credential-copy cooldown.
     for _ in 0..3 {
         let repeated_foreign = control
             .clone()
@@ -1637,15 +1637,114 @@ async fn credential_copy_hides_foreign_key_existence_and_atomically_limits_concu
             .iter()
             .filter(|status| **status == StatusCode::OK)
             .count(),
-        3
+        8
     );
+}
+
+#[tokio::test]
+async fn service_token_copy_is_global_no_store_and_never_listed() {
+    let (state, _directory) = test_state().await;
+    let issued = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "copyable-service-token".to_owned(),
+                scopes: vec!["keys:read".to_owned()],
+                tenant_external_id: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    state
+        .db
+        .create_tenant("service-copy-tenant", None)
+        .await
+        .unwrap();
+    let tenant_scoped = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "tenant-service-token-copy-denied".to_owned(),
+                scopes: vec!["service_tokens:write".to_owned()],
+                tenant_external_id: Some("service-copy-tenant".to_owned()),
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let bootstrap = state.config.service_token.clone();
+    let control = router_for_role(state, RuntimeRole::Control);
+
+    let listed = control
+        .clone()
+        .oneshot(
+            Request::get("/internal/v1/service-tokens")
+                .header(header::AUTHORIZATION, format!("Bearer {bootstrap}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed: Value = serde_json::from_slice(
+        &axum::body::to_bytes(listed.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let listed_token = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|value| value["service_id"] == issued.service_id.to_string())
+        .unwrap();
+    assert_eq!(listed_token["credential_copy_available"], true);
+    assert!(!listed.to_string().contains(&issued.token));
+
+    let copied = control
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/internal/v1/service-tokens/{}/copy",
+                issued.service_id
+            ))
+            .header(header::AUTHORIZATION, format!("Bearer {bootstrap}"))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(copied.status(), StatusCode::OK);
     assert_eq!(
-        statuses
-            .iter()
-            .filter(|status| **status == StatusCode::TOO_MANY_REQUESTS)
-            .count(),
-        5
+        copied.headers().get(header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static("no-store"))
     );
+    let copied: Value = serde_json::from_slice(
+        &axum::body::to_bytes(copied.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(copied["token"], issued.token);
+    assert_eq!(copied["credential_generation"], 1);
+
+    let forbidden = control
+        .oneshot(
+            Request::post(format!(
+                "/internal/v1/service-tokens/{}/copy",
+                issued.service_id
+            ))
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", tenant_scoped.token),
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

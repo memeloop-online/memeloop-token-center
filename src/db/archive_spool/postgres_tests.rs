@@ -747,7 +747,7 @@ async fn postgres_seal_cancelled_inside_commit_remains_recoverable_after_reconne
 }
 
 #[tokio::test]
-async fn postgres_slow_budget_lock_claims_once_without_cancelling_transaction() {
+async fn postgres_claims_ignore_busy_budget_and_still_claim_once() {
     let Some(fixture) = PgFixture::new().await else {
         return;
     };
@@ -775,26 +775,14 @@ async fn postgres_slow_budget_lock_claims_once_without_cancelling_transaction() 
     let second = tokio::spawn(async move {
         crate::response_archive_spool::observed_claim_for_test(&second_db, Uuid::new_v4()).await
     });
-    // Observe actual server-side row-lock waits, not elapsed sleeps or an
-    // assumed query schedule. Neither claimant can UPDATE before release.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let waiting: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND query LIKE '%response_archive_spool_budget%' AND wait_event_type = 'Lock'")
-                .bind(&fixture.schema).fetch_one(&fixture.admin).await.unwrap();
-            if waiting == 2 { break; }
-            tokio::task::yield_now().await;
-        }
-    }).await.expect("both claims must wait on the real budget lock");
-    // Advance only the worker's clock across the removed 2s deadline. The
-    // server lock stays held until this test explicitly commits its owner.
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(6)).await;
-    tokio::time::resume();
-    tokio::task::yield_now().await;
-    assert!(!first.is_finished());
-    assert!(!second.is_finished());
-    blocker.commit().await.unwrap();
-    let (first, second) = tokio::join!(first, second);
+    // The budget row remains locked throughout both claims. Lease-only state
+    // transitions must serialize on the candidate spool row instead, so a
+    // slow producer/GC accounting transaction cannot stall the upload worker.
+    let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(first, second)
+    })
+    .await
+    .expect("claims must not wait for the unrelated global budget lock");
     let tasks = [first.unwrap().unwrap(), second.unwrap().unwrap()];
     assert_eq!(tasks.iter().filter(|task| task.is_some()).count(), 1);
     let row = sqlx::query("SELECT state, attempts, lease_token FROM response_archive_spools")
@@ -808,6 +796,7 @@ async fn postgres_slow_budget_lock_claims_once_without_cancelling_transaction() 
         row.get::<String, _>("lease_token"),
         winner.lease_token.to_string()
     );
+    blocker.commit().await.unwrap();
     fixture.finish().await;
 }
 
@@ -899,6 +888,54 @@ async fn postgres_claim_cancelled_inside_commit_is_reclaimed_with_new_fence() {
             .await
             .unwrap()
             .is_some()
+    );
+
+    // Reproduce a lease that expires while heartbeat is waiting for the spool
+    // row. Validation must use a database clock read after the row lock, not a
+    // timestamp captured before the wait.
+    let mut expiry_blocker = fixture.db.pool.begin().await.unwrap();
+    sqlx::query("SELECT request_id FROM response_archive_spools WHERE request_id = $1 FOR UPDATE")
+        .bind(fixture.id.request_id.to_string())
+        .fetch_one(&mut *expiry_blocker)
+        .await
+        .unwrap();
+    let heartbeat_db = fixture.db.clone();
+    let heartbeat_task = recovered.clone();
+    let heartbeat = tokio::spawn(async move {
+        heartbeat_db
+            .heartbeat_response_archive_spool(&heartbeat_task)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND query LIKE 'SELECT * FROM response_archive_spools%' AND wait_event_type = 'Lock'")
+                .bind(&fixture.schema)
+                .fetch_one(&fixture.admin)
+                .await
+                .unwrap();
+            if waiting == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("heartbeat must wait on the real spool row lock");
+    // Set expiry only after the waiter has captured any pre-lock timestamp.
+    // The broken ordering accepts this lease; the lock-then-clock ordering
+    // observes a clock greater than or equal to this committed expiry.
+    sqlx::query("UPDATE response_archive_spools SET lease_expires_at = CAST(FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000) AS BIGINT) WHERE request_id = $1")
+        .bind(fixture.id.request_id.to_string())
+        .execute(&mut *expiry_blocker)
+        .await
+        .unwrap();
+    expiry_blocker.commit().await.unwrap();
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(5), heartbeat)
+            .await
+            .expect("heartbeat must finish after the row lock is released")
+            .unwrap()
+            .unwrap()
     );
     fixture.finish().await;
 }

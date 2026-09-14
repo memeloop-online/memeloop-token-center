@@ -920,7 +920,239 @@ async fn postgres_prepaid_boundary_remains_fail_closed_under_parallel_admission(
 }
 
 #[tokio::test]
-async fn postgres_proxy_conversation_finish_lock_does_not_block_same_key_admission() {
+async fn postgres_conversation_projection_prematerializes_before_the_session_lock() {
+    // Keep synchronized with the explicit-session lock namespace in
+    // src/db/requests/conversations.rs.
+    const CONVERSATION_SESSION_LOCK_SEED: i64 = 734_627_102_948_338;
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let _postgres_test_guard = POSTGRES_TEST_SERIAL.lock().await;
+    let database = Database::connect_with_max(&database_url, 16).await.unwrap();
+    database.migrate().await.unwrap();
+    let inspection = PgPool::connect(&database_url).await.unwrap();
+    let unique = Uuid::now_v7();
+    let model = format!("projection-prematerialize-{unique}");
+    let pepper = b"postgres projection prematerialize pepper";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: format!("projection-prematerialize-{unique}"),
+                principal_external_id: "member".to_owned(),
+                alias: "projection-prematerialize".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy {
+                    enforcement_mode: EnforcementMode::MeteredUnlimited,
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::ZERO,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let price = database
+        .upsert_model_price(&model, "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let request_id = Uuid::now_v7();
+    let reservation = database
+        .start_proxy_request(StartProxyRequest {
+            request_id,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 1,
+            output_token_ceiling: 1,
+            protocol: "openai",
+            model: &model,
+            request_object: "objects/blake3/projection-prematerialize-request",
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+    let session_id = format!("projection-prematerialize-session-{unique}");
+    let request_json = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": format!("projection-prematerialize-{unique}")}]
+    });
+    let hints = ConversationHints {
+        session_id: Some(session_id.clone()),
+        ..ConversationHints::default()
+    };
+    database
+        .finish_proxy_request(FinishProxyRequest {
+            request_id,
+            tenant_id: key.tenant_id,
+            reservation: &reservation,
+            input_token_ceiling: 1,
+            output_token_ceiling: 1,
+            requested_service_tier: None,
+            status_code: 200,
+            duration_ms: 1,
+            usage: TokenUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                ..TokenUsage::default()
+            },
+            charge_contract_ceiling: false,
+            error_code: None,
+            response_object: "objects/blake3/projection-prematerialize-response",
+            conversation: Some(ProxyConversationInput {
+                key: &key,
+                request_json: &request_json,
+                hints: &hints,
+                client_name: Some("codex"),
+                upstream_response_id: None,
+            }),
+        })
+        .await
+        .unwrap();
+    let projector = Uuid::now_v7();
+    let tasks = database
+        .claim_conversation_projection_tasks(projector, 1)
+        .await
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].request_id, request_id);
+
+    // Model an old worker's session -> content lock order. The new projector
+    // must wait only for this content transaction to commit; it must not hold
+    // the session lock while doing so, which would recreate the mixed-version
+    // deadlock cycle.
+    let target_atom = extract_atoms(&request_json)
+        .into_iter()
+        .next()
+        .expect("the projected request must materialize one semantic atom");
+    let mut old_writer = inspection.begin().await.unwrap();
+    let old_writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *old_writer)
+        .await
+        .unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, $2))")
+        .bind(format!("{}:{session_id}", key.key_id))
+        .bind(CONVERSATION_SESSION_LOCK_SEED)
+        .execute(&mut *old_writer)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO semantic_atoms (tenant_id, content_hash, instance_hash, role, kind, content_json, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(&target_atom.content_hash)
+    .bind(&target_atom.instance_hash)
+    .bind(&target_atom.role)
+    .bind(&target_atom.kind)
+    .bind(serde_json::to_string(&target_atom.content).unwrap())
+    .bind(unix_millis())
+    .execute(&mut *old_writer)
+    .await
+    .unwrap();
+
+    let projection_database = database.clone();
+    let mut projection = tokio::spawn(async move {
+        projection_database
+            .project_claimed_conversation_projection_task(projector, request_id)
+            .await
+    });
+    let blocked_pid = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(pid) = sqlx::query_scalar::<_, i32>(
+                "SELECT pid FROM pg_stat_activity WHERE datname = current_database() AND backend_type = 'client backend' AND state = 'active' AND wait_event_type = 'Lock' AND query LIKE 'INSERT INTO semantic_atoms%' AND $1 = ANY(pg_blocking_pids(pid)) ORDER BY query_start DESC LIMIT 1",
+            )
+            .bind(old_writer_pid)
+            .fetch_optional(&inspection)
+            .await
+            .unwrap()
+            {
+                break pid;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let blocked_pid = match blocked_pid {
+        Ok(pid) => pid,
+        Err(_) => {
+            old_writer.rollback().await.unwrap();
+            let projection_result =
+                tokio::time::timeout(std::time::Duration::from_secs(30), &mut projection).await;
+            if projection_result.is_err() {
+                projection.abort();
+                let _ = projection.await;
+            }
+            panic!(
+                "the projector never reached the independent content transaction: {projection_result:?}"
+            );
+        }
+    };
+    assert!(blocked_pid > 0);
+
+    // Expiring the lease while pre-materialization waits proves that the final
+    // session transaction rechecks ownership. The committed content rows have
+    // no visible cluster meaning, while the durable outbox remains retryable.
+    sqlx::query(
+        "UPDATE conversation_projection_outbox SET lease_expires_at = $1 WHERE request_id = $2 AND lease_owner = $3",
+    )
+    .bind(unix_millis().saturating_sub(1))
+    .bind(request_id.to_string())
+    .bind(projector.to_string())
+    .execute(&inspection)
+    .await
+    .unwrap();
+    old_writer.commit().await.unwrap();
+    assert!(
+        !tokio::time::timeout(std::time::Duration::from_secs(30), &mut projection)
+            .await
+            .expect("projection must resume after the old content owner commits")
+            .unwrap()
+            .unwrap()
+    );
+    let pre_retry: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM semantic_atoms WHERE tenant_id = $1), (SELECT COUNT(*) FROM context_nodes WHERE tenant_id = $2), (SELECT COUNT(*) FROM conversation_clusters WHERE tenant_id = $3), (SELECT COUNT(*) FROM conversation_observations WHERE request_id = $4), (SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $5 AND projected_at IS NULL)",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(key.tenant_id.to_string())
+    .bind(key.tenant_id.to_string())
+    .bind(request_id.to_string())
+    .bind(request_id.to_string())
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(pre_retry, (1, 1, 0, 0, 1));
+
+    let retry_projector = Uuid::now_v7();
+    let retry_tasks = database
+        .claim_conversation_projection_tasks(retry_projector, 1)
+        .await
+        .unwrap();
+    assert_eq!(retry_tasks.len(), 1);
+    assert_eq!(retry_tasks[0].request_id, request_id);
+    assert!(
+        database
+            .project_claimed_conversation_projection_task(retry_projector, request_id)
+            .await
+            .unwrap()
+    );
+    let recovered: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1), (SELECT COUNT(*) FROM request_records WHERE id = $2 AND conversation_cluster_id IS NOT NULL), (SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $3 AND projected_at IS NOT NULL)",
+    )
+    .bind(request_id.to_string())
+    .bind(request_id.to_string())
+    .bind(request_id.to_string())
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(recovered, (1, 1, 1));
+}
+
+#[tokio::test]
+async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         return;
     };
@@ -1112,6 +1344,52 @@ async fn postgres_proxy_conversation_finish_lock_does_not_block_same_key_admissi
     )
     .await;
 
+    let request_b_json = serde_json::json!({"messages": [{
+        "role": "user", "content": format!("independent-context-{unique}")
+    }]});
+    let hints_b = ConversationHints {
+        session_id: Some(format!("admission-lock-{unique}")),
+        ..ConversationHints::default()
+    };
+    // The observed unique-row wait above is our database barrier: A is still
+    // preparing its content. B must finish on the SAME explicit session while
+    // that wait remains blocked, not merely pass same-key admission.
+    let finished_b = if let Ok(Ok(reservation_b)) = &started_b {
+        Some(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                database.finish_proxy_request(FinishProxyRequest {
+                    request_id: request_b,
+                    tenant_id: key.tenant_id,
+                    reservation: reservation_b,
+                    input_token_ceiling: 100,
+                    output_token_ceiling: 100,
+                    requested_service_tier: None,
+                    status_code: 200,
+                    duration_ms: 1,
+                    usage: TokenUsage {
+                        input_tokens: 5,
+                        output_tokens: 3,
+                        ..TokenUsage::default()
+                    },
+                    charge_contract_ceiling: false,
+                    error_code: None,
+                    response_object: "objects/blake3/postgres-admission-lock-response-b",
+                    conversation: Some(ProxyConversationInput {
+                        key: &key,
+                        request_json: &request_b_json,
+                        hints: &hints_b,
+                        client_name: Some("codex"),
+                        upstream_response_id: None,
+                    }),
+                }),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+
     // Always release the blocker before interpreting B's result so a regression fails
     // promptly instead of leaving the spawned finish waiting on test teardown.
     blocker.rollback().await.unwrap();
@@ -1139,11 +1417,26 @@ async fn postgres_proxy_conversation_finish_lock_does_not_block_same_key_admissi
     .fetch_one(&inspection)
     .await
     .unwrap();
-    assert_eq!(materialized, (151, 151));
+    assert_eq!(materialized, (152, 152));
     let reservation_b = started_b
         .expect("same-key request B admission must complete within five seconds")
         .unwrap();
+    assert_eq!(
+        finished_b
+            .expect("B must have been admitted")
+            .expect("same-session B must finish while A waits for immutable content")
+            .unwrap(),
+        FinishProxyRequestResult::Finished {
+            cost_micros: 8,
+            usage_invalid: false,
+        }
+    );
 
+    // A finished-owner replay with brand-new content must not prepare any
+    // tenant atoms/nodes, or repeated forged payloads could grow hidden rows.
+    let replay_json = serde_json::json!({"messages": [{
+        "role": "user", "content": format!("must-not-materialize-{unique}")
+    }]});
     let finish_b_result = database
         .finish_proxy_request(FinishProxyRequest {
             request_id: request_b,
@@ -1162,17 +1455,40 @@ async fn postgres_proxy_conversation_finish_lock_does_not_block_same_key_admissi
             charge_contract_ceiling: false,
             error_code: None,
             response_object: "objects/blake3/postgres-admission-lock-response-b",
-            conversation: None,
+            conversation: Some(ProxyConversationInput {
+                key: &key,
+                request_json: &replay_json,
+                hints: &hints_b,
+                client_name: Some("codex"),
+                upstream_response_id: None,
+            }),
         })
         .await
         .unwrap();
     assert_eq!(
         finish_b_result,
-        FinishProxyRequestResult::Finished {
+        FinishProxyRequestResult::AlreadyFinished {
+            status_code: 200,
             cost_micros: 8,
-            usage_invalid: false,
+            error_code: None,
+            response_object: "objects/blake3/postgres-admission-lock-response-b".to_owned(),
         }
     );
+    let replay_atoms: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM semantic_atoms WHERE tenant_id = $1")
+            .bind(key.tenant_id.to_string())
+            .fetch_one(&inspection)
+            .await
+            .unwrap();
+    assert_eq!(replay_atoms, 152);
+    let observations: (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(DISTINCT cluster_id) FROM conversation_observations WHERE key_id = $1",
+    )
+    .bind(key.key_id.to_string())
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(observations, (2, 1));
 
     for (reservation_id, expected_cost) in [(reservation_a.id, 18_i64), (reservation_b.id, 8)] {
         let reservation_row: (String, Option<i64>) =

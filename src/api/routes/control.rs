@@ -29,6 +29,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(rotate_service_token),
         )
         .route(
+            "/internal/v1/service-tokens/{service_id}/copy",
+            post(copy_service_token),
+        )
+        .route(
             "/internal/v1/service-tokens/{service_id}/status",
             patch(set_service_token_status),
         )

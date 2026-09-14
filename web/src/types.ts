@@ -457,6 +457,7 @@ export interface ServiceTokenView {
   service_id: string;
   name: string;
   credential_generation: number;
+  credential_copy_available?: boolean;
   fingerprint: string;
   scopes: string[];
   tenant_external_id: string | null;
@@ -678,7 +679,7 @@ export interface PluginManifest {
 export type PluginOperatorUiSlot = 'operator.sidebar.tab' | 'operator.overview.card';
 export type PluginOperatorUiIcon = 'activity' | 'chart' | 'database' | 'heart' | 'plug' | 'shield';
 /** Closed core-owned data presentation; this is never a plugin browser-code entrypoint. */
-export type PluginOperatorUiPresentation = 'health_intelligence_v1';
+export type PluginOperatorUiPresentation = 'health_intelligence_v1' | 'projection_v1';
 
 export interface PluginOperatorUiContribution {
   id: string;

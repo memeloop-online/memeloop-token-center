@@ -29,6 +29,7 @@ mod configuration;
 /// host-opted-in through `application` and never enabled by the production binary.
 #[cfg(feature = "experimental-plugin-revisions")]
 pub mod lifecycle;
+mod ui_projection;
 pub use configuration::{
     ConfigurationSource, ResolvedConfigurationRevision, ResolvedTrafficSnapshot,
 };
@@ -155,6 +156,7 @@ pub enum PluginOperatorUiSlot {
 #[serde(rename_all = "snake_case")]
 pub enum PluginOperatorUiPresentation {
     HealthIntelligenceV1,
+    ProjectionV1,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

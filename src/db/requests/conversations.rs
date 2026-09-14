@@ -53,6 +53,9 @@ pub(crate) struct ConversationObservationInput<'a> {
     pub(crate) observed_at: i64,
     /// Archive-only observations intentionally have no request_records row.
     pub(crate) attach_request_record: bool,
+    /// Content-addressed atoms and prefixes were committed before this
+    /// transaction, so the session lock never nests shared unique-row waits.
+    pub(crate) content_materialized: bool,
 }
 
 /// A lease-owned terminal observation awaiting semantic materialization.
@@ -119,6 +122,27 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
 }
 
 impl Database {
+    async fn materialize_conversation_content(
+        &self,
+        tenant_id: &str,
+        request_json: &serde_json::Value,
+        observed_at: i64,
+    ) -> Result<(), AppError> {
+        let atoms = extract_atoms(request_json);
+        let nodes = build_prefix(&atoms);
+        let mut transaction = self.begin_write_transaction().await?;
+        materialize_conversation_content_in_transaction(
+            &mut transaction,
+            tenant_id,
+            &atoms,
+            &nodes,
+            observed_at,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     /// Claims a bounded batch of terminal conversation observations for one
     /// projector. A crashed worker's lease expires and another worker can
     /// safely retry the same durable payload.
@@ -170,6 +194,35 @@ impl Database {
         lease_owner: Uuid,
         request_id: Uuid,
     ) -> Result<bool, AppError> {
+        // Materialize immutable, tenant-scoped content in its own transaction
+        // before taking the explicit-session lock below. A stale lease is
+        // rechecked in the final transaction; its durable outbox row makes a
+        // committed content-only prefix retryable rather than user-visible.
+        {
+            let prepare_now = unix_millis();
+            let prepare = sqlx::query(
+                "SELECT tenant_id, request_json, observed_at FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND lease_owner = $2 AND lease_expires_at >= $3",
+            )
+            .bind(request_id.to_string())
+            .bind(lease_owner.to_string())
+            .bind(prepare_now)
+            .fetch_optional(&self.pool)
+            .await?;
+            let Some(prepare) = prepare else {
+                return Ok(false);
+            };
+            let prepare_tenant_id: String = prepare.try_get("tenant_id")?;
+            let prepare_request_json =
+                serde_json::from_str(&prepare.try_get::<String, _>("request_json")?)
+                    .map_err(|_| AppError::Internal)?;
+            self.materialize_conversation_content(
+                &prepare_tenant_id,
+                &prepare_request_json,
+                prepare.try_get("observed_at")?,
+            )
+            .await?;
+        }
+
         let now = unix_millis();
         let mut transaction = self.begin_write_transaction().await?;
         let select = match self.backend {
@@ -232,6 +285,7 @@ impl Database {
                 client_name: client_name.as_deref(),
                 observed_at,
                 attach_request_record: true,
+                content_materialized: true,
             },
         )
         .await?;
@@ -287,6 +341,7 @@ impl Database {
                     client_name,
                     observed_at: unix_millis(),
                     attach_request_record: true,
+                    content_materialized: false,
                 },
             )
             .await?;
@@ -307,6 +362,7 @@ impl Database {
             client_name,
             observed_at,
             attach_request_record,
+            content_materialized,
         } = input;
         let atoms = extract_atoms(request_json);
         let nodes = build_prefix(&atoms);
@@ -341,10 +397,11 @@ impl Database {
             // Explicit session identity is authoritative within one stable key.
             // Serialize candidate selection for that identity so two PostgreSQL
             // writers cannot both observe an empty cluster and create one.
-            // Keep this lock before the content-addressed INSERT ... ON CONFLICT
-            // writes below. Moving it later would invert lock order with an older
-            // process during a rolling deploy (content row -> session lock versus
-            // session lock -> content row) and can deadlock overlapping contexts.
+            // Synchronous writers keep this lock before their content-addressed
+            // INSERT ... ON CONFLICT writes below. Moving it later would invert
+            // lock order with an older process during a rolling deploy. Projected
+            // tasks instead commit those rows in a separate transaction first, so
+            // they retain no content-row lock when they enter this session scope.
             sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, $2))")
                 .bind(format!("{}:{session_id}", key.key_id))
                 .bind(EXPLICIT_SESSION_LOCK_SEED)
@@ -353,48 +410,15 @@ impl Database {
         }
 
         let tenant_id = key.tenant_id.to_string();
-        for atom_batch in
-            atoms.chunks(CONVERSATION_INSERT_BATCH_BIND_LIMIT / SEMANTIC_ATOM_INSERT_BIND_COUNT)
-        {
-            let statement = conversation_batch_insert_statement(
-                "INSERT INTO semantic_atoms (tenant_id, content_hash, instance_hash, role, kind, content_json, created_at) VALUES ",
-                atom_batch.len(),
-                SEMANTIC_ATOM_INSERT_BIND_COUNT,
-                " ON CONFLICT(tenant_id, content_hash) DO NOTHING",
-            );
-            let mut query = sqlx::query(sqlx::AssertSqlSafe(statement));
-            for atom in atom_batch {
-                query = query
-                    .bind(&tenant_id)
-                    .bind(&atom.content_hash)
-                    .bind(&atom.instance_hash)
-                    .bind(&atom.role)
-                    .bind(&atom.kind)
-                    .bind(serde_json::to_string(&atom.content).map_err(|_| AppError::Internal)?)
-                    .bind(now);
-            }
-            query.execute(&mut **transaction).await?;
-        }
-        for node_batch in
-            nodes.chunks(CONVERSATION_INSERT_BATCH_BIND_LIMIT / CONTEXT_NODE_INSERT_BIND_COUNT)
-        {
-            let statement = conversation_batch_insert_statement(
-                "INSERT INTO context_nodes (tenant_id, node_hash, parent_hash, atom_hash, depth, created_at) VALUES ",
-                node_batch.len(),
-                CONTEXT_NODE_INSERT_BIND_COUNT,
-                " ON CONFLICT(tenant_id, node_hash) DO NOTHING",
-            );
-            let mut query = sqlx::query(sqlx::AssertSqlSafe(statement));
-            for node in node_batch {
-                query = query
-                    .bind(&tenant_id)
-                    .bind(&node.node_hash)
-                    .bind(&node.parent_hash)
-                    .bind(&node.atom_hash)
-                    .bind(node.depth as i64)
-                    .bind(now);
-            }
-            query.execute(&mut **transaction).await?;
+        if !content_materialized {
+            materialize_conversation_content_in_transaction(
+                transaction,
+                &tenant_id,
+                &atoms,
+                &nodes,
+                now,
+            )
+            .await?;
         }
 
         let principal_id = key.principal_id.to_string();
@@ -1213,6 +1237,59 @@ fn conversation_batch_insert_statement(
     }
     statement.push_str(suffix);
     statement
+}
+
+pub(crate) async fn materialize_conversation_content_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    tenant_id: &str,
+    atoms: &[SemanticAtom],
+    nodes: &[PrefixNode],
+    observed_at: i64,
+) -> Result<(), AppError> {
+    for atom_batch in
+        atoms.chunks(CONVERSATION_INSERT_BATCH_BIND_LIMIT / SEMANTIC_ATOM_INSERT_BIND_COUNT)
+    {
+        let statement = conversation_batch_insert_statement(
+            "INSERT INTO semantic_atoms (tenant_id, content_hash, instance_hash, role, kind, content_json, created_at) VALUES ",
+            atom_batch.len(),
+            SEMANTIC_ATOM_INSERT_BIND_COUNT,
+            " ON CONFLICT(tenant_id, content_hash) DO NOTHING",
+        );
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(statement));
+        for atom in atom_batch {
+            query = query
+                .bind(tenant_id)
+                .bind(&atom.content_hash)
+                .bind(&atom.instance_hash)
+                .bind(&atom.role)
+                .bind(&atom.kind)
+                .bind(serde_json::to_string(&atom.content).map_err(|_| AppError::Internal)?)
+                .bind(observed_at);
+        }
+        query.execute(&mut **transaction).await?;
+    }
+    for node_batch in
+        nodes.chunks(CONVERSATION_INSERT_BATCH_BIND_LIMIT / CONTEXT_NODE_INSERT_BIND_COUNT)
+    {
+        let statement = conversation_batch_insert_statement(
+            "INSERT INTO context_nodes (tenant_id, node_hash, parent_hash, atom_hash, depth, created_at) VALUES ",
+            node_batch.len(),
+            CONTEXT_NODE_INSERT_BIND_COUNT,
+            " ON CONFLICT(tenant_id, node_hash) DO NOTHING",
+        );
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(statement));
+        for node in node_batch {
+            query = query
+                .bind(tenant_id)
+                .bind(&node.node_hash)
+                .bind(&node.parent_hash)
+                .bind(&node.atom_hash)
+                .bind(node.depth as i64)
+                .bind(observed_at);
+        }
+        query.execute(&mut **transaction).await?;
+    }
+    Ok(())
 }
 
 fn bounded_atom_hashes(atoms: &[crate::conversation::SemanticAtom]) -> Vec<String> {

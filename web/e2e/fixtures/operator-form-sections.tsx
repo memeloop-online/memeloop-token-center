@@ -5,6 +5,7 @@ import { I18nProvider } from '../../src/i18n';
 import { safeValidator } from '../../src/safeValidator';
 import { upstreamFormTemplates } from '../../src/operator/UpstreamFormTemplates';
 import { schemaFormTemplates } from '../../src/SchemaTemplates';
+import { MtcFluentProvider } from '../../src/design-system';
 import { useInlineEditorFocus } from '../../src/operator/hooks/useInlineEditorFocus';
 import '../../src/styles.css';
 import '../../src/theme.css';
@@ -41,7 +42,7 @@ function FocusLifecycle() {
     <button type="button" disabled={!busy || Boolean(editing)} onClick={() => setBusy(false)}>Finish refresh</button>
   </section>;
 }
-createRoot(document.getElementById('root')!).render(<I18nProvider><main style={{ padding: 24, maxWidth: 760, margin: '0 auto' }}>
+createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><main style={{ padding: 24, maxWidth: 760, margin: '0 auto' }}>
   <h1>Upstream connection</h1>
   <div className="form-panel"><Form schema={schema} formData={{ name: 'Research workspace', config: { base_url: 'https://provider.example.invalid/v1', timeout_seconds: 0 } }} validator={safeValidator} templates={upstreamFormTemplates} onSubmit={() => {}}><button type="submit">Save fixture</button></Form></div>
   <FocusLifecycle />
@@ -54,4 +55,4 @@ createRoot(document.getElementById('root')!).render(<I18nProvider><main style={{
       <button type="submit">Save extended fields</button>
     </Form>
   </div>
-</main></I18nProvider>);
+</main></MtcFluentProvider></I18nProvider>);

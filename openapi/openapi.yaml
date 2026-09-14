@@ -263,12 +263,11 @@ paths:
     put:
       tags: [Client credentials]
       operationId: storeClientCredentialRecovery
-      summary: Store an already-active client credential for future authorized copying
+      summary: Store an already-active client credential for direct authorized copying
       description: |
-        Verifies the supplied credential against the active stable key and stores only a
-        key- and generation-bound encrypted envelope. It does not rotate, replace, or
-        otherwise change the credential. This supports an authorized importer that still
-        has source access; existing credentials without an envelope cannot be reconstructed.
+        Verifies the supplied credential against the active stable key and stores its original
+        value for direct copying. It does not rotate, replace, or otherwise change the
+        credential. Existing hash-only credentials cannot be reconstructed.
       security: [{ serviceBearer: [] }]
       x-required-scope: keys:write
       parameters: [{ $ref: '#/components/parameters/KeyId' }]
@@ -278,7 +277,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/StoreClientCredentialRecoveryRequest' }
       responses:
-        '204': { description: Encrypted recovery envelope stored; no secret is returned. }
+        '204': { description: Original credential stored; no secret is returned. }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -293,13 +292,9 @@ paths:
         Returns plaintext only for an explicit, authorized copy action and only while the
         matching key generation remains active. Credential lists and self-service APIs never
         contain the secret. This operation never rotates or replaces the credential; repeated
-        authorized calls return the same current-generation credential while its envelope
-        remains available and rate limits permit. A key created before recovery envelopes were
-        enabled returns 404 and is explicitly unrecoverable through this endpoint unless an
-        authorized importer still has the source credential and stores its envelope. Retrieval
-        attempts are durably audited without credential material and limited in a short window
-        by target tenant, authenticated actor, and key; the actor also has a tenant-wide cap to
-        prevent bulk plaintext recovery across keys.
+        authorized calls return the same current-generation credential. A hash-only historical
+        key returns 404 unless an authorized importer still has and stores its original value.
+        Legacy encrypted values are verified against the active generation before copying.
       security: [{ serviceBearer: [] }]
       x-required-scope: keys:write
       parameters: [{ $ref: '#/components/parameters/KeyId' }]
@@ -314,11 +309,6 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
-        '429':
-          description: The authenticated actor exceeded a credential-recovery access limit.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/ErrorResponse' }
 
   /internal/v1/keys/{key_id}/alias:
     patch:
@@ -558,6 +548,30 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/IssuedServiceCredential' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/service-tokens/{service_id}/copy:
+    post:
+      tags: [Service credentials]
+      operationId: copyServiceCredential
+      summary: Copy a durable active service credential
+      description: |
+        Global service-token management only. Returns the current original credential through
+        an explicit no-store copy action without rotating it. Hash-only historical tokens
+        return 404 and are never replaced or fabricated.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: service_tokens:write
+      parameters: [{ $ref: '#/components/parameters/ServiceId' }]
+      responses:
+        '200':
+          description: The active service credential for immediate copying.
+          headers:
+            Cache-Control: { schema: { const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecoveredServiceCredential' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -5441,19 +5455,28 @@ components:
     ServiceCredential:
       type: object
       additionalProperties: false
-      required: [service_id, name, status, credential_generation, fingerprint, scopes, tenant_external_id, created_at, updated_at]
+      required: [service_id, name, status, credential_generation, fingerprint, credential_copy_available, scopes, tenant_external_id, created_at, updated_at]
       properties:
         service_id: { type: string, format: uuid }
         name: { type: string }
         status: { $ref: '#/components/schemas/CredentialStatus' }
         credential_generation: { type: integer, format: int64 }
         fingerprint: { type: string }
+        credential_copy_available: { type: boolean, description: Whether the current active credential has an original value available for copying. }
         scopes:
           type: array
           items: { $ref: '#/components/schemas/ServiceScope' }
         tenant_external_id: { type: [string, 'null'] }
         created_at: { type: integer, format: int64 }
         updated_at: { type: integer, format: int64 }
+    RecoveredServiceCredential:
+      type: object
+      additionalProperties: false
+      required: [service_id, credential_generation, token]
+      properties:
+        service_id: { type: string, format: uuid }
+        credential_generation: { type: integer, format: int64, minimum: 1 }
+        token: { type: string, writeOnly: true, description: Active service credential returned only by an explicit no-store copy action. }
     JsonSchema:
       oneOf:
         - type: object

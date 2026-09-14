@@ -35,9 +35,11 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     await mkdir(artifacts, { recursive: true });
     await page.goto(url);
     assert.equal(await page.getByLabel('Base URL', { exact: true }).getAttribute('readonly'), '');
-    await page.getByText('3. Advanced network and retry policy', { exact: true }).focus();
+    const advanced = page.getByRole('button', { name: '3. Advanced network and retry policy', exact: true });
+    await advanced.focus();
     await page.keyboard.press('Enter');
     await page.getByLabel('Connect attempts', { exact: true }).waitFor();
+    assert.equal(await advanced.getAttribute('aria-expanded'), 'true');
     await page.getByRole('button', { name: 'Configure network proxy', exact: true }).click();
     const proxy = page.locator('.upstream-proxy-editor input');
     await proxy.fill('socks5://100.64.0.16:1080');
@@ -54,10 +56,22 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
       const styles = await page.evaluate(() => {
         const border = getComputedStyle(document.querySelector('.upstream-connection')!);
         const label = getComputedStyle(document.querySelector('.upstream-connection dt')!);
-        const advanced = getComputedStyle(document.querySelector('.upstream-advanced')!);
-        return { border: border.borderTopColor, width: border.borderTopWidth, style: border.borderTopStyle, muted: label.color, advanced: advanced.borderTopColor };
+        return { border: border.borderTopColor, width: border.borderTopWidth, style: border.borderTopStyle, muted: label.color };
       });
-      assert.deepEqual(styles, { border: theme === 'light' ? 'rgb(195, 213, 219)' : 'rgb(61, 105, 113)', width: '1px', style: 'solid', muted: theme === 'light' ? 'rgb(82, 105, 112)' : 'rgb(145, 170, 176)', advanced: theme === 'light' ? 'rgb(195, 213, 219)' : 'rgb(61, 105, 113)' });
+      assert.deepEqual(styles, { border: theme === 'light' ? 'rgb(195, 213, 219)' : 'rgb(61, 105, 113)', width: '1px', style: 'solid', muted: theme === 'light' ? 'rgb(82, 105, 112)' : 'rgb(145, 170, 176)' });
+      await advanced.focus();
+      // The proxy editor was closed with a pointer click. Re-enter through the
+      // keyboard: programmatic focus alone correctly does not imply :focus-visible.
+      await page.keyboard.press('Tab');
+      await page.keyboard.press('Shift+Tab');
+      const focus = await advanced.evaluate(element => {
+        const style = getComputedStyle(element);
+        return { active: document.activeElement === element, width: Number.parseFloat(style.outlineWidth), style: style.outlineStyle, color: style.outlineColor };
+      });
+      assert.equal(focus.active, true);
+      assert.ok(focus.width >= 2, 'advanced settings retain a substantial keyboard focus indicator');
+      assert.equal(focus.style, 'solid');
+      assert.notEqual(focus.color, 'rgba(0, 0, 0, 0)');
         await page.setViewportSize({ width, height: 900 });
         assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth));
         await page.screenshot({ path: join(artifacts, `upstream-quota-${theme}-${width}.png`), fullPage: true });

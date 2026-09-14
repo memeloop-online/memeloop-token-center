@@ -4,14 +4,14 @@ import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
-import { createServer } from 'vite';
+import { createIsolatedFixtureServer as createServer } from './support/isolated-vite-server.js';
 import { fixtureAssets } from './support/fixture-assets.js';
 
 const routes = [
   { name: 'operator-overview', ready: '.overview-trend-card canvas', surface: '.overview-trend-card', action: '.overview-trend-data > summary' },
   { name: 'request-diagnostics', ready: '.request-diagnostics', surface: '.request-diagnostics', action: '.request-diagnostic-session' },
   { name: 'upstream-availability', ready: '.provider-availability', surface: '.provider-availability', action: '.provider-attempt-link' },
-  { name: 'operator-form-sections', ready: '.operator-form-section', surface: '.operator-form-section, .operator-form-advanced', action: '.operator-form-advanced > summary' },
+  { name: 'operator-form-sections', ready: '.mtc-form-section', surface: '.mtc-form-section, .form-journey-disclosure', action: '.form-journey-disclosure button[aria-expanded]' },
 ] as const;
 
 type SurfaceLayout = { client: number; scroll: number; left: number; right: number };
@@ -135,9 +135,9 @@ test('shared surfaces contain long content and retain keyboard actions across lo
         }
         if (route.name === 'operator-form-sections') {
           await page.keyboard.press('Enter');
-          assert.equal(await action.evaluate(element => (element.parentElement as HTMLDetailsElement).open), true, `${label}: keyboard disclosure`);
+          assert.equal(await action.getAttribute('aria-expanded'), 'true', `${label}: keyboard disclosure`);
           await page.keyboard.press('Enter');
-          assert.equal(await action.evaluate(element => (element.parentElement as HTMLDetailsElement).open), false, `${label}: keyboard collapse`);
+          assert.equal(await action.getAttribute('aria-expanded'), 'false', `${label}: keyboard collapse`);
           if (width <= 390) assert.ok(await page.locator('.rjsf > button[type="submit"]').evaluateAll(elements => elements.length > 0 && elements.every(element => element.getBoundingClientRect().height >= 44)), `${label}: every save target`);
         }
         if (route.name === 'request-diagnostics') {
