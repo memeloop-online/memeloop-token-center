@@ -246,12 +246,14 @@ export function RequestTable({
               ? `${t('request.completedAt')}: ${new Date(request.completed_at).toLocaleString(locale)}`
               : '';
             const cost = currencyForRequest ? formatCurrencyDisplay(request.cost, currencyForRequest, locale) : { text: '—' };
+            const tokenDisplay = formatMetricDisplay(request.input_tokens + request.output_tokens, locale);
+            const durationText = request.duration_ms === null ? '—' : `${formatNumber(request.duration_ms, locale, 2)} ms`;
             return <tr key={request.request_id}>
               <td className="request-time-cell"><time>{new Date(request.created_at).toLocaleString(locale)}</time><RequestIdentifier requestId={request.request_id} compact /></td>
               <td className="request-credential-cell"><strong>{request.credential_identity?.key_alias ?? credentialAlias ?? t('common.none')}</strong>{technicalSummary && <button type="button" className="request-technical-info" title={technicalSummary} aria-label={technicalSummary}>ⓘ</button>}</td>
               <td className="request-model-cell"><code>{request.model}</code></td>
-              <td className="request-token-cell"><span title={formatMetricDisplay(request.input_tokens + request.output_tokens, locale).title}>{formatMetricDisplay(request.input_tokens + request.output_tokens, locale).text}</span><RequestTokenSummary request={request} /></td>
-              <td className="request-cost-cell" title={cost.title}>{cost.text}</td>
+              <td className="request-token-cell"><span className="request-value-info" title={tokenDisplay.title} aria-label={tokenDisplay.title ? `${tokenDisplay.text} (${tokenDisplay.title})` : undefined} tabIndex={tokenDisplay.title ? 0 : undefined}>{tokenDisplay.text}</span><RequestTokenSummary request={request} /></td>
+              <td className="request-cost-cell"><span className="request-value-info" title={cost.title} aria-label={cost.title ? `${cost.text} (${cost.title})` : undefined} tabIndex={cost.title ? 0 : undefined}>{cost.text}</span></td>
               {showsSession && <td className="request-session-cell">
                 {!context
                   ? '—'
@@ -263,7 +265,7 @@ export function RequestTable({
                 {sessionMeta && <RequestSessionMetadata value={sessionMeta} />}
               </td>}
               <td><span className={`status ${request.status_code && request.status_code < 400 ? 'ok' : request.status_code ? 'bad' : 'pending'}`}>{request.status_code ?? t('common.running')}</span></td>
-              <td><span className="request-duration-info" title={durationSummary || undefined} aria-label={durationSummary || undefined} tabIndex={durationSummary ? 0 : undefined}>{request.duration_ms === null ? '—' : `${formatNumber(request.duration_ms, locale, 2)} ms`}</span></td>
+              <td><span className="request-duration-info" title={durationSummary || undefined} aria-label={durationSummary ? `${durationText}; ${durationSummary}` : undefined} tabIndex={durationSummary ? 0 : undefined}>{durationText}</span></td>
               <td>{request.error_code ? <code className="error-code">{request.error_code}</code> : '—'}</td>
               {onSelect && <td><button className="secondary table-action" type="button" onClick={() => onSelect(request)} aria-label={t('request.openDetail', { model: request.model })}>{t('request.inspect')}</button></td>}
             </tr>

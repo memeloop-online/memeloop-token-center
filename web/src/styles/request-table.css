@@ -130,6 +130,15 @@
   box-shadow: 0 0 0 2px #79dfcf;
 }
 
+.request-value-info[tabindex='0'] {
+  border-radius: 3px;
+  outline: 0;
+}
+
+.request-value-info[tabindex='0']:focus-visible {
+  box-shadow: 0 0 0 2px #79dfcf;
+}
+
 table.request-table .request-model-cell code {
   color: #f1fbfc;
   font-size: 0.88rem;
