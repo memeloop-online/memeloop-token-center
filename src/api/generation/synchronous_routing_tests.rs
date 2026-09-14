@@ -729,7 +729,17 @@ async fn filesystem_staged_image_request_arms_once_and_replays_without_another_p
     )
     .await;
     assert_eq!(replay.status(), StatusCode::OK);
-    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    let sent = upstream.received_requests().await.unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0]
+            .headers
+            .get_all(header::AUTHORIZATION)
+            .iter()
+            .count(),
+        1,
+        "credential revalidation must not append a duplicate authorization header"
+    );
     pool.close().await;
 }
 
