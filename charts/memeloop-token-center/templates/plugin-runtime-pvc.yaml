@@ -1,0 +1,17 @@
+{{- if and .Values.plugins.runtimeInventory.enabled .Values.plugins.runtimeInventory.persistence.create }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "memeloop-token-center.runtimeInventory.claimName" . }}
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "memeloop-token-center.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteMany]
+  volumeMode: Filesystem
+  storageClassName: {{ .Values.plugins.runtimeInventory.persistence.storageClass | quote }}
+  resources:
+    requests:
+      storage: {{ .Values.plugins.runtimeInventory.persistence.size | quote }}
+{{- end }}

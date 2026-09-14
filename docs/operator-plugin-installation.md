@@ -46,6 +46,91 @@ Host policy example:
 }
 ```
 
+## Helm runtime inventory
+
+`plugins.runtimeInventory` is separate from legacy `plugins.enabled`; the modes
+are mutually exclusive so a startup directory cannot silently diverge from the
+published complete inventory. The chart uses the service image's bundled installer
+at `/usr/local/bin/install-plugin-oci` and verifier at `/usr/local/bin/cosign`.
+No installer sidecar, shell image, additional Service or namespace is required.
+
+```yaml
+plugins:
+  enabled: false
+  runtimeInventory:
+    enabled: true
+    existingClaim: shared-plugin-inventories
+    installationEnabled: true
+    policyConfigMap: plugin-install-policy
+    cosignPublicKeysSecret:
+      name: plugin-publisher-trust
+      keys: [publisher.pem]
+    registrySecrets: [] # Public artifacts require no registry credential.
+```
+
+Alternatively, clear `existingClaim` and set
+`persistence: {create: true, storageClass: <reviewed-RWX-class>, size: 1Gi}`.
+This creates one dedicated same-namespace `ReadWriteMany`, Filesystem PVC and
+retains it on Helm removal. The storage class must be explicitly chosen; the
+chart does not assume a cluster's default class supports RWX. Increase capacity
+for retained revisions: a package can consume 80 MiB plus verified staging space,
+and a 16-package inventory plus history may exceed the initial 1 GiB allowance.
+Do not reuse database, archive, migration-clone or MinIO data volumes.
+
+All roles mount the entire PVC directory at
+`/var/lib/memeloop-token-center/plugin-runtime` (never a file `subPath`). Control
+and the combined `all` role mount it read-write. Gateway and worker mount it
+read-only at both PVC and container boundaries. UID/GID/fsGroup are 10001; the
+driver must actually provide that identity writable directory ownership, including
+on root-squashed storage. No root/chown helper container is introduced.
+
+The existing service image runs `prepare-plugin-inventory` as an init container.
+Writers create a fully synced temporary `{}` file and atomically link it to
+`inventory.json` without replacing an existing file; concurrent initializers
+converge. Existing malformed files fail closed and are not emptied. Reader init
+containers use `--read-only` and retry until Control has published a valid file.
+`{}` is the actual inventory map schema, not a fake installed plugin; no revision
+is published and no provider is added by initialization.
+
+The named host ConfigMap must contain `policy.json` with these mounted paths:
+
+```json
+{
+  "plugin_root": "/var/lib/memeloop-token-center/plugin-runtime/inventories",
+  "allowed_sources": ["ghcr.io/your-org/reviewed-plugin"],
+  "cosign_public_keys": ["/var/run/mtc-plugin-trust/publisher.pem"],
+  "source_credentials": {}
+}
+```
+
+The source above is a placeholder, not a published artifact or an implicitly
+trusted publisher. Policy, public-key Secret and selected registry Secret items
+are mounted only on Control/all when installation is enabled. For private sources,
+each `registrySecrets` entry `{name, keys}` is mounted at
+`/var/run/mtc-plugin-registry/<zero-based-index>/<key>`; refer to those files from
+the policy's exact-source credential map. Secret bytes are never Helm values.
+Disabling installation removes policy/trust/credential mounts while retaining
+readable historical inventories and explicit revision publication/rollback.
+
+Before formal enablement, the storage owner must verify the chosen RWX backend
+supports coherent cross-client file locks, atomic no-replace rename/hard links,
+fsync and same-path updates across nodes. RWX access mode alone does not prove
+these semantics; object-store/FUSE mounts or NFS mounted with local-only locks
+are not interchangeable. Database attempt fencing does not replace the filesystem
+lock used to serialize inventory-file appends. Confirm these capabilities with
+the actual CSI/storage configuration before permitting multiple Control replicas.
+
+First-install acceptance requires a reviewed **plugin artifact** digest and its
+existing Cosign public key. A service/installer image digest is not a plugin
+artifact. Current service-image release workflows do not publish or sign the
+example plugin packages. The policy-rewrite example changes requests and test
+group-routing components are fixtures; neither should be silently selected as a
+production smoke test. A first-party, no-network presentation-only package can be
+used after its artifact publishing identity and signing trust are explicitly
+approved. Then verify in the browser: install for review, inspect capabilities,
+approve the exact digest, publish a revision, inspect audit/history, and roll back
+to the previous complete inventory. These steps need no paid upstream request.
+
 Allowed sources are exact registry/repository names, not individual plugin
 versions or a fixed installation plan. Global administrators can install a new
 digest and new contract from those repositories at runtime. Signing keys and
