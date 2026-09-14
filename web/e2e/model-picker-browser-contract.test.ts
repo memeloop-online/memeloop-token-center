@@ -105,6 +105,7 @@ test('filters are non-modal themed popovers and model selection is searchable by
     const settings = page.locator('.system-settings');
     const billing = settings.getByRole('combobox', { name: 'Billing credential', exact: true });
     await billing.fill('Research');
+    assert.equal(await billing.getAttribute('aria-expanded'), 'true', 'typing or pasting into the billing search opens its suggestions without an extra click');
     await page.getByRole('option', { name: 'Budget route-b · Research team', exact: true }).click();
     await page.evaluate(() => { (window as unknown as { settingsFixture: { delaySave: boolean } }).settingsFixture.delaySave = true; });
     const save = settings.getByRole('button', { name: 'Save', exact: true });

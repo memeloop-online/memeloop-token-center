@@ -93,6 +93,7 @@ function AssistantSettings({ token, tenant }: { token: string; tenant: string })
   const [billingLoading, setBillingLoading] = useState(false);
   const [billingError, setBillingError] = useState('');
   const [billingSearch, setBillingSearch] = useState('');
+  const [billingOpen, setBillingOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -173,7 +174,7 @@ function AssistantSettings({ token, tenant }: { token: string; tenant: string })
   const changeRoute = (value: string) => {
     draftGeneration.current += 1;
     billingSequence.current += 1;
-    setSelectedRouteId(value); setSelectedBillingId(''); setBillingSearch('');
+    setSelectedRouteId(value); setSelectedBillingId(''); setBillingSearch(''); setBillingOpen(false);
     setBillingChoices([]); setBillingCursor(null); setBillingError(''); setMessage(''); setError('');
   };
   const billingLabel = (choice: BillingChoice) => `${choice.alias} · ${choice.principal}`;
@@ -200,7 +201,7 @@ function AssistantSettings({ token, tenant }: { token: string; tenant: string })
         </div>
         {loading ? <div className="empty" role="status">{t('common.loading')}</div> : loadError ? <div className="settings-empty" role="alert"><b>{t('settings.filterAssistantLoadFailed')}</b><span>{loadError}</span><button type="button" className="secondary" onClick={() => void load()}>{t('common.retry')}</button></div> : assistantOptions.length === 0 ? <div className="settings-empty"><b>{t('settings.noEnabledRoute')}</b><span>{t('settings.noEnabledRouteHint')}</span></div> : <form className="system-settings-form" onSubmit={(event) => { event.preventDefault(); void save(); }}>
           <div><ModelPicker label={t('settings.filterAssistantRoute')} popupLabel={t('settings.filterAssistantRoute')} value={selectedRouteIsVerified ? selectedRouteId : ''} onChange={changeRoute} disabled={saving} options={assistantOptions} describedBy="filter-assistant-route-hint" /><small id="filter-assistant-route-hint">{t('settings.assistantTextHint')}</small>{selectedRouteId && !selectedUnverifiedRoute && !selectedRouteHasAvailableCandidate && <small className="error-text" role="alert">{t('settings.assistantTextUnavailable')}</small>}</div>
-          <div className="settings-billing-field"><label htmlFor="assistant-billing-choice">{t('settings.assistantBillingCredential')}</label><Combobox id="assistant-billing-choice" aria-describedby="assistant-billing-hint" placeholder={t('settings.assistantSelectBillingCredential')} value={billingSearch || billingChoices.filter((choice) => choice.key_id === selectedBillingId).map(billingLabel)[0] || ''} selectedOptions={selectedBillingId ? [selectedBillingId] : []} disabled={saving || !selectedRouteId} onChange={(event) => { setBillingSearch(event.target.value); setSelectedBillingId(''); draftGeneration.current += 1; setMessage(''); }} onOptionSelect={(_, data) => { setSelectedBillingId(data.optionValue ?? ''); setBillingSearch(''); draftGeneration.current += 1; setMessage(''); }}>
+          <div className="settings-billing-field"><label htmlFor="assistant-billing-choice">{t('settings.assistantBillingCredential')}</label><Combobox id="assistant-billing-choice" aria-describedby="assistant-billing-hint" placeholder={t('settings.assistantSelectBillingCredential')} open={billingOpen} onOpenChange={(_, data) => setBillingOpen(data.open)} expandIcon={{ children: t('common.select'), 'aria-label': t('settings.assistantSelectBillingCredential') }} value={billingSearch || billingChoices.filter((choice) => choice.key_id === selectedBillingId).map(billingLabel)[0] || ''} selectedOptions={selectedBillingId ? [selectedBillingId] : []} disabled={saving || !selectedRouteId} onChange={(event) => { setBillingSearch(event.target.value); setBillingOpen(true); setSelectedBillingId(''); draftGeneration.current += 1; setMessage(''); }} onOptionSelect={(_, data) => { setSelectedBillingId(data.optionValue ?? ''); setBillingSearch(''); setBillingOpen(false); draftGeneration.current += 1; setMessage(''); }}>
             {visibleBilling.map((choice) => <Option key={choice.key_id} value={choice.key_id} text={billingLabel(choice)}>{billingLabel(choice)}</Option>)}
             {!billingLoading && !billingError && visibleBilling.length === 0 && <Option disabled>{t(billingChoices.length ? 'settings.noMatchingCredential' : 'settings.assistantNoBillingCredential')}</Option>}
           </Combobox><small id="assistant-billing-hint">{t('settings.assistantBillingHint')}</small></div>
