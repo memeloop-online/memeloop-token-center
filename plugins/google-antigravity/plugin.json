@@ -1,0 +1,125 @@
+{
+  "id": "google-antigravity",
+  "version": "0.1.0",
+  "wit_version": "0.2.0",
+  "wasm": null,
+  "capabilities": [],
+  "contributions": {
+    "providers": [
+      {
+        "id": "google-antigravity",
+        "display_name": "Google Antigravity",
+        "protocols": [
+          "generation"
+        ],
+        "modalities": [
+          "image"
+        ],
+        "config_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "base_url",
+            "network_scope"
+          ],
+          "properties": {
+            "base_url": {
+              "type": "string",
+              "format": "uri",
+              "default": "https://daily-cloudcode-pa.googleapis.com",
+              "title": "Generation API URL"
+            },
+            "network_scope": {
+              "const": "public"
+            },
+            "control_url": {
+              "type": "string",
+              "format": "uri",
+              "default": "https://cloudcode-pa.googleapis.com",
+              "title": "Project API URL"
+            },
+            "project_id": {
+              "type": "string",
+              "maxLength": 256,
+              "title": "Google Cloud project"
+            },
+            "request_headers": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string",
+                "maxLength": 8192
+              },
+              "maxProperties": 64,
+              "title": "Request headers",
+              "description": "Optional administrator-configured client compatibility headers."
+            }
+          }
+        },
+        "credential_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "required": [
+            "type",
+            "access_token"
+          ],
+          "properties": {
+            "type": {
+              "const": "oauth"
+            },
+            "access_token": {
+              "type": "string",
+              "writeOnly": true
+            },
+            "refresh_token": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "writeOnly": true
+            },
+            "expires_at": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "adapter_state": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "writeOnly": true
+            },
+            "proxy_url": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "writeOnly": true
+            },
+            "proxy_network_scope": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "header": {
+              "const": "authorization"
+            },
+            "prefix": {
+              "const": "Bearer "
+            }
+          }
+        },
+        "oauth_adapter": {
+          "api_version": "oauth-adapter-v1",
+          "flow_kind": "authorization_code_pkce",
+          "login_url": "https://accounts.google.com/o/oauth2/v2/auth",
+          "poll_url": "https://oauth2.googleapis.com/token",
+          "refresh_url": "https://oauth2.googleapis.com/token"
+        }
+      }
+    ]
+  }
+}

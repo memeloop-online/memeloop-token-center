@@ -46,6 +46,8 @@ impl ResolvedManagedOAuthAdapter {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OAuthFlowKind {
+    /// Host-owned standard authorization code flow with S256 PKCE.
+    AuthorizationCodePkce,
     /// Cursor-compatible redirect/PKCE login and polling contract.
     CursorPkce,
     /// OpenAI's server-owned Codex device authorization flow.

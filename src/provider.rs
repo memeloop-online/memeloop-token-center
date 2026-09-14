@@ -1,4 +1,5 @@
 mod catalog;
+pub mod antigravity;
 mod cbcnx;
 mod credential;
 mod transport_policy;

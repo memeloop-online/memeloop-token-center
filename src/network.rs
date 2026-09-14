@@ -170,6 +170,17 @@ pub async fn client_for_config_url(
     .await
 }
 
+/// Non-idempotent OAuth/media operations must not be retried by HTTP middleware.
+pub async fn client_for_config_url_no_retry(
+    shared_private_client: &reqwest::Client,
+    value: &str,
+    config: &Value,
+    proxy: Option<(&str, OutboundScope)>,
+    allow_test_loopback: bool,
+) -> Result<reqwest::Client, AppError> {
+    config_url_client(shared_private_client, value, config, proxy, allow_test_loopback, true).await
+}
+
 async fn config_url_client(
     shared_private_client: &reqwest::Client,
     value: &str,

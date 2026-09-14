@@ -94,6 +94,8 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route("/internal/v1/oauth/codex/start", post(start_codex_oauth))
         .route("/internal/v1/oauth/codex/poll", post(poll_codex_oauth))
         .route("/internal/v1/oauth/claude/start", post(start_claude_oauth))
+        .route("/internal/v1/oauth/authorization-code/start", post(start_authorization_code_oauth))
+        .route("/internal/v1/oauth/authorization-code/complete", post(complete_authorization_code_oauth))
         .route(
             "/internal/v1/oauth/claude/complete",
             post(complete_claude_oauth),

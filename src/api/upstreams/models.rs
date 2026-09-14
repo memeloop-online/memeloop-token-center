@@ -268,6 +268,13 @@ async fn discover_models(
     if account.driver == "openai-codex" {
         return discover_codex_models(state, account, credential).await;
     }
+    if account.driver == crate::provider::antigravity::DRIVER {
+        let config = crate::provider::antigravity::Config::from_account(&account.config).map_err(|_| "destination_invalid")?;
+        let client = crate::provider::antigravity::NativeClient { http: &state.http, credential, config: &config, allow_test_loopback: state.config.allow_oauth_loopback };
+        let ids = client.list_models().await.map_err(|_| "upstream_unavailable")?;
+        let models = ids.into_iter().filter(|id| id.contains("image")).map(|model_id| DiscoveredUpstreamModel { model_id, protocol: "generation".into(), context_window: None, reservation_token_bound: None, reservation_bound_source: None }).collect();
+        return Ok(("antigravity_native", models));
+    }
     if account.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER {
         credential
             .validate(unix_millis())

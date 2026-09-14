@@ -361,6 +361,7 @@ fn validate_session_scope(
     if !matches!(
         flow_kind,
         "openai_codex_device"
+            | "generic_authorization_code"
             | "cursor_pkce"
             | "provider_adapter_cursor_pkce"
             | "claude_manual_pkce"
