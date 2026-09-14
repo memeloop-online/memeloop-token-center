@@ -51,6 +51,8 @@ export function PluginRuntimeManager({ token, canManage, onPublished }: { token:
   const [status, setStatus] = useState<RuntimeStatus>();
   const [history, setHistory] = useState<History>();
   const [unavailable, setUnavailable] = useState(false);
+  const [statusError, setStatusError] = useState('');
+  const [historyError, setHistoryError] = useState('');
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
@@ -66,18 +68,22 @@ export function PluginRuntimeManager({ token, canManage, onPublished }: { token:
   useEffect(() => { alive.current = true; return () => { alive.current = false; generation.current++; }; }, []);
   const load = useCallback(async () => {
     const request = ++generation.current;
-    try {
-      const [nextStatus, nextHistory] = await Promise.all([
-        api<RuntimeStatus>('/internal/v1/plugin-runtime', token),
-        api<History>('/internal/v1/plugin-runtime/history', token),
-      ]);
-      if (!alive.current || request !== generation.current) return;
-      setStatus(nextStatus); setHistory(nextHistory); setUnavailable(false);
-    } catch (reason) {
-      if (!alive.current || request !== generation.current) return;
+    setStatusError(''); setHistoryError('');
+    const current = () => alive.current && request === generation.current;
+    const statusRead = api<RuntimeStatus>('/internal/v1/plugin-runtime', token).then((nextStatus) => {
+      if (!current()) return;
+      setStatus(nextStatus); setUnavailable(false);
+    }).catch((reason) => {
+      if (!current()) return;
       if (reason instanceof ApiError && [403, 404].includes(reason.status)) setUnavailable(true);
-      else setError(reason instanceof Error ? reason.message : 'Request failed');
-    }
+      else setStatusError(reason instanceof Error ? reason.message : 'Request failed');
+    });
+    const historyRead = api<History>('/internal/v1/plugin-runtime/history', token).then((nextHistory) => {
+      if (current()) setHistory(nextHistory);
+    }).catch((reason) => {
+      if (current()) setHistoryError(reason instanceof Error ? reason.message : 'Request failed');
+    });
+    await Promise.allSettled([statusRead, historyRead]);
   }, [token]);
   useEffect(() => { void load(); }, [load]);
   const installing = history?.installations.some((job) => job.status === 'installing') ?? false;
@@ -138,41 +144,49 @@ export function PluginRuntimeManager({ token, canManage, onPublished }: { token:
     <div className="panel-title"><div><h2>{text.title}</h2><p className="muted">{text.global}</p></div><button type="button" className="secondary" disabled={busy} onClick={() => void load()}>{text.refresh}</button></div>
     {error && <p className="notice error" role="alert">{error}</p>}
     {message && <p className="notice" role="status">{message}</p>}
-    {unavailable ? <p className="muted">{text.unavailable}</p> : !status || !history ? <p>{text.loading}</p> : <>
-      <p>{text.current}: {history.runtime_enabled === false ? text.unavailable : status.current ? `${status.current.revision} · ${status.current.inventory_id}` : text.baseline}</p>
-      <p className="muted">{text.scope}</p>
-      {!history.installation_enabled ? <p className="notice">{text.disabled}</p> : canManage && <form onSubmit={(event) => { event.preventDefault(); void mutate('/internal/v1/plugin-runtime/installations', { inventory_id: inventory.trim(), packages: packages.split('\n').map((line) => line.trim()).filter(Boolean) }); }}>
-        <label>{text.inventory}<input required pattern="[A-Za-z0-9_-]{1,64}" value={inventory} onChange={(event) => setInventory(event.target.value)} disabled={busy} /></label>
-        <label>{text.packages}<textarea required rows={3} value={packages} onChange={(event) => setPackages(event.target.value)} disabled={busy} placeholder="ghcr.io/example/plugin@sha256:…" /></label>
-        <button disabled={busy} type="submit">{busy ? text.pending : text.install}</button>
-      </form>}
-      <h3>{text.tasks}</h3>
-      {history.installations.length === 0 && <p className="muted">{text.empty}</p>}
-      {history.installations.map((job) => <section className="managed-resource" key={job.id}>
-        <b>{job.inventory_id}</b> <span className="pill">{job.status}</span><p className="muted">{job.completed_packages ?? 0}/{job.packages.length} · {new Date(job.updated_at).toLocaleString(locale)} · {job.actor}</p>
-        {job.failure_category && <p role="alert">{job.failure_category}</p>}
-        {job.review_digest && <button type="button" className="secondary" onClick={() => void review(job)}>{text.review}</button>}
-        {reviews[job.id]?.review && <details open><summary>{text.review}</summary><pre style={{ maxHeight: '24rem', overflow: 'auto', whiteSpace: 'pre-wrap' }}>{JSON.stringify(reviews[job.id].review, null, 2)}</pre></details>}
-        {canManage && job.status === 'review' && job.review_digest && <><p>{text.warning}</p><label><input type="checkbox" disabled={!reviews[job.id]?.review || reviews[job.id].review_digest !== job.review_digest} checked={approvals[job.id] === true} onChange={(event) => setApprovals((old) => ({ ...old, [job.id]: event.target.checked }))} />{text.approve}</label><button type="button" disabled={busy || !approvals[job.id] || reviews[job.id]?.review_digest !== job.review_digest} onClick={() => void mutate(`/internal/v1/plugin-runtime/installations/${encodeURIComponent(job.id)}/approve`, { review_digest: reviews[job.id].review_digest })}>{text.approve}</button></>}
-        {canManage && ['failed', 'interrupted'].includes(job.status) && <button type="button" disabled={busy} onClick={() => void mutate(`/internal/v1/plugin-runtime/installations/${encodeURIComponent(job.id)}/retry`, {})}>{text.retry}</button>}
-      </section>)}
-      <h3>{text.candidates}</h3>
-      {canManage && <label><input type="checkbox" checked={confirmation} onChange={(event) => setConfirmation(event.target.checked)} />{text.confirm}</label>}
-      {status.candidates.map((candidate) => <div className="managed-resource" key={candidate.inventory_id}>
-        <b>{candidate.inventory_id}</b><span className="pill">{candidate.staged ? text.staged : text.unstaged}</span>
-        <p>{Object.entries(candidate.plugins).map(([id, versions]) => `${id}: ${versions.join(', ')}`).join(' · ')}</p>
-        <button type="button" className="secondary" disabled={busy || !canManage} onClick={() => void mutate('/internal/v1/plugin-runtime/candidates', { inventory_id: candidate.inventory_id })}>{text.stage}</button>
-        <button type="button" disabled={busy || !canManage || !confirmation || candidate.inventory_id === status.current?.inventory_id} onClick={() => void mutate('/internal/v1/plugin-runtime/publish', { inventory_id: candidate.inventory_id, expected_revision: status.current?.revision ?? 0 }, true)}>{text.publish}</button>
-      </div>)}
-      <h3>{text.history}</h3>
-      {history.revisions.length === 0 && <p className="muted">{text.empty}</p>}
-      {history.revisions.map((revision) => <div className="managed-resource" key={revision.revision}>
-        <b>{revision.revision} · {revision.inventory_id}</b> <span>{revision.reason}</span>
-        <button type="button" className="secondary" disabled={busy || !canManage || !confirmation || !status.current || revision.revision >= status.current.revision || revision.inventory_id === status.current.inventory_id} onClick={() => void mutate('/internal/v1/plugin-runtime/rollback', { target_revision: revision.revision, expected_revision: status.current?.revision }, true)}>{text.rollback}</button>
-      </div>)}
-      {history.revisions.length > 0 && <button type="button" className="secondary" disabled={busy} onClick={() => void older()}>{text.older}</button>}
-      <h3>{text.audit}</h3>
-      {history.audit.length === 0 ? <p className="muted">{text.empty}</p> : <><ul>{history.audit.map((entry) => <li key={entry.id}>{new Date(entry.created_at).toLocaleString(locale)} · {entry.actor} · {entry.action} · {entry.inventory_id ?? '—'} · {entry.revision ?? '—'} · {entry.outcome}</li>)}</ul><button type="button" className="secondary" disabled={busy} onClick={() => void olderAudit()}>{text.olderAudit}</button></>}
+    {unavailable ? <p className="muted">{text.unavailable}</p> : <>
+      {statusError && <p className="notice error" role="alert">{statusError}</p>}
+      {!status && !statusError && <p role="status">{text.loading}</p>}
+      {status && <>
+        <p>{text.current}: {history?.runtime_enabled === false ? text.unavailable : status.current ? `${status.current.revision} · ${status.current.inventory_id}` : text.baseline}</p>
+        <p className="muted">{text.scope}</p>
+        <h3>{text.candidates}</h3>
+        {canManage && <label><input type="checkbox" checked={confirmation} onChange={(event) => setConfirmation(event.target.checked)} />{text.confirm}</label>}
+        {status.candidates.map((candidate) => <div className="managed-resource" key={candidate.inventory_id}>
+          <b>{candidate.inventory_id}</b><span className="pill">{candidate.staged ? text.staged : text.unstaged}</span>
+          <p>{Object.entries(candidate.plugins).map(([id, versions]) => `${id}: ${versions.join(', ')}`).join(' · ')}</p>
+          <button type="button" className="secondary" disabled={busy || !canManage} onClick={() => void mutate('/internal/v1/plugin-runtime/candidates', { inventory_id: candidate.inventory_id })}>{text.stage}</button>
+          <button type="button" disabled={busy || !canManage || !confirmation || candidate.inventory_id === status.current?.inventory_id} onClick={() => void mutate('/internal/v1/plugin-runtime/publish', { inventory_id: candidate.inventory_id, expected_revision: status.current?.revision ?? 0 }, true)}>{text.publish}</button>
+        </div>)}
+      </>}
+      {historyError && <p className="notice error" role="alert">{historyError}</p>}
+      {!history && !historyError && <p role="status">{text.history}: {text.loading}</p>}
+      {history && <>
+        {!history.installation_enabled ? <p className="notice">{text.disabled}</p> : canManage && <form onSubmit={(event) => { event.preventDefault(); void mutate('/internal/v1/plugin-runtime/installations', { inventory_id: inventory.trim(), packages: packages.split('\n').map((line) => line.trim()).filter(Boolean) }); }}>
+          <label>{text.inventory}<input required pattern="[A-Za-z0-9_-]{1,64}" value={inventory} onChange={(event) => setInventory(event.target.value)} disabled={busy} /></label>
+          <label>{text.packages}<textarea required rows={3} value={packages} onChange={(event) => setPackages(event.target.value)} disabled={busy} placeholder="ghcr.io/example/plugin@sha256:…" /></label>
+          <button disabled={busy} type="submit">{busy ? text.pending : text.install}</button>
+        </form>}
+        <h3>{text.tasks}</h3>
+        {history.installations.length === 0 && <p className="muted">{text.empty}</p>}
+        {history.installations.map((job) => <section className="managed-resource" key={job.id}>
+          <b>{job.inventory_id}</b> <span className="pill">{job.status}</span><p className="muted">{job.completed_packages ?? 0}/{job.packages.length} · {new Date(job.updated_at).toLocaleString(locale)} · {job.actor}</p>
+          {job.failure_category && <p role="alert">{job.failure_category}</p>}
+          {job.review_digest && <button type="button" className="secondary" onClick={() => void review(job)}>{text.review}</button>}
+          {reviews[job.id]?.review && <details open><summary>{text.review}</summary><pre style={{ maxHeight: '24rem', overflow: 'auto', whiteSpace: 'pre-wrap' }}>{JSON.stringify(reviews[job.id].review, null, 2)}</pre></details>}
+          {canManage && job.status === 'review' && job.review_digest && <><p>{text.warning}</p><label><input type="checkbox" disabled={!reviews[job.id]?.review || reviews[job.id].review_digest !== job.review_digest} checked={approvals[job.id] === true} onChange={(event) => setApprovals((old) => ({ ...old, [job.id]: event.target.checked }))} />{text.approve}</label><button type="button" disabled={busy || !approvals[job.id] || reviews[job.id]?.review_digest !== job.review_digest} onClick={() => void mutate(`/internal/v1/plugin-runtime/installations/${encodeURIComponent(job.id)}/approve`, { review_digest: reviews[job.id].review_digest })}>{text.approve}</button></>}
+          {canManage && ['failed', 'interrupted'].includes(job.status) && <button type="button" disabled={busy} onClick={() => void mutate(`/internal/v1/plugin-runtime/installations/${encodeURIComponent(job.id)}/retry`, {})}>{text.retry}</button>}
+        </section>)}
+        <h3>{text.history}</h3>
+        {history.revisions.length === 0 && <p className="muted">{text.empty}</p>}
+        {history.revisions.map((revision) => <div className="managed-resource" key={revision.revision}>
+          <b>{revision.revision} · {revision.inventory_id}</b> <span>{revision.reason}</span>
+          <button type="button" className="secondary" disabled={busy || !canManage || !confirmation || !status?.current || revision.revision >= status.current.revision || revision.inventory_id === status.current.inventory_id} onClick={() => void mutate('/internal/v1/plugin-runtime/rollback', { target_revision: revision.revision, expected_revision: status?.current?.revision }, true)}>{text.rollback}</button>
+        </div>)}
+        {history.revisions.length > 0 && <button type="button" className="secondary" disabled={busy} onClick={() => void older()}>{text.older}</button>}
+        <h3>{text.audit}</h3>
+        {history.audit.length === 0 ? <p className="muted">{text.empty}</p> : <><ul>{history.audit.map((entry) => <li key={entry.id}>{new Date(entry.created_at).toLocaleString(locale)} · {entry.actor} · {entry.action} · {entry.inventory_id ?? '—'} · {entry.revision ?? '—'} · {entry.outcome}</li>)}</ul><button type="button" className="secondary" disabled={busy} onClick={() => void olderAudit()}>{text.olderAudit}</button></>}
+      </>}
     </>}
   </article>;
 }

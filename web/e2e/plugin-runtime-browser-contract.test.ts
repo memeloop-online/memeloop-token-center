@@ -16,6 +16,9 @@ test('Operator plugin page installs, explicitly reviews, publishes and rolls bac
   assert.ok(address && typeof address === 'object');
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
+  let releaseInitialHistory: () => void = () => undefined;
+  const initialHistoryGate = new Promise<void>((resolve) => { releaseInitialHistory = resolve; });
+  let holdInitialHistory = true;
   // The application defaults to Chinese. This contract uses English labels,
   // so establish the locale before I18nProvider reads persisted preferences.
   await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
@@ -34,7 +37,13 @@ test('Operator plugin page installs, explicitly reviews, publishes and rolls bac
       assert.equal(request.headers().authorization, 'Bearer operator-test');
       const path = new URL(request.url()).pathname;
       if (request.method() === 'GET') {
-        if (path.endsWith('/history')) await route.fulfill({ json: { runtime_enabled: true, installation_enabled: true, revisions, installations: job ? [{ ...job, review: null }] : [], audit: [] } });
+        if (path.endsWith('/history')) {
+          if (holdInitialHistory) {
+            await initialHistoryGate;
+            holdInitialHistory = false;
+          }
+          await route.fulfill({ json: { runtime_enabled: true, installation_enabled: true, revisions, installations: job ? [{ ...job, review: null }] : [], audit: [] } });
+        }
         else if (path.endsWith('/installations/job')) await route.fulfill({ json: job });
         else await route.fulfill({ json: { current, candidates } });
         return;
@@ -62,6 +71,10 @@ test('Operator plugin page installs, explicitly reviews, publishes and rolls bac
       } else await route.fulfill({ status: 204 });
     });
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/plugin-runtime.html`);
+    await page.getByText('Current revision: 1 · baseline', { exact: true }).waitFor();
+    await page.getByRole('heading', { name: 'Available inventories', exact: true }).waitFor();
+    assert.equal(await page.getByLabel('New inventory ID').count(), 0, 'history-only controls remain pending without hiding current runtime state');
+    releaseInitialHistory();
     await page.getByText('broken current catalog', { exact: false }).waitFor();
     await page.getByLabel('New inventory ID').fill('new-inventory');
     const reference = `ghcr.io/example/new@sha256:${'a'.repeat(64)}`;
@@ -105,5 +118,5 @@ test('Operator plugin page installs, explicitly reviews, publishes and rolls bac
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
     assert.equal(await page.getByRole('heading', { name: 'Plugin installation and versions' }).count(), 0);
     assert.equal(tenantRuntimeReads, 0);
-  } finally { await browser.close(); await server.close(); }
+  } finally { releaseInitialHistory(); await browser.close(); await server.close(); }
 });

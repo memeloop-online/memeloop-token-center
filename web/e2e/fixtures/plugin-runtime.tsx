@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { I18nProvider } from '../../src/i18n';
-import { PluginsPage } from '../../src/operator/pages/OperatorPages';
+import { PluginsPage } from '../../src/operator/pages/PluginsPage';
 
 function Fixture() {
   const [reloads, setReloads] = useState(0);

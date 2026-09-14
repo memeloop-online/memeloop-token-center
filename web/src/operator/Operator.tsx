@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
+import { Fragment, lazy, Suspense, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
 import { Shell } from '../components';
 import { useI18n } from '../i18n';
 import { tenantDisplayName } from '../tenantDisplayName';
@@ -12,13 +12,8 @@ import type { RequestDrilldown } from './overviewDrilldown';
 import { useOperatorScope } from './hooks/useOperatorScope';
 import { useOperatorResource } from './hooks/useOperatorResource';
 import { useOperatorRequestStream } from './hooks/useOperatorRequestStream';
-import { CredentialsPage, PricingPage, ProvidersPage, RoutesPage, ServiceCredentialsPage } from './pages/ManagementPages';
-import { GenerationsPage, OverviewPage, PluginsPage, UsagePage } from './pages/OperatorPages';
-import { RequestsPage } from './pages/RequestsPage';
-import { SessionsPage } from './pages/SessionsPage';
-import { OperatorAccessSettings, SystemSettingsPage } from './pages/SystemSettingsPage';
+import { OperatorAccessSettings } from './OperatorAccessSettings';
 import { operatorRouteKeys, isOperatorRouteKey, type OperatorRouteKey } from './scope/operatorRoutes';
-import { TenantManager } from './TenantManager';
 import {
   PluginContributionPage,
   PluginOverviewCards,
@@ -26,6 +21,20 @@ import {
   type PluginNavigationSection,
 } from './pluginContributions';
 import type { PluginRouteKey } from '../app/routes';
+
+const CredentialsPage = lazy(() => import('./pages/ManagementPages').then((module) => ({ default: module.CredentialsPage })));
+const PricingPage = lazy(() => import('./pages/ManagementPages').then((module) => ({ default: module.PricingPage })));
+const ProvidersPage = lazy(() => import('./pages/ManagementPages').then((module) => ({ default: module.ProvidersPage })));
+const RoutesPage = lazy(() => import('./pages/ManagementPages').then((module) => ({ default: module.RoutesPage })));
+const ServiceCredentialsPage = lazy(() => import('./pages/ManagementPages').then((module) => ({ default: module.ServiceCredentialsPage })));
+const GenerationsPage = lazy(() => import('./pages/OperatorPages').then((module) => ({ default: module.GenerationsPage })));
+const OverviewPage = lazy(() => import('./pages/OperatorPages').then((module) => ({ default: module.OverviewPage })));
+const UsagePage = lazy(() => import('./pages/OperatorPages').then((module) => ({ default: module.UsagePage })));
+const PluginsPage = lazy(() => import('./pages/PluginsPage').then((module) => ({ default: module.PluginsPage })));
+const RequestsPage = lazy(() => import('./pages/RequestsPage').then((module) => ({ default: module.RequestsPage })));
+const SessionsPage = lazy(() => import('./pages/SessionsPage').then((module) => ({ default: module.SessionsPage })));
+const SystemSettingsPage = lazy(() => import('./pages/SystemSettingsPage').then((module) => ({ default: module.SystemSettingsPage })));
+const TenantManager = lazy(() => import('./TenantManager').then((module) => ({ default: module.TenantManager })));
 
 type OperatorApplicationRoute = OperatorRouteKey | PluginRouteKey;
 
@@ -194,7 +203,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
     <section id={`operator-panel-${pageId(activeRoute)}`} role="tabpanel" aria-labelledby={showNavigation ? `operator-tab-${pageId(activeRoute)}` : undefined} tabIndex={0}>
       {scope.authenticating && activeRoute !== 'settings'
         ? <div className="empty">{t('common.loading')}</div>
-        : <Fragment key={pageScopeKey}>{page}</Fragment>}
+        : <Fragment key={pageScopeKey}><Suspense fallback={<div className="empty">{t('common.loading')}</div>}>{page}</Suspense></Fragment>}
     </section>
   </>;
 
