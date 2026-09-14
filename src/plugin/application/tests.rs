@@ -190,11 +190,16 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
             .contains(directory.path().to_str().unwrap())
     );
     assert_eq!(
-        authority_a
-            .publish(publish("a", 0), "initial")
-            .await
-            .unwrap()
-            .revision,
+        management_call(
+            &first,
+            &first.config.service_token,
+            json!({"inventory_id":"a", "expected_revision":0})
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        control_get(&second, "/internal/v1/plugin-runtime").await["current"]["revision"],
         1
     );
     first.db.migrate().await.unwrap();
@@ -294,14 +299,16 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
     // Exact replay returns its original receipt, even after another head won.
     assert_eq!(
         authority_a
-            .publish(publish("a", 0), "initial")
+            .publish(publish("a", 0), "management-test")
             .await
             .unwrap()
             .revision,
         1
     );
     assert!(matches!(
-        authority_a.publish(publish("b", 1), "initial").await,
+        authority_a
+            .publish(publish("b", 1), "management-test")
+            .await,
         Err(AppError::Conflict(_))
     ));
     assert!(matches!(
