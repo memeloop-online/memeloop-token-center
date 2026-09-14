@@ -15,13 +15,13 @@ pub use lifecycle::{
     AttachProxyArchiveResult, FinishProxyRequest, FinishProxyRequestResult, FinishRequest,
     NewRequest, ProxyConversationInput, StartProxyRequest,
 };
+pub(crate) use lifecycle::{
+    ProxyRequestUpstreamAttribution, SwitchProxyCandidateInput, allocate_request_event_cursor,
+    record_request_finished_in_transaction, record_request_started_in_transaction,
+};
 #[cfg(test)]
 pub(crate) use lifecycle::{
     RequestEventCursor, claim_request_event_locator, claim_request_record_locator,
-};
-pub(crate) use lifecycle::{
-    SwitchProxyCandidateInput, allocate_request_event_cursor,
-    record_request_finished_in_transaction, record_request_started_in_transaction,
 };
 pub use metered_projection::MeteredUsageProjectionTask;
 pub use queries::RequestListFilter;

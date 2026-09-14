@@ -233,6 +233,15 @@ pub struct RecoveredClientCredential {
     pub key: String,
 }
 
+/// A service credential that an explicitly authorized global management caller
+/// requested to copy. This is never included in service-token lists.
+#[derive(Serialize)]
+pub struct RecoveredServiceCredential {
+    pub service_id: Uuid,
+    pub credential_generation: i64,
+    pub token: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct KeyView {
     pub key_id: Uuid,
@@ -369,6 +378,7 @@ pub struct ServiceTokenView {
     pub status: String,
     pub credential_generation: i64,
     pub fingerprint: String,
+    pub credential_copy_available: bool,
     pub scopes: Vec<String>,
     pub tenant_external_id: Option<String>,
     pub created_at: i64,

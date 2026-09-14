@@ -23,6 +23,7 @@ use crate::{
 };
 
 mod configuration;
+mod ui_projection;
 /// Experimental primitives only; not connected to AppState or management APIs.
 #[cfg(feature = "experimental-plugin-revisions")]
 pub mod lifecycle;
@@ -152,6 +153,7 @@ pub enum PluginOperatorUiSlot {
 #[serde(rename_all = "snake_case")]
 pub enum PluginOperatorUiPresentation {
     HealthIntelligenceV1,
+    ProjectionV1,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -42,18 +42,21 @@ test('release contains only runtime images and no retired migration delivery sur
   const memoryBinary = parsed.jobs?.['memory-binary'];
   const memoryAcceptance = parsed.jobs?.['memory-acceptance'];
   const rust = parsed.jobs?.rust;
+  const web = parsed.jobs?.web;
   const migration = parsed.jobs?.['migration-smoke'];
   assert.equal(memoryBinary?.if, "needs.changes.outputs.memory == 'true'");
   assert.equal(memoryAcceptance?.if, "needs.changes.outputs.memory == 'true'");
   assert.equal(rust?.if, "needs.changes.outputs.rust == 'true'");
+  assert.equal(web?.if, "needs.changes.outputs.web == 'true'");
   assert.equal(migration?.if, "needs.changes.outputs.migration == 'true'");
+  assert.ok(web?.needs?.includes('changes'));
   assert.ok(rust?.needs?.includes('changes'));
   assert.ok(migration?.needs?.includes('changes'));
   assert.ok(memoryBinary?.needs?.includes('changes'));
   assert.ok(memoryAcceptance?.needs?.includes('memory-binary'));
   assert.equal(memoryAcceptance?.uses, './.github/workflows/memory-acceptance.yml');
   assert.equal(memoryAcceptance?.with?.binary_artifact, 'memory-binary-${{ github.sha }}');
-  for (const jobName of ['repository-security', 'dependency-security', 'web', 'api-contract', 'packaging']) {
+  for (const jobName of ['repository-security', 'dependency-security', 'api-contract', 'packaging']) {
     assert.equal(parsed.jobs?.[jobName]?.if, undefined, `${jobName} must remain unconditional`);
   }
   assert.ok(workflow.includes('--find-renames=100%'));

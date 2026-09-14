@@ -40,16 +40,20 @@ if (eventName === 'pull_request' && changes.length === 0) {
 // allowlist, so every unknown or newly introduced path runs acceptance.
 const memorySafe = /^(?:docs\/|web\/|charts\/|openapi\/|tests\/(?!load(?:\/|$))|README\.md$|LICENSE$|\.gitignore$|compose\.yaml$)/;
 const memory = eventName === 'push' || paths.some((path) => !memorySafe.test(path));
-// Rust and migration jobs have no non-web contract that is safe to skip. Both
-// sides of rename/copy records participate, so boundary crossings stay full.
+// Both sides of rename/copy records participate, so boundary crossings stay
+// full. Static operator-contract tests neither build nor execute the service;
+// their packaging contract job remains mandatory, while production source,
+// browser, workflow, and CI-script changes remain full coverage.
 const webOnly = changes.length > 0 && changes.every(({ paths }) => paths.every((path) => path.startsWith('web/')));
-const rust = eventName === 'push' || !webOnly;
-const migration = eventName === 'push' || !webOnly;
+const staticContractsOnly = changes.length > 0 && changes.every(({ paths }) => paths.every((path) => path.startsWith('tests/ops/')));
+const rust = eventName === 'push' || !(webOnly || staticContractsOnly);
+const web = eventName === 'push' || !staticContractsOnly;
+const migration = eventName === 'push' || !(webOnly || staticContractsOnly);
 const pluginInstaller = eventName === 'push' || paths.some((path) => /^(?:\.cargo\/|\.dockerignore$|\.github\/workflows\/ci\.yml$|Cargo\.(?:toml|lock)$|Dockerfile\.plugin-installer$|packaging\/cosign\/|src\/|migrations\/|schemas\/|wit\/|vendor\/|tests\/ops\/plugin-installer-image-contract\.test\.ts$)/.test(path));
 
 appendFileSync(
   outputValue,
-  `rust=${String(rust)}\nmigration=${String(migration)}\nmemory=${String(memory)}\nplugin_installer=${String(pluginInstaller)}\n`,
+  `rust=${String(rust)}\nweb=${String(web)}\nmigration=${String(migration)}\nmemory=${String(memory)}\nplugin_installer=${String(pluginInstaller)}\n`,
   'utf8',
 );
-console.log(JSON.stringify({ event: eventName, change_count: changes.length, web_only: webOnly, rust, migration, memory, plugin_installer: pluginInstaller }));
+console.log(JSON.stringify({ event: eventName, change_count: changes.length, web_only: webOnly, static_contracts_only: staticContractsOnly, rust, web, migration, memory, plugin_installer: pluginInstaller }));

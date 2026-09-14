@@ -37,9 +37,31 @@ const percentile = (values: number[], fraction: number): number => values.length
 
 export function processMemory(pid: number): Obj {
   let status: string; try { status = readFileSync(`/proc/${pid}/status`, "utf8"); } catch { throw new HarnessFailure(`process ${pid} exited while memory was sampled`); }
-  const kib = (name: string): number => Number(new RegExp(`^${name}:\\s+(\\d+)`, "mu").exec(status)?.[1] ?? 0);
-  let pss = 0; try { pss = Number(/^Pss:\s+(\d+)/mu.exec(readFileSync(`/proc/${pid}/smaps_rollup`, "utf8"))?.[1] ?? 0); } catch { /* optional */ }
-  return { rss_mib: kib("VmRSS") / 1024, high_water_mib: kib("VmHWM") / 1024, pss_mib: pss / 1024 };
+  let smaps = ""; try { smaps = readFileSync(`/proc/${pid}/smaps_rollup`, "utf8"); } catch { /* optional */ }
+  return processMemoryFromProc(status, smaps);
+}
+
+export function processMemoryFromProc(status: string, smaps: string): Obj {
+  const statusMib = (name: string): number => Number(new RegExp(`^${name}:\\s+(\\d+)`, "mu").exec(status)?.[1] ?? 0) / 1024;
+  const smapsMib = (name: string): number => Number(new RegExp(`^${name}:\\s+(\\d+)`, "mu").exec(smaps)?.[1] ?? 0) / 1024;
+  return {
+    rss_mib: statusMib("VmRSS"),
+    high_water_mib: statusMib("VmHWM"),
+    pss_mib: smapsMib("Pss"),
+    rss_anon_mib: statusMib("RssAnon"),
+    rss_file_mib: statusMib("RssFile"),
+    rss_shmem_mib: statusMib("RssShmem"),
+    data_mib: statusMib("VmData"),
+    swap_mib: statusMib("VmSwap"),
+    pss_anon_mib: smapsMib("Pss_Anon"),
+    pss_file_mib: smapsMib("Pss_File"),
+    pss_shmem_mib: smapsMib("Pss_Shmem"),
+    private_clean_mib: smapsMib("Private_Clean"),
+    private_dirty_mib: smapsMib("Private_Dirty"),
+    shared_clean_mib: smapsMib("Shared_Clean"),
+    shared_dirty_mib: smapsMib("Shared_Dirty"),
+    anonymous_mib: smapsMib("Anonymous"),
+  };
 }
 
 export class Sampler {

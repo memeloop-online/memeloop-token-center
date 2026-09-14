@@ -17,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
+      web: ${{ steps.scope.outputs.web }}
       migration: ${{ steps.scope.outputs.migration }}
       memory: ${{ steps.scope.outputs.memory }}
       plugin_installer: ${{ steps.scope.outputs.plugin_installer }}
@@ -127,6 +128,8 @@ jobs:
           done
 
   web:
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     defaults:
