@@ -16,12 +16,22 @@ test('request detail follows terminal events and fences late responses after sel
   const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
   const browser = await chromium.launch({ headless: true });
   try {
-    const page = await browser.newPage();
+    const page = await browser.newPage({ hasTouch: true });
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/request-lifecycle.html`);
     const first = page.locator('tbody tr').filter({ has: page.getByText('model-a', { exact: true }) });
+    await page.getByRole('tooltip').filter({ hasText: 'Background scope help' }).waitFor();
     await first.locator('.table-action').click();
     await page.locator('.drawer [data-outcome="running"]').waitFor();
+    assert.equal(await page.getByRole('tooltip').filter({ hasText: 'Background scope help' }).count(), 0, 'other-scope floating content remains excluded while the drawer is open');
+    assert.equal(await page.locator('#background-help').evaluate((element) => !!element.closest('[inert]')), true, 'background controls remain inert');
+    await page.locator('.drawer .request-outcome').tap();
+    const ownedTooltip = page.getByRole('tooltip').filter({ hasText: 'No terminal outcome is recorded yet' });
+    await ownedTooltip.waitFor();
+    assert.equal(await ownedTooltip.evaluate((element) => !!element.closest('.drawer-owned-portals') && !element.closest('[inert], [aria-hidden="true"]')), true, 'only the drawer-owned portal remains in the accessible modal subtree');
+    await page.locator('.drawer .close').focus();
+    await page.locator('.drawer .request-outcome').focus();
+    await ownedTooltip.waitFor();
     assert.match(await page.locator('.drawer .request-diagnostics').first().innerText(), /Awaiting settlement/);
     await page.evaluate(() => window.requestLifecycleFixture.finish());
     await page.locator('.drawer [data-outcome="completed"]').waitFor();
@@ -29,6 +39,9 @@ test('request detail follows terminal events and fences late responses after sel
     await page.evaluate(() => { window.requestLifecycleFixture.hold(); window.requestLifecycleFixture.finish(); });
     await page.waitForFunction(() => window.requestLifecycleFixture.held);
     await page.getByRole('button', { name: 'Close', exact: true }).click();
+    await page.getByRole('tooltip').filter({ hasText: 'Background scope help' }).waitFor();
+    assert.equal(await page.locator('.drawer-owned-portals').count(), 0, 'closing removes only the owned portal subtree');
+    assert.equal(await page.locator('#background-help').evaluate((element) => !!element.closest('[inert], [aria-hidden="true"]')), false, 'closing restores background accessibility');
     await page.locator('tbody tr').filter({ has: page.getByText('model-b', { exact: true }) }).locator('.table-action').click();
     await page.getByRole('dialog', { name: 'model-b' }).waitFor();
     await page.evaluate(() => window.requestLifecycleFixture.release());
