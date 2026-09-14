@@ -101,18 +101,24 @@ fn context() -> super::super::types::RequestContext {
 }
 
 async fn assert_policy(state: &AppState, second: bool) {
-    let snapshot = state.pinned_application_plugins.clone().unwrap();
+    let snapshot = state.pinned_application_plugins.clone();
+    let baseline = state.plugins.clone();
     let expected = if second {
         "example-revisionb"
     } else {
         "example-rewritten"
     };
-    let decision = tokio::task::spawn_blocking(move || {
-        snapshot.runtime.apply_traffic_with_config(
+    let decision = tokio::task::spawn_blocking(move || match snapshot {
+        Some(snapshot) => snapshot.runtime.apply_traffic_with_config(
             context(),
             &json!({"model":"model"}),
             &BTreeMap::new(),
-        )
+        ),
+        None => baseline.apply_traffic_with_config(
+            context(),
+            &json!({"model":"model"}),
+            &BTreeMap::new(),
+        ),
     })
     .await
     .unwrap()
@@ -166,17 +172,23 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
     config.plugin_dir = a_root.to_str().map(str::to_owned);
     let first = AppState::initialize(config.clone()).await.unwrap();
     let trusted = inventory(&first.db, &[("a", a_root.clone()), ("b", b_root.clone())]);
-    let first = first
-        .with_application_plugin_inventory(trusted.clone())
-        .unwrap();
-    let second = AppState::initialize(config.clone())
-        .await
-        .unwrap()
-        .with_application_plugin_inventory(trusted.clone())
-        .unwrap();
+    let inventory_path = directory.join("host-inventory.json");
+    std::fs::write(&inventory_path, serde_json::to_vec(&trusted).unwrap()).unwrap();
+    config.plugin_inventory_file = Some(inventory_path.to_str().unwrap().to_owned());
+    let first = AppState::initialize(config.clone()).await.unwrap();
+    let second = AppState::initialize(config.clone()).await.unwrap();
     let authority_a = first.application_plugins.clone().unwrap();
     let authority_b = second.application_plugins.clone().unwrap();
-    assert!(first.clone().pin_application_plugins().await.is_err());
+    let baseline = first.clone().pin_application_plugins().await.unwrap();
+    assert_policy(&baseline, false).await;
+    let status = control_get(&first, "/internal/v1/plugin-runtime").await;
+    assert!(status["current"].is_null());
+    assert_eq!(status["candidates"].as_array().unwrap().len(), 2);
+    assert!(
+        !status
+            .to_string()
+            .contains(directory.path().to_str().unwrap())
+    );
     assert_eq!(
         authority_a
             .publish(publish("a", 0), "initial")
@@ -273,6 +285,9 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
     let fresh = first.clone().pin_application_plugins().await.unwrap();
     assert_policy(&fresh, true).await;
     assert_provider_phases(&fresh, true).await;
+    assert_control_revision(&second, "1.0.1", 2).await;
+    // Even a request begun before first publication is an immutable baseline pin.
+    assert_policy(&baseline.pin_application_plugins().await.unwrap(), false).await;
     resume.send(()).unwrap();
     request.await.unwrap();
 
@@ -294,11 +309,7 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
         Err(AppError::Conflict(_))
     ));
 
-    let restarted = AppState::initialize(config)
-        .await
-        .unwrap()
-        .with_application_plugin_inventory(trusted)
-        .unwrap();
+    let restarted = AppState::initialize(config).await.unwrap();
     assert_provider_phases(
         &restarted.clone().pin_application_plugins().await.unwrap(),
         true,
@@ -316,6 +327,7 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
         .unwrap();
     assert_eq!(rolled.revision, 3);
     assert_eq!(rolled.inventory_id, "a");
+    assert_control_revision(&second, "1.0.0", 3).await;
     assert_provider_phases(
         &second.clone().pin_application_plugins().await.unwrap(),
         false,
@@ -406,6 +418,31 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
     std::fs::write(&manifest, original).unwrap();
     std::fs::rename(&a_root, directory.join("removed-inventory-a")).unwrap();
     assert!(first.clone().pin_application_plugins().await.is_err());
+    for path in [
+        "/internal/v1/plugins",
+        "/internal/v1/provider-types",
+        "/internal/v1/plugins/example-policy-rewrite/configuration",
+        "/internal/v1/plugins/example-policy-rewrite/data/feed",
+    ] {
+        let response =
+            crate::api::router_for_role(second.clone(), crate::config::RuntimeRole::Control)
+                .oneshot(
+                    Request::get(path)
+                        .header(
+                            header::AUTHORIZATION,
+                            format!("Bearer {}", second.config.service_token),
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{path} must not use baseline"
+        );
+    }
     std::fs::rename(directory.join("removed-inventory-a"), &a_root).unwrap();
     let pinned = first.clone().pin_application_plugins().await.unwrap();
     first.db.close().await;
@@ -465,6 +502,78 @@ async fn management_call(state: &AppState, token: &str, body: serde_json::Value)
         .status()
 }
 
+async fn control_get(state: &AppState, path: &str) -> serde_json::Value {
+    let response = crate::api::router_for_role(state.clone(), crate::config::RuntimeRole::Control)
+        .oneshot(
+            Request::get(path)
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", state.config.service_token),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{path}");
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+async fn assert_control_revision(state: &AppState, version: &str, revision: i64) {
+    let manifests = control_get(state, "/internal/v1/plugins").await;
+    assert_eq!(manifests[0]["version"], version);
+    let providers = control_get(state, "/internal/v1/provider-types").await;
+    let pinned = state.clone().pin_application_plugins().await.unwrap();
+    assert_eq!(
+        providers,
+        serde_json::to_value(pinned.providers.list()).unwrap()
+    );
+    let status = control_get(state, "/internal/v1/plugin-runtime/candidates").await;
+    assert_eq!(status["current"]["revision"], revision);
+    assert!(
+        status["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate["staged"] == true)
+    );
+}
+
+#[tokio::test]
+async fn configured_empty_inventory_preserves_baseline_and_reports_no_revision() {
+    let directory = tempfile::tempdir().unwrap();
+    let inventory_path = directory.path().join("empty.json");
+    std::fs::write(&inventory_path, b"{}").unwrap();
+    let mut config = Config::for_test(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("empty.db").display()
+    ));
+    config.plugin_inventory_file = Some(inventory_path.to_str().unwrap().to_owned());
+    let state = AppState::initialize(config.clone()).await.unwrap();
+    assert!(
+        state
+            .clone()
+            .pin_application_plugins()
+            .await
+            .unwrap()
+            .plugins
+            .manifests()
+            .is_empty()
+    );
+    assert_eq!(
+        control_get(&state, "/internal/v1/plugin-runtime").await,
+        json!({"current":null,"candidates":[]})
+    );
+    std::fs::write(&inventory_path, b"{invalid").unwrap();
+    assert!(matches!(
+        AppState::initialize(config).await,
+        Err(crate::InitializationError::Plugin)
+    ));
+}
+
 #[tokio::test]
 async fn runtime_management_rejects_scoped_credentials_and_forged_candidate_fields() {
     let directory = tempfile::tempdir().unwrap();
@@ -480,6 +589,7 @@ async fn runtime_management_rejects_scoped_credentials_and_forged_candidate_fiel
     let body = json!({"inventory_id":"a", "expected_revision":0});
     state.db.create_tenant("tenant", None).await.unwrap();
     for tenant in [None, Some("tenant".to_owned())] {
+        let tenant_scoped = tenant.is_some();
         let scoped = state
             .db
             .create_service_token(
@@ -489,7 +599,7 @@ async fn runtime_management_rejects_scoped_credentials_and_forged_candidate_fiel
                         tenant.as_deref().unwrap_or("global")
                     ),
                     scopes: if tenant.is_some() {
-                        vec!["plugins:write".into()]
+                        vec!["plugins:write".into(), "plugins:read".into()]
                     } else {
                         vec!["plugins:read".into()]
                     },
@@ -502,6 +612,24 @@ async fn runtime_management_rejects_scoped_credentials_and_forged_candidate_fiel
         assert_eq!(
             management_call(&state, &scoped.token, body.clone()).await,
             StatusCode::FORBIDDEN
+        );
+        let response =
+            crate::api::router_for_role(state.clone(), crate::config::RuntimeRole::Control)
+                .oneshot(
+                    Request::get("/internal/v1/plugin-runtime")
+                        .header(header::AUTHORIZATION, format!("Bearer {}", scoped.token))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        assert_eq!(
+            response.status(),
+            if tenant_scoped {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::OK
+            }
         );
     }
     for field in ["url", "path", "wasm", "grant", "tenant_external_id"] {

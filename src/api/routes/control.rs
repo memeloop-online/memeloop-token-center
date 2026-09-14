@@ -331,8 +331,13 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
     #[cfg(feature = "experimental-plugin-revisions")]
     let authenticated = authenticated
         .route(
+            "/internal/v1/plugin-runtime",
+            get(super::super::plugins::application_plugin_status),
+        )
+        .route(
             "/internal/v1/plugin-runtime/candidates",
-            post(super::super::plugins::stage_application_plugin),
+            get(super::super::plugins::application_plugin_status)
+                .post(super::super::plugins::stage_application_plugin),
         )
         .route(
             "/internal/v1/plugin-runtime/publish",

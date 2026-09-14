@@ -33,11 +33,14 @@ canonical request is rejected. Secret values are never returned after issuance.
 
 ## Provider accounts and routes
 
-Experimental application plugin publication is documented separately in
-[the draft runtime contract](plugin-runtime-application-draft.md). Its three
+Installed plugin hot publication is documented separately in
+[the runtime contract](plugin-runtime-application-draft.md). Its three
 `/internal/v1/plugin-runtime/*` POST operations are global `plugins:write`
 management only and require both the compile-time experimental feature and
-host-provisioned inventory opt-in. They are not enabled in the production binary.
+host-provisioned `MTC_PLUGIN_INVENTORY_FILE` opt-in. The service image includes
+the feature. Global `plugins:read` credentials can query current revision and
+available/staged version IDs via `GET /internal/v1/plugin-runtime` or its
+`/candidates` alias; no filesystem roots or provenance are returned.
 Candidate requests accept opaque preinstalled inventory IDs, never package URLs,
 paths, Wasm or grants. Publish and rollback use revision CAS and idempotency;
 rollback always creates a new revision. The feature remains disabled unless a

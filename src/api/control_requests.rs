@@ -37,6 +37,7 @@ pub(super) async fn provider_types(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     require_service(&headers, &state, "providers:read").await?;
+    let state = state.pin_application_plugins().await?;
     Ok(Json(state.providers.list().to_vec()))
 }
 
@@ -45,6 +46,7 @@ pub(super) async fn plugin_manifests(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     require_service(&headers, &state, "plugins:read").await?;
+    let state = state.pin_application_plugins().await?;
     Ok(Json(state.plugins.manifests()))
 }
 

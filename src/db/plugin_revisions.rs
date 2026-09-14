@@ -2,6 +2,14 @@ use super::*;
 use crate::plugin::application::ApplicationRevision;
 
 impl Database {
+    pub(crate) async fn staged_application_plugin_ids(&self) -> Result<Vec<String>, AppError> {
+        Ok(sqlx::query_scalar(
+            "SELECT inventory_id FROM application_plugin_candidates ORDER BY inventory_id",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     pub(crate) async fn stage_application_plugin_candidate(
         &self,
         inventory_id: &str,
@@ -23,9 +31,17 @@ impl Database {
 
     /// Always consult the primary database; notifications are not authority.
     pub(crate) async fn application_plugin_head(&self) -> Result<ApplicationRevision, AppError> {
+        self.optional_application_plugin_head()
+            .await?
+            .ok_or(AppError::Internal)
+    }
+
+    pub(crate) async fn optional_application_plugin_head(
+        &self,
+    ) -> Result<Option<ApplicationRevision>, AppError> {
         let row = sqlx::query("SELECT r.revision, r.inventory_id, r.reason, c.identity_digest, c.contract_digest FROM application_plugin_head h JOIN application_plugin_revisions r ON r.revision = h.revision JOIN application_plugin_candidates c ON c.inventory_id = r.inventory_id WHERE h.scope = 'global'")
-            .fetch_optional(&self.pool).await?.ok_or(AppError::Internal)?;
-        application_revision(row)
+            .fetch_optional(&self.pool).await?;
+        row.map(application_revision).transpose()
     }
 
     pub(crate) async fn application_plugin_revision(

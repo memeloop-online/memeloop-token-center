@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::{PluginCapability, PluginRuntime, TrafficDecision, types};
 use crate::error::AppError;
@@ -19,7 +19,8 @@ const FAILURE_THRESHOLD: u32 = 3;
 const COOLDOWN: Duration = Duration::from_secs(30);
 
 /// A core/operator-owned allowlist, never read from guest configuration.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginGrant {
     pub version: String,
     pub capabilities: Vec<PluginCapability>,

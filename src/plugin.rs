@@ -312,7 +312,8 @@ pub struct PluginInstallProvenance {
 }
 
 #[cfg(feature = "experimental-plugin-revisions")]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginPackageIdentity {
     pub component_sha256: Option<String>,
     pub provenance: Option<PluginInstallProvenance>,

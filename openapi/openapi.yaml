@@ -843,12 +843,47 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
+  /internal/v1/plugin-runtime:
+    get:
+      tags: [System]
+      operationId: getApplicationPluginRuntime
+      summary: Read the current installed-plugin revision and host-approved candidates
+      description: Service images include experimental-plugin-revisions. Requires host inventory configuration and a global plugins:read credential. An unpublished head is null. No filesystem roots, digests or provenance are exposed.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:read
+      x-global-operator-only: true
+      responses:
+        '200':
+          description: Current revision and configured version IDs.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApplicationPluginStatus' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /internal/v1/plugin-runtime/candidates:
+    get:
+      tags: [System]
+      operationId: listApplicationPluginCandidates
+      summary: Read current revision and candidate versions (runtime status alias)
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:read
+      x-global-operator-only: true
+      responses:
+        '200':
+          description: Current revision and configured version IDs.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApplicationPluginStatus' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
     post:
       tags: [System]
       operationId: stageApplicationPluginInventory
       summary: Validate a preinstalled application plugin inventory (experimental)
-      description: Requires experimental-plugin-revisions and explicit host-only inventory opt-in, neither enabled in production. Global operators only; no URL, path, Wasm, grant, or tenant override is accepted. Only already-approved unchanged contracts can be staged.
+      description: Requires host-only MTC_PLUGIN_INVENTORY_FILE configuration; service images include experimental-plugin-revisions. Global operators only; no URL, path, Wasm, grant, or tenant override is accepted. Only already-approved unchanged contracts can be staged.
       security: [{ serviceBearer: [] }]
       x-required-scope: plugins:write
       x-global-operator-only: true
@@ -877,7 +912,7 @@ paths:
       tags: [System]
       operationId: publishApplicationPluginInventory
       summary: Publish a global application snapshot using revision CAS (experimental)
-      description: Requires experimental-plugin-revisions and explicit host-only inventory opt-in, neither enabled in production. Validates a preinstalled inventory and atomically publishes expected_revision plus one. Zero bootstraps an absent head. Exact idempotency replay returns its original receipt, not the latest head. Global operators only; unknown fields and remote installation inputs are rejected.
+      description: Requires host-only MTC_PLUGIN_INVENTORY_FILE configuration; service images include experimental-plugin-revisions. Validates a preinstalled inventory and atomically publishes expected_revision plus one. Zero bootstraps an absent head. Exact idempotency replay returns its original receipt, not the latest head. Global operators only; unknown fields and remote installation inputs are rejected.
       security: [{ serviceBearer: [] }]
       x-required-scope: plugins:write
       x-global-operator-only: true
@@ -912,7 +947,7 @@ paths:
       tags: [System]
       operationId: rollbackApplicationPluginInventory
       summary: Publish an earlier inventory as a new monotonic revision (experimental)
-      description: Requires experimental-plugin-revisions and explicit host-only inventory opt-in, neither enabled in production. Global operators only. Target must be earlier than expected_revision and locally available with the original approved identity. Rollback publishes expected_revision plus one and never rewinds head.
+      description: Requires host-only MTC_PLUGIN_INVENTORY_FILE configuration; service images include experimental-plugin-revisions. Global operators only. Target must be earlier than expected_revision and locally available with the original approved identity. Rollback publishes expected_revision plus one and never rewinds head.
       security: [{ serviceBearer: [] }]
       x-required-scope: plugins:write
       x-global-operator-only: true
@@ -5266,6 +5301,29 @@ components:
           schema: { type: object, additionalProperties: true }
 
   schemas:
+    ApplicationPluginStatus:
+      type: object
+      additionalProperties: false
+      required: [current, candidates]
+      properties:
+        current:
+          oneOf:
+            - { $ref: '#/components/schemas/ApplicationPluginRevision' }
+            - { type: 'null' }
+        candidates:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [inventory_id, staged, plugins]
+            properties:
+              inventory_id: { type: string }
+              staged: { type: boolean }
+              plugins:
+                type: object
+                additionalProperties:
+                  type: array
+                  items: { type: string }
     ApplicationPluginRevision:
       type: object
       additionalProperties: false
