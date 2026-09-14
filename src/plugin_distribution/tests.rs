@@ -628,27 +628,30 @@ async fn keyless_verifier_pins_identity_and_keeps_transparency_checks() {
         .verify(&reference, &digest, &RegistryCredentials::Anonymous)
         .await
         .unwrap();
-    let calls = runner.invocations.lock().unwrap();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(
-        calls[1].arguments,
-        vec![
-            OsString::from("verify"),
-            "--certificate-oidc-issuer".into(),
-            identity.issuer.clone().into(),
-            "--certificate-identity".into(),
-            identity.identity.clone().into(),
-            reference.clone().into(),
-        ]
-    );
-    assert!(
-        !calls[1]
-            .environment
-            .iter()
-            .any(|(key, _)| key.to_string_lossy().starts_with("COSIGN_"))
-    );
-    assert!(calls[1].key_path.is_none());
-    drop(calls);
+    {
+        // End the synchronous guard's lexical scope before the next verifier
+        // await; explicit drop alone is not recognized by the Clippy gate.
+        let calls = runner.invocations.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[1].arguments,
+            vec![
+                OsString::from("verify"),
+                "--certificate-oidc-issuer".into(),
+                identity.issuer.clone().into(),
+                "--certificate-identity".into(),
+                identity.identity.clone().into(),
+                reference.clone().into(),
+            ]
+        );
+        assert!(
+            !calls[1]
+                .environment
+                .iter()
+                .any(|(key, _)| key.to_string_lossy().starts_with("COSIGN_"))
+        );
+        assert!(calls[1].key_path.is_none());
+    }
     let wrong_version = PolicyCosignRunner::new(&[], reference.clone()).with_version("v3.1.3");
     assert!(
         CosignKeylessSignatureVerifier {
