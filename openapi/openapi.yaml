@@ -871,12 +871,35 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
+  /internal/v1/plugins/runtime-access:
+    get:
+      tags: [System]
+      operationId: getPluginRuntimeAccess
+      summary: Read the current plugin reader's runtime-management capability
+      description: Available without experimental features or inventory configuration. Tenant-bound plugin readers receive false for both capabilities. Global plugin readers can view runtime data when compiled in; management additionally requires plugins:write. Does not read global runtime data. The Operator mounts runtime reads only with view capability and enables mutations only with manage capability; endpoints still independently enforce authorization.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:read
+      responses:
+        '200':
+          description: Current principal capability only; no tenant or inventory information.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [can_view_runtime, can_manage_runtime]
+                properties:
+                  can_manage_runtime: { type: boolean }
+                  can_view_runtime: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
   /internal/v1/plugin-runtime:
     get:
       tags: [System]
       operationId: getApplicationPluginRuntime
       summary: Read the current installed-plugin revision and host-approved candidates
-      description: Service images include experimental-plugin-revisions. Requires host inventory configuration and a global plugins:read credential. An unpublished head is null. No filesystem roots, digests or provenance are exposed.
+      description: Service images include experimental-plugin-revisions. Requires a global plugins:read credential. Without host inventory configuration this read returns an empty status and history reports runtime_enabled false; mutations remain disabled. An unpublished head is null. No filesystem roots, digests or provenance are exposed.
       security: [{ serviceBearer: [] }]
       x-required-scope: plugins:read
       x-global-operator-only: true
@@ -886,6 +909,135 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApplicationPluginStatus' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/plugin-runtime/history:
+    get:
+      tags: [System]
+      operationId: getPluginRuntimeHistory
+      summary: Read plugin installation tasks, version history and actor audit
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:read
+      x-global-operator-only: true
+      parameters:
+        - { name: before_revision, in: query, schema: { type: integer, format: int64, minimum: 1 } }
+        - { name: before_audit_id, in: query, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: At most 100 records per list; installation summaries omit full manifests. No host paths, trust keys, registry credentials or raw process output.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PluginRuntimeHistory' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/plugin-runtime/installations:
+    post:
+      tags: [System]
+      operationId: installPluginInventory
+      summary: Install new signed OCI packages into an inactive inventory for review
+      description: Requires host installation policy. The host owns storage roots, allowed repositories, Cosign trust keys and registry credential files. Only digest-pinned references and a fresh inventory ID are accepted. A durable task survives HTTP disconnect; exact retries reuse the task. Successful download does not register grants or publish a revision.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:write
+      x-global-operator-only: true
+      parameters:
+        - { name: Idempotency-Key, in: header, required: true, schema: { type: string, minLength: 1, maxLength: 200 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [inventory_id, packages]
+              properties:
+                inventory_id: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
+                packages:
+                  type: array
+                  minItems: 1
+                  maxItems: 16
+                  uniqueItems: true
+                  items: { type: string, maxLength: 2048, pattern: '^[^@]+@sha256:[0-9A-Fa-f]{64}$' }
+      responses:
+        '202':
+          description: Durable installation task or exact replay.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PluginInstallation' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/plugin-runtime/installations/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [System]
+      operationId: getPluginInstallationReview
+      summary: Inspect one installation and its bounded signed-manifest review
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:read
+      x-global-operator-only: true
+      responses:
+        '200':
+          description: Installation detail; review includes every manifest and capability, capped at 4 MiB.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PluginInstallation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/plugin-runtime/installations/{id}/approve:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [System]
+      operationId: approvePluginInstallation
+      summary: Approve the exact reviewed package contracts and register an inactive candidate
+      description: Revalidates installed bytes, current signing-trust fingerprint and stored configuration. Grants are derived only after explicit global approval of the exact review digest. Approval is idempotent and audited; activation still requires publish CAS.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:write
+      x-global-operator-only: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [review_digest]
+              properties:
+                review_digest: { type: string, minLength: 1, maxLength: 128 }
+      responses:
+        '204': { description: 'Approved inventory registered and validated, or exact replay.' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/plugin-runtime/installations/{id}/retry:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [System]
+      operationId: retryPluginInstallation
+      summary: Retry a failed or interrupted installation under current host trust
+      description: Reuses the exact package references and owned root. Re-verifies signatures and existing package bytes. Lease attempts fence stale completion, and the retrying actor is audited.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:write
+      x-global-operator-only: true
+      responses:
+        '202':
+          description: Installation retry or current durable state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PluginInstallation' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -911,7 +1063,7 @@ paths:
       tags: [System]
       operationId: stageApplicationPluginInventory
       summary: Validate a preinstalled application plugin inventory (experimental)
-      description: Requires host-only MTC_PLUGIN_INVENTORY_FILE configuration; service images include experimental-plugin-revisions. Global operators only; no URL, path, Wasm, grant, or tenant override is accepted. Only already-approved unchanged contracts can be staged.
+      description: Requires host-only MTC_PLUGIN_INVENTORY_FILE configuration; service images include experimental-plugin-revisions. Global operators only; this staging endpoint accepts an inventory ID, never a URL, path, Wasm, grant, or tenant override. New contracts are permitted when the immutable inventory has explicit approved grants.
       security: [{ serviceBearer: [] }]
       x-required-scope: plugins:write
       x-global-operator-only: true
@@ -5726,6 +5878,58 @@ components:
           schema: { type: object, additionalProperties: true }
 
   schemas:
+    PluginInstallation:
+      type: object
+      additionalProperties: false
+      required: [id, inventory_id, actor, status, packages, completed_packages, review_digest, review, failure_category, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        inventory_id: { type: string }
+        actor: { type: string, description: Service identity or bootstrap marker; never a credential. }
+        status: { type: string, enum: [installing, review, registered, failed, interrupted] }
+        packages: { type: array, maxItems: 16, items: { type: string } }
+        completed_packages: { type: integer, minimum: 0, maximum: 16 }
+        review_digest: { type: [string, 'null'] }
+        review:
+          type: [object, 'null']
+          properties:
+            plugins: { type: array, items: { type: object } }
+        failure_category: { type: [string, 'null'], description: Bounded host category; no raw process errors. }
+        created_at: { type: integer, format: int64 }
+        updated_at: { type: integer, format: int64 }
+    PluginRuntimeHistory:
+      type: object
+      additionalProperties: false
+      required: [runtime_enabled, installation_enabled, installations, revisions, audit]
+      properties:
+        installation_enabled: { type: boolean }
+        runtime_enabled: { type: boolean }
+        installations: { type: array, maxItems: 100, items: { $ref: '#/components/schemas/PluginInstallation' } }
+        revisions:
+          type: array
+          maxItems: 100
+          items:
+            type: object
+            required: [revision, inventory_id, reason, created_at]
+            properties:
+              revision: { type: integer, format: int64 }
+              inventory_id: { type: string }
+              reason: { type: string }
+              created_at: { type: integer, format: int64 }
+        audit:
+          type: array
+          maxItems: 100
+          items:
+            type: object
+            required: [id, actor, action, inventory_id, revision, outcome, created_at]
+            properties:
+              id: { type: string, format: uuid }
+              actor: { type: string }
+              action: { type: string }
+              inventory_id: { type: [string, 'null'] }
+              revision: { type: [integer, 'null'], format: int64 }
+              outcome: { type: string }
+              created_at: { type: integer, format: int64 }
     ApplicationPluginStatus:
       type: object
       additionalProperties: false

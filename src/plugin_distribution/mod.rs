@@ -44,8 +44,10 @@ const MAX_PUBLIC_KEYS: usize = 8;
 const MAX_PUBLIC_KEY_BYTES: u64 = 64 * 1024;
 const MAX_COSIGN_OUTPUT_BYTES: u64 = 64 * 1024;
 const COSIGN_TIMEOUT: Duration = Duration::from_secs(60);
+// A whole-operation bound prevents drip-fed bodies holding an install lease.
+const OCI_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
 pub const COSIGN_VERIFIER_PATH: &str = "/usr/local/bin/cosign";
-pub const COSIGN_VERIFIER_VERSION: &str = "v3.1.3-mtc.1";
+pub const COSIGN_VERIFIER_VERSION: &str = "v3.1.3-mtc.3";
 
 #[derive(Clone, Default)]
 pub enum RegistryCredentials {
@@ -452,10 +454,13 @@ async fn install_plugin_oci_with_verifier(
         ..Default::default()
     });
     let auth = options.credentials.oci_auth();
-    let (manifest, resolved_digest) = client
-        .pull_manifest(&reference, &auth)
-        .await
-        .map_err(|_| PluginDistributionError::Registry)?;
+    let (manifest, resolved_digest) = tokio::time::timeout(
+        OCI_OPERATION_TIMEOUT,
+        client.pull_manifest(&reference, &auth),
+    )
+    .await
+    .map_err(|_| PluginDistributionError::Registry)?
+    .map_err(|_| PluginDistributionError::Registry)?;
     if resolved_digest != expected_digest {
         return Err(PluginDistributionError::InvalidArtifact(
             "registry returned a different manifest digest".to_owned(),
@@ -744,10 +749,13 @@ async fn pull_config(
     descriptor: &OciDescriptor,
 ) -> Result<ArtifactConfig, PluginDistributionError> {
     let mut buffer = BoundedBuffer::new(descriptor.size as u64);
-    client
-        .pull_blob(reference, descriptor, &mut buffer)
-        .await
-        .map_err(|_| PluginDistributionError::Registry)?;
+    tokio::time::timeout(
+        OCI_OPERATION_TIMEOUT,
+        client.pull_blob(reference, descriptor, &mut buffer),
+    )
+    .await
+    .map_err(|_| PluginDistributionError::Registry)?
+    .map_err(|_| PluginDistributionError::Registry)?;
     if buffer.bytes.len() as i64 != descriptor.size {
         return Err(PluginDistributionError::InvalidArtifact(
             "config size does not match its descriptor".to_owned(),
@@ -777,10 +785,13 @@ async fn pull_file(
         .await
         .map_err(|_| PluginDistributionError::Storage)?;
     let mut output = BoundedFile::new(output, file.maximum);
-    client
-        .pull_blob(reference, &file.descriptor, &mut output)
-        .await
-        .map_err(|_| PluginDistributionError::Registry)?;
+    tokio::time::timeout(
+        OCI_OPERATION_TIMEOUT,
+        client.pull_blob(reference, &file.descriptor, &mut output),
+    )
+    .await
+    .map_err(|_| PluginDistributionError::Registry)?
+    .map_err(|_| PluginDistributionError::Registry)?;
     if output.written != file.descriptor.size as u64 {
         return Err(PluginDistributionError::InvalidArtifact(
             "file size does not match its descriptor".to_owned(),

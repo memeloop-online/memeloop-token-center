@@ -26,6 +26,22 @@ pub(super) async fn group_routing_strategies(
     Ok(Json(state.plugins.group_routing_strategies()))
 }
 
+pub(super) async fn application_plugin_access(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "plugins:read").await?;
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "private, no-store")],
+        Json(serde_json::json!({
+            "can_view_runtime": cfg!(feature = "experimental-plugin-revisions")
+                && service.tenant_external_id.is_none(),
+            "can_manage_runtime": cfg!(feature = "experimental-plugin-revisions")
+                && service.tenant_external_id.is_none() && service.allows("plugins:write"),
+        })),
+    ))
+}
+
 #[cfg(feature = "experimental-plugin-revisions")]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -50,13 +66,99 @@ pub(in crate::api) async fn application_plugin_status(
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "plugins:read").await?;
     super::require_global_service(&service)?;
-    let authority = state
-        .application_plugins
-        .as_ref()
-        .ok_or(AppError::NotFound)?;
+    let status = match &state.application_plugins {
+        Some(authority) => authority.status().await?,
+        None => crate::plugin::application::ApplicationPluginStatus {
+            current: None,
+            candidates: Vec::new(),
+        },
+    };
     Ok((
         [(axum::http::header::CACHE_CONTROL, "private, no-store")],
-        Json(authority.status().await?),
+        Json(status),
+    ))
+}
+
+#[cfg(feature = "experimental-plugin-revisions")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PluginRuntimeHistoryQuery {
+    before_revision: Option<i64>,
+    before_audit_id: Option<String>,
+}
+
+#[cfg(feature = "experimental-plugin-revisions")]
+pub(super) async fn application_plugin_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<PluginRuntimeHistoryQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "plugins:read").await?;
+    super::require_global_service(&service)?;
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "private, no-store")],
+        Json(serde_json::json!({
+            "runtime_enabled":state.application_plugins.is_some(),
+            "installation_enabled":state.application_plugins.as_ref().is_some_and(|authority| authority.installation_enabled()),
+            "revisions":state.db.application_plugin_history(query.before_revision).await?,
+            "installations":state.db.plugin_installations().await?,
+            "audit":state.db.plugin_audit(query.before_audit_id.as_deref()).await?,
+        })),
+    ))
+}
+
+#[cfg(feature = "experimental-plugin-revisions")]
+pub(super) async fn install_application_plugin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::plugin::application::installation::InstallPluginRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let authority = application_authority(&state, &headers).await?;
+    let service = require_service(&headers, &state, "plugins:write").await?;
+    let actor = service
+        .service_id
+        .map(|id| format!("service:{id}"))
+        .unwrap_or_else(|| "bootstrap".into());
+    let record = authority
+        .install(body, runtime_operation_key(&headers)?, &actor)
+        .await?;
+    Ok((axum::http::StatusCode::ACCEPTED, Json(record)))
+}
+
+#[cfg(feature = "experimental-plugin-revisions")]
+pub(super) async fn approve_application_plugin_installation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<crate::plugin::application::installation::ApproveInstallationRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let authority = application_authority(&state, &headers).await?;
+    let service = require_service(&headers, &state, "plugins:write").await?;
+    let actor = service
+        .service_id
+        .map(|id| format!("service:{id}"))
+        .unwrap_or_else(|| "bootstrap".into());
+    authority
+        .approve_installation(&id, &body.review_digest, &actor)
+        .await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[cfg(feature = "experimental-plugin-revisions")]
+pub(super) async fn retry_application_plugin_installation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let authority = application_authority(&state, &headers).await?;
+    let service = require_service(&headers, &state, "plugins:write").await?;
+    let actor = service
+        .service_id
+        .map(|id| format!("service:{id}"))
+        .unwrap_or_else(|| "bootstrap".into());
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(authority.retry_installation(&id, &actor).await?),
     ))
 }
 
@@ -66,6 +168,23 @@ fn runtime_operation_key(headers: &HeaderMap) -> Result<&str, AppError> {
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| AppError::BadRequest("Idempotency-Key is required".into()))
+}
+
+#[cfg(feature = "experimental-plugin-revisions")]
+pub(super) async fn application_plugin_installation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "plugins:read").await?;
+    super::require_global_service(&service)?;
+    if state.application_plugins.is_none() {
+        return Err(AppError::NotFound);
+    }
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "private, no-store")],
+        Json(state.db.plugin_installation(&id).await?),
+    ))
 }
 
 #[cfg(feature = "experimental-plugin-revisions")]
@@ -86,9 +205,14 @@ pub(in crate::api) async fn publish_application_plugin(
     Json(body): Json<crate::plugin::application::PublishApplicationPlugin>,
 ) -> Result<impl IntoResponse, AppError> {
     let authority = application_authority(&state, &headers).await?;
+    let service = require_service(&headers, &state, "plugins:write").await?;
+    let actor = service
+        .service_id
+        .map(|id| format!("service:{id}"))
+        .unwrap_or_else(|| "bootstrap".into());
     Ok(Json(
         authority
-            .publish(body, runtime_operation_key(&headers)?)
+            .publish_as(body, runtime_operation_key(&headers)?, &actor)
             .await?,
     ))
 }
@@ -100,9 +224,14 @@ pub(in crate::api) async fn rollback_application_plugin(
     Json(body): Json<crate::plugin::application::RollbackApplicationPlugin>,
 ) -> Result<impl IntoResponse, AppError> {
     let authority = application_authority(&state, &headers).await?;
+    let service = require_service(&headers, &state, "plugins:write").await?;
+    let actor = service
+        .service_id
+        .map(|id| format!("service:{id}"))
+        .unwrap_or_else(|| "bootstrap".into());
     Ok(Json(
         authority
-            .rollback(body, runtime_operation_key(&headers)?)
+            .rollback_as(body, runtime_operation_key(&headers)?, &actor)
             .await?,
     ))
 }
