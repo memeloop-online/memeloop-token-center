@@ -471,7 +471,9 @@ pub(super) async fn require_members_tenant(
         "provider_groups" => "SELECT 1 FROM provider_groups WHERE tenant_id = $1 AND id = $2",
         "route_groups" => "SELECT 1 FROM route_groups WHERE tenant_id = $1 AND id = $2",
         "key_records" => "SELECT 1 FROM key_records WHERE tenant_id = $1 AND id = $2",
-        "model_routes" => "SELECT 1 FROM model_routes WHERE tenant_id = $1 AND id = $2",
+        "model_routes" => {
+            "SELECT 1 FROM model_routes WHERE archived_at IS NULL AND tenant_id = $1 AND id = $2"
+        }
         _ => return Err(AppError::Internal),
     };
     for id in ids {
