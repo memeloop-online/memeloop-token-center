@@ -29,6 +29,7 @@ test('GitHub workflow policy rejects malicious fixtures', () => {
     const mutate = (mode: string): void => {
       const payload = parse(readFileSync(workflow, 'utf8')) as Workflow;
       const publish = payload.jobs['publish-ghcr'];
+      const verifier = payload.jobs['verify-ghcr-release'];
       const dependency = payload.jobs['dependency-security'];
       const buildStep = publish.steps.find((step: Workflow) => String(step.uses ?? '').startsWith('docker/build-push-action@'));
       switch (mode) {
@@ -44,6 +45,7 @@ test('GitHub workflow policy rejects malicious fixtures', () => {
         }
         case 'exporter-downgrade': buildStep.with.outputs = 'type=image,push=true'; break;
         case 'push-shorthand-conflict': buildStep.with.push = true; break;
+        case 'verify-skipped-propagation': verifier.if = "github.event_name == 'push' && github.ref == 'refs/heads/master'"; break;
         default: throw new Error(`unknown mutation: ${mode}`);
       }
       writeFileSync(workflow, stringify(payload));
@@ -54,6 +56,7 @@ test('GitHub workflow policy rejects malicious fixtures', () => {
       'top-permissions', 'publish-permissions', 'other-packages-write', 'other-write-all',
       'other-actions-write', 'other-extra-scope', 'rustsec-folded-ignore',
       'exporter-downgrade', 'push-shorthand-conflict',
+      'verify-skipped-propagation',
     ]) { writeGood(); mutate(mode); expectRejected(mode); }
 
     writeGood();
