@@ -1,0 +1,14 @@
+.system-settings { max-width: 960px; }
+.settings-access-card.panel { border: 0; border-bottom: 1px solid var(--colorNeutralStroke2, #888); border-radius: 0; background: transparent; box-shadow: none; padding: 20px 0; }
+.settings-access-card .system-settings-access label { color: var(--colorNeutralForeground1, inherit); }
+.system-settings .settings-page-header h2 { font-family: inherit; font-size: 24px; font-weight: 600; }
+.system-settings .settings-card { padding: 20px 0; border: 0; background: transparent; box-shadow: none; }
+.system-settings .settings-empty { border: 0; border-radius: 0; padding: 16px 0; }
+.system-settings .settings-empty b,
+.system-settings .system-settings-form label { color: var(--colorNeutralForeground1, inherit); }
+.system-settings .settings-empty span,
+.system-settings .system-settings-form small,
+.system-settings .settings-status-note { color: var(--colorNeutralForeground2, inherit); font-size: 13px; }
+.settings-billing-field { display: grid; gap: 7px; min-width: 0; }
+.settings-billing-field > .fui-Combobox { width: 100%; min-width: 0; }
+.system-settings .settings-status-note { border: 0; padding: 0; }

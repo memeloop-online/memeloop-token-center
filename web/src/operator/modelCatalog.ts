@@ -37,11 +37,11 @@ export interface AssistantRouteCatalog {
 }
 
 /**
- * Admit a filter-assistant source only when the authoritative provider catalog
- * and the current model catalog jointly prove text generation. The projection
- * has no model-level modality, so a provider that declares any non-text
- * modality is ambiguous and must fail closed. Model names and custom aliases
- * are deliberately never treated as capability evidence.
+ * Match the assistant execution context: the route uses a supported text
+ * protocol and its provider supports text. Provider modalities describe a
+ * capability set, not mutually exclusive model types; additional modalities
+ * do not prevent a pure-text request. The current catalog confirms route-model
+ * membership, not model-level modality. Never infer capabilities from names.
  */
 export function assistantRouteCatalog(items: ModelPickerProjectionItem[]): AssistantRouteCatalog {
   const options: RouteModelOption[] = [];
@@ -51,8 +51,7 @@ export function assistantRouteCatalog(items: ModelPickerProjectionItem[]): Assis
       const protocol = source.capabilities.route_protocol;
       return (protocol === 'openai' || protocol === 'anthropic')
         && source.provider.protocols.includes(protocol)
-        && source.provider.modalities.length === 1
-        && source.provider.modalities[0] === 'text'
+        && source.provider.modalities.includes('text')
         && source.catalog.status === 'ready'
         && source.catalog.model_listed
         && source.capabilities.catalog_model_listed;

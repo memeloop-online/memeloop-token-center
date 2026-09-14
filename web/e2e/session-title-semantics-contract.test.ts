@@ -13,7 +13,7 @@ test('session titles use only explicitly reported names', () => {
 
 test('session identifiers remain inside diagnostic disclosures', () => {
   assert.match(sessions, /<details><summary>\{t\('sessions\.diagnostics'\)\}<\/summary><code>\{session\.session_id\}<\/code>/);
-  assert.match(sessions, /showDiagnosticIds && <details className="session-diagnostics"/);
+  assert.match(sessions, /showDiagnosticIds && <div className="session-diagnostics"><Disclosure/);
   assert.match(sessions, /reportedSessionId && <>/);
   assert.doesNotMatch(sessions, /reportedSession && <span>/);
   assert.doesNotMatch(sessions, /const title[^;]*session_id/);

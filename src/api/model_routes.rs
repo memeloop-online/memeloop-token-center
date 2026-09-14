@@ -60,6 +60,7 @@ pub(super) async fn create_model_route(
     let service = require_service(&headers, &state, "routes:write").await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
     let idempotency_key = route_create_idempotency_key(&headers, &state)?;
+    let state = state.pin_application_plugins().await?;
     let mut upstream_account_ids = body.upstream_account_ids;
     if let Some(legacy_account_id) = body.upstream_account_id {
         upstream_account_ids.push(legacy_account_id);
@@ -240,6 +241,7 @@ pub(super) async fn update_model_route(
     let service = require_service(&headers, &state, "routes:write").await?;
     let tenant = management_tenant(&service, Some(body.tenant_external_id))?
         .ok_or_else(|| AppError::BadRequest("tenant_external_id is required".into()))?;
+    let state = state.pin_application_plugins().await?;
     let mut upstream_account_ids = body.upstream_account_ids;
     if let Some(legacy_account_id) = body.upstream_account_id {
         upstream_account_ids.push(legacy_account_id);

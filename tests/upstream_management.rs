@@ -6,8 +6,9 @@ use memeloop_token_center::{
     AppState, api,
     config::{Config, RuntimeRole},
     db::{
-        CreateModelRouteInput, CreateRoutedModelRouteInput, CreateServiceTokenInput,
-        CreateUpstreamAccountInput, Database, ReauthorizeUpstreamAccountInput,
+        ClaimUpstreamOAuthRefreshResult, CreateModelRouteInput, CreateRoutedModelRouteInput,
+        CreateServiceTokenInput, CreateUpstreamAccountInput, Database,
+        ReauthorizeUpstreamAccountInput,
     },
     provider::{UpstreamAccountView, UpstreamCredential},
 };
@@ -819,6 +820,146 @@ async fn codex_proxy_rotation_fences_stale_reauthorization_and_token_rotation() 
     assert_eq!(rotated.proxy_scheme.as_deref(), Some("socks5h"));
 }
 
+#[tokio::test]
+async fn codex_proxy_rotation_cannot_clone_a_dispatched_refresh_token() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory
+            .path()
+            .join("codex-proxy-refresh-fence.db")
+            .display()
+    );
+    let state = AppState::initialize(Config::for_test(database_url))
+        .await
+        .unwrap();
+    let pepper = state.config.key_pepper.as_bytes();
+    let original_proxy = "socks5h://100.64.0.40:1080";
+    let replacement_proxy = "socks5h://100.64.0.41:1080";
+    let refresh_url = "https://auth.openai.com/oauth/token";
+    let credential =
+        |access_token: &str, refresh_token: &str, proxy_url: &str| UpstreamCredential::OAuth {
+            access_token: access_token.into(),
+            refresh_token: Some(refresh_token.into()),
+            expires_at: Some(memeloop_token_center::db::unix_millis() + 3_600_000),
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            adapter_state: Some(json!({
+                "schema": "openai-codex-oauth-v1",
+                "account_id": "refresh-fenced-account"
+            })),
+            proxy_url: Some(proxy_url.into()),
+            proxy_network_scope: Some(memeloop_token_center::network::OutboundScope::Private),
+        };
+    let account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "codex-proxy-refresh-fence".into(),
+                name: "Refresh fenced Codex".into(),
+                driver: "openai-codex".into(),
+                config: json!({
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "network_scope": "public",
+                    "reservation_token_bounds": {}
+                }),
+                credential: credential("access-v1", "refresh-v1", original_proxy),
+                oauth_session_id: Some(Uuid::now_v7()),
+                oauth_driver: Some("openai_codex_device".into()),
+                oauth_refresh_url: Some(refresh_url.into()),
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let refresh_key = "codex-proxy-refresh-fence";
+    let claim = state
+        .db
+        .claim_upstream_oauth_refresh(account.id, refresh_key, pepper)
+        .await
+        .unwrap();
+    let ClaimUpstreamOAuthRefreshResult::Claimed(claim) = claim else {
+        panic!("first refresh must claim the current generation");
+    };
+    assert_eq!(claim.credential_generation, account.credential_generation);
+    assert_eq!(claim.driver, "openai_codex_device");
+    assert_eq!(claim.refresh_url, refresh_url);
+    state
+        .db
+        .mark_upstream_oauth_refresh_request_started(account.id, refresh_key)
+        .await
+        .unwrap();
+
+    let blocked = state
+        .db
+        .rotate_codex_transport_proxy(
+            account.id,
+            "codex-proxy-refresh-fence",
+            replacement_proxy.into(),
+            account.updated_at,
+            account.credential_generation,
+            "proxy-after-refresh-dispatch",
+            None,
+            pepper,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        &blocked,
+        memeloop_token_center::error::AppError::Conflict(_)
+    ));
+    assert!(blocked.to_string().contains("already dispatched"));
+
+    let refreshed = state
+        .db
+        .finish_upstream_oauth_refresh(
+            account.id,
+            credential("access-v2", "refresh-v2", original_proxy),
+            refresh_key,
+            pepper,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        refreshed.credential_generation,
+        account.credential_generation + 1
+    );
+    let (rotated, changed) = state
+        .db
+        .rotate_codex_transport_proxy(
+            account.id,
+            "codex-proxy-refresh-fence",
+            replacement_proxy.into(),
+            refreshed.updated_at,
+            refreshed.credential_generation,
+            "proxy-after-refresh-finalize",
+            None,
+            pepper,
+        )
+        .await
+        .unwrap();
+    assert!(changed);
+    assert_eq!(
+        rotated.credential_generation,
+        refreshed.credential_generation + 1
+    );
+    let (_, installed, _, _) = state
+        .db
+        .upstream_account_with_current_credential(account.id, pepper)
+        .await
+        .unwrap();
+    let UpstreamCredential::OAuth {
+        refresh_token,
+        proxy_url,
+        ..
+    } = installed
+    else {
+        panic!("Codex credential must stay OAuth");
+    };
+    assert_eq!(refresh_token.as_deref(), Some("refresh-v2"));
+    assert_eq!(proxy_url.as_deref(), Some(replacement_proxy));
+}
+
 fn account(value: Value) -> UpstreamAccountView {
     serde_json::from_value(value).unwrap()
 }
@@ -1311,17 +1452,17 @@ async fn oauth_refresh_lease_is_account_generation_scoped_and_stale_safe() {
     assert!(account.can_refresh);
     assert!(account.config.get("oauth").is_none());
 
-    assert!(
+    assert!(matches!(
         state
             .db
-            .begin_upstream_oauth_refresh(account.id, "refresh-lease-a", pepper)
+            .claim_upstream_oauth_refresh(account.id, "refresh-lease-a", pepper)
             .await
-            .unwrap()
-            .is_none()
-    );
+            .unwrap(),
+        ClaimUpstreamOAuthRefreshResult::Claimed(_)
+    ));
     let concurrent = state
         .db
-        .begin_upstream_oauth_refresh(account.id, "refresh-lease-b", pepper)
+        .claim_upstream_oauth_refresh(account.id, "refresh-lease-b", pepper)
         .await
         .unwrap_err();
     assert!(matches!(
@@ -1378,14 +1519,14 @@ async fn oauth_refresh_lease_is_account_generation_scoped_and_stale_safe() {
         .await
         .unwrap();
 
-    assert!(
+    assert!(matches!(
         state
             .db
-            .begin_upstream_oauth_refresh(account.id, "refresh-lease-b", pepper)
+            .claim_upstream_oauth_refresh(account.id, "refresh-lease-b", pepper)
             .await
-            .unwrap()
-            .is_none()
-    );
+            .unwrap(),
+        ClaimUpstreamOAuthRefreshResult::Claimed(_)
+    ));
     let refreshed = state
         .db
         .finish_upstream_oauth_refresh(
@@ -1447,14 +1588,14 @@ async fn oauth_refresh_finalize_failure_recovers_pending_ciphertext_without_remo
         .await
         .unwrap();
     let idempotency_key = format!("oauth-worker-{}-generation-1", account.id);
-    assert!(
+    assert!(matches!(
         state
             .db
-            .begin_upstream_oauth_refresh(account.id, &idempotency_key, pepper)
+            .claim_upstream_oauth_refresh(account.id, &idempotency_key, pepper)
             .await
-            .unwrap()
-            .is_none()
-    );
+            .unwrap(),
+        ClaimUpstreamOAuthRefreshResult::Claimed(_)
+    ));
     state
         .db
         .mark_upstream_oauth_refresh_request_started(account.id, &idempotency_key)
@@ -1515,18 +1656,22 @@ async fn oauth_refresh_finalize_failure_recovers_pending_ciphertext_without_remo
     // No authorization-server call or plaintext token is needed here.
     let recovered = state
         .db
-        .begin_upstream_oauth_refresh(account.id, &idempotency_key, pepper)
+        .claim_upstream_oauth_refresh(account.id, &idempotency_key, pepper)
         .await
-        .unwrap()
-        .expect("pending OAuth result finalized");
+        .unwrap();
+    let ClaimUpstreamOAuthRefreshResult::Replay(recovered) = recovered else {
+        panic!("pending OAuth result must be finalized");
+    };
     assert_eq!(recovered.id, account.id);
     assert_eq!(recovered.credential_generation, 2);
     let replay = state
         .db
-        .begin_upstream_oauth_refresh(account.id, &idempotency_key, pepper)
+        .claim_upstream_oauth_refresh(account.id, &idempotency_key, pepper)
         .await
-        .unwrap()
-        .expect("committed result replayed exactly");
+        .unwrap();
+    let ClaimUpstreamOAuthRefreshResult::Replay(replay) = replay else {
+        panic!("committed result must replay exactly");
+    };
     assert_eq!(replay.id, recovered.id);
     assert_eq!(
         replay.credential_generation,

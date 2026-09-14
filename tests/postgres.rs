@@ -1,7 +1,8 @@
 use memeloop_token_center::{
     db::{
-        CreateGenerationJobInput, CreateKeyInput, CreateModelRouteInput, CreateServiceTokenInput,
-        CreateUpstreamAccountInput, Database, FinishGenerationJobInput, StatsFilter, unix_millis,
+        ClaimUpstreamOAuthRefreshResult, CreateGenerationJobInput, CreateKeyInput,
+        CreateModelRouteInput, CreateServiceTokenInput, CreateUpstreamAccountInput, Database,
+        FinishGenerationJobInput, StatsFilter, unix_millis,
     },
     error::{AppError, LimitReason},
     model::{ArchivedGenerationAsset, GenerationStagedAssets, KeyPolicy},
@@ -365,7 +366,7 @@ async fn postgres_oauth_refresh_has_one_account_generation_lease() {
         tasks.push(tokio::spawn(async move {
             barrier.wait().await;
             let result = database
-                .begin_upstream_oauth_refresh(account.id, &key, pepper)
+                .claim_upstream_oauth_refresh(account.id, &key, pepper)
                 .await;
             (key, result)
         }));
@@ -375,17 +376,39 @@ async fn postgres_oauth_refresh_has_one_account_generation_lease() {
     for task in tasks {
         let (key, result) = task.await.unwrap();
         match result {
-            Ok(None) => winner = Some(key),
+            Ok(ClaimUpstreamOAuthRefreshResult::Claimed(claim)) => winner = Some((key, claim)),
             Err(AppError::Conflict(_)) => conflicts += 1,
             other => panic!("unexpected PostgreSQL OAuth lease result: {other:?}"),
         }
     }
     assert_eq!(conflicts, 7);
-    let winner = winner.expect("one refresh lease winner");
+    let (winner, claim) = winner.expect("one refresh lease winner");
+    assert_eq!(claim.credential_generation, account.credential_generation);
+    assert_eq!(claim.driver, "cursor");
+    assert_eq!(claim.refresh_url, "https://oauth.example.test/refresh");
     database
         .mark_upstream_oauth_refresh_request_started(account.id, &winner)
         .await
         .unwrap();
+    let blocked_proxy_rotation = database
+        .rotate_codex_transport_proxy(
+            account.id,
+            &format!("postgres-oauth-lease-{unique}"),
+            "socks5h://100.64.0.42:1080".into(),
+            account.updated_at,
+            account.credential_generation,
+            &format!("postgres-proxy-after-refresh-{unique}"),
+            None,
+            pepper,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(&blocked_proxy_rotation, AppError::Conflict(_)));
+    assert!(
+        blocked_proxy_rotation
+            .to_string()
+            .contains("already dispatched")
+    );
     let refreshed = database
         .finish_upstream_oauth_refresh(
             account.id,
@@ -407,10 +430,12 @@ async fn postgres_oauth_refresh_has_one_account_generation_lease() {
     assert_eq!(refreshed.id, account.id);
     assert_eq!(refreshed.credential_generation, 2);
     let replay = database
-        .begin_upstream_oauth_refresh(account.id, &winner, pepper)
+        .claim_upstream_oauth_refresh(account.id, &winner, pepper)
         .await
-        .unwrap()
-        .expect("PostgreSQL exact committed replay");
+        .unwrap();
+    let ClaimUpstreamOAuthRefreshResult::Replay(replay) = replay else {
+        panic!("PostgreSQL exact committed replay must be returned");
+    };
     assert_eq!(replay.id, account.id);
     assert_eq!(replay.credential_generation, 2);
 }

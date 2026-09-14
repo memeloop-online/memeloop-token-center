@@ -13,6 +13,7 @@ pub(in crate::api) async fn list_models(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
+    let state = state.pin_application_plugins().await?;
     let sources = state
         .db
         .granted_model_capability_sources(key.key_id, key.tenant_id)

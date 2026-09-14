@@ -427,6 +427,7 @@ pub(in crate::api) async fn start_cursor_oauth(
         start_cursor_login(
             &state.db,
             StartCursorLogin {
+                application_plugin_revision: state.application_plugin_revision(),
                 tenant_external_id: body.tenant_external_id,
                 account_name: body.account_name,
                 provider_driver: body.provider_driver,
@@ -502,6 +503,7 @@ pub(in crate::api) async fn start_provider_adapter_oauth(
         start_cursor_login(
             &state.db,
             StartCursorLogin {
+                application_plugin_revision: state.application_plugin_revision(),
                 tenant_external_id: body.tenant_external_id,
                 account_name: body.account_name,
                 provider_driver: body.provider_driver,
@@ -534,7 +536,17 @@ pub(in crate::api) async fn poll_cursor_oauth(
     Json(body): Json<PollCursorOAuthRequest>,
 ) -> Result<Response, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
-    let state = state.pin_application_plugins().await?;
+    let revision = crate::oauth::cursor_login_application_revision(
+        &body.session_token,
+        state.config.key_pepper.as_bytes(),
+        unix_millis(),
+        crate::oauth::CursorPollAuthority {
+            required_tenant: service.tenant_external_id.as_deref(),
+            operator_service_id: service.service_id,
+            allow_test_loopback: state.config.allow_oauth_loopback,
+        },
+    )?;
+    let state = state.pin_oauth_application_revision(revision).await?;
     match poll_cursor_login(
         &state.db,
         &state.providers,
@@ -777,18 +789,23 @@ async fn refresh_managed_upstream_oauth_impl(
 ) -> Result<crate::provider::UpstreamAccountView, AppError> {
     let pinned = state.clone().pin_application_plugins().await?;
     let state = &pinned;
-    let (driver, refresh_url) = state.db.upstream_oauth_lifecycle(account_id).await?;
-    if let Some(replay) = state
+    let claim = match state
         .db
-        .begin_upstream_oauth_refresh(
+        .claim_upstream_oauth_refresh(
             account_id,
             idempotency_key,
             state.config.key_pepper.as_bytes(),
         )
         .await?
     {
-        return Ok(replay);
-    }
+        crate::db::ClaimUpstreamOAuthRefreshResult::Replay(replay) => return Ok(*replay),
+        crate::db::ClaimUpstreamOAuthRefreshResult::Claimed(claim) => claim,
+    };
+    let crate::db::ClaimedUpstreamOAuthRefresh {
+        credential_generation,
+        driver,
+        refresh_url,
+    } = claim;
     let request_guard =
         crate::oauth::DurableOAuthRefreshRequestGuard::new(&state.db, account_id, idempotency_key);
     let refreshed: Result<UpstreamCredential, AppError> = async {
@@ -796,6 +813,11 @@ async fn refresh_managed_upstream_oauth_impl(
             .db
             .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
             .await?;
+        if account.credential_generation != credential_generation {
+            return Err(AppError::Conflict(
+                "OAuth credential changed before its refresh request was dispatched".into(),
+            ));
+        }
         if credential.proxy().is_some() && !supports_oauth_refresh_proxy(&driver) {
             return Err(AppError::BadRequest(
                 "this OAuth lifecycle does not support a private proxy".into(),

@@ -525,6 +525,37 @@ async fn control_get(state: &AppState, path: &str) -> serde_json::Value {
     serde_json::from_slice(&body).unwrap()
 }
 
+async fn application_json(
+    state: &AppState,
+    role: crate::config::RuntimeRole,
+    method: &str,
+    path: &str,
+    token: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let response = crate::api::router_for_role(state.clone(), role)
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(if method == "GET" {
+                    Body::empty()
+                } else {
+                    Body::from(serde_json::to_vec(&body).unwrap())
+                })
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
 async fn assert_control_revision(state: &AppState, version: &str, revision: i64) {
     let manifests = control_get(state, "/internal/v1/plugins").await;
     assert_eq!(manifests[0]["version"], version);
@@ -572,14 +603,33 @@ async fn running_authority_admits_new_contract_and_pins_history_without_restart(
         .unwrap();
     let previous = state.clone().pin_application_plugins().await.unwrap();
     assert!(previous.providers.get(PROVIDER).is_none());
+    authority.status().await.unwrap();
+    authority.status().await.unwrap();
+    assert_eq!(
+        authority
+            .inventory_reads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
 
     // The new signed package, provider/OAuth contract and host grant did not
     // exist when either AppState or the authority was created.
     let new_root = directory.path().join("new-root");
     write_inventory(&new_root, false);
+    let manifest_path = new_root.join("example-policy-rewrite/plugin.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["contributions"]["providers"][0]["credential_schema"] = json!({"type":"object"});
+    std::fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
     trusted.extend(inventory(&state.db, &[("new", new_root)]));
     std::fs::write(&inventory_path, serde_json::to_vec(&trusted).unwrap()).unwrap();
     assert_eq!(authority.status().await.unwrap().candidates.len(), 2);
+    assert_eq!(
+        authority
+            .inventory_reads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
     authority
         .publish(publish("new", 1), "new-contract")
         .await
@@ -594,6 +644,98 @@ async fn running_authority_admits_new_contract_and_pins_history_without_restart(
             .is_some()
     );
     assert_provider_phases(&current, false).await;
+    use crate::config::RuntimeRole;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+    let mock = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/poll"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "accessToken":"test-access", "refreshToken":"test-refresh", "accountId":"stable-cursor-id"
+        }))).expect(1).mount(&mock).await;
+    let issued = state
+        .db
+        .create_key(
+            crate::db::CreateKeyInput {
+                tenant_external_id: "dynamic-tenant".into(),
+                principal_external_id: "dynamic-user".into(),
+                alias: "dynamic-key".into(),
+                currency: "USD".into(),
+                policy: crate::model::KeyPolicy {
+                    allowed_models: vec!["*".into()],
+                    ..Default::default()
+                },
+                initial_balance: rust_decimal::Decimal::ONE,
+                idempotency_key: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let token = &state.config.service_token;
+    let (status, account) = application_json(&state, RuntimeRole::Control, "POST", "/internal/v1/upstreams", token,
+        json!({"tenant_external_id":"dynamic-tenant","name":"new-provider-account","driver":PROVIDER,
+            "config":{"base_url":mock.uri(),"network_scope":"private"},"credential":{"type":"api_key","value":"test-key"}})).await;
+    assert_eq!(status, StatusCode::CREATED, "{account}");
+    let route_body = json!({"tenant_external_id":"dynamic-tenant","public_model":"dynamic-model",
+        "upstream_account_ids":[account["id"]],"upstream_model":"dynamic-upstream","protocol":"openai",
+        "custom_model_confirmed":true,"granted_credential_ids":[issued.key_id]});
+    let (status, route) = application_json(
+        &state,
+        RuntimeRole::Control,
+        "POST",
+        "/internal/v1/model-routes",
+        token,
+        route_body.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{route}");
+    let mut update = route_body;
+    update["priority"] = json!(1);
+    update["expected_updated_at"] = route["updated_at"].clone();
+    update["expected_grant_revision"] = route["grant_revision"].clone();
+    let (status, updated) = application_json(
+        &state,
+        RuntimeRole::Control,
+        "PUT",
+        &format!(
+            "/internal/v1/model-routes/{}",
+            route["id"].as_str().unwrap()
+        ),
+        token,
+        update,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    let picker = control_get(
+        &state,
+        "/internal/v1/model-picker-options?tenant_external_id=dynamic-tenant&selection_kind=route",
+    )
+    .await;
+    assert!(picker.to_string().contains("dynamic-model"), "{picker}");
+    let (status, models) = application_json(
+        &state,
+        RuntimeRole::Gateway,
+        "GET",
+        "/v1/models",
+        &issued.key,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{models}");
+    assert!(
+        models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| model["id"] == "dynamic-model")
+    );
+    let (status, login) = application_json(&state, RuntimeRole::Control, "POST", "/internal/v1/oauth/cursor/start", token,
+        json!({"tenant_external_id":"dynamic-tenant","account_name":"historical-oauth","provider_driver":PROVIDER,
+            "provider_config":{"base_url":mock.uri(),"network_scope":"private"},
+            "endpoints":{"login_url":format!("{}/login",mock.uri()),"poll_url":format!("{}/poll",mock.uri()),"refresh_url":format!("{}/refresh",mock.uri())}})).await;
+    assert_eq!(status, StatusCode::OK, "{login}");
     assert!(previous.providers.get(PROVIDER).is_none());
     let resumed = state
         .clone()
@@ -610,6 +752,15 @@ async fn running_authority_admits_new_contract_and_pins_history_without_restart(
     );
     assert!(nested.providers.get(PROVIDER).is_none());
     assert!(nested.plugins.manifests().is_empty());
+    let startup_session = state
+        .clone()
+        .pin_oauth_application_revision(None)
+        .await
+        .unwrap()
+        .pin_application_plugins()
+        .await
+        .unwrap();
+    assert!(startup_session.providers.get(PROVIDER).is_none());
     assert!(
         authority
             .pin_historical(1)
@@ -647,6 +798,30 @@ async fn running_authority_admits_new_contract_and_pins_history_without_restart(
             .get(PROVIDER)
             .is_none()
     );
+    // Session started with revision 2, but current revision 3 removed its
+    // provider. Poll and consumed replay must use the authenticated old pin.
+    let poll_body = json!({"session_token":login["session_token"]});
+    let (status, connected) = application_json(
+        &state,
+        RuntimeRole::Control,
+        "POST",
+        "/internal/v1/oauth/cursor/poll",
+        token,
+        poll_body.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{connected}");
+    let (status, replay) = application_json(
+        &state,
+        RuntimeRole::Control,
+        "POST",
+        "/internal/v1/oauth/cursor/poll",
+        token,
+        poll_body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(connected["id"], replay["id"]);
     assert!(
         authority
             .pin_historical(2)
@@ -668,6 +843,47 @@ async fn running_authority_admits_new_contract_and_pins_history_without_restart(
             .get(PROVIDER)
             .is_some()
     );
+
+    // Committed operation replay needs no local package access or compilation.
+    std::fs::rename(
+        directory.path().join("new-root"),
+        directory.path().join("offline-root"),
+    )
+    .unwrap();
+    let count = authority
+        .compilations
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        authority
+            .publish(publish("new", 1), "new-contract")
+            .await
+            .unwrap()
+            .revision,
+        2
+    );
+    assert!(
+        authority
+            .publish(publish("empty", 1), "new-contract")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        authority
+            .compilations
+            .load(std::sync::atomic::Ordering::Relaxed),
+        count
+    );
+    assert!(authority.pin_historical(2).await.is_err());
+    let (status, _) = application_json(
+        &state,
+        RuntimeRole::Control,
+        "POST",
+        "/internal/v1/oauth/cursor/poll",
+        token,
+        json!({"session_token":login["session_token"]}),
+    )
+    .await;
+    assert!(!status.is_success());
 
     // A host publication cannot silently mutate or remove an observed ID.
     trusted.remove("empty");
@@ -699,6 +915,24 @@ async fn configured_empty_inventory_preserves_baseline_and_reports_no_revision()
     assert_eq!(
         control_get(&state, "/internal/v1/plugin-runtime").await,
         json!({"current":null,"candidates":[]})
+    );
+    let authority = state.application_plugins.as_ref().unwrap();
+    assert_eq!(
+        authority
+            .inventory_reads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    // An atomic same-length replacement must invalidate the metadata cache.
+    let replacement = directory.path().join("replacement.json");
+    std::fs::write(&replacement, b"{}").unwrap();
+    std::fs::rename(replacement, &inventory_path).unwrap();
+    authority.status().await.unwrap();
+    assert_eq!(
+        authority
+            .inventory_reads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2
     );
     std::fs::write(&inventory_path, b"{invalid").unwrap();
     assert!(matches!(

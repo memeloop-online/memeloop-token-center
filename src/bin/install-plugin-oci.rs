@@ -138,10 +138,35 @@ fn register_inventory(
         return Err("absolute inventory paths required".into());
     }
     let entry: PreinstalledInventory = serde_json::from_slice(&read_json(entry_path)?)?;
+    let manifest = memeloop_token_center::plugin::validate_plugin_package(&installed.path)?;
+    let manifest_digest = memeloop_token_center::plugin::lifecycle::manifest_digest(&manifest)?;
+    let provenance: memeloop_token_center::plugin::PluginInstallProvenance =
+        serde_json::from_slice(&read_json(&installed.path.join(".mtc-oci-install.json"))?)?;
+    let component_sha256 = match &manifest.wasm {
+        Some(wasm) => {
+            use sha2::{Digest, Sha256};
+            let mut bytes = Vec::new();
+            std::fs::File::open(installed.path.join(wasm))?
+                .take(64 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > 64 * 1024 * 1024 {
+                return Err("plugin component too large".into());
+            }
+            Some(format!("sha256:{:x}", Sha256::digest(&bytes)))
+        }
+        None => None,
+    };
     if entry.root != root
+        || installed.path != root.join(&manifest.id)
+        || manifest.id != installed.id
+        || manifest.version != installed.version
         || !entry.grants.get(&installed.id).is_some_and(|grants| {
             grants.iter().any(|grant| {
                 grant.version == installed.version
+                    && grant.manifest_digest == manifest_digest
+                    && grant.capabilities == manifest.capabilities
+                    && grant.identity.component_sha256 == component_sha256
+                    && grant.identity.provenance.as_ref() == Some(&provenance)
                     && grant.identity.provenance.as_ref().is_some_and(|receipt| {
                         receipt.source == installed.source
                             && receipt.digest == installed.digest
@@ -164,8 +189,11 @@ fn register_inventory(
         Ok(bytes) => serde_json::from_slice(&bytes)?,
         Err(error) => return Err(error),
     };
-    if inventory.contains_key(id) {
-        return Err("inventory ID already registered".into());
+    if let Some(existing) = inventory.get(id) {
+        if serde_json::to_value(existing)? == serde_json::to_value(&entry)? {
+            return Ok(());
+        }
+        return Err("inventory ID already registered with different contents".into());
     }
     inventory.insert(id.to_owned(), entry);
     let bytes = serde_json::to_vec_pretty(&inventory)?;
@@ -252,17 +280,37 @@ mod inventory_tests {
             source: "ghcr.io/example/plugins".into(),
             path: root.join("new-plugin"),
         };
+        std::fs::create_dir_all(&installed.path).unwrap();
+        let manifest: memeloop_token_center::plugin::PluginManifest =
+            serde_json::from_value(serde_json::json!({
+                "id":"new-plugin", "version":"1.0.0", "wit_version":"0.2.0", "wasm":null,
+                "capabilities":[], "contributions":{}
+            }))
+            .unwrap();
+        std::fs::write(
+            installed.path.join("plugin.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let manifest_digest =
+            memeloop_token_center::plugin::lifecycle::manifest_digest(&manifest).unwrap();
         let entry = serde_json::json!({"root":root,"grants":{"new-plugin":[{
-            "version":"1.0.0","capabilities":[],"manifest_digest":"reviewed-manifest",
+            "version":"1.0.0","capabilities":[],"manifest_digest":manifest_digest,
             "identity":{"component_sha256":null,"provenance":{
                 "format_version":1,"source":installed.source,"digest":installed.digest,
                 "signature_policy":"cosign-public-key"
             }}
         }]}});
+        std::fs::write(
+            installed.path.join(".mtc-oci-install.json"),
+            serde_json::to_vec(&entry["grants"]["new-plugin"][0]["identity"]["provenance"])
+                .unwrap(),
+        )
+        .unwrap();
         std::fs::write(&entry_path, serde_json::to_vec(&entry).unwrap()).unwrap();
         register_inventory(&path, &entry_path, "new", &root, &installed).unwrap();
         let original = std::fs::read(&path).unwrap();
-        assert!(register_inventory(&path, &entry_path, "new", &root, &installed).is_err());
+        register_inventory(&path, &entry_path, "new", &root, &installed).unwrap();
         let mut wrong = installed;
         wrong.digest = format!("sha256:{}", "b".repeat(64));
         assert!(register_inventory(&path, &entry_path, "other", &root, &wrong).is_err());
