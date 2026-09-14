@@ -106,8 +106,8 @@ export function GenerationWorkspace({ token, tenant, writeTenant = tenant }: { t
 
   return <>{confirmationDialog}
     <ImageGenerationQuarantine token={token} tenant={tenant} writeTenant={writeTenant} />
-    {error && <div className="notice error" role="alert">{error}</div>}
-    {message && <div className="notice success" role="status">{message}</div>}
+    {!detail && error && <div className="notice error" role="alert">{error}</div>}
+    {!detail && message && <div className="notice success" role="status">{message}</div>}
     <article className="panel operator-generations">
       <div className="panel-title"><div><h2>{t('generations.title')}</h2><p className="muted">{t('generations.description')}</p></div><div className="row-actions"><span>{formatNumber(jobs.length, locale)}</span><button type="button" className="secondary" disabled={loading || !token.trim()} onClick={() => void load()}>{loading ? t('common.loading') : t('usage.refresh')}</button></div></div>
       {jobs.length === 0 ? <div className="empty">{loading ? t('common.loading') : t('generations.empty')}</div> : <div className="table-scroll"><table>
@@ -123,6 +123,8 @@ export function GenerationWorkspace({ token, tenant, writeTenant = tenant }: { t
       </table></div>}
     </article>
     {detail && <DrawerFrame title={detail.model} eyebrow={t('generations.detailTitle')} onClose={() => setDetail(undefined)}>
+      {error && <div className="notice error" role="alert">{error}</div>}
+      {message && <div className="notice success" role="status">{message}</div>}
       <p className="muted break-anywhere">{detail.job_id} · {detail.tenant_external_id} · {detail.key_alias}</p>
       <h3>{t('request.status')}</h3><pre>{detail.status}</pre>
       <h3>{t('generations.units')}</h3><pre>{JSON.stringify({ estimated: detail.estimated_units, billed: detail.billed_units, billing_unit: detail.billing_unit, cost: detail.cost, currency: detail.currency }, null, 2)}</pre>

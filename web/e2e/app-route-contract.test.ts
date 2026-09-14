@@ -52,14 +52,5 @@ test('application shell preserves native links and provides modal mobile navigat
   assert.match(styles, /\.drawer-backdrop \{ z-index: 80; \}/);
 });
 
-test('drawer keeps a stable close callback, traps focus, and restores background state', async () => {
-  const source = await readFile(new URL('../src/components.tsx', import.meta.url), 'utf8');
-  const drawer = source.slice(source.indexOf('export function DrawerFrame'));
-  assert.match(drawer, /const onCloseRef = useRef\(onClose\)/);
-  assert.match(drawer, /sibling\.inert = true/);
-  assert.match(drawer, /element\.inert = inert/);
-  assert.match(drawer, /previousFocus\.current\?\.isConnected/);
-  assert.match(drawer, /document\.addEventListener\('keydown', keydown\)/);
-  assert.match(drawer, /\}, \[\]\);/);
-  assert.doesNotMatch(drawer, /\}, \[onClose\]\);/);
-});
+// Drawer isolation, cleanup, focus containment and live-update stability are
+// exercised through the real DOM in request-lifecycle-browser-contract.test.ts.

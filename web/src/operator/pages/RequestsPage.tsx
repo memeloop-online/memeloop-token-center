@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
+import { Button } from '@fluentui/react-components';
 import { api, apiDiagnosticMessage } from '../../api';
 import { DrawerFrame, Metric, NumberMetric, RequestDiagnostics, RequestTable } from '../../components';
 import { formatDurationDisplay, formatPercent } from '../../format';
@@ -346,17 +347,19 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
 
 function RequestDrawer({ detail, upstreamName, onOpenSession, onClose }: { detail: RequestDetail; upstreamName?: string; onOpenSession: (sessionId: string) => void; onClose: () => void }) {
   const { t } = useI18n();
+  const [technicalOpen, setTechnicalOpen] = useState(false);
+  const technicalId = useId();
   return <DrawerFrame title={detail.model} eyebrow={t('request.operatorDiagnosis')} onClose={onClose}>
     <RequestDiagnostics request={detail} onOpenSession={onOpenSession} upstreamName={upstreamName} />
     <div className="request-diagnostics request-detail-surface request-archive-diagnostics">
       <span><b>{t('self.archive')}</b>{detail.archive_complete ? t('request.archiveComplete') : t('request.archiveIncomplete')}</span>
       {detail.provenance && <span><b>{t('request.provenance')}</b>{detail.provenance.unlinked ? t('request.archiveOnly') : t('request.exactArchive')} · {detail.provenance.source}</span>}
     </div>
-    <details className="request-technical-details">
-      <summary>{t('request.technicalDetails')}</summary>
+    <Button appearance="subtle" aria-expanded={technicalOpen} aria-controls={technicalId} onClick={() => setTechnicalOpen(!technicalOpen)}>{t('request.technicalDetails')}</Button>
+    {technicalOpen && <section id={technicalId} className="request-technical-details" aria-label={t('request.technicalDetails')}>
       <h3>{t('request.request')}</h3><pre>{JSON.stringify(detail.request_body, null, 2)}</pre>
       <h3>{t('request.response')}</h3><pre>{JSON.stringify(detail.response_body, null, 2)}</pre>
       {detail.provenance && <><h3>{t('request.provenance')}</h3><pre>{JSON.stringify(detail.provenance, null, 2)}</pre></>}
-    </details>
+    </section>}
   </DrawerFrame>;
 }
