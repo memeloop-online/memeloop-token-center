@@ -105,6 +105,36 @@ function parseBounds(raw: string, absent: string): [number, number] {
   return parts as [number, number];
 }
 
+/**
+ * Reproducible before/after plan pair for the unfiltered Control
+ * `model-prices/usage-summary` projection. The baseline is the former
+ * per-arm key/principal/tenant join. The optimized form builds exactly the
+ * same eligible `(key_id, tenant_id)` relation once and reuses it across the
+ * daily and disjoint fact-edge arms.
+ */
+function globalPricingUsageSummaryQuery(
+  from: number,
+  to: number,
+  fullDayFrom: number,
+  fullDayTo: number,
+  optimized: boolean,
+): string {
+  const eligible = optimized
+    ? "pricing_visible_keys AS MATERIALIZED (SELECT k.id, k.tenant_id FROM key_records k JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id JOIN tenants t ON t.id = k.tenant_id),"
+    : "";
+  const join = (alias: string) => optimized
+    ? ` JOIN pricing_visible_keys k ON k.id = ${alias}.key_id AND k.tenant_id = ${alias}.tenant_id`
+    : ` JOIN key_records k ON k.id = ${alias}.key_id AND k.tenant_id = ${alias}.tenant_id JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id JOIN tenants t ON t.id = ${alias}.tenant_id`;
+  return `WITH ${eligible}filtered_activity AS (
+    SELECT a.model, a.input_tokens, a.output_tokens, a.requests FROM request_daily_aggregates a${join("a")} WHERE a.day_bucket >= ${fullDayFrom} / 86400000 AND a.day_bucket < ${fullDayTo} / 86400000
+    UNION ALL SELECT f.model, f.input_tokens, f.output_tokens, 1::bigint FROM request_stats_facts f${join("f")} WHERE f.created_at >= ${from} AND f.created_at <= ${to} AND f.created_at < ${fullDayFrom}
+    UNION ALL SELECT f.model, f.input_tokens, f.output_tokens, 1::bigint FROM request_stats_facts f${join("f")} WHERE f.created_at >= ${from} AND f.created_at <= ${to} AND f.created_at >= ${fullDayTo} AND f.created_at >= ${fullDayFrom}
+    UNION ALL SELECT a.model, 0::bigint, 0::bigint, a.requests FROM generation_daily_aggregates a${join("a")} WHERE a.day_bucket >= ${fullDayFrom} / 86400000 AND a.day_bucket < ${fullDayTo} / 86400000
+    UNION ALL SELECT f.model, 0::bigint, 0::bigint, 1::bigint FROM generation_stats_facts f${join("f")} WHERE f.created_at >= ${from} AND f.created_at <= ${to} AND f.created_at < ${fullDayFrom}
+    UNION ALL SELECT f.model, 0::bigint, 0::bigint, 1::bigint FROM generation_stats_facts f${join("f")} WHERE f.created_at >= ${from} AND f.created_at <= ${to} AND f.created_at >= ${fullDayTo} AND f.created_at >= ${fullDayFrom}
+  ) SELECT model, SUM(requests), SUM(input_tokens), SUM(output_tokens) FROM filtered_activity GROUP BY model ORDER BY SUM(requests) DESC, model ASC LIMIT 100`;
+}
+
 export function main(argv = process.argv.slice(2)): number {
   let args: Arguments;
   try { args = parseArgs(argv); } catch (error) { return prerequisite(error); }
@@ -147,7 +177,9 @@ export function main(argv = process.argv.slice(2)): number {
     const statsFrom = Math.max(statsMinDay, statsMaxDay - 92) * 86_400_000 + 1;
     const statsTo = (statsMaxDay + 1) * 86_400_000 - 2;
     const statsFullDayFrom = Math.ceil(statsFrom / 86_400_000) * 86_400_000;
-    const statsFullDayTo = Math.ceil((statsTo + 1) / 86_400_000) * 86_400_000;
+    const statsFullDayTo = Math.floor((statsTo + 1) / 86_400_000) * 86_400_000;
+    const globalPricingUsageSummaryBaseline = globalPricingUsageSummaryQuery(statsFrom, statsTo, statsFullDayFrom, statsFullDayTo, false);
+    const globalPricingUsageSummaryOptimized = globalPricingUsageSummaryQuery(statsFrom, statsTo, statsFullDayFrom, statsFullDayTo, true);
     const filteredStatsQuery = `WITH filtered_activity AS MATERIALIZED (SELECT day_bucket * 86400000 AS created_at, model, status_class, error_code, requests, input_tokens, output_tokens, cost_micros FROM request_daily_aggregates WHERE tenant_id = '${tenantId}' AND day_bucket >= ${statsFullDayFrom} / 86400000 AND day_bucket < ${statsFullDayTo} / 86400000 UNION ALL SELECT created_at, model, status_class, error_code, 1, input_tokens, output_tokens, cost_micros FROM request_stats_facts WHERE tenant_id = '${tenantId}' AND created_at >= ${statsFrom} AND created_at <= ${statsTo} AND (created_at < ${statsFullDayFrom} OR created_at >= ${statsFullDayTo})), enriched AS (SELECT model, created_at / 86400000 AS day_bucket, NULLIF(error_code, '') AS error_bucket, status_class, requests, input_tokens, output_tokens, cost_micros FROM filtered_activity) SELECT model, day_bucket, error_bucket, SUM(requests), SUM(input_tokens), SUM(output_tokens), SUM(cost_micros) FROM enriched GROUP BY GROUPING SETS ((), (model), (day_bucket), (error_bucket)) HAVING GROUPING(error_bucket) = 1 OR error_bucket IS NOT NULL`;
     const [usageMinDay, usageMaxDay] = parseBounds(scalar(databaseUrl, `SELECT min(day_bucket)::text || '|' || max(day_bucket)::text FROM usage_analysis_daily WHERE tenant_id = '${tenantId}';`, timeout), "usage analysis daily rollups are absent for the sample tenant");
     const usageFromDay = Math.max(usageMinDay, usageMaxDay - 92);
@@ -163,6 +195,8 @@ export function main(argv = process.argv.slice(2)): number {
       ["key_newest_cursor", `SELECT id, created_at, model, status_code FROM request_records WHERE key_id = '${keyId}' ORDER BY created_at DESC, id DESC LIMIT 100`],
       ["key_daily_aggregate", `SELECT day_bucket, SUM(requests), SUM(input_tokens), SUM(output_tokens), SUM(cost_micros) FROM usage_daily_aggregates WHERE key_id = '${keyId}' GROUP BY day_bucket ORDER BY day_bucket`],
       ["tenant_filtered_stats", filteredStatsQuery], ["tenant_usage_analysis_daily_93d", usageDailyQuery], ["tenant_usage_analysis_hourly_31d", usageHourlyQuery],
+      ["global_pricing_usage_summary_baseline", globalPricingUsageSummaryBaseline],
+      ["global_pricing_usage_summary", globalPricingUsageSummaryOptimized],
     ];
     if (errorCode !== undefined) queries.push(["tenant_error_troubleshooting", `SELECT id, created_at, model, status_code, error_code FROM request_records WHERE tenant_id = '${tenantId}' AND error_code = ${errorCode} ORDER BY created_at DESC, id DESC LIMIT 100`]);
     for (const [name, column, value] of [["tenant_usage_model_drilldown", "model", analysisModel], ["tenant_usage_error_drilldown", "error_code", analysisError], ["tenant_usage_route_drilldown", "model_route_id", analysisRoute]] as const) if (value !== undefined) queries.push([name, `SELECT currency, SUM(requests), SUM(cost_micros) FROM usage_analysis_daily WHERE tenant_id = '${tenantId}' AND ${column} = ${value} AND day_bucket >= ${usageFromDay} AND day_bucket <= ${usageMaxDay} GROUP BY currency`]);
@@ -184,10 +218,11 @@ export function main(argv = process.argv.slice(2)): number {
       { name: "required observability indexes are ready", actual: validRequiredObservabilityIndexes, operator: "==", expected: 9, passed: validRequiredObservabilityIndexes === 9 },
     ];
     for (const result of results) {
+      if (result.name === "global_pricing_usage_summary_baseline") continue;
       checks.push({ name: `${result.name} execution time`, actual: result.execution_time_ms, operator: "<=", expected: args.maxExecutionMs, passed: result.execution_time_ms <= args.maxExecutionMs });
       if (!args.allowSequentialScan && requestRows >= args.minRequestRows) {
         const scans = result.sequential_large_relations as string[];
-        const bounded = result.name === "tenant_filtered_stats" && scans.every((relation) => relation === "request_stats_facts" || relation === "generation_stats_facts");
+        const bounded = (result.name === "tenant_filtered_stats" || result.name === "global_pricing_usage_summary") && scans.every((relation) => relation === "request_stats_facts" || relation === "generation_stats_facts");
         checks.push({ name: `${result.name} avoids sequential history scan`, actual: scans, operator: "==", expected: "[] except bounded incomplete-day fact branches", passed: scans.length === 0 || bounded });
       }
     }
