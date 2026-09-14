@@ -1,5 +1,5 @@
 use super::super::*;
-use super::accounts::{upstream_account_view, validate_upstream_account_name};
+use super::accounts::{upstream_account_view_with_transport, validate_upstream_account_name};
 
 const KIMI_COHORT_CONTRACT: &str = "atomic_kimi_cohort_v2";
 const NATIVE_OAUTH_TENANT_LOCK_SEED: i64 = 734_627_102_948_337;
@@ -79,13 +79,10 @@ impl Database {
                 || !ordinals.insert(input.ordinal)
                 || !identities.insert(input.source_identity_hash.clone())
                 || input.account_name != format!("Kimi OAuth {}", input.ordinal)
-                || input
-                    .credential
-                    .expires_at()
-                    .is_none_or(|expires_at| expires_at <= now)
+                || input.credential.expires_at().is_none()
             {
                 return Err(AppError::BadRequest(
-                    "native Kimi OAuth cohort is invalid or expired".into(),
+                    "native Kimi OAuth cohort is invalid".into(),
                 ));
             }
         }
@@ -209,7 +206,7 @@ impl Database {
                     "native Kimi OAuth receipt belongs to another cohort".into(),
                 ));
             }
-            validate_existing_kimi_account(&row, input, now, key_material)?;
+            validate_existing_kimi_account(&row, input, key_material)?;
             exists.push(true);
             changed.push(
                 row.try_get::<String, _>("payload_digest")? != input.payload_digest
@@ -274,10 +271,11 @@ impl Database {
                 .await?
                 .ok_or(AppError::Internal)?;
                 if !changed[index] {
-                    accounts.push(upstream_account_view(row)?);
+                    accounts.push(upstream_account_view_with_transport(row, key_material)?);
                     continue;
                 }
                 rotate_native_kimi_credential(
+                    self.backend,
                     &mut tx,
                     &tenant_id,
                     &input,
@@ -296,7 +294,7 @@ impl Database {
                 )
                 .await?
                 .ok_or(AppError::Internal)?;
-                accounts.push(upstream_account_view(updated)?);
+                accounts.push(upstream_account_view_with_transport(updated, key_material)?);
                 rotated += 1;
                 continue;
             }
@@ -313,6 +311,9 @@ impl Database {
                     "another upstream provider already uses the approved Kimi name".into(),
                 ));
             }
+            // `active` enables the managed-refresh lifecycle. An expired
+            // credential remains ineligible for model discovery and traffic
+            // until a generation-guarded refresh installs a current token.
             let account_insert = sqlx::query(
                 "INSERT INTO upstream_accounts (id, tenant_id, name, driver, auth_kind, config_json, status, credential_generation, oauth_session_id, oauth_driver, oauth_refresh_url, created_at, updated_at) VALUES ($1, $2, $3, $4, 'oauth', $5, 'active', 1, $1, $4, $6, $7, $7)",
             )
@@ -367,7 +368,10 @@ impl Database {
             )
             .await?
             .ok_or(AppError::Internal)?;
-            accounts.push(upstream_account_view(inserted)?);
+            accounts.push(upstream_account_view_with_transport(
+                inserted,
+                key_material,
+            )?);
             created += 1;
         }
 
@@ -491,7 +495,6 @@ async fn native_oauth_receipt_row(
 fn validate_existing_kimi_account(
     row: &sqlx::any::AnyRow,
     input: &NativeOAuthImportAccountInput,
-    now: i64,
     key_material: &[u8],
 ) -> Result<(), AppError> {
     let account_id: String = row.try_get("id")?;
@@ -513,9 +516,7 @@ fn validate_existing_kimi_account(
         || row.try_get::<String, _>("name")? != input.account_name
         || config != input.config
         || row.try_get::<String, _>("status")? != "active"
-        || row
-            .try_get::<Option<i64>, _>("expires_at")?
-            .is_none_or(|expires_at| expires_at <= now)
+        || row.try_get::<Option<i64>, _>("expires_at")?.is_none()
         || row.try_get::<i64, _>("route_count")? != 0
     {
         return Err(AppError::Conflict(
@@ -554,6 +555,7 @@ fn current_cas_matches_account(
 
 #[allow(clippy::too_many_arguments)]
 async fn rotate_native_kimi_credential(
+    backend: DatabaseBackend,
     tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     tenant_id: &str,
     input: &NativeOAuthImportAccountInput,
@@ -573,6 +575,34 @@ async fn rotate_native_kimi_credential(
     if kimi_device_identity(&current) != kimi_device_identity(&input.credential) {
         return Err(AppError::Conflict(
             "native Kimi OAuth source changed its device identity".into(),
+        ));
+    }
+    // A source document may omit transport settings because proxy ownership is
+    // managed independently in MTC. Preserve the installed account proxy in
+    // that case; an explicit source proxy still replaces it.
+    let credential = input.credential.clone().preserve_proxy_from(&current);
+    let credential_ciphertext = if credential.proxy() == input.credential.proxy() {
+        credential_ciphertext
+    } else {
+        seal_credential(&credential, key_material)?
+    };
+    let lease_sql = match backend {
+        DatabaseBackend::PostgreSql => {
+            "SELECT account_id FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND credential_generation = $2 FOR UPDATE"
+        }
+        DatabaseBackend::Sqlite => {
+            "SELECT account_id FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND credential_generation = $2"
+        }
+    };
+    if sqlx::query(lease_sql)
+        .bind(&account_id)
+        .bind(current_generation)
+        .fetch_optional(&mut **tx)
+        .await?
+        .is_some()
+    {
+        return Err(AppError::Conflict(
+            "native Kimi OAuth refresh is in progress; retry the import".into(),
         ));
     }
     let generation = current_generation
@@ -784,6 +814,92 @@ mod tests {
         );
         assert!(
             inventory
+                .iter()
+                .all(|account| account.credential_generation == 2)
+        );
+
+        let expired_tenant = format!("{tenant}-expired");
+        let mut expired_inputs = vec![
+            input(&expired_tenant, 1, '9', '9', "india"),
+            input(&expired_tenant, 2, 'a', 'a', "juliet"),
+        ];
+        for input in &mut expired_inputs {
+            let UpstreamCredential::OAuth { expires_at, .. } = &mut input.credential else {
+                unreachable!();
+            };
+            *expires_at = Some(1);
+        }
+        let expired = db
+            .import_native_kimi_oauth_cohort(expired_inputs.clone(), approval(), key)
+            .await
+            .unwrap();
+        assert_eq!((expired.created, expired.rotated), (2, 0));
+        assert!(expired.accounts.iter().all(|account| {
+            account.status == "active"
+                && account.credential_generation == 1
+                && account.credential_expires_at == Some(1)
+                && account.route_count == 0
+        }));
+        let refresh_candidates = db
+            .list_managed_oauth_refresh_candidates(unix_millis(), 100)
+            .await
+            .unwrap();
+        assert!(expired.accounts.iter().all(|account| {
+            refresh_candidates.contains(&(account.id, account.credential_generation))
+        }));
+
+        let lease_key = "native-kimi-expired-refresh-claim";
+        let claim = db
+            .claim_upstream_oauth_refresh(expired.accounts[1].id, lease_key, key)
+            .await
+            .unwrap();
+        let ClaimUpstreamOAuthRefreshResult::Claimed(claim) = claim else {
+            panic!("an imported expired credential must be newly claimable");
+        };
+        assert_eq!(claim.credential_generation, 1);
+        assert_eq!(claim.driver, crate::oauth::managed::kimi::PROVIDER_DRIVER);
+        assert_eq!(
+            claim.refresh_url,
+            crate::oauth::managed::kimi::TOKEN_ENDPOINT
+        );
+
+        bind_current(&mut expired_inputs, &expired.accounts);
+        for (index, input) in expired_inputs.iter_mut().enumerate() {
+            input.source_document_sha256 = if index == 0 {
+                "b".repeat(64)
+            } else {
+                "c".repeat(64)
+            };
+            input.payload_digest = if index == 0 {
+                "d".repeat(64)
+            } else {
+                "e".repeat(64)
+            };
+            input.credential = credential(&format!("device-{}", index + 1), "rotated-expired");
+        }
+        assert!(matches!(
+            db.import_native_kimi_oauth_cohort(expired_inputs.clone(), approval(), key)
+                .await,
+            Err(AppError::Conflict(message)) if message.contains("refresh is in progress")
+        ));
+        assert!(
+            db.list_upstream_accounts(&expired_tenant)
+                .await
+                .unwrap()
+                .iter()
+                .all(|account| account.credential_generation == 1)
+        );
+        db.abort_upstream_oauth_refresh(expired.accounts[1].id, lease_key)
+            .await
+            .unwrap();
+        let after_lease = db
+            .import_native_kimi_oauth_cohort(expired_inputs, approval(), key)
+            .await
+            .unwrap();
+        assert_eq!((after_lease.created, after_lease.rotated), (0, 2));
+        assert!(
+            after_lease
+                .accounts
                 .iter()
                 .all(|account| account.credential_generation == 2)
         );

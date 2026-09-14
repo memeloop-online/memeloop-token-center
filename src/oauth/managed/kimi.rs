@@ -33,6 +33,8 @@ struct NativeImportDocument {
     last_refresh: Option<String>,
     #[serde(default)]
     disabled: bool,
+    #[serde(default)]
+    proxy_url: Option<String>,
 }
 
 fn invalid() -> AppError {
@@ -90,10 +92,20 @@ pub(crate) fn credential_from_native_import(
             "scope": source.scope,
             "token_type": source.token_type,
         })),
-        proxy_url: None,
-        proxy_network_scope: None,
+        proxy_network_scope: source
+            .proxy_url
+            .as_ref()
+            .map(|_| crate::network::OutboundScope::Private),
+        proxy_url: source.proxy_url,
     };
     validate_credential(&credential)?;
+    if credential.proxy().is_some_and(|(proxy_url, _)| {
+        url::Url::parse(proxy_url)
+            .ok()
+            .is_none_or(|proxy| !network::has_safe_private_ip_literal_host(&proxy))
+    }) {
+        return Err(invalid());
+    }
     Ok(credential)
 }
 
@@ -124,6 +136,12 @@ pub(crate) fn validate_credential(credential: &UpstreamCredential) -> Result<(),
         return Err(invalid());
     };
     credential.validate(i64::MIN).map_err(|_| invalid())?;
+    if let Some((proxy_url, crate::network::OutboundScope::Private)) = credential.proxy() {
+        let parsed = url::Url::parse(proxy_url).map_err(|_| invalid())?;
+        if parsed.scheme() != "socks5h" {
+            return Err(invalid());
+        }
+    }
     super::bearer_token(access_token, "Kimi")?;
     super::required_secret(refresh_token, "Kimi")?;
     let object = state.as_object().ok_or_else(invalid)?;
@@ -324,7 +342,9 @@ mod tests {
         UpstreamCredential::OAuth {
             access_token: "fixture-access".to_owned(),
             refresh_token: Some("fixture-refresh".to_owned()),
-            expires_at: None,
+            // Managed refresh must accept an already-expired access token.
+            // Send-time traffic validation still fences this credential.
+            expires_at: Some(1),
             header: "authorization".to_owned(),
             prefix: "Bearer ".to_owned(),
             adapter_state: Some(json!({
@@ -367,7 +387,8 @@ mod tests {
 
     #[test]
     fn native_import_parsing_is_local_strict_and_preserves_expiry() {
-        let document = native_document("2099-01-01T00:00:00Z");
+        let mut document = native_document("2099-01-01T00:00:00Z");
+        document["proxy_url"] = json!("socks5h://10.0.0.1:1080");
         let credential = credential_from_native_import(&document).unwrap();
         assert_eq!(
             credential.adapter_state().unwrap()["device_id"],
@@ -382,6 +403,13 @@ mod tests {
             )
         );
         assert_eq!(native_import_config()["base_url"], BASE_URL);
+        assert_eq!(
+            credential.proxy(),
+            Some((
+                "socks5h://10.0.0.1:1080",
+                crate::network::OutboundScope::Private
+            ))
+        );
 
         let mut disabled = document.clone();
         disabled["disabled"] = json!(true);
@@ -389,6 +417,10 @@ mod tests {
         let mut unknown = document;
         unknown["unexpected"] = json!("rejected");
         assert!(credential_from_native_import(&unknown).is_err());
+
+        let mut local_dns_proxy = native_document("2099-01-01T00:00:00Z");
+        local_dns_proxy["proxy_url"] = json!("socks5://10.0.0.1:1080");
+        assert!(credential_from_native_import(&local_dns_proxy).is_err());
     }
 
     #[test]
