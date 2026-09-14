@@ -35,6 +35,20 @@ function checkedOutMergeDiff(): { input: string; base: string } | undefined {
   }
 }
 
+function checkedOutPushDiff(): { input: string; base: string } | undefined {
+  const checkout = process.env.GITHUB_SHA ?? '';
+  const before = process.env.GITHUB_EVENT_BEFORE ?? '';
+  const after = process.env.GITHUB_EVENT_AFTER ?? '';
+  if (![checkout, before, after].every((sha) => /^[0-9a-f]{40}$/i.test(sha)) || after.toLowerCase() !== checkout.toLowerCase()) return undefined;
+  const git = (...args: string[]): string => execFileSync('git', ['--no-replace-objects', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024 });
+  try {
+    if (git('rev-parse', '--verify', 'HEAD').trim() !== checkout.toLowerCase()) return undefined;
+    git('cat-file', '-e', `${before}^{commit}`);
+    const input = git('diff', '--name-status', '--find-renames=100%', '--diff-filter=ACDMRT', '-z', before, checkout);
+    return input === '' ? undefined : { input, base: before };
+  } catch { return undefined; }
+}
+
 function parseNameStatus(value: string): Change[] {
   if (value === '') return [];
   const fields = value.split('\0');
@@ -54,8 +68,8 @@ function parseNameStatus(value: string): Change[] {
 }
 
 const verifiedMergeMode = changedPathsValue === '--verified-merge';
-const merge = verifiedMergeMode && eventName === 'pull_request' ? checkedOutMergeDiff() : undefined;
-const forceFull = verifiedMergeMode && eventName === 'pull_request' && merge === undefined;
+const merge = verifiedMergeMode ? (eventName === 'pull_request' ? checkedOutMergeDiff() : checkedOutPushDiff()) : undefined;
+const forceFull = verifiedMergeMode && merge === undefined;
 if (forceFull) console.warn(`${SCOPE}: merge checkout could not be verified; running all gates`);
 const changes = parseNameStatus(verifiedMergeMode ? merge?.input ?? '' : readFileSync(changedPathsValue, 'utf8'));
 const paths = changes.flatMap(({ paths }) => paths);
@@ -68,13 +82,14 @@ if (eventName === 'pull_request' && !forceFull && changes.length === 0) {
 // exercised by the memory gate. Memory/load harness inputs remain outside this
 // allowlist, so every unknown or newly introduced path runs acceptance.
 const memorySafe = /^(?:docs\/|web\/|charts\/|openapi\/|tests\/(?!load(?:\/|$))|README\.md$|LICENSE$|\.gitignore$|compose\.yaml$)/;
-const fullCoverage = eventName === 'push' || forceFull;
-const memory = fullCoverage || paths.some((path) => !memorySafe.test(path));
+const fullCoverage = forceFull || (eventName === 'push' && !verifiedMergeMode);
+const memory = eventName === 'push' || fullCoverage || paths.some((path) => !memorySafe.test(path));
 // Both sides of rename/copy records participate, so boundary crossings stay
 // full. Static operator-contract tests neither build nor execute the service;
 // their packaging contract job remains mandatory, while production source,
 // browser, workflow, and CI-script changes remain full coverage.
 const webOnly = changes.length > 0 && changes.every(({ paths }) => paths.every((path) => path.startsWith('web/')));
+const memoryAcceptance = fullCoverage || (eventName === 'push' ? !webOnly : memory);
 const staticContractsOnly = changes.length > 0 && changes.every(({ paths }) => paths.every((path) => path.startsWith('tests/ops/')));
 const rust = fullCoverage || !(webOnly || staticContractsOnly);
 const web = fullCoverage || !staticContractsOnly;
@@ -83,7 +98,7 @@ const pluginInstaller = fullCoverage || paths.some((path) => /^(?:\.cargo\/|\.do
 
 appendFileSync(
   outputValue,
-  `rust=${String(rust)}\nweb=${String(web)}\nmigration=${String(migration)}\nmemory=${String(memory)}\nplugin_installer=${String(pluginInstaller)}\n`,
+  `rust=${String(rust)}\nweb=${String(web)}\nmigration=${String(migration)}\nmemory=${String(memory)}\nmemory_acceptance=${String(memoryAcceptance)}\nplugin_installer=${String(pluginInstaller)}\n`,
   'utf8',
 );
-console.log(JSON.stringify({ event: eventName, comparison_base: merge?.base, force_full: forceFull, change_count: changes.length, web_only: webOnly, static_contracts_only: staticContractsOnly, rust, web, migration, memory, plugin_installer: pluginInstaller }));
+console.log(JSON.stringify({ event: eventName, comparison_base: merge?.base, force_full: forceFull, change_count: changes.length, web_only: webOnly, static_contracts_only: staticContractsOnly, rust, web, migration, memory, memory_acceptance: memoryAcceptance, plugin_installer: pluginInstaller }));

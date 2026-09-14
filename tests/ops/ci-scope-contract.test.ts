@@ -25,9 +25,9 @@ function scopes(event: 'pull_request' | 'push', changes: readonly Change[]): Rec
   }
 }
 
-const webOnly = { rust: 'false', web: 'true', migration: 'false', memory: 'false', plugin_installer: 'false' };
-const staticContractsOnly = { rust: 'false', web: 'false', migration: 'false', memory: 'false', plugin_installer: 'false' };
-const full = { rust: 'true', web: 'true', migration: 'true', memory: 'true', plugin_installer: 'false' };
+const webOnly = { rust: 'false', web: 'true', migration: 'false', memory: 'false', memory_acceptance: 'false', plugin_installer: 'false' };
+const staticContractsOnly = { rust: 'false', web: 'false', migration: 'false', memory: 'false', memory_acceptance: 'false', plugin_installer: 'false' };
+const full = { rust: 'true', web: 'true', migration: 'true', memory: 'true', memory_acceptance: 'true', plugin_installer: 'false' };
 const fullPlugin = { ...full, plugin_installer: 'true' };
 
 test('verified merge scope ignores a stale event base and fails closed for an unverified checkout', () => {
@@ -121,7 +121,7 @@ test('scope matrix skips expensive service gates only for web or static-contract
 test('known documentation and ordinary test paths preserve existing memory policy but not Rust or migration coverage', () => {
   assert.deepEqual(
     scopes('pull_request', [['M', 'docs/performance.md'], ['M', 'tests/route_management.rs']]),
-    { rust: 'true', web: 'true', migration: 'true', memory: 'false', plugin_installer: 'false' },
+    { rust: 'true', web: 'true', migration: 'true', memory: 'false', memory_acceptance: 'false', plugin_installer: 'false' },
   );
 });
 
@@ -141,4 +141,37 @@ test('pushes and malformed or empty pull-request diffs fail closed', () => {
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }
+});
+
+test('verified push scopes use the complete before-after range and fail closed without it', () => {
+  const temporary = mkdtempSync(join(tmpdir(), 'mtc-ci-push-scope-'));
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_AUTHOR_NAME: 'CI fixture', GIT_AUTHOR_EMAIL: 'fixture@example.test', GIT_COMMITTER_NAME: 'CI fixture', GIT_COMMITTER_EMAIL: 'fixture@example.test' };
+  const git = (...args: string[]): string => run('git', args, { cwd: temporary, env }).trim();
+  try {
+    git('init', '--quiet', '--initial-branch=fixture'); mkdirSync(join(temporary, 'web'));
+    writeFileSync(join(temporary, 'web', 'a.tsx'), 'one\n'); git('add', '.'); const before = git('commit-tree', git('write-tree'), '-m', 'before');
+    writeFileSync(join(temporary, 'web', 'a.tsx'), 'two\n'); git('add', '.'); const middle = git('commit-tree', git('write-tree'), '-p', before, '-m', 'web');
+    writeFileSync(join(temporary, 'web', 'b.tsx'), 'three\n'); git('add', '.'); const after = git('commit-tree', git('write-tree'), '-p', middle, '-p', before, '-m', 'web merge'); git('update-ref', 'HEAD', after);
+    const output = join(temporary, 'out'); writeFileSync(output, '');
+    run(process.execPath, [join(repository, 'ops/ci/detect-expensive-ci-scopes.ts'), 'push', '--verified-merge', output], { cwd: temporary, env: { ...env, GITHUB_SHA: after, GITHUB_EVENT_BEFORE: before, GITHUB_EVENT_AFTER: after } });
+    const result = Object.fromEntries(readFileSync(output, 'utf8').trim().split('\n').map(line => line.split('=', 2)));
+    assert.equal(result.memory, 'true'); assert.equal(result.memory_acceptance, 'false'); assert.equal(result.rust, 'false');
+    writeFileSync(output, ''); run(process.execPath, [join(repository, 'ops/ci/detect-expensive-ci-scopes.ts'), 'push', '--verified-merge', output], { cwd: temporary, env: { ...env, GITHUB_SHA: after, GITHUB_EVENT_BEFORE: '', GITHUB_EVENT_AFTER: after } });
+    assert.equal(Object.fromEntries(readFileSync(output, 'utf8').trim().split('\n').map(line => line.split('=', 2))).memory_acceptance, 'true');
+  } finally { rmSync(temporary, { recursive: true, force: true }); }
+});
+
+test('publisher admits only successful required jobs and scope-authorized skips', () => {
+  const workflow = readFileSync(join(repository, '.github/workflows/ci.yml'), 'utf8');
+  const publish = workflow.slice(workflow.indexOf('  publish-ghcr:'), workflow.indexOf('\n  verify-ghcr-release:'));
+  assert.match(publish, /needs:\n(?:.*\n)*?      - changes\n/);
+  assert.match(publish, /needs:\n(?:.*\n)*?      - memory-binary\n/);
+  for (const condition of [
+    "needs.changes.result == 'success'", "needs.memory-binary.result == 'success'",
+    "needs.web.result == 'success' || (needs.changes.outputs.web == 'false' && needs.web.result == 'skipped')",
+    "needs.rust.result == 'success' || (needs.changes.outputs.rust == 'false' && needs.rust.result == 'skipped')",
+    "needs.migration-smoke.result == 'success' || (needs.changes.outputs.migration == 'false' && needs.migration-smoke.result == 'skipped')",
+    "needs.memory-acceptance.result == 'success' || (needs.changes.outputs.memory_acceptance == 'false' && needs.memory-acceptance.result == 'skipped')",
+  ]) assert.match(publish, new RegExp(condition.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.doesNotMatch(publish, /\.result != 'failure'/);
 });

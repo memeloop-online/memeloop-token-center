@@ -86,7 +86,7 @@ test('release contains only runtime images and no retired migration delivery sur
   contains('Dockerfile.release', 'COPY --chmod=0555 --from=release-input /memeloop-token-center /usr/local/bin/memeloop-token-center');
   contains('Dockerfile.release', 'COPY --from=web-builder /build/web/dist /usr/share/memeloop-token-center/web');
   assert.equal(memoryBinary?.if, "needs.changes.outputs.memory == 'true'");
-  assert.equal(memoryAcceptance?.if, "needs.changes.outputs.memory == 'true'");
+  assert.equal(memoryAcceptance?.if, "needs.changes.outputs.memory_acceptance == 'true'");
   assert.equal(rust?.if, "needs.changes.outputs.rust == 'true'");
   assert.equal(web?.if, "needs.changes.outputs.web == 'true'");
   assert.equal(migration?.if, "needs.changes.outputs.migration == 'true'");

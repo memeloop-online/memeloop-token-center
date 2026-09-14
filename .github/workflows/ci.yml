@@ -23,6 +23,7 @@ jobs:
       web: ${{ steps.scope.outputs.web }}
       migration: ${{ steps.scope.outputs.migration }}
       memory: ${{ steps.scope.outputs.memory }}
+      memory_acceptance: ${{ steps.scope.outputs.memory_acceptance }}
       plugin_installer: ${{ steps.scope.outputs.plugin_installer }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -36,6 +37,8 @@ jobs:
         id: scope
         env:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+          GITHUB_EVENT_AFTER: ${{ github.event.after }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
           node ops/ci/detect-expensive-ci-scopes.ts "$EVENT_NAME" --verified-merge "$GITHUB_OUTPUT"
@@ -467,7 +470,7 @@ jobs:
           retention-days: 1
 
   memory-acceptance:
-    if: needs.changes.outputs.memory == 'true'
+    if: needs.changes.outputs.memory_acceptance == 'true'
     # The harness consumes only the sealed same-run binary. Keep its critical
     # path independent from unrelated Rust, browser, migration, and security
     # gates; publish still waits for every existing release check below.
@@ -514,8 +517,17 @@ jobs:
           cache-from: type=gha,scope=service
 
   publish-ghcr:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    if: >-
+      always() && github.event_name == 'push' && github.ref == 'refs/heads/master' &&
+      needs.changes.result == 'success' && needs.repository-security.result == 'success' &&
+      needs.dependency-security.result == 'success' && needs.api-contract.result == 'success' &&
+      needs.packaging.result == 'success' && needs.memory-binary.result == 'success' &&
+      (needs.web.result == 'success' || (needs.changes.outputs.web == 'false' && needs.web.result == 'skipped')) &&
+      (needs.rust.result == 'success' || (needs.changes.outputs.rust == 'false' && needs.rust.result == 'skipped')) &&
+      (needs.migration-smoke.result == 'success' || (needs.changes.outputs.migration == 'false' && needs.migration-smoke.result == 'skipped')) &&
+      (needs.memory-acceptance.result == 'success' || (needs.changes.outputs.memory_acceptance == 'false' && needs.memory-acceptance.result == 'skipped'))
     needs:
+      - changes
       - repository-security
       - dependency-security
       - web
@@ -524,6 +536,7 @@ jobs:
       - api-contract
       - packaging
       - memory-acceptance
+      - memory-binary
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
