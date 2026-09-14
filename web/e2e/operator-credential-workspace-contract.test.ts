@@ -267,6 +267,10 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
       const create = client.locator('.create-journey');
       await create.locator(':scope > .journey-heading [data-workspace-toggle]').click();
       const retryCatalog = create.getByRole('button', { name: english ? 'Retry account catalog' : '重试读取目录', exact: true });
+      await retryCatalog.waitFor();
+      // Restore the mock service only after the visible editor shows failure.
+      // Earlier editor mounts must not consume a one-shot failure intended here.
+      await client.evaluate(() => { document.documentElement.dataset.accountCatalogAvailable = 'true'; });
       await retryCatalog.click();
       await retryCatalog.waitFor({ state: 'hidden' });
       const routes = create.getByRole('combobox', { name: english ? 'Specific routes' : '具体路由', exact: true });

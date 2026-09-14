@@ -205,7 +205,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     return json({ key_id: 'key-recovery', credential_generation: 1, key: 'mts_client_recovered' });
   }
   if (scenario === 'client-form') {
-    if (url.pathname === '/internal/v1/upstreams' && parameters.has('account-catalog-failure') && window.credentialFixture.calls.filter(call => call.startsWith('/internal/v1/upstreams?')).length === 1) return json({ error: { message: 'fixture catalog unavailable' } }, 503);
+    if (url.pathname === '/internal/v1/upstreams' && parameters.has('account-catalog-failure') && document.documentElement.dataset.accountCatalogAvailable !== 'true') return json({ error: { message: 'fixture catalog unavailable' } }, 503);
     if (url.pathname === '/internal/v1/keys/key-form/routing') return json({ ...routingResponse, route_ids: ['00000000-0000-4000-8000-000000000004'], effective_route_ids: ['00000000-0000-4000-8000-000000000004'] });
     if (url.pathname === '/internal/v1/provider-types') return json([{ id: 'kimi', display_name: 'Kimi' }]);
     if (url.pathname === '/internal/v1/upstreams') return json([{ id: 'account-personal', name: 'Personal Kimi', driver: 'kimi', status: 'active' }, { id: 'account-team', name: 'Team Kimi', driver: 'kimi', status: 'active' }]);
