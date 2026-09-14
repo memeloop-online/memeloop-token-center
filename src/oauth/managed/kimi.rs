@@ -99,6 +99,13 @@ pub(crate) fn credential_from_native_import(
         proxy_url: source.proxy_url,
     };
     validate_credential(&credential)?;
+    if credential.proxy().is_some_and(|(proxy_url, _)| {
+        url::Url::parse(proxy_url)
+            .ok()
+            .is_none_or(|proxy| !network::has_safe_private_ip_literal_host(&proxy))
+    }) {
+        return Err(invalid());
+    }
     Ok(credential)
 }
 
@@ -131,7 +138,7 @@ pub(crate) fn validate_credential(credential: &UpstreamCredential) -> Result<(),
     credential.validate(i64::MIN).map_err(|_| invalid())?;
     if let Some((proxy_url, crate::network::OutboundScope::Private)) = credential.proxy() {
         let parsed = url::Url::parse(proxy_url).map_err(|_| invalid())?;
-        if parsed.scheme() != "socks5h" || !network::has_safe_private_ip_literal_host(&parsed) {
+        if parsed.scheme() != "socks5h" {
             return Err(invalid());
         }
     }
