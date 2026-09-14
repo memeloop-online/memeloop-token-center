@@ -17,8 +17,8 @@ use crate::{
 };
 
 use super::limits::{
-    CLOUD_WEBHOOK_BODY_PERMITS, CLOUD_WEBHOOK_BODY_READ_DEADLINE, IMAGE_RESPONSE_PERMITS,
-    MAX_CLOUD_WEBHOOK_BODY, REQUEST_ID_HEADER,
+    CLOUD_WEBHOOK_BODY_PERMITS, CLOUD_WEBHOOK_BODY_READ_DEADLINE, MAX_CLOUD_WEBHOOK_BODY,
+    REQUEST_ID_HEADER,
 };
 use super::proxy_diagnostics;
 
@@ -150,8 +150,10 @@ pub(super) async fn authenticate_gateway_before_body(
     }
     let image_lifecycle_permit = if request.uri().path() == "/v1/images/generations" {
         Some(
-            IMAGE_RESPONSE_PERMITS
-                .try_acquire()
+            state
+                .image_response_permits
+                .clone()
+                .try_acquire_owned()
                 .map_err(|_| AppError::Overloaded)?,
         )
     } else {

@@ -61,6 +61,15 @@ key, and an explicit same-currency confirmed amount (zero for non-delivery).
 Resolution atomically audits and settles the original reservation, never
 resends the request and never fabricates a successful image. A ledger that
 cannot apply the exact confirmed amount rejects the whole resolution.
+This also applies to a successful provider HTTP response with unusable image
+data: oversized bodies, empty signed-URL assets, aggregate asset-budget
+failures, and invalid Responses image-tool payloads do not prove non-delivery
+or zero provider cost. These return a non-retryable uncertainty response and
+hold the reservation until evidence-backed confirmation. Acceptance scenarios
+exercise the real tenant-scoped reconciliation API, repeated decision receipt,
+zero additional upstream POSTs before and after resolution, and the original
+privacy, unpublished-asset, and durable staging-cleanup checks. Only explicit
+non-delivery confirmation releases these reservations at zero cost.
 Both image and async-job resolutions recheck the exact authenticated service
 credential generation under transaction locks, including on idempotent replay.
 Rotation revokes an in-flight old-credential decision even if the replacement

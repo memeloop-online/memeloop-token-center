@@ -14,7 +14,18 @@ function decimalMicros(value: number) {
 }
 export function ImageGenerationQuarantine(props: Props) {
   // Remount before displaying a different authority: no old rows or pending drafts flash.
-  return <ScopedQuarantine key={JSON.stringify([props.token, props.tenant, props.writeTenant])} {...props} />;
+  return <QuarantineEntry key={JSON.stringify([props.token, props.tenant, props.writeTenant])} {...props} />;
+}
+function QuarantineEntry(props: Props) {
+  const { t } = useI18n();
+  const [opened, setOpened] = useState(false);
+  // Ordinary generation access (including global operators) does not imply the
+  // tenant-bound quarantine capability. Only an explicit action starts its reads.
+  if (opened) return <ScopedQuarantine {...props} />;
+  return <article className="panel image-generation-quarantine"><h2>{t('quarantine.title')}</h2><p className="muted">{t('quarantine.description')}</p>
+    {!props.tenant && <p className="notice">{t('quarantine.tenantRequired')}</p>}
+    <button type="button" className="secondary" disabled={!props.tenant || !props.token.trim()} onClick={() => setOpened(true)}>{t('quarantine.open')}</button>
+  </article>;
 }
 function ScopedQuarantine({ token, tenant, writeTenant }: Props) {
   const { t, locale } = useI18n();

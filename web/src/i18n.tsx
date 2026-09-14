@@ -5,6 +5,7 @@ type Variables = Record<string, string | number>;
 
 const zh = {
   'quarantine.title': '图片发送结果未知 · 人工核对',
+  'quarantine.open': '打开人工核对（需要租户服务凭据）',
   'request.id': '原请求 ID',
   'quarantine.description': '请求可能已发送至上游。系统保留预留额度，不会自动重发；仅在取得外部证据后人工处理。读取与处理均需绑定当前租户的持久服务凭据和相应权限。',
   'quarantine.tenantRequired': '请先选择明确的租户；此处不执行全局扫描。',
@@ -572,6 +573,7 @@ const zh = {
 
 const en = {
   'quarantine.title': 'Unknown image delivery · Manual review',
+  'quarantine.open': 'Open manual review (tenant service credential required)',
   'request.id': 'Original request ID',
   'quarantine.description': 'The request may already have reached the upstream. Reserved funds remain held and no automatic resend occurs. Resolve only with external evidence. Reads and writes require a persistent service credential bound to this tenant with the appropriate scopes.',
   'quarantine.tenantRequired': 'Select an explicit tenant first; this panel never scans globally.',
