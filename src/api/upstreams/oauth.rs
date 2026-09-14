@@ -768,18 +768,25 @@ async fn refresh_managed_upstream_oauth_impl(
     idempotency_key: &str,
     blocking: Option<&crate::worker::BlockingTasks>,
 ) -> Result<crate::provider::UpstreamAccountView, AppError> {
-    let (driver, refresh_url) = state.db.upstream_oauth_lifecycle(account_id).await?;
-    if let Some(replay) = state
+    let pinned = state.clone().pin_application_plugins().await?;
+    let state = &pinned;
+    let claim = match state
         .db
-        .begin_upstream_oauth_refresh(
+        .claim_upstream_oauth_refresh(
             account_id,
             idempotency_key,
             state.config.key_pepper.as_bytes(),
         )
         .await?
     {
-        return Ok(replay);
-    }
+        crate::db::ClaimUpstreamOAuthRefreshResult::Replay(replay) => return Ok(*replay),
+        crate::db::ClaimUpstreamOAuthRefreshResult::Claimed(claim) => claim,
+    };
+    let crate::db::ClaimedUpstreamOAuthRefresh {
+        credential_generation,
+        driver,
+        refresh_url,
+    } = claim;
     let request_guard =
         crate::oauth::DurableOAuthRefreshRequestGuard::new(&state.db, account_id, idempotency_key);
     let refreshed: Result<UpstreamCredential, AppError> = async {
@@ -787,6 +794,11 @@ async fn refresh_managed_upstream_oauth_impl(
             .db
             .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
             .await?;
+        if account.credential_generation != credential_generation {
+            return Err(AppError::Conflict(
+                "OAuth credential changed before its refresh request was dispatched".into(),
+            ));
+        }
         if credential.proxy().is_some() && !supports_oauth_refresh_proxy(&driver) {
             return Err(AppError::BadRequest(
                 "this OAuth lifecycle does not support a private proxy".into(),
