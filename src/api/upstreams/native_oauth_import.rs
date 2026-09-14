@@ -77,7 +77,6 @@ pub(in crate::api) async fn native_oauth_import_capabilities(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "upstreams:import:write").await?;
-    let state = state.pin_application_plugins().await?;
     require_global_service(&service)?;
     Ok(Json(json!({
         "contract_version": CONTRACT_VERSION,
