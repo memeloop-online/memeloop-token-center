@@ -1500,14 +1500,21 @@ function ResourceBoundary<T>({ resource, scopeKey, children }: {
 
 export function ProvidersPage({ token, tenant, writeTenant, onOpenRequest }: OperatorPageProps & { onOpenRequest?: (requestId: string) => void }) {
   const { t } = useI18n();
+  // This page needs an acknowledged account-list refresh after OAuth creation.
+  // The shared resource hook intentionally preserves its non-throwing semantics.
+  const accountRead = useRef<{ scope: string; failed: boolean }>({ scope: '', failed: false });
   const resource = useOperatorResource(
     Boolean(token), `${token}\0${tenant}`,
     async (signal) => {
-      const [providers, values] = await Promise.all([
-        api<ProviderType[]>('/internal/v1/provider-types', token, { signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]) }),
-        api<UpstreamAccount[]>(`/internal/v1/upstreams${queryForTenant(tenant)}`, token, { signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]) }),
-      ]);
-      return { providers, values };
+      const read = { scope: `${token}\0${tenant}`, failed: false };
+      accountRead.current = read;
+      try {
+        const [providers, values] = await Promise.all([
+          api<ProviderType[]>('/internal/v1/provider-types', token, { signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]) }),
+          api<UpstreamAccount[]>(`/internal/v1/upstreams${queryForTenant(tenant)}`, token, { signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]) }),
+        ]);
+        return { providers, values };
+      } catch (reason) { read.failed = true; throw reason; }
     },
     t('common.requestFailed'),
   );
@@ -1535,7 +1542,11 @@ export function ProvidersPage({ token, tenant, writeTenant, onOpenRequest }: Ope
     availabilityLoading: statistics.state.kind === 'idle' || statistics.state.kind === 'loading',
   };
   return <ResourceBoundary resource={resource.state} scopeKey={`${token}\0${tenant}`}>{({ providers, values }) =>
-    <UpstreamProviders token={token} tenant={tenant} writeTenant={writeTenant} providers={providers} values={values} {...availability} onOpenRequest={onOpenRequest} onChanged={async () => { await Promise.all([resource.reload(), statistics.reload()]); }} />
+    <UpstreamProviders token={token} tenant={tenant} writeTenant={writeTenant} providers={providers} values={values} {...availability} onOpenRequest={onOpenRequest} onChanged={async () => {
+      void statistics.reload();
+      await resource.reload();
+      if (accountRead.current.scope === `${token}\0${tenant}` && accountRead.current.failed) throw new Error(t('common.requestFailed'));
+    }} />
   }</ResourceBoundary>;
 }
 

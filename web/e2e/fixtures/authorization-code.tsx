@@ -3,6 +3,7 @@ import { useState } from 'react';
 import { I18nProvider } from '../../src/i18n';
 import { MtcFluentProvider } from '../../src/design-system';
 import { AuthorizationCodeConnection } from '../../src/operator/AuthorizationCodeConnection';
+import { ProvidersPage } from '../../src/operator/pages/ManagementPages';
 import type { ProviderType } from '../../src/types';
 import '../../src/styles.css';
 import '../../src/theme.css';
@@ -23,4 +24,4 @@ function Fixture() {
     if (!response.ok) throw new Error('fixture list read failed');
   }} /></main>;
 }
-createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><Fixture /></MtcFluentProvider></I18nProvider>);
+createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider>{new URLSearchParams(location.search).has('full-page') ? <ProvidersPage token="fixture-token" tenant="fixture-a" /> : <Fixture />}</MtcFluentProvider></I18nProvider>);
