@@ -144,9 +144,27 @@ async fn await_owned_with_active<T>(
 where
     T: Send + 'static,
 {
-    let mut task = OwnedTask::spawn(operation, stage, active);
-    tokio::time::timeout(deadline, task.wait()).await.ok()?
+    await_owned_until(tokio::time::sleep(deadline), operation, stage, active).await
 }
+
+async fn await_owned_until<T>(
+    deadline: impl Future<Output = ()>,
+    operation: impl Future<Output = Result<T, AppError>> + Send + 'static,
+    stage: &'static str,
+    active: Option<Arc<AtomicBool>>,
+) -> Option<Result<T, AppError>>
+where
+    T: Send + 'static,
+{
+    let mut task = OwnedTask::spawn(operation, stage, active);
+    tokio::select! {
+        result = task.wait() => result,
+        () = deadline => None,
+    }
+}
+
+#[cfg(test)]
+pub(crate) use producer::capture_ack_clock_for_test;
 
 async fn await_owned_unbounded<T>(
     operation: impl Future<Output = Result<T, AppError>> + Send + 'static,
