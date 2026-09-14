@@ -82,8 +82,7 @@ function SemanticExecutionPanel({ detail }: { detail: LogicalSessionDetail }) {
   }
   const maxDuration = Math.max(1, ...observations.map((request) => Math.max(0, request.duration_ms ?? 0)));
   const nodeLabel = (request: LogicalSessionDetail['requests'][number], index: number) => request.execution?.agent_id
-    || request.structure?.turn_id
-    || request.structure?.client_name
+    || clientLabel(request.structure?.client_name)
     || t('sessions.executionNode', { index: index + 1 });
   const observationPositions = new Map(observations.map((request, index) => [request.request_id, { request, index }]));
   const parentLabel = (requestId: string) => {
@@ -115,7 +114,7 @@ function SemanticExecutionPanel({ detail }: { detail: LogicalSessionDetail }) {
         const degraded = semanticNode?.parentSource === 'conflict' || semanticNode?.parentSource === 'cycle';
         return <div className={`execution-lane${execution ? '' : ' inferred'}`} key={request.request_id} style={{ '--agent-depth': depth } as CSSProperties}>
           <span className="execution-agent"><b>{nodeLabel(request, index)}</b>{parent && <small>← {parentLabel(parent)}</small>}{degraded && <small title={t('sessions.parentEvidenceDegraded')}>⚠</small>}</span>
-          <span className="execution-track"><span className="execution-span" style={{ left: `${left}%`, width: `${width}%` }} title={`${new Date(request.created_at).toLocaleString(locale)} · ${request.duration_ms ?? 0} ms`}><span>{execution?.task_kind || t('sessions.taskUnclassified')}</span><small>{index + 1} · {request.duration_ms ?? 0} ms</small></span></span>
+          <span className="execution-track"><span className="execution-span" style={{ left: `${left}%`, width: `${width}%` }} title={`${new Date(request.created_at).toLocaleString(locale)} · ${request.duration_ms ?? 0} ms`}><span>{execution?.task_kind || t('sessions.taskUnclassified')}</span><small>{index + 1} · {formatMilliseconds(request.duration_ms ?? 0, locale)}</small></span></span>
         </div>;
       })}<div className="execution-axis" aria-hidden="true"><span>0</span><span>{formatMilliseconds(timelineDuration, locale)}</span></div></div>
       <div className="task-breakdown"><h4>{t('sessions.taskBreakdown')}</h4><div className="task-pie" style={{ background: `conic-gradient(${stops})` }} role="img" aria-label={t('sessions.taskBreakdown')} /><ul>{taskEntries.map(([kind, count], index) => <li key={kind}><i style={{ background: semanticPalette[index % semanticPalette.length] }} /><span>{kind}</span><b>{count}</b></li>)}</ul><small>{t('sessions.taskBreakdownBasis')}</small></div>
