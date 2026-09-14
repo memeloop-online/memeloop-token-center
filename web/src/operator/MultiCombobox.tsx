@@ -1,5 +1,6 @@
 import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import { useAnchoredPopover } from '../useAnchoredPopover';
+import { DetailTooltip } from '../design-system';
 import './multiCombobox.css';
 
 export interface ComboboxOption {
@@ -9,6 +10,7 @@ export interface ComboboxOption {
   created?: boolean;
   disabled?: boolean;
   details?: string;
+  chipDescription?: string;
 }
 
 interface MultiComboboxProps {
@@ -116,7 +118,9 @@ export function MultiCombobox({
     {hint && <small className="field-hint" id={`${id}-hint`}>{hint}</small>}
     <div ref={anchor} className="multi-combobox-control" onClick={openFromControl}>
       {value.map((item) => <span className={`selection-chip${item.created ? ' pending' : ''}`} key={item.value}>
-        <span className="selection-chip-label" title={item.details}>{item.label}</span>
+        {item.chipDescription && item.details ? <DetailTooltip content={item.details}><span className="selection-chip-label selection-chip-hierarchy" tabIndex={0} onClick={event => event.stopPropagation()}>
+          <span>{item.label}</span><small>{item.chipDescription}</small>
+        </span></DetailTooltip> : <span className="selection-chip-label" title={item.details}>{item.label}</span>}
         <button type="button" disabled={disabled} aria-label={removeLabel(item.label)} onClick={(event) => {
           event.stopPropagation(); onChange(value.filter((selectedItem) => selectedItem.value !== item.value));
           // The chip button unmounts after removal; retain a useful keyboard

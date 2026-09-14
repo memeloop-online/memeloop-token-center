@@ -6,6 +6,7 @@ import { useI18n } from '../i18n';
 import type { GroupView, ModelRouteView, ProviderType, UpstreamAccount } from '../types';
 import { CredentialAuthorizationFields } from './CredentialAuthorizationFields';
 import { credentialRouteOptions } from './credentialRouteOptions';
+import './credentialRoutePresentation.css';
 
 export function CredentialRouteAuthorization({ token, tenant, routes, groups, routeIds, groupIds, onRoutes, onGroups }: {
   token: string; tenant: string; routes: ModelRouteView[]; groups: GroupView[];
@@ -37,13 +38,17 @@ export function CredentialRouteAuthorization({ token, tenant, routes, groups, ro
     <p className="field-hint">{zh ? '只授权某一账号，请选择该账号的专用路由。' : 'To authorize one account, choose its dedicated route.'} <a href={appHref('operator', 'routes')} target="_blank" rel="noopener noreferrer">{zh ? '新建或查看专用路由（新标签页）' : 'Create or inspect a dedicated route (new tab)'}</a> <DetailTooltip content={zh ? '授权包含整条路由的候选账号。路由组可复用这些路由，后续修改共享路由或组成员也会改变授权范围。' : 'Grants cover every candidate account in a route. Groups reuse these routes; later shared-route or group changes also change the scope.'}><Button appearance="subtle" type="button">{zh ? '授权范围说明' : 'About grant scope'}</Button></DetailTooltip></p>
     {!current ? <small role="status">{zh ? '正在读取账号目录…' : 'Loading account catalog…'}</small> : current.failed && <div><small role="status">{zh ? '账号目录读取失败' : 'Account catalog could not be read'}</small> <Button appearance="subtle" type="button" onClick={() => { setCatalog(undefined); setRetry(value => value + 1); }}>{zh ? '重试读取目录' : 'Retry account catalog'}</Button></div>}
     <CredentialAuthorizationFields routes={options} groups={groups.map(group => ({ value: group.id, label: group.name, description: `${group.member_ids.length} ${zh ? '条路由' : 'routes'}` }))} routeIds={routeIds} groupIds={groupIds} onRoutes={onRoutes} onGroups={onGroups} />
-    <section style={{ overflowWrap: 'anywhere' }} aria-label={zh ? '授权范围预览' : 'Authorization scope preview'}>
+    <section className="credential-route-preview" aria-label={zh ? '授权范围预览' : 'Authorization scope preview'}>
       <h4>{zh ? '授权范围预览' : 'Authorization scope preview'}</h4>
       {selectedGroups.some(group => !group) && <small>{zh ? '部分路由组目录不可用' : 'Some route groups are unavailable in the catalog'}</small>}
-      <ul style={{ color: 'var(--colorNeutralForeground1)' }}>{effectiveIds.map(id => {
+      <ul>{effectiveIds.map(id => {
         const option = describe(id);
         const sources = [...(routeIds.includes(id) ? [zh ? '直接授权' : 'Direct grant'] : []), ...selectedGroups.filter(group => group?.member_ids.includes(id)).map(group => group!.name)];
-        return <li key={id}><DetailTooltip content={option?.details ?? id}><span tabIndex={0}>{option?.label ?? `${zh ? '未知路由' : 'Unknown route'} …${id.slice(-6)}`}</span></DetailTooltip><p className="field-hint">{option?.description ?? (zh ? '路由目录未知' : 'Route catalog unknown')} · {sources.join(' / ')}</p></li>;
+        return <li key={id}>
+          <div className="credential-route-preview-heading"><DetailTooltip content={option?.details ?? id}><span tabIndex={0} className="credential-route-model">{option?.label ?? `${zh ? '未知路由' : 'Unknown route'} …${id.slice(-6)}`}</span></DetailTooltip><span className="field-hint">{option?.scope ?? (zh ? '路由目录未知' : 'Route catalog unknown')}</span></div>
+          {option?.accountDescription && <p className="field-hint">{zh ? '账号' : 'Accounts'}: {option.accountDescription}</p>}
+          <p className="field-hint">{option?.disabled && `${zh ? '当前不可用' : 'Currently unavailable'} · `}{zh ? '授权来源' : 'Grant source'}: {sources.join(' / ')}</p>
+        </li>;
       })}</ul>
       {!effectiveIds.length && <small>{zh ? '尚无已知路由授权' : 'No known route grants yet'}</small>}
     </section>

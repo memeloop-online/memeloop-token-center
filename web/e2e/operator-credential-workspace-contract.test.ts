@@ -312,7 +312,7 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
       await routes.fill('Research model');
       await client.getByRole('option').filter({ hasText: 'Personal Kimi' }).waitFor();
       assert.equal(await client.getByRole('option').count(), 2, 'seven inactive copies are hidden while the two active accounts stay distinct');
-      assert.equal(await client.getByRole('option').filter({ hasText: 'Personal Kimi' }).locator('span').textContent(), 'Kimi → Personal Kimi → Research model', 'inactive duplicates do not add a technical suffix to the sole active account route');
+      assert.equal(await client.getByRole('option').filter({ hasText: 'Personal Kimi' }).locator('span').textContent(), 'Research model', 'distinct account descriptions and inactive history do not add technical suffixes');
       await routes.fill('Personal Kimi');
       await routes.press('ArrowDown');
       await routes.press('Enter');
@@ -322,7 +322,8 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
       await groups.press('Enter');
       await groups.press('Escape');
       const preview = create.getByRole('region', { name: english ? 'Authorization scope preview' : '授权范围预览' });
-      await preview.getByText('Kimi → Personal Kimi → Research model', { exact: true }).waitFor();
+      await preview.getByText('Research model', { exact: true }).waitFor();
+      assert.match(await preview.innerText(), /Personal Kimi/, 'the model-first preview still identifies its authorized account');
       assert.equal(await preview.getByRole('listitem').count(), 1, 'direct and group grants share one preview row with both sources');
       assert.match(await preview.innerText(), /Research group/);
       assert.match(await preview.innerText(), english ? /Direct grant/ : /直接授权/);
