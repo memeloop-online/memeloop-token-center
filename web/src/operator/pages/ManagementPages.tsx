@@ -252,7 +252,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
         const deletionBlockers = currentReadiness ? deletionMessages(currentReadiness) : [];
         const detailOpen = providerDetail === value.id;
         const providerName = providers.find(provider => provider.id === value.driver)?.display_name ?? (locale.startsWith('zh') ? '其他服务' : 'Other service');
-        const facts = availabilityWindow?.tenant_external_id === value.tenant_external_id ? availabilityWindow.accounts.find(account => account.upstream_account_id === value.id) : undefined;
+        const facts = availabilityWindow && availabilityWindow.tenant_external_id === value.tenant_external_id ? availabilityWindow.accounts.find(account => account.upstream_account_id === value.id) : undefined;
         const terminal = facts ? facts.metrics.successful_requests + facts.metrics.failed_requests : 0;
         const quota = quotaSummaries[value.id];
         const quotaPercents = quota?.windows.map(quotaUsedPercent).filter((percent): percent is number => percent !== null) ?? [];
