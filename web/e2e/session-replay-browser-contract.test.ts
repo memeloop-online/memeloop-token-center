@@ -63,13 +63,26 @@ test('slow replay reads survive live metadata refresh, publish incrementally and
     assert.equal(await page.evaluate(() => window.sessionReplayReads['replay-r1']), 2, 'metadata-only refreshes never restart completed or in-flight reads');
     assert.equal(await page.evaluate(() => window.sessionReplayReads['replay-r2']), 2);
     assert.ok(await page.evaluate(() => window.sessionReplayAborts) > 0, 'scope transition cancels obsolete reads');
+    const originalTurn = page.locator('.session-replay-turns button').filter({ hasText: 'Find the forecast for Oslo' });
+    await originalTurn.click();
+    const originalEntry = page.locator('.session-replay-feed > li').filter({ has: page.locator('.session-replay-entry.message.user') });
+    await originalEntry.evaluate(element => element.setAttribute('data-retained-test', 'true'));
+    await page.getByRole('button', { name: 'Append earlier archive', exact: true }).click();
+    await page.waitForFunction(() => window.sessionReplayReads['earlier-late'] === 1);
+    assert.equal(await originalTurn.getAttribute('aria-pressed'), 'true', 'new unrelated requests retain the selected user turn');
+    await page.getByRole('button', { name: 'Release earlier archive', exact: true }).click();
+    await page.locator('.session-replay-feed').getByText('Earlier restored user turn', { exact: true }).waitFor();
+    assert.equal(await originalTurn.getAttribute('aria-pressed'), 'true', 'earlier archives do not move the selected identity to another message');
+    assert.equal(await page.locator('.session-replay-feed > li[data-retained-test="true"].selected').count(), 1, 'late insertion preserves the original message DOM and reading state');
     await page.getByRole('button', { name: 'Finish late archive', exact: true }).click();
     await page.getByText('Late archive arrived', { exact: true }).waitFor();
     assert.equal(await page.evaluate(() => window.sessionReplayReads['replay-r1']), 2, 'complete archives are reused inside the same bounded scope');
     assert.equal(await page.evaluate(() => window.sessionReplayReads['replay-r3']), 3, 'late availability refreshes an incomplete archive');
     await page.getByRole('button', { name: 'Invalidate complete archive', exact: true }).click();
     await page.waitForFunction(() => window.sessionReplayReads['replay-r1'] === 3);
-    assert.equal(await page.locator('.session-replay-entry.message.user').count(), 0, 'a changed archive revision invalidates even previously complete cached content');
+    assert.equal(await page.locator('.session-replay-entry.message.user').filter({ hasText: 'Find the forecast for Oslo' }).count(), 0, 'a changed archive revision invalidates even previously complete cached content');
+    assert.equal(await page.locator('.session-replay-turns button[aria-pressed="true"]').count(), 0, 'revoking the selected archive clears its selection');
+    assert.equal(await page.locator('.session-replay-entry.message.user').filter({ hasText: 'Earlier restored user turn' }).count(), 1, 'revocation does not discard unrelated archived messages');
   } finally { await browser.close(); await server.close(); }
 });
 

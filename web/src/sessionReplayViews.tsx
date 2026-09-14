@@ -30,6 +30,7 @@ interface ReplayReadScope {
 interface ReplayEntry {
   item: SessionReplayItem;
   index: number;
+  identity: string;
   archiveBodies?: 2;
 }
 
@@ -137,8 +138,8 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
   const readScope = useRef<ReplayReadScope | undefined>(undefined);
   const [mismatchedIds, setMismatchedIds] = useState<Set<string>>(new Set());
   const [archiveLoading, setArchiveLoading] = useState(Boolean(loadArchiveDetail));
-  const entryRefs = useRef(new Map<number, HTMLElement>());
-  const [selectedTurn, setSelectedTurn] = useState<number>();
+  const entryRefs = useRef(new Map<string, HTMLElement>());
+  const [selectedTurn, setSelectedTurn] = useState<string>();
 
   const requestKey = JSON.stringify(orderedRequests.map(archiveRevision));
   // Live list refreshes create fresh objects even when archive inputs are unchanged.
@@ -216,12 +217,9 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
       scope.cache.delete(id); scope.finished.delete(id); scope.mismatched.delete(id);
     }
     scope.wanted = wanted;
-    setSelectedTurn(undefined);
     pump(scope);
     publish(scope);
   }, [detail.session_id, scopeKey, loadArchiveDetail, requestKey, sourceRequests]);
-
-  if (!loadArchiveDetail) return null;
 
   const projection = projectSessionReplay(detail.session_id, archiveDetails);
   const loadedIds = new Set(archiveDetails.map((request) => request.request_id));
@@ -237,8 +235,14 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
       ];
     });
   const requestPositions = new Map(sourceRequests.map((request, index) => [request.request_id, index]));
+  const sourceOrdinals = new Map<string, number>();
   const orderedEntries = [...projection.items, ...missingEntries]
-    .map((item, index) => ({ item, index }))
+    .map((item, index) => {
+      const source = JSON.stringify([item.requestId, item.body]);
+      const ordinal = sourceOrdinals.get(source) ?? 0;
+      sourceOrdinals.set(source, ordinal + 1);
+      return { item, index, identity: JSON.stringify([item.requestId, item.body, ordinal]) };
+    })
     .sort((left, right) => (requestPositions.get(left.item.requestId) ?? Number.MAX_SAFE_INTEGER) - (requestPositions.get(right.item.requestId) ?? Number.MAX_SAFE_INTEGER)
       || bodyOrder(left.item) - bodyOrder(right.item)
       || left.index - right.index);
@@ -258,12 +262,18 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
     return merged;
   }, []);
   const turns = entries.filter((entry) => entry.item.kind === 'message' && entry.item.role === 'user');
+  const turnIdentities = JSON.stringify(turns.map(entry => entry.identity));
+  useEffect(() => {
+    if (selectedTurn && !turns.some(entry => entry.identity === selectedTurn)) setSelectedTurn(undefined);
+  }, [selectedTurn, turnIdentities]);
   const incompleteCount = archiveDetails.filter((request) => !request.archive_complete).length;
 
   function selectTurn(turn: ReplayEntry) {
-    setSelectedTurn(turn.index);
-    entryRefs.current.get(turn.index)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    setSelectedTurn(turn.identity);
+    entryRefs.current.get(turn.identity)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
   }
+
+  if (!loadArchiveDetail) return null;
 
   return <section className="session-replay" aria-label={t('sessionReplay.title')}>
     <header className="session-replay-heading">
@@ -280,22 +290,22 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
         {turns.length > 0 ? <ol>{turns.map((turn, index) => {
           const message = turn.item.kind === 'message' ? turn.item : undefined;
           const fullText = message?.text ?? unknownLabel(t, message?.unknown ?? null);
-          return <li key={`${turn.item.requestId}:${turn.index}`}><button
+          return <li key={turn.identity}><button
             type="button"
             title={fullText}
             aria-label={t('sessionReplay.userTurn', { index: index + 1, text: fullText })}
-            aria-pressed={selectedTurn === turn.index}
+            aria-pressed={selectedTurn === turn.identity}
             onClick={() => selectTurn(turn)}
           ><span>{index + 1}</span><b>{fullText}</b></button></li>;
         })}</ol> : <p>{t('sessionReplay.noUserTurns')}</p>}
       </aside>
       <ol className="session-replay-feed" aria-label={t('sessionReplay.archiveSequence')}>
         {entries.map((entry) => <li
-          key={`${entry.item.requestId}:${entry.item.body}:${entry.index}`}
-          className={selectedTurn === entry.index ? 'selected' : undefined}
+          key={entry.identity}
+          className={selectedTurn === entry.identity ? 'selected' : undefined}
           ref={(node) => {
-            if (node) entryRefs.current.set(entry.index, node);
-            else entryRefs.current.delete(entry.index);
+            if (node) entryRefs.current.set(entry.identity, node);
+            else entryRefs.current.delete(entry.identity);
           }}
         ><EntryContent entry={entry} t={t} /></li>)}
       </ol>
