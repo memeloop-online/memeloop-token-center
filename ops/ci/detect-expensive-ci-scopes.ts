@@ -1,4 +1,5 @@
 import { appendFileSync, readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 
 const SCOPE = 'expensive CI scope detection';
 const [eventName = '', changedPathsValue = '', outputValue = ''] = process.argv.slice(2);
@@ -9,6 +10,30 @@ if (changedPathsValue === '' || outputValue === '') {
   throw new Error(`${SCOPE}: changed-path and output files are required`);
 }
 type Change = { status: string; paths: string[] };
+
+function checkedOutMergeDiff(): { input: string; base: string } | undefined {
+  const checkout = process.env.GITHUB_SHA ?? '';
+  const head = process.env.PR_HEAD_SHA ?? '';
+  if (![checkout, head].every((sha) => /^[0-9a-f]{40}$/i.test(sha))) return undefined;
+  const git = (...args: string[]): string => execFileSync('git', ['--no-replace-objects', ...args], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  try {
+    if (git('rev-parse', '--verify', 'HEAD').trim() !== checkout.toLowerCase()) return undefined;
+    const [commit, base, parentHead, ...extra] = git('rev-list', '--parents', '-n', '1', checkout).trim().split(/\s+/);
+    if (commit !== checkout.toLowerCase() || !base || !/^[0-9a-f]{40}$/.test(base)
+      || parentHead !== head.toLowerCase() || extra.length !== 0) return undefined;
+    // Event base.sha can lag the base actually used to build this checkout.
+    // Compare the verified merge tree with its real first parent, never a
+    // guessed branch/ref or a stale event base that includes unrelated work.
+    const input = git('diff', '--name-status', '--find-renames=100%', '--diff-filter=ACDMRT', '-z', base, checkout);
+    return input === '' ? undefined : { input, base };
+  } catch {
+    return undefined;
+  }
+}
 
 function parseNameStatus(value: string): Change[] {
   if (value === '') return [];
@@ -28,9 +53,13 @@ function parseNameStatus(value: string): Change[] {
   return changes;
 }
 
-const changes = parseNameStatus(readFileSync(changedPathsValue, 'utf8'));
+const verifiedMergeMode = changedPathsValue === '--verified-merge';
+const merge = verifiedMergeMode && eventName === 'pull_request' ? checkedOutMergeDiff() : undefined;
+const forceFull = verifiedMergeMode && eventName === 'pull_request' && merge === undefined;
+if (forceFull) console.warn(`${SCOPE}: merge checkout could not be verified; running all gates`);
+const changes = parseNameStatus(verifiedMergeMode ? merge?.input ?? '' : readFileSync(changedPathsValue, 'utf8'));
 const paths = changes.flatMap(({ paths }) => paths);
-if (eventName === 'pull_request' && changes.length === 0) {
+if (eventName === 'pull_request' && !forceFull && changes.length === 0) {
   throw new Error(`${SCOPE}: a pull request must resolve at least one changed path`);
 }
 
@@ -39,21 +68,22 @@ if (eventName === 'pull_request' && changes.length === 0) {
 // exercised by the memory gate. Memory/load harness inputs remain outside this
 // allowlist, so every unknown or newly introduced path runs acceptance.
 const memorySafe = /^(?:docs\/|web\/|charts\/|openapi\/|tests\/(?!load(?:\/|$))|README\.md$|LICENSE$|\.gitignore$|compose\.yaml$)/;
-const memory = eventName === 'push' || paths.some((path) => !memorySafe.test(path));
+const fullCoverage = eventName === 'push' || forceFull;
+const memory = fullCoverage || paths.some((path) => !memorySafe.test(path));
 // Both sides of rename/copy records participate, so boundary crossings stay
 // full. Static operator-contract tests neither build nor execute the service;
 // their packaging contract job remains mandatory, while production source,
 // browser, workflow, and CI-script changes remain full coverage.
 const webOnly = changes.length > 0 && changes.every(({ paths }) => paths.every((path) => path.startsWith('web/')));
 const staticContractsOnly = changes.length > 0 && changes.every(({ paths }) => paths.every((path) => path.startsWith('tests/ops/')));
-const rust = eventName === 'push' || !(webOnly || staticContractsOnly);
-const web = eventName === 'push' || !staticContractsOnly;
-const migration = eventName === 'push' || !(webOnly || staticContractsOnly);
-const pluginInstaller = eventName === 'push' || paths.some((path) => /^(?:\.cargo\/|\.dockerignore$|\.github\/workflows\/ci\.yml$|Cargo\.(?:toml|lock)$|Dockerfile\.plugin-installer$|packaging\/cosign\/|src\/|migrations\/|schemas\/|wit\/|vendor\/|tests\/ops\/plugin-installer-image-contract\.test\.ts$)/.test(path));
+const rust = fullCoverage || !(webOnly || staticContractsOnly);
+const web = fullCoverage || !staticContractsOnly;
+const migration = fullCoverage || !(webOnly || staticContractsOnly);
+const pluginInstaller = fullCoverage || paths.some((path) => /^(?:\.cargo\/|\.dockerignore$|\.github\/workflows\/ci\.yml$|Cargo\.(?:toml|lock)$|Dockerfile\.plugin-installer$|packaging\/cosign\/|src\/|migrations\/|schemas\/|wit\/|vendor\/|tests\/ops\/plugin-installer-image-contract\.test\.ts$)/.test(path));
 
 appendFileSync(
   outputValue,
   `rust=${String(rust)}\nweb=${String(web)}\nmigration=${String(migration)}\nmemory=${String(memory)}\nplugin_installer=${String(pluginInstaller)}\n`,
   'utf8',
 );
-console.log(JSON.stringify({ event: eventName, change_count: changes.length, web_only: webOnly, static_contracts_only: staticContractsOnly, rust, web, migration, memory, plugin_installer: pluginInstaller }));
+console.log(JSON.stringify({ event: eventName, comparison_base: merge?.base, force_full: forceFull, change_count: changes.length, web_only: webOnly, static_contracts_only: staticContractsOnly, rust, web, migration, memory, plugin_installer: pluginInstaller }));
