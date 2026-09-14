@@ -208,15 +208,6 @@ async fn refresh_at(
     request_guard: &dyn OAuthRefreshRequestGuard,
 ) -> Result<UpstreamCredential, AppError> {
     validate_credential(credential)?;
-    let UpstreamCredential::OAuth {
-        refresh_token: Some(refresh_token),
-        expires_at,
-        adapter_state,
-        ..
-    } = credential
-    else {
-        return Err(invalid());
-    };
     let client = network::client_for_config_url(
         http,
         endpoint,
@@ -226,6 +217,24 @@ async fn refresh_at(
     )
     .await
     .map_err(|_| failed())?;
+    refresh_with_client(&client, credential, endpoint, request_guard).await
+}
+
+async fn refresh_with_client(
+    client: &reqwest::Client,
+    credential: &UpstreamCredential,
+    endpoint: &str,
+    request_guard: &dyn OAuthRefreshRequestGuard,
+) -> Result<UpstreamCredential, AppError> {
+    let UpstreamCredential::OAuth {
+        refresh_token: Some(refresh_token),
+        expires_at,
+        adapter_state,
+        ..
+    } = credential
+    else {
+        return Err(invalid());
+    };
     let form = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("client_id", CLIENT_ID)
         .append_pair("grant_type", "refresh_token")
@@ -454,7 +463,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_uses_account_socks5h_proxy_and_preserves_it() {
+    async fn refresh_request_uses_socks5h_remote_dns_and_preserves_account_proxy() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/token"))
@@ -492,27 +501,12 @@ mod tests {
 
             let mut request = [0_u8; 4];
             client.read_exact(&mut request).await.unwrap();
-            assert_eq!(&request[..3], &[5, 1, 0]);
-            match request[3] {
-                1 => {
-                    let mut address = [0_u8; 4];
-                    client.read_exact(&mut address).await.unwrap();
-                    assert!(std::net::Ipv4Addr::from(address).is_loopback());
-                }
-                3 => {
-                    let mut hostname_length = [0_u8; 1];
-                    client.read_exact(&mut hostname_length).await.unwrap();
-                    let mut hostname = vec![0_u8; usize::from(hostname_length[0])];
-                    client.read_exact(&mut hostname).await.unwrap();
-                    assert_eq!(hostname, b"localhost");
-                }
-                4 => {
-                    let mut address = [0_u8; 16];
-                    client.read_exact(&mut address).await.unwrap();
-                    assert!(std::net::Ipv6Addr::from(address).is_loopback());
-                }
-                value => panic!("unexpected SOCKS5 address type {value}"),
-            }
+            assert_eq!(&request, &[5, 1, 0, 3]);
+            let mut hostname_length = [0_u8; 1];
+            client.read_exact(&mut hostname_length).await.unwrap();
+            let mut hostname = vec![0_u8; usize::from(hostname_length[0])];
+            client.read_exact(&mut hostname).await.unwrap();
+            assert_eq!(hostname, b"kimi-refresh.test");
             let mut port = [0_u8; 2];
             client.read_exact(&mut port).await.unwrap();
             assert_eq!(u16::from_be_bytes(port), target_address.port());
@@ -529,11 +523,15 @@ mod tests {
 
         let proxy_url = format!("socks5h://{proxy_address}");
         let current = with_proxy(credential("fixture-device"), proxy_url.clone());
-        let refreshed = refresh_at(
-            &crate::build_http_client().unwrap(),
+        // The production network layer passes the same account proxy URL to
+        // `reqwest::Proxy::all` after validating the fixed Kimi destination.
+        // Keep this hostname absent from local DNS so this request can succeed
+        // only when the SOCKS5H client sends the original name to the proxy.
+        let client = crate::build_explicit_proxy_http_client(&proxy_url, &[]).unwrap();
+        let refreshed = refresh_with_client(
+            &client,
             &current,
-            true,
-            &format!("http://localhost:{}/token", target_address.port()),
+            &format!("http://kimi-refresh.test:{}/token", target_address.port()),
             &crate::oauth::TEST_OAUTH_REFRESH_REQUEST_GUARD,
         )
         .await
