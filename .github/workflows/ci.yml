@@ -32,23 +32,10 @@ jobs:
       - name: Resolve fail-closed CI scopes including both sides of renames
         id: scope
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
-          changed="$RUNNER_TEMP/ci-changed-paths.z"
-          : > "$changed"
-          if [ "$EVENT_NAME" = pull_request ]; then
-            case "$BASE_SHA" in
-              ''|*[!0-9a-fA-F]*)
-                echo 'pull request base SHA must be exact hexadecimal' >&2
-                exit 1
-                ;;
-            esac
-            test "${#BASE_SHA}" -eq 40
-            git cat-file -e "$BASE_SHA^{commit}"
-            git diff --name-status --find-renames=100% --diff-filter=ACDMRT -z "$BASE_SHA" "$GITHUB_SHA" > "$changed"
-          fi
-          node ops/ci/detect-expensive-ci-scopes.ts "$EVENT_NAME" "$changed" "$GITHUB_OUTPUT"
+          node ops/ci/detect-expensive-ci-scopes.ts "$EVENT_NAME" --verified-merge "$GITHUB_OUTPUT"
 
   repository-security:
     runs-on: ubuntu-latest
