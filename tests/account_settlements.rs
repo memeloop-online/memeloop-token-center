@@ -7,6 +7,7 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use helpers::{assert_sanitized, get_json, service_token};
+use memeloop_token_center::api;
 use serde_json::{Value, json};
 use support::Fixture;
 use tower::ServiceExt;
@@ -204,27 +205,31 @@ async fn attributed_settlement_adjustment_is_scope_bound_idempotent_and_sanitize
         "source": "cloud-settlement-discount"
     });
 
-    let send = |token: &str, idempotency_key: &str, body: Value| async {
-        let response = api::router_for_role(
-            fixture.state.clone(),
-            memeloop_token_center::config::RuntimeRole::Control,
-        )
-        .oneshot(
-            Request::put(&path)
-                .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("idempotency-key", idempotency_key)
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-        let status = response.status();
-        let headers = response.headers().clone();
-        let response: Value =
-            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
-                .unwrap();
-        (status, headers, response)
+    let send = |token: &str, idempotency_key: &str, body: Value| {
+        let state = fixture.state.clone();
+        let path = path.clone();
+        let token = token.to_owned();
+        let idempotency_key = idempotency_key.to_owned();
+        async move {
+            let response =
+                api::router_for_role(state, memeloop_token_center::config::RuntimeRole::Control)
+                    .oneshot(
+                        Request::put(&path)
+                            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .header("idempotency-key", idempotency_key)
+                            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            let response: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                    .unwrap();
+            (status, headers, response)
+        }
     };
 
     let (status, _, denied) = send(&fixture.credits_only_token, "credit-only", body.clone()).await;
