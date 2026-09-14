@@ -78,6 +78,7 @@ pub(in crate::api) async fn probe_upstream_health(
     Query(query): Query<ManagementTenantQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "providers:write").await?;
+    let state = state.pin_application_plugins().await?;
     if let Some(tenant) = query
         .tenant_external_id
         .as_deref()

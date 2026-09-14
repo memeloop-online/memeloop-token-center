@@ -82,13 +82,46 @@ pub struct RollbackApplicationPlugin {
 
 pub struct ApplicationPlugins {
     db: Database,
-    inventory: BTreeMap<String, PreinstalledInventory>,
-    contract_digest: String,
+    inventory: tokio::sync::RwLock<BTreeMap<String, PreinstalledInventory>>,
+    inventory_file: Option<PathBuf>,
+    inventory_stamp: tokio::sync::Mutex<Option<InventoryStamp>>,
+    #[cfg(test)]
+    inventory_reads: std::sync::atomic::AtomicUsize,
     snapshots: tokio::sync::Mutex<RevisionCache>,
     #[cfg(test)]
     compilations: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     compile_gate: std::sync::Mutex<Option<CompileGate>>,
+}
+
+#[derive(PartialEq, Eq)]
+struct InventoryStamp {
+    length: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    inode: (u64, u64, i64, i64),
+}
+
+impl InventoryStamp {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Result<Self, AppError> {
+        if !metadata.is_file() {
+            return Err(AppError::Forbidden);
+        }
+        Ok(Self {
+            length: metadata.len(),
+            modified: metadata.modified().map_err(|_| AppError::Internal)?,
+            #[cfg(unix)]
+            inode: {
+                use std::os::unix::fs::MetadataExt;
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec(),
+                )
+            },
+        })
+    }
 }
 
 #[cfg(test)]
@@ -137,12 +170,15 @@ impl LoadFailure {
 
 impl ApplicationPlugins {
     pub async fn status(&self) -> Result<ApplicationPluginStatus, AppError> {
+        self.refresh_inventory().await?;
         let current = self.db.optional_application_plugin_head().await?;
         let staged = self.db.staged_application_plugin_ids().await?;
         Ok(ApplicationPluginStatus {
             current,
             candidates: self
                 .inventory
+                .read()
+                .await
                 .iter()
                 .map(|(id, entry)| ApplicationPluginCandidate {
                     inventory_id: id.clone(),
@@ -165,7 +201,7 @@ impl ApplicationPlugins {
     pub fn new(
         db: Database,
         inventory: BTreeMap<String, PreinstalledInventory>,
-        baseline: &PluginRuntime,
+        _baseline: &PluginRuntime,
     ) -> Result<Self, AppError> {
         for (id, entry) in &inventory {
             validate_inventory_id(id)?;
@@ -175,14 +211,89 @@ impl ApplicationPlugins {
         }
         Ok(Self {
             db,
-            inventory,
-            contract_digest: contract_digest(baseline)?,
+            inventory: tokio::sync::RwLock::new(inventory),
+            inventory_file: None,
+            inventory_stamp: tokio::sync::Mutex::new(None),
+            #[cfg(test)]
+            inventory_reads: std::sync::atomic::AtomicUsize::new(0),
             snapshots: tokio::sync::Mutex::new(RevisionCache::default()),
             #[cfg(test)]
             compilations: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             compile_gate: std::sync::Mutex::new(None),
         })
+    }
+
+    /// The installer publishes a complete, host-owned inventory file by atomic
+    /// rename. Requests may select IDs, but never supply paths or grants.
+    pub async fn from_inventory_file(
+        db: Database,
+        path: PathBuf,
+        baseline: &PluginRuntime,
+    ) -> Result<Self, AppError> {
+        if !path.is_absolute() {
+            return Err(AppError::Forbidden);
+        }
+        let mut authority = Self::new(db, BTreeMap::new(), baseline)?;
+        authority.inventory_file = Some(path);
+        authority.refresh_inventory().await?;
+        Ok(authority)
+    }
+
+    async fn refresh_inventory(&self) -> Result<(), AppError> {
+        let Some(path) = &self.inventory_file else {
+            return Ok(());
+        };
+        use tokio::io::AsyncReadExt;
+        const MAX_INVENTORY_BYTES: u64 = 4 * 1024 * 1024;
+        // Serialize refreshes and inspect the opened inode, not a separate
+        // pathname stat. Atomic rename cannot mix metadata from one revision
+        // with bytes from another. Unchanged inventories never parse again.
+        let mut cached_stamp = self.inventory_stamp.lock().await;
+        let file = tokio::fs::File::open(path)
+            .await
+            .map_err(|_| AppError::Internal)?;
+        let stamp =
+            InventoryStamp::from_metadata(&file.metadata().await.map_err(|_| AppError::Internal)?)?;
+        if cached_stamp.as_ref() == Some(&stamp) {
+            return Ok(());
+        }
+        if stamp.length > MAX_INVENTORY_BYTES {
+            return Err(AppError::Forbidden);
+        }
+        let mut bytes = Vec::new();
+        #[cfg(test)]
+        self.inventory_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        file.take(MAX_INVENTORY_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| AppError::Internal)?;
+        if bytes.len() as u64 > MAX_INVENTORY_BYTES {
+            return Err(AppError::Forbidden);
+        }
+        let incoming: BTreeMap<String, PreinstalledInventory> =
+            serde_json::from_slice(&bytes).map_err(|_| AppError::Forbidden)?;
+        let mut inventory = self.inventory.write().await;
+        for (id, entry) in &incoming {
+            validate_inventory_id(id)?;
+            if !entry.root.is_absolute() {
+                return Err(AppError::Forbidden);
+            }
+        }
+        // Retain every historical root for restart-safe rollback. Existing IDs
+        // are immutable, including grants; changing a contract needs a new ID.
+        for (id, old) in inventory.iter() {
+            let new = incoming.get(id).ok_or(AppError::Forbidden)?;
+            if serde_json::to_value(old).map_err(|_| AppError::Internal)?
+                != serde_json::to_value(new).map_err(|_| AppError::Internal)?
+            {
+                return Err(AppError::Forbidden);
+            }
+        }
+        *inventory = incoming;
+        *cached_stamp = Some(stamp);
+        Ok(())
     }
 
     async fn load(
@@ -192,7 +303,14 @@ impl ApplicationPlugins {
         reason: &str,
     ) -> Result<ApplicationPluginSnapshot, AppError> {
         validate_inventory_id(id)?;
-        let entry = self.inventory.get(id).cloned().ok_or(AppError::Forbidden)?;
+        self.refresh_inventory().await?;
+        let entry = self
+            .inventory
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or(AppError::Forbidden)?;
         let db = self.db.clone();
         let permit =
             tokio::time::timeout(ADMISSION_WAIT, COMPILATION_PERMITS.clone().acquire_owned())
@@ -228,9 +346,6 @@ impl ApplicationPlugins {
             .map_err(|_| AppError::Overloaded)?
             .map_err(|_| AppError::Internal)??;
         let contract_digest = contract_digest(&runtime)?;
-        if contract_digest != self.contract_digest {
-            return Err(AppError::Forbidden);
-        }
         runtime.validate_stored_configurations().await?;
         let identity_digest = super::plugin_configuration_schema_digest(&json!({
             "manifests": runtime.manifests(), "identities": runtime.package_identities()
@@ -282,10 +397,17 @@ impl ApplicationPlugins {
         } else {
             "reload"
         };
-        self.stage(&input.inventory_id).await?;
         let hash = super::plugin_configuration_schema_digest(
             &json!({ "action": "publish", "inventory_id": input.inventory_id, "expected_revision": input.expected_revision }),
         )?;
+        if let Some(replay) = self
+            .db
+            .replay_application_plugin_operation(key, &hash)
+            .await?
+        {
+            return Ok(replay);
+        }
+        self.stage(&input.inventory_id).await?;
         self.db
             .publish_application_plugin(
                 &input.inventory_id,
@@ -308,6 +430,16 @@ impl ApplicationPlugins {
                 "rollback target must be an earlier revision".into(),
             ));
         }
+        let hash = super::plugin_configuration_schema_digest(
+            &json!({ "action": "rollback", "target_revision": input.target_revision, "expected_revision": input.expected_revision }),
+        )?;
+        if let Some(replay) = self
+            .db
+            .replay_application_plugin_operation(key, &hash)
+            .await?
+        {
+            return Ok(replay);
+        }
         let target = self
             .db
             .application_plugin_revision(input.target_revision)
@@ -316,9 +448,6 @@ impl ApplicationPlugins {
             .load(&target.inventory_id, target.revision, "rollback")
             .await?;
         validate_receipt(&candidate.receipt, &target)?;
-        let hash = super::plugin_configuration_schema_digest(
-            &json!({ "action": "rollback", "target_revision": input.target_revision, "expected_revision": input.expected_revision }),
-        )?;
         self.db
             .publish_application_plugin(
                 &target.inventory_id,
@@ -337,6 +466,19 @@ impl ApplicationPlugins {
         self.pin_revision(head).await
     }
 
+    /// Resume durable work using its authoritative historical receipt. Never
+    /// substitute the current head when its original inventory is unavailable.
+    pub async fn pin_historical(
+        self: &Arc<Self>,
+        revision: i64,
+    ) -> Result<Arc<ApplicationPluginSnapshot>, AppError> {
+        if revision <= 0 {
+            return Err(AppError::BadRequest("invalid plugin revision".into()));
+        }
+        self.pin_revision(self.db.application_plugin_revision(revision).await?)
+            .await
+    }
+
     pub async fn pin_if_published(
         self: &Arc<Self>,
     ) -> Result<Option<Arc<ApplicationPluginSnapshot>>, AppError> {
@@ -350,9 +492,13 @@ impl ApplicationPlugins {
         self: &Arc<Self>,
         head: ApplicationRevision,
     ) -> Result<Arc<ApplicationPluginSnapshot>, AppError> {
+        self.refresh_inventory().await?;
         let entry = self
             .inventory
+            .read()
+            .await
             .get(&head.inventory_id)
+            .cloned()
             .ok_or(AppError::Forbidden)?;
         let metadata = tokio::fs::symlink_metadata(&entry.root)
             .await

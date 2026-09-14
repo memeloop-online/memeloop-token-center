@@ -94,6 +94,7 @@ pub(in crate::api) async fn import_native_kimi_oauth_cohort(
     request_body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "upstreams:import:write").await?;
+    let state = state.pin_application_plugins().await?;
     require_global_service(&service)?;
     let body: NativeKimiCohortRequest = serde_json::from_slice(&request_body)
         .map_err(|_| AppError::BadRequest("native Kimi OAuth cohort request is invalid".into()))?;

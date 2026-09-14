@@ -278,10 +278,17 @@ async fn pulls_from_mock_registry_and_atomically_installs() {
     )
     .expect("receipt JSON");
     assert_eq!(receipt["digest"], installed.digest);
+    let replay = install_plugin_oci_with_verifier(&artifact.options, &AcceptSignature, true)
+        .await
+        .expect("verified exact install replay");
+    assert_eq!(replay.digest, installed.digest);
+    tokio::fs::write(installed.path.join("plugin.json"), b"tampered")
+        .await
+        .unwrap();
     assert!(matches!(
         install_plugin_oci_with_verifier(&artifact.options, &AcceptSignature, true)
             .await
-            .expect_err("no replacement"),
+            .expect_err("tampered package is not overwritten"),
         PluginDistributionError::TargetExists
     ));
 }

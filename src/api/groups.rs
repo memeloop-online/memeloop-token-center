@@ -72,6 +72,7 @@ async fn update_group_routing_strategy(
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "routes:write").await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
+    let state = state.pin_application_plugins().await?;
     if let Some(strategy) = &body.routing_strategy {
         state
             .plugins

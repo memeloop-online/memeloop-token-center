@@ -107,8 +107,14 @@ async fn pinned_runtime_keeps_old_plan_and_observe_after_package_upgrade() {
     let old =
         PluginRuntime::load(directory.path().join("plugins").to_str(), database.clone()).unwrap();
     let pinned = old.clone();
-    write_version(20, "1.1.0");
+    let original_fingerprints = pinned.group_routing_fingerprints();
+    assert!(original_fingerprints.contains_key("router"));
+    // The same manifest/version/path with different executable bytes must not
+    // impersonate the durable job's original routing implementation.
+    write_version(20, "1.0.0");
     let current = PluginRuntime::load(directory.path().join("plugins").to_str(), database).unwrap();
+    assert_ne!(original_fingerprints, current.group_routing_fingerprints());
+    assert_eq!(original_fingerprints, pinned.group_routing_fingerprints());
     drop(old);
     let candidate = GroupRoutingCandidate {
         tenant_id: "tenant".into(),

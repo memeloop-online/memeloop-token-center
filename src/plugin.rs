@@ -304,6 +304,7 @@ struct LoadedPlugin {
     component: Option<Component>,
     configuration_validator: Option<crate::schema::CompiledSchema>,
     routing_validator: Option<crate::schema::CompiledSchema>,
+    routing_fingerprint: String,
     #[cfg(feature = "experimental-plugin-revisions")]
     identity: PluginPackageIdentity,
 }
@@ -488,7 +489,6 @@ struct HostState {
     deadline: Instant,
 }
 
-#[cfg(feature = "experimental-plugin-revisions")]
 fn read_identity_bytes(path: &Path, maximum: u64) -> Result<Vec<u8>, AppError> {
     use std::io::Read;
     let file = fs::File::open(path).map_err(|_| plugin_runtime_failure("package_read"))?;
@@ -575,20 +575,7 @@ impl PluginRuntime {
                 }
                 providers.push(provider);
             }
-            #[cfg(not(feature = "experimental-plugin-revisions"))]
-            let component = manifest
-                .wasm
-                .as_deref()
-                .map(|wasm| {
-                    let wasm_path = safe_child(&directory, wasm)?;
-                    require_file_size(&wasm_path, PLUGIN_COMPONENT_BYTES, "plugin component")?;
-                    Component::from_file(&engine, &wasm_path).map_err(|_| {
-                        AppError::BadRequest("plugin component cannot be compiled".into())
-                    })
-                })
-                .transpose()?;
-            #[cfg(feature = "experimental-plugin-revisions")]
-            let (component, identity) = {
+            let (component, component_sha256) = {
                 let component_bytes = manifest
                     .wasm
                     .as_deref()
@@ -611,6 +598,13 @@ impl PluginRuntime {
                         })
                     })
                     .transpose()?;
+                (component, component_sha256)
+            };
+            let routing_fingerprint = plugin_configuration_schema_digest(&serde_json::json!({
+                "manifest": manifest, "component_sha256": component_sha256,
+            }))?;
+            #[cfg(feature = "experimental-plugin-revisions")]
+            let identity = {
                 let receipt_path = directory.join(".mtc-oci-install.json");
                 let provenance = if receipt_path.exists() {
                     let path = safe_child(&directory, ".mtc-oci-install.json")?;
@@ -622,13 +616,10 @@ impl PluginRuntime {
                 } else {
                     None
                 };
-                (
-                    component,
-                    PluginPackageIdentity {
-                        component_sha256,
-                        provenance,
-                    },
-                )
+                PluginPackageIdentity {
+                    component_sha256,
+                    provenance,
+                }
             };
             let configuration_validator = manifest
                 .contributions
@@ -647,6 +638,7 @@ impl PluginRuntime {
                 component,
                 configuration_validator,
                 routing_validator,
+                routing_fingerprint,
                 #[cfg(feature = "experimental-plugin-revisions")]
                 identity,
             });
@@ -675,6 +667,21 @@ impl PluginRuntime {
 
     pub fn provider_types(&self) -> Vec<ProviderType> {
         self.providers.as_ref().clone()
+    }
+
+    /// Cached manifest + actual compiled-byte identity for durable group work.
+    /// Available in default builds too; never reopens packages per request.
+    pub fn group_routing_fingerprints(&self) -> BTreeMap<String, String> {
+        self.plugins
+            .iter()
+            .filter(|plugin| plugin.manifest.contributions.group_routing.is_some())
+            .map(|plugin| {
+                (
+                    plugin.manifest.id.clone(),
+                    plugin.routing_fingerprint.clone(),
+                )
+            })
+            .collect()
     }
 
     pub fn manifests(&self) -> Vec<PluginManifest> {

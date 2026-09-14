@@ -2,6 +2,24 @@ use super::*;
 use crate::plugin::application::ApplicationRevision;
 
 impl Database {
+    pub(crate) async fn replay_application_plugin_operation(
+        &self,
+        key: &str,
+        hash: &str,
+    ) -> Result<Option<ApplicationRevision>, AppError> {
+        let row = sqlx::query("SELECT request_hash, result_revision FROM application_plugin_operations WHERE idempotency_key = $1")
+            .bind(key).fetch_optional(&self.pool).await?;
+        let Some(row) = row else { return Ok(None) };
+        if row.try_get::<String, _>("request_hash")? != hash {
+            return Err(AppError::Conflict(
+                "idempotency key was used for another operation".into(),
+            ));
+        }
+        let revision: Option<i64> = row.try_get("result_revision")?;
+        let revision = revision.ok_or(AppError::Internal)?;
+        self.application_plugin_revision(revision).await.map(Some)
+    }
+
     pub(crate) async fn staged_application_plugin_ids(&self) -> Result<Vec<String>, AppError> {
         Ok(sqlx::query_scalar(
             "SELECT inventory_id FROM application_plugin_candidates ORDER BY inventory_id",
@@ -86,13 +104,9 @@ impl Database {
         // Reserve the new revision only if this expected head still wins. A
         // competing transaction either sees the CAS miss or rolls back its
         // tentative insert on conflict. No partially published row survives.
-        if expected_revision > 0 {
-            let compatible: Option<i64> = sqlx::query_scalar("SELECT r.revision FROM application_plugin_revisions r JOIN application_plugin_candidates previous ON previous.inventory_id = r.inventory_id JOIN application_plugin_candidates candidate ON candidate.inventory_id = $1 WHERE r.revision = $2 AND previous.contract_digest = candidate.contract_digest")
-                .bind(inventory_id).bind(expected_revision).fetch_optional(&mut *tx).await?;
-            if compatible.is_none() {
-                return Err(AppError::Forbidden);
-            }
-        }
+        // Contract changes are admitted by host grants during staging. The
+        // immutable candidate FK and head CAS remain the publication authority;
+        // requiring equality here would forbid installing any new provider.
         let inserted = sqlx::query("INSERT INTO application_plugin_revisions (revision, inventory_id, reason, created_at) VALUES ($1, $2, $3, $4) ON CONFLICT(revision) DO NOTHING")
             .bind(next).bind(inventory_id).bind(reason).bind(unix_millis()).execute(&mut *tx).await?;
         if inserted.rows_affected() != 1 {
