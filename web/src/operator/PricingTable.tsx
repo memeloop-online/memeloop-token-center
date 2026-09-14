@@ -25,8 +25,8 @@ export function PricingTable({ rows, currency, loading, usageLoading, usageFaile
   const tierLabel = (tier: string) => tier === 'default' ? t('pricing.tierDefault') : tier === 'priority' ? t('pricing.tierPriority') : tier === 'flex' ? t('pricing.tierFlex') : tier;
   return <section className="pricing-catalog">
     <div className="pricing-list-controls">
-      <label>{t('pricing.search')}<Input type="search" value={search} onChange={event => setSearch(event.target.value)} placeholder={t('pricing.searchHint')} /></label>
-      <label>{t('pricing.filter')}<Select value={filter} onChange={event => setFilter(event.target.value)}>
+      <label>{t('pricing.search')}<Input aria-label={t('pricing.search')} type="search" value={search} onChange={event => setSearch(event.target.value)} placeholder={t('pricing.searchHint')} /></label>
+      <label>{t('pricing.filter')}<Select aria-label={t('pricing.filter')} value={filter} onChange={event => setFilter(event.target.value)}>
         <option value="all">{t('common.all')}</option><option value="used" disabled={!usageReady}>{t('pricing.filterUsed')}</option><option value="missing">{t('pricing.filterMissing')}</option>
       </Select></label>
       {(search || filter !== 'all') && <Button appearance="subtle" onClick={() => { setSearch(''); setFilter('all'); }}>{t('pricing.clearFilters')}</Button>}

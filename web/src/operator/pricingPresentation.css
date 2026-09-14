@@ -14,11 +14,13 @@
 .pricing-table-caption { color: var(--colorNeutralForeground2, var(--picker-muted)); font-size: 12px; }
 .pricing-page .pricing-summary span { border: 0; background: transparent; padding: 0; color: var(--colorNeutralForeground2, var(--picker-muted)); font-size: 12px; }
 .pricing-page .pricing-summary { gap: 8px 24px; }
+:root[data-theme] .pricing-page .pricing-summary span, :root[data-theme] .pricing-page .source-card { background: transparent; }
 .pricing-page .manual-pricing { border: 0; background: transparent; margin: 12px 0; padding: 0; }
 .pricing-page .manual-pricing .journey-heading { padding: 0; }
 .pricing-page .manual-pricing .create-resource-body { border: 0; padding: 0; }
 .pricing-page .manual-pricing-body { border: 0; max-width: 760px; padding: 0; }
 .pricing-page .manual-pricing-body > label { display: grid; gap: 6px; margin: 12px 0; }
+.pricing-page .manual-pricing-body .fui-Combobox { width: 100%; max-width: 100%; }
 .pricing-page .manual-pricing[data-open='true'] { padding: 16px 0; border-block: 1px solid var(--colorNeutralStroke2, var(--picker-border)); }
 .pricing-page .source-card { border: 0; background: transparent; }
 .pricing-page .candidate-list > div { border: 0; }
