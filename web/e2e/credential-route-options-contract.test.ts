@@ -11,7 +11,12 @@ test('route grant identity, candidate count and unavailable reasons are independ
   const options = credentialRouteOptions([...input, input[0]], accounts, providers, 'zh-CN');
   assert.deepEqual(options.map(option => option.value), input.map(value => value.id));
   assert.notEqual(options[0].label, options[1].label);
-  assert.match(options[2].description!, /此路由含 2 个账号/);
+  assert.match(options[2].description!, /共享候选 · 2 个账号/);
+  assert.match(options[0].chipDescription, /单账号/);
+  assert.match(options[0].label, /^Sol/);
+  assert.equal(options[2].label.includes('Same name'), false, 'model is the primary label, not the account chain');
+  assert.match(options[2].details, /提供商: Kimi; 账号: Same name/);
+  assert.match(options[2].details, /上游模型: sol/);
   assert.match(options[3].description!, /已停用/);
   assert.match(options[4].description!, /无可用候选账号/);
   assert.match(options[5].description!, /候选目录未知/);
