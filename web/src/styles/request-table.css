@@ -182,22 +182,26 @@ table.request-table .request-model-cell code {
   }
 
   .request-table .request-time-cell {
-    min-width: 8.5rem;
-    max-width: 9.5rem;
+    min-width: 7.5rem;
+    max-width: 8.5rem;
+  }
+
+  .request-table .request-id-control.compact {
+    max-width: 6.5rem;
   }
 
   .request-model-cell {
-    min-width: 9rem;
-    max-width: 12rem;
+    min-width: 8rem;
+    max-width: 10rem;
   }
 
   .request-credential-cell {
-    min-width: 9rem;
-    max-width: 12rem;
+    min-width: 8rem;
+    max-width: 10rem;
   }
 
   .request-token-cell {
-    min-width: 10rem;
+    min-width: 8rem;
   }
 
   .request-cost-cell {
@@ -205,9 +209,14 @@ table.request-table .request-model-cell code {
   }
 
   .request-session-cell {
-    min-width: 8rem;
-    width: 9rem;
-    max-width: 9rem;
+    min-width: 7rem;
+    width: 8rem;
+    max-width: 8rem;
+  }
+
+  .request-table th:nth-last-child(2),
+  .request-table td:nth-last-child(2) {
+    min-width: 5rem;
   }
 }
 
