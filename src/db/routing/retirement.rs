@@ -21,7 +21,7 @@ impl Database {
         let tenant_id = tenant_id(&mut tx, tenant_external_id).await?;
         lock_routing_relation_writes(&mut tx, &tenant_id).await?;
         let route = sqlx::query(
-            "SELECT enabled, updated_at FROM model_routes WHERE id = $1 AND tenant_id = $2",
+            "SELECT enabled, updated_at FROM model_routes WHERE id = $1 AND tenant_id = $2 AND archived_at IS NULL",
         )
         .bind(route_id.to_string())
         .bind(&tenant_id)

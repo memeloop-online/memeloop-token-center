@@ -29,6 +29,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(rotate_service_token),
         )
         .route(
+            "/internal/v1/service-tokens/{service_id}/copy",
+            post(copy_service_token),
+        )
+        .route(
             "/internal/v1/service-tokens/{service_id}/status",
             patch(set_service_token_status),
         )
@@ -166,6 +170,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             "/internal/v1/usage-analysis",
             get(usage_analysis::internal_usage_analysis),
         )
+        .route(
+            "/internal/v1/usage-analysis/trends",
+            get(usage_analysis::internal_usage_analysis_trends),
+        )
         .route("/internal/v1/request-events", get(internal_request_events))
         .route("/internal/v1/sessions", get(internal_sessions))
         .route(
@@ -227,6 +235,14 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route(
             "/internal/v1/model-routes/{route_id}/retire-upstreams",
             post(retire_model_route_upstreams),
+        )
+        .route(
+            "/internal/v1/model-routes/{route_id}/archive",
+            post(archive_model_route),
+        )
+        .route(
+            "/internal/v1/archived-model-routes/{route_id}",
+            get(get_archived_model_route),
         )
         .route(
             "/internal/v1/model-routes/{route_id}/routing",
@@ -296,6 +312,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             get(list_account_ledger),
         )
         .route(
+            "/internal/v1/accounts/{account_id}/settlements",
+            get(list_account_settlements),
+        )
+        .route(
             "/internal/v1/entitlements",
             get(list_entitlements).put(reconcile_entitlement),
         )
@@ -311,7 +331,22 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route(
             "/internal/v1/integrations/memeloop-cloud/principals/ensure",
             post(ensure_memeloop_cloud_principal),
+        );
+    #[cfg(feature = "experimental-plugin-revisions")]
+    let authenticated = authenticated
+        .route(
+            "/internal/v1/plugin-runtime/candidates",
+            post(super::super::plugins::stage_application_plugin),
         )
+        .route(
+            "/internal/v1/plugin-runtime/publish",
+            post(super::super::plugins::publish_application_plugin),
+        )
+        .route(
+            "/internal/v1/plugin-runtime/rollback",
+            post(super::super::plugins::rollback_application_plugin),
+        );
+    let authenticated = authenticated
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             authenticate_control_before_body,

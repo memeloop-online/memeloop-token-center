@@ -71,14 +71,22 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
     } = buffered_request;
     tokio::spawn(async move {
         // Streaming responses outlive the handler response. Keep the workload
-        // permit inside this task until archive and billing finalization end.
+        // permit until proxy finalization or timeout reconciliation; accepted
+        // archive tails have a separate bounded EOF owner below.
         let _proxy_lifecycle_permit = proxy_lifecycle_permit;
+        let archive_memory = memory.clone();
         let _request_memory = memory;
         let _stream_activity = stream_activity;
         let _upstream_activity = upstream_activity;
         let lifecycle_started = tokio::time::Instant::now();
         let stream_deadline = lifecycle_started + MAX_PROXY_STREAM_LIFETIME;
         let lifecycle_deadline = lifecycle_started + MAX_PROXY_LIFETIME;
+        let (archive_settlement_sender, archive_settlement_receiver) =
+            tokio::sync::oneshot::channel();
+        let archive_eof_owner = tokio::spawn(hold_response_eof_until_archive_settles(
+            archive_settlement_receiver,
+            body_sender.clone(),
+        ));
         // The bounded lifecycle below owns these values. Keep exact copies for
         // the timeout convergence path, which must not infer delivery from a
         // task that Tokio has just cancelled.
@@ -97,8 +105,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let mut archive_sender = crate::response_archive_spool::ResponseArchiveProducer::begin(
                 &background_state,
                 spool_identity,
-            )
-            .await;
+                archive_memory,
+            );
             let mut usage_capture = Vec::new();
             let mut capture_memory = background_state
                 .metrics
@@ -288,7 +296,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         if let Some(spool) = archive_sender.as_mut()
                             && !spool
                                 .append(delivery_frames.iter().map(|f| f.bytes.clone()).collect())
-                                .await
                         {
                             tracing::warn!(%request_id, stage = "response_spool_ack", "proxy archive gap");
                             drop(archive_sender.take());
@@ -355,8 +362,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             break;
                         }
                     }
-                    Err(_) => {
-                        transport_error = Some("upstream_stream");
+                    Err(error_code) => {
+                        transport_error = Some(error_code);
                         drop(archive_sender.take());
                         let _ = tokio::time::timeout(
                             MAX_DOWNSTREAM_SEND_WAIT,
@@ -385,14 +392,24 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 // not leave a complete-looking archive prefix behind.
                 drop(archive_sender.take());
             }
-            // Success terminals and EOF are downstream commit markers. First
-            // make the complete capture recoverable (or record an honest gap).
-            // S3 upload remains asynchronous and is never awaited here.
-            let spool_sealed = match archive_sender.take() {
-                Some(spool) => spool.seal().await,
-                None => false,
+            // Success terminals and EOF transfer the bounded capture to its
+            // owned writer. The terminal frame does not wait for database
+            // drain; the writer keeps the row capturing until seal commits.
+            let archive_settlement: Option<
+                crate::response_archive_spool::ResponseArchiveSettlement,
+            > = match archive_sender.take() {
+                Some(spool) => spool.seal(),
+                None => None,
             };
-            if !spool_sealed {
+            let archive_accepted = archive_settlement.is_some();
+            if let Err(unowned) = archive_settlement_sender.send(archive_settlement)
+                && let Some(settlement) = unowned
+            {
+                // The EOF owner contains no fallible work before receiving, so
+                // this is defensive. Retain ownership locally if it exited.
+                settlement.wait().await;
+            }
+            if !archive_accepted {
                 crate::response_archive_spool::mark_gap(
                     &background_state,
                     spool_identity,
@@ -446,9 +463,9 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                     }
                 }
             }
-            drop(body_sender);
             drop(terminal_frames);
             terminal_memory.set_bytes(0);
+            drop(body_sender);
             let gap_response = format!("gap://{request_id}/response");
             let stored_response = gap_response.clone();
             let response_archive_attempt = None;
@@ -519,6 +536,18 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 }
             }
         }
+        // The absolute proxy lifecycle ends after normal finalization or
+        // timeout reconciliation. A slow archive tail remains memory-bounded
+        // and connection-drain-owned, but must not retain scarce admission
+        // concurrency past that boundary.
+        drop(_proxy_lifecycle_permit);
+        if let Err(error) = archive_eof_owner.await {
+            tracing::error!(
+                task_cancelled = error.is_cancelled(),
+                task_panicked = error.is_panic(),
+                "response archive EOF owner failed"
+            );
+        }
     });
     let mut response = Response::builder()
         .status(status)
@@ -529,4 +558,15 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
     response
         .body(Body::from_stream(ReceiverStream::new(body_receiver)))
         .map_err(|_| AppError::Internal)
+}
+
+async fn hold_response_eof_until_archive_settles(
+    settlement: tokio::sync::oneshot::Receiver<
+        Option<crate::response_archive_spool::ResponseArchiveSettlement>,
+    >,
+    _body_sender: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+) {
+    if let Ok(Some(settlement)) = settlement.await {
+        settlement.wait().await;
+    }
 }

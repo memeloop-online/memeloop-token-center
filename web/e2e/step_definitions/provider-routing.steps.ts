@@ -160,32 +160,57 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   const seed = runtime.requireSeed();
 
   await openAppRoute(page, 'operator', 'providers');
-  const onboarding = page.locator('.provider-onboarding');
-  await onboarding.locator(':scope > summary').click();
+  const onboarding = page.locator('.create-journey');
+  await onboarding.locator('[data-workspace-toggle]').click();
   await assertVisible(onboarding.getByRole('button', { name: 'API 凭据', exact: true }));
   await assertVisible(onboarding.getByRole('button', { name: '账户授权', exact: true }));
+  await onboarding.locator('[data-workspace-toggle]').click();
   await assertVisible(page.getByText('Browser mock upstream', { exact: true }));
   const providerAccount = page.locator(`.provider-account[data-upstream-id="${seed.upstreamId}"]`);
   await assertContains(providerAccount, 'API 凭据');
   await assertContains(providerAccount, '1 条路由');
-  await providerAccount.locator('.upstream-health-details > summary').click();
-  await providerAccount.locator('.upstream-secondary-actions > summary').click();
+  await providerAccount.getByRole('button', { name: '查看详情', exact: true }).click();
+  await providerAccount.getByRole('button', { name: '近期可用性', exact: true }).click();
+  await providerAccount.getByRole('button', { name: '账号设置与授权操作', exact: true }).click();
+  // The shared seed includes a routed 429. Do not make this UI assertion
+  // depend on whether its real-time breaker cooldown has already elapsed.
+  const healthPath = `/internal/v1/upstreams/${seed.upstreamId}/health`;
+  await page.route((url) => url.pathname === healthPath, async (route) => {
+    assert.equal(route.request().method(), 'POST');
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        account_id: seed.upstreamId,
+        status: 'unhealthy',
+        error_code: 'rate_limited',
+        source: 'routing_state',
+        checked_at: Date.UTC(2026, 0, 1),
+        retry_at: Date.UTC(2026, 0, 1, 0, 1),
+      }),
+    });
+  });
   await providerAccount.getByRole('button', { name: '主动健康检查' }).click();
-  await assertContains(providerAccount, '连接正常');
+  const manualHealth = providerAccount.locator('.provider-manual-health');
+  await assertContains(manualHealth, '上游限流中');
+  await assertContains(manualHealth, '最早重试时间');
+  await assertContains(manualHealth, '未发送额外探测请求');
+  await assertNoCount(manualHealth.locator('.status.ok'));
   const disabledProvider = page.waitForResponse((response) => {
     const url = new URL(response.url());
     return response.request().method() === 'PATCH'
       && url.pathname === `/internal/v1/upstreams/${seed.upstreamId}`;
   });
-  await providerAccount.locator('.upstream-danger-zone > summary').click();
+  await providerAccount.getByRole('button', { name: '危险操作', exact: true }).click();
   await providerAccount.getByRole('button', { name: '停用', exact: true }).click();
   assert.equal((await disabledProvider).status(), 200);
   await page.locator('[data-resource-list-status-filter]').getByRole('button', { name: /显示非正常状态/ }).click();
   await assertContains(providerAccount, '已停用');
-  await assertNotContains(providerAccount, '连接正常');
-  await providerAccount.locator('.upstream-danger-zone:not([open]) > summary').click();
+  await assertNotContains(providerAccount, '上游限流中');
+  await providerAccount.getByRole('button', { name: '危险操作', exact: true }).click();
   await providerAccount.getByRole('button', { name: '启用', exact: true }).click();
   await assertContains(providerAccount, '正常');
+  await onboarding.locator('[data-workspace-toggle]').click();
   await onboarding.getByRole('button', { name: '账户授权', exact: true }).click();
   await assertContains(onboarding.getByLabel('服务提供商'), 'OpenAI Codex');
 
@@ -193,7 +218,7 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   const routeRow = page.locator('tbody tr').filter({ hasText: model });
   await assertContains(routeRow, 'Browser mock upstream');
   await routeRow.getByRole('button', { name: '编辑', exact: true }).click();
-  const routeEditor = page.locator('.inline-editor');
+  const routeEditor = page.locator('.create-journey');
   const synchronizedModels = page.waitForResponse((response) => response.url().includes(`/internal/v1/upstreams/${seed.upstreamId}/models/sync`) && response.request().method() === 'POST');
   await routeEditor.getByRole('button', { name: '同步模型', exact: true }).click();
   assert.equal((await synchronizedModels).status(), 200);
@@ -225,20 +250,29 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
 Then('中英文新增上游使用面向操作的产品文案', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   await openAppRoute(page, 'operator', 'providers');
-  const onboarding = page.locator('.provider-onboarding');
-  await onboarding.locator(':scope > summary').click();
+  const onboarding = page.locator('.create-journey');
   await assertVisible(page.getByRole('heading', { name: '上游服务', exact: true }));
-  await assertContains(page.locator('.provider-list'), '连接并管理模型服务。');
+  await onboarding.locator('[data-workspace-toggle]').click();
+  await assertVisible(onboarding.getByRole('heading', { name: '新增上游', exact: true }));
+  await assertContains(onboarding, '连接并管理模型服务。');
   await assertVisible(onboarding.getByRole('button', { name: 'API 凭据', exact: true }));
-  await assertContains(onboarding.getByLabel('服务提供商'), 'Browser dual method');
+  await onboarding.getByLabel('服务提供商').click();
+  await assertVisible(onboarding.getByRole('option', { name: /Browser dual method/ }));
+  await page.keyboard.press('Escape');
   await onboarding.getByRole('button', { name: '账户授权', exact: true }).click();
   await assertVisible(onboarding.getByLabel('服务提供商'));
-  await assertContains(onboarding.getByLabel('服务提供商'), 'Browser dual method');
-  await assertContains(onboarding.getByLabel('服务提供商'), 'Cursor');
-  await assertContains(onboarding.getByLabel('服务提供商'), 'Anthropic Claude');
-  await assertContains(onboarding.getByLabel('服务提供商'), 'GitHub Copilot');
-  await assertContains(onboarding.getByLabel('服务提供商'), 'OpenAI Codex');
-  await onboarding.getByLabel('服务提供商').selectOption('openai-codex');
+  await onboarding.getByLabel('服务提供商').click();
+  for (const provider of ['Browser dual method', 'Cursor', 'Anthropic Claude', 'GitHub Copilot', 'OpenAI Codex']) {
+    await assertVisible(onboarding.getByRole('option', { name: new RegExp(`^${provider}`) }));
+  }
+  await onboarding.getByRole('option', { name: /^OpenAI Codex/ }).click();
+  await appPreferenceControls(page).getByRole('button', { name: 'English', exact: true }).click();
+  await onboarding.getByLabel('Service provider').click();
+  for (const provider of ['Browser dual method', 'Cursor', 'Anthropic Claude', 'GitHub Copilot', 'OpenAI Codex']) {
+    await assertVisible(onboarding.getByRole('option', { name: new RegExp(`^${provider}`) }));
+  }
+  await page.keyboard.press('Escape');
+  await appPreferenceControls(page).getByRole('button', { name: '中文', exact: true }).click();
   await onboarding.getByLabel('上游名称').fill('codex-primary');
   assert.equal(await onboarding.getByRole('button', { name: '开始登录', exact: true }).isDisabled(), true);
   await onboarding.locator('.upstream-proxy-editor input').fill('socks5h://10.0.0.10:1080');
@@ -257,15 +291,13 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
 
   await appPreferenceControls(page).getByRole('button', { name: 'English', exact: true }).click();
   await assertAttribute(page.locator('html'), 'lang', 'en');
-  await assertVisible(page.getByRole('heading', { name: 'Upstream services', exact: true }));
-  await assertContains(page.locator('.provider-list'), 'Connect and manage model services.');
+  await assertVisible(onboarding.getByRole('heading', { name: 'Add upstream', exact: true }));
+  await assertContains(onboarding, 'Connect and manage model services.');
   await assertVisible(onboarding.getByRole('button', { name: 'API credential', exact: true }));
   await assertVisible(onboarding.getByRole('button', { name: 'Account authorization', exact: true }));
   await assertVisible(onboarding.getByLabel('Service provider'));
-  await assertContains(onboarding.getByLabel('Service provider'), 'Cursor');
-  await assertContains(onboarding.getByLabel('Service provider'), 'Anthropic Claude');
-  await assertContains(onboarding.getByLabel('Service provider'), 'GitHub Copilot');
   await assertContains(onboarding.getByLabel('Service provider'), 'OpenAI Codex');
+  assert.equal(await onboarding.getByLabel('Service provider').isDisabled(), true, 'an in-progress authorization keeps its selected provider locked');
   await assertContains(onboarding.getByRole('status'), 'Continue on OpenAI only if you just started this login.');
   await assertNotContains(page.locator('body'), 'CPA');
   await assertNotContains(page.locator('body'), 'Bridge');
@@ -359,7 +391,7 @@ When('管理员用键盘创建提供商组和路由组', { timeout: 120_000 }, a
 
   const existingRoute = page.locator('tbody tr').filter({ hasText: model });
   await existingRoute.getByRole('button', { name: '编辑', exact: true }).click();
-  const staleEditor = page.locator('.inline-editor');
+  const staleEditor = page.locator('.create-journey');
   const staleCredentialField = staleEditor.locator('.multi-combobox').filter({
     has: page.getByRole('combobox', { name: '授权给具体凭据', exact: true }),
   });
@@ -368,14 +400,15 @@ When('管理员用键盘创建提供商组和路由组', { timeout: 120_000 }, a
   await staleLookupRequest;
   await assertContains(staleCredentialField.getByRole('status'), '正在查找凭据');
   const staleRequestFailed = page.waitForEvent('requestfailed', (request) => new URL(request.url()).searchParams.get('key_id') === staleCredentialId);
-  await staleEditor.getByRole('button', { name: '取消', exact: true }).click();
+  await staleEditor.locator('[data-workspace-toggle]').click();
   releaseStaleLookup();
   await staleRequestFailed;
   await assertNoCount(page.getByText('stale form result', { exact: true }));
 
-  const routeEditor = page.locator('details.create-resource').filter({ hasText: '创建模型路由' });
-  await routeEditor.locator('summary').click();
+  const routeEditor = page.locator('.create-journey');
+  await routeEditor.locator('[data-workspace-toggle]').click();
   await routeEditor.getByLabel('公开模型').fill(groupedModel);
+  await routeEditor.getByRole('button', { name: '按上游组选择与排除', exact: true }).click();
   const includeProviders = routeEditor.getByRole('combobox', { name: '包含提供商组', exact: true });
   await includeProviders.fill('主力');
   const groupCatalog = page.waitForResponse((response) => {
@@ -462,12 +495,13 @@ Then('提供商组参与路由候选而路由组参与凭据授权', async funct
   const page = this.requirePage();
   const seed = runtime.requireSeed();
   await openAppRoute(page, 'operator', 'credentials');
-  const credential = page.locator('.managed-resource').filter({ hasText: seed.clientKeyId });
+  const credential = page.locator('.managed-resource').filter({ has: page.locator(`b[title*="${seed.clientKeyId}"]`) });
   const openedRouting = page.waitForResponse((response) => response.url().includes(`/internal/v1/keys/${seed.clientKeyId}/routing`) && response.request().method() === 'GET');
-  await credential.getByRole('button', { name: '路由权限', exact: true }).click();
+  await credential.getByRole('button', { name: '更多操作', exact: true }).click();
+  await page.getByRole('menuitem', { name: '路由权限', exact: true }).click();
   const openedRoutingResponse = await openedRouting;
   assert.equal(openedRoutingResponse.status(), 200, `${openedRoutingResponse.request().method()} ${openedRoutingResponse.url()} ${await openedRoutingResponse.text()}`);
-  const routing = credential.locator('.routing-editor');
+  const routing = page.locator('.credential-active-editor .routing-editor');
   await assertVisible(routing);
   const routeGroupInput = routing.getByRole('combobox', { name: '路由组', exact: true });
   await routeGroupInput.fill('默认路由');
@@ -479,6 +513,8 @@ Then('提供商组参与路由候选而路由组参与凭据授权', async funct
   const routingPayload = routingSavedResponse.request().postDataJSON() as Record<string, unknown>;
   assert.equal(Object.hasOwn(routingPayload, 'expected_updated_at'), false);
   assert.equal(typeof routingPayload.expected_grant_revision, 'number');
+  await credential.getByRole('button', { name: '更多操作', exact: true }).click();
+  await page.getByRole('menuitem', { name: '路由权限', exact: true }).click();
   await assertContains(routing, '默认路由');
   await assertContains(routing, '当前共可使用');
 
@@ -492,7 +528,11 @@ Then('提供商组参与路由候选而路由组参与凭据授权', async funct
   const staleSave = page.waitForResponse((response) => response.url().endsWith(`/internal/v1/keys/${seed.clientKeyId}/routing`) && response.request().method() === 'PUT');
   await routing.getByRole('button', { name: '保存', exact: true }).click();
   assert.equal((await staleSave).status(), 409);
-  await assertContains(page.getByRole('alert'), '路由权限已被其他操作修改，已重新加载最新内容。');
+  await assertContains(page.locator('.create-journey').getByRole('alert'), '你的草稿已保留');
+  await assertContains(routing, '默认路由');
+  await page.locator('.create-journey [data-workspace-toggle]').click();
+  await credential.getByRole('button', { name: '更多操作', exact: true }).click();
+  await page.getByRole('menuitem', { name: '路由权限', exact: true }).click();
   await assertNotContains(routing, '默认路由');
   await routeGroupInput.fill('默认路由');
   await routeGroupInput.press('Enter');
@@ -509,6 +549,7 @@ When('管理员创建凭据组并按组筛选凭据', async function (this: Dogf
     requestJson('/v1/models', { credential: seed.clientCredential }),
   ]);
   credentialGroupObservations.set(this, { routing, models });
+  await page.locator('.credential-group-workspace').getByRole('button', { name: '凭据组', exact: true }).click();
   const credentialGroups = page.locator('.group-manager[data-group-kind="credential"]');
   await assertNoCount(page.locator('.group-manager[data-group-kind="provider"]'));
   await assertNoCount(page.locator('.group-manager[data-group-kind="route"]'));
@@ -532,8 +573,8 @@ When('管理员创建凭据组并按组筛选凭据', async function (this: Dogf
   await connectOperator(this, 'dark');
   await openAppRoute(page, 'operator', 'credentials');
   await page.getByLabel('按凭据组筛选').selectOption({ label: '测试凭据' });
-  await assertCount(page.locator('.managed-resource').filter({ hasText: seed.clientKeyId }), 1);
-  await assertNoCount(page.locator('.managed-resource').filter({ hasText: seed.otherClientKeyId }));
+  await assertCount(page.locator('.managed-resource').filter({ has: page.locator(`b[title*="${seed.clientKeyId}"]`) }), 1);
+  await assertNoCount(page.locator('.managed-resource').filter({ has: page.locator(`b[title*="${seed.otherClientKeyId}"]`) }));
 });
 
 Then('凭据组只用于分类且不改变凭据授权或可用模型', async function (this: DogfoodWorld) {
@@ -548,9 +589,10 @@ Then('凭据组只用于分类且不改变凭据授权或可用模型', async fu
   assert.deepEqual(routingAfter, before.routing, '凭据组成员变更不应改变路由授权摘要');
   assert.deepEqual(modelsAfter, before.models, '凭据组成员变更不应改变可用模型');
   await page.getByLabel('按凭据组筛选').selectOption('all');
-  const credential = page.locator('.managed-resource').filter({ hasText: seed.clientKeyId });
-  await credential.getByRole('button', { name: '路由权限', exact: true }).click();
-  const routing = credential.locator('.routing-editor');
+  const credential = page.locator('.managed-resource').filter({ has: page.locator(`b[title*="${seed.clientKeyId}"]`) });
+  await credential.getByRole('button', { name: '更多操作', exact: true }).click();
+  await page.getByRole('menuitem', { name: '路由权限', exact: true }).click();
+  const routing = page.locator('.credential-active-editor .routing-editor');
   await assertVisible(routing);
   await assertContains(routing, '当前共可使用');
   await assertContains(routing, '默认路由');
@@ -562,7 +604,7 @@ Then('凭据组只用于分类且不改变凭据授权或可用模型', async fu
   await openAppRoute(page, 'operator', 'routes');
   const routeRow = page.locator('tbody tr').filter({ hasText: model });
   await routeRow.getByRole('button', { name: '编辑', exact: true }).click();
-  const routeEditor = page.locator('.inline-editor.form-panel');
+  const routeEditor = page.locator('.create-journey');
   await assertNotContains(routeEditor, '测试凭据');
   await assertNoCount(routeEditor.getByLabel('凭据组'));
 });

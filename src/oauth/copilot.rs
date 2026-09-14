@@ -14,7 +14,7 @@ use crate::{
     provider::{UpstreamCredential, open_private_json, seal_private_json},
 };
 
-use super::OAuthReauthorizationTarget;
+use super::{OAuthReauthorizationTarget, OAuthRefreshRequestGuard};
 
 pub const PROVIDER_DRIVER: &str = "github-copilot";
 pub const OAUTH_DRIVER: &str = "github_copilot_device";
@@ -898,6 +898,7 @@ pub async fn refresh_copilot_credential(
     credential: &UpstreamCredential,
     now: i64,
     allow_test_loopback: bool,
+    request_guard: &dyn OAuthRefreshRequestGuard,
 ) -> Result<UpstreamCredential, AppError> {
     refresh_at(
         http,
@@ -905,6 +906,7 @@ pub async fn refresh_copilot_credential(
         now,
         allow_test_loopback,
         &Endpoints::production(),
+        request_guard,
     )
     .await
 }
@@ -928,6 +930,7 @@ async fn refresh_at(
     now: i64,
     allow_test_loopback: bool,
     endpoints: &Endpoints,
+    request_guard: &dyn OAuthRefreshRequestGuard,
 ) -> Result<UpstreamCredential, AppError> {
     let UpstreamCredential::OAuth {
         refresh_token,
@@ -962,6 +965,7 @@ async fn refresh_at(
                 refresh_token.as_deref().unwrap_or_default(),
                 allow_test_loopback,
                 endpoints,
+                request_guard,
             )
             .await?;
             validate_secret(&refreshed.access_token)?;
@@ -1007,6 +1011,7 @@ async fn refresh_github(
     refresh_token: &str,
     allow_test_loopback: bool,
     endpoints: &Endpoints,
+    request_guard: &dyn OAuthRefreshRequestGuard,
 ) -> Result<GitHubRefreshResponse, AppError> {
     validate_secret(refresh_token)?;
     let form = url::form_urlencoded::Serializer::new(String::new())
@@ -1014,15 +1019,19 @@ async fn refresh_github(
         .append_pair("grant_type", "refresh_token")
         .append_pair("refresh_token", refresh_token)
         .finish();
-    let response = oauth_client(http, &endpoints.access_token, allow_test_loopback)
-        .await?
+    let client = oauth_client(http, &endpoints.access_token, allow_test_loopback).await?;
+    let request = client
         .post(&endpoints.access_token)
         .header(ACCEPT, "application/json")
         .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header(USER_AGENT, USER_AGENT_VALUE)
         .body(form)
         .timeout(REQUEST_TIMEOUT)
-        .send()
+        .build()
+        .map_err(|_| upstream_error())?;
+    request_guard.mark_request_started().await?;
+    let response = client
+        .execute(request)
         .await
         .map_err(|_| upstream_error())?;
     if !response.status().is_success() {
@@ -1243,6 +1252,8 @@ fn upstream_error() -> AppError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::db::CreateUpstreamAccountInput;
     use serde_json::json;
@@ -1253,6 +1264,16 @@ mod tests {
 
     const NOW: i64 = 1_700_000_000_000;
     const KEY: &[u8] = b"test material with at least 32 bytes";
+
+    struct CountingRefreshGuard(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl OAuthRefreshRequestGuard for CountingRefreshGuard {
+        async fn mark_request_started(&self) -> Result<(), AppError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     async fn sqlite_database() -> (tempfile::TempDir, String, Database) {
         let directory = tempfile::tempdir().unwrap();
@@ -1956,12 +1977,14 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
+        let request_guard = CountingRefreshGuard(AtomicUsize::new(0));
         let refreshed = refresh_at(
             &reqwest::Client::new(),
             &credential(oauth_state("github.com:12345")),
             NOW,
             true,
             &Endpoints::test(&server.uri()),
+            &request_guard,
         )
         .await
         .unwrap();
@@ -1979,6 +2002,72 @@ mod tests {
         assert_eq!(state["github_token"], "github-raw-secret");
         assert_eq!(state["refresh_in"], 1234);
         assert_eq!(state["copilot_api_endpoint"], DEFAULT_COPILOT_API_ENDPOINT);
+        assert_eq!(request_guard.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_marks_only_the_long_lived_github_token_exchange() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/copilot_internal/v2/token"))
+            .and(header("authorization", "Bearer github-raw-secret"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/login/oauth/access_token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("refresh_token=github-refresh-once"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "github-raw-next",
+                "refresh_token": "github-refresh-next",
+                "expires_in": 3600,
+                "refresh_token_expires_in": 7200,
+                "scope": "repo workflow"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/copilot_internal/v2/token"))
+            .and(header("authorization", "Bearer github-raw-next"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "token": "new-short-token",
+                "expires_at": 1_700_001_800,
+                "refresh_in": 1234,
+                "endpoints": {"api": DEFAULT_COPILOT_API_ENDPOINT}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut source = credential(oauth_state("github.com:12345"));
+        let UpstreamCredential::OAuth { refresh_token, .. } = &mut source else {
+            unreachable!()
+        };
+        *refresh_token = Some("github-refresh-once".into());
+        let request_guard = CountingRefreshGuard(AtomicUsize::new(0));
+        let refreshed = refresh_at(
+            &reqwest::Client::new(),
+            &source,
+            NOW,
+            true,
+            &Endpoints::test(&server.uri()),
+            &request_guard,
+        )
+        .await
+        .unwrap();
+        assert_eq!(request_guard.0.load(Ordering::SeqCst), 1);
+        let UpstreamCredential::OAuth {
+            refresh_token,
+            adapter_state: Some(state),
+            ..
+        } = refreshed
+        else {
+            panic!("expected OAuth")
+        };
+        assert_eq!(refresh_token.as_deref(), Some("github-refresh-next"));
+        assert_eq!(state["github_token"], "github-raw-next");
     }
 
     #[tokio::test]
@@ -2003,6 +2092,7 @@ mod tests {
             NOW,
             true,
             &Endpoints::test(&server.uri()),
+            &crate::oauth::TEST_OAUTH_REFRESH_REQUEST_GUARD,
         )
         .await
         .unwrap_err();
@@ -2031,6 +2121,7 @@ mod tests {
             NOW,
             true,
             &Endpoints::test(&server.uri()),
+            &crate::oauth::TEST_OAUTH_REFRESH_REQUEST_GUARD,
         )
         .await
         .unwrap_err();

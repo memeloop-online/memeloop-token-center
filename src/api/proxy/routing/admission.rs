@@ -18,6 +18,7 @@ pub(in crate::api::proxy) struct NextSendableProxyRouteInput<'a> {
     pub(in crate::api::proxy) failover_reason: Option<UpstreamHealthReason>,
     pub(in crate::api::proxy) candidate_rank: &'a mut usize,
     pub(in crate::api::proxy) outbound_attempts: usize,
+    pub(in crate::api::proxy) recovery_wait_deadline: tokio::time::Instant,
     pub(in crate::api::proxy) deferred_shared_probes:
         &'a mut std::collections::VecDeque<DeferredSharedProbe>,
 }
@@ -40,6 +41,7 @@ pub(in crate::api::proxy) struct AdmittedProxyRouteInput<'a> {
     pub(in crate::api::proxy) failover_reason: Option<UpstreamHealthReason>,
     pub(in crate::api::proxy) planned: PlannedProxyRoute,
     pub(in crate::api::proxy) admission: UpstreamAttemptAdmission,
+    pub(in crate::api::proxy) existing_guard: Option<UpstreamAttemptGuard>,
     pub(in crate::api::proxy) shared_probe_permit: Option<SharedProbePermit>,
     pub(in crate::api::proxy) candidate_rank: usize,
     pub(in crate::api::proxy) outbound_attempt: usize,
@@ -60,20 +62,23 @@ pub(in crate::api::proxy) async fn prepare_admitted_proxy_route(
         failover_reason,
         planned,
         admission,
+        existing_guard,
         shared_probe_permit,
         candidate_rank,
         outbound_attempt,
     } = input;
     let state = request.state;
     let request_id = request.request_id;
-    let mut upstream_attempt = UpstreamAttemptGuard::new(
-        state,
-        request_id,
-        planned.route.account_id,
-        planned.route.credential_generation,
-        admission,
-        shared_probe_permit,
-    );
+    let mut upstream_attempt = existing_guard.unwrap_or_else(|| {
+        UpstreamAttemptGuard::new(
+            state,
+            request_id,
+            planned.route.account_id,
+            planned.route.credential_generation,
+            admission,
+            shared_probe_permit,
+        )
+    });
     let next_assignment = (planned.route.account_id, planned.route.route_id);
     if *assigned_route != next_assignment
         || *input_token_ceiling != next_input_token_ceiling

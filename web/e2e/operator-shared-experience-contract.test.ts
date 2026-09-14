@@ -27,5 +27,5 @@ test('system-settings load failure cannot be rendered as the no-enabled-route em
   assert.match(settings, /messageOf\(reason, t\('common\.requestFailed'\)\)/);
   assert.match(settings, /loading \? <div className="empty" role="status">/);
   assert.match(settings, /loadError \? <div className="settings-empty" role="alert"><b>\{t\('settings\.filterAssistantLoadFailed'\)\}<\/b><span>\{loadError\}<\/span><button type="button" className="secondary" onClick=\{\(\) => void load\(\)\}>\{t\('common\.retry'\)\}/);
-  assert.match(settings, /routes\.length === 0 \? <div className="settings-empty"><b>\{t\('settings\.noEnabledRoute'\)\}/);
+  assert.match(settings, /assistantOptions\.length === 0 \? <div className="settings-empty"><b>\{t\('settings\.noEnabledRoute'\)\}/);
 });

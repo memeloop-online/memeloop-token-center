@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 import Form from '@rjsf/core/lib/components/Form.js';
 import { createRoot } from 'react-dom/client';
 import { I18nProvider, useI18n } from '../../src/i18n';
+import { MtcFluentProvider } from '../../src/design-system';
 import { UpstreamQuotaDetails } from '../../src/operator/UpstreamQuota';
 import { UpstreamQuotaReset } from '../../src/operator/UpstreamQuotaReset';
 import { UpstreamConnection, connectionSchema } from '../../src/operator/UpstreamConnection';
@@ -37,4 +38,4 @@ function Preview() {
   }, []);
   return <main className="main"><article className="panel"><h1>Static quota acceptance · no network</h1><UpstreamConnection account={account} token="mock-only" tenant="default" disabled={false} onChanged={async () => {}} /><Form schema={{ type: 'object', properties: { name: { type: 'string', title: 'Upstream name' }, config } }} formData={{ name: 'Mock Codex', config: account.config }} validator={safeValidator} templates={upstreamFormTemplates}><span /></Form><section className="upstream-quota"><h2>{t('quota.title')}</h2><p className="notice error" role="alert">{t('quota.refreshFailedRetained')}</p><UpstreamQuotaDetails snapshot={snapshot} /><details className="upstream-danger-zone" open><summary>{t('quota.resetAction')}</summary><p>{t('quota.resetWarning')}</p><UpstreamQuotaReset accountId="mock-account" accountName="Mock Codex" tenant="default" token="mock-only" snapshot={snapshot} /></details></section>{confirmationDialog}</article></main>;
 }
-createRoot(document.getElementById('root')!).render(<I18nProvider><Preview /></I18nProvider>);
+createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><Preview /></MtcFluentProvider></I18nProvider>);

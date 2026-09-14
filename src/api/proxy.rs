@@ -17,7 +17,7 @@ mod upstream_response;
 use crate::db::UpstreamFailureKind;
 use crate::response_archive_spool::BufferedArchive;
 use crate::{
-    db::{SwitchProxyCandidateInput, UpstreamAttemptAdmission},
+    db::{ProxyRequestUpstreamAttribution, SwitchProxyCandidateInput, UpstreamAttemptAdmission},
     metrics::{UpstreamHealthEvent, UpstreamHealthReason},
     provider::AuthorizedUpstreamCandidate,
 };
@@ -25,7 +25,9 @@ use buffered_upstream::read_bounded_upstream;
 use chat_sse_usage::ChatSseUsageContract;
 pub(in crate::api) use conversation_hints::safe_conversation_hint as safe_response_id;
 use conversation_hints::{client_name, conversation_hints};
-use lifecycle::{finish_proxy_request_with_archive_fallback, run_bounded_proxy_lifecycle};
+use lifecycle::{
+    finish_proxy_request_with_archive_fallback, finish_unavailable, run_bounded_proxy_lifecycle,
+};
 use routing::{
     AdmittedProxyRouteInput, CandidatePreparationSummary, CodexRetryTerminal,
     CodexRetryTerminalGuard, DeferredSharedProbe, NextSendableProxyRouteInput, PlannedProxyRoute,
@@ -55,6 +57,7 @@ mod sse_delivery_tests;
 
 const PROXY_BODY_CHANNEL_CAPACITY: usize = 1;
 const MAX_INPUT_TOKEN_OVERHEAD_CEILING: i64 = 1_000_000;
+const RETAINED_REQUEST_ADMISSION_WAIT: Duration = Duration::from_secs(1);
 
 fn validate_openai_chat_choice_count(request: &Value) -> Result<(), AppError> {
     if openai_chat_choice_count(request)? == 1 {
@@ -185,6 +188,7 @@ async fn next_sendable_proxy_route(
         mut failover_reason,
         candidate_rank,
         outbound_attempts,
+        recovery_wait_deadline,
         deferred_shared_probes,
     } = input;
     let state = request.state;
@@ -193,6 +197,7 @@ async fn next_sendable_proxy_route(
     let strict_choice_count_is_incompatible = matches!(request.protocol, Protocol::OpenAiChat)
         && openai_chat_choice_count(request.request_json)? != 1;
     let mut summary = CandidatePreparationSummary::default();
+    let mut transient_candidate = None;
     while let Some(mut planned) = match planned_candidate.take() {
         Some(planned) => Some(planned),
         None => {
@@ -274,6 +279,7 @@ async fn next_sendable_proxy_route(
             cooldown_until,
             probe_lease_until,
             shared_probe_eligible,
+            transient_wait_eligible,
         } = admission
         {
             let now = unix_millis();
@@ -302,6 +308,10 @@ async fn next_sendable_proxy_route(
                     probe_lease_until,
                 });
             }
+            // Retain at most one small route snapshot, never another request body.
+            if outbound_attempts == 0 && transient_wait_eligible && transient_candidate.is_none() {
+                transient_candidate = Some((planned.route.clone(), rank));
+            }
             state.metrics.observe_upstream_health(
                 UpstreamHealthEvent::Skipped,
                 UpstreamHealthReason::Cooldown,
@@ -321,6 +331,7 @@ async fn next_sendable_proxy_route(
             failover_reason,
             planned,
             admission,
+            existing_guard: None,
             shared_probe_permit: None,
             candidate_rank: rank,
             outbound_attempt,
@@ -407,6 +418,7 @@ async fn next_sendable_proxy_route(
                     failover_reason,
                     planned,
                     admission,
+                    existing_guard: None,
                     shared_probe_permit: Some(permit),
                     candidate_rank: deferred.candidate_rank,
                     outbound_attempt,
@@ -427,6 +439,40 @@ async fn next_sendable_proxy_route(
                 );
             }
         }
+    }
+    if let Some((route, rank)) = transient_candidate
+        && let Some((route, admission, guard)) =
+            routing::recovery_wait::wait(state, request_id, route, recovery_wait_deadline).await?
+    {
+        let prepared = async {
+            let planned = plan_proxy_route(ProxyRoutePlanInput {
+                request,
+                route,
+                preparation_now: unix_millis(),
+            })?;
+            let (next_input, next_output) =
+                candidate_reservation_bounds(&planned, original_body_length, output_choice_count)?;
+            prepare_admitted_proxy_route(AdmittedProxyRouteInput {
+                request,
+                price,
+                reservation,
+                input_token_ceiling,
+                output_token_ceiling,
+                next_input_token_ceiling: next_input,
+                next_output_token_ceiling: next_output,
+                assigned_route,
+                failover_reason,
+                planned,
+                admission,
+                existing_guard: Some(guard),
+                shared_probe_permit: None,
+                candidate_rank: rank,
+                outbound_attempt,
+            })
+            .await
+        }
+        .await;
+        return prepared.map(Some);
     }
     Ok(None)
 }
@@ -575,14 +621,14 @@ async fn execute_component_primary(
             tracing::warn!(
                 request_id = %request.request_id,
                 upstream_account_id = %primary.route.account_id,
-                error = %error,
+                error_category = error.diagnostic_category(),
                 "current upstream credential is invalid"
             );
             return finish_proxy_failure(&request, "upstream_credential_invalid").await;
         }
     };
     if readiness != PreparedRouteReadiness::Ready {
-        return finish_proxy_unavailable(&request, readiness.error_code()).await;
+        return finish_unavailable(&request, readiness.error_code(), None).await;
     }
     let mut active_route = match materialize_proxy_route(request.state, primary).await {
         Ok(prepared) => prepared,
@@ -658,6 +704,7 @@ pub(in crate::api) async fn proxy_with_identity(
     let _request_buffer = state
         .metrics
         .memory_usage(crate::metrics::MemoryComponent::RequestBuffer, body.len());
+    let state = state.pin_application_plugins().await?;
     let proxy_lifecycle_permit = state
         .proxy_lifecycle_permits
         .clone()
@@ -728,7 +775,9 @@ pub(in crate::api) async fn proxy_with_identity(
     let primary = route_plan.primary_route();
     // Freeze before reservation and archive work: later candidates/reloads may
     // change account transport settings, never replenish the request budget.
-    let attempt_budget = routing::RequestAttemptBudget::from_primary(primary)?;
+    let attempt_budget = routing::RequestAttemptBudget::from_primary(primary, request_id)?;
+    let recovery_wait_deadline =
+        attempt_budget.recovery_wait_deadline(state.config.upstream_health);
     let upstream_account_id = Some(primary.account_id);
     let model_route_id = Some(primary.route_id);
     let price = state.db.model_price(&model, &key.currency).await?;
@@ -762,7 +811,7 @@ pub(in crate::api) async fn proxy_with_identity(
     {
         Ok(reservation) => reservation,
         Err(error) => {
-            tracing::error!(%request_id, stage = "request_transaction_admission", "proxy request admission failed");
+            tracing::error!(%request_id, stage = "request_transaction_admission", failure_domain = "local_admission", error_category = error.diagnostic_category(), "proxy request admission failed");
             return Err(error);
         }
     };
@@ -799,7 +848,15 @@ pub(in crate::api) async fn proxy_with_identity(
     };
     // Admission ACK includes reservation, request record, and encrypted sealed
     // request spool in one transaction. No upstream work starts before it.
-    if !buffered_request.memory.try_finalize_request() {
+    // A requested stream can still return a successful JSON envelope, so it
+    // needs the buffered-response safety partition until the response headers
+    // prove that the actual downstream path is SSE. Waiting here is bounded,
+    // FIFO, and occurs after durable admission but before any upstream send.
+    if !buffered_request
+        .memory
+        .finalize_request(tokio::time::Instant::now() + RETAINED_REQUEST_ADMISSION_WAIT)
+        .await
+    {
         state
             .metrics
             .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Retained);
@@ -843,6 +900,7 @@ pub(in crate::api) async fn proxy_with_identity(
         model_route_id.ok_or(AppError::Internal)?,
     );
     let mut outbound_attempts = 0_usize;
+    let mut last_dispatch = None;
     let mut candidate_rank = 0_usize;
     let mut deferred_shared_probes = std::collections::VecDeque::new();
     let mut next_failover_reason = None;
@@ -850,7 +908,7 @@ pub(in crate::api) async fn proxy_with_identity(
         if let Some(reason) = attempt_budget.terminal_reason(outbound_attempts) {
             tracing::warn!(%request_id, outbound_attempts, stage = reason,
                 policy_version = attempt_budget.version, "proxy request budget exhausted");
-            return finish_proxy_unavailable(&buffered_request, reason).await;
+            return finish_unavailable(&buffered_request, reason, last_dispatch).await;
         }
         let selected = match next_sendable_proxy_route(NextSendableProxyRouteInput {
             request: request_context,
@@ -866,6 +924,7 @@ pub(in crate::api) async fn proxy_with_identity(
             failover_reason: next_failover_reason.take(),
             candidate_rank: &mut candidate_rank,
             outbound_attempts,
+            recovery_wait_deadline,
             deferred_shared_probes: &mut deferred_shared_probes,
         })
         .await
@@ -874,7 +933,9 @@ pub(in crate::api) async fn proxy_with_identity(
             Err(error) => {
                 tracing::warn!(
                     %request_id,
-                    error = %error,
+                    error_category = error.diagnostic_category(),
+                    failure_domain = "local_admission",
+                    stage = "upstream_candidate_selection",
                     "proxy candidate selection failed"
                 );
                 return finish_proxy_failure(&buffered_request, "upstream_candidate_invalid").await;
@@ -883,15 +944,19 @@ pub(in crate::api) async fn proxy_with_identity(
         let Some((active_route, mut upstream_attempt, selected_candidate_rank, outbound_attempt)) =
             selected
         else {
-            return finish_proxy_unavailable(&buffered_request, "upstream_unavailable").await;
+            return finish_unavailable(&buffered_request, "upstream_unavailable", last_dispatch)
+                .await;
         };
         // Selection may have waited for database admission; do not dispatch
         // when the original deadline expired during that wait.
         if let Some(reason) = attempt_budget.terminal_reason(outbound_attempts) {
+            tracing::warn!(%request_id, outbound_attempts, stage = reason,
+                failure_domain = "local_admission", delivery_evidence = "candidate_not_dispatched",
+                "proxy request budget expired during candidate selection");
             upstream_attempt
                 .complete(UpstreamAttemptTerminal::Inconclusive)
                 .await;
-            return finish_proxy_unavailable(&buffered_request, reason).await;
+            return finish_unavailable(&buffered_request, reason, last_dispatch).await;
         }
         let (result, rate_limit) = match attempt_budget
             .send(send_proxy_route(
@@ -921,8 +986,15 @@ pub(in crate::api) async fn proxy_with_identity(
         );
         if consumed_outbound_attempt {
             outbound_attempts += 1;
+            last_dispatch = Some((active_route.route.account_id, active_route.route.route_id));
         }
         let failure = routing::classify_attempt_failure(&result, rate_limit);
+        routing::diagnostics::observe_send(
+            request_id,
+            selected_candidate_rank,
+            outbound_attempt,
+            &result,
+        );
         let candidate_unavailable = matches!(
             &result,
             Err(ProxySendError::CandidateUnavailable | ProxySendError::CredentialUnavailable)
@@ -1008,17 +1080,20 @@ pub(in crate::api) async fn proxy_with_identity(
                 return finish_proxy_failure(&buffered_request, "provider_credential").await;
             }
             Err(ProxySendError::CredentialUnavailable) => {
-                return finish_proxy_unavailable(
+                return finish_unavailable(
                     &buffered_request,
                     "upstream_credential_unavailable",
+                    last_dispatch,
                 )
                 .await;
             }
             Err(ProxySendError::RetryableConnection(_) | ProxySendError::CandidateUnavailable) => {
-                return finish_proxy_unavailable(&buffered_request, "upstream_connection").await;
+                return finish_unavailable(&buffered_request, "upstream_connection", last_dispatch)
+                    .await;
             }
             Err(ProxySendError::RetryableCodexBadRequest) => {
-                return finish_proxy_unavailable(&buffered_request, "upstream_rejected").await;
+                return finish_unavailable(&buffered_request, "upstream_rejected", last_dispatch)
+                    .await;
             }
             Err(ProxySendError::CodexBadRequest) => {
                 upstream_attempt
@@ -1042,7 +1117,7 @@ pub(in crate::api) async fn proxy_with_identity(
                     .await;
                 return finish_proxy_failure(&buffered_request, error_code).await;
             }
-            Err(ProxySendError::NonRetryableTransport) => {
+            Err(ProxySendError::NonRetryableTransport | ProxySendError::OuterDeadline) => {
                 upstream_attempt
                     .complete(UpstreamAttemptTerminal::Inconclusive)
                     .await;
@@ -1110,7 +1185,16 @@ pub(in crate::api) async fn proxy_with_identity(
                 tracing::warn!(%request_id, stage = error_code, "Codex upstream response failed");
                 let result = finish_proxy_failure(&buffered_request, error_code).await;
                 upstream_attempt
-                    .complete(UpstreamAttemptTerminal::invalid_response())
+                    .complete(
+                        if matches!(
+                            error_code,
+                            "upstream_read_timeout" | "upstream_request_timeout"
+                        ) {
+                            UpstreamAttemptTerminal::Inconclusive
+                        } else {
+                            UpstreamAttemptTerminal::invalid_response()
+                        },
+                    )
                     .await;
                 codex_retry.complete(CodexRetryTerminal::Failed);
                 return result;
@@ -1174,6 +1258,9 @@ pub(in crate::api) async fn proxy_with_identity(
         })
         .await;
     }
+    buffered_request
+        .memory
+        .release_retained_request_for_stream();
     streaming::stream_response(streaming::StreamingResponse {
         state: &state,
         upstream,
@@ -1531,34 +1618,34 @@ async fn finish_proxy_failure(
     .await
 }
 
-async fn finish_proxy_unavailable(
+async fn finish_buffered_request(
     request: &BufferedRequest<'_>,
-    error_code: &str,
+    status: StatusCode,
+    body: Bytes,
+    content_type: &str,
+    usage: TokenUsage,
+    error_code: Option<String>,
 ) -> Result<Response, AppError> {
-    let mut response = finish_buffered_request(
+    finish_buffered_request_with_upstream_attribution(
         request,
-        StatusCode::SERVICE_UNAVAILABLE,
-        Bytes::from_static(
-            b"{\"error\":{\"message\":\"no healthy upstream is currently available\",\"type\":\"upstream_error\"}}",
-        ),
-        "application/json",
-        TokenUsage::default(),
-        Some(error_code.to_owned()),
+        status,
+        body,
+        content_type,
+        usage,
+        error_code,
+        ProxyRequestUpstreamAttribution::KeepSelected,
     )
-    .await?;
-    response
-        .headers_mut()
-        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-    Ok(response)
+    .await
 }
 
-async fn finish_buffered_request(
+async fn finish_buffered_request_with_upstream_attribution(
     request: &BufferedRequest<'_>,
     mut status: StatusCode,
     mut body: Bytes,
     content_type: &str,
     usage: TokenUsage,
     mut error_code: Option<String>,
+    upstream_attribution: ProxyRequestUpstreamAttribution,
 ) -> Result<Response, AppError> {
     let request_id = request.request_id;
     let usage = match crate::db::normalize_proxy_usage(
@@ -1645,6 +1732,7 @@ async fn finish_buffered_request(
                 &request.state.db,
                 terminal,
                 &archive,
+                upstream_attribution,
             )
             .await
         }
@@ -1655,7 +1743,8 @@ async fn finish_buffered_request(
                 elapsed_ms = capture_started.elapsed().as_millis() as u64,
                 "proxy archive gap"
             );
-            finish_proxy_request_with_retry(&request.state.db, terminal, None).await
+            finish_proxy_request_with_retry(&request.state.db, terminal, None, upstream_attribution)
+                .await
         }
     };
     drop(response_capture_memory);

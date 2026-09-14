@@ -65,6 +65,14 @@ export async function assertOperatorTenantScope(
   return pickerExpectation === 'visible' ? tenantPicker : undefined;
 }
 
+/** A restored credential owns the form until its tenant discovery commits.
+ * An explicit connection must begin after that transition, otherwise the
+ * successful restoration can correctly clear the matching draft we just filled.
+ */
+export function operatorCredentialEntryForm(page: Page): Locator {
+  return page.locator('form.operator-credential[aria-busy="false"]');
+}
+
 export async function connectOperator(
   world: DogfoodWorld,
   theme: 'dark' | 'light',
@@ -79,7 +87,7 @@ export async function connectOperator(
   // performs tenant discovery and only then remounts this form as a
   // replacement-credential form. Target the form instead of its translated
   // submit label so both entry points exercise the same user flow.
-  const accessForm = page.locator('form.operator-credential');
+  const accessForm = operatorCredentialEntryForm(page);
   const credentialInput = accessForm.locator('input[type="password"]');
   await credentialInput.waitFor({ state: 'visible' });
   await credentialInput.fill(expectedCredential);
@@ -98,9 +106,11 @@ export async function connectOperator(
       const url = new URL(response.url());
       return response.request().method() === 'GET'
         // The helper opens the settings route, whose tenant-scoped resource
-        // load is model routes rather than the traffic page's request list.
-        && url.pathname === '/internal/v1/model-routes'
-        && url.searchParams.get('tenant_external_id') === tenant;
+        // load is the bounded route projection rather than the traffic page's
+        // request list.
+        && url.pathname === '/internal/v1/model-picker-options'
+        && url.searchParams.get('tenant_external_id') === tenant
+        && url.searchParams.get('selection_kind') === 'route';
     });
     await tenantPicker.selectOption(tenant);
     assert.equal((await scopedReload).status(), 200);

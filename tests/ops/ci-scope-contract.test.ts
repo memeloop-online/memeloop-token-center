@@ -1,16 +1,22 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { run } from './contract-helpers.ts';
+import { rejected, repository, run } from './contract-helpers.ts';
 
-function scopes(event: 'pull_request' | 'push', paths: string[]): Record<string, string> {
+type Change = readonly [status: string, ...paths: string[]];
+
+function encoded(changes: readonly Change[]): string {
+  return changes.flatMap(([status, ...paths]) => [status, ...paths]).join('\0') + (changes.length === 0 ? '' : '\0');
+}
+
+function scopes(event: 'pull_request' | 'push', changes: readonly Change[]): Record<string, string> {
   const temporary = mkdtempSync(join(tmpdir(), 'mtc-ci-scope-contract-'));
   try {
-    const changed = join(temporary, 'changed.txt');
+    const changed = join(temporary, 'changed.z');
     const output = join(temporary, 'output.txt');
-    writeFileSync(changed, paths.length === 0 ? '' : `${paths.join('\n')}\n`);
+    writeFileSync(changed, encoded(changes));
     writeFileSync(output, '');
     run(process.execPath, ['ops/ci/detect-expensive-ci-scopes.ts', event, changed, output]);
     return Object.fromEntries(readFileSync(output, 'utf8').trim().split('\n').map((line) => line.split('=', 2)));
@@ -19,50 +25,120 @@ function scopes(event: 'pull_request' | 'push', paths: string[]): Record<string,
   }
 }
 
-test('memory acceptance skips non-binary and ordinary test-only pull requests', () => {
-  assert.deepEqual(
-    scopes('pull_request', [
-      'README.md',
-      'docs/performance.md',
-      'web/src/App.tsx',
-      'charts/memeloop-token-center/values.yaml',
-      'tests/ops/readme-canonical-contract.test.ts',
-      'tests/route_management.rs',
-    ]),
-    { memory: 'false', plugin_installer: 'false' },
+const webOnly = { rust: 'false', web: 'true', migration: 'false', memory: 'false', plugin_installer: 'false' };
+const staticContractsOnly = { rust: 'false', web: 'false', migration: 'false', memory: 'false', plugin_installer: 'false' };
+const full = { rust: 'true', web: 'true', migration: 'true', memory: 'true', plugin_installer: 'false' };
+const fullPlugin = { ...full, plugin_installer: 'true' };
+
+test('verified merge scope ignores a stale event base and fails closed for an unverified checkout', () => {
+  const temporary = mkdtempSync(join(tmpdir(), 'mtc-ci-merge-scope-contract-'));
+  const env = {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_AUTHOR_NAME: 'CI fixture', GIT_AUTHOR_EMAIL: 'fixture@example.test',
+    GIT_COMMITTER_NAME: 'CI fixture', GIT_COMMITTER_EMAIL: 'fixture@example.test',
+    GIT_AUTHOR_DATE: '2026-01-01T00:00:00Z', GIT_COMMITTER_DATE: '2026-01-01T00:00:00Z',
+  };
+  const git = (...args: string[]): string => run('git', args, { cwd: temporary, env }).trim();
+  const commit = (message: string, ...parents: string[]): string => git(
+    'commit-tree', git('write-tree'), ...parents.flatMap((parent) => ['-p', parent]), '-m', message,
   );
-  for (const path of [
-    'src/main.rs',
-    'Cargo.toml',
-    'Cargo.lock',
-    'build.rs',
-    'Dockerfile',
-    '.cargo/config.toml',
-    'migrations/common/0073_future.sql',
-    'schemas/core-config.schema.json',
-    'wit/policy.wit',
-    'vendor/rust_decimal/src/lib.rs',
-    'tests/load/test-benchmark-memory.ts',
-    'ops/benchmark-memory.ts',
-    'ops/benchmark-stream-barrier.ts',
-    'ops/benchmark-soak-diagnostics.ts',
-    '.github/workflows/ci.yml',
-    '.github/workflows/memory-acceptance.yml',
-    'future-runtime-input.txt',
-  ]) {
-    assert.equal(scopes('pull_request', [path]).memory, 'true', `${path} must run memory acceptance`);
+  try {
+    git('init', '--quiet', '--initial-branch=fixture');
+    mkdirSync(join(temporary, 'src'));
+    mkdirSync(join(temporary, 'web'));
+    writeFileSync(join(temporary, 'src/runtime.rs'), 'old base\n');
+    writeFileSync(join(temporary, 'web/App.tsx'), 'old UI\n');
+    git('add', '.');
+    const eventBase = commit('original event base');
+    writeFileSync(join(temporary, 'web/App.tsx'), 'new UI\n');
+    git('add', 'web/App.tsx');
+    const prHead = commit('web-only PR', eventBase);
+    git('read-tree', eventBase);
+    writeFileSync(join(temporary, 'src/runtime.rs'), 'unrelated base advance\n');
+    git('add', 'src/runtime.rs');
+    const actualBase = commit('base advanced after event snapshot', eventBase);
+    git('read-tree', prHead);
+    git('add', 'src/runtime.rs');
+    const merge = commit('actual checked out merge', actualBase, prHead);
+    git('update-ref', 'HEAD', merge);
+    assert.match(git('diff', '--name-only', eventBase, merge), /^src\/runtime\.rs$/m,
+      'the stale event-base comparison must reproduce the unrelated runtime change');
+
+    const resolve = (checkout: string, head: string): { scopes: Record<string, string>; evidence: Record<string, unknown> } => {
+      const output = join(temporary, 'scope-output.txt');
+      writeFileSync(output, '');
+      const result = run(process.execPath, [join(repository, 'ops/ci/detect-expensive-ci-scopes.ts'), 'pull_request', '--verified-merge', output], {
+        cwd: temporary, env: { ...env, BASE_SHA: eventBase, GITHUB_SHA: checkout, PR_HEAD_SHA: head },
+      });
+      return {
+        scopes: Object.fromEntries(readFileSync(output, 'utf8').trim().split('\n').map((line) => line.split('=', 2))),
+        evidence: JSON.parse(result),
+      };
+    };
+    const verified = resolve(merge, prHead);
+    assert.deepEqual(verified.scopes, webOnly);
+    assert.equal(verified.evidence.comparison_base, actualBase);
+    assert.equal(verified.evidence.change_count, 1);
+    assert.equal(verified.evidence.force_full, false);
+    for (const [checkout, head] of [[merge, actualBase], [merge, 'not-a-sha'], [prHead, prHead]]) {
+      const fallback = resolve(checkout!, head!);
+      assert.deepEqual(fallback.scopes, fullPlugin);
+      assert.equal(fallback.evidence.force_full, true);
+    }
+    git('update-ref', 'HEAD', prHead);
+    assert.deepEqual(resolve(prHead, prHead).scopes, fullPlugin, 'one-parent checkout must not grant skips');
+    const octopus = commit('unexpected three-parent merge', actualBase, prHead, eventBase);
+    git('update-ref', 'HEAD', octopus);
+    assert.deepEqual(resolve(octopus, prHead).scopes, fullPlugin, 'three-parent checkout must not grant skips');
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
   }
 });
 
-test('master push remains unconditionally full and plugin inputs remain covered', () => {
-  assert.deepEqual(scopes('push', []), { memory: 'true', plugin_installer: 'true' });
-  for (const path of [
-    '.dockerignore',
-    'Dockerfile.plugin-installer',
-    'Cargo.lock',
-    'src/bin/install-plugin-oci.rs',
-    'packaging/cosign/v3.1.3-security.patch',
-  ]) {
-    assert.equal(scopes('pull_request', [path]).plugin_installer, 'true', `${path} must build the plugin installer`);
+test('scope matrix skips expensive service gates only for web or static-contract pull requests', () => {
+  const matrix: readonly [label: string, changes: readonly Change[], expected: Record<string, string>][] = [
+    ['PR 66-shaped web source and browser contract', [['M', 'web/src/useAnchoredPopover.ts'], ['A', 'web/e2e/popover-width-browser-contract.test.ts']], webOnly],
+    ['web deletion', [['D', 'web/e2e/obsolete-browser-contract.test.ts']], webOnly],
+    ['web-only rename', [['R100', 'web/src/old.tsx', 'web/src/new.tsx']], webOnly],
+    ['PR 115-shaped source module static contract', [['M', 'tests/ops/source-module-size-contract.test.ts']], staticContractsOnly],
+    ['static contract helper', [['M', 'tests/ops/contract-helpers.ts']], staticContractsOnly],
+    ['static contract plus runtime source', [['M', 'tests/ops/source-module-size-contract.test.ts'], ['M', 'src/api/routes/control.rs']], fullPlugin],
+    ['web build script', [['M', 'web/scripts/verify-github-workflow-policy.mjs']], webOnly],
+    ['CI scope script', [['M', 'ops/ci/detect-expensive-ci-scopes.ts']], full],
+    ['production renamed into web', [['R100', 'src/api/routes.rs', 'web/src/routes.ts']], fullPlugin],
+    ['web renamed into production', [['R100', 'web/src/routes.ts', 'src/api/routes.rs']], fullPlugin],
+    ['shared manifest', [['M', 'package-lock.json']], full],
+    ['Rust manifest', [['M', 'Cargo.lock']], fullPlugin],
+    ['migration', [['D', 'migrations/0099_retired.sql']], fullPlugin],
+    ['CI workflow', [['M', '.github/workflows/ci.yml']], fullPlugin],
+    ['unknown path', [['A', 'future-runtime-input.txt']], full],
+  ];
+  for (const [label, changes, expected] of matrix) assert.deepEqual(scopes('pull_request', changes), expected, label);
+});
+
+test('known documentation and ordinary test paths preserve existing memory policy but not Rust or migration coverage', () => {
+  assert.deepEqual(
+    scopes('pull_request', [['M', 'docs/performance.md'], ['M', 'tests/route_management.rs']]),
+    { rust: 'true', web: 'true', migration: 'true', memory: 'false', plugin_installer: 'false' },
+  );
+});
+
+test('pushes and malformed or empty pull-request diffs fail closed', () => {
+  assert.deepEqual(scopes('push', [['M', 'web/src/App.tsx']]), fullPlugin);
+  const temporary = mkdtempSync(join(tmpdir(), 'mtc-ci-scope-contract-'));
+  try {
+    const changed = join(temporary, 'changed.z');
+    const output = join(temporary, 'output.txt');
+    writeFileSync(output, '');
+    writeFileSync(changed, '');
+    rejected(process.execPath, ['ops/ci/detect-expensive-ci-scopes.ts', 'pull_request', changed, output]);
+    writeFileSync(changed, 'R100\0web/src/old.tsx\0');
+    rejected(process.execPath, ['ops/ci/detect-expensive-ci-scopes.ts', 'pull_request', changed, output]);
+    writeFileSync(changed, 'X\0web/src/App.tsx\0');
+    rejected(process.execPath, ['ops/ci/detect-expensive-ci-scopes.ts', 'pull_request', changed, output]);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
   }
 });

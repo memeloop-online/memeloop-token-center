@@ -4,6 +4,7 @@ import type { Page, Request } from 'playwright';
 
 import { eventually } from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
+import { operatorCredentialEntryForm } from './dogfood.support.js';
 
 interface ObservedRequest {
   credential: string;
@@ -58,6 +59,7 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
   observations.set(this, observed);
   const singletonTenants = deferred();
   const slowTenants = deferred();
+  let restoredTenants: ReturnType<typeof deferred> | undefined;
 
   await page.route('**/internal/v1/**', async (route) => {
     const request = route.request();
@@ -70,6 +72,7 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
         await singletonTenants.promise;
         await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify([{ external_id: 'singleton-tenant', default_currency: 'USD' }]) });
       } else if (credential === 'multi-credential') {
+        if (restoredTenants) await restoredTenants.promise;
         await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify([
           { external_id: 'tenant-a', default_currency: 'USD' },
           { external_id: 'tenant-b', default_currency: 'USD' },
@@ -121,9 +124,9 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
   singletonTenants.resolve();
   await waitForSingleTenantScope(page, 'singleton-tenant');
   // This scenario opens the settings route. Its first tenant-scoped resource
-  // reads are the model-route catalog and the filter-assistant settings, not
-  // the traffic-page requests used by other operator scenarios.
-  const resourcePaths = ['/internal/v1/model-routes', '/internal/v1/filter-assistant/settings'];
+  // reads are the bounded model-picker projection and filter-assistant
+  // settings, not the traffic-page requests used by other operator scenarios.
+  const resourcePaths = ['/internal/v1/model-picker-options', '/internal/v1/filter-assistant/settings'];
   await eventually(() => assert.ok(observed.filter((value) => value.credential === 'singleton-credential'
     && resourcePaths.includes(value.path)).length >= 2));
   const singletonResources = observed.filter((value) => value.credential === 'singleton-credential'
@@ -174,6 +177,31 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
   const fastResources = observed.filter((value) => value.credential === 'fast-credential'
     && resourcePaths.includes(value.path));
   assert.ok(fastResources.every((value) => value.tenant === 'fast-tenant'), JSON.stringify(fastResources));
+
+  // Reproduce the shared helper's same-scenario reload: remembered auth is
+  // deliberately held in flight. Its form must not qualify for a new fill
+  // until that owner has committed, even though the password input is visible.
+  restoredTenants = deferred();
+  await page.evaluate(() => localStorage.setItem('mtc.operator.service-credential.v1', 'multi-credential'));
+  const restoring = page.waitForRequest(request => new URL(request.url()).pathname === '/internal/v1/tenants'
+    && request.headers().authorization === 'Bearer multi-credential');
+  await this.open('/operator?view=settings', { theme: 'dark', locale: 'zh-CN' });
+  await restoring;
+  await page.locator('form.operator-credential[aria-busy="true"] input[type="password"]').waitFor();
+  const entryForm = operatorCredentialEntryForm(page);
+  assert.equal(await entryForm.isVisible(), false, 'a visible pending-restore form does not own a new explicit connection');
+  restoredTenants.resolve();
+  await entryForm.waitFor({ state: 'visible' });
+  const restoredInput = entryForm.locator('input[type="password"]');
+  await restoredInput.fill('multi-credential');
+  assert.equal(await restoredInput.inputValue(), 'multi-credential');
+  const explicitDiscovery = page.waitForResponse(response => new URL(response.url()).pathname === '/internal/v1/tenants'
+    && response.request().headers().authorization === 'Bearer multi-credential');
+  await entryForm.locator('button[type="submit"]').click();
+  assert.equal((await explicitDiscovery).status(), 200);
+  await entryForm.waitFor({ state: 'visible' });
+  await waitForTenantPicker(page, 'tenant-a');
+  assert.equal(await page.evaluate(() => localStorage.getItem('mtc.operator.service-credential.v1')), 'multi-credential');
 });
 
 Then('只有当前凭据解析出的安全租户范围会提交到资源 API', function (this: DogfoodWorld) {

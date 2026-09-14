@@ -80,6 +80,20 @@ pub(in crate::api) async fn rotate_service_token(
     ))
 }
 
+pub(in crate::api) async fn copy_service_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(service_id): Path<Uuid>,
+) -> Result<Response, AppError> {
+    let service = require_service(&headers, &state, "service_tokens:write").await?;
+    require_global_service(&service)?;
+    let mut response = Json(state.db.copy_service_token(service_id).await?).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
 pub(in crate::api) async fn set_service_token_status(
     State(state): State<AppState>,
     headers: HeaderMap,

@@ -32,7 +32,7 @@
   min-width: 0;
   height: 100vh;
   color: #c9d9de;
-  background: #070d10f5;
+  background: #070d10;
   border-right: 1px solid #213137;
 }
 
@@ -190,12 +190,13 @@
     width: min(320px, calc(100vw - 40px));
     box-shadow: 20px 0 70px #0008;
     transform: translateX(-105%);
+    visibility: hidden;
     transition: transform 160ms ease-out;
   }
   .app-brand { justify-content: flex-start; padding-inline: 16px 8px; }
   .app-brand span { display: block; }
   .app-mobile-close { display: inline-grid; place-items: center; width: 44px; height: 44px; margin-left: auto; padding: 0; color: #9fd8d1; background: transparent; border-color: transparent; border-radius: 7px; font-size: 24px; }
-  .is-mobile-nav-open .app-sidebar { transform: translateX(0); }
+  .is-mobile-nav-open .app-sidebar { transform: translateX(0); visibility: visible; }
   .app-nav-backdrop { position: fixed; z-index: 40; inset: 0; display: block; width: 100%; height: 100%; padding: 0; background: #0009; border: 0; border-radius: 0; }
   .app-context-bar { padding-inline: 12px; }
   .app-mobile-menu { display: inline-grid; place-items: center; width: 44px; height: 44px; margin-right: 9px; padding: 0; color: #82dcd0; background: transparent; border-color: #2b4a4c; border-radius: 7px; font-size: 20px; }
@@ -215,7 +216,7 @@
   .app-main-content { padding-inline: 10px; }
 }
 
-:root[data-theme='light'] .app-sidebar { color: #173238; background: #f8fbf9f7; border-color: #cddbd8; }
+:root[data-theme='light'] .app-sidebar { color: #173238; background: #f8fbf9; border-color: #cddbd8; }
 :root[data-theme='light'] .app-brand, :root[data-theme='light'] .app-sidebar-footer { border-color: #d5e1de; }
 :root[data-theme='light'] .app-brand small, :root[data-theme='light'] .app-nav-section h2 { color: #62767b; }
 :root[data-theme='light'] .app-nav-item { color: #496168; }

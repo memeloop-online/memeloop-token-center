@@ -213,7 +213,7 @@ mod tests {
                 Ok(Bytes::from(vec![b'x'; MAX_BODY + 1])),
                 Ok(Bytes::from_static(b"tail")),
             ],
-            vec![Ok(Bytes::from_static(b"partial")), Err(())],
+            vec![Ok(Bytes::from_static(b"partial")), Err("upstream_stream")],
         ] {
             let response = UpstreamResponse::Prefetched {
                 status: StatusCode::TOO_MANY_REQUESTS,

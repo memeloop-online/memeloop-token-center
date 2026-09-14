@@ -385,3 +385,145 @@ async fn rejected_capture_never_publishes_a_complete_prefix() {
             .unwrap();
     assert_eq!(locator, format!("gap://{}/response", identity.request_id));
 }
+
+#[tokio::test]
+async fn cancelled_producer_fences_a_begin_that_committed_late() {
+    let (_dir, state, pool, identity) = fixture().await;
+    let (entering, release) = pause_next_begin_ack_for_test(&state);
+    let memory = state.proxy_memory_budget.reservation();
+    let producer = ResponseArchiveProducer::begin(&state, identity, memory).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), entering)
+        .await
+        .expect("writer begin must commit before the deterministic pause")
+        .unwrap();
+    drop(producer);
+    release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let row = sqlx::query(
+                "SELECT state, expires_at, updated_at FROM response_archive_spools WHERE request_id = $1",
+            )
+            .bind(identity.request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if row.get::<String, _>("state") == "gap" {
+                assert!(row.get::<i64, _>("expires_at") <= row.get::<i64, _>("updated_at"));
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a late committed begin must be fenced after producer cancellation");
+}
+
+#[tokio::test]
+async fn terminal_tail_survives_observer_cancellation_without_waiting_for_database_ack() {
+    let (_dir, state, pool, identity) = fixture().await;
+    let (entering, release) = pause_next_begin_ack_for_test(&state);
+    let memory = state.proxy_memory_budget.reservation();
+    let mut producer = ResponseArchiveProducer::begin(&state, identity, memory).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), entering)
+        .await
+        .expect("owned writer must commit begin before the test pause")
+        .unwrap();
+    assert!(
+        producer.append(vec![Bytes::from_static(b"one"), Bytes::from_static(b"two")]),
+        "small frames merge in the preallocated partial chunk without waiting for the writer"
+    );
+    let state_before_terminal: String =
+        sqlx::query_scalar("SELECT state FROM response_archive_spools WHERE request_id = $1")
+            .bind(identity.request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state_before_terminal, "capturing");
+
+    let settlement = producer
+        .seal()
+        .expect("terminal handoff must not wait for SQL");
+    drop(settlement);
+    release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let row = sqlx::query(
+                "SELECT state, chunk_count, byte_count FROM response_archive_spools WHERE request_id = $1",
+            )
+            .bind(identity.request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if row.get::<String, _>("state") == "pending" {
+                assert_eq!(row.get::<i64, _>("chunk_count"), 1);
+                assert_eq!(row.get::<i64, _>("byte_count"), 6);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the runtime supervisor must persist and seal the accepted terminal tail");
+}
+
+#[tokio::test]
+async fn owned_writer_queue_is_byte_bounded_and_releases_proxy_memory_after_gap() {
+    let (_dir, state, pool, identity) = fixture().await;
+    let (entering, release) = pause_next_begin_ack_for_test(&state);
+    let baseline = state.proxy_memory_budget.snapshot().0;
+    let memory = state.proxy_memory_budget.reservation();
+    let mut producer = ResponseArchiveProducer::begin(&state, identity, memory).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), entering)
+        .await
+        .expect("writer begin must reach the deterministic pause")
+        .unwrap();
+    assert_eq!(
+        state.proxy_memory_budget.snapshot().0 - baseline,
+        super::CAPTURE_MEMORY_BYTES * crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT
+    );
+
+    let kib = Bytes::from(vec![b'x'; 1024]);
+    assert!(
+        producer.append(vec![kib.clone(); super::CAPTURE_QUEUE_CHUNKS * 64]),
+        "many small frames must merge by bytes rather than consume message slots"
+    );
+    assert!(
+        !producer.append(vec![kib; 64]),
+        "a fourth complete queued chunk must fail closed while the writer is paused"
+    );
+    release.send(()).unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let state_name: Option<String> = sqlx::query_scalar(
+                "SELECT state FROM response_archive_spools WHERE request_id = $1",
+            )
+            .bind(identity.request_id.to_string())
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            if state_name.as_deref() == Some("gap") && producer.queue_memory_owners_for_test() == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("queue failure must settle the writer and fence the spool");
+    assert_eq!(
+        state.proxy_memory_budget.snapshot().0 - baseline,
+        super::CAPTURE_MEMORY_BYTES * crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+        "the live producer must keep the shared queue allocation charged after the writer exits"
+    );
+    assert!(
+        !producer.append(vec![Bytes::from_static(b"late")]),
+        "a producer must observe an already failed writer before buffering more bytes"
+    );
+    drop(producer);
+    assert_eq!(
+        state.proxy_memory_budget.snapshot().0,
+        baseline,
+        "the shared queue charge must release after both producer and writer settle"
+    );
+}

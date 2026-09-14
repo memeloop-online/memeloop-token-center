@@ -119,7 +119,7 @@ pub(in crate::api::proxy) async fn next_planned_proxy_candidate(
                     %request.request_id,
                     route_id = %candidate.route_id,
                     upstream_account_id = %candidate.account_id,
-                    error = %error,
+                    error_category = error.diagnostic_category(),
                     stage = "candidate_materialize",
                     "selected authorized proxy candidate is invalid"
                 );

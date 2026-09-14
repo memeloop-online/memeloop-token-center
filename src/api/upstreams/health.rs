@@ -1,5 +1,46 @@
 use super::super::*;
 
+fn health_probe_error(driver: &str, status: StatusCode) -> Option<&'static str> {
+    match status {
+        StatusCode::TOO_MANY_REQUESTS => Some("rate_limited"),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Some("authentication_failed"),
+        // This provider probes a deliberately nonexistent task without creating
+        // a billable generation. Its authenticated not-found reply is expected.
+        StatusCode::NOT_FOUND if driver == "volcengine-seedance" => None,
+        status if status.is_success() => None,
+        _ => Some("upstream_unavailable"),
+    }
+}
+
+fn health_probe_transport_error(proxy_configured: bool) -> &'static str {
+    if proxy_configured {
+        "proxy_connection_failed"
+    } else {
+        "connection_failed"
+    }
+}
+
+fn suppressed_health_body(
+    account_id: Uuid,
+    failure: &str,
+    retry_at: i64,
+    checked_at: i64,
+) -> Value {
+    let error_code = match failure {
+        "quota_exhausted" => "quota_exhausted",
+        "rate_limited" => "rate_limited",
+        _ => "upstream_unavailable",
+    };
+    json!({
+        "account_id": account_id,
+        "status": "unhealthy",
+        "error_code": error_code,
+        "retry_at": retry_at,
+        "source": "routing_state",
+        "checked_at": checked_at
+    })
+}
+
 fn upstream_health_probe_url(driver: &str, config: &Value, base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
     match driver {
@@ -66,7 +107,43 @@ pub(in crate::api) async fn probe_upstream_health(
             "checked_at": unix_millis()
         })));
     }
-    let base_url = validate_config(&account.config)?;
+    let checked_at = unix_millis();
+    match state
+        .db
+        .upstream_manual_health_suppression(account_id, account.credential_generation, checked_at)
+        .await
+    {
+        Ok(Some((failure, retry_at))) => {
+            return Ok(Json(suppressed_health_body(
+                account_id, &failure, retry_at, checked_at,
+            )));
+        }
+        Ok(None) => {}
+        Err(_) => {
+            // Do not send a probe when the current-generation routing state
+            // cannot be read: it may be suppressing traffic after a quota or
+            // capacity failure. The response is deliberately detail-free.
+            return Ok(Json(json!({
+                "account_id": account_id,
+                "status": "unhealthy",
+                "error_code": "health_state_unavailable",
+                "source": "local_state",
+                "checked_at": checked_at
+            })));
+        }
+    }
+    let proxy_configured = credential.proxy().is_some();
+    let base_url = match validate_config(&account.config) {
+        Ok(base_url) => base_url,
+        Err(_) => {
+            return Ok(Json(json!({
+                "account_id": account_id,
+                "status": "unhealthy",
+                "error_code": "destination_invalid",
+                "checked_at": unix_millis()
+            })));
+        }
+    };
     let outbound = match if account.driver == "openai-codex" {
         network::client_for_codex_url(
             &state.http,
@@ -142,15 +219,48 @@ pub(in crate::api) async fn probe_upstream_health(
             // bounded and prevents provider error text or secrets from being
             // copied into logs or the management response.
             let upstream_status = response.status();
-            let authentication_failed = matches!(
-                upstream_status,
-                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-            );
-            let healthy = !authentication_failed && !upstream_status.is_server_error();
+            let error_code = health_probe_error(&account.driver, upstream_status);
+            if error_code.is_none() {
+                // A request that began while the account was healthy can race
+                // with a routed generation failure. Re-read the same account
+                // and credential generation before reporting healthy; this
+                // never acquires a lease or changes the breaker.
+                let completed_at = unix_millis();
+                match state
+                    .db
+                    .upstream_manual_health_suppression(
+                        account_id,
+                        account.credential_generation,
+                        completed_at,
+                    )
+                    .await
+                {
+                    Ok(Some((failure, retry_at))) => {
+                        return Ok(Json(suppressed_health_body(
+                            account_id,
+                            &failure,
+                            retry_at,
+                            completed_at,
+                        )));
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        return Ok(Json(json!({
+                            "account_id": account_id,
+                            "status": "unhealthy",
+                            "error_code": "health_state_unavailable",
+                            "source": "local_state",
+                            "checked_at": completed_at
+                        })));
+                    }
+                }
+            }
+            let healthy = error_code.is_none();
             Ok(Json(json!({
                 "account_id": account_id,
                 "status": if healthy { "healthy" } else { "unhealthy" },
-                "error_code": if healthy { Value::Null } else if authentication_failed { json!("authentication_failed") } else { json!("upstream_unavailable") },
+                "error_code": error_code,
+                "source": "connection_probe",
                 "upstream_status": upstream_status.as_u16(),
                 "latency_ms": latency_ms,
                 "checked_at": checked_at
@@ -159,7 +269,7 @@ pub(in crate::api) async fn probe_upstream_health(
         Err(_) => Ok(Json(json!({
             "account_id": account_id,
             "status": "unhealthy",
-            "error_code": "connection_failed",
+            "error_code": health_probe_transport_error(proxy_configured),
             "latency_ms": latency_ms,
             "checked_at": checked_at
         }))),
@@ -170,7 +280,44 @@ pub(in crate::api) async fn probe_upstream_health(
 mod tests {
     use serde_json::json;
 
-    use super::upstream_health_probe_url;
+    use super::{health_probe_transport_error, upstream_health_probe_url};
+
+    #[test]
+    fn probe_transport_errors_keep_proxy_and_direct_paths_distinct() {
+        assert_eq!(health_probe_transport_error(false), "connection_failed");
+        assert_eq!(
+            health_probe_transport_error(true),
+            "proxy_connection_failed"
+        );
+    }
+
+    #[test]
+    fn probe_rejections_are_not_reported_as_healthy() {
+        use super::{StatusCode, health_probe_error};
+        for (status, expected) in [
+            (200, None),
+            (302, Some("upstream_unavailable")),
+            (400, Some("upstream_unavailable")),
+            (401, Some("authentication_failed")),
+            (403, Some("authentication_failed")),
+            (404, Some("upstream_unavailable")),
+            (429, Some("rate_limited")),
+            (503, Some("upstream_unavailable")),
+        ] {
+            assert_eq!(
+                health_probe_error("openai-codex", StatusCode::from_u16(status).unwrap()),
+                expected
+            );
+        }
+        assert_eq!(
+            health_probe_error("volcengine-seedance", StatusCode::NOT_FOUND),
+            None
+        );
+        assert_eq!(
+            health_probe_error("volcengine-seedance", StatusCode::TOO_MANY_REQUESTS),
+            Some("rate_limited")
+        );
+    }
 
     #[test]
     fn codex_health_uses_the_authenticated_model_catalog_endpoint() {

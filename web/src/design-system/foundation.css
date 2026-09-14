@@ -1,0 +1,71 @@
+/* Fluent owns control geometry and tokens. These classes own product layout only.
+   No global button/input reset: unmigrated pages retain their behavior. */
+.mtc-fluent-root {
+  min-width: 0;
+  background: transparent;
+  --mtc-space-section: 24px;
+  --mtc-space-field: 16px;
+  --mtc-touch-target: 36px;
+}
+/* Fluent copies provider classes to portals: viewport sizing here would create
+   an invisible full-screen pointer blocker after closing a tooltip. */
+.mtc-fluent-root:not([data-portal-node]) { min-height: 100vh; }
+.mtc-data-surface {
+  position: relative;
+  isolation: isolate;
+  min-width: 0;
+  padding: var(--mtc-space-section);
+  color: var(--colorNeutralForeground1);
+  background: var(--colorNeutralBackground1);
+  border: 0;
+  border-radius: var(--borderRadiusXLarge);
+  box-shadow: var(--shadow2);
+}
+.mtc-form-section {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.mtc-form-section > legend {
+  padding: 0;
+  margin-bottom: 8px;
+  font-size: var(--fontSizeBase400);
+  font-weight: var(--fontWeightSemibold);
+}
+.mtc-form-fields { display: grid; gap: var(--mtc-space-field); min-width: 0; }
+.mtc-secondary-text { color: var(--colorNeutralForeground2); margin: 0 0 16px; }
+.mtc-fluent-root .mtc-detail-trigger {
+  color: inherit;
+  font: inherit;
+  min-height: var(--mtc-touch-target);
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  padding: 2px 4px;
+  background: transparent;
+  border: 0;
+  border-radius: var(--borderRadiusMedium);
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  cursor: help;
+}
+.mtc-fluent-root .mtc-detail-trigger:hover { background: var(--colorNeutralBackground1Hover); }
+.mtc-fluent-root .mtc-detail-trigger:focus-visible {
+  outline: 2px solid var(--colorStrokeFocus2);
+  outline-offset: 2px;
+}
+@media (width <= 768px) {
+  .mtc-fluent-root { --mtc-space-section: 16px; --mtc-touch-target: 44px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mtc-fluent-root, .mtc-fluent-root *, .mtc-fluent-root *::before, .mtc-fluent-root *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+@media (forced-colors: active) {
+  .mtc-data-surface { background: Canvas; color: CanvasText; outline: 1px solid CanvasText; box-shadow: none; }
+  .mtc-fluent-root .mtc-detail-trigger:focus-visible { outline-color: Highlight; }
+}

@@ -5,12 +5,14 @@ mod admission;
 mod candidates;
 mod clock;
 mod codex;
+pub(super) mod diagnostics;
 mod http;
 pub(super) mod kimi;
 mod outcome;
 mod policy;
 mod probe;
 mod readiness;
+pub(super) mod recovery_wait;
 mod route_types;
 
 pub(super) use crate::provider::PROXY_ROUTING_POLICY;

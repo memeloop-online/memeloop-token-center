@@ -1,5 +1,4 @@
-//! Bounded encrypted spool. Normal mutations serialize against the budget row.
-//! GC uses bounded spool-first transactions with a NOWAIT budget lock; uploads
+//! Bounded encrypted spool. Mutations and GC serialize budget-first; uploads
 //! read bounded snapshot batches. No transaction encompasses object-storage I/O.
 use crate::response_archive_spool::BufferedArchivePurpose;
 
@@ -176,9 +175,8 @@ impl Database {
         tx: &mut Transaction<'_, Any>,
         now: i64,
         archive: &crate::response_archive_spool::BufferedArchive<'_>,
+        prepared_first_batch: Option<crate::response_archive_spool::PreparedArchiveBatch>,
     ) -> Result<bool, AppError> {
-        const INSERT_BATCH_CHUNKS: usize = 16;
-
         let identity = archive.identity();
         let purpose = archive.purpose();
         let body = archive.body();
@@ -197,6 +195,31 @@ impl Database {
         }
         if accounted > CIPHER_LIMIT {
             return Ok(false);
+        }
+        let prepared_first_batch = prepared_first_batch
+            .map(|prepared| prepared.into_chunks_for(archive).ok_or(AppError::Internal))
+            .transpose()?;
+        let expected_prepared =
+            chunk_count.min(crate::response_archive_spool::CAPTURE_INSERT_BATCH_CHUNKS);
+        if let Some(chunks) = prepared_first_batch.as_deref() {
+            if chunks.len() != expected_prepared {
+                return Err(AppError::Internal);
+            }
+            for (seq, chunk) in chunks.iter().enumerate() {
+                let start = seq
+                    .checked_mul(crate::response_archive_spool::CHUNK_BYTES)
+                    .ok_or(AppError::Internal)?;
+                let expected_bytes = body
+                    .len()
+                    .saturating_sub(start)
+                    .min(crate::response_archive_spool::CHUNK_BYTES);
+                if chunk.seq != i64::try_from(seq).map_err(|_| AppError::Internal)?
+                    || chunk.byte_count
+                        != i64::try_from(expected_bytes).map_err(|_| AppError::Internal)?
+                {
+                    return Err(AppError::Internal);
+                }
+            }
         }
         let byte_count = i64::try_from(body.len()).map_err(|_| AppError::Internal)?;
         let valid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND completed_at IS NULL")
@@ -236,8 +259,14 @@ impl Database {
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.reservation_id.to_string())
             .bind(chunk_count as i64).bind(byte_count).bind(accounted).bind(now).bind(now + RETENTION).execute(&mut **tx).await?;
         let mut first_seq = 0;
+        if let Some(chunks) = prepared_first_batch {
+            insert_spool_chunks(tx, purpose, identity, &chunks).await?;
+            first_seq = chunks.len();
+            drop(chunks);
+        }
         while first_seq < chunk_count {
-            let end_seq = (first_seq + INSERT_BATCH_CHUNKS).min(chunk_count);
+            let end_seq = (first_seq + crate::response_archive_spool::CAPTURE_INSERT_BATCH_CHUNKS)
+                .min(chunk_count);
             let chunks = (first_seq..end_seq)
                 .map(|seq| {
                     let start = seq * crate::response_archive_spool::CHUNK_BYTES;
@@ -261,9 +290,16 @@ impl Database {
     ) -> Result<bool, AppError> {
         let purpose = BufferedArchivePurpose::Response;
         let (mut tx, now) = self.spool_transaction().await?;
-        let valid: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND completed_at IS NULL")))
+        // The response writer is owned independently from the proxy lifecycle.
+        // A short stream may therefore finalize its request before the writer's
+        // begin transaction acquires the global spool budget. The canonical gap
+        // locator is the exact, fenced placeholder that finalization writes
+        // until the worker binds a durable object; no other completed request
+        // may be reopened for capture.
+        let gap_locator = format!("gap://{}/response", identity.request_id);
+        let valid: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND (completed_at IS NULL OR response_object = $4)")))
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
-            .bind(identity.reservation_id.to_string()).fetch_one(&mut *tx).await?;
+            .bind(identity.reservation_id.to_string()).bind(gap_locator).fetch_one(&mut *tx).await?;
         if valid != 1 {
             return Ok(false);
         }
@@ -308,7 +344,7 @@ impl Database {
             return Ok(false);
         }
         let (mut tx, now) = self.spool_transaction().await?;
-        let Some(row) = spool_row(&mut tx, identity, purpose).await? else {
+        let Some(row) = locked_spool_row(&mut tx, self.backend, identity, purpose).await? else {
             return Ok(false);
         };
         if row.try_get::<String, _>("state")? != "capturing"
@@ -356,10 +392,11 @@ impl Database {
         if chunk_count < 0 || byte_count < 0 {
             return Ok(false);
         }
-        let (mut tx, now) = self.spool_transaction().await?;
-        let Some(row) = spool_row(&mut tx, identity, purpose).await? else {
+        let mut tx = self.archive_state_transaction().await?;
+        let Some(row) = locked_spool_row(&mut tx, self.backend, identity, purpose).await? else {
             return Ok(false);
         };
+        let now = archive_clock(&mut tx, self.backend).await?;
         if row.try_get::<i64, _>("chunk_count")? != chunk_count
             || row.try_get::<i64, _>("byte_count")? != byte_count
             || row.try_get::<i64, _>("expires_at")? <= now
@@ -385,10 +422,14 @@ impl Database {
         reason: &str,
     ) -> Result<(), AppError> {
         let purpose = BufferedArchivePurpose::Response;
-        let (mut tx, now) = self.spool_transaction().await?;
+        let mut tx = self.archive_state_transaction().await?;
+        let now = archive_clock(&mut tx, self.backend).await?;
         // A lost seal ACK must not destroy a complete, recoverable pending spool.
-        let changed = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET state = 'gap', last_error_code = $1, updated_at = $2, expires_at = $3, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $4 AND tenant_id = $5 AND reservation_id = $6 AND state = 'capturing'")))
-            .bind(reason_code(reason)).bind(now).bind(now + CAPTURE_TTL).bind(identity.request_id.to_string())
+        // The audit row and terminal reason remain retained, but incomplete
+        // ciphertext can never be uploaded. Make it immediately eligible for
+        // the existing expiry-indexed GC so it cannot pin global capacity.
+        let changed = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET state = 'gap', last_error_code = $1, updated_at = $2, expires_at = $2, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $3 AND tenant_id = $4 AND reservation_id = $5 AND state = 'capturing'")))
+            .bind(reason_code(reason)).bind(now).bind(identity.request_id.to_string())
             .bind(identity.tenant_id.to_string()).bind(identity.reservation_id.to_string()).execute(&mut *tx).await?;
         if changed.rows_affected() == 1 {
             emit_response_archive_transition_event_in_transaction(
@@ -429,13 +470,42 @@ impl Database {
         purpose: BufferedArchivePurpose,
         admit: impl FnOnce() -> bool,
     ) -> Result<Option<ArchiveSpoolTask>, AppError> {
-        let (mut tx, now) = self.spool_transaction().await?;
-        let row = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT s.* FROM response_archive_spools s WHERE s.expires_at > $1 AND s.attempts < 10 AND ((s.state = 'pending' AND s.next_attempt_at <= $1) OR (s.state = 'uploading' AND s.lease_expires_at <= $1)) AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND r.completed_at IS NOT NULL AND r.response_object = 'gap://' || s.request_id || '/response') ORDER BY s.next_attempt_at, s.request_id LIMIT 1")))
-            .bind(now).fetch_optional(&mut *tx).await?;
+        let mut tx = self.archive_state_transaction().await?;
+        let hint_now = archive_clock(&mut tx, self.backend).await?;
+        let claim = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT s.* FROM response_archive_spools s WHERE s.expires_at > $1 AND s.attempts < 10 AND ((s.state = 'pending' AND s.next_attempt_at <= $1) OR (s.state = 'uploading' AND s.lease_expires_at <= $1)) AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND r.completed_at IS NOT NULL AND r.response_object = 'gap://' || s.request_id || '/response') ORDER BY s.next_attempt_at, s.request_id LIMIT 1 FOR UPDATE OF s SKIP LOCKED"
+            }
+            DatabaseBackend::Sqlite => {
+                "SELECT s.* FROM response_archive_spools s WHERE s.expires_at > $1 AND s.attempts < 10 AND ((s.state = 'pending' AND s.next_attempt_at <= $1) OR (s.state = 'uploading' AND s.lease_expires_at <= $1)) AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND r.completed_at IS NOT NULL AND r.response_object = 'gap://' || s.request_id || '/response') ORDER BY s.next_attempt_at, s.request_id LIMIT 1"
+            }
+        };
+        let row = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, claim)))
+            .bind(hint_now)
+            .fetch_optional(&mut *tx)
+            .await?;
         let Some(row) = row else {
             tx.commit().await?;
             return Ok(None);
         };
+        // Candidate scans may wait on I/O even though locked rows are skipped.
+        // Recheck every time-sensitive predicate against the database clock
+        // after owning the candidate row.
+        let now = archive_clock(&mut tx, self.backend).await?;
+        let state: String = row.try_get("state")?;
+        let claimable = row.try_get::<i64, _>("expires_at")? > now
+            && row.try_get::<i64, _>("attempts")? < 10
+            && match state.as_str() {
+                "pending" => row.try_get::<i64, _>("next_attempt_at")? <= now,
+                "uploading" => row
+                    .try_get::<Option<i64>, _>("lease_expires_at")?
+                    .is_some_and(|expiry| expiry <= now),
+                _ => false,
+            };
+        if !claimable {
+            tx.commit().await?;
+            return Ok(None);
+        }
         // Decide shutdown admission while owning the serialized transaction,
         // before spending an attempt. Once admitted, the worker owns one
         // bounded upload even if shutdown arrives during COMMIT. Do not offer
@@ -532,10 +602,10 @@ impl Database {
         task: &ArchiveSpoolTask,
     ) -> Result<bool, AppError> {
         let purpose = task.purpose;
-        let (mut tx, now) = self.spool_transaction().await?;
-        if !live_task(&mut tx, task, now).await? {
+        let mut tx = self.archive_state_transaction().await?;
+        let Some((_, now)) = locked_live_task(&mut tx, self.backend, task).await? else {
             return Ok(false);
-        }
+        };
         sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET lease_expires_at = $1, updated_at = $2 WHERE request_id = $3")))
             .bind(now + LEASE_TTL).bind(now).bind(task.identity.request_id.to_string()).execute(&mut *tx).await?;
         tx.commit().await?;
@@ -554,10 +624,10 @@ impl Database {
         {
             return Ok(false);
         }
-        let (mut tx, now) = self.spool_transaction().await?;
-        if !live_task(&mut tx, task, now).await? {
+        let mut tx = self.archive_state_transaction().await?;
+        let Some((_, now)) = locked_live_task(&mut tx, self.backend, task).await? else {
             return Ok(false);
-        }
+        };
         let changed = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE request_records SET response_object = $1 WHERE id = $2 AND tenant_id = $3 AND reservation_id = $4 AND completed_at IS NOT NULL AND response_object = $5")))
             .bind(locator).bind(task.identity.request_id.to_string()).bind(task.identity.tenant_id.to_string())
             .bind(task.identity.reservation_id.to_string()).bind(format!("gap://{}/{}", task.identity.request_id, purpose.as_str())).execute(&mut *tx).await?;
@@ -599,17 +669,17 @@ impl Database {
         reason: &str,
     ) -> Result<(), AppError> {
         let purpose = task.purpose;
-        let (mut tx, now) = self.spool_transaction().await?;
-        if !live_task(&mut tx, task, now).await? {
+        let mut tx = self.archive_state_transaction().await?;
+        let Some((row, now)) = locked_live_task(&mut tx, self.backend, task).await? else {
             return Ok(());
-        }
-        let row = spool_row(&mut tx, task.identity, purpose)
-            .await?
-            .ok_or(AppError::Internal)?;
+        };
         let attempts: i64 = row.try_get("attempts")?;
         let backoff = 5_000_i64 * (1_i64 << attempts.clamp(0, 10) as u32);
         let terminal = attempts >= 10;
-        sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET state = $1, next_attempt_at = $2, updated_at = $3, last_error_code = $4, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $5")))
+        // Terminal retry exhaustion has the same irreversible payload state
+        // as producer capture failure: retain audit facts, but let GC reclaim
+        // ciphertext through the existing expiry index immediately.
+        sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET state = $1, next_attempt_at = $2, updated_at = $3, expires_at = CASE WHEN $1 = 'gap' THEN $3 ELSE expires_at END, last_error_code = $4, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $5")))
             .bind(if attempts >= 10 { "gap" } else { "pending" }).bind(now + backoff).bind(now).bind(reason_code(reason)).bind(task.identity.request_id.to_string()).execute(&mut *tx).await?;
         if terminal {
             emit_response_archive_transition_event_in_transaction(
@@ -693,7 +763,10 @@ impl Database {
         &self,
         purpose: BufferedArchivePurpose,
     ) -> Result<Option<bool>, AppError> {
-        let mut tx = self.begin_write_transaction().await?;
+        // Use the producer lock order and the connection's bounded lock
+        // timeout. PostgreSQL's lock queue prevents sustained admissions from
+        // starving GC; each transaction still deletes at most 64 chunks/1 MiB.
+        let (mut tx, _) = self.spool_transaction().await?;
         let row = match self.backend {
             DatabaseBackend::PostgreSql => {
                 // Each indexed class contributes its oldest unlocked row, and
@@ -818,16 +891,7 @@ impl Database {
         sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET state = $1, cleaned_at = $2, cipher_bytes = cipher_bytes - $3, updated_at = $4, expires_at = CASE WHEN $5 = 1 THEN expires_at ELSE $4 END, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $6")))
             .bind(if bound { "bound" } else { "gap" }).bind(cleaned.then_some(now))
             .bind(released).bind(now).bind(i64::from(bound)).bind(&id).execute(&mut *tx).await?;
-        // GC locks a bounded candidate set first, then tries the global lock
-        // WITHOUT waiting. Producers use global -> spool order. NOWAIT is
-        // essential: if one is waiting for a candidate, abort GC and let that
-        // producer progress rather than creating a lock-order deadlock. The
-        // entire bounded deletion rolls back, so a later pass can safely resume.
-        if matches!(self.backend, DatabaseBackend::PostgreSql) {
-            let _: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1 FOR UPDATE NOWAIT")))
-                .fetch_one(&mut *tx).await?;
-        }
-        // The shared budget is held only for this decrement and commit.
+        // The shared budget and this bounded spool mutation commit atomically.
         sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes - $1 WHERE singleton = 1")))
             .bind(released).execute(&mut *tx).await?;
         if !matches!(previous_state.as_str(), "bound" | "gap") {
@@ -847,8 +911,9 @@ impl Database {
 
     pub(super) async fn spool_transaction(&self) -> Result<(Transaction<'_, Any>, i64), AppError> {
         let mut tx = self.begin_write_transaction().await?;
-        // First for normal mutations. GC uses spool -> budget NOWAIT, never
-        // waits on the reversed order, and rolls its bounded work back on busy.
+        // First for every accounting mutation, including GC. State-only
+        // transactions may lock a spool row but never wait for this row, so no
+        // transaction can hold a spool row while requesting the reverse order.
         let lock = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1 FOR UPDATE"
@@ -858,17 +923,31 @@ impl Database {
             }
         };
         let _: i64 = sqlx::query_scalar(lock).fetch_one(&mut *tx).await?;
-        let clock = match self.backend {
-            DatabaseBackend::PostgreSql => {
-                "SELECT CAST(FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000) AS BIGINT)"
-            }
-            DatabaseBackend::Sqlite => {
-                "SELECT CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)"
-            }
-        };
-        let now: i64 = sqlx::query_scalar(clock).fetch_one(&mut *tx).await?;
+        let now = archive_clock(&mut tx, self.backend).await?;
         Ok((tx, now))
     }
+
+    /// State and lease transitions do not change global archive accounting.
+    /// Lock only their spool row so slow claims, events, or WAL flushes cannot
+    /// block unrelated producer admissions behind the singleton budget row.
+    async fn archive_state_transaction(&self) -> Result<Transaction<'_, Any>, AppError> {
+        Ok(self.begin_write_transaction().await?)
+    }
+}
+
+async fn archive_clock(
+    tx: &mut Transaction<'_, Any>,
+    backend: DatabaseBackend,
+) -> Result<i64, AppError> {
+    let clock = match backend {
+        DatabaseBackend::PostgreSql => {
+            "SELECT CAST(FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000) AS BIGINT)"
+        }
+        DatabaseBackend::Sqlite => {
+            "SELECT CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)"
+        }
+    };
+    Ok(sqlx::query_scalar(clock).fetch_one(&mut **tx).await?)
 }
 
 /// Emit a sparse, locator-free convergence signal only after a real terminal
@@ -958,15 +1037,38 @@ async fn spool_row(
         .bind(id.request_id.to_string()).bind(id.tenant_id.to_string()).bind(id.reservation_id.to_string()).fetch_optional(&mut **tx).await?)
 }
 
-async fn live_task(
+async fn locked_spool_row(
     tx: &mut Transaction<'_, Any>,
-    task: &ArchiveSpoolTask,
-    now: i64,
-) -> Result<bool, AppError> {
-    let Some(row) = spool_row(tx, task.identity, task.purpose).await? else {
-        return Ok(false);
+    backend: DatabaseBackend,
+    id: ArchiveSpoolIdentity,
+    purpose: BufferedArchivePurpose,
+) -> Result<Option<AnyRow>, AppError> {
+    let select = match backend {
+        DatabaseBackend::PostgreSql => {
+            "SELECT * FROM response_archive_spools WHERE request_id = $1 AND tenant_id = $2 AND reservation_id = $3 FOR UPDATE"
+        }
+        DatabaseBackend::Sqlite => {
+            "SELECT * FROM response_archive_spools WHERE request_id = $1 AND tenant_id = $2 AND reservation_id = $3"
+        }
     };
-    Ok(row.try_get::<String, _>("state")? == "uploading"
+    Ok(sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, select)))
+        .bind(id.request_id.to_string())
+        .bind(id.tenant_id.to_string())
+        .bind(id.reservation_id.to_string())
+        .fetch_optional(&mut **tx)
+        .await?)
+}
+
+async fn locked_live_task(
+    tx: &mut Transaction<'_, Any>,
+    backend: DatabaseBackend,
+    task: &ArchiveSpoolTask,
+) -> Result<Option<(AnyRow, i64)>, AppError> {
+    let Some(row) = locked_spool_row(tx, backend, task.identity, task.purpose).await? else {
+        return Ok(None);
+    };
+    let now = archive_clock(tx, backend).await?;
+    let live = row.try_get::<String, _>("state")? == "uploading"
         && row.try_get::<Option<String>, _>("lease_owner")?.as_deref()
             == Some(task.lease_owner.to_string().as_str())
         && row.try_get::<Option<String>, _>("lease_token")?.as_deref()
@@ -976,7 +1078,8 @@ async fn live_task(
             .is_some_and(|expiry| expiry > now)
         && row.try_get::<i64, _>("expires_at")? > now
         && row.try_get::<i64, _>("chunk_count")? == task.chunk_count
-        && row.try_get::<i64, _>("byte_count")? == task.byte_count)
+        && row.try_get::<i64, _>("byte_count")? == task.byte_count;
+    Ok(live.then_some((row, now)))
 }
 
 fn identity_from_row(row: &AnyRow) -> Result<ArchiveSpoolIdentity, AppError> {

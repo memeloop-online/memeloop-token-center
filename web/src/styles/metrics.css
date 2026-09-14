@@ -1,9 +1,20 @@
 .metrics {
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr));
+  background: transparent;
+  border: 0;
+  gap: 12px;
+}
+
+/* Keep the grid itself transparent in the light theme so empty track space
+   does not read as an extra, unlabeled metric card. */
+:root[data-theme='light'] .metrics {
+  background: transparent;
+  border-color: transparent;
 }
 
 .metric {
   container-type: inline-size;
+  border: 1px solid #27373c;
   padding: clamp(1rem, 0.875rem + 0.45vw, 1.375rem);
 }
 
@@ -58,6 +69,18 @@
   letter-spacing: 0;
   line-height: 1.35;
   white-space: nowrap;
+}
+
+/* Dense analytics surfaces lead with the localized compact value while the
+   exact grouped value remains in the DOM for copy, accessibility, and tests. */
+.metric-number.has-compact {
+  align-items: baseline;
+}
+
+.metric-number.has-compact .metric-exact {
+  color: inherit;
+  font: inherit;
+  font-variant-numeric: inherit;
 }
 
 /* Operator monitoring and traffic summaries use the same metric primitive as

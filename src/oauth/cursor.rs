@@ -18,7 +18,7 @@ use crate::{
 };
 
 use super::{
-    bounded_body,
+    OAuthRefreshRequestGuard, bounded_body,
     endpoint::{
         oauth_adapter_endpoint_scope, validate_oauth_endpoint, validate_oauth_endpoint_with_scope,
     },
@@ -538,6 +538,7 @@ pub async fn refresh_cursor_credential(
     credential: &UpstreamCredential,
     now: i64,
     configured_scope: OutboundScope,
+    request_guard: &dyn OAuthRefreshRequestGuard,
 ) -> Result<UpstreamCredential, AppError> {
     let UpstreamCredential::OAuth {
         refresh_token: Some(refresh_token),
@@ -550,12 +551,16 @@ pub async fn refresh_cursor_credential(
     };
     let refresh_url =
         validate_oauth_endpoint_with_scope(refresh_url, "refresh_url", configured_scope)?;
-    let response = http
+    let request = http
         .post(refresh_url.as_str())
         .bearer_auth(refresh_token)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body("{}")
-        .send()
+        .build()
+        .map_err(|_| AppError::Upstream("Cursor OAuth refresh failed".into()))?;
+    request_guard.mark_request_started().await?;
+    let response = http
+        .execute(request)
         .await
         .map_err(|_| AppError::Upstream("Cursor OAuth refresh failed".into()))?;
     if !response.status().is_success() {

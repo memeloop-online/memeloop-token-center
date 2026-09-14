@@ -98,7 +98,7 @@ export function RequestsPage({ credential, credentialView, onError, onOpenReques
       <NumberMetric label={t('traffic.total')} value={stats.summary.total_requests} />
       <NumberMetric label={t('traffic.success')} value={stats.summary.successful_requests} tone="positive" />
       <NumberMetric label={t('traffic.failure')} value={stats.summary.failed_requests} tone="negative" />
-      <NumberMetric label={t('request.tokens')} value={stats.summary.input_tokens + stats.summary.output_tokens} showCompact={false} />
+      <NumberMetric label={t('request.tokens')} value={stats.summary.input_tokens + stats.summary.output_tokens} />
     </section>}
     {stats && stats.errors.length > 0 && <article className="panel self-request-errors"><h2>{t('traffic.errors')}</h2><Buckets values={stats.errors} onSelect={(bucket) => filterBy({ status: 'error', errorCode: bucket.name })} /></article>}
     <article className="panel self-history">
@@ -118,7 +118,7 @@ export function RequestsPage({ credential, credentialView, onError, onOpenReques
         <label><span>{t('traffic.maxCost')}</span><input inputMode="decimal" value={filters.maxCost} onChange={(event) => setFilters((current) => ({ ...current, maxCost: event.target.value }))} /></label>
         <div className="filter-actions"><button type="submit" disabled={loading}>{loading ? t('common.loading') : t('traffic.applyFilters')}</button><button type="button" className="secondary" onClick={clearFilters} disabled={loading}>{t('traffic.clearFilters')}</button></div>
       </form>
-      {loading && requests.length === 0 ? <div className="boot">{t('common.loading')}</div> : <RequestTable requests={requests} currency={credentialView.currency} onSelect={onOpenRequest} onOpenSession={onOpenSession} />}
+      {loading && requests.length === 0 ? <div className="boot">{t('common.loading')}</div> : <RequestTable requests={requests} currency={credentialView.currency} credentialAlias={credentialView.alias} onSelect={onOpenRequest} onOpenSession={onOpenSession} />}
       {hasOlder && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={() => void fetchPage(appliedFilters, true)}>{loading ? t('common.loading') : t('traffic.loadOlder')}</button></div>}
     </article>
   </div>;

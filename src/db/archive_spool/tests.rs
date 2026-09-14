@@ -610,6 +610,15 @@ async fn identity_sequence_replay_and_exact_quota() {
         tenant_id: Uuid::new_v4(),
         ..id
     };
+    sqlx::query(
+        "UPDATE request_records SET completed_at = 2, response_object = 'archive/already-bound' WHERE id = $1",
+    )
+    .bind(id.request_id.to_string())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert!(!db.begin_response_archive_spool(id).await.unwrap());
+    terminal(&db, id).await;
     assert!(!db.begin_response_archive_spool(alien).await.unwrap());
     assert!(db.begin_response_archive_spool(id).await.unwrap());
     assert!(db.begin_response_archive_spool(id).await.unwrap());
@@ -678,7 +687,7 @@ async fn identity_sequence_replay_and_exact_quota() {
 }
 
 #[tokio::test]
-async fn plaintext_budget_and_cleanup_release_exact_cipher_bytes() {
+async fn gap_cleanup_immediately_releases_exact_cipher_bytes_and_preserves_audit() {
     let (_dir, db, id) = fixture().await;
     assert!(db.begin_response_archive_spool(id).await.unwrap());
     assert!(
@@ -695,18 +704,20 @@ async fn plaintext_budget_and_cleanup_release_exact_cipher_bytes() {
     db.fail_response_archive_spool(id, "payload-bearing-untrusted-reason")
         .await
         .unwrap();
-    let reason: String = sqlx::query_scalar("SELECT last_error_code FROM response_archive_spools")
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
-    assert_eq!(reason, "internal");
-    assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 0);
-    sqlx::query("UPDATE response_archive_spools SET expires_at = 0")
-        .execute(&db.pool)
-        .await
-        .unwrap();
+    let row = sqlx::query(
+        "SELECT state, last_error_code, updated_at, expires_at FROM response_archive_spools",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("state"), "gap");
+    assert_eq!(row.get::<String, _>("last_error_code"), "internal");
+    assert_eq!(
+        row.get::<i64, _>("expires_at"),
+        row.get::<i64, _>("updated_at")
+    );
     assert_eq!(db.cleanup_response_archive_spools(0).await.unwrap(), 0);
-    assert_eq!(db.cleanup_response_archive_spools(100).await.unwrap(), 1);
+    assert_eq!(db.cleanup_response_archive_spools(1).await.unwrap(), 1);
     assert_eq!(budget(&db).await, 0);
     assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 0);
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records")
@@ -715,6 +726,53 @@ async fn plaintext_budget_and_cleanup_release_exact_cipher_bytes() {
         .unwrap();
     assert_eq!(rows, 1);
     let audit: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spools WHERE state = 'gap' AND cleaned_at IS NOT NULL AND byte_count = $1").bind(PLAIN_LIMIT).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(audit, 1);
+}
+
+#[tokio::test]
+async fn exhausted_upload_gap_is_immediately_cleanup_eligible() {
+    let (_dir, db, id) = fixture().await;
+    assert!(db.begin_response_archive_spool(id).await.unwrap());
+    assert!(
+        db.append_response_archive_spool(id, 0, 1, "ciphertext")
+            .await
+            .unwrap()
+    );
+    assert!(db.seal_response_archive_spool(id, 1, 1).await.unwrap());
+    terminal(&db, id).await;
+    let task = db
+        .claim_response_archive_spool(Uuid::new_v4())
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE response_archive_spools SET attempts = 10")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    db.retry_response_archive_spool(&task, "upload_failed")
+        .await
+        .unwrap();
+    let row = sqlx::query(
+        "SELECT state, last_error_code, updated_at, expires_at FROM response_archive_spools",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("state"), "gap");
+    assert_eq!(row.get::<String, _>("last_error_code"), "upload_failed");
+    assert_eq!(
+        row.get::<i64, _>("expires_at"),
+        row.get::<i64, _>("updated_at")
+    );
+    assert_eq!(db.cleanup_response_archive_spools(1).await.unwrap(), 1);
+    assert_eq!(budget(&db).await, 0);
+    let audit: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM response_archive_spools WHERE state = 'gap' AND cleaned_at IS NOT NULL AND last_error_code = 'upload_failed'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
     assert_eq!(audit, 1);
 }
 

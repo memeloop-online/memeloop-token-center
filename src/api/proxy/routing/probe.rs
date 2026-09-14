@@ -208,7 +208,7 @@ impl UpstreamAttemptGuard {
                                     tracing::warn!(
                                         %request_id,
                                         %upstream_account_id,
-                                        error = %error,
+                                        error_category = error.diagnostic_category(),
                                         "failed to renew upstream probe lease"
                                     );
                                     break;
@@ -382,7 +382,7 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                 Err(error) => tracing::warn!(
                     %request_id,
                     %upstream_account_id,
-                    error = %error,
+                    error_category = error.diagnostic_category(),
                     "failed to clear upstream account cooldown after a valid probe"
                 ),
             }
@@ -402,7 +402,7 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                 tracing::warn!(
                     %request_id,
                     %upstream_account_id,
-                    error = %error,
+                    error_category = error.diagnostic_category(),
                     "failed to release inconclusive upstream probe"
                 );
             }
@@ -455,7 +455,7 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                 Err(error) => tracing::warn!(
                     %request_id,
                     %upstream_account_id,
-                    error = %error,
+                    error_category = error.diagnostic_category(),
                     "failed to persist unsuccessful upstream attempt"
                 ),
             }

@@ -263,12 +263,11 @@ paths:
     put:
       tags: [Client credentials]
       operationId: storeClientCredentialRecovery
-      summary: Store an already-active client credential for future authorized copying
+      summary: Store an already-active client credential for direct authorized copying
       description: |
-        Verifies the supplied credential against the active stable key and stores only a
-        key- and generation-bound encrypted envelope. It does not rotate, replace, or
-        otherwise change the credential. This supports an authorized importer that still
-        has source access; existing credentials without an envelope cannot be reconstructed.
+        Verifies the supplied credential against the active stable key and stores its original
+        value for direct copying. It does not rotate, replace, or otherwise change the
+        credential. Existing hash-only credentials cannot be reconstructed.
       security: [{ serviceBearer: [] }]
       x-required-scope: keys:write
       parameters: [{ $ref: '#/components/parameters/KeyId' }]
@@ -278,7 +277,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/StoreClientCredentialRecoveryRequest' }
       responses:
-        '204': { description: Encrypted recovery envelope stored; no secret is returned. }
+        '204': { description: Original credential stored; no secret is returned. }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -293,13 +292,9 @@ paths:
         Returns plaintext only for an explicit, authorized copy action and only while the
         matching key generation remains active. Credential lists and self-service APIs never
         contain the secret. This operation never rotates or replaces the credential; repeated
-        authorized calls return the same current-generation credential while its envelope
-        remains available and rate limits permit. A key created before recovery envelopes were
-        enabled returns 404 and is explicitly unrecoverable through this endpoint unless an
-        authorized importer still has the source credential and stores its envelope. Retrieval
-        attempts are durably audited without credential material and limited in a short window
-        by target tenant, authenticated actor, and key; the actor also has a tenant-wide cap to
-        prevent bulk plaintext recovery across keys.
+        authorized calls return the same current-generation credential. A hash-only historical
+        key returns 404 unless an authorized importer still has and stores its original value.
+        Legacy encrypted values are verified against the active generation before copying.
       security: [{ serviceBearer: [] }]
       x-required-scope: keys:write
       parameters: [{ $ref: '#/components/parameters/KeyId' }]
@@ -314,11 +309,6 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
-        '429':
-          description: The authenticated actor exceeded a credential-recovery access limit.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/ErrorResponse' }
 
   /internal/v1/keys/{key_id}/alias:
     patch:
@@ -558,6 +548,30 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/IssuedServiceCredential' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/service-tokens/{service_id}/copy:
+    post:
+      tags: [Service credentials]
+      operationId: copyServiceCredential
+      summary: Copy a durable active service credential
+      description: |
+        Global service-token management only. Returns the current original credential through
+        an explicit no-store copy action without rotating it. Hash-only historical tokens
+        return 404 and are never replaced or fabricated.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: service_tokens:write
+      parameters: [{ $ref: '#/components/parameters/ServiceId' }]
+      responses:
+        '200':
+          description: The active service credential for immediate copying.
+          headers:
+            Cache-Control: { schema: { const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecoveredServiceCredential' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -828,6 +842,105 @@ paths:
                 items: { $ref: '#/components/schemas/PluginManifest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/plugin-runtime/candidates:
+    post:
+      tags: [System]
+      operationId: stageApplicationPluginInventory
+      summary: Validate a preinstalled application plugin inventory (experimental)
+      description: Requires experimental-plugin-revisions and explicit host-only inventory opt-in, neither enabled in production. Global operators only; no URL, path, Wasm, grant, or tenant override is accepted. Only already-approved unchanged contracts can be staged.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:write
+      x-global-operator-only: true
+      x-experimental-feature: experimental-plugin-revisions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [inventory_id]
+              properties:
+                inventory_id: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
+      responses:
+        '204': { description: Verified immutable inventory identity staged. }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /internal/v1/plugin-runtime/publish:
+    post:
+      tags: [System]
+      operationId: publishApplicationPluginInventory
+      summary: Publish a global application snapshot using revision CAS (experimental)
+      description: Requires experimental-plugin-revisions and explicit host-only inventory opt-in, neither enabled in production. Validates a preinstalled inventory and atomically publishes expected_revision plus one. Zero bootstraps an absent head. Exact idempotency replay returns its original receipt, not the latest head. Global operators only; unknown fields and remote installation inputs are rejected.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:write
+      x-global-operator-only: true
+      x-experimental-feature: experimental-plugin-revisions
+      parameters: [{ $ref: '#/components/parameters/RequiredIdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [inventory_id, expected_revision]
+              properties:
+                inventory_id: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
+                expected_revision: { type: integer, format: int64, minimum: 0 }
+      responses:
+        '200':
+          description: Original publication receipt, including exact replay.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApplicationPluginRevision' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /internal/v1/plugin-runtime/rollback:
+    post:
+      tags: [System]
+      operationId: rollbackApplicationPluginInventory
+      summary: Publish an earlier inventory as a new monotonic revision (experimental)
+      description: Requires experimental-plugin-revisions and explicit host-only inventory opt-in, neither enabled in production. Global operators only. Target must be earlier than expected_revision and locally available with the original approved identity. Rollback publishes expected_revision plus one and never rewinds head.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:write
+      x-global-operator-only: true
+      x-experimental-feature: experimental-plugin-revisions
+      parameters: [{ $ref: '#/components/parameters/RequiredIdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [target_revision, expected_revision]
+              properties:
+                target_revision: { type: integer, format: int64, minimum: 1 }
+                expected_revision: { type: integer, format: int64, minimum: 2 }
+      responses:
+        '200':
+          description: Original rollback receipt with a strictly new revision.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApplicationPluginRevision' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /internal/v1/plugins/{plugin_id}/configuration:
     parameters:
@@ -1162,7 +1275,8 @@ paths:
       x-required-scope: providers:read
       description: |
         Requires an explicit authorized tenant. Performs only bounded native
-        Codex usage and reset-credit GETs with server-held encrypted credentials.
+        Codex/Kimi usage GETs and the Codex reset-credit GET with server-held
+        encrypted credentials.
         Never consumes a reset credit or exposes supplier bodies or secrets.
         Snapshots are cached for 30 seconds with bounded singleflight/concurrency;
         stale observations may be retained for five minutes after a read error.
@@ -1185,7 +1299,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [contract_version, upstream_account_id, tenant_external_id, provider, status, observed_at, stale_after, stale, plan_type, windows, credits, reset_capability, error_code]
+                required: [contract_version, upstream_account_id, tenant_external_id, provider, status, observed_at, stale_after, stale, freshness, plan_type, workspace, capabilities, subscription_active_until, reset_credits, windows, credits, reset_capability, error_code]
                 properties:
                   contract_version: { const: upstream_quota_v1 }
                   upstream_account_id: { type: string, format: uuid }
@@ -1195,18 +1309,48 @@ paths:
                   observed_at: { type: [integer, 'null'], format: int64, description: Unix epoch milliseconds of supplier observation. }
                   stale_after: { type: [integer, 'null'], format: int64, description: Unix epoch milliseconds freshness deadline. }
                   stale: { type: boolean }
+                  freshness: { type: string, enum: [unobserved, fresh, stale] }
                   plan_type: { type: [string, 'null'] }
+                  workspace: { type: [string, 'null'], description: Verified supplier workspace label; null when the native adapter has no source contract. }
+                  subscription_active_until: { type: [integer, 'null'], format: int64, description: Verified subscription expiry, never OAuth access-token expiry. }
+                  capabilities:
+                    type: object
+                    required: [read, plan, workspace, window_amounts, window_amount_unit, window_percent, reset_credit_expiry, subscription_expiry, supplier_read_only, refreshes_credentials, consumes_reset_credit]
+                    properties:
+                      read: { type: boolean }
+                      plan: { type: boolean }
+                      workspace: { type: boolean }
+                      window_amounts: { type: boolean }
+                      window_amount_unit: { type: boolean }
+                      window_percent: { type: boolean }
+                      reset_credit_expiry: { type: boolean }
+                      subscription_expiry: { type: boolean }
+                      supplier_read_only: { type: boolean, description: The quota inspection itself does not mutate the supplier. }
+                      refreshes_credentials: { type: boolean }
+                      consumes_reset_credit: { type: boolean }
+                  reset_credits:
+                    type: array
+                    maxItems: 1024
+                    items:
+                      type: object
+                      required: [status, granted_at, expires_at, source]
+                      properties:
+                        status: { type: [string, 'null'] }
+                        granted_at: { type: [integer, 'null'], format: int64 }
+                        expires_at: { type: [integer, 'null'], format: int64 }
+                        source: { type: string, enum: [codex_reset_credits] }
                   error_code: { type: [string, 'null'], description: Sanitized product error code; never upstream text. }
                   credits:
                     type: object
-                    required: [balance, unlimited, has_credits]
+                    required: [balance, unlimited, has_credits, source]
                     properties:
                       balance: { type: [string, 'null'], description: Supplier decimal balance, not customer key balance. }
                       unlimited: { type: [boolean, 'null'] }
                       has_credits: { type: [boolean, 'null'] }
+                      source: { type: [string, 'null'], enum: [codex_usage, null] }
                   reset_capability:
                     type: object
-                    required: [provider_supported, implementation_available, prepare_available, confirmation_required, retryable, available_credits, applicable_credits, reason, credit_error_code]
+                    required: [provider_supported, implementation_available, prepare_available, confirmation_required, retryable, available_credits, applicable_credits, reason, credit_error_code, evidence]
                     properties:
                       provider_supported: { type: [boolean, 'null'] }
                       implementation_available: { type: boolean }
@@ -1217,18 +1361,21 @@ paths:
                       applicable_credits: { type: [integer, 'null'], format: int64 }
                       reason: { type: string }
                       credit_error_code: { type: [string, 'null'] }
+                      evidence: { type: string, enum: [server_driver_contract, unknown_provider], description: Server-held driver capability; dispatch still requires fresh credit evidence. }
                   windows:
                     type: array
                     maxItems: 68
                     items:
                       type: object
-                      required: [id, label, used_percent, remaining, limit, reset_at, period_seconds, source, reset_is_estimated, allowed, limit_reached]
+                      required: [id, label, used_percent, used, remaining, limit, unit, reset_at, period_seconds, source, reset_is_estimated, allowed, limit_reached]
                       properties:
                         id: { type: string }
                         label: { type: string }
                         used_percent: { type: [number, 'null'] }
+                        used: { type: [number, 'null'] }
                         remaining: { type: [number, 'null'] }
                         limit: { type: [number, 'null'] }
+                        unit: { type: [string, 'null'], description: Supplier-declared unit; null when amounts are unitless or the contract is unknown. }
                         reset_at: { type: [integer, 'null'], format: int64, description: Unix epoch milliseconds. }
                         period_seconds: { type: [integer, 'null'], format: int64 }
                         source: { type: string }
@@ -2179,6 +2326,67 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
 
+  /internal/v1/model-routes/{route_id}/archive:
+    post:
+      tags: [Routes and pricing]
+      operationId: archiveModelRoute
+      summary: Archive a disabled route while retaining request history
+      description: Removes live grants and memberships and hides the route from management and selection. Archived routes cannot be edited or reactivated. Repeating an archive is idempotent.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:write
+      parameters: [{ $ref: '#/components/parameters/RouteId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [tenant_external_id, expected_updated_at]
+              properties:
+                tenant_external_id: { type: string }
+                expected_updated_at: { type: integer, format: int64 }
+      responses:
+        '204': { description: Route archived or already archived. }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/archived-model-routes/{route_id}:
+    get:
+      tags: [Routes and pricing]
+      operationId: getArchivedModelRoute
+      summary: Look up a retained route identity for historical audit
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:read
+      parameters:
+        - $ref: '#/components/parameters/RouteId'
+        - $ref: '#/components/parameters/RequiredTenant'
+      responses:
+        '200':
+          description: Archived identity; no active configuration edges or credentials.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, tenant_external_id, public_model, upstream_model, protocol, priority, enabled, created_at, archived_at]
+                properties:
+                  id: { type: string, format: uuid }
+                  tenant_external_id: { type: string }
+                  public_model: { type: string }
+                  upstream_model: { type: string }
+                  protocol: { type: string }
+                  priority: { type: integer, format: int64 }
+                  enabled: { type: boolean, const: false }
+                  created_at: { type: integer, format: int64 }
+                  archived_at: { type: integer, format: int64 }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /internal/v1/model-routes/{route_id}/retire-upstreams:
     post:
       tags: [Routing]
@@ -2829,6 +3037,48 @@ paths:
                 type: array
                 maxItems: 500
                 items: { $ref: '#/components/schemas/LedgerEntry' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/accounts/{account_id}/settlements:
+    get:
+      tags: [Credits]
+      operationId: listAccountSettlements
+      summary: List immutable account usage settlements
+      description: |
+        Requires both `credits:read` and `requests:read`. Results are ordered by the
+        immutable account-local `(settlement_sequence, settlement_id)` ascending key.
+        Use the final row's `settlement_sequence` and `settlement_id` as the paired,
+        exclusive `after_sequence` and `after_id` cursor. The paired `request_kind`
+        and `request_id` select one settlement and cannot be combined with either
+        cursor parameter. Every
+        page remains bound to the path account, and a tenant-scoped service credential
+        may inspect only an account in its own tenant. The cursor pair must identify
+        an existing settlement in that account. Unknown query parameters are rejected.
+        Covers prepaid terminal snapshots published after migration 86; historical
+        records are not bulk-backfilled and metered-unlimited usage is excluded.
+        An empty exact lookup is not evidence of zero cost. Polling consumers retain
+        the final item's cursor even when next_cursor is null.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: credits:read
+      x-required-scopes: [credits:read, requests:read]
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/SettlementListLimit500'
+        - $ref: '#/components/parameters/AfterSettlementSequence'
+        - $ref: '#/components/parameters/AfterSettlementId'
+        - $ref: '#/components/parameters/SettlementRequestKind'
+        - $ref: '#/components/parameters/SettlementRequestId'
+      responses:
+        '200':
+          description: Immutable account settlements in ascending sequence order.
+          headers:
+            Cache-Control: { schema: { const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountSettlementPage' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -3737,6 +3987,60 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
+  /internal/v1/usage-analysis/trends:
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorUsageAnalysisTrends
+      summary: Read the bounded summary and time-series usage projection
+      description: |
+        Uses the same tenant scope, filters, inclusive range, bucket selection, and metric
+        aggregation as the complete usage-analysis resource. The response is restricted to
+        summary and time-series data and executes one business aggregation statement; it does
+        not load dimension, session, generation-breakdown, or heatmap projections.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/FromCreatedAt'
+        - $ref: '#/components/parameters/ToCreatedAt'
+        - name: granularity
+          in: query
+          required: false
+          schema: { type: string, enum: [auto, hour, day], default: auto }
+        - $ref: '#/components/parameters/KeyFilter'
+        - $ref: '#/components/parameters/ModelFilter'
+        - name: protocol
+          in: query
+          required: false
+          description: Exact canonical protocol family.
+          schema: { type: string, enum: [openai, anthropic, openai-image, generation] }
+        - name: status
+          in: query
+          required: false
+          description: Terminal logical status; pending traffic is intentionally absent from usage rollups.
+          schema: { type: string, enum: [success, error] }
+        - $ref: '#/components/parameters/ErrorCodeFilter'
+        - name: upstream_account_id
+          in: query
+          required: false
+          description: One stable upstream UUID, or `unassigned` for terminal activity recorded without an upstream.
+          schema:
+            oneOf:
+              - { type: string, format: uuid }
+              - { type: string, const: unassigned }
+        - $ref: '#/components/parameters/RouteFilter'
+        - $ref: '#/components/parameters/KeyAliasFilter'
+        - $ref: '#/components/parameters/PrincipalFilter'
+      responses:
+        '200':
+          description: Currency-safe summary and UTC time buckets.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UsageAnalysisTrends' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
   /internal/v1/request-events:
     get:
       tags: [Operator traffic]
@@ -4620,6 +4924,30 @@ components:
       required: false
       description: Stable row UUID from the last row of the prior page. Use together with `before_created_at`; the concrete response documents whether this is a key, ledger-entry, request, or generation ID.
       schema: { type: string, format: uuid }
+    AfterSettlementSequence:
+      name: after_sequence
+      in: query
+      required: false
+      description: Immutable account-local sequence from the final row of the prior page. Use together with `after_id` as an exclusive ascending keyset cursor.
+      schema: { type: integer, format: int64, minimum: 1 }
+    AfterSettlementId:
+      name: after_id
+      in: query
+      required: false
+      description: Settlement UUID from the final row of the prior page. Use together with `after_sequence` as an exclusive ascending keyset cursor.
+      schema: { type: string, format: uuid }
+    SettlementRequestId:
+      name: request_id
+      in: query
+      required: false
+      description: Request or generation UUID for an exact settlement lookup. Must be paired with `request_kind`; the pair cannot be combined with `after_sequence` or `after_id`.
+      schema: { type: string, format: uuid }
+    SettlementRequestKind:
+      name: request_kind
+      in: query
+      required: false
+      description: Request type for an exact settlement lookup. Must be paired with `request_id`; the pair cannot be combined with `after_sequence` or `after_id`.
+      schema: { $ref: '#/components/schemas/AccountSettlementKind' }
     RequestPageEnvelope:
       name: paged
       in: query
@@ -4751,6 +5079,12 @@ components:
       in: query
       required: false
       schema: { type: integer, format: int64, minimum: 1, maximum: 500, default: 50 }
+    SettlementListLimit500:
+      name: limit
+      in: query
+      required: false
+      description: Maximum immutable account settlements returned in this page.
+      schema: { type: integer, format: int64, minimum: 1, maximum: 500, default: 100 }
     CredentialListLimit500:
       name: limit
       in: query
@@ -4948,6 +5282,14 @@ components:
           schema: { type: object, additionalProperties: true }
 
   schemas:
+    ApplicationPluginRevision:
+      type: object
+      additionalProperties: false
+      required: [revision, inventory_id, reason]
+      properties:
+        revision: { type: integer, format: int64, minimum: 1 }
+        inventory_id: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
+        reason: { type: string, enum: [initial, reload, rollback] }
     UpstreamQuotaResetOperation:
       type: object
       required: [id, upstream_account_id, state, credential_generation, available_credits, applicable_credits, observed_at, expires_at, prepared_by_service_id, confirmed_by_service_id, confirmed_at, created_at, updated_at, last_reconciled_at, reconciled_available_credits, reconciled_applicable_credits, error_code, audit, effect, consumes_credits]
@@ -5308,19 +5650,28 @@ components:
     ServiceCredential:
       type: object
       additionalProperties: false
-      required: [service_id, name, status, credential_generation, fingerprint, scopes, tenant_external_id, created_at, updated_at]
+      required: [service_id, name, status, credential_generation, fingerprint, credential_copy_available, scopes, tenant_external_id, created_at, updated_at]
       properties:
         service_id: { type: string, format: uuid }
         name: { type: string }
         status: { $ref: '#/components/schemas/CredentialStatus' }
         credential_generation: { type: integer, format: int64 }
         fingerprint: { type: string }
+        credential_copy_available: { type: boolean, description: Whether the current active credential has an original value available for copying. }
         scopes:
           type: array
           items: { $ref: '#/components/schemas/ServiceScope' }
         tenant_external_id: { type: [string, 'null'] }
         created_at: { type: integer, format: int64 }
         updated_at: { type: integer, format: int64 }
+    RecoveredServiceCredential:
+      type: object
+      additionalProperties: false
+      required: [service_id, credential_generation, token]
+      properties:
+        service_id: { type: string, format: uuid }
+        credential_generation: { type: integer, format: int64, minimum: 1 }
+        token: { type: string, writeOnly: true, description: Active service credential returned only by an explicit no-store copy action. }
     JsonSchema:
       oneOf:
         - type: object
@@ -6637,6 +6988,49 @@ components:
         source: { type: string }
         idempotency_key: { type: [string, 'null'] }
         created_at: { type: integer, format: int64 }
+    AccountSettlementKind:
+      type: string
+      enum: [text, generation]
+    AccountSettlement:
+      type: object
+      additionalProperties: false
+      required: [settlement_id, settlement_sequence, request_id, kind, account_id, key_id, model, cost, currency, settled_at, completed_at, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens]
+      properties:
+        settlement_id: { type: string, format: uuid }
+        settlement_sequence: { type: integer, format: int64 }
+        request_id: { type: string, format: uuid }
+        kind: { $ref: '#/components/schemas/AccountSettlementKind' }
+        account_id: { type: string, format: uuid }
+        key_id: { type: string, format: uuid }
+        model: { type: string }
+        cost: { $ref: '#/components/schemas/NonNegativeMoney' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        settled_at: { type: integer, format: int64 }
+        completed_at: { type: integer, format: int64 }
+        input_tokens: { type: [integer, 'null'], format: int64 }
+        cached_input_tokens: { type: [integer, 'null'], format: int64 }
+        cache_write_tokens: { type: [integer, 'null'], format: int64 }
+        output_tokens: { type: [integer, 'null'], format: int64 }
+    AccountSettlementCursor:
+      type: object
+      additionalProperties: false
+      required: [after_sequence, after_id]
+      properties:
+        after_sequence: { type: integer, format: int64 }
+        after_id: { type: string, format: uuid }
+    AccountSettlementPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          maxItems: 500
+          items: { $ref: '#/components/schemas/AccountSettlement' }
+        next_cursor:
+          oneOf:
+            - $ref: '#/components/schemas/AccountSettlementCursor'
+            - type: 'null'
     EntitlementIdentity:
       type: string
       minLength: 1
@@ -7547,6 +7941,21 @@ components:
             sentinel. Missing coordinates mean zero activity and are filled by
             the client.
           items: { $ref: '#/components/schemas/UsageAnalysisHeatmapBucket' }
+    UsageAnalysisTrends:
+      type: object
+      additionalProperties: false
+      required: [from_created_at, to_created_at, granularity, time_zone, p95_is_approximate, p95_method, summary, time_series]
+      properties:
+        from_created_at: { type: integer, format: int64, minimum: 0 }
+        to_created_at: { type: integer, format: int64, minimum: 0 }
+        granularity: { type: string, enum: [hour, day] }
+        time_zone: { type: string, const: UTC }
+        p95_is_approximate: { type: boolean, const: true }
+        p95_method: { type: string, const: fixed_histogram_upper_bound_capped_60000ms }
+        summary: { $ref: '#/components/schemas/UsageAnalysisMetrics' }
+        time_series:
+          type: array
+          items: { $ref: '#/components/schemas/UsageAnalysisTimeBucket' }
     SelfUsageAnalysis:
       type: object
       additionalProperties: false
