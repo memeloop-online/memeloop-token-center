@@ -427,6 +427,7 @@ pub struct AccountSettlementView {
     pub cached_input_tokens: Option<i64>,
     pub cache_write_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
+    pub usage_basis: Option<RequestUsageBasis>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -478,6 +479,7 @@ pub struct EntitlementReconcileResult {
 
 #[derive(Clone, Debug)]
 pub struct RequestView {
+    pub usage_basis: Option<RequestUsageBasis>,
     /// Only an explicitly persisted context-compaction marker is true.
     /// Absence (including legacy false/default observations) remains unknown.
     pub compaction: Option<bool>,
@@ -547,7 +549,8 @@ impl Serialize for RequestView {
         use serde::ser::SerializeStruct;
 
         let tokens = self.usage.tokens.as_ref();
-        let mut state = serializer.serialize_struct("RequestView", 26)?;
+        let mut state = serializer.serialize_struct("RequestView", 27)?;
+        state.serialize_field("usage_basis", &self.usage_basis)?;
         state.serialize_field("compaction", &self.compaction.filter(|value| *value))?;
         state.serialize_field("request_id", &self.request_id)?;
         state.serialize_field("created_at", &self.created_at)?;
@@ -644,6 +647,37 @@ pub struct RequestUsageView {
     pub generation: Option<RequestGenerationUsageView>,
 }
 
+/// Provenance of recorded text-token quantities, not proof of a provider bill.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestUsageBasis {
+    ProviderReported,
+    ProviderEstimated,
+    ContractCeiling,
+    NotObserved,
+}
+
+impl RequestUsageBasis {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderReported => "provider_reported",
+            Self::ProviderEstimated => "provider_estimated",
+            Self::ContractCeiling => "contract_ceiling",
+            Self::NotObserved => "not_observed",
+        }
+    }
+
+    pub(crate) fn from_storage(value: &str) -> Option<Self> {
+        match value {
+            "provider_reported" => Some(Self::ProviderReported),
+            "provider_estimated" => Some(Self::ProviderEstimated),
+            "contract_ceiling" => Some(Self::ContractCeiling),
+            "not_observed" => Some(Self::NotObserved),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct RequestBillingView {
     pub billable: bool,
@@ -713,6 +747,7 @@ impl RequestSessionContext {
 
 #[derive(Clone, Debug)]
 pub struct RequestEventView {
+    pub usage_basis: Option<RequestUsageBasis>,
     pub compaction: Option<bool>,
     pub first_output_ms: Option<i64>,
     pub generation_duration_ms: Option<i64>,
@@ -754,7 +789,8 @@ impl Serialize for RequestEventView {
         use serde::ser::SerializeStruct;
 
         let tokens = self.usage.tokens.as_ref();
-        let mut state = serializer.serialize_struct("RequestEventView", 30)?;
+        let mut state = serializer.serialize_struct("RequestEventView", 31)?;
+        state.serialize_field("usage_basis", &self.usage_basis)?;
         state.serialize_field("compaction", &self.compaction.filter(|value| *value))?;
         state.serialize_field("event_id", &self.event_id)?;
         state.serialize_field("request_id", &self.request_id)?;
