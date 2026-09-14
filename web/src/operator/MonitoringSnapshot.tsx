@@ -1,5 +1,5 @@
 import { Metric, NumberMetric } from '../components';
-import { formatCurrency, formatElapsedTime, formatMilliseconds, formatNumber, formatPercent } from '../format';
+import { formatCurrency, formatElapsedTime, formatMetricDisplay, formatMilliseconds, formatPercent } from '../format';
 import { useI18n } from '../i18n';
 import type { MonitoringHealth, OperatorMonitoringSnapshot, UsageAnalysisCost } from '../types';
 import { monitoringModelGroups } from './monitoringAccountGroups';
@@ -38,7 +38,7 @@ function MonitoringMetricList({ metrics }: { metrics: OperatorMonitoringSnapshot
   const terminal = metrics.successful_requests + metrics.failed_requests;
   const successRate = terminal > 0 ? metrics.successful_requests / terminal : null;
   return <dl className="monitoring-metric-list">
-    <div><dt>{t('usage.requests')}</dt><dd>{formatNumber(metrics.requests, locale)}</dd></div>
+    <div><dt>{t('usage.requests')}</dt><dd title={formatMetricDisplay(metrics.requests, locale).title}>{formatMetricDisplay(metrics.requests, locale).text}</dd></div>
     <div><dt>{t('usage.successRate')}</dt><dd>{formatPercent(successRate, locale)}</dd></div>
     <div><dt>{t('usage.average')}</dt><dd>{formatMilliseconds(metrics.avg_duration_ms, locale)}</dd></div>
     <div><dt>{t('usage.p95Approx')}</dt><dd>{formatMilliseconds(metrics.p95_duration_ms, locale)}</dd></div>

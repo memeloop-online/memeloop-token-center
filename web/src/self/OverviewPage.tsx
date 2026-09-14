@@ -65,7 +65,7 @@ export function OverviewPage({ credential, credentialView, onError, onOpenReques
       <NumberMetric label={t('traffic.total')} value={summary?.total_requests} />
       <Metric label={t('usage.successRate')} value={formatPercent(successRate, locale)} tone="positive" />
       <NumberMetric label={t('traffic.failure')} value={summary?.failed_requests} tone="negative" />
-      <NumberMetric label={t('request.tokens')} value={summary ? summary.input_tokens + summary.output_tokens : undefined} showCompact={false} />
+      <NumberMetric label={t('request.tokens')} value={summary ? summary.input_tokens + summary.output_tokens : undefined} />
       <Metric label={t('traffic.cost')} value={formatCurrency(summary?.total_cost, currentKey.currency, locale)} />
     </section>
     <article className="panel key-summary self-account-summary">

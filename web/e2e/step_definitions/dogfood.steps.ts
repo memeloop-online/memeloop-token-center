@@ -428,9 +428,13 @@ Then('中文指标显示万、亿、万亿、USD 与 CNY 并保留精确值', as
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(localizationUsageFixture()) });
   });
   await page.getByRole('button', { name: '刷新', exact: true }).click();
-  await assertExactText(metric(page, '请求数'), '111,227');
-  await assertExactText(metric(page, '总 Token'), '1,000,100,111,227');
-  await assertExactText(metric(page, '生成计费单位'), '12,345');
+  const exactMetric = (label: string) => metric(page, label).locator('.metric-exact');
+  await assertExactText(metric(page, '请求数'), '11.12万');
+  await assertAttribute(exactMetric('请求数'), 'title', '111,227');
+  await assertExactText(metric(page, '总 Token'), '1万亿');
+  await assertAttribute(exactMetric('总 Token'), 'title', '1,000,100,111,227');
+  await assertExactText(metric(page, '生成计费单位'), '1.23万');
+  await assertAttribute(exactMetric('生成计费单位'), 'title', '12,345');
   await assertExactText(metric(page, '缓存 Token'), '0');
   const costs = page.locator('.usage-cost-lines');
   await assertContains(costs, '¥2.5');
@@ -440,7 +444,7 @@ Then('中文指标显示万、亿、万亿、USD 与 CNY 并保留精确值', as
   await assertCount(page.locator('.usage-chart-card .usage-echart canvas'), 3);
   const trendTable = page.locator('.usage-chart-card').first().locator('.usage-chart-table');
   await trendTable.locator('summary').click();
-  await assertContains(trendTable, '1,000,100,111,227');
+  await assertContains(trendTable, '1万亿');
   await assertContains(trendTable, '18.5 ms');
   await assertContains(trendTable, '25 ms');
   await assertContains(trendTable, '¥2.5');
@@ -456,13 +460,15 @@ When('管理员将请求统计切换为英文', async function (this: DogfoodWor
   await page.getByRole('tab', { name: 'Overview', exact: true }).click();
 });
 
-Then('英文大数使用完整千分位而非 K 或 M 且亮暗主题均可切换', async function (this: DogfoodWorld) {
+Then('英文大数使用紧凑 K、M、B 或 T 且 tooltip 保留精确值并可切换亮暗主题', async function (this: DogfoodWorld) {
   const page = this.requirePage();
-  await assertExactText(metric(page, 'Requests'), '111,227');
-  await assertNotContains(metric(page, 'Requests'), 'K');
-  await assertNotContains(metric(page, 'Requests'), 'M');
-  await assertExactText(metric(page, 'Total tokens'), '1,000,100,111,227');
-  await assertExactText(metric(page, 'Generation billing units'), '12,345');
+  const exactMetric = (label: string) => metric(page, label).locator('.metric-exact');
+  await assertExactText(metric(page, 'Requests'), '111.23K');
+  await assertAttribute(exactMetric('Requests'), 'title', '111,227');
+  await assertExactText(metric(page, 'Total tokens'), '1T');
+  await assertAttribute(exactMetric('Total tokens'), 'title', '1,000,100,111,227');
+  await assertExactText(metric(page, 'Generation billing units'), '12.35K');
+  await assertAttribute(exactMetric('Generation billing units'), 'title', '12,345');
   await assertExactText(metric(page, 'Cached tokens'), '0');
   await assertAttribute(page.locator('html'), 'data-theme', 'dark');
   await appPreferenceControls(page).getByRole('button', { name: 'Switch to light theme' }).click();
