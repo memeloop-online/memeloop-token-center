@@ -71,13 +71,9 @@ fn usage(value: &Value) -> Result<Value, &'static str> {
     let output = value["completion_tokens"]
         .as_u64()
         .ok_or("usage_output_invalid")?;
-    let total = input.checked_add(output).ok_or("usage_total_overflow")?;
-    if value["total_tokens"]
+    let total = value["total_tokens"]
         .as_u64()
-        .is_some_and(|claimed| claimed != total)
-    {
-        return Err("usage_total_mismatch");
-    }
+        .ok_or("kimi_usage_field_type")?;
     let cached = value
         .pointer("/prompt_tokens_details/cached_tokens")
         .and_then(Value::as_u64)
@@ -549,6 +545,16 @@ mod tests {
             buffered(&context, &value),
             Err("kimi_cached_tokens_conflict")
         );
+    }
+
+    #[test]
+    fn buffered_rejects_every_malformed_accounting_shape_before_completed() {
+        let context = Context::new(&json!({"model":"kimi-k3"}));
+        for usage in super::super::usage::invalid_examples() {
+            let value = json!({"choices":[{"finish_reason":"stop", "message":{"content":"Hello"}}],
+                "usage": usage});
+            assert!(buffered(&context, &value).is_err());
+        }
     }
 
     #[test]
