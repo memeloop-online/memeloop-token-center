@@ -1,6 +1,6 @@
 use super::responses_request::{ToolIdentity, tools};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 const MAX_ACCUMULATED_BYTES: usize = 8 * 1024 * 1024;
@@ -47,6 +47,19 @@ impl Context {
             item["arguments"] = Value::String(arguments.into());
         }
         item
+    }
+
+    fn validate_custom_call(&self, call: &Value) -> Result<(), &'static str> {
+        let name = call["function"]["name"].as_str().unwrap_or("");
+        if self.tools.get(name).is_some_and(|tool| tool.custom) {
+            let args = call["function"]["arguments"].as_str().unwrap_or("");
+            let parsed = crate::api::sse::parse_unique_json(args.as_bytes())
+                .map_err(|_| "tool_arguments_invalid")?;
+            if parsed["input"].as_str().is_none() {
+                return Err("tool_arguments_invalid");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -95,6 +108,60 @@ fn finish_failure(reason: Option<&str>) -> &'static str {
     }
 }
 
+fn incomplete_reason(reason: Option<&str>) -> Option<&'static str> {
+    match reason {
+        Some("length") => Some("max_output_tokens"),
+        Some("content_filter") => Some("content_filter"),
+        _ => None,
+    }
+}
+
+fn terminal_envelope(mut value: Value, reason: Option<&str>) -> Value {
+    if let Some(reason) = incomplete_reason(reason) {
+        value["status"] = "incomplete".into();
+        value["incomplete_details"] = json!({"reason":reason});
+        if let Some(items) = value["output"].as_array_mut() {
+            for item in items {
+                if item.get("status").is_some() {
+                    item["status"] = "incomplete".into();
+                }
+            }
+        }
+    }
+    value
+}
+
+fn validate_tool_items(items: &[Value]) -> Result<(), &'static str> {
+    let mut ids = BTreeSet::new();
+    for item in items {
+        if !matches!(
+            item["type"].as_str(),
+            Some("function_call" | "custom_tool_call")
+        ) {
+            continue;
+        }
+        let id = item["call_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or("tool_call_id_missing")?;
+        if !ids.insert(id) {
+            return Err("tool_call_id_duplicate");
+        }
+        if item["name"].as_str().is_none_or(str::is_empty) {
+            return Err("tool_name_missing");
+        }
+        if item["type"] == "function_call" {
+            let arguments = item["arguments"].as_str().ok_or("tool_arguments_invalid")?;
+            let value = crate::api::sse::parse_unique_json(arguments.as_bytes())
+                .map_err(|_| "tool_arguments_invalid")?;
+            if !value.is_object() {
+                return Err("tool_arguments_invalid");
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(in crate::api) fn buffered(context: &Context, value: &Value) -> Result<Value, &'static str> {
     if value.get("error").is_some_and(|error| !error.is_null()) {
         return Err("provider_error");
@@ -106,7 +173,7 @@ pub(in crate::api) fn buffered(context: &Context, value: &Value) -> Result<Value
     let choice = &choices[0];
     if !matches!(
         choice["finish_reason"].as_str(),
-        Some("stop" | "tool_calls" | "function_call")
+        Some("stop" | "tool_calls" | "function_call" | "length" | "content_filter")
     ) {
         return Err(finish_failure(choice["finish_reason"].as_str()));
     }
@@ -132,15 +199,31 @@ pub(in crate::api) fn buffered(context: &Context, value: &Value) -> Result<Value
             return Err("item_limit");
         }
         for (index, call) in calls.iter().enumerate() {
+            if incomplete_reason(choice["finish_reason"].as_str()).is_none() {
+                context.validate_custom_call(call)?;
+            }
             outputs.push(context.tool_item(call, &format!("fc_{id}_{index}")));
         }
     }
-    Ok(envelope(
-        context,
-        &id,
-        value["created"].as_i64().unwrap_or(0),
-        outputs,
-        usage(&value["usage"])?,
+    if incomplete_reason(choice["finish_reason"].as_str()).is_none() {
+        validate_tool_items(&outputs)?;
+        if matches!(
+            choice["finish_reason"].as_str(),
+            Some("tool_calls" | "function_call")
+        ) && message["tool_calls"].as_array().is_none_or(Vec::is_empty)
+        {
+            return Err("tool_calls_missing");
+        }
+    }
+    Ok(terminal_envelope(
+        envelope(
+            context,
+            &id,
+            value["created"].as_i64().unwrap_or(0),
+            outputs,
+            usage(&value["usage"])?,
+        ),
+        choice["finish_reason"].as_str(),
     ))
 }
 
@@ -369,17 +452,34 @@ impl Stream {
         }
         if !matches!(
             self.finish.as_deref(),
-            Some("stop" | "tool_calls" | "function_call")
+            Some("stop" | "tool_calls" | "function_call" | "length" | "content_filter")
         ) {
             return Err(finish_failure(self.finish.as_deref()));
+        }
+        let incomplete = incomplete_reason(self.finish.as_deref()).is_some();
+        if !incomplete {
+            validate_tool_items(&self.items)?;
+            if matches!(self.finish.as_deref(), Some("tool_calls" | "function_call"))
+                && self.calls.is_empty()
+            {
+                return Err("tool_calls_missing");
+            }
+            for (_, call) in self.calls.values() {
+                self.context.validate_custom_call(call)?;
+            }
         }
         let usage = self.usage.take().ok_or("usage_missing")?;
         self.done = true;
         let mut events = Vec::new();
         for index in 0..self.items.len() {
             let mut item = self.items[index].clone();
-            if item["type"] == "message" {
-                item["status"] = "completed".into();
+            if item.get("status").is_some() {
+                item["status"] = if incomplete {
+                    "incomplete"
+                } else {
+                    "completed"
+                }
+                .into();
             }
             match item["type"].as_str() {
                 Some("message" | "reasoning") => {
@@ -406,14 +506,24 @@ impl Stream {
                 json!({"output_index":index,"item":item}),
             )?);
         }
-        let response = envelope(
-            &self.context,
-            &self.id,
-            self.created,
-            self.items.clone(),
-            usage,
+        let response = terminal_envelope(
+            envelope(
+                &self.context,
+                &self.id,
+                self.created,
+                self.items.clone(),
+                usage,
+            ),
+            self.finish.as_deref(),
         );
-        events.push(self.event("response.completed", json!({"response":response}))?);
+        events.push(self.event(
+            if incomplete {
+                "response.incomplete"
+            } else {
+                "response.completed"
+            },
+            json!({"response":response}),
+        )?);
         Ok(events)
     }
 }

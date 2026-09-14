@@ -6,7 +6,7 @@ fn state() -> StreamState {
     StreamState {
         upstream: Box::pin(futures_util::stream::empty()),
         framer: BoundedSseFramer::default(),
-        usage: ChatSseUsageState::default(),
+        usage: ChatSseUsageState::for_kimi(),
         translator: responses::Stream::new(responses::Context::new(&json!({"model":"kimi-k3"}))),
         pending: VecDeque::new(),
         terminal: false,
@@ -34,7 +34,7 @@ fn failed_done_preserves_first_contract_reason_and_observed_usage() {
         .unwrap();
     assert_eq!(
         state.observe(b"data: [DONE]\n\n"),
-        Err("chat_usage_on_choice_or_choice_after_usage")
+        Err("chat_usage_sequence")
     );
     assert!(state.usage_observed);
     assert!(state.done_observed);
@@ -55,7 +55,10 @@ fn translation_reasons_distinguish_usage_finish_and_limits_without_payload() {
     translator
         .observe(&json!({"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}))
         .unwrap();
-    assert_eq!(translator.finish(), Err("finish_reason_length"));
+    translator.observe(&json!({"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}})).unwrap();
+    let incomplete = String::from_utf8(translator.finish().unwrap().concat()).unwrap();
+    assert!(incomplete.contains("response.incomplete"));
+    assert!(!incomplete.contains("response.completed"));
     let mut translator =
         responses::Stream::new(responses::Context::new(&json!({"model":"kimi-k3"})));
     translator

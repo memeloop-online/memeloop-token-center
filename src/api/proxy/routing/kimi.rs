@@ -104,6 +104,62 @@ impl StreamState {
         }
         Ok(())
     }
+
+    fn into_stream(self) -> UpstreamByteStream {
+        Box::pin(futures_util::stream::unfold(self, |mut state| async move {
+            loop {
+                if let Some(output) = state.pending.pop_front() {
+                    return Some((output, state));
+                }
+                if state.failed {
+                    return None;
+                }
+                match state.upstream.next().await {
+                    Some(Ok(chunk)) => {
+                        if let Err(reason) = state.observe(&chunk) {
+                            state.report_failure("observe", reason);
+                            state.pending.clear();
+                            state.failed = true;
+                            return Some((Err(UPSTREAM_STREAM_ERROR), state));
+                        }
+                    }
+                    Some(Err(error)) => {
+                        state.report_failure("body_read", "transport_body_error");
+                        state.failed = true;
+                        return Some((Err(error), state));
+                    }
+                    None => {
+                        state.failed = true;
+                        // A clean EOF may replace Kimi's optional DONE marker,
+                        // never its validated finish, usage, or complete framing.
+                        if !state.framer.is_complete() || !state.usage.terminal_ready() {
+                            state.report_failure(
+                                "eof",
+                                if !state.framer.is_complete() {
+                                    "sse_frame_incomplete"
+                                } else {
+                                    state
+                                        .usage
+                                        .invalid_reason()
+                                        .unwrap_or("terminal_evidence_missing")
+                                },
+                            );
+                            return Some((Err(UPSTREAM_STREAM_ERROR), state));
+                        }
+                        match state.translator.finish() {
+                            Ok(events) => state
+                                .pending
+                                .extend(events.into_iter().map(|event| Ok(Bytes::from(event)))),
+                            Err(reason) => {
+                                state.report_failure("eof", reason);
+                                return Some((Err(UPSTREAM_STREAM_ERROR), state));
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+    }
 }
 
 fn report_failure(
@@ -189,7 +245,7 @@ pub(in crate::api::proxy) fn translate(
         let state = StreamState {
             upstream: parts.stream,
             framer: BoundedSseFramer::default(),
-            usage: ChatSseUsageState::default(),
+            usage: ChatSseUsageState::for_kimi(),
             translator: responses::Stream::new(context),
             pending: VecDeque::new(),
             terminal: false,
@@ -199,57 +255,7 @@ pub(in crate::api::proxy) fn translate(
             usage_observed: false,
             done_observed: false,
         };
-        Box::pin(futures_util::stream::unfold(
-            state,
-            |mut state| async move {
-                loop {
-                    if let Some(output) = state.pending.pop_front() {
-                        return Some((output, state));
-                    }
-                    if state.failed {
-                        return None;
-                    }
-                    match state.upstream.next().await {
-                        Some(Ok(chunk)) => {
-                            if let Err(reason) = state.observe(&chunk) {
-                                state.report_failure("observe", reason);
-                                state.pending.clear();
-                                state.failed = true;
-                                return Some((Err(UPSTREAM_STREAM_ERROR), state));
-                            }
-                        }
-                        Some(Err(error)) => {
-                            state.report_failure("body_read", "transport_body_error");
-                            state.failed = true;
-                            return Some((Err(error), state));
-                        }
-                        None => {
-                            state.failed = true;
-                            if !state.terminal || !state.framer.is_complete() {
-                                state.report_failure(
-                                    "eof",
-                                    if !state.framer.is_complete() {
-                                        "sse_frame_incomplete"
-                                    } else {
-                                        "done_missing"
-                                    },
-                                );
-                                return Some((Err(UPSTREAM_STREAM_ERROR), state));
-                            }
-                            match state.translator.finish() {
-                                Ok(events) => state
-                                    .pending
-                                    .extend(events.into_iter().map(|event| Ok(Bytes::from(event)))),
-                                Err(reason) => {
-                                    state.report_failure("eof", reason);
-                                    return Some((Err(UPSTREAM_STREAM_ERROR), state));
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-        )) as UpstreamByteStream
+        state.into_stream()
     } else {
         Box::pin(futures_util::stream::once(async move {
             let mut usage_observed = false;
@@ -314,6 +320,10 @@ pub(in crate::api::proxy) fn translate(
 #[cfg(test)]
 #[path = "kimi_diagnostics_tests.rs"]
 mod diagnostics_tests;
+
+#[cfg(test)]
+#[path = "kimi_terminal_tests.rs"]
+mod terminal_tests;
 
 #[cfg(test)]
 mod tests {

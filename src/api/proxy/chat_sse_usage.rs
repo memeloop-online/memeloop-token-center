@@ -48,6 +48,7 @@ pub(super) struct ChatSseUsageState {
     done: bool,
     invalid: bool,
     invalid_reason: Option<&'static str>,
+    allow_terminal_choice_usage: bool,
 }
 
 impl Default for ChatSseUsageState {
@@ -66,11 +67,28 @@ impl Default for ChatSseUsageState {
             done: false,
             invalid: false,
             invalid_reason: None,
+            allow_terminal_choice_usage: false,
         }
     }
 }
 
 impl ChatSseUsageState {
+    /// Kimi accepts usage on the terminal choice as well as a usage-only
+    /// frame. Other Chat routes retain the strict usage-only contract.
+    pub(super) fn for_kimi() -> Self {
+        Self {
+            allow_terminal_choice_usage: true,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn terminal_ready(&self) -> bool {
+        !self.invalid
+            && self.usage.is_some()
+            && self.seen_choice_indices == self.expected_choice_indices
+            && self.finished_choice_indices == self.expected_choice_indices
+    }
+
     fn invalidate(&mut self, reason: &'static str) {
         self.invalid = true;
         self.invalid_reason.get_or_insert(reason);
@@ -176,7 +194,7 @@ impl ChatSseUsageState {
         usage: Option<CanonicalChatUsage>,
         choices: &[CanonicalChatChoice],
     ) {
-        if self.usage.is_some() || usage.is_some() {
+        if self.usage.is_some() || (usage.is_some() && !self.allow_terminal_choice_usage) {
             self.invalidate("chat_usage_on_choice_or_choice_after_usage");
             return;
         }
@@ -194,13 +212,18 @@ impl ChatSseUsageState {
                 }
                 Some(reason)
                     if is_terminal_finish_reason(reason)
-                        && self.seen_choice_indices.contains(&choice.index)
+                        && (self.seen_choice_indices.contains(&choice.index)
+                            || self.allow_terminal_choice_usage)
                         && self.finished_choice_indices.insert(choice.index) => {}
                 _ => {
                     self.invalidate("chat_finish_sequence");
                     return;
                 }
             }
+            self.seen_choice_indices.insert(choice.index);
+        }
+        if usage.is_some() {
+            self.observe_usage_only(usage);
         }
     }
 
