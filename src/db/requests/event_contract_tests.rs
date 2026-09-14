@@ -117,7 +117,7 @@ async fn assert_event_enrichment(database: &Database) {
         .execute(&mut *transaction)
         .await
         .unwrap();
-    super::lifecycle::record_request_finished_in_transaction(
+    crate::db::requests::lifecycle::record_request_finished_in_transaction(
         &mut transaction,
         &FinishRequest {
             request_id: Uuid::parse_str(&request).unwrap(),
