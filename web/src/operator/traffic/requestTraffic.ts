@@ -225,6 +225,8 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
   if (generationDuration !== undefined) request.generation_duration_ms = generationDuration;
   const compaction = event.compaction ?? previous?.compaction;
   if (compaction !== undefined) request.compaction = compaction;
+  const usageBasis = event.usage_basis === undefined ? previous?.usage_basis : event.usage_basis;
+  if (usageBasis !== undefined) request.usage_basis = usageBasis;
   if (credentialIdentity !== undefined) request.credential_identity = credentialIdentity;
   return request;
 }

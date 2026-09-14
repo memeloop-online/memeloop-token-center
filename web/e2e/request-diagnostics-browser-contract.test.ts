@@ -155,7 +155,11 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     await timedRow.locator('.request-outcome').focus();
     await page.getByRole('tooltip').filter({ hasText: 'not client acknowledgement' }).waitFor();
     assert.match(await timedRow.locator('.request-tps-cell').innerText(), /Generation TPS\s+32/);
-    await timedRow.locator('.request-tps-cell [tabindex="0"]').focus();
+    assert.match(await timedRow.locator('.request-tps-cell').innerText(), /Average TPS\s+25\.93/, 'average includes the first-output wait and remains alongside generation throughput');
+    assert.match(await recordedRow.locator('[data-rate="generation"]').innerText(), /Generation TPS\s+—/, 'missing generation timing does not borrow the average');
+    assert.match(await historicalGapDiagnostics.locator('[data-rate="average"]').innerText(), /Average TPS\s+—/);
+    assert.match(await historicalGapDiagnostics.locator('[data-rate="generation"]').innerText(), /Generation TPS\s+—/);
+    await timedRow.locator('[data-rate="generation"]').focus();
     await page.getByRole('tooltip').filter({ hasText: 'First output wait' }).waitFor();
     assert.match(await page.getByRole('tooltip').filter({ hasText: 'First output wait' }).innerText(), /234/);
     assert.match(await page.locator('tbody tr').nth(1).locator('.request-token-cell .request-value-info').getAttribute('aria-label') ?? '', /Input tokens: 160.*Output tokens: 32/);
@@ -201,6 +205,11 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
         assert.ok(layout.tableScrollWidth >= layout.tableClientWidth, `${theme} ${width}px table remains in its own scroll container`);
         assert.ok(layout.compactIdScrollWidth >= layout.compactIdClientWidth, `${theme} ${width}px request ID remains safely clipped in its cell`);
         assert.equal(layout.diagnostics.length, 2, `${theme} ${width}px fixture must retain both recorded and historical diagnostic surfaces`);
+        for (const surface of [recordedRow, recordedDiagnostics]) {
+          const alignment = await surface.locator('.request-token-cell').evaluate(element => ({ total: element.querySelector('.request-token-total > span')!.getBoundingClientRect().left, input: element.querySelector('.request-token-primary b')!.getBoundingClientRect().left, output: element.querySelectorAll('.request-token-primary b')[1].getBoundingClientRect().left }));
+          assert.ok(Math.abs(alignment.total - alignment.input) < 1 && Math.abs(alignment.input - alignment.output) < 1, `${theme} ${width}px total/input/output values share one left edge`);
+          assert.equal(await surface.locator('.request-output-rate').count(), 2, `${theme} ${width}px both throughput measures remain available`);
+        }
         for (const diagnostics of layout.diagnostics) assert.ok(diagnostics.scrollWidth <= diagnostics.clientWidth, `${theme} ${width}px each detail diagnostics surface must remain contained`);
         if (width < 600) {
           await recordedRow.evaluate((row) => row.scrollIntoView({ block: 'start' }));
@@ -235,6 +244,15 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
         }
       }
     }
+    await page.goto(`${origin}/e2e/fixtures/request-diagnostics.html?usage-basis=contract_ceiling`);
+    const ceiling = page.locator('[data-fixture-request="recorded"] .request-diagnostics');
+    await ceiling.waitFor();
+    assert.match(await ceiling.innerText(), /Settlement ceiling/);
+    assert.match(await ceiling.locator('.request-token-primary').innerText(), /≤/);
+    assert.match(await ceiling.locator('[data-rate="average"]').innerText(), /Average TPS\s+—/);
+    assert.match(await ceiling.locator('[data-rate="generation"]').innerText(), /Generation TPS\s+—/);
+    assert.doesNotMatch(await ceiling.innerText(), /8,?560\.91/);
+    assert.match(await ceiling.innerText(), /US\$<0\.01|\$<0\.01/, 'a ceiling settlement is not changed to free');
   } catch (reason) {
     const diagnostics = await fixtureDiagnostics(page, current.value, history, pageErrors, consoleErrors);
     process.stderr.write(`request-diagnostics browser contract failed: ${JSON.stringify(diagnostics)}\n`);
