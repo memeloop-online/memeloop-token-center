@@ -26,6 +26,7 @@ test('assistant accepts text-capable multimodal providers without inferring capa
   ]);
   assert.deepEqual(catalog.options.map((option) => option.value), ['legal-text-alias', 'multimodal-text'], 'text support is additive and model aliases are not capability evidence');
   assert.deepEqual(catalog.unverifiedRoutes.map((route) => route.value), ['image-only', 'embedding-only', 'custom-name']);
+  assert.ok(catalog.options.every((option) => option.health === 'unknown'), 'catalog reads do not claim to probe upstream health');
 
   const unavailable = item('unavailable', 'Unavailable', 'opaque-model-id', ['image', 'text']);
   unavailable.sources[0].configuration_availability = { status: 'unavailable', reasons: ['account_inactive'] };
@@ -76,14 +77,8 @@ test('all maintained model selectors share the same picker and stale catalogs re
 
 test('filter-assistant choice exposes configuration availability without probing an upstream', async () => {
   const settings = await readFile(new URL('../src/operator/pages/SystemSettingsPage.tsx', import.meta.url), 'utf8');
-  const catalog = await readFile(new URL('../src/operator/modelCatalog.ts', import.meta.url), 'utf8');
   assert.match(settings, /selectedRouteHasAvailableCandidate/);
   assert.match(settings, /assistantTextUnavailable/);
   assert.match(settings, /describedBy="filter-assistant-route-hint"/);
-  assert.match(catalog, /source\.provider\.modalities\.length === 1/);
-  assert.match(catalog, /source\.catalog\.status === 'ready'/);
-  assert.doesNotMatch(catalog, /embeddings\?|rerank|whisper|transcri/);
-  assert.match(catalog, /health: 'unknown'/);
-  assert.match(catalog, /disabled: !available/);
   assert.doesNotMatch(settings, /\/health|\/models\/sync|filter-assistant\/plan/);
 });

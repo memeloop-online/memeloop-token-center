@@ -81,8 +81,12 @@ test('filters are non-modal themed popovers and model selection is searchable by
     const settingsCatalog = page.locator('.system-settings .shared-model-popover');
     await settingsCatalog.getByRole('combobox').fill('only');
     assert.equal(await settingsCatalog.getByRole('option').count(), 0, 'non-conversational routes never appear in assistant suggestions');
-    await settingsCatalog.getByRole('combobox').fill('omni-moderation-latest');
-    assert.equal(await settingsCatalog.getByRole('option').count(), 0, 'known moderation models remain excluded without relying on a name pattern');
+    await settingsCatalog.getByRole('combobox').fill('opaque-embedding-id');
+    assert.equal(await settingsCatalog.getByRole('option').count(), 0, 'a provider explicitly lacking text capability is excluded regardless of model name');
+    await settingsCatalog.getByRole('combobox').fill('multimodal-assistant');
+    await settingsCatalog.getByRole('option', { name: /multimodal-assistant/i }).click();
+    assert.match(await page.locator('.system-settings .model-picker-trigger').textContent() ?? '', /multimodal-assistant/, 'a text-capable multimodal route can actually be selected');
+    await page.locator('.system-settings .model-picker-trigger').click();
     await settingsCatalog.getByRole('combobox').fill('image-analysis-assistant');
     assert.equal(await settingsCatalog.getByRole('option').count(), 1, 'a catalog-proven text alias is not rejected because its name contains image');
     await settingsCatalog.getByRole('combobox').fill('friendly-custom-chat');
@@ -100,7 +104,7 @@ test('filters are non-modal themed popovers and model selection is searchable by
     await settingsCatalog.getByRole('combobox').press('Enter');
     await settingsCatalog.waitFor({ state: 'hidden' });
     assert.match(await page.locator('.system-settings .model-picker-trigger').textContent() ?? '', /production-model/, 'Enter skips an unavailable first result and chooses the first available route');
-    assert.match(await page.locator('.system-settings').getByRole('status').last().textContent() ?? '', /5 routes are omitted.+custom model name is not capability evidence/i);
+    assert.match(await page.locator('.system-settings').getByRole('status').last().textContent() ?? '', /4 routes are omitted.+custom model name is not capability evidence/i);
     assert.deepEqual(pageErrors, [], 'model picker interactions must not produce page errors');
   } finally {
     await browser.close();
