@@ -548,6 +548,31 @@ async fn exercise_credential_and_ledger_acceptance(state: AppState, label: &str)
 
 async fn exercise_filtered_credential_pages(state: &AppState) {
     let tenant = format!("filtered-{}", Uuid::now_v7());
+    let unicode = create_credential(
+        state,
+        &tenant,
+        "ÉQUIPE-Ö-中文",
+        "ÉQUIPE Ö 中文",
+        "0",
+        &format!("{tenant}:unicode"),
+    )
+    .await;
+    // Preserve original non-ASCII spelling; never pre-fold the needle with a
+    // different Unicode implementation from the database's column function.
+    for search in ["%C3%89QUIPE", "%C3%96", "%E4%B8%AD%E6%96%87"] {
+        let (status, rows) = json_request(
+            state,
+            "GET",
+            &format!("/internal/v1/keys?tenant_external_id={tenant}&search={search}"),
+            BOOTSTRAP_TOKEN,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["key_id"], unicode["key_id"]);
+    }
     let first = create_credential(
         state,
         &tenant,

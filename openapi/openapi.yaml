@@ -188,7 +188,7 @@ paths:
           schema: { type: string, format: uuid }
         - name: search
           in: query
-          description: Case-insensitive literal substring of alias or principal, applied before pagination. Never searches secrets.
+          description: Literal substring of alias or principal, applied before pagination. ASCII matching is case-insensitive; original non-ASCII spelling is preserved and searchable. Unicode case folding follows the database collation. Never searches secrets.
           schema: { type: string, maxLength: 200 }
         - name: status
           in: query
