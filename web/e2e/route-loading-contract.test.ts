@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { chromium } from 'playwright';
-import { createServer } from 'vite';
+import { createIsolatedFixtureServer as createServer } from './support/isolated-vite-server.js';
 
 const webRoot = fileURLToPath(new URL('..', import.meta.url));
 
@@ -49,7 +49,7 @@ test('route credentials stay off the list critical path and load inside an opene
     assert.equal(initialRouteCalls.length, 1, 'route list must have a one-request critical path');
     assert.equal(initialKeyCalls.length, 0, 'credential inventory must stay off the initial route-list path');
 
-    await page.locator('details.create-resource > summary').click();
+    await page.locator('.create-journey [data-workspace-toggle]').click();
     await page.waitForFunction(() => window.routeLoadingFixture.calls.some((call) => {
       const url = new URL(call, location.origin);
       return url.pathname === '/internal/v1/keys' && !url.searchParams.has('key_id');
@@ -58,7 +58,7 @@ test('route credentials stay off the list critical path and load inside an opene
     assert.equal(openedCalls.filter((call) => new URL(call, 'http://fixture').pathname === '/internal/v1/keys').length, 1,
       'opening create performs one authoritative credential inventory read');
 
-    const credentialField = page.locator('details.create-resource .multi-combobox').filter({
+    const credentialField = page.locator('.create-journey .multi-combobox').filter({
       has: page.getByRole('combobox', { name: 'Grant to specific credentials', exact: true }),
     });
     await page.evaluate(() => { document.documentElement.dataset.theme = 'light'; });

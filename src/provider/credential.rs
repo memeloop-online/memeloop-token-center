@@ -548,11 +548,23 @@ pub(crate) fn seal_private_json<T: Serialize>(
     key_material: &[u8],
     aad: &[u8],
 ) -> Result<String, AppError> {
+    let mut nonce = [0_u8; 12];
+    fill(&mut nonce).map_err(|_| AppError::Internal)?;
+    seal_private_json_with_nonce(value, key_material, aad, nonce)
+}
+
+/// Seals a private value with a caller-provided nonce. This is restricted to
+/// durable records whose caller can prove nonce uniqueness and needs an exact
+/// ciphertext replay after an unknown database COMMIT acknowledgement.
+pub(crate) fn seal_private_json_with_nonce<T: Serialize>(
+    value: &T,
+    key_material: &[u8],
+    aad: &[u8],
+    nonce: [u8; 12],
+) -> Result<String, AppError> {
     let plaintext = serde_json::to_vec(value).map_err(|_| AppError::Internal)?;
     let cipher = ChaCha20Poly1305::new_from_slice(&current_encryption_key(key_material)?)
         .map_err(|_| AppError::Internal)?;
-    let mut nonce = [0_u8; 12];
-    fill(&mut nonce).map_err(|_| AppError::Internal)?;
     let ciphertext = cipher
         .encrypt(
             (&nonce).into(),

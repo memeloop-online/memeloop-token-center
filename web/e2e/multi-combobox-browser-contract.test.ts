@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
@@ -56,10 +57,68 @@ test('multi-select escapes clipping and supports keyboard selection, dismissal a
     assert.equal(await retry.evaluate(element => element === document.activeElement), true);
     await retry.press('Enter');
     await page.getByRole('alert').waitFor({ state: 'detached' });
-    for (const theme of ['dark', 'light']) {
+    const artifacts = fileURLToPath(new URL('../e2e-artifacts/ui-system/multi-combobox/', import.meta.url));
+    await mkdir(artifacts, { recursive: true });
+    for (const theme of ['dark', 'light']) for (const width of [320, 390, 768, 1440]) {
+      await page.setViewportSize({ width, height: 900 });
+      // Every capture starts from identical component state, without the
+      // deliberately clipped host used by the earlier top-layer regression.
+      await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/multi-combobox.html?matrix=1`);
       await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
+      for (const query of ['Workspace 1', 'Workspace 2']) {
+        await input.fill(query);
+        await input.press('ArrowDown');
+        await input.press('Enter');
+      }
+      assert.equal(await page.getByLabel('Selected count').innerText(), '2');
+      await input.fill('no-such-workspace');
+      await page.getByText('No matching workspaces', { exact: true }).waitFor();
+      const before = await page.getByLabel('Submission count').innerText();
+      await input.press('Enter');
+      assert.equal(await page.getByLabel('Submission count').innerText(), before, 'empty open picker must not submit the editor');
+      assert.equal(await input.evaluate(element => element === document.activeElement), true);
+      await input.press('Escape');
+      await menu.waitFor({ state: 'hidden' });
+      assert.equal(await input.getAttribute('aria-controls'), null);
+      assert.equal(await input.getAttribute('aria-activedescendant'), null);
+      // A closed picker still allows the enclosing form's ordinary Enter action.
+      await input.press('Enter');
+      assert.equal(await page.getByLabel('Submission count').innerText(), String(Number(before) + 1));
+      const remove = page.getByRole('button', { name: /^Remove Workspace/ }).first();
+      await remove.focus();
+      await remove.press('Enter');
+      assert.equal(await input.evaluate(element => element === document.activeElement), true, 'removing the focused chip returns focus to the picker');
+      await input.fill('Workspace');
+      await input.press('ArrowDown');
+      await input.press('Enter');
+      assert.equal(await page.getByLabel('Selected count').innerText(), '2');
       await input.focus();
+      await input.press('ArrowDown');
+      const relationships = await input.evaluate(element => {
+        const list = document.getElementById(element.getAttribute('aria-controls') ?? '');
+        const active = document.getElementById(element.getAttribute('aria-activedescendant') ?? '');
+        return {
+          listbox: list?.getAttribute('role'),
+          option: active?.getAttribute('role'),
+          selected: active?.getAttribute('aria-selected'),
+          contained: Boolean(list && active && list.contains(active)),
+        };
+      });
+      assert.deepEqual(relationships, { listbox: 'listbox', option: 'option', selected: 'true', contained: true });
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+      for (const surface of [page.locator('.multi-combobox'), menu]) {
+        assert.equal(await surface.evaluate(element => {
+          const bounds = element.getBoundingClientRect();
+          return element.scrollWidth <= element.clientWidth && bounds.left >= 0 && bounds.right <= innerWidth;
+        }), true, `${theme}/${width}: picker surface is independently contained`);
+      }
+      assert.equal(await menu.getAttribute('aria-modal'), null);
+      await page.screenshot({ path: `${artifacts}/${theme}-${width}.png`, fullPage: true });
+      await input.press('Escape');
+      await menu.waitFor({ state: 'hidden' });
+      assert.equal(await input.getAttribute('aria-expanded'), 'false');
+      assert.equal(await input.getAttribute('aria-controls'), null);
+      assert.equal(await input.getAttribute('aria-activedescendant'), null, 'closing clears the previously active option reference');
     }
   } finally { await browser.close(); await server.close(); }
 });

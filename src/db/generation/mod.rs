@@ -3,6 +3,7 @@ mod jobs;
 mod operator;
 mod reconcile;
 mod synchronous;
+mod terminal;
 
 use sqlx::{Any, Transaction};
 

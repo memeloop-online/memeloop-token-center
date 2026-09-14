@@ -292,6 +292,33 @@ async fn request_projection_preserves_source_truth_scope_and_cross_source_cursor
         memeloop_token_center::model::RequestArchiveState::Bound
     );
 
+    // An imported orphan newer than the valid archive must not consume the
+    // bounded page before identity enrichment. The model predicate must also
+    // apply before LIMIT, even though newer native/generation rows exist.
+    sqlx::query("INSERT INTO session_archive_unlinked_requests (tenant_id, source, external_request_id, archive_request_id, key_id, principal_id, source_started_at, protocol, model, imported_at, source_session_id) VALUES ($1, 'fixture', $2, $2, $3, $4, $5, 'openai-responses', 'projection-archive', $5, 'orphan-session')")
+        .bind(key.tenant_id.to_string())
+        .bind(Uuid::now_v7().to_string())
+        .bind(Uuid::now_v7().to_string())
+        .bind(key.principal_id.to_string())
+        .bind(now + 1000)
+        .execute(&inspection)
+        .await
+        .unwrap();
+    let bounded_archive = state
+        .db
+        .list_all_requests_filtered(
+            "projection-a",
+            memeloop_token_center::db::RequestListFilter {
+                limit: 1,
+                model: Some("projection-archive".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(bounded_archive.len(), 1);
+    assert_eq!(bounded_archive[0].request_id, archive_id);
+
     let operator_rows = state
         .db
         .list_all_requests("projection-a", 10)

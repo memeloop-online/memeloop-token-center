@@ -1,16 +1,37 @@
 export interface ModelConfirmation { scope: string; confirmed: boolean }
 
+/** Eligible counts all active candidates, including unresolved snapshots. */
+export function catalogEvidenceVerified(catalog: {
+  eligible_account_count: number;
+  unknown_account_count: number;
+  unsupported_account_count?: number;
+  stale_account_count: number;
+} | undefined, explicitCandidateCount?: number, allowUnsupportedDiscovery = false) {
+  if (!catalog) return false;
+  const { eligible_account_count: eligible, unknown_account_count: unknown, stale_account_count: stale, unsupported_account_count: unsupported = 0 } = catalog;
+  return Number.isSafeInteger(eligible) && eligible > 0
+    && Number.isSafeInteger(unknown) && unknown >= 0 && unknown <= eligible
+    && Number.isSafeInteger(unsupported) && unsupported >= 0 && unsupported <= unknown
+    && (unknown === 0 || (allowUnsupportedDiscovery && unknown === unsupported))
+    && Number.isSafeInteger(stale) && stale >= 0 && stale <= eligible - unknown
+    && (explicitCandidateCount === undefined || eligible === explicitCandidateCount);
+}
+
 /** Consent belongs to one scope; returning to an old scope cannot revive it. */
 export function confirmationForScope(state: ModelConfirmation, scope: string): ModelConfirmation {
   return state.scope === scope ? state : { scope, confirmed: false };
 }
 
-export function modelConfirmationValidity({ hasValue, catalogListed, customAllowed, customConfirmed }: {
+export function modelConfirmationValidity({ hasValue, catalogListed, customAllowed, customConfirmed, catalogVerified = true }: {
   hasValue: boolean;
   catalogListed: boolean;
   customAllowed: boolean;
   customConfirmed: boolean;
+  catalogVerified?: boolean;
 }) {
+  // A pending/failed directory cannot prove absence or authorize an explicit
+  // custom bypass, including when editing a previously confirmed route.
+  if (!catalogVerified) return { needsCustomConfirmation: false, allowCustom: false, valid: false };
   const needsCustomConfirmation = hasValue && !catalogListed;
   const allowCustom = Boolean(needsCustomConfirmation && customAllowed && customConfirmed);
   return { needsCustomConfirmation, allowCustom, valid: catalogListed || allowCustom };

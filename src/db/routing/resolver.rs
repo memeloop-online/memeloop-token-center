@@ -206,7 +206,7 @@ impl Database {
                ON candidates.tenant_id = r.tenant_id AND candidates.model_route_id = r.id
              JOIN upstream_accounts a ON a.id = candidates.upstream_account_id AND a.tenant_id = r.tenant_id
              WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3
-               AND r.enabled = 1 AND a.status = 'active'
+               AND r.enabled = 1 AND r.archived_at IS NULL AND a.status = 'active'
                AND (
                  EXISTS (SELECT 1 FROM routing_grants g WHERE g.tenant_id = r.tenant_id AND g.key_id = $4 AND g.model_route_id = r.id)
                  OR EXISTS (
@@ -244,17 +244,21 @@ impl Database {
             }
         }
         let mut candidates = candidates.into_values().collect::<Vec<_>>();
-        candidates.sort_by(|left, right| {
-            hint_rank(upstream_account_hint, left)
-                .cmp(&hint_rank(upstream_account_hint, right))
-                .then_with(|| left.priority.cmp(&right.priority))
-                .then_with(|| {
-                    weighted_rendezvous_score(key_id, selection_seed, left)
-                        .total_cmp(&weighted_rendezvous_score(key_id, selection_seed, right))
-                })
-                .then_with(|| left.route_id.cmp(&right.route_id))
-                .then_with(|| left.account_id.cmp(&right.account_id))
-        });
+        let hint_disposition = order_authorized_candidates(
+            &mut candidates,
+            key_id,
+            selection_seed,
+            upstream_account_hint,
+        );
+        tracing::debug!(
+            event = "authorized_candidate_order",
+            %tenant_id,
+            %key_id,
+            %selection_seed,
+            candidate_count = candidates.len(),
+            hint_disposition = hint_disposition.as_str(),
+            "host ordered the authorized candidate set"
+        );
         let mut ordered = Vec::with_capacity(
             candidates
                 .len()
@@ -303,7 +307,7 @@ impl Database {
               AND credential.generation = account.credential_generation
               AND credential.revoked_at IS NULL
               AND (credential.expires_at IS NULL OR credential.expires_at > $6)
-             WHERE route.id = $1 AND route.enabled = 1",
+             WHERE route.id = $1 AND route.enabled = 1 AND route.archived_at IS NULL",
         )
         .bind(candidate.route_id.to_string())
         .bind(candidate.account_id.to_string())
@@ -351,7 +355,7 @@ impl Database {
         let rows = sqlx::query(
             "SELECT DISTINCT r.public_model AS model
              FROM model_routes r
-             WHERE r.tenant_id = $1 AND r.enabled = 1
+             WHERE r.tenant_id = $1 AND r.enabled = 1 AND r.archived_at IS NULL
                AND (
                  EXISTS (SELECT 1 FROM routing_grants g WHERE g.tenant_id = r.tenant_id AND g.key_id = $2 AND g.model_route_id = r.id)
                  OR EXISTS (
@@ -400,7 +404,7 @@ impl Database {
               AND credential.generation = account.credential_generation
               AND credential.revoked_at IS NULL
               AND (credential.expires_at IS NULL OR credential.expires_at > $3)
-             WHERE r.tenant_id = $1 AND r.enabled = 1
+             WHERE r.tenant_id = $1 AND r.enabled = 1 AND r.archived_at IS NULL
                AND (
                  EXISTS (SELECT 1 FROM routing_grants g WHERE g.tenant_id = r.tenant_id AND g.key_id = $2 AND g.model_route_id = r.id)
                  OR EXISTS (
@@ -450,7 +454,7 @@ impl Database {
         let found = sqlx::query(
             "SELECT r.id
              FROM model_routes r
-             WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND r.enabled = 1
+             WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND r.enabled = 1 AND r.archived_at IS NULL
                AND (
                  EXISTS (SELECT 1 FROM routing_grants g WHERE g.tenant_id = r.tenant_id AND g.key_id = $4 AND g.model_route_id = r.id)
                  OR EXISTS (
@@ -501,6 +505,58 @@ impl RoutingCandidate {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum HintDisposition {
+    Absent,
+    Preferred,
+    OutsideAuthorizedSet,
+}
+
+impl HintDisposition {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Preferred => "preferred",
+            Self::OutsideAuthorizedSet => "outside_authorized_set",
+        }
+    }
+}
+
+/// This boundary accepts only a mutable slice of host-authorized candidates:
+/// a policy hint can reorder, but cannot append, remove, or materialize an
+/// account. Health admission, transport validation and budget reservation
+/// remain later host-owned checks, including for the preferred candidate.
+fn order_authorized_candidates(
+    candidates: &mut [RoutingCandidate],
+    key_id: Uuid,
+    selection_seed: Uuid,
+    hint: Option<Uuid>,
+) -> HintDisposition {
+    let disposition = match hint {
+        None => HintDisposition::Absent,
+        Some(id)
+            if candidates
+                .iter()
+                .any(|candidate| candidate.account_id == id) =>
+        {
+            HintDisposition::Preferred
+        }
+        Some(_) => HintDisposition::OutsideAuthorizedSet,
+    };
+    candidates.sort_by(|left, right| {
+        hint_rank(hint, left)
+            .cmp(&hint_rank(hint, right))
+            .then_with(|| left.priority.cmp(&right.priority))
+            .then_with(|| {
+                weighted_rendezvous_score(key_id, selection_seed, left)
+                    .total_cmp(&weighted_rendezvous_score(key_id, selection_seed, right))
+            })
+            .then_with(|| left.route_id.cmp(&right.route_id))
+            .then_with(|| left.account_id.cmp(&right.account_id))
+    });
+    disposition
+}
+
 fn hint_rank(hint: Option<Uuid>, candidate: &RoutingCandidate) -> u8 {
     u8::from(hint.is_some_and(|hint| hint != candidate.account_id))
 }
@@ -538,6 +594,92 @@ mod tests {
             priority: 0,
             scheduling_weight: 100,
         }
+    }
+
+    fn identities(candidates: &[RoutingCandidate]) -> Vec<(Uuid, Uuid, i64, i64)> {
+        candidates
+            .iter()
+            .map(|c| {
+                (
+                    c.route_id,
+                    c.account_id,
+                    c.transport_revision,
+                    c.credential_generation,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn preference_preserves_every_authorized_candidate_and_revision() {
+        let mut candidates = vec![
+            candidate(Uuid::from_u128(101)),
+            candidate(Uuid::from_u128(102)),
+        ];
+        candidates[1].priority = 10;
+        candidates[1].transport_revision = 42;
+        candidates[1].credential_generation = 7;
+        let mut before = identities(&candidates);
+        let disposition = order_authorized_candidates(
+            &mut candidates,
+            Uuid::from_u128(10),
+            Uuid::from_u128(20),
+            Some(Uuid::from_u128(102)),
+        );
+        assert_eq!(disposition, HintDisposition::Preferred);
+        assert_eq!(candidates[0].account_id, Uuid::from_u128(102));
+        let mut after = identities(&candidates);
+        before.sort();
+        after.sort();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn outside_hint_is_observable_but_cannot_change_default_order() {
+        let mut candidates = vec![
+            candidate(Uuid::from_u128(101)),
+            candidate(Uuid::from_u128(102)),
+        ];
+        let key = Uuid::from_u128(10);
+        let seed = Uuid::from_u128(20);
+        assert_eq!(
+            order_authorized_candidates(&mut candidates, key, seed, None),
+            HintDisposition::Absent
+        );
+        let before = identities(&candidates);
+        candidates.reverse();
+        assert_eq!(
+            order_authorized_candidates(&mut candidates, key, seed, Some(Uuid::from_u128(999))),
+            HintDisposition::OutsideAuthorizedSet
+        );
+        assert_eq!(before, identities(&candidates));
+    }
+
+    #[test]
+    fn hint_cannot_create_a_candidate_in_an_empty_authorized_set() {
+        let mut candidates = Vec::new();
+        assert_eq!(
+            order_authorized_candidates(
+                &mut candidates,
+                Uuid::nil(),
+                Uuid::nil(),
+                Some(Uuid::from_u128(999))
+            ),
+            HintDisposition::OutsideAuthorizedSet
+        );
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn same_account_on_distinct_authorized_routes_is_not_collapsed() {
+        let account = Uuid::from_u128(101);
+        let mut candidates = vec![candidate(account), candidate(account)];
+        candidates[1].route_id = Uuid::from_u128(2);
+        candidates[1].priority = -1;
+        order_authorized_candidates(&mut candidates, Uuid::nil(), Uuid::nil(), Some(account));
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].route_id, Uuid::from_u128(2));
+        assert_eq!(candidates[1].route_id, Uuid::from_u128(1));
     }
 
     #[test]

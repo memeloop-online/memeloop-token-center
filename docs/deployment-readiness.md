@@ -2,6 +2,121 @@
 
 This document defines release gates for Memeloop Token Center.
 
+## Archive network diagnostics
+
+### Text archive delivery and recovery
+
+Text requests and buffered responses are captured independently into encrypted
+database spools before upstream dispatch and downstream completion, respectively.
+Request admission persists its reservation, request record and sealed capture in
+one transaction. Only a confirmed commit permits upstream dispatch; capacity
+rejection or an unconfirmed database commit returns a retryable failure before
+any upstream execution. A successful capture acknowledgement means the
+payload survives gateway restart, not that object storage has finished uploading.
+S3 latency is outside these delivery paths. Streaming responses retain their
+existing bounded database capture acknowledgements.
+
+Workers upload sealed captures after request settlement and atomically replace
+the corresponding request or response gap locator under the spool lease and
+archive staging fence. This convergence changes archive state only: it must never
+dispatch another upstream request or repeat settlement. Request capture failure
+does not disable response capture. Pending and uploading captures are recoverable
+work, distinct from a terminal archive gap.
+
+Request and response captures share the existing 256 MiB encrypted spool budget,
+including row and chunk accounting. They do not each receive a separate budget.
+Buffered response capture capacity failure is reported as an explicit archive
+gap while preserving the already executed response and settlement. Leased worker
+retries, expiration and bounded cleanup
+apply independently to each capture. Preserve the database and its encryption
+key together for recovery; restarting a worker does not require recapturing or
+replaying upstream traffic. Existing response captures keep their original
+encrypted format and remain readable across this release.
+
+### Rolling rollback of request spooling
+
+Before admitting traffic to the new gateway, run this read-only shared-budget
+gate. The default 16 MiB request deployment requires at least 192 MiB free in
+the 256 MiB durable spool budget, leaving room for a request capture and a
+maximum buffered response with encrypted chunk/row overhead:
+
+```sql
+SELECT cipher_bytes AS occupied_cipher_bytes,
+       268435456 - cipher_bytes AS free_cipher_bytes,
+       CASE WHEN cipher_bytes <= 67108864 THEN 1 ELSE 0 END
+           AS ready_for_request_spool_rollout
+FROM response_archive_spool_budget
+WHERE singleton = 1;
+```
+
+Stop rollout if the row is missing or the gate is zero. Let existing workers
+drain and reclaim the backlog, then repeat the same read-only check. A new
+request subcounter is not reserved capacity: old response workers can still
+consume the shared total. Larger configured request ceilings require reviewing
+the combined encrypted request/response headroom before rollout; do not weaken
+this gate or delete captures to make an upgrade proceed.
+
+Schema 80 retains `response_archive_spool_budget.cipher_bytes` as the combined
+request/response total understood by schema-79 binaries. Its new
+`request_cipher_bytes` subcounter tracks the request portion; request mutations
+change both counters, while older response writers continue changing only the
+total. The database requires `0 <= request_cipher_bytes <= cipher_bytes`.
+
+Stop schema-80 request admission before rolling back gateways. Keep schema-80
+workers running until sealed request captures have uploaded or expired and
+their ciphertext has been reclaimed. Roll those workers back last, only when
+this read-only PostgreSQL/SQLite gate returns `safe_to_rollback = 1`:
+
+```sql
+SELECT b.cipher_bytes AS total_cipher_bytes,
+       b.request_cipher_bytes,
+       (SELECT COUNT(*) FROM request_archive_spools s
+        WHERE s.cleaned_at IS NULL
+          AND s.state IN ('capturing', 'pending', 'uploading'))
+           AS active_request_spool_rows,
+       CASE WHEN b.request_cipher_bytes = 0 AND NOT EXISTS (
+           SELECT 1 FROM request_archive_spools s
+           WHERE s.cleaned_at IS NULL
+             AND s.state IN ('capturing', 'pending', 'uploading')
+       ) THEN 1 ELSE 0 END AS safe_to_rollback
+FROM response_archive_spool_budget b
+WHERE b.singleton = 1;
+```
+
+Zero active uploads alone is insufficient: bound captures may still retain
+ciphertext awaiting bounded cleanup. Do not delete spool rows or alter the
+counters to force this gate, and retain the additive schema during rollback.
+
+All roles use the same S3 settings. Helm `config.s3.connectTimeoutMillis`,
+`requestTimeoutMillis` and `readinessDeadlineMillis` map to
+`MTC_S3_CONNECT_TIMEOUT_MILLIS`, `MTC_S3_REQUEST_TIMEOUT_MILLIS` and
+`MTC_S3_READINESS_DEADLINE_MILLIS`. Defaults remain 5000, 30000 and 5000 ms.
+Connect/readiness accept 100–30000 ms; requests accept 100–120000 ms;
+connect must not exceed request. Invalid settings fail startup. Change values
+through a controlled rolling rollout; no image rebuild is needed. This is not
+hot reload. Request timeout covers the response body, per attempt; the existing
+three-retry/ten-second retry budget remains unchanged. The canary deadline bounds
+the entire LIST/multipart-create/part-write/complete/GET/read/DELETE sequence,
+including retries. This uses the same multipart capability required by archive
+writers; ordinary PUT success does not establish writer readiness.
+
+Canary logs report operation stage, elapsed time, configured deadline, bounded
+error class and stale-success grace. The object-store abstraction does not expose
+DNS, connect or TTFB timings: `transport_phase=opaque` is intentional, and
+`transport_or_service` does not establish a network root cause. No endpoint,
+object path, credentials or raw error strings are logged. Prometheus exposes
+`memeloop_token_center_archive_canary_total` by fixed stage/outcome, cumulative
+duration and cache hits, including successful recovery. Cached checks do not
+count as new attempts. Cold startup has no stale success; later failures retain
+the existing bounded grace. Database-healthy `/readyz` remains HTTP 200 with
+`degraded` archive status; Kubernetes `/livez` is unchanged. Consumers timing
+`/readyz` must allow the configured archive deadline plus one second.
+When Kubernetes probes `/readyz`, Helm additionally rejects a probe timeout below
+`ceil(readinessDeadlineMillis / 1000) + 2` seconds, so the dependency check has
+time to report its deliberate degraded result before kubelet's deadline.
+This cross-field requirement does not apply to `/livez` probes. Defaults are
+unchanged; increasing the archive deadline requires explicitly sizing the probe.
+
 ## Release identity
 
 - Deploy immutable service and plugin-installer image digests built from the exact

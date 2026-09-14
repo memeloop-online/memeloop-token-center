@@ -57,7 +57,7 @@ test('Usage analysis keeps exact localized metrics and real trend charts contain
             const exactValues = [...document.querySelectorAll<HTMLElement>('.usage-metrics .metric-exact')].map((exact) => {
               const range = document.createRange();
               range.selectNodeContents(exact);
-              return { lines: range.getClientRects().length, text: exact.textContent };
+              return { lines: range.getClientRects().length, text: exact.textContent, title: exact.getAttribute('title') };
             });
             return {
               documentClientWidth: document.documentElement.clientWidth,
@@ -70,7 +70,7 @@ test('Usage analysis keeps exact localized metrics and real trend charts contain
           assert.equal(layout.charts.length, 3, `${locale} ${theme} ${width}px renders request, latency, and cost from the usage API`);
           assert.ok(layout.documentScrollWidth <= layout.documentClientWidth, `${locale} ${theme} ${width}px does not create page-level horizontal overflow`);
           assert.ok(layout.charts.every((chart) => chart.scrollWidth <= chart.clientWidth), `${locale} ${theme} ${width}px keeps every chart in its card`);
-          assert.ok(layout.exactValues.every((value) => value.lines === 1 && value.text), `${locale} ${theme} ${width}px retains each exact localized metric on one line`);
+          assert.ok(layout.exactValues.every((value) => value.lines === 1 && value.text && value.title), `${locale} ${theme} ${width}px retains each metric and its exact tooltip on one line`);
           if (width === 1440) assert.ok(layout.columns >= 3, 'wide layouts use all three overview trend cards');
           if (width <= 768) assert.equal(layout.columns, 1, 'mobile and tablet layouts stack overview charts in reading order');
           const screenshotPath = join(artifactRoot, `usage-analysis-${locale}-${theme}-${width}.png`);

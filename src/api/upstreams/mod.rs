@@ -1,8 +1,10 @@
 mod accounts;
 mod availability;
+mod config_secret_graph;
+mod config_secret_paths;
+mod config_secrets;
 mod health;
 mod models;
-mod native_codex_upgrade;
 mod native_oauth_import;
 mod oauth;
 mod oauth_claude;
@@ -25,9 +27,6 @@ pub(in crate::api) use health::probe_upstream_health;
 pub(crate) use models::trigger_upstream_model_sync;
 pub(in crate::api) use models::{
     aggregate_upstream_models, list_upstream_models, sync_upstream_models,
-};
-pub(in crate::api) use native_codex_upgrade::{
-    apply_native_codex_upgrade, prepare_native_codex_upgrade,
 };
 pub(in crate::api) use native_oauth_import::{
     MAX_NATIVE_KIMI_COHORT_REQUEST, import_native_kimi_oauth_cohort,

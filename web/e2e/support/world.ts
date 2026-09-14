@@ -2,13 +2,14 @@ import assert from 'node:assert/strict';
 import { World, setWorldConstructor, type IWorldOptions } from '@cucumber/cucumber';
 import type { BrowserContext, Page } from 'playwright';
 import { baseURL, runtime } from './runtime.js';
-import { isExpectedModelCatalogAbort } from './request-failures.js';
+import { isExpectedResourceAbort } from './request-failures.js';
 
 export class DogfoodWorld extends World {
   context?: BrowserContext;
   page?: Page;
   readonly consoleErrors: string[] = [];
   readonly failedRequests: string[] = [];
+  readonly serverErrorPaths: string[] = [];
 
   constructor(options: IWorldOptions) {
     super(options);
@@ -28,9 +29,16 @@ export class DogfoodWorld extends World {
       const failure = request.failure()?.errorText ?? 'unknown';
       // React intentionally aborts the long-lived SSE tail during a tab or tenant change.
       if (request.url().includes('/internal/v1/request-events') && failure.includes('ERR_ABORTED')) return;
-      // The model picker debounces searches and cancels only the superseded catalog GET.
-      if (isExpectedModelCatalogAbort(request.method(), request.url(), failure)) return;
+      // Catalog searches and monitoring snapshots cancel superseded reads on
+      // query, tenant or page changes; other failures must remain observable.
+      if (isExpectedResourceAbort(request.method(), request.url(), failure)) return;
       this.failedRequests.push(`${request.method()} ${request.url()}: ${failure}`);
+    });
+    this.page.on('response', (response) => {
+      if (response.status() < 500) return;
+      // Keep CI diagnostics safe: a pathname carries neither query values,
+      // credentials, nor response content.
+      this.serverErrorPaths.push(new URL(response.url()).pathname);
     });
   }
 
@@ -54,6 +62,7 @@ export class DogfoodWorld extends World {
   }
 
   assertNoBrowserFailures(): void {
+    assert.deepEqual(this.serverErrorPaths, [], 'browser HTTP 5xx responses were observed');
     assert.deepEqual(this.consoleErrors, [], 'browser console or page errors were observed');
     assert.deepEqual(this.failedRequests, [], 'browser requests failed');
   }

@@ -110,7 +110,11 @@ pub(in crate::api) async fn complete_claude_oauth(
                 .db
                 .upstream_account_for_reauthorization(account_id, &tenant_external_id)
                 .await?;
-            Ok((StatusCode::OK, Json(account)).into_response())
+            Ok((
+                StatusCode::OK,
+                Json(super::config_secrets::public_account(&state, account)?),
+            )
+                .into_response())
         }
         claude::ClaudeCompleteResult::Ready { lease_owner, login } => {
             finish_claude_login(&state, &service, lease_owner, *login).await
@@ -203,7 +207,7 @@ async fn finish_claude_login(
         } else {
             StatusCode::CREATED
         },
-        Json(account),
+        Json(super::config_secrets::public_account(state, account)?),
     )
         .into_response())
 }

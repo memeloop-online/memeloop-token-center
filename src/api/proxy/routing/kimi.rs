@@ -2,6 +2,7 @@ use super::super::chat_sse_usage::ChatSseUsageState;
 use super::*;
 use crate::api::{
     kimi_transport::responses,
+    proxy::upstream_response::{UPSTREAM_STREAM_ERROR, UpstreamByteStream},
     sse::{BoundedSseFramer, parse_sse_event},
 };
 use std::collections::VecDeque;
@@ -31,11 +32,11 @@ pub(super) fn prepare_forwarded_request(
 }
 
 struct StreamState {
-    upstream: super::super::upstream_response::UpstreamByteStream,
+    upstream: UpstreamByteStream,
     framer: BoundedSseFramer,
     usage: ChatSseUsageState,
     translator: responses::Stream,
-    pending: VecDeque<Result<Bytes, ()>>,
+    pending: VecDeque<Result<Bytes, &'static str>>,
     terminal: bool,
     failed: bool,
 }
@@ -74,7 +75,7 @@ impl StreamState {
     }
 }
 
-pub(super) fn translate(
+pub(in crate::api::proxy) fn translate(
     response: reqwest::Response,
     context: responses::Context,
     streaming: bool,
@@ -83,6 +84,16 @@ pub(super) fn translate(
         return Ok(response.into());
     }
     let mut parts = UpstreamResponse::from(response).into_parts();
+    if parts
+        .headers
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
+    {
+        return Err(ProxySendError::AmbiguousResponse(
+            "upstream_invalid_content_encoding",
+        ));
+    }
     let media_type = parts
         .headers
         .get(header::CONTENT_TYPE)
@@ -128,29 +139,29 @@ pub(super) fn translate(
                             if state.observe(&chunk).is_err() {
                                 state.pending.clear();
                                 state.failed = true;
-                                return Some((Err(()), state));
+                                return Some((Err(UPSTREAM_STREAM_ERROR), state));
                             }
                         }
-                        Some(Err(())) => {
+                        Some(Err(error)) => {
                             state.failed = true;
-                            return Some((Err(()), state));
+                            return Some((Err(error), state));
                         }
                         None => {
                             state.failed = true;
                             if !state.terminal || !state.framer.is_complete() {
-                                return Some((Err(()), state));
+                                return Some((Err(UPSTREAM_STREAM_ERROR), state));
                             }
                             match state.translator.finish() {
                                 Ok(events) => state
                                     .pending
                                     .extend(events.into_iter().map(|event| Ok(Bytes::from(event)))),
-                                Err(()) => return Some((Err(()), state)),
+                                Err(()) => return Some((Err(UPSTREAM_STREAM_ERROR), state)),
                             }
                         }
                     }
                 }
             },
-        )) as super::super::upstream_response::UpstreamByteStream
+        )) as UpstreamByteStream
     } else {
         Box::pin(futures_util::stream::once(async move {
             let mut upstream = parts.stream;
@@ -158,15 +169,23 @@ pub(super) fn translate(
             while let Some(chunk) = upstream.next().await {
                 let chunk = chunk?;
                 if body.len().saturating_add(chunk.len()) > MAX_PROXY_RESPONSE_BODY {
-                    return Err(());
+                    return Err(UPSTREAM_STREAM_ERROR);
                 }
                 body.extend_from_slice(&chunk);
             }
-            let value = crate::api::sse::parse_unique_json(&body).map_err(|_| ())?;
-            let response = responses::buffered(&context, &value)?;
+            body.shrink_to_fit();
+            if !crate::gateway_body::memory::bounded_json_fits(&body, MAX_PROXY_RESPONSE_BODY * 3) {
+                return Err(UPSTREAM_STREAM_ERROR);
+            }
+            let value =
+                crate::api::sse::parse_unique_json(&body).map_err(|_| UPSTREAM_STREAM_ERROR)?;
+            drop(body);
+            let response =
+                responses::buffered(&context, &value).map_err(|_| UPSTREAM_STREAM_ERROR)?;
+            drop(value);
             serde_json::to_vec(&response)
                 .map(Bytes::from)
-                .map_err(|_| ())
+                .map_err(|_| UPSTREAM_STREAM_ERROR)
         }))
     };
     parts.headers.insert(

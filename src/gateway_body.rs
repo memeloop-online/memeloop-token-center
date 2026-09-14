@@ -11,12 +11,15 @@ use axum::{
     extract::Request,
     http::header,
 };
+use futures_util::StreamExt;
+
+pub(crate) mod memory;
 
 pub(crate) const GATEWAY_BODY_READ_DEADLINE: Duration = Duration::from_secs(60);
 const MAX_DEFAULT_BODY: usize = 4 * 1024 * 1024;
 const MAX_IMAGE_BODY: usize = 16 * 1024 * 1024;
 pub(crate) const GATEWAY_BODY_ROUTE_CLASS_COUNT: usize = 4;
-pub(crate) const GATEWAY_BODY_REJECTION_REASON_COUNT: usize = 2;
+pub(crate) const GATEWAY_BODY_REJECTION_REASON_COUNT: usize = 3;
 
 /// Fixed route classes prevent request paths from becoming metric labels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,18 +58,21 @@ impl GatewayBodyRouteClass {
 pub(crate) enum GatewayBodyRejectionReason {
     DeclaredContentLengthExceedsLimit,
     BodyReadRejected,
+    CapacityExhausted,
 }
 
 impl GatewayBodyRejectionReason {
     pub(crate) const ALL: [Self; GATEWAY_BODY_REJECTION_REASON_COUNT] = [
         Self::DeclaredContentLengthExceedsLimit,
         Self::BodyReadRejected,
+        Self::CapacityExhausted,
     ];
 
     pub(crate) const fn index(self) -> usize {
         match self {
             Self::DeclaredContentLengthExceedsLimit => 0,
             Self::BodyReadRejected => 1,
+            Self::CapacityExhausted => 2,
         }
     }
 
@@ -74,6 +80,7 @@ impl GatewayBodyRejectionReason {
         match self {
             Self::DeclaredContentLengthExceedsLimit => "declared_content_length_exceeds_limit",
             Self::BodyReadRejected => "body_read_rejected",
+            Self::CapacityExhausted => "capacity_exhausted",
         }
     }
 }
@@ -117,16 +124,37 @@ impl GatewayBodyRejectionMetrics {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GatewayBodyAdmissionError {
     CapacityExhausted,
+    UnsupportedEncoding,
     Timeout,
     Rejected(GatewayBodyRejection),
 }
 
+#[cfg(test)]
 pub(crate) async fn admit_gateway_request_body(
     request: Request,
     deadline: Duration,
     permits: Arc<tokio::sync::Semaphore>,
     responses_permits: Arc<tokio::sync::Semaphore>,
     responses_maximum: usize,
+) -> Result<Request, GatewayBodyAdmissionError> {
+    admit_gateway_request_body_with_memory(
+        request,
+        deadline,
+        permits,
+        responses_permits,
+        responses_maximum,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn admit_gateway_request_body_with_memory(
+    request: Request,
+    deadline: Duration,
+    permits: Arc<tokio::sync::Semaphore>,
+    responses_permits: Arc<tokio::sync::Semaphore>,
+    responses_maximum: usize,
+    memory_budget: Option<&memory::ProxyMemoryBudget>,
 ) -> Result<Request, GatewayBodyAdmissionError> {
     // This guard is intentionally local to buffering. Downstream parsing,
     // routing, proxying and response streaming have their own limits, so a
@@ -143,7 +171,21 @@ pub(crate) async fn admit_gateway_request_body(
     let _body_read_permit = permits
         .try_acquire_owned()
         .map_err(|_| GatewayBodyAdmissionError::CapacityExhausted)?;
-    admit_request_body_for_route(request, deadline, maximum, route_class).await
+    let reservation = memory_budget
+        .filter(|_| is_text_proxy_path(request.uri().path()))
+        .map(memory::ProxyMemoryBudget::reservation);
+    admit_request_body_for_route(request, deadline, maximum, route_class, reservation).await
+}
+
+fn is_text_proxy_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/v1/responses"
+            | "/v1/chat/completions"
+            | "/v1/embeddings"
+            | "/v1/messages"
+            | "/v1/messages/count_tokens"
+    )
 }
 
 pub(crate) async fn admit_request_body(
@@ -151,7 +193,14 @@ pub(crate) async fn admit_request_body(
     deadline: Duration,
     maximum: usize,
 ) -> Result<Request, GatewayBodyAdmissionError> {
-    admit_request_body_for_route(request, deadline, maximum, GatewayBodyRouteClass::Other).await
+    admit_request_body_for_route(
+        request,
+        deadline,
+        maximum,
+        GatewayBodyRouteClass::Other,
+        None,
+    )
+    .await
 }
 
 async fn admit_request_body_for_route(
@@ -159,6 +208,7 @@ async fn admit_request_body_for_route(
     deadline: Duration,
     maximum: usize,
     route_class: GatewayBodyRouteClass,
+    reservation: Option<Arc<memory::ProxyMemoryReservation>>,
 ) -> Result<Request, GatewayBodyAdmissionError> {
     let declared_content_length = declared_content_length(request.headers());
     if request
@@ -175,7 +225,60 @@ async fn admit_request_body_for_route(
             GatewayBodyRejectionReason::DeclaredContentLengthExceedsLimit,
         ));
     }
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
+    if parts
+        .headers
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
+    {
+        return Err(GatewayBodyAdmissionError::UnsupportedEncoding);
+    }
+    if let Some(reservation) = reservation {
+        let read_maximum = declared_content_length
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or(maximum)
+            .min(maximum);
+        // A transport can yield a frame larger than a dishonest Content-Length
+        // before reporting its framing error. Always cover the route maximum
+        // before the first poll; the declared length only tightens validation.
+        if !reservation.try_grow(maximum, memory::REQUEST_MEMORY_WEIGHT) {
+            return Err(GatewayBodyAdmissionError::CapacityExhausted);
+        }
+        let read = async {
+            let mut stream = body.into_data_stream();
+            let mut retained = bytes::BytesMut::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|_| {
+                    rejected_body(
+                        route_class,
+                        declared_content_length,
+                        maximum,
+                        GatewayBodyRejectionReason::BodyReadRejected,
+                    )
+                })?;
+                if retained.len().saturating_add(chunk.len()) > read_maximum {
+                    return Err(rejected_body(
+                        route_class,
+                        declared_content_length,
+                        maximum,
+                        GatewayBodyRejectionReason::BodyReadRejected,
+                    ));
+                }
+                retained.extend_from_slice(&chunk);
+            }
+            Ok(retained.freeze())
+        };
+        let bytes = tokio::time::timeout(deadline, read)
+            .await
+            .map_err(|_| GatewayBodyAdmissionError::Timeout)??;
+        reservation.release(
+            maximum.saturating_sub(bytes.len()),
+            memory::REQUEST_MEMORY_WEIGHT,
+        );
+        parts.extensions.insert(reservation);
+        return Ok(Request::from_parts(parts, Body::from(bytes)));
+    }
     let bytes = tokio::time::timeout(deadline, to_bytes(body, maximum))
         .await
         .map_err(|_| GatewayBodyAdmissionError::Timeout)?
@@ -231,6 +334,101 @@ mod tests {
     use futures_util::stream;
 
     use super::*;
+
+    #[tokio::test]
+    async fn understated_content_length_cannot_poll_without_route_maximum_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let budget = memory::ProxyMemoryBudget::new(64 * 1024);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = polls.clone();
+        let request = Request::post("/v1/responses")
+            .header(header::CONTENT_LENGTH, "1")
+            .body(Body::from_stream(stream::poll_fn(move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                std::task::Poll::Ready(Some(Ok::<_, Infallible>(Bytes::from(vec![
+                    b'x';
+                    128 * 1024
+                ]))))
+            })))
+            .unwrap();
+        let result = admit_gateway_request_body_with_memory(
+            request,
+            Duration::from_secs(1),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            16 * 1024 * 1024,
+            Some(&budget),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(GatewayBodyAdmissionError::CapacityExhausted)
+        ));
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        assert_eq!(budget.snapshot().0, 0);
+    }
+
+    #[tokio::test]
+    async fn chunked_text_body_reserves_before_retention_and_releases_on_rejection() {
+        let budget = memory::ProxyMemoryBudget::new(64 * 1024);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .body(Body::from_stream(stream::iter([
+                Ok::<_, Infallible>(Bytes::from(vec![b'x'; 16 * 1024])),
+                Ok::<_, Infallible>(Bytes::from(vec![b'x'; 16 * 1024])),
+            ])))
+            .unwrap();
+        let result = admit_gateway_request_body_with_memory(
+            request,
+            Duration::from_secs(1),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            16 * 1024 * 1024,
+            Some(&budget),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(GatewayBodyAdmissionError::CapacityExhausted)
+        ));
+        assert!(budget.reservation().try_grow(64 * 1024, 1));
+    }
+
+    #[tokio::test]
+    async fn admitted_text_body_retains_weighted_permit_for_lifecycle_owner() {
+        let budget = memory::ProxyMemoryBudget::new(48 * 1024 * 1024);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(header::CONTENT_LENGTH, 16 * 1024)
+            .body(Body::from(vec![b'x'; 16 * 1024]))
+            .unwrap();
+        let admitted = admit_gateway_request_body_with_memory(
+            request,
+            Duration::from_secs(1),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            16 * 1024 * 1024,
+            Some(&budget),
+        )
+        .await
+        .unwrap();
+        let owner = admitted
+            .extensions()
+            .get::<Arc<memory::ProxyMemoryReservation>>()
+            .unwrap()
+            .clone();
+        drop(admitted);
+        assert_eq!(
+            budget.snapshot().0,
+            64 * 1024,
+            "EOF refunds unused route allowance"
+        );
+        drop(owner);
+        assert_eq!(budget.snapshot().0, 0);
+        assert!(budget.reservation().try_grow(48 * 1024 * 1024, 1));
+    }
 
     #[tokio::test]
     async fn absolute_deadline_rejects_a_drip_body() {

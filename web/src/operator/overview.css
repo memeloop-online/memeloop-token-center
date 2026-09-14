@@ -22,6 +22,11 @@
   width: 100%;
   height: 300px;
   min-width: 0;
+  /* ECharts owns pixel-sized canvas/tooltip descendants. Keep their previous
+     viewport size local while ResizeObserver redraws at the new host width;
+     they must not enlarge the card or the document during a breakpoint change. */
+  contain: inline-size;
+  overflow: hidden;
 }
 
 .overview-trend-data {

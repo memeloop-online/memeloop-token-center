@@ -22,7 +22,7 @@ use crate::{
     },
 };
 
-static PLUGIN_EXECUTION_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+use super::plugin_execution::{self, Phase};
 
 #[cfg(test)]
 tokio::task_local! {
@@ -42,18 +42,24 @@ where
 
 pub(super) async fn proxy_openai_chat(
     State(state): State<AppState>,
+    axum::Extension(memory): axum::Extension<
+        std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    >,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    super::proxy::proxy(state, headers, body, Protocol::OpenAiChat).await
+    super::proxy::proxy(state, headers, body, Protocol::OpenAiChat, memory).await
 }
 
 pub(super) async fn proxy_openai_responses(
     State(state): State<AppState>,
+    axum::Extension(memory): axum::Extension<
+        std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    >,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    super::proxy::proxy(state, headers, body, Protocol::OpenAiResponses).await
+    super::proxy::proxy(state, headers, body, Protocol::OpenAiResponses, memory).await
 }
 
 /// Temporary transport negotiation for clients that probe the Responses
@@ -79,26 +85,35 @@ pub(super) async fn negotiate_openai_responses_websocket() -> Response {
 
 pub(super) async fn proxy_openai_embeddings(
     State(state): State<AppState>,
+    axum::Extension(memory): axum::Extension<
+        std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    >,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    super::proxy::proxy(state, headers, body, Protocol::OpenAiEmbeddings).await
+    super::proxy::proxy(state, headers, body, Protocol::OpenAiEmbeddings, memory).await
 }
 
 pub(super) async fn proxy_anthropic(
     State(state): State<AppState>,
+    axum::Extension(memory): axum::Extension<
+        std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    >,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    super::proxy::proxy(state, headers, body, Protocol::AnthropicMessages).await
+    super::proxy::proxy(state, headers, body, Protocol::AnthropicMessages, memory).await
 }
 
 pub(super) async fn proxy_anthropic_count_tokens(
     State(state): State<AppState>,
+    axum::Extension(memory): axum::Extension<
+        std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    >,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    super::proxy::proxy(state, headers, body, Protocol::AnthropicCountTokens).await
+    super::proxy::proxy(state, headers, body, Protocol::AnthropicCountTokens, memory).await
 }
 
 #[derive(Clone, Copy)]
@@ -208,6 +223,26 @@ pub(super) async fn apply_traffic_policy(
     protocols: TrafficPolicyProtocols<'_>,
     original_request_json: Value,
 ) -> Result<AppliedTraffic, AppError> {
+    apply_traffic_policy_inner(state, key, protocols, original_request_json, None).await
+}
+
+pub(super) async fn apply_traffic_policy_with_memory(
+    state: &AppState,
+    key: &AuthenticatedKey,
+    protocols: TrafficPolicyProtocols<'_>,
+    original_request_json: Value,
+    memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+) -> Result<AppliedTraffic, AppError> {
+    apply_traffic_policy_inner(state, key, protocols, original_request_json, Some(memory)).await
+}
+
+async fn apply_traffic_policy_inner(
+    state: &AppState,
+    key: &AuthenticatedKey,
+    protocols: TrafficPolicyProtocols<'_>,
+    original_request_json: Value,
+    memory: Option<std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>>,
+) -> Result<AppliedTraffic, AppError> {
     let requested_model = requested_traffic_model(&original_request_json)?;
     authorize_traffic_model(state, key, protocols.routing, &requested_model).await?;
     let applied = apply_traffic_plugin(
@@ -216,6 +251,7 @@ pub(super) async fn apply_traffic_policy(
         protocols.client,
         original_request_json,
         requested_model,
+        memory,
     )
     .await?;
     authorize_traffic_model(state, key, protocols.routing, &applied.model).await?;
@@ -239,6 +275,7 @@ pub(super) async fn apply_traffic_plugin_for_existing_idempotency(
         client_protocol,
         original_request_json,
         requested_model,
+        None,
     )
     .await
 }
@@ -293,12 +330,40 @@ async fn apply_traffic_plugin(
     client_protocol: &str,
     original_request_json: Value,
     requested_model: String,
+    memory: Option<std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>>,
 ) -> Result<AppliedTraffic, AppError> {
     let plugins = state.plugins.clone();
+    if !plugins.has_traffic_hooks() {
+        return Ok(AppliedTraffic {
+            request_json: original_request_json,
+            requested_model: requested_model.clone(),
+            model: requested_model,
+            upstream_account_hint: None,
+        });
+    }
+    let temporary_memory = if memory.is_some() {
+        let input_length =
+            crate::gateway_body::memory::json_encoded_length(&original_request_json)?;
+        Some(
+            state
+                .proxy_memory_budget
+                .temporary(64 * 1024 * 1024 + input_length.max(16 * 1024 * 1024).saturating_mul(5))
+                .map_err(|error| {
+                    state.metrics.observe_proxy_memory_error(
+                        crate::metrics::ProxyMemoryRejectionStage::Plugin,
+                        error,
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
     let plugin_configurations = plugins
         .resolved_traffic_configurations(key.tenant_id)
         .await?;
     let plugin_request = original_request_json.clone();
+    #[cfg(feature = "experimental-plugin-revisions")]
+    let application_snapshot = state.pinned_application_plugins.clone();
     let plugin_context = RequestContext {
         tenant_id: key.tenant_id.to_string(),
         principal_id: key.principal_id.to_string(),
@@ -307,19 +372,35 @@ async fn apply_traffic_plugin(
         model: requested_model.clone(),
         config_json: "{}".to_owned(),
     };
-    let plugin_permit =
-        tokio::time::timeout(Duration::from_secs(1), PLUGIN_EXECUTION_PERMITS.acquire())
-            .await
-            .map_err(|_| AppError::Upstream("plugin execution capacity is exhausted".into()))?
-            .map_err(|_| AppError::Internal)?;
-    let plugin_task = tokio::task::spawn_blocking(move || {
-        let _plugin_permit = plugin_permit;
-        plugins.apply_traffic_with_config(plugin_context, &plugin_request, &plugin_configurations)
-    });
-    let plugin_decision = tokio::time::timeout(Duration::from_secs(35), plugin_task)
-        .await
-        .map_err(|_| AppError::Upstream("plugin execution timed out".into()))?
-        .map_err(|error| AppError::Upstream(format!("plugin task failed: {error}")))??;
+    let metrics = state.metrics.clone();
+    let plugin_decision =
+        plugin_execution::run(state.metrics.clone(), Phase::PostAuth, move || {
+            let _temporary_memory = temporary_memory;
+            let result = (|| {
+                #[cfg(feature = "experimental-plugin-revisions")]
+                if let Some(snapshot) = application_snapshot {
+                    return snapshot.runtime.apply_traffic_with_config_and_memory(
+                        plugin_context,
+                        &plugin_request,
+                        &plugin_configurations,
+                        memory.as_deref(),
+                    );
+                }
+                plugins.apply_traffic_with_config_and_memory(
+                    plugin_context,
+                    &plugin_request,
+                    &plugin_configurations,
+                    memory.as_deref(),
+                )
+            })();
+            result.map_err(|error| {
+                metrics.observe_proxy_memory_error(
+                    crate::metrics::ProxyMemoryRejectionStage::Plugin,
+                    error,
+                )
+            })
+        })
+        .await?;
     if !plugin_decision.allow {
         plugin_decision.log_denial();
         return Err(AppError::Forbidden);
@@ -347,11 +428,7 @@ async fn apply_traffic_plugin(
         ));
     }
     request_json["model"] = Value::String(model.clone());
-    if serde_json::to_vec(&request_json)
-        .map_err(|_| AppError::Internal)?
-        .len()
-        > MAX_IMAGE_REQUEST_BODY
-    {
+    if crate::gateway_body::memory::json_encoded_length(&request_json)? > MAX_IMAGE_REQUEST_BODY {
         return Err(AppError::Upstream(
             "plugin-rewritten request exceeds 16 MiB".into(),
         ));
@@ -378,6 +455,7 @@ pub(super) async fn prepare_component_provider(
     context: RequestContext,
     config: Value,
     request_json: Value,
+    memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 ) -> Result<PreparedProviderRequest, AppError> {
     #[cfg(test)]
     let _ = TEST_COMPONENT_PREPARE_COUNTER.try_with(|counter| {
@@ -385,21 +463,14 @@ pub(super) async fn prepare_component_provider(
     });
     let plugins = state.plugins.clone();
     let provider_id = provider_id.to_owned();
-    let permit = tokio::time::timeout(Duration::from_secs(1), PLUGIN_EXECUTION_PERMITS.acquire())
-        .await
-        .map_err(|_| AppError::Upstream("plugin execution capacity is exhausted".into()))?
-        .map_err(|_| AppError::Internal)?;
-    let task = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
+    plugin_execution::run(state.metrics.clone(), Phase::Prepare, move || {
+        let _memory = memory;
         plugins.prepare_provider_request(&provider_id, context, &config, &request_json)
-    });
-    tokio::time::timeout(Duration::from_secs(35), task)
-        .await
-        .map_err(|_| AppError::Upstream("component provider prepare timed out".into()))?
-        .map_err(|error| AppError::Upstream(format!("component provider task failed: {error}")))??
-        .ok_or_else(|| {
-            AppError::Upstream("component provider adapter is declared but unavailable".into())
-        })
+    })
+    .await?
+    .ok_or_else(|| {
+        AppError::Upstream("component provider adapter is declared but unavailable".into())
+    })
 }
 
 pub(super) async fn normalize_component_provider(
@@ -410,23 +481,25 @@ pub(super) async fn normalize_component_provider(
     headers: BTreeMap<String, String>,
     body: Vec<u8>,
 ) -> Result<NormalizedProviderResponse, AppError> {
+    let temporary_memory = state
+        .proxy_memory_budget
+        .temporary(64 * 1024 * 1024 + body.len().saturating_mul(6))
+        .map_err(|error| {
+            state.metrics.observe_proxy_memory_error(
+                crate::metrics::ProxyMemoryRejectionStage::Plugin,
+                error,
+            )
+        })?;
     let plugins = state.plugins.clone();
     let provider_id = provider_id.to_owned();
-    let permit = tokio::time::timeout(Duration::from_secs(1), PLUGIN_EXECUTION_PERMITS.acquire())
-        .await
-        .map_err(|_| AppError::Upstream("plugin execution capacity is exhausted".into()))?
-        .map_err(|_| AppError::Internal)?;
-    let task = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
+    plugin_execution::run(state.metrics.clone(), Phase::Normalize, move || {
+        let _temporary_memory = temporary_memory;
         plugins.normalize_provider_response(&provider_id, context, status, &headers, &body)
-    });
-    tokio::time::timeout(Duration::from_secs(35), task)
-        .await
-        .map_err(|_| AppError::Upstream("component provider normalize timed out".into()))?
-        .map_err(|error| AppError::Upstream(format!("component provider task failed: {error}")))??
-        .ok_or_else(|| {
-            AppError::Upstream("component provider adapter is declared but unavailable".into())
-        })
+    })
+    .await?
+    .ok_or_else(|| {
+        AppError::Upstream("component provider adapter is declared but unavailable".into())
+    })
 }
 
 pub(super) fn component_provider_url(base_url: &str, path: &str) -> Result<String, AppError> {

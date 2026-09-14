@@ -22,6 +22,18 @@ use crate::{
     provider::ProviderType,
 };
 
+#[cfg(feature = "experimental-plugin-revisions")]
+pub mod application;
+mod configuration;
+/// Experimental lifecycle primitives; application integration is separately
+/// host-opted-in through `application` and never enabled by the production binary.
+#[cfg(feature = "experimental-plugin-revisions")]
+pub mod lifecycle;
+mod ui_projection;
+pub use configuration::{
+    ConfigurationSource, ResolvedConfigurationRevision, ResolvedTrafficSnapshot,
+};
+
 const PLUGIN_FUEL: u64 = 5_000_000;
 const PLUGIN_MEMORY_BYTES: usize = 32 * 1024 * 1024;
 const PLUGIN_TABLE_ELEMENTS: usize = 100_000;
@@ -144,6 +156,7 @@ pub enum PluginOperatorUiSlot {
 #[serde(rename_all = "snake_case")]
 pub enum PluginOperatorUiPresentation {
     HealthIntelligenceV1,
+    ProjectionV1,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -271,7 +284,7 @@ fn empty_json_object() -> Value {
     serde_json::json!({})
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PluginCapability {
     Log,
@@ -284,13 +297,43 @@ struct LoadedPlugin {
     manifest: PluginManifest,
     component: Option<Component>,
     configuration_validator: Option<crate::schema::CompiledSchema>,
+    #[cfg(feature = "experimental-plugin-revisions")]
+    identity: PluginPackageIdentity,
+}
+
+#[cfg(feature = "experimental-plugin-revisions")]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginInstallProvenance {
+    pub format_version: u8,
+    pub source: String,
+    pub digest: String,
+    pub signature_policy: String,
+}
+
+#[cfg(feature = "experimental-plugin-revisions")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PluginPackageIdentity {
+    pub component_sha256: Option<String>,
+    pub provenance: Option<PluginInstallProvenance>,
 }
 
 #[derive(Clone)]
 struct CachedPluginConfigurations {
     loaded_at: Instant,
-    values: BTreeMap<String, Value>,
+    snapshot: ResolvedTrafficSnapshot,
     estimated_bytes: usize,
+}
+
+#[derive(Default)]
+struct ConfigurationCache {
+    // An identity token cannot wrap/reuse a counter while an old read holds it.
+    epoch: Arc<()>,
+    read_generation: u64,
+    // Fixed-size completion fences survive value eviction and uncached reads.
+    // Hash collisions conservatively fence older reads for another tenant.
+    published_generations: [u64; 32],
+    entries: BTreeMap<Uuid, CachedPluginConfigurations>,
 }
 
 #[derive(Clone)]
@@ -404,10 +447,22 @@ pub struct PluginRuntime {
     kv: Option<PluginKv>,
     plugins: Arc<Vec<LoadedPlugin>>,
     providers: Arc<Vec<ProviderType>>,
-    configuration_cache: Arc<tokio::sync::RwLock<BTreeMap<Uuid, CachedPluginConfigurations>>>,
+    configuration_cache: Arc<tokio::sync::RwLock<ConfigurationCache>>,
     service_data_cache: Arc<tokio::sync::RwLock<BTreeMap<String, CachedPluginServiceData>>>,
     execution_timeout: Duration,
     fuel: u64,
+    #[cfg(feature = "experimental-plugin-revisions")]
+    _epoch_task: Option<Arc<EpochTask>>,
+}
+
+#[cfg(feature = "experimental-plugin-revisions")]
+struct EpochTask(tokio::task::JoinHandle<()>);
+
+#[cfg(feature = "experimental-plugin-revisions")]
+impl Drop for EpochTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[derive(Clone)]
@@ -423,6 +478,22 @@ struct HostState {
     kv: Option<PluginKv>,
     limits: StoreLimits,
     deadline: Instant,
+}
+
+#[cfg(feature = "experimental-plugin-revisions")]
+fn read_identity_bytes(path: &Path, maximum: u64) -> Result<Vec<u8>, AppError> {
+    use std::io::Read;
+    let file = fs::File::open(path).map_err(|_| plugin_runtime_failure("package_read"))?;
+    let mut bytes = Vec::new();
+    file.take(maximum + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| plugin_runtime_failure("package_read"))?;
+    if bytes.len() as u64 > maximum {
+        return Err(AppError::BadRequest(
+            "plugin file exceeds size limit".into(),
+        ));
+    }
+    Ok(bytes)
 }
 
 impl PluginRuntime {
@@ -444,13 +515,17 @@ impl PluginRuntime {
         let engine = Engine::new(&engine_config)
             .map_err(|_| plugin_runtime_failure("engine_initialization"))?;
         let epoch_engine = engine.clone();
-        tokio::spawn(async move {
+        let epoch_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(PLUGIN_EPOCH_TICK);
             loop {
                 interval.tick().await;
                 epoch_engine.increment_epoch();
             }
         });
+        #[cfg(feature = "experimental-plugin-revisions")]
+        let epoch_task = Arc::new(EpochTask(epoch_task));
+        #[cfg(not(feature = "experimental-plugin-revisions"))]
+        drop(epoch_task); // Preserve the default loader's detached epoch timer.
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(30))
@@ -492,6 +567,7 @@ impl PluginRuntime {
                 }
                 providers.push(provider);
             }
+            #[cfg(not(feature = "experimental-plugin-revisions"))]
             let component = manifest
                 .wasm
                 .as_deref()
@@ -503,6 +579,49 @@ impl PluginRuntime {
                     })
                 })
                 .transpose()?;
+            #[cfg(feature = "experimental-plugin-revisions")]
+            let (component, identity) = {
+                let component_bytes = manifest
+                    .wasm
+                    .as_deref()
+                    .map(|wasm| {
+                        let wasm_path = safe_child(&directory, wasm)?;
+                        require_file_size(&wasm_path, PLUGIN_COMPONENT_BYTES, "plugin component")?;
+                        read_identity_bytes(&wasm_path, PLUGIN_COMPONENT_BYTES)
+                    })
+                    .transpose()?;
+                use sha2::{Digest, Sha256};
+                let component_sha256 = component_bytes
+                    .as_ref()
+                    .map(|bytes| format!("sha256:{:x}", Sha256::digest(bytes)));
+                // Compile exactly the bytes that were hashed, never reopen a path.
+                let component = component_bytes
+                    .as_ref()
+                    .map(|bytes| {
+                        Component::new(&engine, bytes).map_err(|_| {
+                            AppError::BadRequest("plugin component cannot be compiled".into())
+                        })
+                    })
+                    .transpose()?;
+                let receipt_path = directory.join(".mtc-oci-install.json");
+                let provenance = if receipt_path.exists() {
+                    let path = safe_child(&directory, ".mtc-oci-install.json")?;
+                    Some(
+                        serde_json::from_slice(&read_identity_bytes(&path, 16 * 1024)?).map_err(
+                            |_| AppError::BadRequest("invalid plugin install receipt".into()),
+                        )?,
+                    )
+                } else {
+                    None
+                };
+                (
+                    component,
+                    PluginPackageIdentity {
+                        component_sha256,
+                        provenance,
+                    },
+                )
+            };
             let configuration_validator = manifest
                 .contributions
                 .configuration
@@ -513,9 +632,15 @@ impl PluginRuntime {
                 manifest,
                 component,
                 configuration_validator,
+                #[cfg(feature = "experimental-plugin-revisions")]
+                identity,
             });
         }
         validate_loaded_operator_ui_contributions(&plugins)?;
+        // Manifest ordering belongs only to the explicit revision contract.
+        // Default builds retain the existing sorted-directory precedence.
+        #[cfg(feature = "experimental-plugin-revisions")]
+        plugins.sort_by(|left, right| left.manifest.id.cmp(&right.manifest.id));
 
         Ok(Self {
             engine: Some(engine),
@@ -528,6 +653,8 @@ impl PluginRuntime {
             service_data_cache: Arc::default(),
             execution_timeout: PLUGIN_EXECUTION_TIMEOUT,
             fuel: PLUGIN_FUEL,
+            #[cfg(feature = "experimental-plugin-revisions")]
+            _epoch_task: Some(epoch_task),
         })
     }
 
@@ -542,6 +669,14 @@ impl PluginRuntime {
             .collect()
     }
 
+    #[cfg(feature = "experimental-plugin-revisions")]
+    pub fn package_identities(&self) -> BTreeMap<String, PluginPackageIdentity> {
+        self.plugins
+            .iter()
+            .map(|plugin| (plugin.manifest.id.clone(), plugin.identity.clone()))
+            .collect()
+    }
+
     /// A bounded, aggregate-only snapshot for operational metrics. Tenant and
     /// plugin identifiers never leave the cache through this interface.
     pub async fn runtime_metrics(&self) -> PluginRuntimeMetrics {
@@ -550,9 +685,11 @@ impl PluginRuntime {
         PluginRuntimeMetrics {
             loaded_plugins: self.plugins.len(),
             cache_entries: configuration_cache
+                .entries
                 .len()
                 .saturating_add(service_data_cache.len()),
             cache_bytes: configuration_cache
+                .entries
                 .values()
                 .fold(0usize, |total, entry| {
                     total.saturating_add(entry.estimated_bytes)
@@ -763,112 +900,19 @@ impl PluginRuntime {
         &self,
         tenant_id: Uuid,
     ) -> Result<BTreeMap<String, Value>, AppError> {
-        let configurable: Vec<_> = self
-            .plugins
-            .iter()
-            .filter(|plugin| {
-                (plugin.manifest.contributions.traffic_policy
-                    || plugin.manifest.contributions.request_rewrite)
-                    && plugin.manifest.contributions.configuration.is_some()
-            })
-            .collect();
-        if configurable.is_empty() {
-            return Ok(BTreeMap::new());
-        }
-        if let Some(cached) = self.configuration_cache.read().await.get(&tenant_id)
-            && cached.loaded_at.elapsed() < PLUGIN_CONFIGURATION_CACHE_TTL
-        {
-            return Ok(cached.values.clone());
-        }
-        let database = &self.kv.as_ref().ok_or(AppError::Internal)?.database;
-        let layers = database.plugin_configuration_layers(tenant_id).await?;
-        let mut resolved = BTreeMap::new();
-        for plugin in configurable {
-            let contribution = plugin
-                .manifest
-                .contributions
-                .configuration
-                .as_ref()
-                .expect("filtered configurable plugin");
-            let stored = layers
-                .iter()
-                .find(|layer| {
-                    layer.plugin_id == plugin.manifest.id && layer.tenant_id == Some(tenant_id)
-                })
-                .or_else(|| {
-                    layers.iter().find(|layer| {
-                        layer.plugin_id == plugin.manifest.id && layer.tenant_id.is_none()
-                    })
-                });
-            let value = stored
-                .map(|configuration| configuration.value.clone())
-                .unwrap_or_else(|| contribution.default.clone());
-            plugin
-                .configuration_validator
-                .as_ref()
-                .ok_or(AppError::Internal)?
-                .validate(&value)?;
-            resolved.insert(plugin.manifest.id.clone(), value);
-        }
-        self.cache_resolved_configurations(tenant_id, resolved.clone())
-            .await;
-        Ok(resolved)
-    }
-
-    async fn cache_resolved_configurations(
-        &self,
-        tenant_id: Uuid,
-        values: BTreeMap<String, Value>,
-    ) {
-        let estimated_bytes = values.iter().fold(0usize, |total, (plugin_id, value)| {
-            total
-                .saturating_add(plugin_id.len())
-                .saturating_add(estimated_json_bytes(value))
-        });
-        if estimated_bytes > PLUGIN_CONFIGURATION_CACHE_BYTES {
-            return;
-        }
-        let now = Instant::now();
-        let mut cache = self.configuration_cache.write().await;
-        cache.retain(|_, entry| {
-            now.duration_since(entry.loaded_at) <= PLUGIN_CONFIGURATION_CACHE_TTL
-        });
-        cache.remove(&tenant_id);
-        loop {
-            let current_bytes = cache.values().fold(0usize, |total, entry| {
-                total.saturating_add(entry.estimated_bytes)
-            });
-            if cache.len() < PLUGIN_CONFIGURATION_CACHE_ENTRIES
-                && current_bytes.saturating_add(estimated_bytes) <= PLUGIN_CONFIGURATION_CACHE_BYTES
-            {
-                break;
-            }
-            let Some(oldest) = cache
-                .iter()
-                .min_by_key(|(_, entry)| entry.loaded_at)
-                .map(|(id, _)| *id)
-            else {
-                break;
-            };
-            cache.remove(&oldest);
-        }
-        cache.insert(
-            tenant_id,
-            CachedPluginConfigurations {
-                loaded_at: now,
-                values,
-                estimated_bytes,
-            },
-        );
+        Ok(self.resolved_traffic_snapshot(tenant_id).await?.values)
     }
 
     pub async fn invalidate_configuration_cache(&self, tenant_id: Option<Uuid>) {
         let mut cache = self.configuration_cache.write().await;
+        // Publish the fence and remove entries under the same lock as refill.
+        // A tenant write also fences other in-flight reads, conservatively.
+        cache.epoch = Arc::new(());
         if let Some(tenant_id) = tenant_id {
-            cache.remove(&tenant_id);
+            cache.entries.remove(&tenant_id);
         } else {
             // A global write may affect every tenant without an override.
-            cache.clear();
+            cache.entries.clear();
         }
     }
 
@@ -921,6 +965,24 @@ impl PluginRuntime {
         context: types::RequestContext,
         request_json: &Value,
         configurations: &BTreeMap<String, Value>,
+    ) -> Result<TrafficDecision, AppError> {
+        self.apply_traffic_with_config_and_memory(context, request_json, configurations, None)
+    }
+
+    pub(crate) fn has_traffic_hooks(&self) -> bool {
+        self.engine.is_some()
+            && self.plugins.iter().any(|plugin| {
+                plugin.manifest.contributions.traffic_policy
+                    || plugin.manifest.contributions.request_rewrite
+            })
+    }
+
+    pub(crate) fn apply_traffic_with_config_and_memory(
+        &self,
+        context: types::RequestContext,
+        request_json: &Value,
+        configurations: &BTreeMap<String, Value>,
+        memory: Option<&crate::gateway_body::memory::ProxyMemoryReservation>,
     ) -> Result<TrafficDecision, AppError> {
         let Some(engine) = &self.engine else {
             return Ok(TrafficDecision {
@@ -1013,6 +1075,12 @@ impl PluginRuntime {
                         validate_plugin_text(account_id, MAX_TRAFFIC_ACCOUNT_ID_BYTES, false)
                             .is_ok()
                     });
+            if let (Some(memory), Some(rewrite)) = (memory, result.request_json.as_deref())
+                && (rewrite.len() > MAX_TRAFFIC_REQUEST_JSON_BYTES
+                    || !memory.try_reserve_rewrite(rewrite.as_bytes()))
+            {
+                return Err(AppError::Overloaded);
+            }
             let validated_request = result
                 .request_json
                 .as_deref()
@@ -2481,18 +2549,31 @@ mod tests {
     #[tokio::test]
     async fn plugin_configuration_cache_has_entry_and_byte_bounds() {
         let runtime = PluginRuntime::default();
+        let epoch = runtime.configuration_cache.read().await.epoch.clone();
         for index in 0..(PLUGIN_CONFIGURATION_CACHE_ENTRIES + 10) {
             runtime
-                .cache_resolved_configurations(
-                    Uuid::from_u128(index as u128 + 1),
-                    BTreeMap::from([("plugin".to_owned(), Value::String("x".repeat(512 * 1024)))]),
+                .cache_snapshot(
+                    &epoch,
+                    index as u64 + 1,
+                    Instant::now(),
+                    ResolvedTrafficSnapshot {
+                        tenant_id: Uuid::from_u128(index as u128 + 1),
+                        values: BTreeMap::from([(
+                            "plugin".to_owned(),
+                            Value::String("x".repeat(512 * 1024)),
+                        )]),
+                        revisions: BTreeMap::new(),
+                        freshness_deadline: Instant::now() + PLUGIN_CONFIGURATION_CACHE_TTL,
+                    },
+                    Instant::now,
                 )
                 .await;
         }
         let cache = runtime.configuration_cache.read().await;
-        assert!(cache.len() <= PLUGIN_CONFIGURATION_CACHE_ENTRIES);
+        assert!(cache.entries.len() <= PLUGIN_CONFIGURATION_CACHE_ENTRIES);
         assert!(
             cache
+                .entries
                 .values()
                 .map(|entry| entry.estimated_bytes)
                 .sum::<usize>()

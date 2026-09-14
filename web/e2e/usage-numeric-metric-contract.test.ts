@@ -10,6 +10,14 @@ import { createServer } from 'vite';
 
 const webRoot = fileURLToPath(new URL('..', import.meta.url));
 const viewportWidths = [320, 390, 768, 1024, 1440, 1920, 2560] as const;
+const displayValuesByLabel: Record<string, string> = {
+  Requests: '1.25T',
+  Failures: '1.25T',
+  'Total tokens': '3.13T',
+  'Generation billing units': '1.25T',
+  'Cached tokens': '1.25T',
+  'Cache-write tokens': '1.25T',
+};
 const exactValuesByLabel: Record<string, string> = {
   Requests: '1,250,000,000,000',
   Failures: '1,250,000,000,000',
@@ -71,6 +79,7 @@ test('UsageAnalysis keeps every rendered NumericMetric exact value on one readab
                 exactFontSize: exact ? Number.parseFloat(getComputedStyle(exact).fontSize) : undefined,
                 exactLineCount: exact ? range.getClientRects().length : undefined,
                 exactText: exact?.textContent,
+                exactTitle: exact?.getAttribute('title'),
                 label: card.querySelector('.metric-label')?.textContent,
                 metricClientWidth: card.clientWidth,
                 metricScrollWidth: card.scrollWidth,
@@ -84,11 +93,13 @@ test('UsageAnalysis keeps every rendered NumericMetric exact value on one readab
         const numericCards = layout.cards.filter((card) => card.exactText !== undefined);
         assert.equal(numericCards.length, 6, `${theme} ${width}px fixture must render all UsageAnalysis NumericMetric cards`);
         for (const card of numericCards) {
+          const expectedDisplay = card.label ? displayValuesByLabel[card.label] : undefined;
           const expectedExact = card.label ? exactValuesByLabel[card.label] : undefined;
-          assert.ok(expectedExact, `${theme} ${width}px NumericMetric must retain its expected UsageAnalysis label`);
-          assert.equal(card.exactText, expectedExact, `${theme} ${width}px ${card.label} NumericMetric must expose its full formatted value`);
-          assert.equal(card.exactLineCount, 1, `${theme} ${width}px NumericMetric exact value must not wrap`);
-          assert.equal(card.exactFontSize, card.valueFontSize, `${theme} ${width}px NumericMetric exact value must remain primary`);
+          assert.ok(expectedDisplay && expectedExact, `${theme} ${width}px NumericMetric must retain its expected UsageAnalysis label`);
+          assert.equal(card.exactText, expectedDisplay, `${theme} ${width}px ${card.label} NumericMetric must expose its localized compact value`);
+          assert.equal(card.exactTitle, expectedExact, `${theme} ${width}px ${card.label} NumericMetric must retain full precision in its tooltip`);
+          assert.equal(card.exactLineCount, 1, `${theme} ${width}px NumericMetric display value must not wrap`);
+          assert.equal(card.exactFontSize, card.valueFontSize, `${theme} ${width}px NumericMetric display value must remain primary`);
           assert.ok(card.valueLineHeight >= card.valueFontSize * 1.1, `${theme} ${width}px NumericMetric line-height must remain readable`);
         }
         for (const card of layout.cards) assert.ok(card.metricScrollWidth <= card.metricClientWidth, `${theme} ${width}px UsageAnalysis metric card must not overflow`);

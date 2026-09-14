@@ -2,6 +2,7 @@ pub mod api;
 pub mod archive;
 pub mod archive_reaper;
 pub mod archive_staging;
+mod codex_clients;
 pub mod config;
 pub mod conversation;
 pub mod crypto;
@@ -56,15 +57,21 @@ pub struct AppState {
     pub db: Database,
     pub archive: ArchiveStore,
     pub http: reqwest::Client,
-    pub(crate) codex_http: wreq::Client,
+    pub(crate) codex_clients: Arc<codex_clients::CodexClients>,
     pub providers: ProviderCatalog,
     pub plugins: PluginRuntime,
+    #[cfg(feature = "experimental-plugin-revisions")]
+    pub(crate) application_plugins: Option<Arc<plugin::application::ApplicationPlugins>>,
+    #[cfg(feature = "experimental-plugin-revisions")]
+    pub(crate) pinned_application_plugins:
+        Option<Arc<plugin::application::ApplicationPluginSnapshot>>,
     pub metrics: metrics::Metrics,
     pub(crate) request_event_streams: request_event_stream::RequestEventStreamLimiter,
     pub(crate) gateway_body_read_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) responses_body_read_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) gateway_body_rejections: Arc<gateway_body::GatewayBodyRejectionMetrics>,
     pub(crate) proxy_lifecycle_permits: Arc<tokio::sync::Semaphore>,
+    pub(crate) proxy_memory_budget: Arc<gateway_body::memory::ProxyMemoryBudget>,
     pub(crate) proxy_archive_stream_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) upstream_quota: Arc<upstream_quota::QuotaCache>,
 }
@@ -79,11 +86,19 @@ pub enum InitializationError {
     Plugin,
     #[error("HTTP client initialization failed")]
     HttpClient,
+    #[error("invalid proxy memory budget")]
+    ProxyMemoryBudget,
 }
 
 impl AppState {
     pub async fn initialize(config: Config) -> Result<Self, InitializationError> {
+        config
+            .validate_proxy_memory_budget()
+            .map_err(|_| InitializationError::ProxyMemoryBudget)?;
         let proxy_lifecycle_concurrency = config.proxy_lifecycle_concurrency as usize;
+        let proxy_memory_budget = Arc::new(gateway_body::memory::ProxyMemoryBudget::new(
+            config.proxy_memory_budget_bytes,
+        ));
         let gateway_body_read_concurrency = config.gateway_body_read_concurrency as usize;
         let responses_body_read_concurrency = config.responses_body_read_concurrency as usize;
         if config.run_migrations_on_start {
@@ -122,6 +137,10 @@ impl AppState {
             archive,
             providers,
             plugins,
+            #[cfg(feature = "experimental-plugin-revisions")]
+            application_plugins: None,
+            #[cfg(feature = "experimental-plugin-revisions")]
+            pinned_application_plugins: None,
             metrics: metrics::Metrics::default(),
             request_event_streams: request_event_stream::RequestEventStreamLimiter::default(),
             upstream_quota: Arc::new(upstream_quota::QuotaCache::default()),
@@ -135,16 +154,60 @@ impl AppState {
             proxy_lifecycle_permits: Arc::new(tokio::sync::Semaphore::new(
                 proxy_lifecycle_concurrency,
             )),
+            proxy_memory_budget,
             proxy_archive_stream_permits: Arc::new(tokio::sync::Semaphore::new(
                 PROXY_ARCHIVE_STREAM_CONCURRENCY,
             )),
             http: build_http_client().map_err(|_| InitializationError::HttpClient)?,
-            codex_http: build_codex_http_client().map_err(|_| InitializationError::HttpClient)?,
+            codex_clients: Arc::new(codex_clients::CodexClients::default()),
         })
+    }
+
+    /// Explicit host-only draft opt-in. Configuration, HTTP input and plugin
+    /// guests cannot grant inventory access or enable revision publication.
+    #[cfg(feature = "experimental-plugin-revisions")]
+    pub fn with_application_plugin_inventory(
+        mut self,
+        inventory: std::collections::BTreeMap<String, plugin::application::PreinstalledInventory>,
+    ) -> Result<Self, error::AppError> {
+        self.application_plugins = Some(Arc::new(plugin::application::ApplicationPlugins::new(
+            self.db.clone(),
+            inventory,
+            &self.plugins,
+        )?));
+        self.pinned_application_plugins = None;
+        Ok(self)
+    }
+
+    /// Called once at a request entry point. A cloned request state retains the
+    /// atomic runtime/catalog pair through policy, prepare, retries and normalize.
+    pub(crate) async fn pin_application_plugins(self) -> Result<Self, error::AppError> {
+        #[cfg(feature = "experimental-plugin-revisions")]
+        {
+            let mut state = self;
+            if state.pinned_application_plugins.is_none()
+                && let Some(authority) = &state.application_plugins
+            {
+                let snapshot = authority.pin().await?;
+                state.plugins = snapshot.runtime.runtime().clone();
+                state.providers = snapshot.providers.clone();
+                state.pinned_application_plugins = Some(snapshot);
+            }
+            Ok(state)
+        }
+        #[cfg(not(feature = "experimental-plugin-revisions"))]
+        Ok(self)
     }
 }
 
+#[cfg(test)]
 fn build_codex_http_client() -> Result<wreq::Client, wreq::Error> {
+    build_codex_http_client_with_policy(provider::CodexTransportPolicy::default())
+}
+
+fn build_codex_http_client_with_policy(
+    policy: provider::CodexTransportPolicy,
+) -> Result<wreq::Client, wreq::Error> {
     use wreq_util::{Emulation, Platform, Profile};
 
     let emulation = Emulation::builder()
@@ -156,15 +219,14 @@ fn build_codex_http_client() -> Result<wreq::Client, wreq::Error> {
         .headers(false)
         .build();
     wreq::Client::builder()
-        .connect_timeout(HTTP_CONNECT_TIMEOUT)
-        .read_timeout(HTTP_READ_TIMEOUT)
-        .timeout(HTTP_REQUEST_TIMEOUT)
+        .connect_timeout(Duration::from_millis(policy.connect_timeout_millis))
         .redirect(wreq::redirect::Policy::none())
         // Responses POSTs are not safe for an HTTP client's implicit retry.
         // Candidate failover remains explicit and pre-delivery in the proxy.
         .retry(wreq::retry::Policy::never())
         .no_proxy()
-        .pool_max_idle_per_host(64)
+        // The cache owns at most 64 account clients; bound each idle pool too.
+        .pool_max_idle_per_host(8)
         .pool_idle_timeout(Duration::from_secs(90))
         .emulation(emulation)
         .build()

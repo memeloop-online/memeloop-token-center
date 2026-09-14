@@ -18,5 +18,6 @@ export function requestEventFixture(eventId: string, requestId: string, eventAt:
     output_tokens: 7,
     cost: '0.000019',
     error_code: null,
+    archive_state: 'pending',
   };
 }

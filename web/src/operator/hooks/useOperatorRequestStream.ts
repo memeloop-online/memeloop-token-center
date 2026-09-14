@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { RequestEvent } from '../../types';
-import { enqueueSessionEventKey } from '../sessionRefresh';
+import { enqueueSessionEventIdentity } from '../sessionRefresh';
 import { useRequestEventStream } from './useRequestEventStream';
 
 export function useOperatorRequestStream({ token, tenant, enabled, disconnectedMessage }: {
@@ -32,7 +32,7 @@ export function useOperatorRequestStream({ token, tenant, enabled, disconnectedM
         if (!oldest) break;
         events.current.delete(oldest);
       }
-      enqueueSessionEventKey(sessionEventKeyIds.current, event.key_id);
+      enqueueSessionEventIdentity(sessionEventKeyIds.current, event);
       setRevision((value) => value + 1);
     },
   });

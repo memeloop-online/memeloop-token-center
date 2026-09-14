@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { chromium } from 'playwright';
-import { createServer } from 'vite';
+import { createIsolatedFixtureServer as createServer } from './support/isolated-vite-server.js';
 
 const webRoot = fileURLToPath(new URL('..', import.meta.url));
 
@@ -21,8 +21,10 @@ declare global {
         credentials?: RequestCredentials;
         referrerPolicy?: ReferrerPolicy;
         hasSignal: boolean;
+        body?: string;
       }>;
       releaseIssue: (token: string) => void;
+      releaseRoutingResponse: (status: number) => void;
       releaseCredentialScopeA: () => void;
       releaseCredentialCursor: () => void;
       createdObjectUrls: string[];
@@ -70,8 +72,14 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     await allTenants.goto(fixture('all-tenants'));
     await allTenants.getByText('All tenant client', { exact: true }).waitFor();
     await allTenants.getByText('Tenant: tenant-visible', { exact: false }).waitFor();
-    assert.equal(await allTenants.getByRole('button', { name: 'Rename', exact: true }).isDisabled(), true);
-    const limits = allTenants.getByRole('button', { name: 'Current limit state', exact: true });
+    const allTenantBalance = allTenants.getByText('Available:', { exact: false });
+    assert.equal(await allTenantBalance.count(), 1);
+    assert.doesNotMatch(await allTenantBalance.innerText(), /9,223,372,036,854/, 'a large prepaid balance stays compact in the row');
+    assert.match(await allTenantBalance.getAttribute('title') ?? '', /9,223,372,036,854\.775807/, 'the complete prepaid balance remains available in the tooltip');
+    assert.equal(await allTenants.getByText('key-all', { exact: true }).count(), 0, 'technical credential IDs are not part of the list reading path');
+    await allTenants.getByRole('button', { name: 'More actions', exact: true }).click();
+    assert.equal(await allTenants.getByRole('menuitem', { name: 'Rename', exact: true }).isDisabled(), true);
+    const limits = allTenants.getByRole('menuitem', { name: 'Current limit state', exact: true });
     assert.equal(await limits.isDisabled(), false, 'stable key ID permits a read-only limit lookup without selecting a tenant');
     await limits.click();
     await allTenants.waitForFunction(() => window.credentialFixture.calls.some((call) => call.endsWith('/keys/key-all/limits')));
@@ -88,9 +96,12 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     await recovery.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await recovery.goto(fixture('client-recovery'));
     await recovery.getByText('Recoverable client', { exact: true }).waitFor();
-    await recovery.getByRole('button', { name: 'Recover and copy credential', exact: true }).click();
-    await recovery.getByRole('button', { name: 'Confirm and continue', exact: true }).click();
-    await recovery.getByText('mts_client_recovered', { exact: true }).waitFor();
+    await recovery.getByText('Unlimited (metered)', { exact: true }).waitFor();
+    await recovery.getByRole('button', { name: 'Copy credential', exact: true }).click();
+    await recovery.getByRole('status').filter({ hasText: 'Copied Recoverable client credential.' }).waitFor();
+    assert.equal(await recovery.getByRole('dialog').count(), 0, 'copy does not add a recovery confirmation');
+    assert.equal(await recovery.locator('html').getAttribute('data-copied-fixture-credential'), 'true', 'copy uses the original value, not the credential ID');
+    assert.equal(await recovery.getByText('mts_client_recovered', { exact: true }).count(), 0, 'successful clipboard copying does not expose a secret panel');
     const recoveryRequest = await recovery.evaluate(() => window.credentialFixture.requests.find((request) => request.path.endsWith('/credential-recovery/copy')));
     assert.deepEqual(recoveryRequest, {
       method: 'POST',
@@ -100,6 +111,16 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
       referrerPolicy: 'no-referrer',
       hasSignal: true,
     });
+    assert.equal(await recovery.evaluate(() => window.credentialFixture.requests.some(request => request.path.endsWith('/rotate'))), false, 'copy never rotates the credential');
+    const manualCopy = await browser.newPage();
+    await manualCopy.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await manualCopy.goto(`${fixture('client-recovery')}&clipboard-failure`);
+    await manualCopy.getByText('Recoverable client', { exact: true }).waitFor();
+    await manualCopy.getByRole('button', { name: 'Copy credential', exact: true }).click();
+    await manualCopy.getByText('mts_client_recovered', { exact: true }).waitFor();
+    await manualCopy.getByRole('status').filter({ hasText: 'Copy this credential manually' }).waitFor();
+    assert.equal(await manualCopy.getByRole('dialog').count(), 0);
+    await manualCopy.close();
 
     const race = await browser.newPage();
     await race.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
@@ -147,7 +168,7 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     const oneTimePanel = plaintext.locator('aside.one-time');
     assert.equal(await oneTimePanel.getAttribute('role'), null, 'rendering plaintext must not announce it as a live region');
     assert.equal(await oneTimePanel.locator('code').evaluate((element) => element.closest('[role="status"], [aria-live]') === null), true);
-    await plaintext.getByRole('button', { name: 'Copy credential', exact: true }).click();
+    await oneTimePanel.getByRole('button', { name: 'Copy credential', exact: true }).click();
     await plaintext.getByRole('alert').getByText('Copy failed. Use download or select the credential above manually.', { exact: true }).waitFor();
     assert.equal(await plaintext.locator('textarea').count(), 0, 'a throwing clipboard fallback clears and removes its plaintext node');
     await plaintext.getByRole('button', { name: 'Download credential', exact: true }).click();
@@ -183,6 +204,82 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     await aba.waitForFunction(() => window.credentialFixture.requests.filter((request) => request.method === 'POST' && request.path === '/internal/v1/service-tokens').length === 2);
     await aba.evaluate(() => window.credentialFixture.releaseIssue('mts_service_secret_current'));
     await aba.getByText('mts_service_secret_current', { exact: true }).waitFor();
+
+    // Exercise the actual page and shipped schemas on this same server. Each
+    // locale creates and edits a different mode, covering both payload values
+    // in both endpoints without a second synthetic component/server fixture.
+    for (const locale of ['en', 'zh-CN'] as const) {
+      const client = await browser.newPage({ viewport: { width: 390, height: 844 } });
+      client.setDefaultTimeout(5_000);
+      await client.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
+      await client.goto(fixture('client-form'));
+      const english = locale === 'en';
+      const modeLabel = english ? 'Metering and limit mode' : '计量与限额模式';
+      await client.getByText(english ? 'Research workspace' : '研发工作区', { exact: true }).waitFor();
+      await client.getByRole('button', { name: english ? 'More actions' : '更多操作', exact: true }).click();
+      await client.getByRole('menuitem', { name: english ? 'Policy and limits' : '权限与限流', exact: true }).click();
+      const edit = client.locator('.inline-editor.form-panel');
+      const editMode = edit.getByRole('combobox', { name: modeLabel, exact: true });
+      await edit.locator('#root_max_concurrency').focus();
+      await client.keyboard.press('Tab');
+      assert.equal(await editMode.evaluate(element => document.activeElement === element), true);
+      const editedMode = english ? 'metered_unlimited' : 'prepaid';
+      await editMode.selectOption(editedMode);
+      await edit.getByRole('button', { name: english ? 'Save' : '保存', exact: true }).click();
+      await nextPaint(client);
+      assert.deepEqual(await edit.locator('.schema-errors').allTextContents(), [], 'valid policy must submit without schema validation errors');
+      await client.waitForFunction(() => window.credentialFixture.requests.some(request => request.method === 'PUT' && request.path.endsWith('/key-form/policy')));
+      const policyRequest = await client.evaluate(() => window.credentialFixture.requests.find(request => request.method === 'PUT' && request.path.endsWith('/key-form/policy'))!);
+      assert.equal(JSON.parse(policyRequest.body!).enforcement_mode, editedMode);
+      assert.equal(JSON.parse(policyRequest.body!).daily_budget, null);
+
+      const create = client.locator('.create-journey');
+      await create.locator(':scope > .journey-heading [data-workspace-toggle]').click();
+      const routes = create.getByRole('combobox', { name: english ? 'Specific routes' : '具体路由', exact: true });
+      const groups = create.getByRole('combobox', { name: english ? 'Route groups' : '路由组', exact: true });
+      await routes.fill('Research model');
+      await routes.press('ArrowDown');
+      await routes.press('Enter');
+      await routes.press('Escape');
+      await groups.fill('Research group');
+      await groups.press('ArrowDown');
+      await groups.press('Enter');
+      await groups.press('Escape');
+      assert.equal(await create.locator('.schema-array').count(), 0, 'routing IDs have one named control each');
+      assert.equal(await create.getByText('Unsupported field schema', { exact: false }).count(), 0);
+      await create.locator('#root_principal_external_id').fill('fixture-principal');
+      await create.locator('#root_alias').fill('Created client');
+      await create.getByRole('button', { name: english ? 'Usage and budget' : '用量与预算', exact: true }).click();
+      const createMode = create.getByRole('combobox', { name: modeLabel, exact: true });
+      await create.locator('#root_policy_max_concurrency').focus();
+      await client.keyboard.press('Tab');
+      assert.equal(await createMode.evaluate(element => document.activeElement === element), true);
+      await client.keyboard.press('Shift+Tab');
+      assert.equal(await create.locator('#root_policy_max_concurrency').evaluate(element => document.activeElement === element), true);
+      const createdMode = english ? 'prepaid' : 'metered_unlimited';
+      await createMode.selectOption(createdMode);
+      for (const theme of ['light', 'dark']) {
+        await client.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
+        assert.equal(await client.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+        assert.equal(await createMode.evaluate(element => getComputedStyle(element).fontSize), '16px');
+      }
+      const artifacts = fileURLToPath(new URL('../e2e-artifacts/upstream-availability', import.meta.url));
+      mkdirSync(artifacts, { recursive: true });
+      await create.screenshot({ path: `${artifacts}/credential-workspace-${locale}-mobile.png` });
+      await create.locator('button[type="submit"]').click();
+      await client.getByText('mts_fixture_created', { exact: true }).waitFor();
+      const createRequests = await client.evaluate(() => window.credentialFixture.requests.filter(request => request.method === 'POST' && request.path === '/internal/v1/keys'));
+      assert.equal(createRequests.length, 1);
+      const body = JSON.parse(createRequests[0].body!);
+      assert.equal(body.tenant_external_id, 'tenant-a');
+      assert.equal(body.principal_external_id, 'fixture-principal');
+      assert.equal(body.alias, 'Created client');
+      assert.equal(body.policy.enforcement_mode, createdMode);
+      assert.deepEqual(body.route_ids, ['00000000-0000-4000-8000-000000000001']);
+      assert.deepEqual(body.route_group_ids, ['00000000-0000-4000-8000-000000000002']);
+      assert.equal('route_ids' in body.policy || 'route_group_ids' in body.policy, false);
+      await client.close();
+    }
   } finally {
     await browser.close();
     await server.close();

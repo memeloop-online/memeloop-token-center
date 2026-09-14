@@ -25,7 +25,7 @@ fn temporarily_unavailable() -> AppError {
     AppError::Overloaded
 }
 
-async fn fresh(
+async fn fresh_snapshot(
     state: &AppState,
     account: &UpstreamAccountView,
     credential: &UpstreamCredential,
@@ -39,7 +39,7 @@ async fn fresh(
         .permits
         .try_acquire()
         .map_err(|_| temporarily_unavailable())?;
-    let snapshot = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(8),
         read_codex(
             state,
@@ -50,7 +50,16 @@ async fn fresh(
     )
     .await
     .map_err(|_| temporarily_unavailable())?
-    .map_err(|_| temporarily_unavailable())?;
+    .map_err(|_| temporarily_unavailable())
+}
+
+async fn fresh(
+    state: &AppState,
+    account: &UpstreamAccountView,
+    credential: &UpstreamCredential,
+    tenant: &str,
+) -> Result<QuotaSnapshot, AppError> {
+    let snapshot = fresh_snapshot(state, account, credential, tenant).await?;
     if snapshot.reset_capability.credit_error_code.is_some()
         || snapshot.reset_capability.available_credits.is_none()
         || snapshot.reset_capability.applicable_credits.is_none()
@@ -260,16 +269,39 @@ pub(crate) async fn confirm(
     };
     // No automatic retry and no new redeem ID on any ambiguous outcome.
     let result = dispatch_once(&http, credential, account_header, CONSUME_URL, &redeem).await;
+    drop(_permit);
+    let accepted = result.is_ok();
     state
         .db
-        .finish_quota_reset(operation, result.is_ok(), result.err())
+        .finish_quota_reset(operation, accepted, result.err())
         .await?;
     state
         .upstream_quota
         .entries
         .lock()
         .await
-        .retain(|(id, _, _), _| *id != account.id);
+        .retain(|key, _| key.account != account.id);
+    if accepted {
+        // The consume response proves only that the reset was accepted. A
+        // separate fresh supplier read is the evidence that may clear the
+        // exact quota-exhausted health row through the existing fenced CAS.
+        // Recovery failure must never replay the paid reset or change its
+        // accepted durable result.
+        match fresh_snapshot(state, account, credential, tenant).await {
+            Ok(_) => tracing::info!(
+                upstream_account_id = %account.id,
+                credential_generation = account.credential_generation,
+                "refreshed quota evidence after an accepted reset"
+            ),
+            Err(error) => tracing::warn!(
+                upstream_account_id = %account.id,
+                credential_generation = account.credential_generation,
+                error = %error,
+                error_code = "quota_reset_recovery_pending",
+                "accepted quota reset could not refresh supplier evidence"
+            ),
+        }
+    }
     // Accepted means only supplier HTTP 2xx. It does not assert window state.
     state
         .db

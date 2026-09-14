@@ -229,6 +229,20 @@ async fn native_kimi_cohort_contract_is_atomic_rotatable_and_secret_free() {
     assert_eq!(created["disposition"], "created");
     assert_eq!(created["accounts"][0]["name"], "Kimi OAuth 2");
     assert_eq!(created["accounts"][1]["name"], "Kimi OAuth 1");
+    // Batch import responses use the same public account boundary as list and
+    // individual mutations: only the fixed non-secret config is exposed.
+    for account in created["accounts"].as_array().unwrap() {
+        let keys = account["config"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec!["base_url", "network_scope", "reservation_token_bounds"]
+        );
+    }
     assert!(
         created["accounts"]
             .as_array()

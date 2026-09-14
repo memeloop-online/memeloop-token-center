@@ -1,5 +1,45 @@
 use super::*;
 
+#[tokio::test]
+async fn kimi_translation_clears_length_and_uses_complete_unknown_length_memory_reservation() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id":"kimi-buffered", "choices":[{"message":{"role":"assistant","content":"translated"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}
+        }))).expect(1).mount(&upstream).await;
+    let response = reqwest::Client::new()
+        .post(upstream.uri())
+        .send()
+        .await
+        .unwrap();
+    assert!(response.content_length().is_some());
+    let context = crate::api::kimi_transport::responses::Context::new(&json!({"model":"kimi"}));
+    let translated = routing::kimi::translate(response, context, false).unwrap();
+    assert!(translated.content_length().is_none());
+    let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(
+        crate::config::DEFAULT_PROXY_MEMORY_BUDGET_BYTES,
+    );
+    let memory = budget.reservation();
+    let body = read_bounded_upstream(
+        translated,
+        MAX_PROXY_RESPONSE_BODY,
+        &memory,
+        Instant::now(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["output"][0]["content"][0]["text"],
+        "translated"
+    );
+    assert_eq!(budget.snapshot().0, 192 * 1024 * 1024);
+    drop(memory);
+    assert_eq!(budget.snapshot().0, 0);
+    upstream.verify().await;
+}
+
 #[test]
 fn native_kimi_billing_does_not_depend_on_client_usage_opt_in() {
     for body in [

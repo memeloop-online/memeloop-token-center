@@ -1,7 +1,59 @@
 use super::*;
 use crate::{db::Database, proxy_lifecycle::ProxyArchiveAttempt};
 
-pub(super) const MAX_PROXY_TEXT_ARCHIVE_WAIT: Duration = Duration::from_secs(2);
+pub(super) async fn finish_unavailable(
+    request: &BufferedRequest<'_>,
+    error_code: &str,
+    last_dispatched_upstream: Option<(Uuid, Uuid)>,
+) -> Result<Response, AppError> {
+    let mut response = finish_buffered_request_with_upstream_attribution(
+        request,
+        StatusCode::SERVICE_UNAVAILABLE,
+        Bytes::from_static(
+            b"{\"error\":{\"message\":\"no healthy upstream is currently available\",\"type\":\"upstream_error\"}}",
+        ),
+        "application/json",
+        TokenUsage::default(),
+        Some(error_code.to_owned()),
+        ProxyRequestUpstreamAttribution::LastDispatched(last_dispatched_upstream),
+    )
+    .await?;
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    Ok(response)
+}
+
+pub(super) async fn finish_buffered_proxy_request_with_retry(
+    database: &Database,
+    input: FinishProxyRequest<'_>,
+    archive: &crate::response_archive_spool::BufferedArchive<'_>,
+    upstream_attribution: ProxyRequestUpstreamAttribution,
+) -> Result<FinishProxyRequestResult, AppError> {
+    // Keep the same identity and ciphertext across unknown COMMIT ACKs. Do not
+    // cancel in-flight SQL or replay upstream work to repair archive delivery.
+    for millis in [10, 50, 200] {
+        match database
+            .finish_proxy_request_with_buffered_archive_and_upstream_attribution(
+                input.clone(),
+                archive,
+                upstream_attribution,
+            )
+            .await
+        {
+            Ok(result) => return Ok(result),
+            Err(AppError::Internal) => tokio::time::sleep(Duration::from_millis(millis)).await,
+            Err(error) => return Err(error),
+        }
+    }
+    database
+        .finish_proxy_request_with_buffered_archive_and_upstream_attribution(
+            input,
+            archive,
+            upstream_attribution,
+        )
+        .await
+}
 
 pub(super) async fn run_bounded_proxy_lifecycle<F>(
     deadline: tokio::time::Instant,
@@ -13,15 +65,6 @@ where
     tokio::time::timeout_at(deadline, lifecycle).await
 }
 
-pub(super) async fn run_bounded_text_archive<F>(
-    archive: F,
-) -> Result<F::Output, tokio::time::error::Elapsed>
-where
-    F: std::future::Future,
-{
-    tokio::time::timeout(MAX_PROXY_TEXT_ARCHIVE_WAIT, archive).await
-}
-
 pub(super) async fn finish_proxy_request_with_archive_fallback<'a>(
     database: &Database,
     input: FinishProxyRequest<'a>,
@@ -29,7 +72,13 @@ pub(super) async fn finish_proxy_request_with_archive_fallback<'a>(
     gap_response: &'a str,
 ) -> Result<FinishProxyRequestResult, AppError> {
     let stored_response = input.response_object;
-    let primary = finish_proxy_request_with_retry(database, input.clone(), archive_attempt).await;
+    let primary = finish_proxy_request_with_retry(
+        database,
+        input.clone(),
+        archive_attempt,
+        ProxyRequestUpstreamAttribution::KeepSelected,
+    )
+    .await;
     if primary.is_ok() || archive_attempt.is_none() {
         if response_archive_requires_cleanup(&primary, stored_response)
             && let Some(attempt) = archive_attempt
@@ -50,6 +99,7 @@ pub(super) async fn finish_proxy_request_with_archive_fallback<'a>(
             ..input
         },
         None,
+        ProxyRequestUpstreamAttribution::KeepSelected,
     )
     .await;
     let cleanup = matches!(&fallback, Ok(FinishProxyRequestResult::Finished { .. }))

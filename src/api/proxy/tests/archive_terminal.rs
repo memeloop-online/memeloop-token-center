@@ -1,6 +1,161 @@
 use super::*;
 
 #[tokio::test]
+async fn encoded_buffered_upstream_is_rejected_once_without_replay() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(successful_chat_response().insert_header("content-encoding", "gzip"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = resilient_route_fixture("encoded-buffered", &[(upstream.uri(), 0)]).await;
+    let response = send_resilient_chat(&fixture, None, false).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].error_code.as_deref(),
+        Some("upstream_invalid_content_encoding")
+    );
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn request_archive_failure_after_dispatch_does_not_skip_response_or_repeat_settlement() {
+    let fixture = codex_route_fixture("request-capture-gap").await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    // Simulate a terminal background request-archive failure only once the
+    // upstream response has returned and its independent capture is inserted.
+    sqlx::query("CREATE TRIGGER fail_request_archive_after_dispatch AFTER INSERT ON response_archive_spools BEGIN UPDATE request_archive_spools SET state = 'gap', last_error_code = 'capture_failed' WHERE request_id = NEW.request_id AND tenant_id = NEW.tenant_id AND reservation_id = NEW.reservation_id; END")
+        .execute(&pool).await.unwrap();
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            completed_codex_sse("response survives request capture failure"),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({
+            "model": fixture.model, "input": "capture independently", "stream": false
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    let request_id = rows[0].request_id;
+    assert_eq!(rows[0].cost, "0.000005");
+    assert_eq!(
+        rows[0].archive_state,
+        crate::model::RequestArchiveState::Pending
+    );
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, request_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        refs.request_archive_state,
+        crate::model::RequestArchiveState::Gap
+    );
+    assert!(refs.request_archive_reason.is_some());
+    assert_eq!(
+        refs.response_archive_state,
+        crate::model::RequestArchiveState::Pending
+    );
+    assert!(refs.response_archive_reason.is_none());
+    let detail = crate::api::request_detail::request_detail(&fixture.state, refs).await;
+    assert!(detail.archive.request.reason.is_some());
+    assert!(detail.archive.response.reason.is_none());
+    assert!(!detail.archive.response.complete);
+    drain_completed_response_archive(&fixture).await;
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, request_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        refs.view.archive_state,
+        crate::model::RequestArchiveState::Gap
+    );
+    assert_eq!(
+        refs.response_archive_state,
+        crate::model::RequestArchiveState::Bound
+    );
+    assert_eq!(
+        fixture
+            .state
+            .archive
+            .get(refs.response_object.as_deref().unwrap())
+            .await
+            .unwrap()
+            .as_ref(),
+        delivered.as_ref()
+    );
+    assert_exactly_once_side_effects(&fixture, request_id, Some("resp-codex")).await;
+    upstream.verify().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn request_capture_failure_rejects_before_upstream_and_rolls_back_admission() {
+    let fixture = codex_route_fixture("request-capture-admission-failure").await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query("CREATE TRIGGER reject_request_capture BEFORE INSERT ON request_archive_spools BEGIN SELECT RAISE(ABORT, 'fixture capture rejection'); END")
+        .execute(&pool).await.unwrap();
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({
+            "model": fixture.model, "input": "must be durable before dispatch", "stream": false
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(response.headers().contains_key(header::RETRY_AFTER));
+    let requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let reservations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_reservations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!((requests, reservations), (0, 0));
+    upstream.verify().await;
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn incomplete_or_failed_tail_revokes_held_success_terminal() {
     for (label, payload, expected_gap) in [
         (
@@ -38,10 +193,22 @@ async fn incomplete_or_failed_tail_revokes_held_success_terminal() {
         assert!(!text.contains("private provider detail"));
         if expected_gap {
             let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-            let state: String = sqlx::query_scalar("SELECT state FROM response_archive_spools")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+            let state = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(state) =
+                        sqlx::query_scalar::<_, String>("SELECT state FROM response_archive_spools")
+                            .fetch_optional(&pool)
+                            .await
+                            .unwrap()
+                        && state == "gap"
+                    {
+                        break state;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("owned writer must durably fence the incomplete capture");
             assert_eq!(state, "gap");
             pool.close().await;
         }
@@ -50,7 +217,7 @@ async fn incomplete_or_failed_tail_revokes_held_success_terminal() {
 }
 
 #[tokio::test]
-async fn terminal_delivery_observes_sealed_spool_or_explicit_capture_gap() {
+async fn terminal_delivery_transfers_capture_to_the_owned_writer_or_records_a_gap() {
     for fail_append in [false, true] {
         let upstream = MockServer::start().await;
         let payload = concat!(
@@ -73,6 +240,8 @@ async fn terminal_delivery_observes_sealed_spool_or_explicit_capture_gap() {
         )
         .await;
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+        let begin_pause = (!fail_append)
+            .then(|| crate::response_archive_spool::pause_next_begin_for_test(&fixture.state));
         if fail_append {
             // A SQLite RAISE(ABORT) queues transaction rollback when SQLx drops
             // the failed append. Under executor load that rollback can delay
@@ -84,15 +253,52 @@ async fn terminal_delivery_observes_sealed_spool_or_explicit_capture_gap() {
         }
         let response = send_resilient_chat(&fixture, None, true).await;
         assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-        assert_eq!(body.as_ref(), payload.as_bytes());
-        // No polling: receipt of terminal/EOF itself guarantees that capture
-        // is no longer left as an unrecoverable "capturing" success.
-        let (state, gap_reason): (String, Option<String>) =
-            sqlx::query_as("SELECT state, last_error_code FROM response_archive_spools")
-                .fetch_one(&pool)
+        let body =
+            tokio::spawn(async move { to_bytes(response.into_body(), 1024 * 1024).await.unwrap() });
+        if let Some((entering, release)) = begin_pause {
+            tokio::time::timeout(Duration::from_secs(1), entering)
                 .await
+                .expect("owned writer must reach the deterministic pre-begin pause")
                 .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let row: Option<(String, Option<i64>, Option<String>)> = sqlx::query_as(
+                        "SELECT id, completed_at, response_object FROM request_records",
+                    )
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap();
+                    if let Some((request_id, Some(_), Some(response_object))) = row
+                        && response_object == format!("gap://{request_id}/response")
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("short stream must finalize before the paused writer begins");
+            release.send(()).unwrap();
+        }
+        let body = body.await.unwrap();
+        assert_eq!(body.as_ref(), payload.as_bytes());
+        let (state, gap_reason): (String, Option<String>) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    let row: (String, Option<String>) = sqlx::query_as(
+                        "SELECT state, last_error_code FROM response_archive_spools",
+                    )
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    if matches!(row.0.as_str(), "pending" | "gap") {
+                        break row;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the owned writer must eventually seal or fence the capture");
         assert_eq!(state, if fail_append { "gap" } else { "pending" });
         assert_eq!(
             gap_reason.as_deref(),

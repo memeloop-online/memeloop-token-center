@@ -3,11 +3,13 @@ import RjsfForm, { type FormProps } from '@rjsf/core/lib/components/Form.js';
 import type { RJSFSchema } from '@rjsf/utils';
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { ApiError, api, apiRead } from '../../api';
-import { formatCurrency, formatNumber } from '../../format';
+import { formatCurrency, formatNumber, formatPercent } from '../../format';
 import { localizeSchema, useI18n } from '../../i18n';
 import { LimitSnapshot } from '../../LimitSnapshot';
 import { ModelPicker } from '../../ModelPicker';
 import { schemaFormFields, schemaFormTemplates } from '../../SchemaTemplates';
+import { SecureSchemaField } from '../../SecureSchemaField';
+import { prepareSecretForm } from '../../secretSchema';
 import { safeValidator as validator } from '../../safeValidator';
 import type {
   ConfigurationSchemas, CredentialRoutingView, GenerationPriceView, GroupView, KeyLimitSnapshot, KeyListCursor, KeyView,
@@ -25,18 +27,37 @@ import {
   type KeyListLoadState, type KeyListRequestIdentity,
 } from '../keyPagination';
 import { directCredentialSchema, supportsDirectConnection } from '../providerConnectionMethods';
-import { UpstreamAvailability } from '../UpstreamAvailability';
+import { UpstreamAvailability, manualHealthLabel } from '../UpstreamAvailability';
 import { UpstreamQuota } from '../UpstreamQuota';
+import { quotaUsedPercent, type UpstreamQuotaSnapshot } from '../upstreamQuota';
 import { connectionSchema, isPrivateProxyUrl, ProxyInput, UpstreamConnection } from '../UpstreamConnection';
 import { upstreamFormTemplates } from '../UpstreamFormTemplates';
+import { credentialFormTemplates } from '../CredentialFormTemplates';
+import { Button, Input, Select, DetailTooltip, Disclosure, FormSection } from '../../design-system';
+import { JourneyDisclosure as AdvancedFormSection } from '../JourneyDisclosure';
+import { formJourneyCopy } from '../formJourneyCopy';
+import { CreateJourney } from '../CreateJourney';
+import { CredentialActionMenu } from '../CredentialActionMenu';
+import { credentialBudgetPresentation } from '../credentialListPresentation';
+import { fluentFormWidgets } from '../FluentFormWidgets';
+import '../formJourney.css';
+import '../providerEditLayout.css';
+import '../providerDirectory.css';
+import { credentialCreateSchema, credentialCreateUiSchema, credentialFormFields, credentialPolicySchema, credentialPolicyUiSchema } from '../CredentialForm';
 import { upstreamAvailabilityPath, type UpstreamAvailabilityWindow } from '../upstreamAvailabilityWindow';
 import { useOperatorResource, type ResourceState } from '../hooks/useOperatorResource';
+import { useInlineEditorFocus } from '../hooks/useInlineEditorFocus';
 import { loadModelPricePages } from '../pricingLoading';
+import { CredentialPolicySummary } from '../CredentialPolicySummary';
+import { PriceSource } from '../PriceSource';
 import { enumLabel, messageOf, OneTimeSecret, queryForTenant, WriteScopeNotice } from '../scope/operatorShared';
 
-function Form(props: FormProps) {
-  return <RjsfForm {...props} noHtml5Validate onError={() => { /* Validation is rendered inline. */ }} />;
+export function OperatorSchemaForm(props: FormProps) {
+  const prepared = useMemo(() => prepareSecretForm(props.schema, props.validator, props.formData), [props.schema, props.validator, props.formData]);
+  return <RjsfForm {...props} {...prepared} experimental_defaultFormStateBehavior={prepared.schema === props.schema ? props.experimental_defaultFormStateBehavior : { ...props.experimental_defaultFormStateBehavior, emptyObjectFields: 'skipEmptyDefaults', arrayMinItems: { ...props.experimental_defaultFormStateBehavior?.arrayMinItems, computeSkipPopulate: (_validator, schema) => schema.writeOnly === true || schema.format === 'password' } }} fields={{ ...props.fields, SchemaField: SecureSchemaField }} noHtml5Validate onError={() => { /* Validation is rendered inline; never log form data. */ }} />;
 }
+
+const Form = OperatorSchemaForm;
 
 const secretResponseRequestPolicy = {
   cache: 'no-store',
@@ -67,11 +88,22 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   const [rotating, setRotating] = useState<UpstreamAccount>();
   const [editing, setEditing] = useState<UpstreamAccount>();
   const [reauthorizing, setReauthorizing] = useState<UpstreamAccount>();
+  const [providerWorkspaceOpen, setProviderWorkspaceOpen] = useState(false);
+  const [providerDetail, setProviderDetail] = useState<string>();
+  const [quotaSummaries, setQuotaSummaries] = useState<Record<string, { generation: number; snapshot: UpstreamQuotaSnapshot }>>({});
+  const quotaScope = useRef({ token, tenant, values });
+  quotaScope.current = { token, tenant, values };
+  const [providerCreateGeneration, setProviderCreateGeneration] = useState(0);
+  const [proxyEditorOpen, setProxyEditorOpen] = useState(false);
+  const [providerEditDraft, setProviderEditDraft] = useState<Record<string, unknown>>();
+  const providerSuccess = useRef<HTMLDivElement>(null);
   const [busy, setBusy] = useState('');
+  const { container: providerList, rememberTrigger } = useInlineEditorFocus(editing?.id, Boolean(busy), `${token}\0${tenant}\0${writeTenant}`);
   const [health, setHealth] = useState<Record<string, UpstreamHealth>>({});
   const [deletionReadiness, setDeletionReadiness] = useState<Record<string, UpstreamDeletionReadiness>>({});
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  useLayoutEffect(() => { if (message && !providerWorkspaceOpen && !editing && !rotating && !reauthorizing) providerSuccess.current?.focus(); }, [message, providerWorkspaceOpen, editing, rotating, reauthorizing]);
   const providerGroups = useGroups('provider', token, writeTenant);
   const directProviders = providers.filter(supportsDirectConnection);
   const provider = directProviders.find((value) => value.id === driver) ?? directProviders[0];
@@ -111,6 +143,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   } as RJSFSchema, locale) : undefined, [editing, editProvider, locale]);
   const uiSchema = {
     driver: { 'ui:widget': 'hidden' },
+    ...(provider?.id === 'http-json' ? { credential: { type: { 'ui:widget': 'hidden' } } } : {}),
     config: {
       oauth: { 'ui:widget': 'hidden' },
       ...(provider?.id === 'comfyui' ? {
@@ -120,7 +153,8 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     },
   };
   useEffect(() => {
-    setMethod('direct'); setDriver(''); setRotating(undefined); setEditing(undefined); setReauthorizing(undefined);
+    setProviderDetail(undefined); setQuotaSummaries({});
+    setProviderEditDraft(undefined); setMethod('direct'); setDriver(''); setRotating(undefined); setEditing(undefined); setReauthorizing(undefined); setProviderWorkspaceOpen(false);
     setBusy(''); setHealth({}); setDeletionReadiness({}); setMessage(''); setError('');
   }, [token, tenant, writeTenant]);
 
@@ -207,63 +241,96 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     finally { setBusy(''); }
   }
 
-  return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} /><section className="provider-layout">
+  const providerEditors = <>
+      {editing && editSchema && <div className="inline-editor"><Form key={`${editing.id}-${locale}`} schema={editSchema} formContext={{ providerEdit: true }} uiSchema={{ config: { oauth: { 'ui:disabled': true }, ...(editing.driver === 'openai-codex' && editing.auth_kind === 'oauth' ? { base_url: { 'ui:widget': 'hidden' } } : {}) } }} formData={providerEditDraft ?? { name: editing.name, config: editing.config }} onChange={({ formData }) => setProviderEditDraft(formData)} validator={validator} widgets={fluentFormWidgets} templates={upstreamFormTemplates} onSubmit={async ({ formData }) => { if (!formData || proxyEditorOpen) return; setBusy(`edit-${editing.id}`); try { await api(`/internal/v1/upstreams/${editing.id}`, token, { method: 'PUT', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant, expected_updated_at: editing.updated_at }) }); setEditing(undefined); setProviderWorkspaceOpen(false); setMessage(t('providers.updated', { name: editing.name })); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}><Button appearance="primary" type="submit" disabled={!canManage(editing) || Boolean(busy) || proxyEditorOpen}>{t('common.save')}</Button></Form></div>}
+      {rotating && rotateProvider && <div className="inline-editor"><Form key={`${rotating.id}-${locale}`} schema={localizeSchema(rotateProvider.credential_schema as RJSFSchema, locale)} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { setBusy(`rotate-${rotating.id}`); try { await api(`/internal/v1/upstreams/${rotating.id}/credential`, token, { method: 'PUT', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ credential: formData }) }); setRotating(undefined); setProviderWorkspaceOpen(false); setMessage(t('providers.rotated', { name: rotating.name })); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}><button type="submit" disabled={!canManage(rotating) || Boolean(busy)}>{t('providers.confirmRotate')}</button></Form></div>}
+  </>;
+  const providerWorkspaceActive = providerWorkspaceOpen || Boolean(editing || rotating || reauthorizing);
+  return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} /><section ref={providerList} className="provider-layout">
     <article className="panel provider-list"><div className="panel-title"><div><h2>{t('providers.title')}</h2><p className="muted">{t('providers.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>
-      {error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{availabilityError && <div className="notice error" role="alert">{availabilityError}</div>}{message && <div className="notice success" role="status">{message}</div>}
-      <div className="account-list">{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('status.active')} empty={t('providers.empty')} />}{statusFilter.values.map((value) => {
+      {error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{availabilityError && <div className="notice error" role="alert">{availabilityError}</div>}{message && <div ref={providerSuccess} tabIndex={-1} className="notice success" role="status">{message}</div>}
+      <div className="account-list provider-directory">{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('status.active')} empty={t('providers.empty')} />}{statusFilter.values.map((value) => {
         const providerAvailable = providers.some((provider) => provider.id === value.driver);
         const currentHealth = providerAvailable ? health[value.id] : undefined;
         const manageable = canManage(value);
         const memberships = providerGroups.groups.filter((group) => group.member_ids.includes(value.id));
         const currentReadiness = deletionReadiness[value.id];
         const deletionBlockers = currentReadiness ? deletionMessages(currentReadiness) : [];
+        const detailOpen = providerDetail === value.id;
+        const providerName = providers.find(provider => provider.id === value.driver)?.display_name ?? t('providerDirectory.other');
+        const facts = availabilityWindow && availabilityWindow.tenant_external_id === (value.tenant_external_id ?? tenant) ? availabilityWindow.accounts.find(account => account.upstream_account_id === value.id) : undefined;
+        const terminal = facts ? facts.metrics.successful_requests + facts.metrics.failed_requests : 0;
+        const cachedQuota = quotaSummaries[value.id];
+        const generation = value.credential_generation;
+        const quota = cachedQuota?.generation === generation ? cachedQuota.snapshot : undefined;
+        const quotaPercents = quota?.windows.map(quotaUsedPercent).filter((percent): percent is number => percent !== null) ?? [];
+        const quotaText = !quota ? t('providerDirectory.notChecked')
+          : quota.status === 'unsupported' ? t('providerDirectory.unsupported')
+          : quota.status === 'error' ? t('providerDirectory.readFailed')
+          : quotaPercents.length ? t('providerDirectory.used', { percent: formatPercent(Math.max(...quotaPercents) / 100, locale) })
+          : t('providerDirectory.usageUnavailable');
         return <div className="account provider-account" data-upstream-id={value.id} key={value.id}>
-          <div className="account-main">
-            <b>{value.name}</b>
-            <span>{value.driver} · {t('providers.method')}: {enumLabel(t, 'auth', value.connection_method)}{value.tenant_external_id ? ` · ${value.tenant_external_id}` : ''}</span>
+          <div className="provider-directory-row">
+            <div className="provider-directory-identity">
+            <DetailTooltip content={`${providerName} · ${value.driver} · ID: ${value.id}${value.tenant_external_id ? ` · ${value.tenant_external_id}` : ''}`}><b tabIndex={0}>{value.name}</b></DetailTooltip>
+            <span>{providerName} · {value.auth_kind === 'oauth' ? t('providers.oauth') : enumLabel(t, 'auth', value.connection_method)}</span>
             {memberships.length > 0 && <div className="table-chip-list provider-group-summary" aria-label={t('groups.provider.title')}>{memberships.map((group) => <span key={group.id}>{group.name}</span>)}</div>}
             {!providerAvailable && <span className="pill">{t('providers.retired')}</span>}
-            <small>{value.id}</small>
-            <UpstreamConnection key={`connection\0${token}\0${writeTenant}\0${value.id}`} account={value} token={token} tenant={writeTenant} disabled={!manageable || Boolean(busy)} onChanged={onChanged} />
+            </div>
+            <div className="provider-directory-summary"><span className={`status ${value.status === 'active' ? 'ok' : 'pending'}`}>{enumLabel(t, 'status', value.status)}</span><span>{t('providers.routes', { count: formatNumber(value.route_count, locale) })}</span></div>
+            <div className="provider-directory-summary"><small>{t('providers.recentAvailability')}</small><span>{availabilityLoading ? t('common.loading') : !facts ? t('providerDirectory.unavailable') : terminal > 0 ? t('providerDirectory.successful', { percent: formatPercent(facts.metrics.successful_requests / terminal, locale) }) : t('providerDirectory.noRequests')}</span></div>
+            <div className="provider-directory-summary"><small>{t('quota.title')}</small><span>{quotaText}</span>{quota && (quota.stale || (quota.stale_after !== null && quota.stale_after <= Date.now())) && <small>{t('quota.stale')}</small>}</div>
+            <div className="provider-directory-actions">
+              <Button appearance="secondary" type="button" aria-expanded={detailOpen} aria-controls={`provider-details-${value.id}`} disabled={Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} onClick={() => setProviderDetail(detailOpen ? undefined : value.id)}>{t(detailOpen ? 'providerDirectory.close' : 'providerDirectory.open')}</Button>
+              {providerAvailable && <Button appearance="subtle" type="button" data-inline-edit-trigger={value.id} disabled={!manageable || Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} onClick={(event) => { rememberTrigger(value.id, event.currentTarget); setProviderDetail(undefined); setProviderEditDraft(undefined); setEditing(value); }}>{t('providers.edit')}</Button>}
+            </div>
+          </div>
+          {detailOpen && <section id={`provider-details-${value.id}`} className="provider-detail-workspace" aria-label={t('providerDirectory.details', { name: value.name })}>
+            <div className="provider-detail-heading"><h3>{value.name}</h3><DetailTooltip content={`ID: ${value.id} · ${t('providers.generation')} ${value.credential_generation}`}><span tabIndex={0}>{t('providerDirectory.account')}</span></DetailTooltip></div>
+            <div className="account-main">
+            <UpstreamConnection key={`connection\0${token}\0${writeTenant}\0${value.id}`} account={value} token={token} tenant={writeTenant} disabled={!manageable || Boolean(busy)} onChanged={onChanged} onEditingChange={setProxyEditorOpen} />
             {value.credential_expires_at && <small>{t('providers.expires')}: {new Date(value.credential_expires_at).toLocaleString(locale)}</small>}
-            <details className="upstream-health-details"><summary>{t('providers.recentAvailability')} · {currentHealth ? t(currentHealth.status === 'healthy' ? 'providers.healthy' : 'providers.unhealthy') : t('providers.manualHealthCheck')}</summary><UpstreamAvailability account={value} snapshot={availabilitySnapshot} window={availabilityWindow} loading={availabilityLoading} manualHealth={currentHealth} onOpenRequest={onOpenRequest} /></details>
-            <UpstreamQuota key={`${token}\0${tenant}\0${value.id}`} accountId={value.id} accountName={value.name} tenant={value.tenant_external_id ?? tenant} token={token} />
+            <Disclosure title={currentHealth ? `${t('providers.recentAvailability')} · ${t(manualHealthLabel(currentHealth))}` : t('providers.recentAvailability')}><UpstreamAvailability account={value} snapshot={availabilitySnapshot} window={availabilityWindow} loading={availabilityLoading} manualHealth={currentHealth} onOpenRequest={onOpenRequest} /></Disclosure>
+            <UpstreamQuota key={`${token}\0${tenant}\0${value.id}\0${generation}`} accountId={value.id} accountName={value.name} credentialGeneration={generation} tenant={value.tenant_external_id ?? tenant} token={token} initialSnapshot={quota} onSnapshot={snapshot => setQuotaSummaries(current => {
+              // A late read owns the generation captured when it began, never
+              // the current account's newer generation after a credential change.
+              if (quotaScope.current.token !== token || quotaScope.current.tenant !== tenant || !quotaScope.current.values.some(account => account.id === value.id && account.credential_generation === generation)) return current;
+              return { ...current, [value.id]: { generation, snapshot } };
+            })} />
             {currentReadiness && <small className={`status ${currentReadiness.can_delete ? 'ok' : 'pending'}`}>{deletionBlockers.join(' · ')}</small>}
           </div>
           <div className="account-meta">
-            <span className={`status ${value.status === 'active' ? 'ok' : 'pending'}`}>{enumLabel(t, 'status', value.status)}</span>
-            <span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span>
-            <span className="pill">{t('providers.routes', { count: formatNumber(value.route_count, locale) })}</span>
-            <details className="upstream-secondary-actions"><summary>{t('connection.manageAccount')}</summary><div className="row-actions">
+            <Disclosure title={t('connection.manageAccount')}><div className="row-actions">
               {providerAvailable && <>
-                <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setEditing(value)}>{t('providers.edit')}</button>
-                <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void checkHealth(value)}>{t('providers.runManualHealthCheck')}</button>
-                {value.can_refresh && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void refreshOAuth(value)}>{t('providers.refreshAuthorization')}</button>}
-                {value.can_reauthorize && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setReauthorizing(value)}>{t('providers.reauthorize')}</button>}
-                {value.can_rotate && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setRotating(value)}>{t('providers.rotateCredential')}</button>}
+                <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => void checkHealth(value)}>{t('providers.runManualHealthCheck')}</Button>
+                {value.can_refresh && <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => void refreshOAuth(value)}>{t('providers.refreshAuthorization')}</Button>}
+                {value.can_reauthorize && <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => { setProviderDetail(undefined); setReauthorizing(value); }}>{t('providers.reauthorize')}</Button>}
+                {value.can_rotate && <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => { setProviderDetail(undefined); setRotating(value); }}>{t('providers.rotateCredential')}</Button>}
               </>}
-            </div></details>
-            <details className="upstream-danger-zone"><summary>{t('connection.dangerZone')}</summary><p>{t('connection.dangerHint')}</p><div className="row-actions">
-              {value.auth_kind === 'oauth' && <button type="button" className="danger" disabled={!manageable || Boolean(busy)} onClick={() => void disconnectOAuth(value)}>{t('providers.disconnect')}</button>}
-              {(value.status === 'active' || providerAvailable) && <button type="button" className="danger" disabled={!manageable || Boolean(busy)} onClick={() => void setStatus(value, value.status === 'active' ? 'disabled' : 'active')}>{value.status === 'active' ? t('providers.disable') : t('providers.enable')}</button>}
-              <button type="button" className="danger" title={deletionBlockers.length > 0 ? deletionBlockers.join(' ') : undefined} disabled={!manageable || Boolean(busy)} onClick={() => void remove(value)}>{t('common.remove')}</button>
-            </div></details>
+            </div></Disclosure>
+            <Disclosure title={t('connection.dangerZone')}><p>{t('connection.dangerHint')}</p><div className="row-actions">
+              {value.auth_kind === 'oauth' && <Button appearance="secondary" type="button" className="danger" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => void disconnectOAuth(value)}>{t('providers.disconnect')}</Button>}
+              {(value.status === 'active' || providerAvailable) && <Button appearance="secondary" type="button" className="danger" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => void setStatus(value, value.status === 'active' ? 'disabled' : 'active')}>{value.status === 'active' ? t('providers.disable') : t('providers.enable')}</Button>}
+              <Button appearance="secondary" type="button" className="danger" title={deletionBlockers.length > 0 ? deletionBlockers.join(' ') : undefined} disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => void remove(value)}>{t('common.remove')}</Button>
+            </div></Disclosure>
           </div>
+          </section>}
         </div>;
       })}</div>
-      {editing && editSchema && <div className="inline-editor"><div className="panel-title"><h3>{t('providers.editFor', { name: editing.name })}</h3><button type="button" className="secondary" onClick={() => setEditing(undefined)}>{t('common.cancel')}</button></div><Form key={`${editing.id}-${locale}`} schema={editSchema} uiSchema={{ config: { oauth: { 'ui:disabled': true } } }} formData={{ name: editing.name, config: editing.config }} validator={validator} templates={upstreamFormTemplates} onSubmit={async ({ formData }) => { if (!formData) return; setBusy(`edit-${editing.id}`); try { await api(`/internal/v1/upstreams/${editing.id}`, token, { method: 'PUT', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant, expected_updated_at: editing.updated_at }) }); setEditing(undefined); setMessage(t('providers.updated', { name: editing.name })); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}><button type="submit" disabled={!canManage(editing) || Boolean(busy)}>{t('common.save')}</button></Form></div>}
-      {rotating && rotateProvider && <div className="inline-editor"><div className="panel-title"><h3>{t('providers.rotateFor', { name: rotating.name })}</h3><button type="button" className="secondary" onClick={() => setRotating(undefined)}>{t('common.cancel')}</button></div><Form key={`${rotating.id}-${locale}`} schema={localizeSchema(rotateProvider.credential_schema as RJSFSchema, locale)} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { setBusy(`rotate-${rotating.id}`); try { await api(`/internal/v1/upstreams/${rotating.id}/credential`, token, { method: 'PUT', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ credential: formData }) }); setRotating(undefined); setMessage(t('providers.rotated', { name: rotating.name })); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}><button type="submit" disabled={!canManage(rotating) || Boolean(busy)}>{t('providers.confirmRotate')}</button></Form></div>}
     </article>
-    <details key={reauthorizing?.id ?? 'provider-create'} className="panel create-resource provider-onboarding" open={reauthorizing ? true : undefined}><summary><span><b>{reauthorizing ? t('providers.reauthorizeFor', { name: reauthorizing.name }) : t('providers.add')}</b><small>{t('providers.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">{reauthorizing ? <>
-      <div className="panel-title"><h2>{t('providers.reauthorizeFor', { name: reauthorizing.name })}</h2><button type="button" className="secondary" onClick={() => setReauthorizing(undefined)}>{t('common.cancel')}</button></div>
+    <CreateJourney className={editing ? 'provider-edit-workspace' : ''} title={editing ? t('providers.editFor', { name: editing.name }) : rotating ? t('providers.rotateFor', { name: rotating.name }) : reauthorizing ? t('providers.reauthorizeFor', { name: reauthorizing.name }) : t('providers.add')} description={t('providers.description')} open={providerWorkspaceActive} busy={Boolean(busy) || proxyEditorOpen} onOpenChange={(open) => { if (proxyEditorOpen) return; setProviderWorkspaceOpen(open); if (open) setProviderDetail(undefined); if (!open) { setEditing(undefined); setRotating(undefined); setReauthorizing(undefined); } }}>
+      {error && <div className="notice error" role="alert">{error}</div>}
+      {editing && <UpstreamConnection key={editing.id} account={editing} token={token} tenant={writeTenant} disabled={!canManage(editing) || Boolean(busy)} onChanged={onChanged} onEditingChange={setProxyEditorOpen} onSaved={updated => setEditing(current => current?.id === updated.id ? { ...updated, name: current.name, config: current.config } : current)} />}
+      {editing && proxyEditorOpen && <p role="status">{t('connection.finishProxyFirst')}</p>}
+      {editing || rotating ? providerEditors : reauthorizing ? <>
       <AuthorizationConnection key={`reauthorize-${reauthorizing.id}`} token={token} tenant={writeTenant} providers={providers} existing={reauthorizing} onChanged={async () => { setReauthorizing(undefined); setMessage(t('providers.reauthorized', { name: reauthorizing.name })); await onChanged(); }} />
     </> : <>
       <div className="segmented" role="group" aria-label={t('providers.method')}><button type="button" aria-pressed={method === 'direct'} className={method === 'direct' ? 'active' : ''} onClick={() => setMethod('direct')}>{t('providers.direct')}</button><button type="button" aria-pressed={method === 'authorization'} className={method === 'authorization' ? 'active' : ''} onClick={() => setMethod('authorization')}>{t('providers.oauth')}</button></div>
       {method === 'direct' ? <>
-        <label>{t('providers.provider')}<select value={provider?.id ?? ''} onChange={(event) => setDriver(event.target.value)}>{directProviders.map((value) => <option key={value.id} value={value.id}>{value.display_name} · {value.source}</option>)}</select></label>
-        {schema ? <Form key={`${provider.id}-${locale}`} schema={schema} uiSchema={uiSchema} fields={schemaFormFields} validator={validator} templates={upstreamFormTemplates} onSubmit={async ({ formData }) => { if (!writeTenant) return; try { setError(''); await api('/internal/v1/upstreams', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant }) }); setMessage(t('providers.created')); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!writeTenant || !token}>{t('providers.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
-      </> : <AuthorizationConnection token={token} tenant={writeTenant} providers={providers} onChanged={onChanged} />}</>}</div>
-    </details>
+        <ModelPicker label={t('providers.provider')} value={provider?.id ?? ''} onChange={setDriver} options={directProviders.map(value => ({ key: value.id, value: value.id, label: value.display_name, provider: value.display_name, upstream: '', capabilities: value.protocols }))} />
+        {schema ? <Form key={`${provider.id}-${locale}-${providerCreateGeneration}`} schema={schema} uiSchema={uiSchema} fields={schemaFormFields} validator={validator} widgets={fluentFormWidgets} templates={upstreamFormTemplates} onSubmit={async ({ formData }) => { if (!writeTenant) return; try { setError(''); await api('/internal/v1/upstreams', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant }) }); setProviderCreateGeneration(generation => generation + 1); setProviderWorkspaceOpen(false); setMessage(t('providers.created')); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!writeTenant || !token}>{t('providers.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
+      </> : <AuthorizationConnection token={token} tenant={writeTenant} providers={providers} onChanged={onChanged} />}</>}
+    </CreateJourney>
   </section></>;
 }
 
@@ -274,7 +341,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
   const initialProvider = existingOAuthProvider ?? oauthProviders[0];
   const [providerChoice, setProviderChoice] = useState(initialProvider?.id ?? '');
   const selectedProvider = oauthProviders.find((provider) => provider.id === providerChoice);
-  const [name, setName] = useState(existing?.name ?? (initialProvider ? `${initialProvider.id}-primary` : ''));
+  const [name, setName] = useState(existing?.name ?? initialProvider?.display_name ?? '');
   const [session, setSession] = useState<{ login_url?: string; verification_url?: string; user_code?: string; session_token: string; expires_at?: number; poll_after_seconds?: number }>();
   const [manualCode, setManualCode] = useState('');
   const [proxyUrl, setProxyUrl] = useState('');
@@ -334,9 +401,14 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
   return <div className="authorization-form"><p className="muted">{t('providers.oauthSecurity')}</p>
     {error && <div className="notice error" role="alert">{error}</div>}
     {oauthProviders.length === 0 ? <div className="empty">{t('providers.noAdapter')}</div> : <>
-    <label>{t('providers.provider')}<select disabled={Boolean(existing)} value={providerChoice} onChange={(event) => { const next = event.target.value; setProviderChoice(next); setName(`${next}-primary`); reset(); }}>{oauthProviders.map((value) => <option key={value.id} value={value.id}>{value.display_name}</option>)}</select></label>
+    <ModelPicker label={t('providers.provider')} disabled={Boolean(existing) || authorizing || Boolean(session)} value={providerChoice} onChange={(next) => { setProviderChoice(next); setName(oauthProviders.find(value => value.id === next)?.display_name ?? ''); reset(); }} options={oauthProviders.map(value => ({ key: value.id, value: value.id, label: value.display_name, provider: value.display_name, upstream: '', capabilities: value.protocols }))} />
     <label>{t('providers.name')} · {t('connection.required')}<input required maxLength={200} readOnly={Boolean(existing)} disabled={authorizing || Boolean(session)} value={name} onChange={(event) => setName(event.target.value)} /></label>
-    {selectedProvider?.oauth_adapter?.flow_kind === 'openai_device' && !session && <section className="upstream-connection"><h3>{t('connection.title')}</h3><p><b>Base URL</b> · {t('connection.fixed')}</p><code>https://chatgpt.com/backend-api/codex</code><p className="muted">{t('connection.endpointHint')}</p>{!existing ? <ProxyInput value={proxyUrl} onChange={setProxyUrl} disabled={authorizing} /> : <p>{t(existing.has_proxy === undefined ? 'connection.proxyUnknown' : existing.has_proxy ? 'connection.proxyConfigured' : 'connection.proxyMissing')}</p>}</section>}
+    {selectedProvider?.oauth_adapter?.flow_kind === 'openai_device' && !session && <section className="upstream-connection">
+      <h3>{t('connection.title')}</h3>
+      <p className="field-hint">{formJourneyCopy(locale).codexProxy}</p>
+      {!existing ? <ProxyInput value={proxyUrl} onChange={setProxyUrl} disabled={authorizing} /> : <p>{t(existing.has_proxy === undefined ? 'connection.proxyUnknown' : existing.has_proxy ? 'connection.proxyConfigured' : 'connection.proxyMissing')}</p>}
+      <p><b>{t('connection.baseUrl')}</b> · {t('connection.fixed')}</p><code>https://chatgpt.com/backend-api/codex</code>
+    </section>}
     {selectedProvider && selectedProvider.source !== 'builtin' && !session ? <Form key={`${selectedProvider.id}-${locale}`} schema={localizeSchema(selectedProvider.config_schema as RJSFSchema, locale)} formData={existing?.config} readonly={Boolean(existing)} validator={validator} templates={schemaFormTemplates} onSubmit={({ formData }) => void start(formData)}><button type="submit" disabled={!tenant || authorizing}>{t('common.startLogin')}</button></Form> : <div className="button-row"><button type="button" onClick={() => void start()} disabled={!tenant || !name.trim() || authorizing || Boolean(session) || (!existing && selectedProvider?.oauth_adapter?.flow_kind === 'openai_device' && !isPrivateProxyUrl(proxyUrl.trim()))}>{t(authorizing ? 'common.loading' : 'common.startLogin')}</button>{session && <><a className="button secondary" href={session.verification_url ?? session.login_url} target="_blank" rel="noreferrer">{t('common.openAuthorization')}</a>{selectedProvider?.oauth_adapter?.flow_kind !== 'claude_manual_pkce' && <button type="button" onClick={() => void poll()}>{t('common.checkAuthorization')}</button>}</>}</div>}
     {session && selectedProvider?.oauth_adapter?.flow_kind === 'claude_manual_pkce' && <div className="manual-authorization"><label>{t('providers.manualCode')}<input value={manualCode} onChange={(event) => setManualCode(event.target.value)} placeholder={t('providers.manualCodeHint')} /></label><button type="button" disabled={!manualCode.includes('#')} onClick={() => void complete()}>{t('providers.completeAuthorization')}</button></div>}
     {existing && selectedProvider?.oauth_adapter?.flow_kind === 'openai_device' && !session && <p>{t('connection.reauthorizationProxy')}</p>}
@@ -475,7 +547,7 @@ function Pricing({ token, tenant, writeTenant = tenant, schemas, schemasLoading 
       {syncResult && <><div className="source-status">{syncResult.sourceResults.map((source) => <div className={`source-card ${source.error ? 'failed' : 'healthy'}`} key={source.source}><b>{source.source}</b><span>{source.error ? t('pricing.sourceFailed') : t('pricing.sourceHealthy', { count: formatNumber(source.models, locale) })}</span>{source.error && <small>{source.error}</small>}</div>)}</div><div className="notice success"><b>{t('pricing.result')}</b> · {t('pricing.imported', { count: formatNumber(syncResult.imported, locale) })} · {t('pricing.candidates', { count: formatNumber(syncResult.candidates.length, locale) })} · {t('pricing.unmatched', { count: formatNumber(syncResult.unmatched.length, locale) })} · {t('pricing.preserved', { count: formatNumber(syncResult.preserved.length, locale) })}</div>
         {(syncResult.candidates.length > 0 || syncResult.unmatched.length > 0) && <div className="sync-details"><h3>{t('pricing.candidateDetails')}</h3>{syncResult.candidates.map((candidate) => <details key={candidate.model}><summary><code>{candidate.model}</code><span>{t('pricing.candidateCount', { count: formatNumber(candidate.candidates.length, locale) })}</span></summary><div className="candidate-list">{candidate.candidates.map((match) => <div key={`${match.source}-${match.sourceModelId}-${match.serviceTier}`}><b>{match.sourceModelId}</b><span>{match.source} · {match.serviceTier} · {match.reason}</span><code>{t('pricing.input')}: {formatCurrency(match.inputPerMillion, renderCurrency, locale)} · {t('pricing.output')}: {formatCurrency(match.outputPerMillion, renderCurrency, locale)}</code></div>)}</div></details>)}{syncResult.unmatched.length > 0 && <details><summary>{t('pricing.unmatchedModels')}</summary><div className="model-name-list">{syncResult.unmatched.map((name) => <code key={name}>{name}</code>)}</div></details>}</div>}
       </>}
-      <div className="table-scroll"><table><thead><tr><th>{t('pricing.model')}</th><th>{t('pricing.calls')}</th><th>{t('pricing.serviceTier')}</th><th>{t('pricing.input')}</th><th>{t('pricing.cachedInput')}</th><th>{t('pricing.cacheWrite')}</th><th>{t('pricing.output')}</th><th>{t('pricing.source')}</th><th>{t('pricing.updated')}</th></tr></thead><tbody>{rows.map((row) => <tr key={`${row.model}-${row.tier?.service_tier ?? 'missing'}`}><td><code>{row.model}</code></td><td>{row.usage ? formatNumber(row.usage.calls, locale) : ''}</td><td>{row.tier?.service_tier ?? '—'}</td><td>{row.tier ? formatCurrency(row.tier.input_per_million, renderCurrency, locale) : '—'}</td><td>{row.tier ? <>{formatCurrency(row.tier.cached_input_per_million, renderCurrency, locale)}{row.tier.cache_price_estimated && <small className="muted"> {t('pricing.estimated')}</small>}</> : '—'}</td><td>{row.tier ? <>{formatCurrency(row.tier.cache_write_per_million, renderCurrency, locale)}{row.tier.cache_price_estimated && <small className="muted"> {t('pricing.estimated')}</small>}</> : '—'}</td><td>{row.tier ? formatCurrency(row.tier.output_per_million, renderCurrency, locale) : '—'}</td><td>{row.tier ? <span className={`pill source-${row.tier.source.replace('.', '-')}`}>{row.tier.source}</span> : <span className="status pending">{t('pricing.missing')}</span>}</td><td>{row.tier ? new Date(row.tier.updated_at).toLocaleString(locale) : '—'}</td></tr>)}</tbody></table>{rows.length === 0 && <div className="empty">{pricingLoading ? t('common.loading') : t('pricing.noPricesForCurrency', { currency: renderCurrency })}</div>}</div>
+      <div className="table-scroll token-pricing-scroll" tabIndex={0} role="region" aria-label={t('pricing.title')}><table className="token-pricing-table"><thead><tr><th>{t('pricing.model')}</th><th>{t('pricing.calls')}</th><th>{t('pricing.serviceTier')}</th><th>{t('pricing.input')}</th><th>{t('pricing.cachedInput')}</th><th>{t('pricing.cacheWrite')}</th><th>{t('pricing.output')}</th><th>{t('pricing.source')}</th><th>{t('pricing.updated')}</th></tr></thead><tbody>{rows.map((row) => <tr key={`${row.model}-${row.tier?.service_tier ?? 'missing'}`}><td><code>{row.model}</code></td><td>{row.usage ? formatNumber(row.usage.calls, locale) : ''}</td><td>{row.tier?.service_tier ?? '—'}</td><td>{row.tier ? formatCurrency(row.tier.input_per_million, renderCurrency, locale) : '—'}</td><td>{row.tier ? <>{formatCurrency(row.tier.cached_input_per_million, renderCurrency, locale)}{row.tier.cache_price_estimated && <small className="muted"> {t('pricing.estimated')}</small>}</> : '—'}</td><td>{row.tier ? <>{formatCurrency(row.tier.cache_write_per_million, renderCurrency, locale)}{row.tier.cache_price_estimated && <small className="muted"> {t('pricing.estimated')}</small>}</> : '—'}</td><td>{row.tier ? formatCurrency(row.tier.output_per_million, renderCurrency, locale) : '—'}</td><td>{row.tier ? <PriceSource source={row.tier.source} /> : <span className="status pending">{t('pricing.missing')}</span>}</td><td>{row.tier ? new Date(row.tier.updated_at).toLocaleString(locale) : '—'}</td></tr>)}</tbody></table>{rows.length === 0 && <div className="empty">{pricingLoading ? t('common.loading') : t('pricing.noPricesForCurrency', { currency: renderCurrency })}</div>}</div>
     </article>
     <article className="panel"><div className="panel-title"><h2>{t('pricing.generationPrices')}</h2><span>{formatNumber(generationPrices.length, locale)}</span></div><div className="table-scroll"><table><thead><tr><th>{t('pricing.model')}</th><th>{t('pricing.currency')}</th><th>{t('self.units')}</th><th>{t('pricing.unitPrice')}</th></tr></thead><tbody>{generationPrices.map((price) => <tr key={`${price.currency}-${price.model}`}><td><code>{price.model}</code></td><td>{price.currency}</td><td>{enumLabel(t, 'billingUnit', price.billing_unit)}</td><td>{formatCurrency(price.price_per_unit, price.currency, locale)}</td></tr>)}</tbody></table>{generationPrices.length === 0 && <div className="empty">{t('pricing.noGenerationPrices')}</div>}</div></article>
     <details className="panel manual-pricing" onToggle={(event) => { if (event.currentTarget.open) onRequestSchemas?.(); }}><summary><span><b>{t('pricing.manual')}</b><small>{t('pricing.manualHint')}</small></span><span>＋</span></summary><div className="manual-pricing-body form-panel"><label>{t('pricing.type')}<select value={kind} onChange={(event) => setKind(event.target.value as typeof kind)}><option value="token">{t('pricing.tokenModel')}</option><option value="generation">{t('pricing.generationModel')}</option></select></label><ModelPicker label={t('pricing.model')} value={model} onChange={setModel} options={modelOptions} editable /><label>{t('pricing.currency')}<select value={currency} onChange={(event) => setCurrency(event.target.value)}><option value="USD">USD</option><option value="CNY">CNY</option></select></label>{schema ? <Form key={`${kind}-${locale}`} schema={localizeSchema(schema as RJSFSchema, locale)} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!writeTenant) return; try { const prefix = kind === 'generation' ? 'generation-prices' : 'prices'; await api(`/internal/v1/${prefix}/${encodeURIComponent(currency)}/${encodeURIComponent(model)}`, token, { method: 'POST', body: JSON.stringify(formData) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setMessage(t('pricing.savedMessage')); if (currency === displayCurrency) await load(currency); else setDisplayCurrency(currency); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!writeTenant || !model.trim()}>{t('pricing.save')}</button></Form> : <div className="empty">{schemasLoading ? t('common.loading') : t('providers.schemaMissing')}</div>}</div></details>
@@ -595,6 +667,7 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
 }) {
   const { locale, t } = useI18n();
   const knownProtocols = ['openai', 'anthropic', 'generation'];
+  const journey = formJourneyCopy(locale);
   const priorityHintId = useId();
   const includedAccountIds = providerGroups.filter((group) => draft.included_provider_group_ids.includes(group.id)).flatMap((group) => group.member_ids);
   const excludedAccountIds = new Set(providerGroups.filter((group) => draft.excluded_provider_group_ids.includes(group.id)).flatMap((group) => group.member_ids));
@@ -615,26 +688,38 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
     ...draft.route_group_names.map((name) => ({ value: `new:${name}`, label: name, created: true })),
   ];
   const priorityValid = Number.isInteger(draft.priority) && Math.abs(draft.priority) <= 1000000;
-  return <div className="route-form-sections">
-    <fieldset><legend>{t('routes.identitySection')}</legend><p className="field-hint">{t('routes.identityHint')}</p>
-    <label>{t('routes.publicModel')} · {t('connection.required')}<input required value={draft.public_model} onChange={(event) => onChange({ ...draft, public_model: event.target.value })} /></label>
-    </fieldset><fieldset><legend>{t('routes.upstreamSection')}</legend>
+  return <div className="route-form-sections form-journey">
+    <FormSection title={t('routes.identitySection')} description={t('routes.identityHint')}>
+    <label>{t('routes.publicModel')} · {t('connection.required')}<Input required value={draft.public_model} onChange={(_, data) => onChange({ ...draft, public_model: data.value })} /></label>
+    </FormSection><FormSection title={t('routes.upstreamSection')}>
     <MultiCombobox label={t('routes.explicitUpstreams')} options={upstreamOptions} value={selections(draft.upstream_account_ids, upstreamOptions)} onChange={(selected) => {
       const upstream_account_ids = selected.map((item) => item.value);
       const upstream_account_id = upstream_account_ids[0] ?? '';
       onChange({ ...draft, upstream_account_id, upstream_account_ids });
     }} placeholder={t('routes.searchUpstreams')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('routes.explicitUpstreamsHint')} />
+    <AdvancedFormSection title={journey.candidates} description={journey.candidatesHint}>
     <div className="route-group-grid">
       <MultiCombobox label={t('routes.includeProviderGroups')} options={providerGroupOptions} value={selections(draft.included_provider_group_ids, providerGroupOptions)} onChange={(selected) => onChange({ ...draft, included_provider_group_ids: selected.map((item) => item.value) })} placeholder={t('routes.searchProviderGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} />
       <MultiCombobox label={t('routes.excludeProviderGroups')} options={providerGroupOptions} value={selections(draft.excluded_provider_group_ids, providerGroupOptions)} onChange={(selected) => onChange({ ...draft, excluded_provider_group_ids: selected.map((item) => item.value) })} placeholder={t('routes.searchProviderGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('routes.exclusionWins')} />
     </div>
-    <label>{t('routes.protocol')}<select aria-invalid={!protocolCompatible} value={draft.protocol} onChange={(event) => onChange({ ...draft, protocol: event.target.value })}>{knownProtocols.map((protocol) => <option disabled={candidateIds.length > 0 && !supportedByAll.includes(protocol)} key={protocol} value={protocol}>{protocol === 'generation' ? t('routes.generation') : protocol === 'anthropic' ? 'Anthropic' : 'OpenAI'}</option>)}</select><small className={`field-hint${protocolCompatible ? '' : ' field-error'}`}>{t(protocolCompatible ? 'routes.protocolCompatibilityHint' : 'routes.protocolIncompatible')}</small></label>
+    </AdvancedFormSection>
+    <label>{t('routes.protocol')}<Select aria-invalid={!protocolCompatible} value={draft.protocol} onChange={(event) => onChange({ ...draft, protocol: event.target.value })}>{knownProtocols.map((protocol) => <option disabled={candidateIds.length > 0 && !supportedByAll.includes(protocol)} key={protocol} value={protocol}>{protocol === 'generation' ? t('routes.generation') : protocol === 'anthropic' ? 'Anthropic' : 'OpenAI'}</option>)}</Select></label>
+    {protocolCompatible ? <DetailTooltip content={t('routes.protocolCompatibilityHint')}><Button appearance="subtle" type="button">{journey.protocolHelp}</Button></DetailTooltip> : <p className="field-error" role="alert">{t('routes.protocolIncompatible')}</p>}
     <UpstreamModelCombobox token={token} tenant={tenant} upstreams={upstreams} accountIds={draft.upstream_account_ids} includedProviderGroupIds={draft.included_provider_group_ids} excludedProviderGroupIds={draft.excluded_provider_group_ids} syncAccountIds={candidateIds} protocol={draft.protocol} value={draft.upstream_model} onChange={(upstream_model) => onChange({ ...draft, upstream_model, custom_model_confirmed: false })} customModelConfirmed={draft.custom_model_confirmed} onValidityChange={(valid, allowCustom) => onCatalogValidity(valid && protocolCompatible, allowCustom)} />
-    </fieldset><fieldset><legend>{t('routes.accessSection')}</legend><p className="field-hint">{t('routes.accessHint')}</p>
-    <label>{t('routes.priority')}<input type="number" required step={1} aria-invalid={!priorityValid} aria-describedby={priorityHintId} min={-1000000} max={1000000} value={Number.isNaN(draft.priority) ? '' : draft.priority} onChange={(event) => onChange({ ...draft, priority: event.target.valueAsNumber })} /></label><small id={priorityHintId} className={priorityValid ? 'field-hint' : 'field-error'}>{t('routes.priorityHint')}</small>
+    <AdvancedFormSection title={journey.priority} invalid={!priorityValid}>
+    <label>{t('routes.priority')}<Input type="number" required step={1} aria-invalid={!priorityValid} aria-describedby={priorityHintId} min={-1000000} max={1000000} value={Number.isNaN(draft.priority) ? '' : String(draft.priority)} onChange={(event) => onChange({ ...draft, priority: event.target.valueAsNumber })} /></label><small id={priorityHintId} className={priorityValid ? 'field-hint' : 'field-error'}>{t('routes.priorityHint')}</small>
+    </AdvancedFormSection>
+    </FormSection><FormSection title={journey.routeAccess} description={t('routes.accessHint')}>
     <MultiCombobox label={t('routes.routeGroups')} options={routeGroupOptions} value={routeGroupValue} onChange={(selected) => onChange({ ...draft, route_group_ids: selected.filter((item) => !item.created).map((item) => item.value), route_group_names: selected.filter((item) => item.created).map((item) => item.label) })} placeholder={t('routes.searchOrCreateRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} allowCreate createLabel={(name) => t('routes.createRouteGroupNamed', { name })} hint={t('routes.routeGroupsHint')} />
     <ExactCredentialCombobox token={token} tenant={tenant} credentials={credentials} value={draft.granted_credential_ids} onChange={(granted_credential_ids) => onChange({ ...draft, granted_credential_ids })} />
-    </fieldset>
+    </FormSection>
+    <section className="form-journey-preview" aria-label={journey.preview}>
+      <h4>{journey.preview}</h4>
+      <dl><div><dt>{t('routes.publicModel')}</dt><dd>{draft.public_model.trim() || journey.noModel}</dd></div>
+        <div><dt>{t('routes.upstreamModel')}</dt><dd>{draft.upstream_model.trim() || journey.noModel}</dd></div>
+        <div><dt>{t('routes.upstream')}</dt><dd>{candidateIds.map(id => upstreams.find(value => value.id === id)?.name ?? id).join(' · ') || journey.noUpstream}</dd></div>
+        <div><dt>{journey.access}</dt><dd>{draft.granted_credential_ids.length ? formatNumber(draft.granted_credential_ids.length, locale) : journey.noGrant}</dd></div></dl>
+    </section>
   </div>;
 }
 
@@ -650,11 +735,14 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   const [form, setForm] = useState<RouteDraft>(emptyRouteDraft);
   const [formCatalog, setFormCatalog] = useState({ valid: false, allowCustom: false });
   const [editing, setEditing] = useState<ModelRouteView>();
+  const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  const successNotice = useRef<HTMLDivElement>(null);
   const [editForm, setEditForm] = useState<RouteDraft>(emptyRouteDraft);
   const [editCatalog, setEditCatalog] = useState({ valid: false, allowCustom: false });
   const [busy, setBusy] = useState('');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  useLayoutEffect(() => { if (message && !workspaceOpen) successNotice.current?.focus(); }, [message, workspaceOpen]);
   const loadSequence = useRef(0);
   const loadAbort = useRef<AbortController | undefined>(undefined);
   const credentialLoadSequence = useRef(0);
@@ -702,7 +790,7 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   }, [credentialsRequested, token, tenant, writeTenant, t]);
   useEffect(() => {
     loadSequence.current += 1; credentialLoadSequence.current += 1; setRoutes([]); setCredentials([]); setCredentialsRequested(false); setCredentialError(''); setForm(emptyRouteDraft); setFormCatalog({ valid: false, allowCustom: false });
-    setEditing(undefined); setEditForm(emptyRouteDraft); setEditCatalog({ valid: false, allowCustom: false });
+    setEditing(undefined); setWorkspaceOpen(false); setEditForm(emptyRouteDraft); setEditCatalog({ valid: false, allowCustom: false });
     setBusy(''); setMessage(''); setError(''); void load();
     return () => { loadAbort.current?.abort(); credentialLoadAbort.current?.abort(); };
   }, [token, tenant, writeTenant]);
@@ -722,6 +810,7 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
       && Number.isInteger(draft.priority) && Math.abs(draft.priority) <= 1000000);
   };
   const beginEdit = (route: ModelRouteView) => {
+    setWorkspaceOpen(true);
     setCredentialsRequested(true);
     setEditing(route);
     setEditCatalog({ valid: false, allowCustom: false });
@@ -746,13 +835,29 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
     setBusy(editing.id); setMessage(''); setError('');
     try {
       await api(`/internal/v1/model-routes/${editing.id}`, token, { method: 'PUT', body: JSON.stringify({ ...routeRequest(editForm, editCatalog.allowCustom), tenant_external_id: writeTenant, expected_updated_at: editing.updated_at, expected_grant_revision: editing.grant_revision }) });
-      setEditing(undefined); setMessage(t('routes.updated')); await Promise.all([load(), routeGroups.load]);
+      if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return;
+      setEditing(undefined); setWorkspaceOpen(false); await Promise.all([load(), routeGroups.load()]);
+      if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setMessage(t('routes.updated'));
     } catch (reason) {
+      if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return;
       if (reason instanceof ApiError && reason.status === 409) {
-        setEditing(undefined); setError(t('routes.concurrentChangeReloaded')); await Promise.all([load(), routeGroups.load]);
+        await Promise.all([load(), routeGroups.load()]); setError(formJourneyCopy(locale).concurrentDraftPreserved);
       } else setError(messageOf(reason, t('common.requestFailed')));
     }
-    finally { setBusy(''); }
+    finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); }
+  };
+  const createRoute = async () => {
+    if (!canSubmit(form, formCatalog.valid) || busy) return;
+    setBusy('create'); setMessage(''); setError('');
+    try {
+      await api('/internal/v1/model-routes', token, { method: 'POST', body: JSON.stringify({ ...routeRequest(form, formCatalog.allowCustom), tenant_external_id: writeTenant }) });
+      if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return;
+      setForm(emptyRouteDraft); setFormCatalog({ valid: false, allowCustom: false }); setWorkspaceOpen(false);
+      await Promise.all([load(), routeGroups.load()]);
+      if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setMessage(t('routes.created'));
+    } catch (reason) {
+      if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setError(messageOf(reason, t('common.requestFailed')));
+    } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); }
   };
   const setEnabled = async (route: ModelRouteView, enabled: boolean) => {
     setBusy(route.id); setMessage(''); setError('');
@@ -764,19 +869,21 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   };
   const remove = async (route: ModelRouteView) => {
     if (route.enabled || !await confirm(t('routes.confirmDelete', { model: route.public_model }))) return;
-    const query = new URLSearchParams({ tenant_external_id: writeTenant, expected_updated_at: String(route.updated_at) });
     setBusy(route.id); setMessage(''); setError('');
     try {
-      await api(`/internal/v1/model-routes/${route.id}?${query}`, token, { method: 'DELETE' });
+      await api(`/internal/v1/model-routes/${route.id}/archive`, token, { method: 'POST', body: JSON.stringify({ tenant_external_id: writeTenant, expected_updated_at: route.updated_at }) });
       setEditing(undefined); setMessage(t('routes.deleted')); await load();
     } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
     finally { setBusy(''); }
   };
   return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} /><section className="management-layout">
-    <article className="panel"><div className="panel-title"><div><h2>{t('routes.title')}</h2><p className="muted">{t('routes.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>{error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{credentialError && <div className="notice error" role="alert">{credentialError}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="table-scroll"><table><thead><tr>{!tenant && <th>{t('credentials.tenant')}</th>}<th>{t('routes.publicModel')}</th><th>{t('routes.upstream')}</th><th>{t('routes.groups')}</th><th>{t('routes.upstreamModel')}</th><th>{t('routes.protocol')}</th><th>{t('routes.priority')}</th><th>{t('request.status')}</th><th>{t('routes.actions')}</th></tr></thead><tbody>{statusFilter.values.map((route) => <tr key={route.id}>{!tenant && <td><code>{route.tenant_external_id ?? '—'}</code></td>}<td><code>{route.public_model}</code></td><td><div className="table-chip-list">{(route.upstream_account_ids ?? (route.upstream_account_id ? [route.upstream_account_id] : [])).map((id) => <span key={id}>{upstreams.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><div className="table-chip-list">{(route.route_group_ids ?? []).map((id) => <span key={id}>{routeGroups.groups.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><code>{route.upstream_model}</code></td><td>{route.protocol}</td><td>{formatNumber(route.priority, locale)}</td><td><span className={`status ${route.enabled ? 'ok' : 'pending'}`}>{route.enabled ? t('common.enabled') : t('common.disabled')}</span></td><td><div className="row-actions"><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => beginEdit(route)}>{t('routes.edit')}</button><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => void setEnabled(route, !route.enabled)}>{route.enabled ? t('routes.disable') : t('routes.enable')}</button><button type="button" className="danger" title={route.enabled ? t('routes.disableBeforeDelete') : undefined} disabled={busy === route.id || !canManage(route) || route.enabled} onClick={() => void remove(route)}>{t('common.remove')}</button></div></td></tr>)}</tbody></table>{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('common.enabled')} empty={t('routes.empty')} />}</div>
-      {editing && <div className="inline-editor form-panel"><div className="panel-title"><h3>{t('routes.editTitle', { model: editing.public_model })}</h3><button type="button" className="secondary" onClick={() => setEditing(undefined)}>{t('common.cancel')}</button></div><RouteFields token={token} tenant={writeTenant} draft={editForm} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setEditForm} onCatalogValidity={(valid, allowCustom) => setEditCatalog({ valid, allowCustom })} /><button type="button" disabled={busy === editing.id || !canSubmit(editForm, editCatalog.valid)} onClick={() => void saveEdit()}>{t('common.save')}</button></div>}
+    <article className="panel"><div className="panel-title"><div><h2>{t('routes.title')}</h2><p className="muted">{t('routes.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>{error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{credentialError && <div className="notice error" role="alert">{credentialError}</div>}{message && <div ref={successNotice} tabIndex={-1} className="notice success" role="status">{message}</div>}<div className="table-scroll"><table><thead><tr>{!tenant && <th>{t('credentials.tenant')}</th>}<th>{t('routes.publicModel')}</th><th>{t('routes.upstream')}</th><th>{t('routes.groups')}</th><th>{t('routes.upstreamModel')}</th><th>{t('routes.protocol')}</th><th>{t('routes.priority')}</th><th>{t('request.status')}</th><th>{t('routes.actions')}</th></tr></thead><tbody>{statusFilter.values.map((route) => <tr key={route.id}>{!tenant && <td><code>{route.tenant_external_id ?? '—'}</code></td>}<td><code>{route.public_model}</code></td><td><div className="table-chip-list">{(route.upstream_account_ids ?? (route.upstream_account_id ? [route.upstream_account_id] : [])).map((id) => <span key={id}>{upstreams.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><div className="table-chip-list">{(route.route_group_ids ?? []).map((id) => <span key={id}>{routeGroups.groups.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><code>{route.upstream_model}</code></td><td>{route.protocol}</td><td>{formatNumber(route.priority, locale)}</td><td><span className={`status ${route.enabled ? 'ok' : 'pending'}`}>{route.enabled ? t('common.enabled') : t('common.disabled')}</span></td><td><div className="row-actions"><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => beginEdit(route)}>{t('routes.edit')}</button><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => void setEnabled(route, !route.enabled)}>{route.enabled ? t('routes.disable') : t('routes.enable')}</button><button type="button" className="danger" title={route.enabled ? t('routes.disableBeforeDelete') : undefined} disabled={busy === route.id || !canManage(route) || route.enabled} onClick={() => void remove(route)}>{t('routes.archive')}</button></div></td></tr>)}</tbody></table>{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('common.enabled')} empty={t('routes.empty')} />}</div>
     </article>
-    <details className="panel create-resource" onToggle={(event) => { if (event.currentTarget.open) setCredentialsRequested(true); }}><summary><span><b>{t('routes.createTitle')}</b><small>{t('routes.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel"><RouteFields token={token} tenant={writeTenant} draft={form} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setForm} onCatalogValidity={(valid, allowCustom) => setFormCatalog({ valid, allowCustom })} /><button type="button" disabled={busy === 'create' || !canSubmit(form, formCatalog.valid)} onClick={async () => { setBusy('create'); setMessage(''); setError(''); try { await api('/internal/v1/model-routes', token, { method: 'POST', body: JSON.stringify({ ...routeRequest(form, formCatalog.allowCustom), tenant_external_id: writeTenant }) }); setForm(emptyRouteDraft); setFormCatalog({ valid: false, allowCustom: false }); setMessage(t('routes.created')); await Promise.all([load(), routeGroups.load]); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}>{t('routes.create')}</button></div></details>
+    <CreateJourney title={editing ? t('routes.editTitle', { model: editing.public_model }) : t('routes.createTitle')} description={t('routes.description')} open={workspaceOpen} busy={Boolean(busy)} onOpenChange={(open) => { setWorkspaceOpen(open); if (!open) setEditing(undefined); }} onOpen={() => setCredentialsRequested(true)}>
+      {(error || providerGroups.error || routeGroups.error || credentialError) && <div className="notice error" role="alert">{error || providerGroups.error || routeGroups.error || credentialError}</div>}
+      <RouteFields key={editing?.id ?? 'create'} token={token} tenant={writeTenant} draft={editing ? editForm : form} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={editing ? setEditForm : setForm} onCatalogValidity={(valid, allowCustom) => editing ? setEditCatalog({ valid, allowCustom }) : setFormCatalog({ valid, allowCustom })} />
+      <div className="journey-actions"><p>{t('routes.description')}</p><Button appearance="primary" type="button" disabled={Boolean(busy) || !canSubmit(editing ? editForm : form, editing ? editCatalog.valid : formCatalog.valid)} onClick={() => void (editing ? saveEdit() : createRoute())}>{t(editing ? 'common.save' : 'routes.create')}</Button></div>
+    </CreateJourney>
   </section><section className="routing-group-managers">
     <GroupManager kind="provider" token={token} tenant={writeTenant} groups={providerGroups.groups} resources={scopedUpstreams.map((value) => ({ value: value.id, label: value.name, description: value.driver }))} onChanged={providerGroups.load} />
     <GroupManager kind="route" token={token} tenant={writeTenant} groups={routeGroups.groups} resources={routes.filter(canManage).map((route) => ({ value: route.id, label: route.public_model, description: route.protocol }))} onChanged={async () => { await Promise.all([routeGroups.load(), load()]); }} />
@@ -792,13 +899,28 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   }
   const [values, setValues] = useState<KeyView[]>([]);
   const [routes, setRoutes] = useState<ModelRouteView[]>([]);
-  const [editingPolicy, setEditingPolicy] = useState<string>();
-  const [editingRouting, setEditingRouting] = useState<string>();
+  type CredentialEditor = 'policy' | 'routing' | 'rename' | 'grant' | 'limits';
+  const [workspace, setWorkspace] = useState<{ kind: 'create' } | { kind: CredentialEditor; keyId: string }>();
+  const activeEditorRegion = useRef<HTMLDivElement>(null);
+  const editorGeneration = useRef(0);
+  const activateEditor = (kind: CredentialEditor, keyId?: string) => { editorGeneration.current += 1; setWorkspace(keyId ? { kind, keyId } : undefined); };
+  const editingPolicy = workspace?.kind === 'policy' ? workspace.keyId : undefined;
+  const setEditingPolicy = (keyId?: string) => activateEditor('policy', keyId);
+  const editingRouting = workspace?.kind === 'routing' ? workspace.keyId : undefined;
+  const setEditingRouting = (keyId?: string) => activateEditor('routing', keyId);
   const [routingDraft, setRoutingDraft] = useState<CredentialRoutingView>();
-  const [renaming, setRenaming] = useState<string>();
+  const routingSaveLock = useRef<symbol | undefined>(undefined);
+  useLayoutEffect(() => {
+    if (!workspace || workspace.kind === 'create' || activeEditorRegion.current?.contains(document.activeElement)) return;
+    const fields = activeEditorRegion.current?.querySelectorAll<HTMLElement>('input:not([type="hidden"]), select, button');
+    [...(fields ?? [])].find(field => field.getClientRects().length > 0 && !field.hasAttribute('disabled'))?.focus();
+  }, [workspace, routingDraft]);
+  const renaming = workspace?.kind === 'rename' ? workspace.keyId : undefined;
+  const setRenaming = (keyId?: string) => activateEditor('rename', keyId);
   const [aliasDraft, setAliasDraft] = useState('');
   const [limitSnapshots, setLimitSnapshots] = useState<Record<string, KeyLimitSnapshot>>({});
-  const [granting, setGranting] = useState<string>();
+  const granting = workspace?.kind === 'grant' ? workspace.keyId : undefined;
+  const setGranting = (keyId?: string) => activateEditor('grant', keyId);
   const [grant, setGrant] = useState({ amount: '', source: '' });
   const [busy, setBusy] = useState('');
   const [newRouteIds, setNewRouteIds] = useState<string[]>([]);
@@ -820,6 +942,12 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const secretRequest = useRef<AbortController | undefined>(undefined);
   const secretOperation = useRef<symbol | undefined>(undefined);
   const visibleSecret = secret?.scopeGeneration === renderScope.current.generation ? secret : undefined;
+  const secretPriority = useRef<HTMLDivElement>(null);
+  const credentialSuccess = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    if (visibleSecret) { secretPriority.current?.focus(); secretPriority.current?.scrollIntoView({ block: 'start' }); }
+    else if (message && !workspace) credentialSuccess.current?.focus();
+  }, [visibleSecret?.displayId, message, workspace]);
   const secretRef = useRef(visibleSecret);
   secretRef.current = visibleSecret;
   const scopeRef = useRef({ token, tenant, writeTenant });
@@ -831,8 +959,8 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
     && scopeRef.current.writeTenant === operationWriteTenant;
   const credentialGroups = useGroups('credential', token, writeTenant);
   const routeGroups = useGroups('route', token, writeTenant);
-  const createFormSchema = createSchema;
-  const policyFormSchema = policySchema;
+  const createFormSchema = useMemo(() => createSchema ? credentialCreateSchema(createSchema as RJSFSchema) : undefined, [createSchema]);
+  const policyFormSchema = useMemo(() => policySchema ? credentialPolicySchema(policySchema as RJSFSchema) : undefined, [policySchema]);
   const ownsKeyRequest = (request: { identity: KeyListRequestIdentity; controller: AbortController }) => ownsKeyListRequest(keyRequest.current?.identity, request.identity)
     && scopeGeneration.current === request.identity.scopeGeneration
     && scopeRef.current.token === token && scopeRef.current.tenant === tenant;
@@ -900,7 +1028,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   };
   useEffect(() => {
     secretRequest.current?.abort(); secretRequest.current = undefined; secretOperation.current = undefined; secretRef.current = undefined;
-    scopeGeneration.current += 1; setValues([]); setRoutes([]); setEditingPolicy(undefined); setEditingRouting(undefined); setRoutingDraft(undefined);
+    routingSaveLock.current = undefined; scopeGeneration.current += 1; setValues([]); setRoutes([]); setEditingPolicy(undefined); setEditingRouting(undefined); setRoutingDraft(undefined);
     setRenaming(undefined); setAliasDraft(''); setLimitSnapshots({}); setGranting(undefined); setGrant({ amount: '', source: '' }); setBusy('');
     setNewRouteIds([]); setNewRouteGroupIds([]); setGroupFilter('all'); setSearch(''); setNextCursor(undefined); setKeyListState('initial-loading'); setKeyError(''); setRouteError(''); setSecret(undefined); setMessage(''); setError(''); void load();
     return () => { keyRequest.current?.controller.abort(); routeRequest.current?.controller.abort(); secretRequest.current?.abort(); };
@@ -957,6 +1085,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
     // cannot replace plaintext before React commits the state update.
     const scoped = { ...next, scopeGeneration: renderScope.current.generation };
     secretRef.current = scoped;
+    setWorkspace(undefined);
     setSecret(scoped);
   };
   const dismissSecret = () => {
@@ -994,7 +1123,6 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
     secretRequest.current?.abort();
     secretRequest.current = controller;
     try {
-      if (!await confirm(t('credentials.confirmRecovery', { alias: value.alias }))) return;
       // This is the only historical-credential read. The server enforces
       // keys:write, tenant scope, active generation and a valid envelope.
       const result = await api<{ key_id: string; credential_generation: number; key: string }>(`/internal/v1/keys/${value.key_id}/credential-recovery/copy`, operationToken, {
@@ -1002,8 +1130,14 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
       });
       if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
       if (result.key_id !== value.key_id || result.credential_generation !== value.credential_generation) throw new Error(t('common.requestFailed'));
-      showSecret({ value: result.key, recovered: true, displayId: crypto.randomUUID() });
-      setMessage(t('credentials.recovered', { alias: value.alias }));
+      try {
+        await navigator.clipboard.writeText(result.key);
+        if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setMessage(t('credentials.copySuccess', { alias: value.alias }));
+      } catch {
+        if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
+        showSecret({ value: result.key, recovered: true, displayId: crypto.randomUUID() });
+        setMessage(t('credentials.copyManual'));
+      }
     } catch (reason) {
       if (!controller.signal.aborted && ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setError(messageOf(reason, t('common.requestFailed')));
     } finally {
@@ -1016,61 +1150,105 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const openRouting = async (value: KeyView) => {
     if (editingRouting === value.key_id) { setEditingRouting(undefined); setRoutingDraft(undefined); return; }
     setError('');
+    setEditingRouting(value.key_id); setRoutingDraft(undefined);
+    const generation = editorGeneration.current;
     const operationToken = token; const operationTenant = tenant;
     try {
       const routing = await api<CredentialRoutingView>(`/internal/v1/keys/${value.key_id}/routing${queryForTenant(operationTenant)}`, operationToken);
-      if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant) return;
-      setRoutingDraft(routing); setEditingRouting(value.key_id);
-    } catch (reason) { if (scopeRef.current.token === operationToken && scopeRef.current.tenant === operationTenant) setError(messageOf(reason, t('common.requestFailed'))); }
+      if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || editorGeneration.current !== generation) return;
+      setRoutingDraft(routing);
+    } catch (reason) { if (scopeRef.current.token === operationToken && scopeRef.current.tenant === operationTenant && editorGeneration.current === generation) setError(messageOf(reason, t('common.requestFailed'))); }
   };
   const saveRouting = async (value: KeyView, draft: CredentialRoutingView) => {
+    if (busy || routingSaveLock.current || !canManage(value)) return;
+    const operation = Symbol('credential-routing-save');
+    routingSaveLock.current = operation;
     const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant;
+    const generation = editorGeneration.current;
+    setBusy('edit-routing'); setError('');
     try {
       const saved = await api<CredentialRoutingView>(`/internal/v1/keys/${value.key_id}/routing`, operationToken, { method: 'PUT', body: JSON.stringify({ tenant_external_id: operationWriteTenant, route_ids: draft.route_ids, route_group_ids: draft.route_group_ids, expected_grant_revision: draft.grant_revision }) });
-      if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || scopeRef.current.writeTenant !== operationWriteTenant) return;
-      setRoutingDraft(saved); setMessage(t('credentials.routingSaved')); setError('');
+      if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || scopeRef.current.writeTenant !== operationWriteTenant || editorGeneration.current !== generation) return;
+      setRoutingDraft(saved); setBusy(''); setEditingRouting(undefined); setMessage(t('credentials.routingSaved')); setError('');
     } catch (reason) {
-      if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || scopeRef.current.writeTenant !== operationWriteTenant) return;
+      if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || scopeRef.current.writeTenant !== operationWriteTenant || editorGeneration.current !== generation) return;
       if (reason instanceof ApiError && reason.status === 409) {
-        const current = await api<CredentialRoutingView>(`/internal/v1/keys/${value.key_id}/routing${queryForTenant(operationTenant)}`, operationToken);
-        if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || scopeRef.current.writeTenant !== operationWriteTenant) return;
-        setRoutingDraft(current); setError(t('credentials.concurrentRoutingReloaded'));
+        setError(formJourneyCopy(locale).concurrentDraftPreserved);
       } else setError(messageOf(reason, t('common.requestFailed')));
+    } finally {
+      if (routingSaveLock.current === operation) routingSaveLock.current = undefined;
+      if (scopeRef.current.token === operationToken && scopeRef.current.tenant === operationTenant && scopeRef.current.writeTenant === operationWriteTenant && editorGeneration.current === generation) setBusy('');
     }
   };
-  return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} />{visibleSecret && <OneTimeSecret key={visibleSecret.displayId} value={visibleSecret.value} recovered={visibleSecret.recovered} recoveryAvailable={!visibleSecret.recovered} filename="client-credential.txt" onDismiss={dismissSecret} message={t(visibleSecret.recovered ? 'credentials.recoveredSecret' : 'credentials.oneTimeSecret')} />}<section className="management-layout">
-    <article className="panel"><div className="panel-title"><div><h2>{t('credentials.title')}</h2><p className="muted">{t('credentials.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>
-      <div className="notice warning" role="note">{t('credentials.secretUnavailable')}</div>
-      <div className="credential-list-controls"><label>{t('credentials.search')}<input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t('credentials.searchPlaceholder')} /></label>{writeTenant && <label>{t('credentials.groupFilter')}<select value={groupFilter} onChange={(event) => setGroupFilter(event.target.value)}><option value="all">{t('common.all')}</option><option value="unassigned">{t('credentials.ungrouped')}</option>{credentialGroups.groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select></label>}</div>
-      <p className="credential-list-summary" role="status">{listPresentation === 'loading' ? t('credentials.loadingList') : listPresentation === 'loading-more' ? t('credentials.loadingMore', { count: formatNumber(values.length, locale) }) : listPresentation === 'failed' ? t('credentials.loadFailed', { count: formatNumber(values.length, locale) }) : listPresentation === 'filtered' ? t('credentials.filteredLoaded', { shown: formatNumber(filteredValues.length, locale), loaded: formatNumber(values.length, locale) }) : listPresentation === 'more' ? t('credentials.loadedMore', { count: formatNumber(values.length, locale) }) : t('credentials.loadedComplete', { count: formatNumber(values.length, locale) })}</p>
-      {keyError && <div className="notice error" role="alert">{keyError}</div>}{routeError && <div className="notice error" role="alert">{routeError}</div>}{error && <div className="notice error" role="alert">{error}</div>}{credentialGroups.error && <div className="notice error" role="alert">{credentialGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{message && <div className="notice success" role="status">{message}</div>}
-      <div className="account-list">{filteredValues.length === 0 && (loadingKeys ? <div className="empty">{t('common.loading')}</div> : keyListState === 'failed' ? <div className="empty">{t('credentials.loadFailed', { count: formatNumber(values.length, locale) })}</div> : <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('status.active')} empty={values.length === 0 ? t('credentials.empty') : t('credentials.noFilterResults')} />)}{filteredValues.map((value) => {
-        const memberships = credentialGroups.groups.filter((group) => group.member_ids.includes(value.key_id));
-        return <div className="managed-resource" key={value.key_id}><div className="managed-resource-header"><div><b>{value.alias}</b><small>{value.key_id}</small><span>{!tenant && <>{t('credentials.tenant')}: {value.tenant_external_id ?? '—'} · </>}{value.principal_external_id ?? t('common.unknownPrincipal')} · {formatCurrency(value.available_balance, value.currency, locale)}</span></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div>
-          <div className="credential-recovery-control">
-            {value.credential_recovery_available && value.status === 'active'
-              ? <button type="button" className="secondary" disabled={!canManage(value) || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void recoverCredential(value)}>{busy === `recover-${value.key_id}` ? t('common.loading') : t('credentials.recoverAndCopy')}</button>
-              : <><span className="pill credential-recovery-unavailable" title={t(value.status === 'revoked' ? 'credentials.copyRevoked' : value.status === 'suspended' ? 'credentials.copySuspended' : 'credentials.copyNotStored')}>{t(value.status === 'revoked' ? 'credentials.copyRevoked' : value.status === 'suspended' ? 'credentials.copySuspended' : 'credentials.copyNotStored')}</span>
-                {value.status !== 'revoked' && <button type="button" className="secondary" disabled={!canManage(value) || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void rotateCredential(value)}>{t('credentials.rotateToCopy')}</button>}</>}
-          </div>
-          {memberships.length > 0 && <div className="table-chip-list credential-group-chips" aria-label={t('groups.credential.title')}>{memberships.map((group) => <span key={group.id}>{group.name}</span>)}</div>}
-          <div className="policy-chips"><span>{enumLabel(t, 'enforcementMode', value.policy.enforcement_mode)}</span><span>RPM {formatNumber(value.policy.requests_per_minute, locale)}</span><span>TPM {formatNumber(value.policy.tokens_per_minute, locale)}</span><span>{t('self.concurrency')} {formatNumber(value.policy.max_concurrency, locale)}</span><span>{t('budget.daily')}: {value.policy.daily_budget === null ? '—' : formatCurrency(value.policy.daily_budget, value.currency, locale)}</span><span>{t('budget.weekly')}: {value.policy.weekly_budget === null ? '—' : formatCurrency(value.policy.weekly_budget, value.currency, locale)}</span><span>{t('budget.lifetime')}: {value.policy.lifetime_budget === null ? '—' : formatCurrency(value.policy.lifetime_budget, value.currency, locale)}</span></div>
-          <div className="row-actions"><button type="button" className="secondary" disabled={!canWrite} onClick={() => { setRenaming(renaming === value.key_id ? undefined : value.key_id); setAliasDraft(value.alias); }}>{t('credentials.rename')}</button><button type="button" className="secondary" disabled={!canReadLimits} onClick={async () => { try { const snapshot = await api<KeyLimitSnapshot>(`/internal/v1/keys/${value.key_id}/limits`, token); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setLimitSnapshots((current) => ({ ...current, [value.key_id]: snapshot })); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } }}>{t('credentials.viewLimits')}</button><button type="button" className="secondary" disabled={!canWrite || value.status === 'revoked' || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void rotateCredential(value)}>{t('credentials.rotate')}</button><button type="button" className="secondary" disabled={!canWrite || value.status === 'revoked'} onClick={() => setEditingPolicy(editingPolicy === value.key_id ? undefined : value.key_id)}>{t('credentials.editPolicy')}</button><button type="button" className="secondary" disabled={!canWrite || value.status === 'revoked'} onClick={() => void openRouting(value)}>{t('credentials.routing')}</button><button type="button" className="secondary" disabled={!canWrite || !value.account_id || value.status === 'revoked'} title={!value.account_id ? t('credentials.accountMissing') : undefined} onClick={() => setGranting(granting === value.key_id ? undefined : value.key_id)}>{t('credentials.grant')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" disabled={!canWrite} onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; try { await api(`/internal/v1/keys/${value.key_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setMessage(t(nextStatus === 'active' ? 'credentials.resumed' : 'credentials.suspended', { alias: value.alias })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } }}>{value.status === 'active' ? t('credentials.suspend') : t('credentials.resume')}</button>}</div>
-          {renaming === value.key_id && <div className="inline-editor form-panel"><h3>{t('credentials.renameFor', { alias: value.alias })}</h3><label>{t('schema.Credential alias')}<input value={aliasDraft} maxLength={200} onChange={(event) => setAliasDraft(event.target.value)} /></label><button type="button" disabled={!canWrite || !aliasDraft.trim()} onClick={async () => { try { await api(`/internal/v1/keys/${value.key_id}/alias`, token, { method: 'PATCH', body: JSON.stringify({ alias: aliasDraft }) }); setRenaming(undefined); setMessage(t('credentials.renamed', { alias: aliasDraft.trim() })); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}>{t('common.save')}</button></div>}
-          {limitSnapshots[value.key_id] && <LimitSnapshot value={limitSnapshots[value.key_id]} />}
-          {editingPolicy === value.key_id && policyFormSchema && <div className="inline-editor form-panel"><h3>{t('credentials.policyFor', { alias: value.alias })}</h3><Form key={`${value.key_id}-${locale}`} schema={localizeSchema(policyFormSchema as RJSFSchema, locale)} formData={value.policy} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { try { await api(`/internal/v1/keys/${value.key_id}/policy`, token, { method: 'PUT', body: JSON.stringify(formData) }); setEditingPolicy(undefined); setMessage(t('credentials.policySaved')); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!canWrite}>{t('common.save')}</button></Form></div>}
+  const saveCredentialConfiguration = async (value: KeyView, suffix: 'alias' | 'policy', body: unknown, success: string) => {
+    if (busy) return;
+    const generation = editorGeneration.current;
+    const current = () => editorGeneration.current === generation && scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant;
+    setBusy('edit-credential'); setError(''); setMessage('');
+    try {
+      await api(`/internal/v1/keys/${value.key_id}/${suffix}`, token, { method: suffix === 'alias' ? 'PATCH' : 'PUT', body: JSON.stringify(body) });
+      if (!current()) return;
+      setWorkspace(undefined); await load(); if (current()) setMessage(success);
+    } catch (reason) { if (current()) setError(messageOf(reason, t('common.requestFailed'))); }
+    finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); }
+  };
+  const activeCredential = workspace && workspace.kind !== 'create' ? values.find(value => value.key_id === workspace.keyId) : undefined;
+  const credentialEditor = (value: KeyView) => <div ref={activeEditorRegion} className="credential-active-editor">
+          {renaming === value.key_id && <div className="inline-editor form-panel"><h3>{t('credentials.renameFor', { alias: value.alias })}</h3><label>{t('schema.Credential alias')}<Input value={aliasDraft} maxLength={200} onChange={(event) => setAliasDraft(event.target.value)} /></label><Button appearance="primary" type="button" disabled={!canWrite || !aliasDraft.trim()} onClick={() => void saveCredentialConfiguration(value, 'alias', { alias: aliasDraft }, t('credentials.renamed', { alias: aliasDraft.trim() }))}>{t('common.save')}</Button></div>}
+          {workspace?.kind === 'limits' && (limitSnapshots[value.key_id] ? <LimitSnapshot value={limitSnapshots[value.key_id]} /> : <p role="status">{t('common.loading')}</p>)}
+          {editingPolicy === value.key_id && policyFormSchema && <div className="inline-editor form-panel"><h3>{t('credentials.policyFor', { alias: value.alias })}</h3><CredentialPolicySummary policy={value.policy} currency={value.currency} /><Form key={`${value.key_id}-${locale}`} schema={localizeSchema(policyFormSchema as RJSFSchema, locale)} formData={value.policy} uiSchema={credentialPolicyUiSchema} fields={credentialFormFields} validator={validator} templates={credentialFormTemplates} widgets={fluentFormWidgets} onSubmit={({ formData }) => void saveCredentialConfiguration(value, 'policy', formData, t('credentials.policySaved'))}><Button appearance="primary" type="submit" disabled={!canWrite}>{t('common.save')}</Button></Form></div>}
           {editingRouting === value.key_id && routingDraft && <div className="inline-editor form-panel routing-editor"><h3>{t('credentials.routingFor', { alias: value.alias })}</h3><p className="muted">{t('credentials.routingHint')}</p>
             <MultiCombobox label={t('credentials.exactRoutes')} options={routeOptions} value={selections(routingDraft.route_ids, routeOptions)} onChange={(selected) => setRoutingDraft({ ...routingDraft, route_ids: selected.map((item) => item.value) })} placeholder={t('credentials.searchRoutes')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} />
             <MultiCombobox label={t('credentials.routeGroups')} options={routeGroupOptions} value={selections(routingDraft.route_group_ids, routeGroupOptions)} onChange={(selected) => setRoutingDraft({ ...routingDraft, route_group_ids: selected.map((item) => item.value) })} placeholder={t('credentials.searchRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('credentials.existingGroupsOnly')} />
             {routingDraft.effective_route_ids.length > 0 && <small className="field-hint">{t('credentials.effectiveRoutes', { count: formatNumber(routingDraft.effective_route_ids.length, locale) })}</small>}
-            <button type="button" disabled={!canWrite} onClick={() => void saveRouting(value, routingDraft)}>{t('common.save')}</button>
+            <Button appearance="primary" type="button" disabled={!canWrite || Boolean(busy)} onClick={() => void saveRouting(value, routingDraft)}>{t('common.save')}</Button>
           </div>}
-          {granting === value.key_id && value.account_id && <div className="inline-editor form-panel"><h3>{t('credentials.grantFor', { alias: value.alias })}</h3><label>{t('credentials.grantAmount')} ({value.currency})<input inputMode="decimal" value={grant.amount} onChange={(event) => setGrant({ ...grant, amount: event.target.value })} /></label><label>{t('credentials.grantSource')}<input value={grant.source} onChange={(event) => setGrant({ ...grant, source: event.target.value })} /></label><button type="button" disabled={!canWrite || Boolean(busy) || !isPositiveDecimal(grant.amount) || !grant.source.trim()} onClick={async () => { const amount = grant.amount.trim(); const source = grant.source.trim(); if (!await confirm(`${t('credentials.grantFor', { alias: value.alias })}\n${t('credentials.grantAmount')}: ${amount} ${value.currency}\n${t('credentials.grantSource')}: ${source}`)) return; setBusy(`grant-${value.key_id}`); try { await api(`/internal/v1/accounts/${value.account_id}/grants`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ amount, source }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setGranting(undefined); setGrant({ amount: '', source: '' }); setMessage(t('credentials.granted')); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setBusy(''); } }}>{t('credentials.confirmGrant')}</button></div>}
+          {granting === value.key_id && value.account_id && <div className="inline-editor form-panel"><h3>{t('credentials.grantFor', { alias: value.alias })}</h3><label>{t('credentials.grantAmount')} ({value.currency})<input inputMode="decimal" value={grant.amount} onChange={(event) => setGrant({ ...grant, amount: event.target.value })} /></label><label>{t('credentials.grantSource')}<input value={grant.source} onChange={(event) => setGrant({ ...grant, source: event.target.value })} /></label><Button appearance="primary" type="button" disabled={!canWrite || Boolean(busy) || !isPositiveDecimal(grant.amount) || !grant.source.trim()} onClick={async () => { const amount = grant.amount.trim(); const source = grant.source.trim(); if (!await confirm(`${t('credentials.grantFor', { alias: value.alias })}\n${t('credentials.grantAmount')}: ${amount} ${value.currency}\n${t('credentials.grantSource')}: ${source}`)) return; setBusy(`grant-${value.key_id}`); try { await api(`/internal/v1/accounts/${value.account_id}/grants`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ amount, source }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setGranting(undefined); setGrant({ amount: '', source: '' }); setMessage(t('credentials.granted')); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setBusy(''); } }}>{t('credentials.confirmGrant')}</Button></div>}
+    {workspace?.kind === 'routing' && !routingDraft && <p role="status">{t('common.loading')}</p>}
+  </div>;
+  return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} />{visibleSecret && <div ref={secretPriority} tabIndex={-1} className="credential-secret-priority"><OneTimeSecret key={visibleSecret.displayId} value={visibleSecret.value} recovered={visibleSecret.recovered} recoveryAvailable={!visibleSecret.recovered} filename="client-credential.txt" onDismiss={dismissSecret} message={t(visibleSecret.recovered ? 'credentials.recoveredSecret' : 'credentials.oneTimeSecret')} /></div>}<section className="management-layout">
+    <article className="panel"><div className="panel-title"><div><h2>{t('credentials.title')}</h2><p className="muted">{t('credentials.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>
+      <div className="credential-list-controls"><label>{t('credentials.search')}<input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t('credentials.searchPlaceholder')} /></label>{writeTenant && <label>{t('credentials.groupFilter')}<select value={groupFilter} onChange={(event) => setGroupFilter(event.target.value)}><option value="all">{t('common.all')}</option><option value="unassigned">{t('credentials.ungrouped')}</option>{credentialGroups.groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select></label>}</div>
+      <p className="credential-list-summary" role="status">{listPresentation === 'loading' ? t('credentials.loadingList') : listPresentation === 'loading-more' ? t('credentials.loadingMore', { count: formatNumber(values.length, locale) }) : listPresentation === 'failed' ? t('credentials.loadFailed', { count: formatNumber(values.length, locale) }) : listPresentation === 'filtered' ? t('credentials.filteredLoaded', { shown: formatNumber(filteredValues.length, locale), loaded: formatNumber(values.length, locale) }) : listPresentation === 'more' ? t('credentials.loadedMore', { count: formatNumber(values.length, locale) }) : t('credentials.loadedComplete', { count: formatNumber(values.length, locale) })}</p>
+      {keyError && <div className="notice error" role="alert">{keyError}</div>}{routeError && <div className="notice error" role="alert">{routeError}</div>}{error && <div className="notice error" role="alert">{error}</div>}{credentialGroups.error && <div className="notice error" role="alert">{credentialGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{message && <div ref={credentialSuccess} tabIndex={-1} className="notice success" role="status">{message}</div>}
+      <div className="account-list credential-compact-list">{filteredValues.length === 0 && (loadingKeys ? <div className="empty">{t('common.loading')}</div> : keyListState === 'failed' ? <div className="empty">{t('credentials.loadFailed', { count: formatNumber(values.length, locale) })}</div> : <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('status.active')} empty={values.length === 0 ? t('credentials.empty') : t('credentials.noFilterResults')} />)}{filteredValues.map((value) => {
+        const memberships = credentialGroups.groups.filter((group) => group.member_ids.includes(value.key_id));
+        const budget = credentialBudgetPresentation(value, locale, t);
+        const technicalDetails = [
+          t('credentials.identifierHint', { id: value.key_id }),
+          t('credentials.principalHint', { principal: value.principal_external_id ?? t('common.unknownPrincipal') }),
+          !tenant ? t('credentials.tenantHint', { tenant: value.tenant_external_id ?? '—' }) : '',
+        ].filter(Boolean).join('\n');
+        return <div className="managed-resource credential-compact-row" key={value.key_id}><div className="managed-resource-header"><div><b title={technicalDetails}>{value.alias}</b><div className="credential-row-summary"><span className="credential-budget" title={budget.title}>{budget.text}</span>{!tenant && <span className="credential-group-summary">{t('credentials.tenant')}: {value.tenant_external_id ?? '—'}</span>}{memberships.length > 0 && <span className="credential-group-summary" title={memberships.map((group) => group.name).join('\n')}>{t('credentials.groupCount', { count: memberships.length })}</span>}</div></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="credential-generation">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div>
+          <div className="credential-recovery-control credential-row-actions">
+            {value.credential_recovery_available && value.status === 'active'
+              ? <Button appearance="secondary" type="button" disabled={!canManage(value) || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void recoverCredential(value)}>{busy === `recover-${value.key_id}` ? t('common.loading') : t('credentials.copy')}</Button>
+              : <><span className="credential-recovery-unavailable" title={t(value.status === 'revoked' ? 'credentials.copyRevoked' : value.status === 'suspended' ? 'credentials.copySuspended' : 'credentials.copyNotStored')}>{t(value.status === 'revoked' ? 'credentials.copyRevoked' : value.status === 'suspended' ? 'credentials.copySuspended' : 'credentials.copyNotStored')}</span>
+                <Button appearance="secondary" type="button" disabled>{t('credentials.copy')}</Button></>}
+          </div>
+          <CredentialActionMenu label={locale.startsWith('zh') ? '更多操作' : 'More actions'} disabled={Boolean(busy) || Boolean(visibleSecret)} actions={[
+            { id: 'rename', label: t('credentials.rename'), disabled: !canWrite, onSelect: () => { setRenaming(value.key_id); setAliasDraft(value.alias); } },
+            { id: 'limits', label: t('credentials.viewLimits'), disabled: !canReadLimits, onSelect: async () => {
+              activateEditor('limits', value.key_id); const generation = editorGeneration.current;
+              try { const snapshot = await api<KeyLimitSnapshot>(`/internal/v1/keys/${value.key_id}/limits`, token); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || editorGeneration.current !== generation) return; setLimitSnapshots(current => ({ ...current, [value.key_id]: snapshot })); }
+              catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && editorGeneration.current === generation) setError(messageOf(reason, t('common.requestFailed'))); }
+            } },
+            { id: 'rotate', label: t('credentials.rotate'), disabled: !canWrite || value.status === 'revoked', onSelect: () => rotateCredential(value) },
+            { id: 'policy', label: t('credentials.editPolicy'), disabled: !canWrite || value.status === 'revoked', onSelect: () => setEditingPolicy(value.key_id) },
+            { id: 'routing', label: t('credentials.routing'), disabled: !canWrite || value.status === 'revoked', onSelect: () => openRouting(value) },
+            { id: 'grant', label: t('credentials.grant'), disabled: !canWrite || !value.account_id || value.status === 'revoked', description: !value.account_id ? t('credentials.accountMissing') : undefined, onSelect: () => setGranting(value.key_id) },
+            ...(value.status === 'revoked' ? [] : [{ id: 'status', label: value.status === 'active' ? t('credentials.suspend') : t('credentials.resume'), disabled: !canWrite, onSelect: async () => {
+              const nextStatus = value.status === 'active' ? 'suspended' : 'active';
+              try { await api(`/internal/v1/keys/${value.key_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setMessage(t(nextStatus === 'active' ? 'credentials.resumed' : 'credentials.suspended', { alias: value.alias })); await load(); }
+              catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); }
+            } }]),
+          ]} />
         </div>})}</div>{keyListState === 'failed' ? <div className="load-more"><button type="button" className="secondary" onClick={() => void load()}>{t('credentials.retryLoad')}</button></div> : nextCursor && (keyListState === 'more' || keyListState === 'loading-more') && <div className="load-more"><button type="button" className="secondary" disabled={!canLoadMore} onClick={() => void loadMore()}>{loadingKeys ? t('common.loading') : t('credentials.loadMore')}</button></div>}</article>
-    <details className="panel create-resource"><summary><span><b>{t('credentials.createTitle')}</b><small>{t('credentials.createRoutingHint')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">
-      <MultiCombobox label={t('credentials.exactRoutes')} options={routeOptions} value={selections(newRouteIds, routeOptions)} onChange={(selected) => setNewRouteIds(selected.map((item) => item.value))} placeholder={t('credentials.searchRoutes')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} />
-      <MultiCombobox label={t('credentials.routeGroups')} options={routeGroupOptions} value={selections(newRouteGroupIds, routeGroupOptions)} onChange={(selected) => setNewRouteGroupIds(selected.map((item) => item.value))} placeholder={t('credentials.searchRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('credentials.existingGroupsOnly')} />
-      {createFormSchema ? <Form key={`${tenant}-${writeTenant}-${locale}`} schema={localizeSchema(createFormSchema as RJSFSchema, locale)} uiSchema={{ tenant_external_id: { 'ui:widget': 'hidden' } }} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => {
+    <CreateJourney title={activeCredential ? `${t('credentials.title')} · ${activeCredential.alias}` : t('credentials.createTitle')} description={formJourneyCopy(locale).credentialFlowHint} open={Boolean(workspace)} busy={Boolean(busy) || Boolean(visibleSecret)} onOpenChange={(open) => { editorGeneration.current += 1; setWorkspace(open ? { kind: 'create' } : undefined); }}>
+      {(error || routeError || routeGroups.error) && <div className="notice error" role="alert">{error || routeError || routeGroups.error}</div>}
+      {activeCredential && credentialEditor(activeCredential)}
+      <div hidden={workspace?.kind !== 'create'}>
+      {createFormSchema ? <Form key={`${tenant}-${writeTenant}-${locale}`} schema={localizeSchema(createFormSchema as RJSFSchema, locale)} uiSchema={credentialCreateUiSchema} fields={credentialFormFields} validator={validator} widgets={fluentFormWidgets} templates={credentialFormTemplates} onSubmit={async ({ formData }) => {
         if (!writeTenant) return;
         const operation = beginSecretOperation();
         if (!operation) return;
@@ -1089,9 +1267,13 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
           if (secretRequest.current === controller) secretRequest.current = undefined;
           if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) finishSecretOperation(operation);
         }
-      }}><button type="submit" disabled={!canWrite || Boolean(busy) || Boolean(visibleSecret)}>{busy === 'create-credential' ? t('common.loading') : t('credentials.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
-    </div></details>
-  </section>{writeTenant && <GroupManager kind="credential" token={token} tenant={writeTenant} groups={credentialGroups.groups} resources={values.filter(canManage).map((value) => ({ value: value.key_id, label: value.alias, description: value.key_id }))} onChanged={credentialGroups.load} />}</>;
+      }}><FormSection title={formJourneyCopy(locale).access} description={t('credentials.createRoutingHint')}>
+        <MultiCombobox label={t('credentials.exactRoutes')} options={routeOptions} value={selections(newRouteIds, routeOptions)} onChange={(selected) => setNewRouteIds(selected.map((item) => item.value))} placeholder={t('credentials.searchRoutes')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} />
+        <MultiCombobox label={t('credentials.routeGroups')} options={routeGroupOptions} value={selections(newRouteGroupIds, routeGroupOptions)} onChange={(selected) => setNewRouteGroupIds(selected.map((item) => item.value))} placeholder={t('credentials.searchRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('credentials.existingGroupsOnly')} />
+      </FormSection><div className="journey-actions"><p>{newRouteIds.length || newRouteGroupIds.length ? t('credentials.createRoutingHint') : formJourneyCopy(locale).draftNoRoutes}</p><Button appearance="primary" type="submit" disabled={!canWrite || Boolean(busy) || Boolean(visibleSecret)}>{busy === 'create-credential' ? t('common.loading') : t('credentials.create')}</Button></div></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
+      </div>
+    </CreateJourney>
+  </section>{writeTenant && <section className="credential-group-workspace"><Disclosure title={t('groups.credential.title')}><GroupManager kind="credential" token={token} tenant={writeTenant} groups={credentialGroups.groups} resources={values.filter(canManage).map((value) => ({ value: value.key_id, label: value.alias, description: value.key_id }))} onChanged={credentialGroups.load} /></Disclosure></section>}</>;
 }
 
 function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schema }: { token: string; tenant: string; writeTenant?: string; schema?: Record<string, unknown> }) {
@@ -1102,7 +1284,7 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schem
     renderScope.current = { token, tenant, writeTenant, generation: renderScope.current.generation + 1 };
   }
   const [values, setValues] = useState<ServiceTokenView[]>([]);
-  const [secret, setSecret] = useState<{ value: string; displayId: string; scopeGeneration: number }>();
+  const [secret, setSecret] = useState<{ value: string; displayId: string; scopeGeneration: number; copied: boolean }>();
   const [busy, setBusy] = useState('');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -1147,14 +1329,41 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schem
     secretOperation.current = undefined;
     setBusy('');
   };
-  const showSecret = (value: string) => {
-    const next = { value, displayId: crypto.randomUUID(), scopeGeneration: renderScope.current.generation };
+  const showSecret = (value: string, copied = false) => {
+    const next = { value, displayId: crypto.randomUUID(), scopeGeneration: renderScope.current.generation, copied };
     secretRef.current = next;
     setSecret(next);
   };
   const dismissSecret = () => {
     secretRef.current = undefined;
     setSecret(undefined);
+  };
+  const copyServiceCredential = async (value: ServiceTokenView) => {
+    if (!token || !value.credential_copy_available || value.status !== 'active') return;
+    const operation = beginSecretOperation();
+    if (!operation) return;
+    const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant; const operationScopeGeneration = renderScope.current.generation;
+    const current = () => ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration);
+    const controller = new AbortController();
+    secretRequest.current?.abort(); secretRequest.current = controller;
+    setBusy(`copy-${value.service_id}`); setError(''); setMessage('');
+    try {
+      const result = await api<{ service_id: string; credential_generation: number; token: string }>(`/internal/v1/service-tokens/${encodeURIComponent(value.service_id)}/copy`, operationToken, { ...secretResponseRequestPolicy, method: 'POST', signal: controller.signal });
+      if (!current()) return;
+      if (result.service_id !== value.service_id || result.credential_generation !== value.credential_generation) throw new Error(t('common.requestFailed'));
+      try {
+        await navigator.clipboard.writeText(result.token);
+        if (current()) setMessage(t('services.copySuccess', { name: value.name }));
+      } catch {
+        if (!current()) return;
+        showSecret(result.token, true); setMessage(t('credentials.copyManual'));
+      }
+    } catch (reason) {
+      if (!controller.signal.aborted && current()) setError(reason instanceof ApiError && reason.status === 403 ? t('services.copyPermission') : reason instanceof ApiError && reason.status === 404 ? t('services.secretUnavailable') : messageOf(reason, t('common.requestFailed')));
+    } finally {
+      if (secretRequest.current === controller) secretRequest.current = undefined;
+      if (current()) finishSecretOperation(operation);
+    }
   };
   const rotateServiceCredential = async (value: ServiceTokenView) => {
     if (!canManage(value) || value.status === 'revoked') return;
@@ -1196,8 +1405,15 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schem
       if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) finishSecretOperation(operation);
     }
   };
-  return <>{confirmationDialog}{visibleSecret && <OneTimeSecret key={visibleSecret.displayId} value={visibleSecret.value} filename="service-credential.txt" onDismiss={dismissSecret} message={t('services.oneTimeSecret')} />}<section className="management-layout">
-    <article className="panel"><div className="panel-title"><div><h2>{t('services.title')}</h2><p className="muted">{t('services.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>{error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="account-list">{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('status.active')} empty={t('services.empty')} />}{statusFilter.values.map((value) => <div className="managed-resource" key={value.service_id}><div className="managed-resource-header"><div><b>{value.name}</b><small>{value.service_id}</small><span>{value.tenant_external_id ?? t('services.globalScope')} · {value.scopes.join(' · ')}</span></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div><div className="row-actions"><button type="button" className="secondary" disabled={!canManage(value) || value.status === 'revoked' || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void rotateServiceCredential(value)}>{t('services.rotate')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" disabled={!canManage(value) || Boolean(busy)} onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; setBusy(`status-${value.service_id}`); try { await api(`/internal/v1/service-tokens/${value.service_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setMessage(t(nextStatus === 'active' ? 'services.resumed' : 'services.suspended', { name: value.name })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); } } }>{value.status === 'active' ? t('services.suspend') : t('services.resume')}</button>}</div></div>)}</div></article>
+  return <>{confirmationDialog}{visibleSecret && <OneTimeSecret key={visibleSecret.displayId} value={visibleSecret.value} recovered={visibleSecret.copied} recoveryAvailable={!visibleSecret.copied} filename="service-credential.txt" onDismiss={dismissSecret} message={t(visibleSecret.copied ? 'credentials.recoveredSecret' : 'services.oneTimeSecret')} />}<section className="management-layout">
+    <article className="panel"><div className="panel-title"><div><h2>{t('services.title')}</h2><p className="muted">{t('services.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>{error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="account-list credential-compact-list">{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('status.active')} empty={t('services.empty')} />}{statusFilter.values.map((value) => {
+      const technicalDetails = [
+        t('services.identifierHint', { id: value.service_id }),
+        t('services.scopesHint', { scopes: value.scopes.join(' · ') || '—' }),
+        t('services.tenantHint', { tenant: value.tenant_external_id ?? t('services.globalScope') }),
+      ].join('\n');
+      return <div className="managed-resource credential-compact-row" key={value.service_id}><div className="managed-resource-header"><div><b title={technicalDetails}>{value.name}</b><div className="credential-row-summary"><span className="credential-budget" title={t('services.notBilledHint')}>{t('services.notBilled')}</span><span className="credential-group-summary">{value.tenant_external_id ?? t('services.globalScope')} · {value.scopes.join(' · ') || t('common.none')}</span></div></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div><div className="row-actions credential-row-actions"><DetailTooltip content={value.status === 'revoked' ? t('credentials.copyRevoked') : value.status === 'suspended' ? t('credentials.copySuspended') : !value.credential_copy_available ? t('services.secretUnavailable') : t('services.copyPermission')}><span tabIndex={!value.credential_copy_available || value.status !== 'active' ? 0 : undefined}><Button appearance="secondary" type="button" disabled={!token || !value.credential_copy_available || value.status !== 'active' || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void copyServiceCredential(value)}>{busy === `copy-${value.service_id}` ? t('common.loading') : t('credentials.copy')}</Button></span></DetailTooltip><button type="button" className="secondary" disabled={!canManage(value) || value.status === 'revoked' || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void rotateServiceCredential(value)}>{t('services.rotate')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" disabled={!canManage(value) || Boolean(busy)} onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; setBusy(`status-${value.service_id}`); try { await api(`/internal/v1/service-tokens/${value.service_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setMessage(t(nextStatus === 'active' ? 'services.resumed' : 'services.suspended', { name: value.name })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); } } }>{value.status === 'active' ? t('services.suspend') : t('services.resume')}</button>}</div></div>;
+    })}</div></article>
     <details className="panel create-resource"><summary><span><b>{t('services.createTitle')}</b><small>{t('services.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">{schema ? <Form key={`${tenant}-${writeTenant}-${locale}`} schema={localizeSchema(schema as RJSFSchema, locale)} uiSchema={{ tenant_external_id: { 'ui:widget': 'hidden' } }} validator={validator} templates={schemaFormTemplates} onSubmit={({ formData }) => { void createServiceCredential(formData); }}><button type="submit" disabled={!writeTenant || Boolean(busy) || Boolean(visibleSecret)}>{busy === 'create-service-credential' ? t('common.loading') : t('services.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}</div></details>
   </section></>;
 }

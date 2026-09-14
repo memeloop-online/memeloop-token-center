@@ -29,6 +29,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(rotate_service_token),
         )
         .route(
+            "/internal/v1/service-tokens/{service_id}/copy",
+            post(copy_service_token),
+        )
+        .route(
             "/internal/v1/service-tokens/{service_id}/status",
             patch(set_service_token_status),
         )
@@ -128,32 +132,12 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(reconcile_quota_reset),
         )
         .route(
-            "/internal/v1/migrations/openai-codex/prepare",
-            post(prepare_native_codex_upgrade),
-        )
-        .route(
-            "/internal/v1/migrations/openai-codex/apply",
-            post(apply_native_codex_upgrade),
-        )
-        .route(
             "/internal/v1/native-oauth-imports/capabilities",
             get(native_oauth_import_capabilities),
         )
         .route(
             "/internal/v1/native-oauth-imports/kimi-cohort",
             post(import_native_kimi_oauth_cohort),
-        )
-        .route(
-            "/internal/v1/imports/session-archive/quarantine",
-            get(list_archive_quarantine),
-        )
-        .route(
-            "/internal/v1/imports/session-archive/quarantine/{quarantine_id}",
-            get(get_archive_quarantine),
-        )
-        .route(
-            "/internal/v1/imports/session-archive/quarantine/{quarantine_id}/resolutions",
-            post(resolve_archive_quarantine),
         )
         .route("/internal/v1/requests", get(internal_requests))
         .route(
@@ -193,6 +177,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route(
             "/internal/v1/usage-analysis",
             get(usage_analysis::internal_usage_analysis),
+        )
+        .route(
+            "/internal/v1/usage-analysis/trends",
+            get(usage_analysis::internal_usage_analysis_trends),
         )
         .route("/internal/v1/request-events", get(internal_request_events))
         .route("/internal/v1/sessions", get(internal_sessions))
@@ -255,6 +243,14 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route(
             "/internal/v1/model-routes/{route_id}/retire-upstreams",
             post(retire_model_route_upstreams),
+        )
+        .route(
+            "/internal/v1/model-routes/{route_id}/archive",
+            post(archive_model_route),
+        )
+        .route(
+            "/internal/v1/archived-model-routes/{route_id}",
+            get(get_archived_model_route),
         )
         .route(
             "/internal/v1/model-routes/{route_id}/routing",
@@ -324,6 +320,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             get(list_account_ledger),
         )
         .route(
+            "/internal/v1/accounts/{account_id}/settlements",
+            get(list_account_settlements),
+        )
+        .route(
             "/internal/v1/entitlements",
             get(list_entitlements).put(reconcile_entitlement),
         )
@@ -339,7 +339,22 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route(
             "/internal/v1/integrations/memeloop-cloud/principals/ensure",
             post(ensure_memeloop_cloud_principal),
+        );
+    #[cfg(feature = "experimental-plugin-revisions")]
+    let authenticated = authenticated
+        .route(
+            "/internal/v1/plugin-runtime/candidates",
+            post(super::super::plugins::stage_application_plugin),
         )
+        .route(
+            "/internal/v1/plugin-runtime/publish",
+            post(super::super::plugins::publish_application_plugin),
+        )
+        .route(
+            "/internal/v1/plugin-runtime/rollback",
+            post(super::super::plugins::rollback_application_plugin),
+        );
+    let authenticated = authenticated
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             authenticate_control_before_body,

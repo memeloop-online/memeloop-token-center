@@ -151,6 +151,35 @@ export function filtersActive(filters: RequestFilters) {
   return Object.values(filters).some(Boolean);
 }
 
+function mergeArchiveState(previous: RequestView['archive_state'], event: RequestEvent): RequestView['archive_state'] {
+  const incoming = event.archive_state;
+  // A REST snapshot can be newer than the event retained in liveEventsRef.
+  // Archive terminal states are monotonic, and gap dominates bound when the
+  // two terminal facts cannot be ordered by a shared cursor.
+  if (previous === 'gap' || incoming === 'gap') return 'gap';
+  if (previous === 'bound') return 'bound';
+  return incoming;
+}
+
+function mergeSessionContext(previous: RequestView['session_context'], event: RequestEvent) {
+  const incoming = event.session_context;
+  // Confirmation is a one-way ownership projection. An older started or
+  // unlinked event retained in the live map must not undo a newer REST
+  // snapshot; a confirmed live projection may still advance an unlinked row.
+  if (previous?.association === 'confirmed') {
+    if (incoming?.association !== 'confirmed' || incoming.session_id !== previous.session_id) return previous;
+    return {
+      ...previous,
+      session_name: previous.session_name ?? incoming.session_name,
+      task_kind: previous.task_kind ?? incoming.task_kind,
+      agent_id: previous.agent_id ?? incoming.agent_id,
+      semantics_source: previous.semantics_source ?? incoming.semantics_source,
+    };
+  }
+  if (incoming?.association === 'confirmed') return incoming;
+  return previous ?? incoming;
+}
+
 export function requestViewFromEvent(event: RequestEvent, previous?: RequestView): RequestView | undefined {
   // A terminal event's time is not its receipt time. Retained legacy events
   // without a request record must wait for history rather than invent a date.
@@ -159,7 +188,7 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
   if (createdAt === undefined) return previous;
   // Replayed starts must not regress an authoritative terminal history row.
   if (event.event_kind === 'started' && previous?.status_code != null) return previous;
-  return {
+  const request: RequestView = {
     ...previous,
     request_id: event.request_id,
     created_at: createdAt,
@@ -177,8 +206,12 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
     output_tokens: event.output_tokens,
     cost: event.cost,
     error_code: event.error_code,
-    session_context: event.session_context ?? previous?.session_context,
+    archive_state: mergeArchiveState(previous?.archive_state, event),
+    session_context: mergeSessionContext(previous?.session_context, event),
   };
+  const credentialIdentity = event.credential_identity ?? previous?.credential_identity;
+  if (credentialIdentity !== undefined) request.credential_identity = credentialIdentity;
+  return request;
 }
 
 export function mergeLiveRequestEvents(

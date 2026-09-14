@@ -72,6 +72,13 @@ export function formatMetricNumber(value: number | null | undefined, locale: Loc
   return compact === exact ? { text: exact } : { text: exact, compact };
 }
 
+/** A locale-aware compact value for dense analytics surfaces, with the exact
+ * grouped value retained for tooltips and accessible inspection. */
+export function formatMetricDisplay(value: number | null | undefined, locale: Locale): FormattedValue {
+  const formatted = formatMetricNumber(value, locale);
+  return formatted.compact ? { text: formatted.compact, title: formatted.text } : formatted;
+}
+
 export function formatDecimal(value: string | number | null | undefined, locale: Locale, maximumFractionDigits = 6) {
   if (value === null || value === undefined || value === '') return '—';
   const numeric = typeof value === 'number' ? value : Number(value);
@@ -107,6 +114,23 @@ export function formatCurrency(value: string | number | null | undefined, curren
   } catch {
     return `${fixed.negative ? '-' : ''}${exact} ${currency}`.trim();
   }
+}
+
+export function formatCurrencyDisplay(value: string | number | null | undefined, currency: string, locale: Locale): FormattedValue {
+  const title = formatCurrency(value, currency, locale);
+  if (title === '—' || value === null || value === undefined || value === '') return { text: title };
+  const fixed = parseFixedDecimal(value);
+  if (!fixed) return { text: title };
+  const fraction = fixed.fraction.padEnd(3, '0');
+  let cents = BigInt(fixed.integer) * 100n + BigInt(fraction.slice(0, 2));
+  if (fraction[2] >= '5') cents += 1n;
+  const rounded = `${fixed.negative ? '-' : ''}${cents / 100n}.${(cents % 100n).toString().padStart(2, '0')}`;
+  let text = formatCurrency(rounded, currency, locale);
+  if (cents === 0n && /[1-9]/.test(fixed.fraction)) {
+    const tiny = formatCurrency('0.01', currency, locale);
+    text = tiny.replace(/0([.,])01/, '<0$101');
+  }
+  return { text, title };
 }
 
 export function formatPercent(value: number | null | undefined, locale: Locale) {
