@@ -49,8 +49,16 @@ test('request detail follows terminal events and fences late responses after sel
     await page.keyboard.press('Escape');
     await metadata.waitFor({ state: 'detached' });
     assert.equal(await page.locator('.drawer').count(), 1, 'Escape closes the supplemental metadata, not the request drawer');
+    const drawerClose = page.locator('.drawer .close');
+    const technical = page.getByRole('button', { name: 'Technical details', exact: true });
+    await drawerClose.focus();
+    await page.keyboard.press('Shift+Tab');
+    assert.equal(await technical.evaluate(element => element === document.activeElement), true, 'backward Tab wraps to the last drawer action');
+    await page.keyboard.press('Tab');
+    assert.equal(await drawerClose.evaluate(element => element === document.activeElement), true, 'forward Tab wraps to the first drawer action');
     await page.evaluate(() => window.requestLifecycleFixture.finish());
     await page.locator('.drawer [data-outcome="completed"]').waitFor();
+    assert.equal(await drawerClose.evaluate(element => element === document.activeElement), true, 'terminal re-render and updated close callback do not reset drawer focus');
     await page.locator('.drawer .request-compaction').waitFor();
     assert.equal(await first.locator('.request-compaction').count(), 1, 'SSE and detail use the same explicit compaction evidence');
     await page.locator('.drawer .request-compaction').tap();
@@ -58,7 +66,6 @@ test('request detail follows terminal events and fences late responses after sel
     const liveHelp = page.locator('[role="tooltip"]').filter({ hasText: 'Live-added background help' });
     await page.waitForFunction(() => [...document.querySelectorAll('[role="tooltip"]')].some(element => element.textContent === 'Live-added background help' && !!element.closest('[inert][aria-hidden="true"]')));
     assert.equal(await page.getByRole('tooltip').filter({ hasText: 'Live-added background help' }).count(), 0, 'a newly mounted background portal is excluded while the drawer is open');
-    const technical = page.getByRole('button', { name: 'Technical details', exact: true });
     await technical.focus();
     await page.keyboard.press('Enter');
     assert.equal(await technical.getAttribute('aria-expanded'), 'true');
