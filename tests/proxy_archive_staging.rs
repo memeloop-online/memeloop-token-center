@@ -208,6 +208,8 @@ async fn sqlite_proxy_locators_and_staging_bindings_are_one_atomic_commit() {
     complete_object(&archive, &response_lease, b"private response body").await;
     let response_locator = format!("{}/body", response_lease.key.canonical_prefix());
     let finish = || FinishProxyRequest {
+        first_output_ms: None,
+        generation_duration_ms: None,
         request_id,
         tenant_id: key.tenant_id,
         reservation: &reservation,
@@ -283,6 +285,8 @@ async fn sqlite_proxy_locators_and_staging_bindings_are_one_atomic_commit() {
     complete_object(&archive, &loser, b"terminal loser").await;
     let loser_locator = format!("{}/body", loser.key.canonical_prefix());
     let loser_finish = FinishProxyRequest {
+        first_output_ms: None,
+        generation_duration_ms: None,
         response_object: &loser_locator,
         ..finish()
     };

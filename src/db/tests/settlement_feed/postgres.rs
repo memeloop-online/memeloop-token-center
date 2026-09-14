@@ -46,6 +46,8 @@ async fn postgres_fixture(database_url: &str) -> SettlementFixture {
 
 fn completed(request_id: Uuid, cost_micros: i64) -> FinishRequest {
     FinishRequest {
+        first_output_ms: None,
+        generation_duration_ms: None,
         request_id,
         status_code: 200,
         duration_ms: 1,

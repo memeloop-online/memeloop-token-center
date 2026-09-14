@@ -82,6 +82,8 @@ async fn finish(
     fixture
         .database
         .finish_proxy_request(FinishProxyRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
             request_id,
             tenant_id: fixture.key.tenant_id,
             reservation,
@@ -299,6 +301,8 @@ async fn settlement_feed_publishes_after_split_settlement_and_late_completion() 
     );
 
     let completed = FinishRequest {
+        first_output_ms: None,
+        generation_duration_ms: None,
         request_id,
         status_code: 200,
         duration_ms: 1,
@@ -334,6 +338,8 @@ async fn settlement_feed_publishes_after_split_settlement_and_late_completion() 
     fixture
         .database
         .record_request_finished(FinishRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
             request_id,
             status_code: 200,
             duration_ms: 1,

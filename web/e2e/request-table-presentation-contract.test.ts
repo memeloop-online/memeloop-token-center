@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { averageRequestOutputTps, nonCachedRequestInput, requestCredentialLabel, requestIsPending } from '../src/requestTablePresentation.js';
+import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCredentialLabel, requestIsPending } from '../src/requestTablePresentation.js';
+import { requestViewFromEvent } from '../src/operator/traffic/requestTraffic.js';
+import type { RequestEvent } from '../src/types.js';
 import type { RequestView } from '../src/types.js';
 
 const request: RequestView = {
@@ -8,6 +10,24 @@ const request: RequestView = {
   duration_ms: 2000, input_tokens: 160, cached_input_tokens: 40, cache_write_tokens: 20,
   output_tokens: 32, cost: '0', error_code: null,
 };
+
+test('generation TPS requires observed output interval and does not relabel total-duration fallback', () => {
+  const timed = { ...request, first_output_ms: 1000, generation_duration_ms: 500 };
+  assert.equal(generationRequestOutputTps(timed), 64);
+  assert.equal(averageRequestOutputTps(timed), 16);
+  assert.equal(generationRequestOutputTps(request), null);
+  for (const generation_duration_ms of [null, 0, -1, Number.NaN, Infinity]) assert.equal(generationRequestOutputTps({ ...timed, generation_duration_ms }), null);
+  assert.equal(generationRequestOutputTps({ ...timed, status_code: 502 }), null);
+  assert.equal(generationRequestOutputTps({ ...timed, first_output_ms: undefined }), null);
+});
+
+test('legacy and archive SSE patches retain recorded timing', () => {
+  const timed = { ...request, first_output_ms: 1000, generation_duration_ms: 500 };
+  const event = { ...request, event_id: 'event', event_at: 3000, event_kind: 'finished', key_id: 'key' } as RequestEvent;
+  assert.equal(requestViewFromEvent(event, timed)?.generation_duration_ms, 500);
+  assert.equal(requestViewFromEvent({ ...event, first_output_ms: null }, timed)?.first_output_ms, 1000);
+  assert.equal(requestViewFromEvent({ ...event, first_output_ms: 1200, generation_duration_ms: 400 }, timed)?.generation_duration_ms, 400);
+});
 
 test('uncached input uses both recorded cache components and does not fabricate missing counts', () => {
   assert.equal(nonCachedRequestInput(request), 100);

@@ -53,6 +53,8 @@ async fn assert_event_enrichment(database: &Database) {
     sqlx::query("INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, atom_hashes_json, created_at, inference_version, session_name, task_kind, agent_id, metadata_source) VALUES ($1, 'recorded-session', $2, $3, '[]', $4, 1, 'recorded-name', 'task', 'agent', 'declared')")
         .bind(Uuid::now_v7().to_string()).bind(&request).bind(&key).bind(now)
         .execute(&database.pool).await.unwrap();
+    sqlx::query("UPDATE request_records SET first_output_ms = 5, generation_duration_ms = 15 WHERE id = $1 AND created_at = $2")
+        .bind(&request).bind(now).execute(&database.pool).await.unwrap();
     // The foreign event deliberately references the same request/key. It must
     // never inherit the first tenant's routing or conversation fields.
     for event_tenant in [&tenant, &foreign_tenant] {
@@ -72,6 +74,11 @@ async fn assert_event_enrichment(database: &Database) {
     assert_eq!(event.upstream_account_id, Some(upstream));
     assert_eq!(event.route_id, Some(route));
     assert_eq!(event.currency.as_deref(), Some("USD"));
+    assert_eq!(event.first_output_ms, Some(5));
+    assert_eq!(event.generation_duration_ms, Some(15));
+    let serialized = serde_json::to_value(event).unwrap();
+    assert_eq!(serialized["first_output_ms"], 5);
+    assert_eq!(serialized["generation_duration_ms"], 15);
     assert_eq!(event.cached_input_tokens, 30);
     assert_eq!(event.cache_write_tokens, 10);
     let context = event.session_context.as_ref().unwrap();
@@ -83,6 +90,8 @@ async fn assert_event_enrichment(database: &Database) {
         .unwrap();
     assert_eq!(foreign.len(), 1);
     assert!(foreign[0].created_at.is_none());
+    assert!(foreign[0].first_output_ms.is_none());
+    assert!(foreign[0].generation_duration_ms.is_none());
     assert!(foreign[0].upstream_account_id.is_none());
     assert!(foreign[0].route_id.is_none());
     assert!(foreign[0].currency.is_none());

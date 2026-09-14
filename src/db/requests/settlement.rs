@@ -149,6 +149,8 @@ impl Database {
                     .flatten();
                 let result = self
                     .finish_proxy_request(FinishProxyRequest {
+                        first_output_ms: None,
+                        generation_duration_ms: None,
                         request_id,
                         tenant_id,
                         reservation: &reservation,

@@ -4,6 +4,7 @@ use super::*;
 /// the response body, while this typed boundary owns settlement and the two
 /// route health guards.
 pub(super) struct StreamingFinalizationInput<'a> {
+    pub(super) output_timing: super::timing::OutputTiming,
     pub(super) state: &'a AppState,
     pub(super) status_code: i64,
     pub(super) protocol: Protocol,
@@ -78,6 +79,7 @@ fn streaming_upstream_evidence(
 
 pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInput<'_>) {
     let StreamingFinalizationInput {
+        output_timing,
         state,
         status_code,
         protocol,
@@ -241,9 +243,18 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
             client_name: conversation.client_name.as_deref(),
             upstream_response_id: response_id.as_deref(),
         });
+    let (first_output_ms, generation_duration_ms) = output_timing.finish(
+        error_code.is_none()
+            && !charge_contract_ceiling
+            && sse_summary.as_ref().is_some_and(|summary| {
+                matches!(summary.outcome, ResponsesSseOutcome::Completed { .. })
+            }),
+    );
     let terminal_result = finish_proxy_request_with_archive_fallback(
         &state.db,
         FinishProxyRequest {
+            first_output_ms,
+            generation_duration_ms,
             request_id,
             tenant_id,
             reservation: &reservation,

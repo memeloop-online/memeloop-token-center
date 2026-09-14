@@ -94,6 +94,8 @@ async fn buffered_conversation_content_wait_does_not_hold_archive_budget() {
         finish_database
             .finish_proxy_request_with_buffered_archive_and_upstream_attribution(
                 FinishProxyRequest {
+                    first_output_ms: None,
+                    generation_duration_ms: None,
                     request_id,
                     tenant_id: key.tenant_id,
                     reservation: &reservation,
@@ -558,6 +560,8 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
         ..TokenUsage::default()
     };
     let finish = || FinishProxyRequest {
+        first_output_ms: None,
+        generation_duration_ms: None,
         request_id,
         tenant_id: key.tenant_id,
         reservation: &reservation,
@@ -717,6 +721,8 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
     assert!(matches!(
         database
             .finish_proxy_request(FinishProxyRequest {
+                first_output_ms: None,
+                generation_duration_ms: None,
                 request_id: invalid_request_id,
                 tenant_id: key.tenant_id,
                 reservation: &invalid_reservation,
@@ -794,6 +800,8 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
         .unwrap();
     let delivered = database
         .finish_proxy_request(FinishProxyRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
             request_id: delivered_request_id,
             tenant_id: key.tenant_id,
             reservation: &delivered_reservation,
@@ -890,6 +898,8 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
     assert!(matches!(
         database
             .finish_proxy_request(FinishProxyRequest {
+                first_output_ms: None,
+                generation_duration_ms: None,
                 request_id: flex_request_id,
                 tenant_id: key.tenant_id,
                 reservation: &flex_reservation,
@@ -986,6 +996,8 @@ async fn concurrent_proxy_terminal_owners_settle_and_link_once() {
             barrier.wait().await;
             database
                 .finish_proxy_request(FinishProxyRequest {
+                    first_output_ms: None,
+                    generation_duration_ms: None,
                     request_id,
                     tenant_id: key.tenant_id,
                     reservation: &reservation,
@@ -1098,6 +1110,8 @@ async fn terminal_upstream_attribution_uses_only_dispatched_candidates() {
     database
         .finish_proxy_request_with_archive_staging_and_upstream_attribution(
             FinishProxyRequest {
+                first_output_ms: None,
+                generation_duration_ms: None,
                 request_id: no_dispatch_request,
                 tenant_id: key.tenant_id,
                 reservation: &no_dispatch_reservation,
@@ -1151,6 +1165,8 @@ async fn terminal_upstream_attribution_uses_only_dispatched_candidates() {
     database
         .finish_proxy_request_with_archive_staging_and_upstream_attribution(
             FinishProxyRequest {
+                first_output_ms: None,
+                generation_duration_ms: None,
                 request_id: failover_request,
                 tenant_id: key.tenant_id,
                 reservation: &failover_reservation,

@@ -117,6 +117,8 @@ async fn opaque_normal_credential_preserves_identity_history_policy_and_balance(
     state
         .db
         .record_request_finished(FinishRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
             request_id: historical_request_id,
             status_code: 200,
             duration_ms: 42,

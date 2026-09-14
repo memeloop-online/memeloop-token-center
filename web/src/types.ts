@@ -1,4 +1,6 @@
 export interface RequestView {
+  first_output_ms?: number | null;
+  generation_duration_ms?: number | null;
   request_id: string;
   /** Server receipt time in Unix milliseconds; it is not an upstream start time. */
   created_at: number;
@@ -99,6 +101,8 @@ export type RequestEventKind = 'started' | 'finished' | 'projected' | 'archive_b
 export type RequestArchiveState = 'capturing' | 'pending' | 'uploading' | 'bound' | 'gap';
 
 export interface RequestEvent {
+  first_output_ms?: number | null;
+  generation_duration_ms?: number | null;
   event_id: string;
   request_id: string;
   event_at: number;
