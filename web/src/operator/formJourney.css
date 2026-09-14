@@ -1,0 +1,69 @@
+/* Composition only: Fluent/theme-owned inputs and tokens stay untouched. */
+.form-journey, .credential-form-journey { display: grid; gap: 24px; min-width: 0; }
+.management-layout:has(> .create-journey) { grid-template-columns: minmax(0, 1fr); }
+.provider-layout:has(> .create-journey) { grid-template-columns: minmax(0, 1fr); }
+.provider-layout:has(> .create-journey[data-open='true']) > .provider-list { display: none; }
+.provider-layout > .create-journey { order: -1; }
+.create-journey .inline-editor { margin: 0; padding: 0; border: 0; background: transparent; }
+.management-layout > .create-journey { order: -1; border: 0; min-width: 0; }
+.management-layout:has(> .create-journey[data-open='true']) > article:not(.create-journey),
+.management-layout:has(> .create-journey[data-open='true']) + .group-manager,
+.management-layout:has(> .create-journey[data-open='true']) + .credential-group-workspace,
+.management-layout:has(> .create-journey[data-open='true']) + .routing-group-managers { display: none; }
+.create-journey[data-open='true'] { width: 100%; }
+.create-journey { background: transparent; border: 0; border-radius: 0; box-shadow: none; }
+.management-layout:has(> .create-journey) > article:not(.create-journey) { background: transparent; border: 0; border-radius: 0; box-shadow: none; padding-inline: 0; }
+.journey-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+.journey-heading h2 { font-family: inherit; font-size: 22px; font-weight: 600; margin: 0; }
+.create-journey > [hidden] { display: none; }
+.create-journey .create-resource-body { padding-inline: 0; }
+.create-journey-description { font-size: 14px; line-height: 1.6; }
+.create-journey .mtc-form-section, .create-journey .form-journey > .mtc-form-section { border: 0; border-radius: 0; background: transparent; padding: 0; }
+.create-journey .form-panel fieldset { border: 0; border-radius: 0; background: transparent; padding: 0; }
+.create-journey .form-panel label { color: var(--picker-text); font-size: 14px; }
+.create-journey .form-panel .fui-Input, .create-journey .form-panel .fui-Select { width: 100%; box-sizing: border-box; }
+.create-journey .form-panel .fui-Input input { border: 0; background: transparent; box-shadow: none; border-radius: 0; min-height: 0; padding-block: 8px; }
+.create-journey .form-panel .fui-Input input, .create-journey .form-panel .fui-Select select { color: var(--colorNeutralForeground1); }
+.create-journey .form-panel .fui-Select select { background: var(--colorNeutralBackground1); }
+.create-journey .form-panel .fui-Button { font-family: inherit; font-size: 14px; min-height: 40px; }
+.create-journey .credential-active-editor .inline-editor { margin: 0; padding: 0; border: 0; background: transparent; }
+.create-journey, .create-journey :is(h2, h3, h4, legend) { font-family: var(--fontFamilyBase, sans-serif); }
+.management-layout:has(> .create-journey) .panel h2 { font-family: var(--fontFamilyBase, sans-serif); font-weight: 600; }
+.management-layout:has(> .create-journey) .credential-generation { color: var(--picker-muted); font-size: 14px; }
+.credential-secret-priority { scroll-margin-top: 24px; }
+.create-journey .field-hint, .create-journey .field-description, .create-journey .mtc-secondary-text { font-size: 14px; line-height: 1.6; }
+.create-journey .rjsf > .mtc-form-section { margin-top: 28px; }
+.journey-actions { display: flex; align-items: center; gap: 20px; padding: 16px 0; background: transparent; border-top: 1px solid var(--picker-border); margin-top: 24px; }
+.journey-actions p { flex: 1; margin: 0; font-size: 14px; }
+.journey-actions button { flex: 0 0 auto; }
+.credential-secondary-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+.management-layout:has(> .create-journey) .managed-resource { border: 0; background: color-mix(in srgb, var(--picker-inset) 65%, transparent); padding: 20px; }
+.management-layout:has(> .create-journey) .managed-resource .credential-recovery-unavailable,
+.management-layout:has(> .create-journey) .managed-resource .account-meta .pill { border: 0; background: transparent; padding: 0; color: var(--picker-muted); font-size: 14px; }
+.credential-group-workspace .fui-AccordionHeader__button { justify-content: flex-start; }
+@media (min-width: 850px) { .create-journey .credential-form-journey { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; } }
+@media (min-width: 850px) {
+  .create-journey .route-form-sections { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+  .create-journey .route-form-sections > .mtc-form-section:first-child, .create-journey .form-journey-preview { grid-column: 1 / -1; }
+}
+.managed-resource .fui-AccordionHeader__button { justify-content: flex-start; min-height: 44px; }
+.create-journey .fui-AccordionHeader__button { justify-content: flex-start; min-height: 44px; }
+.create-journey .fui-AccordionHeader__button::after { inset: 0; }
+@media (max-width: 480px) { .journey-actions { flex-direction: column; align-items: stretch; gap: 12px; } }
+.upstream-form-sections { display: grid; gap: 24px; min-width: 0; }
+.provider-layout > .panel { background: transparent; border: 0; border-radius: 0; box-shadow: none; padding-inline: 0; }
+.provider-onboarding .authorization-form .upstream-connection { border: 0; border-radius: 0; padding: 16px 0; border-top: 1px solid var(--picker-border); }
+.provider-onboarding .create-resource-body { padding-inline: 0; }
+.mtc-form-section .form-group { min-width: 0; }
+.form-journey-preview { background: color-mix(in srgb, var(--picker-accent, #08796e) 7%, transparent); border: 0; border-radius: 8px; padding: 16px; }
+.form-journey-preview h4 { margin: 0 0 12px; }
+.form-journey-preview dl { display: grid; gap: 12px; margin: 0; }
+.form-journey-preview dl > div { display: grid; grid-template-columns: minmax(96px, 1fr) minmax(0, 2fr); gap: 12px; }
+.form-journey-preview dt { color: var(--picker-muted); }
+.form-journey-preview dd { margin: 0; overflow-wrap: anywhere; }
+.form-journey-disclosure button[aria-expanded]:focus-visible { outline: 2px solid var(--form-focus); outline-offset: 3px; }
+.form-journey-disclosure button[aria-expanded]::after { inset: 0; }
+@media (max-width: 600px) { .form-journey-disclosure button[aria-expanded] { min-height: 44px; } }
+.authorization-form .button-row { display: flex; flex-wrap: wrap; gap: 12px; }
+@media (max-width: 480px) { .authorization-form .button-row { flex-direction: column; } .authorization-form .button-row > * { width: 100%; } }
+@media (max-width: 480px) { .form-journey-preview dl > div { grid-template-columns: 1fr; gap: 4px; } }

@@ -17,6 +17,7 @@ use tokio::{
     net::TcpListener,
     sync::{Semaphore, watch},
     task::JoinSet,
+    time::{Instant, MissedTickBehavior},
 };
 
 const MAX_CONNECTIONS: usize = 2_048;
@@ -29,6 +30,7 @@ const MAX_HTTP1_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_HTTP2_CONCURRENT_STREAMS: u32 = 256;
 const MAX_HTTP2_HEADER_LIST_BYTES: u32 = 64 * 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const SHUTDOWN_DRAIN_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
 struct ServerLimits {
@@ -196,21 +198,54 @@ where
         }
     }
 
-    let _ = shutdown_sender.send(true);
-    while let Some(result) = connections.join_next().await {
-        if result.is_err() {
-            tracing::warn!(
-                error_code = "connection_task_failed",
-                "HTTP connection task stopped unexpectedly"
-            );
+    drain_connections(&mut connections, &shutdown_sender).await;
+    Ok(())
+}
+
+async fn drain_connections(connections: &mut JoinSet<()>, shutdown: &watch::Sender<bool>) {
+    let started = Instant::now();
+    log_shutdown_drain("started", started, connections.len());
+    let _ = shutdown.send(true);
+    let mut progress = tokio::time::interval_at(
+        started + SHUTDOWN_DRAIN_LOG_INTERVAL,
+        SHUTDOWN_DRAIN_LOG_INTERVAL,
+    );
+    progress.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    while !connections.is_empty() {
+        tokio::select! {
+            biased;
+            Some(result) = connections.join_next() => {
+                if result.is_err() {
+                    tracing::warn!(
+                        error_code = "connection_task_failed",
+                        "HTTP connection task stopped unexpectedly"
+                    );
+                }
+            }
+            _ = progress.tick() => {
+                log_shutdown_drain("progress", started, connections.len());
+            }
         }
     }
-    Ok(())
+    log_shutdown_drain("completed", started, connections.len());
+}
+
+fn log_shutdown_drain(phase: &'static str, started: Instant, active_connections: usize) {
+    // JoinSet counts remaining connection tasks, including completed tasks not
+    // yet joined. It is not a count of model requests, HTTP/2 streams or database
+    // sessions. No peer, request, credential or payload identifiers are logged.
+    tracing::info!(
+        event = "http_shutdown_drain",
+        phase,
+        active_connections,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "HTTP graceful shutdown drain"
+    );
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{net::Ipv4Addr, sync::Arc};
+    use std::{io::Write, net::Ipv4Addr, sync::Arc};
 
     use axum::{Router, routing::get};
     use tokio::{
@@ -220,6 +255,101 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl LogCapture {
+        fn fields(&self) -> Vec<serde_json::Value> {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()["fields"].clone()
+                })
+                .collect()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_drain_reports_safe_counts_without_interrupting_connections() {
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(capture.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let (shutdown, shutdown_received) = watch::channel(false);
+        let (release, held_connection) = oneshot::channel();
+        let mut connections = JoinSet::new();
+        connections.spawn(async move {
+            held_connection.await.unwrap();
+        });
+        let mut draining = Box::pin(drain_connections(&mut connections, &shutdown));
+        assert!(futures_util::poll!(&mut draining).is_pending());
+        assert!(*shutdown_received.borrow());
+        assert_eq!(capture.fields().len(), 1);
+
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert!(futures_util::poll!(&mut draining).is_pending());
+        assert_eq!(
+            capture.fields().len(),
+            1,
+            "no immediate or early progress tick"
+        );
+        for advance in [1, 30, 120] {
+            tokio::time::advance(Duration::from_secs(advance)).await;
+            assert!(futures_util::poll!(&mut draining).is_pending());
+        }
+        assert_eq!(
+            capture.fields().len(),
+            4,
+            "missed ticks must not create a log burst"
+        );
+        release.send(()).unwrap();
+        draining.await;
+        let expected = [
+            ("started", 1, 0),
+            ("progress", 1, 30_000),
+            ("progress", 1, 60_000),
+            ("progress", 1, 180_000),
+            ("completed", 0, 180_000),
+        ]
+        .map(|(phase, active_connections, elapsed_ms)| {
+            serde_json::json!({
+                "message": "HTTP graceful shutdown drain",
+                "event": "http_shutdown_drain",
+                "phase": phase,
+                "active_connections": active_connections,
+                "elapsed_ms": elapsed_ms,
+            })
+        });
+        assert_eq!(
+            capture.fields(),
+            expected,
+            "only fixed safe fields may be emitted"
+        );
+    }
 
     fn test_limits() -> ServerLimits {
         ServerLimits {

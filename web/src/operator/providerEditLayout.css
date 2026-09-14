@@ -1,0 +1,28 @@
+/* Existing provider editing is one readable workspace, not nested data cards. */
+.create-journey.provider-edit-workspace {
+  max-width: 720px;
+  padding-inline: 0;
+}
+.provider-edit-workspace .upstream-connection {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0 0 24px;
+  margin-bottom: 24px;
+  border-bottom: 1px solid var(--picker-border);
+}
+.provider-edit-workspace .upstream-connection :is(dt, p) { font-size: 14px; }
+.provider-edit-workspace .upstream-connection h3 { font-size: 16px; font-weight: 600; }
+.provider-edit-workspace .upstream-connection .connection-endpoint-kind { color: var(--picker-muted); font-size: 13px; }
+.provider-edit-workspace .form-panel .rjsf,
+.provider-edit-workspace .form-panel .upstream-form-sections,
+.provider-edit-workspace .form-panel .upstream-form-sections fieldset { background: transparent; border: 0; padding: 0; }
+:root[data-theme] .provider-edit-workspace .inline-editor { background: transparent; border: 0; padding: 0; }
+.provider-edit-workspace .form-panel .fui-Input:focus-within { outline: 2px solid var(--form-focus); outline-offset: 2px; }
+.provider-edit-workspace .form-panel .fui-Input input:focus-visible { outline: 0; }
+.provider-edit-workspace .fui-Button { min-height: 40px; font-size: 14px; font-family: inherit; }
+.provider-edit-workspace .rjsf > .fui-Button { margin-top: 24px; }
+@media (max-width: 600px) {
+  .provider-edit-workspace .fui-Button { min-height: 44px; }
+  .provider-edit-workspace .rjsf > .fui-Button { width: 100%; }
+}

@@ -40,5 +40,9 @@ test('proxy writes stay versioned, capability-gated and secret-free; model IA pr
   assert.doesNotMatch(source, /localStorage|sessionStorage|console\./);
   const forms = await readFile(new URL('../src/operator/pages/ManagementPages.tsx', import.meta.url), 'utf8');
   assert.match(forms, /Number.isInteger\(draft.priority\) && Math.abs\(draft.priority\) <= 1000000/);
-  for (const section of ['identitySection', 'upstreamSection', 'accessSection']) assert.ok(forms.includes(`<legend>{t('routes.${section}')}</legend>`));
+  for (const section of ['identitySection', 'upstreamSection']) assert.ok(forms.includes(`<FormSection title={t('routes.${section}')}`));
+  assert.ok(forms.includes('<FormSection title={journey.routeAccess}'));
+  const sections = await readFile(new URL('../src/design-system/primitives.tsx', import.meta.url), 'utf8');
+  assert.match(sections, /<fieldset className="mtc-form-section"/);
+  assert.match(sections, /<legend>\{title\}<\/legend>/);
 });

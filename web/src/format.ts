@@ -72,6 +72,13 @@ export function formatMetricNumber(value: number | null | undefined, locale: Loc
   return compact === exact ? { text: exact } : { text: exact, compact };
 }
 
+/** A locale-aware compact value for dense analytics surfaces, with the exact
+ * grouped value retained for tooltips and accessible inspection. */
+export function formatMetricDisplay(value: number | null | undefined, locale: Locale): FormattedValue {
+  const formatted = formatMetricNumber(value, locale);
+  return formatted.compact ? { text: formatted.compact, title: formatted.text } : formatted;
+}
+
 export function formatDecimal(value: string | number | null | undefined, locale: Locale, maximumFractionDigits = 6) {
   if (value === null || value === undefined || value === '') return '—';
   const numeric = typeof value === 'number' ? value : Number(value);
