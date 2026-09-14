@@ -20,4 +20,5 @@ test('request inspection retains the selected conversation', () => {
   assert.match(monitor, /SessionCredentialFilter value=\{draft.keyId\}/);
   assert.match(credential, /optionValue/);
   assert.match(credential, /session.key_alias \|\| session.key_id/);
+  assert.match(credential, /setCustomValidity\(''\);\s*\}, \[value, selected\?\.label, scope, id\]\)/);
 });

@@ -37,7 +37,10 @@ export function SessionCredentialFilter({ value, sessions, token, tenant, onChan
   ]).values()];
   const selected = options.find(option => option.id === value);
   const [query, setQuery] = useState(selected?.label ?? value);
-  useEffect(() => setQuery(selected?.label ?? value), [value, selected?.label]);
+  useEffect(() => {
+    setQuery(selected?.label ?? value);
+    (document.getElementById(id) as HTMLInputElement | null)?.setCustomValidity('');
+  }, [value, selected?.label, scope, id]);
   const matches = options.filter(option => `${option.label} ${option.id}`.toLocaleLowerCase().includes(query.toLocaleLowerCase()));
   return <label htmlFor={id}>{t('sessions.credential')}
     <Combobox id={id} freeform value={query} selectedOptions={value ? [value] : []}
