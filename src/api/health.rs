@@ -196,7 +196,7 @@ pub(super) async fn observe_http(
             if let Ok(value) = HeaderValue::from_str(&context.request_id.to_string()) {
                 response.headers_mut().insert(REQUEST_ID_HEADER, value);
             }
-            response
+            proxy_diagnostics::observe_response(response, context)
         }).await
     } else {
         next.run(request).await
