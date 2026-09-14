@@ -88,7 +88,7 @@ test('pricing comparison, deferred usage, provenance and editor drafts remain tr
     const unavailablePrice = page.locator('.token-pricing-table tbody tr').filter({ hasText: 'missing-model' });
     await unavailablePrice.getByText('Price unavailable', { exact: true }).waitFor();
     assert.equal(await page.locator('.token-pricing-table tbody tr').count(), 201, 'first price page remains usable after second-page failure');
-    assert.equal(await page.getByRole('option', { name: 'Missing prices', exact: true }).isDisabled(), true);
+    assert.equal(await page.getByRole('option', { name: 'Missing prices', exact: true }).evaluate(element => (element as HTMLOptionElement).disabled), true);
     assert.doesNotMatch(await unavailablePrice.innerText(), /Missing/);
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/pricing-presentation.html?table-states`);
     await page.getByRole('button', { name: 'Reload prices', exact: true }).click();
@@ -104,6 +104,6 @@ test('pricing comparison, deferred usage, provenance and editor drafts remain tr
     await page.getByRole('status').filter({ hasText: 'used-model filter cannot be applied' }).waitFor();
     assert.equal(await page.getByLabel('Show', { exact: true }).inputValue(), 'used');
     assert.equal(await page.locator('.token-pricing-table tbody tr').count(), 0);
-    assert.equal(await page.getByRole('option', { name: 'Missing prices', exact: true }).isDisabled(), true, 'failed usage cannot establish complete missing-model coverage');
+    assert.equal(await page.getByRole('option', { name: 'Missing prices', exact: true }).evaluate(element => (element as HTMLOptionElement).disabled), true, 'failed usage cannot establish complete missing-model coverage');
   } finally { await browser.close(); await server.close(); }
 });
