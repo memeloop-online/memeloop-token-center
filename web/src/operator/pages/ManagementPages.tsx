@@ -32,6 +32,7 @@ import { UpstreamQuota } from '../UpstreamQuota';
 import { quotaSummaryPresentation, type UpstreamQuotaSnapshot } from '../upstreamQuota';
 import { connectionSchema, isPrivateProxyUrl, ProxyInput, UpstreamConnection } from '../UpstreamConnection';
 import { upstreamFormTemplates } from '../UpstreamFormTemplates';
+import { providerEditSchema } from '../providerEditSchema';
 import { providerConnectionCopy } from '../providerConnectionCopy';
 import { providerFormWidgets } from '../ProviderFormWidgets';
 import { appHref } from '../../app/routes';
@@ -135,7 +136,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   }, [provider, locale]);
   const rotateProvider = rotating ? providers.find((value) => value.id === rotating.driver) : undefined;
   const editProvider = editing ? providers.find((value) => value.id === editing.driver) : undefined;
-  const editSchema = useMemo<RJSFSchema | undefined>(() => editing && editProvider ? localizeSchema({
+  const editSchema = useMemo<RJSFSchema | undefined>(() => editing && editProvider ? providerEditSchema(localizeSchema({
     type: 'object',
     additionalProperties: false,
     required: ['name', 'config'],
@@ -143,7 +144,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
       name: { type: 'string', minLength: 1, maxLength: 200, title: t('providers.name') },
       config: { ...connectionSchema(editProvider.config_schema as RJSFSchema, t('connection.endpointHint')), title: 'Connection configuration' },
     },
-  } as RJSFSchema, locale) : undefined, [editing, editProvider, locale]);
+  } as RJSFSchema, locale), locale) : undefined, [editing, editProvider, locale]);
   const uiSchema = {
     driver: { 'ui:widget': 'hidden' },
     ...(provider?.id === 'http-json' ? { credential: { type: { 'ui:widget': 'hidden' } } } : {}),

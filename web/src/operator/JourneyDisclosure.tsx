@@ -1,11 +1,12 @@
-import { useLayoutEffect, useRef, useState, type ReactNode } from 'react';
-import { Disclosure } from '../design-system';
+import { useId, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { Button, Disclosure } from '../design-system';
 
 /** Disclosure is a labelled action, not a modal or an icon-only affordance.
  * Contents remain mounted so closing never discards a draft. */
-export function JourneyDisclosure({ title, description, children, invalid = false }: {
-  title: string; description?: string; children: ReactNode; invalid?: boolean;
+export function JourneyDisclosure({ title, description, children, invalid = false, action = false }: {
+  title: string; description?: string; children: ReactNode; invalid?: boolean; action?: boolean;
 }) {
+  const id = useId();
   const [open, setOpen] = useState(invalid);
   const section = useRef<HTMLElement>(null);
   const focusRequested = useRef(false);
@@ -18,9 +19,15 @@ export function JourneyDisclosure({ title, description, children, invalid = fals
     if (field) { field.focus(); focusRequested.current = false; }
   }, [open, invalid]);
   return <section ref={section} className="form-journey-disclosure" onInvalidCapture={() => { focusRequested.current = true; setOpen(true); }}>
-    <Disclosure title={title} open={open} onOpenChange={setOpen}>
+    {action ? <>
+      <Button type="button" appearance="secondary" aria-expanded={open} aria-controls={id} onClick={() => setOpen(current => !current)}>{title}</Button>
+      <div id={id} hidden={!open}>
+        {description && <p className="field-hint">{description}</p>}
+        <div className="operator-form-section-fields">{children}</div>
+      </div>
+    </> : <Disclosure title={title} open={open} onOpenChange={setOpen}>
       {description && <p className="field-hint">{description}</p>}
       <div className="operator-form-section-fields">{children}</div>
-    </Disclosure>
+    </Disclosure>}
   </section>;
 }

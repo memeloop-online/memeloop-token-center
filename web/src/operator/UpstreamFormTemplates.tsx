@@ -1,10 +1,11 @@
-import type { ObjectFieldTemplateProps } from '@rjsf/utils';
+import { canExpand, type ObjectFieldTemplateProps } from '@rjsf/utils';
 import ObjectFieldTemplate from '@rjsf/core/lib/components/templates/ObjectFieldTemplate.js';
 import { schemaFormTemplates } from '../SchemaTemplates';
 import { useI18n } from '../i18n';
 import { FormSection } from '../design-system';
 import { JourneyDisclosure as AdvancedFormSection } from './JourneyDisclosure';
 import { formJourneyCopy } from './formJourneyCopy';
+import { AdditionalPropertyTemplate, AddPropertyButton } from './AdditionalPropertyTemplate';
 import './operatorFormSurfaces.css';
 import './formJourney.css';
 
@@ -24,6 +25,23 @@ function UpstreamObjectTemplate(props: ObjectFieldTemplateProps) {
     </div>;
   }
   if (props.fieldPathId.path.at(-1) === 'config') {
+    if (props.registry.formContext?.providerEdit) {
+      const primaryNames = ['base_url'];
+      const retryNames = ['transport_policy', 'timeout_seconds'];
+      const primary = props.properties.filter(field => !field.hidden && primaryNames.includes(field.name));
+      const retries = props.properties.filter(field => !field.hidden && retryNames.includes(field.name));
+      const advanced = props.properties.filter(field => !field.hidden && !primaryNames.includes(field.name) && !retryNames.includes(field.name));
+      const zh = locale.startsWith('zh');
+      return <div className="upstream-form-sections">
+        {props.properties.filter(field => field.hidden).map(field => field.content)}
+        <FormSection title={props.registry.formContext.providerConnectionTitle ?? t('connection.endpointSection')}>
+          {primary.map(field => field.content)}
+          {props.registry.formContext.providerConnection}
+        </FormSection>
+        {retries.length > 0 && <AdvancedFormSection action title={zh ? '配置超时与重试' : 'Configure timeouts and retries'} description={zh ? '调整连接、读取和故障切换时限；日常修改代理无需调整。' : 'Connection, read and failover limits. Changing a proxy does not require adjusting these.'} invalid={retries.some(field => Boolean(props.errorSchema?.[field.name]))}>{retries.map(field => field.content)}</AdvancedFormSection>}
+        {(advanced.length > 0 || canExpand(props.schema, props.uiSchema, props.formData)) && <AdvancedFormSection title={zh ? '高级配置与模型预留' : 'Advanced settings and model reservations'} description={zh ? '网络范围、模型预留及扩展配置。现有字段完整保留；仅在明确了解影响时修改。' : 'Network scope, model reservations and extensions. Existing fields are preserved; change only when you understand their effects.'} invalid={advanced.some(field => Boolean(props.errorSchema?.[field.name]))}><ObjectFieldTemplate {...props} title="" description={undefined} properties={advanced} /></AdvancedFormSection>}
+      </div>;
+    }
     // Unknown plugin fields stay visible. Required capability fields also stay
     // visible: disclosure must not hide an adapter's minimum configuration.
     const optionalNetwork = networkNames.filter((name) => !props.schema.required?.includes(name));
@@ -44,4 +62,5 @@ function UpstreamObjectTemplate(props: ObjectFieldTemplateProps) {
   return <ObjectFieldTemplate {...props} />;
 }
 
-export const upstreamFormTemplates = { ...schemaFormTemplates, ObjectFieldTemplate: UpstreamObjectTemplate };
+export const upstreamFormTemplates = { ...schemaFormTemplates, ObjectFieldTemplate: UpstreamObjectTemplate,
+  WrapIfAdditionalTemplate: AdditionalPropertyTemplate, ButtonTemplates: { AddButton: AddPropertyButton } };
