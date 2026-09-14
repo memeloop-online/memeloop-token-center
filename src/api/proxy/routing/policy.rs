@@ -8,6 +8,19 @@ pub(in crate::api::proxy) struct RequestAttemptBudget {
 }
 
 impl RequestAttemptBudget {
+    pub(in crate::api::proxy) fn recovery_wait_deadline(
+        &self,
+        health: crate::config::UpstreamHealthConfig,
+    ) -> tokio::time::Instant {
+        // Reuse the existing configured cooldown + one probe lease, frozen
+        // once with this request; never extend its original network budget.
+        let millis = health
+            .unavailable_cooldown_millis
+            .saturating_add(health.probe_lease_millis)
+            .max(0) as u64;
+        let cap = tokio::time::Instant::now() + std::time::Duration::from_millis(millis);
+        self.deadline.map_or(cap, |deadline| deadline.min(cap))
+    }
     pub(in crate::api::proxy) fn from_primary(
         route: &ResolvedUpstream,
         request_id: Uuid,
@@ -212,6 +225,31 @@ mod tests {
         let next = RequestAttemptBudget::from_primary(&primary, Uuid::from_u128(4)).unwrap();
         assert_eq!(next.max_attempts, 8);
         assert_eq!(next.terminal_reason(1), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_wait_uses_configured_health_cap_without_extending_network_deadline() {
+        let now = tokio::time::Instant::now();
+        let mut health = crate::config::UpstreamHealthConfig::DEFAULT;
+        health.unavailable_cooldown_millis = 100;
+        health.probe_lease_millis = 200;
+        let budget = RequestAttemptBudget {
+            max_attempts: 2,
+            deadline: Some(now + std::time::Duration::from_millis(250)),
+            version: 1,
+        };
+        assert_eq!(
+            budget.recovery_wait_deadline(health),
+            now + std::time::Duration::from_millis(250)
+        );
+        let unbounded = RequestAttemptBudget {
+            deadline: None,
+            ..budget
+        };
+        assert_eq!(
+            unbounded.recovery_wait_deadline(health),
+            now + std::time::Duration::from_millis(300)
+        );
     }
 
     #[tokio::test(start_paused = true)]

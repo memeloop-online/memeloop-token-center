@@ -116,6 +116,23 @@ export function formatCurrency(value: string | number | null | undefined, curren
   }
 }
 
+export function formatCurrencyDisplay(value: string | number | null | undefined, currency: string, locale: Locale): FormattedValue {
+  const title = formatCurrency(value, currency, locale);
+  if (title === '—' || value === null || value === undefined || value === '') return { text: title };
+  const fixed = parseFixedDecimal(value);
+  if (!fixed) return { text: title };
+  const fraction = fixed.fraction.padEnd(3, '0');
+  let cents = BigInt(fixed.integer) * 100n + BigInt(fraction.slice(0, 2));
+  if (fraction[2] >= '5') cents += 1n;
+  const rounded = `${fixed.negative ? '-' : ''}${cents / 100n}.${(cents % 100n).toString().padStart(2, '0')}`;
+  let text = formatCurrency(rounded, currency, locale);
+  if (cents === 0n && /[1-9]/.test(fixed.fraction)) {
+    const tiny = formatCurrency('0.01', currency, locale);
+    text = tiny.replace(/0([.,])01/, '<0$101');
+  }
+  return { text, title };
+}
+
 export function formatPercent(value: number | null | undefined, locale: Locale) {
   if (value === null || value === undefined || !Number.isFinite(value)) return '—';
   const options: Intl.NumberFormatOptions = {

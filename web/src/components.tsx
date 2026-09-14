@@ -2,7 +2,7 @@ import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { CopyButton } from './CopyButton.js';
 import type { RequestView, StatsBucket } from './types.js';
 import { useI18n } from './i18n.js';
-import { formatCurrency, formatMetricDisplay, formatMetricNumber, formatMilliseconds, formatNumber } from './format.js';
+import { formatCurrency, formatCurrencyDisplay, formatMetricDisplay, formatMetricNumber, formatMilliseconds, formatNumber } from './format.js';
 import { useAnchoredPopover } from './useAnchoredPopover.js';
 
 export function Shell({ children, operator = false }: { children: ReactNode; operator?: boolean }) {
@@ -104,15 +104,20 @@ function requestTokenBreakdown(request: RequestView) {
   };
 }
 
+function requestTokenDetails(request: RequestView, locale: Parameters<typeof formatNumber>[1], t: ReturnType<typeof useI18n>['t']) {
+  const breakdown = requestTokenBreakdown(request);
+  if (breakdown) return t('request.tokenBreakdown', { input: formatNumber(breakdown.input, locale), cached: formatNumber(breakdown.cached, locale), cacheWrite: formatNumber(breakdown.cacheWrite, locale), output: formatNumber(breakdown.output, locale) });
+  return [
+    `${t('usage.inputTokens')}: ${formatNumber(request.input_tokens, locale)}`,
+    `${t('usage.outputTokens')}: ${formatNumber(request.output_tokens, locale)}`,
+    request.cached_input_tokens !== undefined ? `${t('usage.cachedTokens')}: ${formatNumber(request.cached_input_tokens, locale)}` : '',
+    request.cache_write_tokens !== undefined ? `${t('usage.cacheWriteTokens')}: ${formatNumber(request.cache_write_tokens, locale)}` : '',
+  ].filter(Boolean).join(' · ');
+}
+
 function RequestTokenSummary({ request }: { request: RequestView }) {
   const { locale, t } = useI18n();
-  const breakdown = requestTokenBreakdown(request);
-  return <small>{breakdown
-    ? t('request.tokenBreakdown', { input: formatNumber(breakdown.input, locale), cached: formatNumber(breakdown.cached, locale), cacheWrite: formatNumber(breakdown.cacheWrite, locale), output: formatNumber(breakdown.output, locale) })
-    : <>{t('usage.inputTokens')}: {formatNumber(request.input_tokens, locale)} · {t('usage.outputTokens')}: {formatNumber(request.output_tokens, locale)}
-      {request.cached_input_tokens !== undefined && <> · {t('usage.cachedTokens')}: {formatNumber(request.cached_input_tokens, locale)}</>}
-      {request.cache_write_tokens !== undefined && <> · {t('usage.cacheWriteTokens')}: {formatNumber(request.cache_write_tokens, locale)}</>}
-    </>}</small>;
+  return <small>{requestTokenDetails(request, locale, t)}</small>;
 }
 
 function RequestIdentifier({ requestId, compact = false }: { requestId: string; compact?: boolean }) {
@@ -211,14 +216,14 @@ export function RequestTable({
   onSelect,
   onOpenSession,
   currency,
-  showRoutingDetails = false,
+  credentialAlias,
   upstreamNames,
 }: {
   requests: RequestView[];
   onSelect?: (request: RequestView) => void;
   onOpenSession?: (sessionId: string) => void;
   currency?: string;
-  showRoutingDetails?: boolean;
+  credentialAlias?: string;
   upstreamNames?: ReadonlyMap<string, string>;
 }) {
   const { locale, t } = useI18n();
@@ -227,7 +232,7 @@ export function RequestTable({
   return (
     <div className="table-scroll request-table-scroll" role="region" aria-label={t('request.table')} tabIndex={0}>
       <table className="request-table">
-        <thead><tr><th>{t('request.receivedAt')}</th><th>{t('request.model')}</th><th>{t('request.tokens')}</th><th>{t('request.cost')}</th>{showRoutingDetails && <th>{t('request.completedAt')}</th>}{showsSession && <th>{t('request.session')}</th>}<th>{t('request.protocol')}</th>{showRoutingDetails && <><th className="request-technical-heading">{t('request.upstreamId')}</th><th className="request-technical-heading">{t('request.routeId')}</th></>}<th>{t('request.status')}</th><th>{t('request.duration')}</th><th>{t('request.error')}</th>{onSelect && <th><span className="visually-hidden">{t('request.actions')}</span></th>}</tr></thead>
+        <thead><tr><th>{t('request.receivedAt')}</th><th>{t('self.credential')}</th><th>{t('request.model')}</th><th>{t('request.tokens')}</th><th>{t('request.cost')}</th>{showsSession && <th>{t('request.session')}</th>}<th>{t('request.status')}</th><th>{t('request.duration')}</th>{onSelect && <th><span className="visually-hidden">{t('request.actions')}</span></th>}</tr></thead>
         <tbody>
           {requests.map((request) => {
             const context = request.session_context;
@@ -235,12 +240,26 @@ export function RequestTable({
               ?? (context?.association === 'confirmed' ? t('sessions.reportedNameMissing') : t('sessions.unlinkedRequests'));
             const sessionMeta = [context?.task_kind, context?.agent_id].filter(Boolean).join(' · ');
             const currencyForRequest = recordedCurrency(request, currency);
+            const technicalSummary = [
+              `${t('request.protocol')}: ${request.protocol}`,
+              request.upstream_account_id
+                ? `${t('request.upstreamId')}: ${upstreamNames?.get(request.upstream_account_id) ? `${upstreamNames.get(request.upstream_account_id)} (${request.upstream_account_id})` : request.upstream_account_id}`
+                : '',
+              request.route_id ? `${t('request.routeId')}: ${request.route_id}` : '',
+            ].filter(Boolean).join(' · ');
+            const durationSummary = request.completed_at != null
+              ? `${t('request.completedAt')}: ${new Date(request.completed_at).toLocaleString(locale)}`
+              : '';
+            const cost = currencyForRequest ? formatCurrencyDisplay(request.cost, currencyForRequest, locale) : { text: '—' };
+            const tokenDisplay = formatMetricDisplay(request.input_tokens + request.output_tokens, locale);
+            const tokenDetails = requestTokenDetails(request, locale, t);
+            const durationText = request.duration_ms === null ? '—' : `${formatNumber(request.duration_ms, locale, 2)} ms`;
             return <tr key={request.request_id}>
               <td className="request-time-cell"><time>{new Date(request.created_at).toLocaleString(locale)}</time><RequestIdentifier requestId={request.request_id} compact /></td>
+              <td className="request-credential-cell"><strong>{request.credential_identity?.key_alias ?? credentialAlias ?? t('common.none')}</strong>{technicalSummary && <button type="button" className="request-technical-info" title={technicalSummary} aria-label={technicalSummary}>ⓘ</button>}</td>
               <td className="request-model-cell"><code>{request.model}</code></td>
-              <td className="request-token-cell"><span title={formatMetricDisplay(request.input_tokens + request.output_tokens, locale).title}>{formatMetricDisplay(request.input_tokens + request.output_tokens, locale).text}</span><RequestTokenSummary request={request} /></td>
-              <td className="request-cost-cell" title={currencyForRequest ? `${request.cost} ${currencyForRequest}` : undefined}>{currencyForRequest ? formatCurrency(request.cost, currencyForRequest, locale) : '—'}</td>
-              {showRoutingDetails && <td className="request-completed-cell">{request.completed_at == null ? '—' : <time>{new Date(request.completed_at).toLocaleString(locale)}</time>}</td>}
+              <td className="request-token-cell"><span className="request-value-info" title={tokenDetails} aria-label={`${tokenDisplay.text} (${tokenDetails})`} tabIndex={0}>{tokenDisplay.text}</span></td>
+              <td className="request-cost-cell"><span className="request-value-info" title={cost.title} aria-label={cost.title ? `${cost.text} (${cost.title})` : undefined} tabIndex={cost.title ? 0 : undefined}>{cost.text}</span></td>
               {showsSession && <td className="request-session-cell">
                 {!context
                   ? '—'
@@ -251,11 +270,8 @@ export function RequestTable({
                     : <span className="request-session-unlinked">{t('sessions.unlinkedRequests')}</span>}
                 {sessionMeta && <RequestSessionMetadata value={sessionMeta} />}
               </td>}
-              <td>{request.protocol}</td>
-              {showRoutingDetails && <><td className="request-upstream-cell request-technical-cell" title={request.upstream_account_id ? `${upstreamNames?.get(request.upstream_account_id) ?? t('request.upstreamId')}: ${request.upstream_account_id}` : undefined}><span aria-hidden="true">ⓘ</span><span className="visually-hidden">{request.upstream_account_id && upstreamNames?.get(request.upstream_account_id) ? `${upstreamNames.get(request.upstream_account_id)} ${request.upstream_account_id}` : request.upstream_account_id ?? '—'}</span></td><td className="request-route-cell request-technical-cell" title={request.route_id ? `${t('request.routeId')}: ${request.route_id}` : undefined}><span aria-hidden="true">ⓘ</span><span className="visually-hidden">{request.route_id ?? '—'}</span></td></>}
-              <td><span className={`status ${request.status_code && request.status_code < 400 ? 'ok' : request.status_code ? 'bad' : 'pending'}`}>{request.status_code ?? t('common.running')}</span></td>
-              <td>{request.duration_ms === null ? '—' : `${formatNumber(request.duration_ms, locale, 2)} ms`}</td>
-              <td>{request.error_code ? <code className="error-code">{request.error_code}</code> : '—'}</td>
+              <td><span className={`status ${request.status_code && request.status_code < 400 ? 'ok' : request.status_code ? 'bad' : 'pending'}`} title={request.error_code ?? undefined} aria-label={request.error_code ? `${request.status_code ?? t('common.running')}: ${request.error_code}` : undefined}>{request.status_code ?? t('common.running')}</span>{request.error_code && <span className="visually-hidden">{request.error_code}</span>}</td>
+              <td><span className="request-duration-info" title={durationSummary || undefined} aria-label={durationSummary ? `${durationText}; ${durationSummary}` : undefined} tabIndex={durationSummary ? 0 : undefined}>{durationText}</span></td>
               {onSelect && <td><button className="secondary table-action" type="button" onClick={() => onSelect(request)} aria-label={t('request.openDetail', { model: request.model })}>{t('request.inspect')}</button></td>}
             </tr>
           })}

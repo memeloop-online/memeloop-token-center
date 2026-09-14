@@ -57,6 +57,7 @@ mod sse_delivery_tests;
 
 const PROXY_BODY_CHANNEL_CAPACITY: usize = 1;
 const MAX_INPUT_TOKEN_OVERHEAD_CEILING: i64 = 1_000_000;
+const RETAINED_REQUEST_ADMISSION_WAIT: Duration = Duration::from_secs(1);
 
 fn validate_openai_chat_choice_count(request: &Value) -> Result<(), AppError> {
     if openai_chat_choice_count(request)? == 1 {
@@ -187,6 +188,7 @@ async fn next_sendable_proxy_route(
         mut failover_reason,
         candidate_rank,
         outbound_attempts,
+        recovery_wait_deadline,
         deferred_shared_probes,
     } = input;
     let state = request.state;
@@ -195,6 +197,7 @@ async fn next_sendable_proxy_route(
     let strict_choice_count_is_incompatible = matches!(request.protocol, Protocol::OpenAiChat)
         && openai_chat_choice_count(request.request_json)? != 1;
     let mut summary = CandidatePreparationSummary::default();
+    let mut transient_candidate = None;
     while let Some(mut planned) = match planned_candidate.take() {
         Some(planned) => Some(planned),
         None => {
@@ -276,6 +279,7 @@ async fn next_sendable_proxy_route(
             cooldown_until,
             probe_lease_until,
             shared_probe_eligible,
+            transient_wait_eligible,
         } = admission
         {
             let now = unix_millis();
@@ -304,6 +308,10 @@ async fn next_sendable_proxy_route(
                     probe_lease_until,
                 });
             }
+            // Retain at most one small route snapshot, never another request body.
+            if outbound_attempts == 0 && transient_wait_eligible && transient_candidate.is_none() {
+                transient_candidate = Some((planned.route.clone(), rank));
+            }
             state.metrics.observe_upstream_health(
                 UpstreamHealthEvent::Skipped,
                 UpstreamHealthReason::Cooldown,
@@ -323,6 +331,7 @@ async fn next_sendable_proxy_route(
             failover_reason,
             planned,
             admission,
+            existing_guard: None,
             shared_probe_permit: None,
             candidate_rank: rank,
             outbound_attempt,
@@ -409,6 +418,7 @@ async fn next_sendable_proxy_route(
                     failover_reason,
                     planned,
                     admission,
+                    existing_guard: None,
                     shared_probe_permit: Some(permit),
                     candidate_rank: deferred.candidate_rank,
                     outbound_attempt,
@@ -429,6 +439,40 @@ async fn next_sendable_proxy_route(
                 );
             }
         }
+    }
+    if let Some((route, rank)) = transient_candidate
+        && let Some((route, admission, guard)) =
+            routing::recovery_wait::wait(state, request_id, route, recovery_wait_deadline).await?
+    {
+        let prepared = async {
+            let planned = plan_proxy_route(ProxyRoutePlanInput {
+                request,
+                route,
+                preparation_now: unix_millis(),
+            })?;
+            let (next_input, next_output) =
+                candidate_reservation_bounds(&planned, original_body_length, output_choice_count)?;
+            prepare_admitted_proxy_route(AdmittedProxyRouteInput {
+                request,
+                price,
+                reservation,
+                input_token_ceiling,
+                output_token_ceiling,
+                next_input_token_ceiling: next_input,
+                next_output_token_ceiling: next_output,
+                assigned_route,
+                failover_reason,
+                planned,
+                admission,
+                existing_guard: Some(guard),
+                shared_probe_permit: None,
+                candidate_rank: rank,
+                outbound_attempt,
+            })
+            .await
+        }
+        .await;
+        return prepared.map(Some);
     }
     Ok(None)
 }
@@ -704,6 +748,8 @@ pub(super) async fn proxy(
     // Freeze before reservation and archive work: later candidates/reloads may
     // change account transport settings, never replenish the request budget.
     let attempt_budget = routing::RequestAttemptBudget::from_primary(primary, request_id)?;
+    let recovery_wait_deadline =
+        attempt_budget.recovery_wait_deadline(state.config.upstream_health);
     let upstream_account_id = Some(primary.account_id);
     let model_route_id = Some(primary.route_id);
     let price = state.db.model_price(&model, &key.currency).await?;
@@ -776,7 +822,15 @@ pub(super) async fn proxy(
     };
     // Admission ACK includes reservation, request record, and encrypted sealed
     // request spool in one transaction. No upstream work starts before it.
-    if !buffered_request.memory.try_finalize_request() {
+    // A requested stream can still return a successful JSON envelope, so it
+    // needs the buffered-response safety partition until the response headers
+    // prove that the actual downstream path is SSE. Waiting here is bounded,
+    // FIFO, and occurs after durable admission but before any upstream send.
+    if !buffered_request
+        .memory
+        .finalize_request(tokio::time::Instant::now() + RETAINED_REQUEST_ADMISSION_WAIT)
+        .await
+    {
         state
             .metrics
             .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Retained);
@@ -844,6 +898,7 @@ pub(super) async fn proxy(
             failover_reason: next_failover_reason.take(),
             candidate_rank: &mut candidate_rank,
             outbound_attempts,
+            recovery_wait_deadline,
             deferred_shared_probes: &mut deferred_shared_probes,
         })
         .await
@@ -1177,6 +1232,9 @@ pub(super) async fn proxy(
         })
         .await;
     }
+    buffered_request
+        .memory
+        .release_retained_request_for_stream();
     streaming::stream_response(streaming::StreamingResponse {
         state: &state,
         upstream,

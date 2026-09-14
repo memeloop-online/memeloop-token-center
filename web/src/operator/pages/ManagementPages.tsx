@@ -27,7 +27,7 @@ import {
   type KeyListLoadState, type KeyListRequestIdentity,
 } from '../keyPagination';
 import { directCredentialSchema, supportsDirectConnection } from '../providerConnectionMethods';
-import { UpstreamAvailability } from '../UpstreamAvailability';
+import { UpstreamAvailability, manualHealthLabel } from '../UpstreamAvailability';
 import { UpstreamQuota } from '../UpstreamQuota';
 import { quotaUsedPercent, type UpstreamQuotaSnapshot } from '../upstreamQuota';
 import { connectionSchema, isPrivateProxyUrl, ProxyInput, UpstreamConnection } from '../UpstreamConnection';
@@ -288,7 +288,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             <div className="account-main">
             <UpstreamConnection key={`connection\0${token}\0${writeTenant}\0${value.id}`} account={value} token={token} tenant={writeTenant} disabled={!manageable || Boolean(busy)} onChanged={onChanged} onEditingChange={setProxyEditorOpen} />
             {value.credential_expires_at && <small>{t('providers.expires')}: {new Date(value.credential_expires_at).toLocaleString(locale)}</small>}
-            <Disclosure title={t('providers.recentAvailability')}><UpstreamAvailability account={value} snapshot={availabilitySnapshot} window={availabilityWindow} loading={availabilityLoading} manualHealth={currentHealth} onOpenRequest={onOpenRequest} /></Disclosure>
+            <Disclosure title={currentHealth ? `${t('providers.recentAvailability')} · ${t(manualHealthLabel(currentHealth))}` : t('providers.recentAvailability')}><UpstreamAvailability account={value} snapshot={availabilitySnapshot} window={availabilityWindow} loading={availabilityLoading} manualHealth={currentHealth} onOpenRequest={onOpenRequest} /></Disclosure>
             <UpstreamQuota key={`${token}\0${tenant}\0${value.id}\0${generation}`} accountId={value.id} accountName={value.name} credentialGeneration={generation} tenant={value.tenant_external_id ?? tenant} token={token} initialSnapshot={quota} onSnapshot={snapshot => setQuotaSummaries(current => {
               // A late read owns the generation captured when it began, never
               // the current account's newer generation after a credential change.

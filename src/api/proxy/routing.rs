@@ -12,6 +12,7 @@ mod outcome;
 mod policy;
 mod probe;
 mod readiness;
+pub(super) mod recovery_wait;
 mod route_types;
 
 pub(super) use crate::provider::PROXY_ROUTING_POLICY;
