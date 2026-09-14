@@ -13,7 +13,7 @@ const [surface, replayView, replayStyles, operatorSessions, selfSessions, i18n] 
 
 test('sessions surface supplies a scoped archive reader without moving credentials into the replay component', () => {
   assert.match(surface, /loadReplayArchive\?: SessionReplayArchiveLoader/);
-  assert.match(surface, /<SessionReplayPanel detail=\{detail\} loadArchiveDetail=\{loadReplayArchive\}/);
+  assert.match(surface, /<SessionReplayPanel detail=\{detail\} scopeKey=\{summary\?\.key_id \?\? detail\.session_id\} loadArchiveDetail=\{loadReplayArchive\}/);
   assert.match(operatorSessions, /requestArchivePath\(tenant, request\.request_id\)/);
   assert.match(operatorSessions, /tenant_external_id/);
   assert.match(operatorSessions, /loadReplayArchive=\{loadReplayArchive\}/);

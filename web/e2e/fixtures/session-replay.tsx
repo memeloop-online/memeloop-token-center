@@ -1,4 +1,5 @@
 import { createRoot } from 'react-dom/client';
+import { useEffect, useState } from 'react';
 
 import { I18nProvider } from '../../src/i18n';
 import { SessionReplayPanel } from '../../src/sessionReplayViews';
@@ -65,14 +66,34 @@ const archives = new Map<string, RequestDetail>([
   }],
 ]);
 
+const liveFixture = new URLSearchParams(location.search).has('live');
+declare global { interface Window { sessionReplayReads: Record<string, number>; sessionReplayAborts: number } }
+window.sessionReplayReads = {};
+window.sessionReplayAborts = 0;
 async function loadArchive(requestView: ConversationRequest, signal: AbortSignal) {
+  window.sessionReplayReads[requestView.request_id] = (window.sessionReplayReads[requestView.request_id] ?? 0) + 1;
   await new Promise<void>((resolve, reject) => {
-    const timer = window.setTimeout(resolve, 12);
-    signal.addEventListener('abort', () => { window.clearTimeout(timer); reject(signal.reason); }, { once: true });
+    const timer = window.setTimeout(resolve, liveFixture ? requestView.request_id === 'replay-r2' ? 600 : 80 : 12);
+    signal.addEventListener('abort', () => { window.sessionReplayAborts += 1; window.clearTimeout(timer); reject(signal.reason); }, { once: true });
   });
+  if (requestView.request_id === 'replay-r3' && requestView.archive_state === 'bound') return archive(requestView, null,
+    { output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Late archive arrived' }] }] });
   const value = archives.get(requestView.request_id);
   if (!value) throw new Error('fixture archive unavailable');
   return value;
 }
 
-createRoot(document.getElementById('root')!).render(<I18nProvider><main className="main" data-fixture-ready="session-replay"><SessionReplayPanel detail={detail} loadArchiveDetail={loadArchive} /></main></I18nProvider>);
+function Fixture() {
+  const [current, setCurrent] = useState(detail);
+  const [scope, setScope] = useState('scope-a');
+  useEffect(() => {
+    if (!liveFixture) return;
+    const timer = window.setInterval(() => setCurrent(value => ({ ...value, requests: value.requests.map(request => ({ ...request })) })), 20);
+    return () => window.clearInterval(timer);
+  }, []);
+  return <I18nProvider><main className="main" data-fixture-ready="session-replay">
+    {liveFixture && <><button onClick={() => setScope('scope-b')}>Switch replay scope</button><button onClick={() => setCurrent(value => ({ ...value, requests: value.requests.map(request => request.request_id === 'replay-r3' ? { ...request, archive_state: 'bound' } : request) }))}>Finish late archive</button></>}
+    <SessionReplayPanel detail={current} scopeKey={scope} loadArchiveDetail={loadArchive} />
+  </main></I18nProvider>;
+}
+createRoot(document.getElementById('root')!).render(<Fixture />);

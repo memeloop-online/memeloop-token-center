@@ -106,32 +106,40 @@ function EntryContent({ entry, t }: { entry: ReplayEntry; t: Translate }) {
  * by the owning surface so this component never handles authentication material or broadens
  * archive authorization.
  */
-export function SessionReplayPanel({ detail, loadArchiveDetail }: {
+export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadArchiveDetail }: {
   detail: LogicalSessionDetail;
+  scopeKey?: string;
   loadArchiveDetail?: SessionReplayArchiveLoader;
 }) {
   const { t } = useI18n();
-  const [archiveDetails, setArchiveDetails] = useState<RequestDetail[]>([]);
+  const [archivePage, setArchivePage] = useState<{ sessionId: string; scopeKey: string; loader?: SessionReplayArchiveLoader; values: RequestDetail[] }>({ sessionId: '', scopeKey: '', values: [] });
+  const archiveDetails = archivePage.sessionId === detail.session_id && archivePage.scopeKey === scopeKey && archivePage.loader === loadArchiveDetail ? archivePage.values : [];
+  const archiveCache = useRef(new Map<string, RequestDetail>());
+  const archiveOwner = useRef<{ sessionId: string; scopeKey: string; loader?: SessionReplayArchiveLoader }>({ sessionId: '', scopeKey: '' });
   const [mismatchedIds, setMismatchedIds] = useState<Set<string>>(new Set());
   const [archiveLoading, setArchiveLoading] = useState(Boolean(loadArchiveDetail));
   const sequence = useRef(0);
   const entryRefs = useRef(new Map<number, HTMLElement>());
   const [selectedTurn, setSelectedTurn] = useState<number>();
 
-  const sourceRequests = useMemo(
-    () => [...detail.requests].sort(requestOrder).slice(0, SESSION_REPLAY_MAX_REQUESTS),
-    [detail.requests],
-  );
-  const requestKey = useMemo(
-    () => sourceRequests.map((request) => `${request.request_id}:${request.created_at}`).join('\0'),
-    [sourceRequests],
-  );
+  const orderedRequests = [...detail.requests].sort(requestOrder).slice(0, SESSION_REPLAY_MAX_REQUESTS);
+  const requestKey = JSON.stringify(orderedRequests.map((request) => [request.request_id, request.created_at, request.archive_state, request.status_code, request.completed_at, request.session_context?.association, request.session_context?.session_id]));
+  // Live list refreshes create fresh objects even when archive inputs are unchanged.
+  // Keep the bounded read batch stable so a busy session cannot starve its replay.
+  const sourceRequests = useMemo(() => orderedRequests, [requestKey]);
 
   useEffect(() => {
     if (!loadArchiveDetail) return undefined;
     const current = ++sequence.current;
     const controller = new AbortController();
-    setArchiveDetails([]);
+    if (archiveOwner.current.sessionId !== detail.session_id || archiveOwner.current.scopeKey !== scopeKey || archiveOwner.current.loader !== loadArchiveDetail) {
+      archiveCache.current.clear();
+      archiveOwner.current = { sessionId: detail.session_id, scopeKey, loader: loadArchiveDetail };
+    }
+    const activeIds = new Set(sourceRequests.map(request => request.request_id));
+    for (const id of archiveCache.current.keys()) if (!activeIds.has(id)) archiveCache.current.delete(id);
+    const publish = () => setArchivePage({ sessionId: detail.session_id, scopeKey, loader: loadArchiveDetail, values: [...archiveCache.current.values()] });
+    publish();
     setMismatchedIds(new Set());
     setSelectedTurn(undefined);
     if (!sourceRequests.length) {
@@ -141,19 +149,23 @@ export function SessionReplayPanel({ detail, loadArchiveDetail }: {
     setArchiveLoading(true);
 
     void (async () => {
-      const loaded: RequestDetail[] = [];
       const mismatched = new Set<string>();
       let cursor = 0;
       const loadNext = async () => {
         while (!controller.signal.aborted) {
           const request = sourceRequests[cursor++];
           if (!request) return;
+          if (archiveCache.current.get(request.request_id)?.archive_complete) continue;
           try {
-            const candidate = await loadArchiveDetail(request, controller.signal);
+            const candidate = await loadArchiveDetail(request, AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]));
+            if (controller.signal.aborted || current !== sequence.current) return;
             if (candidate.request_id !== request.request_id || candidate.session_context?.session_id !== detail.session_id) {
               mismatched.add(request.request_id);
             } else {
-              loaded.push(candidate);
+              archiveCache.current.set(request.request_id, candidate);
+              // Show each completed read immediately; one slow archive must not
+              // hide the rest of a conversation or discard finished live work.
+              publish();
             }
           } catch {
             // Archive read failures remain an explicit archive-unavailable entry.
@@ -162,13 +174,13 @@ export function SessionReplayPanel({ detail, loadArchiveDetail }: {
       };
       await Promise.all(Array.from({ length: Math.min(REPLAY_ARCHIVE_CONCURRENCY, sourceRequests.length) }, loadNext));
       if (controller.signal.aborted || current !== sequence.current) return;
-      setArchiveDetails(loaded);
+      publish();
       setMismatchedIds(mismatched);
       setArchiveLoading(false);
     })();
 
     return () => controller.abort();
-  }, [detail.session_id, loadArchiveDetail, requestKey, sourceRequests]);
+  }, [detail.session_id, scopeKey, loadArchiveDetail, requestKey, sourceRequests]);
 
   if (!loadArchiveDetail) return null;
 
