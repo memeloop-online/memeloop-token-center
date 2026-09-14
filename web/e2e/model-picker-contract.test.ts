@@ -4,7 +4,7 @@ import test from 'node:test';
 import { assistantRouteCatalog, routeModelOptions, type ModelPickerProjectionItem } from '../src/operator/modelCatalog.js';
 import type { GroupView, ModelRouteView, UpstreamAccount } from '../src/types.js';
 
-test('assistant admits only catalog-proven text sources and never infers capability from model names', () => {
+test('assistant accepts text-capable multimodal providers without inferring capabilities from names', () => {
   const item = (value: string, label: string, upstreamModel: string, modalities: string[], status: ModelPickerProjectionItem['sources'][number]['catalog']['status'] = 'ready', listed = true): ModelPickerProjectionItem => ({
     selection: { kind: 'route', route_id: value }, value, label,
     sources: [{
@@ -19,12 +19,25 @@ test('assistant admits only catalog-proven text sources and never infers capabil
   });
   const catalog = assistantRouteCatalog([
     item('legal-text-alias', 'image-analysis-assistant', 'legal-text-alias', ['text']),
-    item('known-moderation', 'friendly-helper', 'omni-moderation-latest', ['text', 'embedding', 'image']),
-    item('known-embedding', 'friendly-helper', 'embeddinggemma-300m', ['text', 'embedding', 'image']),
+    item('multimodal-text', 'friendly-helper', 'opaque-model-id', ['image', 'text', 'embedding', 'video']),
+    item('image-only', 'text-assistant', 'text-assistant', ['image']),
+    item('embedding-only', 'friendly-helper', 'friendly-helper', ['embedding']),
     item('custom-name', 'custom-chat-name', 'custom-chat-name', ['text'], 'never_observed', false),
   ]);
-  assert.deepEqual(catalog.options.map((option) => option.value), ['legal-text-alias'], 'a legitimate text alias containing “image” is admitted by evidence, not its name');
-  assert.deepEqual(catalog.unverifiedRoutes.map((route) => route.value), ['known-moderation', 'known-embedding', 'custom-name']);
+  assert.deepEqual(catalog.options.map((option) => option.value), ['legal-text-alias', 'multimodal-text'], 'text support is additive and model aliases are not capability evidence');
+  assert.deepEqual(catalog.unverifiedRoutes.map((route) => route.value), ['image-only', 'embedding-only', 'custom-name']);
+  assert.ok(catalog.options.every((option) => option.health === 'unknown'), 'catalog reads do not claim to probe upstream health');
+
+  const unavailable = item('unavailable', 'Unavailable', 'opaque-model-id', ['image', 'text']);
+  unavailable.sources[0].configuration_availability = { status: 'unavailable', reasons: ['account_inactive'] };
+  const wrongProtocol = item('wrong-protocol', 'Text', 'opaque-model-id', ['text', 'image']);
+  wrongProtocol.sources[0].capabilities.route_protocol = 'generation';
+  const unsupportedProtocol = item('unsupported-protocol', 'Text', 'opaque-model-id', ['text', 'image']);
+  unsupportedProtocol.sources[0].provider.protocols = ['anthropic'];
+  const restricted = assistantRouteCatalog([unavailable, wrongProtocol, unsupportedProtocol]);
+  assert.equal(restricted.options.length, 1);
+  assert.equal(restricted.options[0].disabled, true, 'text capability never overrides account availability');
+  assert.deepEqual(restricted.unverifiedRoutes.map((route) => route.value), ['wrong-protocol', 'unsupported-protocol']);
 });
 
 test('model hierarchy uses actual account membership, excludes removed accounts, and preserves route/public IDs', () => {
@@ -64,14 +77,8 @@ test('all maintained model selectors share the same picker and stale catalogs re
 
 test('filter-assistant choice exposes configuration availability without probing an upstream', async () => {
   const settings = await readFile(new URL('../src/operator/pages/SystemSettingsPage.tsx', import.meta.url), 'utf8');
-  const catalog = await readFile(new URL('../src/operator/modelCatalog.ts', import.meta.url), 'utf8');
   assert.match(settings, /selectedRouteHasAvailableCandidate/);
   assert.match(settings, /assistantTextUnavailable/);
   assert.match(settings, /describedBy="filter-assistant-route-hint"/);
-  assert.match(catalog, /source\.provider\.modalities\.length === 1/);
-  assert.match(catalog, /source\.catalog\.status === 'ready'/);
-  assert.doesNotMatch(catalog, /embeddings\?|rerank|whisper|transcri/);
-  assert.match(catalog, /health: 'unknown'/);
-  assert.match(catalog, /disabled: !available/);
   assert.doesNotMatch(settings, /\/health|\/models\/sync|filter-assistant\/plan/);
 });
