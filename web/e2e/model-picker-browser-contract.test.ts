@@ -74,8 +74,8 @@ test('filters are non-modal themed popovers and model selection is searchable by
     context.diagnostic('checking settings provider/account autocomplete');
     const capabilityAlert = page
       .locator('.system-settings p[role="alert"]')
-      .filter({ hasText: /configured route .friendly-custom-chat. lacks verifiable text-generation capability evidence/i });
-    assert.match(await capabilityAlert.textContent() ?? '', /configured route .friendly-custom-chat. lacks verifiable text-generation capability evidence/i);
+      .filter({ hasText: /friendly-custom-chat.+not currently available/i });
+    assert.match(await capabilityAlert.textContent() ?? '', /friendly-custom-chat.+not currently available/i);
     assert.doesNotMatch(await page.locator('.system-settings .model-picker-trigger').textContent() ?? '', /route-custom/, 'an unverified stored route must not leak a raw route ID into the picker');
     await page.locator('.system-settings .model-picker-trigger').click();
     const settingsCatalog = page.locator('.system-settings .shared-model-popover');
@@ -100,7 +100,65 @@ test('filters are non-modal themed popovers and model selection is searchable by
     await settingsCatalog.getByRole('combobox').press('Enter');
     await settingsCatalog.waitFor({ state: 'hidden' });
     assert.match(await page.locator('.system-settings .model-picker-trigger').textContent() ?? '', /production-model/, 'Enter skips an unavailable first result and chooses the first available route');
-    assert.match(await page.locator('.system-settings').getByRole('status').last().textContent() ?? '', /5 routes are omitted.+custom model name is not capability evidence/i);
+    assert.match(await page.locator('.system-settings').getByRole('status').last().textContent() ?? '', /5 models are hidden/i);
+    context.diagnostic('checking billing search, failure recovery and late save scope ownership');
+    const settings = page.locator('.system-settings');
+    const billing = settings.getByRole('combobox', { name: 'Billing credential', exact: true });
+    await billing.fill('Research');
+    assert.equal(await billing.getAttribute('aria-expanded'), 'true', 'typing or pasting into the billing search opens its suggestions without an extra click');
+    await page.getByRole('option', { name: 'Budget route-b · Research team', exact: true }).click();
+    await page.evaluate(() => { (window as unknown as { settingsFixture: { delaySave: boolean } }).settingsFixture.delaySave = true; });
+    const save = settings.getByRole('button', { name: 'Save', exact: true });
+    await save.click();
+    await page.waitForFunction(() => (window as unknown as { settingsFixture: { writes: number } }).settingsFixture.writes === 1);
+    await page.locator('[data-switch-scope]').click();
+    await settings.locator('.model-picker-trigger').filter({ hasText: 'production-model' }).waitFor();
+    await page.evaluate(() => { (window as unknown as { settingsFixture: { releaseSave: () => void } }).settingsFixture.releaseSave(); });
+    await billing.fill('Research');
+    await page.getByRole('option', { name: 'Budget route-b · Research team', exact: true }).click();
+    assert.equal(await settings.locator('.notice.success').count(), 0, 'old-scope completion must not publish success in the new scope');
+    assert.equal(await save.isEnabled(), true, 'old save must not leave the new scope busy');
+    await page.evaluate(() => { (window as unknown as { settingsFixture: { failBilling: boolean } }).settingsFixture.failBilling = true; });
+    await settings.locator('.model-picker-trigger').click();
+    await settingsCatalog.getByRole('combobox').fill('research-model');
+    await settingsCatalog.getByRole('option').click();
+    const retry = settings.getByRole('button', { name: 'Retry', exact: true });
+    await retry.waitFor();
+    assert.equal(await save.isDisabled(), true, 'failed authorization choices cannot retain the prior model billing selection');
+    await page.evaluate(() => { (window as unknown as { settingsFixture: { failBilling: boolean } }).settingsFixture.failBilling = false; });
+    await retry.click();
+    await billing.fill('Research');
+    await page.getByRole('option', { name: 'Budget route-a · Research team', exact: true }).click();
+    assert.equal(await save.isEnabled(), true);
+    await page.evaluate(() => { (window as unknown as { settingsFixture: { delayBilling: boolean } }).settingsFixture.delayBilling = true; });
+    await settings.locator('.model-picker-trigger').click();
+    await settingsCatalog.getByRole('combobox').fill('production-model');
+    await settingsCatalog.getByRole('option').click();
+    await page.waitForFunction(() => (window as unknown as { settingsFixture: { pendingBilling: string } }).settingsFixture.pendingBilling === 'route-b');
+    await page.evaluate(() => { (window as unknown as { settingsFixture: { delayBilling: boolean } }).settingsFixture.delayBilling = false; });
+    await settings.locator('.model-picker-trigger').click();
+    await settingsCatalog.getByRole('combobox').fill('research-model');
+    await settingsCatalog.getByRole('option').click();
+    await billing.fill('Research');
+    await page.getByRole('option', { name: 'Budget route-a · Research team', exact: true }).click();
+    await page.evaluate(() => { (window as unknown as { settingsFixture: { releaseBilling: () => void } }).settingsFixture.releaseBilling(); });
+    await billing.click();
+    await page.getByRole('option', { name: 'Budget route-a · Research team', exact: true }).waitFor();
+    assert.equal(await page.getByRole('option', { name: 'Budget route-b · Research team', exact: true }).count(), 0, 'late billing choices must not replace the newly selected model draft');
+    await billing.press('Escape');
+    const readsBeforeLocale = await page.evaluate(() => {
+      const state = (window as unknown as { settingsFixture: { settingsReads: number; billingReads: number } }).settingsFixture;
+      return [state.settingsReads, state.billingReads];
+    });
+    await page.locator('[data-switch-locale]').click();
+    await settings.getByRole('heading', { name: '系统设置', exact: true }).waitFor();
+    assert.match(await settings.locator('.model-picker-trigger').textContent() ?? '', /research-model/, 'changing language preserves the unsaved model selection');
+    assert.equal(await settings.getByRole('combobox', { name: '计费凭据', exact: true }).inputValue(), 'Budget route-a · Research team', 'changing language preserves the authorized billing draft');
+    assert.equal(await settings.getByRole('button', { name: '保存', exact: true }).isEnabled(), true);
+    assert.deepEqual(await page.evaluate(() => {
+      const state = (window as unknown as { settingsFixture: { settingsReads: number; billingReads: number } }).settingsFixture;
+      return [state.settingsReads, state.billingReads];
+    }), readsBeforeLocale, 'locale changes must not reload settings or billing choices');
     assert.deepEqual(pageErrors, [], 'model picker interactions must not produce page errors');
   } finally {
     await browser.close();
