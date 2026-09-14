@@ -39,6 +39,7 @@ enum Check<T> {
 async fn bounded_wait<T, F, Fut>(
     deadline: Instant,
     permits: Arc<Semaphore>,
+    metrics: Option<&crate::metrics::Metrics>,
     mut check: F,
 ) -> Result<Option<T>, AppError>
 where
@@ -46,6 +47,12 @@ where
     Fut: Future<Output = Result<Check<T>, AppError>>,
 {
     let Ok(permit) = permits.try_acquire_owned() else {
+        if let Some(metrics) = metrics {
+            metrics.observe_upstream_health(
+                UpstreamHealthEvent::Skipped,
+                UpstreamHealthReason::RecoveryWaitCapacity,
+            );
+        }
         return Ok(None);
     };
     let permit = Arc::new(permit);
@@ -82,7 +89,7 @@ pub(in crate::api::proxy) async fn wait(
     )>,
     AppError,
 > {
-    bounded_wait(deadline, WAITERS.clone(), |permit| {
+    bounded_wait(deadline, WAITERS.clone(), Some(&state.metrics), |permit| {
         let mut route = route.clone();
         let state = state.clone();
         // Owned checks finish lease publication/cleanup after caller cancellation;
@@ -139,13 +146,58 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[tokio::test]
+    async fn cancelled_owned_check_keeps_capacity_until_result_cleanup() {
+        struct Published(Arc<tokio::sync::Notify>);
+        impl Drop for Published {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        let permits = Arc::new(Semaphore::new(1));
+        let semaphore = permits.clone();
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let (release, resume) = tokio::sync::oneshot::channel();
+        let cleaned = Arc::new(tokio::sync::Notify::new());
+        let cleanup = cleaned.clone();
+        let caller = tokio::spawn(async move {
+            let mut gate = Some((entered, resume, cleanup));
+            bounded_wait(
+                Instant::now() + Duration::from_secs(20),
+                semaphore,
+                None,
+                |permit| {
+                    let (entered, resume, cleanup) = gate.take().unwrap();
+                    let task = tokio::spawn(async move {
+                        let _permit = permit;
+                        let _ = entered.send(());
+                        resume.await.unwrap();
+                        Ok(Check::Ready(Published(cleanup)))
+                    });
+                    async move { task.await.map_err(|_| AppError::Internal)? }
+                },
+            )
+            .await
+            .map(|_| ())
+        });
+        observed.await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert_eq!(permits.available_permits(), 0);
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), cleaned.notified())
+            .await
+            .unwrap();
+        assert_eq!(permits.available_permits(), 1);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn deadline_and_capacity_bound_unsent_wait_without_replenishment() {
         let permits = Arc::new(Semaphore::new(1));
         let held = permits.clone().acquire_owned().await.unwrap();
         let calls = AtomicUsize::new(0);
         let deadline = Instant::now() + Duration::from_secs(1);
-        let denied = bounded_wait::<(), _, _>(deadline, permits.clone(), |_| async {
+        let denied = bounded_wait::<(), _, _>(deadline, permits.clone(), None, |_| async {
             calls.fetch_add(1, Ordering::SeqCst);
             Ok(Check::Retry)
         })
@@ -155,7 +207,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         drop(held);
         assert!(
-            bounded_wait::<(), _, _>(deadline, permits.clone(), |_| async {
+            bounded_wait::<(), _, _>(deadline, permits.clone(), None, |_| async {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Ok(Check::Retry)
             })
@@ -175,12 +227,17 @@ mod tests {
         let semaphore = permits.clone();
         let task = tokio::spawn(async move {
             let mut entered = Some(entered);
-            bounded_wait::<(), _, _>(Instant::now() + Duration::from_secs(20), semaphore, |_| {
-                if let Some(entered) = entered.take() {
-                    let _ = entered.send(());
-                }
-                std::future::pending::<Result<Check<()>, AppError>>()
-            })
+            bounded_wait::<(), _, _>(
+                Instant::now() + Duration::from_secs(20),
+                semaphore,
+                None,
+                |_| {
+                    if let Some(entered) = entered.take() {
+                        let _ = entered.send(());
+                    }
+                    std::future::pending::<Result<Check<()>, AppError>>()
+                },
+            )
             .await
         });
         observed.await.unwrap();
@@ -192,6 +249,7 @@ mod tests {
             bounded_wait::<(), _, _>(
                 Instant::now() + Duration::from_secs(20),
                 permits,
+                None,
                 |_| async { Ok(Check::Stop) }
             )
             .await

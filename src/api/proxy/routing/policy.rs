@@ -77,6 +77,31 @@ mod tests {
     use super::*;
 
     #[tokio::test(start_paused = true)]
+    async fn recovery_wait_uses_configured_health_cap_without_extending_network_deadline() {
+        let now = tokio::time::Instant::now();
+        let mut health = crate::config::UpstreamHealthConfig::DEFAULT;
+        health.unavailable_cooldown_millis = 100;
+        health.probe_lease_millis = 200;
+        let budget = RequestAttemptBudget {
+            max_attempts: 2,
+            deadline: Some(now + std::time::Duration::from_millis(250)),
+            version: 1,
+        };
+        assert_eq!(
+            budget.recovery_wait_deadline(health),
+            now + std::time::Duration::from_millis(250)
+        );
+        let unbounded = RequestAttemptBudget {
+            deadline: None,
+            ..budget
+        };
+        assert_eq!(
+            unbounded.recovery_wait_deadline(health),
+            now + std::time::Duration::from_millis(300)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn absolute_deadline_and_attempt_limit_cannot_be_reset_by_failover() {
         let budget = RequestAttemptBudget {
             max_attempts: 2,
