@@ -1,3 +1,4 @@
+import { LocalSettlementNotice, localSettlementLabel } from '../LocalSettlementNotice';
 import { totalTokens } from '../charts/usageCharts';
 import { formatCurrencyDisplay, formatMetricDisplay, formatPercent } from '../format';
 import { useI18n } from '../i18n';
@@ -14,16 +15,16 @@ export function UsageSummaryMetrics({ stats }: { stats: OperatorUsageAnalysis })
   const average = analyticsDuration(summary.avg_duration_ms, locale);
   const p95 = histogramP95(summary.p95_duration_ms, summary.p95_is_capped, locale);
   const currency = summary.costs.length === 1 ? summary.costs[0].currency : undefined;
-  return <section className="metrics usage-metrics" aria-label={t('usage.tab.overview')}>
+  return <><LocalSettlementNotice /><section className="metrics usage-metrics" aria-label={t('usage.tab.overview')}>
     {numeric(t('usage.requests'), summary.requests, points.map((point) => point.requests))}
     <AnalyticsMetric label={t('usage.successRate')} value={formatPercent(rate, locale)} ratio={rate} tone="positive" />
     {numeric(t('usage.failures'), summary.failed, points.map((point) => point.failed), 'negative')}
-    <AnalyticsMetric label={t('usage.cost')} value={summary.costs.length ? <span className="usage-cost-lines">{summary.costs.map(({ cost, currency }) => { const display = formatCurrencyDisplay(cost, currency, locale); return <span key={currency} title={display.title}>{display.text}</span>; })}</span> : '—'} trend={currency ? points.map((point) => Number(point.costs.find((cost) => cost.currency === currency)?.cost ?? 0)) : undefined} />
+    <AnalyticsMetric label={localSettlementLabel(locale)} value={summary.costs.length ? <span className="usage-cost-lines">{summary.costs.map(({ cost, currency }) => { const display = formatCurrencyDisplay(cost, currency, locale); return <span key={currency} title={display.title}>{display.text}</span>; })}</span> : '—'} trend={currency ? points.map((point) => Number(point.costs.find((cost) => cost.currency === currency)?.cost ?? 0)) : undefined} />
     {numeric(t('usage.totalTokens'), totalTokens(summary), points.map(totalTokens))}
     {numeric(t('usage.generationUnits'), summary.generation_units, points.map((point) => point.generation_units))}
     {numeric(t('usage.cachedTokens'), summary.cached_input_tokens, points.map((point) => point.cached_input_tokens))}
     {numeric(t('usage.cacheWriteTokens'), summary.cache_write_tokens, points.map((point) => point.cache_write_tokens))}
     <AnalyticsMetric label={t('usage.average')} value={average.text} title={average.title} trend={points.map((point) => point.avg_duration_ms)} />
     <AnalyticsMetric label={t('usage.p95Approx')} value={p95.text} title={p95.title} trend={finiteP95Points(points).map((point) => point.p95_duration_ms)} />
-  </section>;
+  </section></>;
 }

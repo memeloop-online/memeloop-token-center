@@ -1,3 +1,4 @@
+import { LocalSettlementNotice, localSettlementLabel } from '../LocalSettlementNotice';
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { DetailTooltip } from '../design-system';
@@ -64,12 +65,13 @@ export function OverviewPage({ credential, credentialView, onError, onOpenReques
     : null;
   return <div className="self-page self-overview" data-self-page="overview">
     <div className="self-overview-caption">{t('usage.preset.24h')}</div>
+    <LocalSettlementNotice />
     <section className="metrics self-overview-metrics" aria-label={t('usage.preset.24h')}>
       <NumberMetric label={t('traffic.total')} value={summary?.total_requests} />
       <Metric label={t('usage.successRate')} value={formatPercent(successRate, locale)} tone="positive" />
       <NumberMetric label={t('traffic.failure')} value={summary?.failed_requests} tone="negative" />
       <NumberMetric label={t('request.tokens')} value={summary ? summary.input_tokens + summary.output_tokens : undefined} />
-      <Metric label={t('traffic.cost')} value={<DetailTooltip content={cost.title ?? cost.text}><span tabIndex={0}>{cost.text}</span></DetailTooltip>} />
+      <Metric label={localSettlementLabel(locale)} value={<DetailTooltip content={cost.title ?? cost.text}><span tabIndex={0}>{cost.text}</span></DetailTooltip>} />
     </section>
     <article className="panel key-summary self-account-summary">
       <div><span className="eyebrow">{t('self.stableCredential')}</span><DetailTooltip content={currentKey.key_id}><h2 tabIndex={0}>{currentKey.alias}</h2></DetailTooltip><span>{t(`enforcementMode.${currentKey.policy.enforcement_mode}`)}</span></div>

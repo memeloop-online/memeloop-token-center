@@ -1,3 +1,4 @@
+import { LocalSettlementNotice, localSettlementLabel } from '../LocalSettlementNotice';
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from '../api';
 import { HeatmapDataTable } from '../charts/HeatmapDataTable';
@@ -103,6 +104,7 @@ export function UsagePage({ credential, credentialView, onError }: {
   const successRate = stats.summary.requests ? stats.summary.success / stats.summary.requests : null;
   return <div className="self-page self-usage-page usage-page" data-self-page="usage">
     <div className="usage-heading"><div><h2>{t('usage.title')}</h2><p className="muted">{t('self.usageDescription')}</p><span className="usage-time-zone">{timeZone}</span></div><div className="usage-presets" role="group" aria-label={t('usage.timeRange')}>{(['24h', '7d', '30d'] as UsageRange[]).map((value) => <button type="button" key={value} className={range === value ? 'active' : 'secondary'} aria-pressed={range === value} onClick={() => setRange(value)}>{t(`usage.preset.${value}`)}</button>)}</div></div>
+    <LocalSettlementNotice />
     <section className="metrics self-usage-metrics">
       <NumberMetric label={t('usage.requests')} value={stats.summary.requests} />
       <Metric label={t('usage.successRate')} value={formatPercent(successRate, locale)} tone="positive" />
@@ -112,7 +114,7 @@ export function UsagePage({ credential, credentialView, onError }: {
       <NumberMetric label={t('usage.cacheWriteTokens')} value={stats.summary.cache_write_tokens} />
       <Metric label={t('usage.average')} value={formatMilliseconds(stats.summary.avg_duration_ms, locale)} />
       <Metric label={t('usage.p95Approx')} value={formatMilliseconds(stats.summary.p95_duration_ms, locale)} />
-      <Metric label={t('usage.cost')} value={<CostLines values={stats.summary.costs} />} />
+      <Metric label={localSettlementLabel(locale)} value={<CostLines values={stats.summary.costs} />} />
     </section>
     <Suspense fallback={<div className="empty">{t('common.loading')}</div>}>
       <section className="usage-chart-grid self-usage-charts">
