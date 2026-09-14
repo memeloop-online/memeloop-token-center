@@ -1,4 +1,5 @@
 import { LocalSettlementNotice, localSettlementLabel } from '../LocalSettlementNotice';
+import { displayTimeZone, bucketTimeZoneNote } from '../charts/displayTimeZone';
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from '../api';
 import { HeatmapDataTable } from '../charts/HeatmapDataTable';
@@ -81,7 +82,8 @@ export function UsagePage({ credential, credentialView, onError }: {
 
   const scopedRemote = remote?.scope === scope ? remote : { scope, status: 'loading' as const };
   const stats = scopedRemote.status === 'ready' ? scopedRemote.value : undefined;
-  const timeZone = stats?.time_zone ?? 'UTC';
+  const timeZone = displayTimeZone();
+  const heatmapTimeZone = stats?.time_zone ?? 'UTC';
 
   const copy: UsageChartCopy = useMemo(() => ({
     requests: t('usage.requests'), success: t('traffic.success'), failures: t('traffic.failure'), averageLatency: t('usage.average'),
@@ -95,7 +97,7 @@ export function UsagePage({ credential, credentialView, onError }: {
   const throughput = useMemo(() => throughputOption(stats?.time_series ?? [], copy, formatters), [stats?.time_series, copy, formatters]);
   const latency = useMemo(() => latencyOption(stats?.time_series ?? [], copy, formatters), [stats?.time_series, copy, formatters]);
   const costs = useMemo(() => costOption(stats?.time_series ?? [], copy, formatters), [stats?.time_series, copy, formatters]);
-  const weekdays = useMemo(() => Array.from({ length: 7 }, (_, day) => new Date(Date.UTC(2024, 0, 8 + day)).toLocaleDateString(locale, { weekday: 'short', timeZone })), [locale, timeZone]);
+  const weekdays = useMemo(() => Array.from({ length: 7 }, (_, day) => new Date(Date.UTC(2024, 0, 8 + day)).toLocaleDateString(locale, { weekday: 'short', timeZone: heatmapTimeZone })), [locale, heatmapTimeZone]);
   const heatmap = useMemo(() => heatmapOption(stats?.heatmap ?? [], 'requests', credentialView.currency, weekdays, t('usage.heatmapLabel'), formatters), [stats?.heatmap, credentialView.currency, weekdays, t, formatters]);
 
   if (scopedRemote.status === 'loading') return <div className="self-page usage-page"><div className="usage-heading"><div><h2>{t('usage.title')}</h2><p className="muted">{t('self.usageDescription')}</p></div></div><div className="boot" role="status">{t('common.loading')}</div></div>;
@@ -103,7 +105,7 @@ export function UsagePage({ credential, credentialView, onError }: {
   if (!stats) return <div className="empty">{t('common.noData')}</div>;
   const successRate = stats.summary.requests ? stats.summary.success / stats.summary.requests : null;
   return <div className="self-page self-usage-page usage-page" data-self-page="usage">
-    <div className="usage-heading"><div><h2>{t('usage.title')}</h2><p className="muted">{t('self.usageDescription')}</p><span className="usage-time-zone">{timeZone}</span></div><div className="usage-presets" role="group" aria-label={t('usage.timeRange')}>{(['24h', '7d', '30d'] as UsageRange[]).map((value) => <button type="button" key={value} className={range === value ? 'active' : 'secondary'} aria-pressed={range === value} onClick={() => setRange(value)}>{t(`usage.preset.${value}`)}</button>)}</div></div>
+    <div className="usage-heading"><div><h2>{t('usage.title')}</h2><p className="muted">{t('self.usageDescription')}</p><span className="usage-time-zone">{bucketTimeZoneNote(locale, stats.time_zone)}</span></div><div className="usage-presets" role="group" aria-label={t('usage.timeRange')}>{(['24h', '7d', '30d'] as UsageRange[]).map((value) => <button type="button" key={value} className={range === value ? 'active' : 'secondary'} aria-pressed={range === value} onClick={() => setRange(value)}>{t(`usage.preset.${value}`)}</button>)}</div></div>
     <section className="metrics self-usage-metrics">
       <NumberMetric label={t('usage.requests')} value={stats.summary.requests} />
       <Metric label={t('usage.successRate')} value={formatPercent(successRate, locale)} tone="positive" />
@@ -120,7 +122,7 @@ export function UsagePage({ credential, credentialView, onError }: {
         <ChartPanel timeZone={timeZone} title={t('usage.throughput')} values={stats.time_series}><EChart ariaLabel={t('usage.throughput')} locale={locale} option={throughput} timeZone={timeZone} /></ChartPanel>
         <ChartPanel timeZone={timeZone} title={t('usage.latencyTrend')} values={stats.time_series}><EChart ariaLabel={t('usage.latencyTrend')} locale={locale} option={latency} timeZone={timeZone} /></ChartPanel>
         <ChartPanel timeZone={timeZone} title={t('usage.costTrend')} values={stats.time_series}><EChart ariaLabel={t('usage.costTrend')} locale={locale} option={costs} timeZone={timeZone} /></ChartPanel>
-        <article className="panel usage-chart-card usage-heatmap-panel"><div className="panel-title"><h2>{t('usage.heatmap')}</h2><span>{timeZone}</span></div>{stats.heatmap.length === 0 ? <div className="empty">{t('usage.noHeatmapData')}</div> : <><EChart ariaLabel={t('usage.heatmapLabel')} className="usage-echart-heatmap" locale={locale} option={heatmap} timeZone={timeZone} /><HeatmapDataTable currency={credentialView.currency} format={formatters} metric="requests" summary={t('usage.trendData')} timeZone={timeZone} valueLabel={t('usage.requests')} values={stats.heatmap} weekdays={weekdays} /></>}</article>
+        <article className="panel usage-chart-card usage-heatmap-panel"><div className="panel-title"><h2>{t('usage.heatmap')}</h2><span>{heatmapTimeZone}</span></div>{stats.heatmap.length === 0 ? <div className="empty">{t('usage.noHeatmapData')}</div> : <><EChart ariaLabel={t('usage.heatmapLabel')} className="usage-echart-heatmap" locale={locale} option={heatmap} timeZone={heatmapTimeZone} /><HeatmapDataTable currency={credentialView.currency} format={formatters} metric="requests" summary={t('usage.trendData')} timeZone={heatmapTimeZone} valueLabel={t('usage.requests')} values={stats.heatmap} weekdays={weekdays} /></>}</article>
       </section>
     </Suspense>
     <section className="two-column self-usage-breakdown"><DimensionTable title={t('usage.models')} values={stats.by_model} /><DimensionTable title={t('usage.protocols')} values={stats.by_protocol} /></section>

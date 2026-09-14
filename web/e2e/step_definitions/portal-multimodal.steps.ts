@@ -84,7 +84,7 @@ Then('自助门户显示自己的 51 条请求和分页统计', async function (
   await assertExactText(metric(page, '失败'), '1');
   await assertExactText(metric(page, 'Token 用量'), '600');
   await assertContains(metric(page, '可用余额 (USD)'), '$');
-  await assertContains(metric(page, '总费用'), '$');
+  await assertContains(metric(page, '本地结算'), '$');
   await assertVisible(page.getByRole('heading', { name: 'Browser E2E credential', exact: true }));
   await assertVisible(page.getByText(model, { exact: true }).first());
   await assertCount(page.locator('.self-history tbody tr'), 5);
@@ -743,7 +743,7 @@ Then('取消任务不扣费且请求统计反映多模态用量', async function
   const page = this.requirePage();
   await openAppRoute(page, 'portal', 'overview');
   await assertContains(metric(page, '可用余额 (USD)'), '$9.1');
-  await assertContains(metric(page, '总费用'), '$0.9');
+  await assertContains(metric(page, '本地结算'), '$0.9');
   await assertExactText(metric(page, '总请求'), '4');
 });
 
