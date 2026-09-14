@@ -282,14 +282,14 @@ export function RequestTable({
             const credentialDetails = request.credential_identity ? `${request.credential_identity.key_id} · ${request.credential_identity.principal_external_id}` : credentialLabel;
             const upstreamName = request.upstream_account_id ? upstreamNames?.get(request.upstream_account_id) : undefined;
             return <tr key={request.request_id}>
-              <td className="request-time-cell"><time>{new Date(request.created_at).toLocaleString(locale)}</time><RequestIdentifier requestId={request.request_id} compact /></td>
-              <td className="request-credential-cell"><DetailTooltip content={credentialDetails}><strong tabIndex={0}>{credentialLabel}</strong></DetailTooltip></td>
+              <td className="request-time-cell" data-label={t('request.receivedAt')}><time>{new Date(request.created_at).toLocaleString(locale)}</time><RequestIdentifier requestId={request.request_id} compact /></td>
+              <td className="request-credential-cell" data-label={t('self.credential')}><DetailTooltip content={credentialDetails}><strong tabIndex={0}>{credentialLabel}</strong></DetailTooltip></td>
               <td className="request-model-cell"><DetailTooltip content={technicalSummary}><span className="request-routing-info" tabIndex={0}><code>{request.model}</code>{upstreamName && <small className="request-upstream-name">{upstreamName}</small>}</span></DetailTooltip></td>
-              <td className="request-token-cell"><DetailTooltip content={tokenDetails}><span className="request-value-info request-token-total" aria-label={pending ? copy.pendingUsage : `${copy.total} ${tokenDisplay.text} (${tokenDetails})`} tabIndex={0}>{pending ? t('common.running') : <>{copy.total} <span>{tokenDisplay.text}</span></>}</span></DetailTooltip>
+              <td className="request-token-cell" data-label={t('request.tokens')}><DetailTooltip content={tokenDetails}><span className="request-value-info request-token-total" aria-label={pending ? copy.pendingUsage : `${copy.total} ${tokenDisplay.text} (${tokenDetails})`} tabIndex={0}>{pending ? t('common.running') : <>{copy.total} <span>{tokenDisplay.text}</span></>}</span></DetailTooltip>
                 {pending ? <DetailTooltip content={copy.pendingUsage}><span className="request-token-pending" tabIndex={0}>{locale === 'zh-CN' ? '用量待结算' : 'Usage pending settlement'}</span></DetailTooltip> : <span className="request-token-primary"><span>{copy.input} <b>{uncachedInput === null ? <DetailTooltip content={copy.cacheMissing}><span tabIndex={0}>{copy.unknown}</span></DetailTooltip> : formatMetricDisplay(uncachedInput, locale).text}</b></span><span>{copy.output} <b>{formatMetricDisplay(request.output_tokens, locale).text}</b></span></span>}
               </td>
-              <td className="request-cost-cell"><span className="request-value-info" title={cost.title} aria-label={cost.title ? `${cost.text} (${cost.title})` : undefined} tabIndex={cost.title ? 0 : undefined}>{cost.text}</span></td>
-              {showsSession && <td className="request-session-cell">
+              <td className="request-cost-cell" data-label={t('request.cost')}><span className="request-value-info" title={cost.title} aria-label={cost.title ? `${cost.text} (${cost.title})` : undefined} tabIndex={cost.title ? 0 : undefined}>{cost.text}</span></td>
+              {showsSession && <td className="request-session-cell" data-label={t('request.session')}>
                 {!context
                   ? '—'
                   : context.association === 'confirmed'
@@ -299,10 +299,10 @@ export function RequestTable({
                     : <span className="request-session-unlinked">{t('sessions.unlinkedRequests')}</span>}
                 {sessionMeta && <RequestSessionMetadata value={sessionMeta} />}
               </td>}
-              <td><RequestStatus request={request} />{request.error_code && <span className="visually-hidden">{request.error_code}</span>}</td>
-              <td><span className="request-duration-info" title={[duration.title, durationSummary].filter(Boolean).join(' · ') || undefined} aria-label={[duration.text, duration.title, durationSummary].filter(Boolean).join(' · ') || undefined} tabIndex={duration.title || durationSummary ? 0 : undefined}>{duration.text}</span></td>
-              <td className="request-tps-cell"><RequestOutputRate request={request} /></td>
-              {onSelect && <td><button className="secondary table-action" type="button" onClick={() => onSelect(request)} aria-label={t('request.openDetail', { model: request.model })}>{t('request.inspect')}</button></td>}
+              <td className="request-status-cell" data-label={t('request.status')}><RequestStatus request={request} />{request.error_code && <span className="visually-hidden">{request.error_code}</span>}</td>
+              <td className="request-duration-cell" data-label={t('request.duration')}><span className="request-duration-info" title={[duration.title, durationSummary].filter(Boolean).join(' · ') || undefined} aria-label={[duration.text, duration.title, durationSummary].filter(Boolean).join(' · ') || undefined} tabIndex={duration.title || durationSummary ? 0 : undefined}>{duration.text}</span></td>
+              <td className="request-tps-cell" data-label="TPS"><RequestOutputRate request={request} /></td>
+              {onSelect && <td className="request-actions-cell"><button className="secondary table-action" type="button" onClick={() => onSelect(request)} aria-label={t('request.openDetail', { model: request.model })}>{t('request.inspect')}</button></td>}
             </tr>
           })}
         </tbody>

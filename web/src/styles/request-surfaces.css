@@ -24,3 +24,31 @@
 .request-detail-surface.request-diagnostics b { font-size: 11px; letter-spacing: 0; text-transform: none; color: #a7bbc3; }
 :root[data-theme='light'] .request-detail-surface.request-diagnostics b { color: #526d78; }
 .request-detail-surface .request-outcome small { display: inline; margin: 0 0 0 6px; color: inherit; }
+
+/* One request row and one set of formatters: compact screens prioritize the
+   work and its outcome instead of requiring a horizontal hunt for the model. */
+@media (width <= 600px) {
+  .request-table-scroll table.request-table { display: block; width: 100%; min-width: 0; }
+  .request-table thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .request-table tbody { display: grid; gap: 20px; width: 100%; }
+  .request-table tbody tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 16px; padding: 0 0 20px; border-bottom: 1px solid #33484e; }
+  :root[data-theme='light'] .request-table tbody tr { border-bottom-color: #d0dfe2; }
+  .request-table tbody tr td { display: block; width: auto; min-width: 0; max-width: none; padding: 0; border: 0; white-space: normal; overflow-wrap: anywhere; }
+  .request-table tbody tr td[data-label]::before { content: attr(data-label); display: block; margin-bottom: 4px; font-size: 10px; line-height: 1.4; color: #a7bbc3; }
+  :root[data-theme='light'] .request-table tbody tr td[data-label]::before { color: #526d78; }
+  .request-table .request-model-cell { order: 0; grid-column: 1 / -1; }
+  .request-table .request-model-cell code { font-size: 16px; line-height: 1.4; }
+  .request-table .request-credential-cell { order: 1; grid-column: 1 / -1; }
+  .request-table .request-token-cell { order: 2; }
+  .request-table .request-cost-cell { order: 3; }
+  .request-table .request-status-cell { order: 4; }
+  .request-table .request-duration-cell { order: 5; }
+  .request-table .request-tps-cell { order: 6; }
+  .request-table .request-session-cell { order: 7; }
+  .request-table .request-time-cell { order: 8; font-size: 11px; }
+  .request-table .request-actions-cell { order: 9; align-self: end; }
+  .request-table .request-time-cell time { display: inline; }
+  .request-table .request-actions-cell .table-action { min-height: 44px; width: 100%; }
+  .request-table .request-token-primary { min-width: 0; }
+  .request-table .request-session-cell > :is(span, button) { white-space: normal; overflow-wrap: anywhere; }
+}
