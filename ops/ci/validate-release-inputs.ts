@@ -23,7 +23,7 @@ const git = (args: string[]): string => {
 const resolved = git(['rev-parse', 'HEAD']);
 if (resolved !== revision) fail(`checkout is ${resolved}, expected ${revision}`);
 if (git(['status', '--porcelain=v1', '--untracked-files=all']) !== '') fail('release checkout contains tracked or untracked changes');
-for (const path of ['Dockerfile', 'Dockerfile.plugin-installer']) {
+for (const path of ['Dockerfile', 'Dockerfile.release', 'Dockerfile.plugin-installer']) {
   if (!existsSync(resolve(repository, path))) fail(`${path} is missing`);
 }
 // Force a directory read so a concurrently removed checkout fails before any output is trusted.

@@ -38,16 +38,17 @@ COPY wit ./wit
 ARG MTC_BUILD_GIT_SHA_INPUT=unknown
 ARG MTC_BUILD_TIMESTAMP_INPUT=unknown
 ARG MTC_BUILD_TARGET_INPUT=unknown
+FROM builder AS release-input
 RUN MTC_BUILD_GIT_SHA="${MTC_BUILD_GIT_SHA_INPUT}" \
     MTC_BUILD_TIMESTAMP="${MTC_BUILD_TIMESTAMP_INPUT}" \
     MTC_BUILD_TARGET="${MTC_BUILD_TARGET_INPUT}" \
     cargo build --locked --release --features experimental-plugin-revisions --bin memeloop-token-center \
-    && cp target/release/memeloop-token-center /tmp/memeloop-token-center \
-    && cp "$(gcc -print-file-name=libgcc_s.so.1)" /tmp/libgcc_s.so.1 \
-    && cp "$(g++ -print-file-name=libstdc++.so.6)" /tmp/libstdc++.so.6 \
+    && install -D -m 0555 target/release/memeloop-token-center /release-input/memeloop-token-center \
+    && install -D -m 0644 "$(gcc -print-file-name=libgcc_s.so.1)" /release-input/libgcc_s.so.1 \
+    && install -D -m 0644 "$(g++ -print-file-name=libstdc++.so.6)" /release-input/libstdc++.so.6 \
     && rm -rf target /usr/local/cargo/registry /usr/local/cargo/git
 
-FROM ${RUNTIME_IMAGE}
+FROM ${RUNTIME_IMAGE} AS release-input-smoke
 # SQLite copies every bound archive ciphertext through libc. Keep those
 # transient ~114 KiB allocations out of glibc arenas so they are unmapped when
 # the statement clears its bindings instead of fragmenting long-lived heaps.
@@ -55,12 +56,24 @@ FROM ${RUNTIME_IMAGE}
 # environment when profiling a different libc workload.
 ENV LD_LIBRARY_PATH=/usr/local/lib \
     GLIBC_TUNABLES=glibc.malloc.mmap_threshold=65536
-COPY --from=builder /tmp/libgcc_s.so.1 /usr/local/lib/libgcc_s.so.1
-COPY --from=builder /tmp/libstdc++.so.6 /usr/local/lib/libstdc++.so.6
-COPY --from=builder /tmp/memeloop-token-center /usr/local/bin/memeloop-token-center
+COPY --from=release-input /release-input /release-input
+COPY --from=release-input /release-input/libgcc_s.so.1 /usr/local/lib/libgcc_s.so.1
+COPY --from=release-input /release-input/libstdc++.so.6 /usr/local/lib/libstdc++.so.6
+COPY --from=release-input /release-input/memeloop-token-center /usr/local/bin/memeloop-token-center
+# A release-input artifact is only valid when the Docker-native binary starts
+# against the exact distroless runtime that will publish it.
+RUN ["/usr/local/bin/memeloop-token-center", "--help"]
+
+FROM scratch AS release-input-export
+COPY --from=release-input-smoke /release-input /
+
+FROM ${RUNTIME_IMAGE}
+ENV LD_LIBRARY_PATH=/usr/local/lib \
+    GLIBC_TUNABLES=glibc.malloc.mmap_threshold=65536
+COPY --from=release-input /release-input/libgcc_s.so.1 /usr/local/lib/libgcc_s.so.1
+COPY --from=release-input /release-input/libstdc++.so.6 /usr/local/lib/libstdc++.so.6
+COPY --from=release-input /release-input/memeloop-token-center /usr/local/bin/memeloop-token-center
 COPY --from=web-builder /build/web/dist /usr/share/memeloop-token-center/web
-# Execute the production binary inside the final distroless filesystem during
-# every image build so a missing shared library fails before publication.
 RUN ["/usr/local/bin/memeloop-token-center", "--help"]
 USER 10001:10001
 EXPOSE 8080

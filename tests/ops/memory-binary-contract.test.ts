@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { appendFileSync, chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -53,4 +53,30 @@ test('memory binary installer reports all missing required positional arguments 
 
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /memory binary installation: artifact directory, revision, and destination are required/);
+});
+
+test('Docker-native service release inputs bind binary, runtime libraries, feature set, platform, and revision', () => {
+  const temporary = mkdtempSync(join(tmpdir(), 'mtc-release-service-input-contract-'));
+  const revision = '2'.repeat(40);
+  try {
+    const exported = join(temporary, 'exported');
+    const artifact = join(temporary, 'artifact');
+    mkdirSync(exported);
+    copyFileSync(process.execPath, join(exported, 'memeloop-token-center'));
+    writeFileSync(join(exported, 'libgcc_s.so.1'), 'gcc runtime');
+    writeFileSync(join(exported, 'libstdc++.so.6'), 'cxx runtime');
+    run(process.execPath, ['ops/ci/create-memory-binary-manifest.ts', join(exported, 'memeloop-token-center'), revision, artifact]);
+    copyFileSync(join(exported, 'libgcc_s.so.1'), join(artifact, 'libgcc_s.so.1'));
+    copyFileSync(join(exported, 'libstdc++.so.6'), join(artifact, 'libstdc++.so.6'));
+    run(process.execPath, ['ops/ci/create-release-service-input-manifest.ts', artifact, revision]);
+    // GitHub artifact download normalizes file modes. The final Dockerfile
+    // restores the executable bit while digest verification remains valid.
+    chmodSync(join(artifact, 'memeloop-token-center'), 0o644);
+    run(process.execPath, ['ops/ci/verify-release-service-input.ts', artifact, revision]);
+
+    appendFileSync(join(artifact, 'libstdc++.so.6'), 'tampered');
+    rejected(process.execPath, ['ops/ci/verify-release-service-input.ts', artifact, revision], { cwd: repository });
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
 });
