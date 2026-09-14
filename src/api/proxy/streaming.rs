@@ -322,8 +322,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 break;
                             }
                         };
-                        let observed_ms =
-                            started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+                        let observed_ms = diagnostic_context.elapsed_millis_at(Instant::now());
                         for frame in &delivery_frames {
                             output_timing.observe(&frame.bytes, frame.terminal, observed_ms);
                         }

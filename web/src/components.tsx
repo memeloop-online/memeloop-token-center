@@ -247,8 +247,7 @@ export function RequestTable({
   const showsSession = requests.some((request) => request.session_context !== undefined);
   const copy = {
     total: t('request.totalTokens'), input: t('request.uncachedInput'), output: t('request.outputTokens'),
-    unknown: t('request.usageUnknown'), averageTps: t('request.averageTps'), tpsHint: t('request.averageTpsHint'),
-    tpsMissing: t('request.tpsMissing'), tpsRunning: t('request.tpsRunning'),
+    unknown: t('request.usageUnknown'), tpsHint: `${t('request.generationTpsHint')} ${t('request.averageTpsHint')}`,
     cacheMissing: t('request.cacheMissing'), pendingUsage: t('request.pendingUsage'),
   };
   return (

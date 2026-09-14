@@ -200,8 +200,6 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
     model: event.model,
     status_code: event.status_code,
     duration_ms: event.duration_ms,
-    first_output_ms: event.first_output_ms ?? previous?.first_output_ms,
-    generation_duration_ms: event.generation_duration_ms ?? previous?.generation_duration_ms,
     input_tokens: event.input_tokens,
     cached_input_tokens: event.cached_input_tokens ?? previous?.cached_input_tokens,
     cache_write_tokens: event.cache_write_tokens ?? previous?.cache_write_tokens,
@@ -212,6 +210,10 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
     session_context: mergeSessionContext(previous?.session_context, event),
   };
   const credentialIdentity = event.credential_identity ?? previous?.credential_identity;
+  const firstOutput = event.first_output_ms ?? previous?.first_output_ms;
+  const generationDuration = event.generation_duration_ms ?? previous?.generation_duration_ms;
+  if (firstOutput !== undefined) request.first_output_ms = firstOutput;
+  if (generationDuration !== undefined) request.generation_duration_ms = generationDuration;
   if (credentialIdentity !== undefined) request.credential_identity = credentialIdentity;
   return request;
 }

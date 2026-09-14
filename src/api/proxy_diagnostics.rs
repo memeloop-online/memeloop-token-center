@@ -32,6 +32,14 @@ impl Context {
         context.request_id = request_id;
         context
     }
+
+    /// Shares the ingress clock with persisted first-output observations;
+    /// admission and body-reading time must not disappear from user latency.
+    pub(super) fn elapsed_millis_at(self, now: Instant) -> i64 {
+        now.saturating_duration_since(self.started)
+            .as_millis()
+            .min(i64::MAX as u128) as i64
+    }
 }
 
 /// Only exact supported paths (and the explicitly unsupported compact path)
@@ -124,6 +132,15 @@ impl Drop for Phase {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn first_output_clock_includes_preparation_and_admission_wait() {
+        let context = Context::new();
+        let admitted_at = context.started + std::time::Duration::from_secs(3);
+        let first_output_at = admitted_at + std::time::Duration::from_secs(2);
+        assert_eq!(context.elapsed_millis_at(first_output_at), 5000);
+        assert_eq!(context.elapsed_millis_at(context.started), 0);
+    }
 
     #[derive(Clone, Default)]
     struct Writer(Arc<Mutex<Vec<u8>>>);
