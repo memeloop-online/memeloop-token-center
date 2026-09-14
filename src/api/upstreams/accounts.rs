@@ -645,16 +645,21 @@ pub(in crate::api) async fn rotate_codex_transport_proxy(
         .db
         .require_upstream_tenant(account_id, &body.tenant_external_id)
         .await?;
-    crate::provider::validate_codex_proxy_url(&body.proxy_url)?;
-    let config = json!({
-        "base_url": crate::oauth::codex_device::BASE_URL,
-        "network_scope": "public",
-    });
-    network::validate_codex_transport(
-        crate::oauth::codex_device::BASE_URL,
-        &config,
-        Some((&body.proxy_url, OutboundScope::Private)),
-        false,
+    let (current_account, credential, _, _) = state
+        .db
+        .upstream_account_with_current_credential(account_id, state.config.key_pepper.as_bytes())
+        .await?;
+    if current_account.driver == crate::oauth::codex_device::PROVIDER_DRIVER {
+        crate::provider::validate_codex_proxy_url(&body.proxy_url)?;
+    }
+    let replacement = credential.with_transport_proxy(body.proxy_url.clone())?;
+    validate_upstream_proxy(
+        &current_account.driver,
+        &current_account.config,
+        &replacement,
+        &service,
+        &state,
+        true,
     )
     .await?;
     let (account, changed) = state

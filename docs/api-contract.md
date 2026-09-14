@@ -54,6 +54,18 @@ state inside the encrypted OAuth credential and is never represented as
 `config.base_url`. Upstream responses expose only `has_proxy`, the SOCKS scheme,
 remote-DNS semantics, a host-free label and a pepper-keyed fingerprint. They
 never expose a proxy URL, host, port, username or password. The
+The explicit `GET /internal/v1/upstreams/{account_id}/transport-proxy` requires
+`providers:write`, global-operator authority, and an owning `tenant_external_id`.
+It returns the complete proxy URL (including proxy username/password), private
+scope, account ID, update revision, credential generation and `supported` for
+view/copy/edit, with `Cache-Control: private, no-store`. It never exports API
+keys, OAuth access/refresh tokens, adapter state or arbitrary configuration.
+Unconfigured URLs are null; supported containers are OAuth and proxied API-key.
+The existing PUT also supports these containers, replacing only proxy fields
+under existing CAS/idempotency/audit fences. Unsupported containers are rejected.
+Codex retains private IP-literal socks5h; generic socks5 can resolve a hostname
+only to safe private addresses. There is no upstream probe in the GET operation.
+
 `can_update_transport_proxy` capability is additionally restricted by the
 authenticated caller and is always false for tenant-scoped services.
 

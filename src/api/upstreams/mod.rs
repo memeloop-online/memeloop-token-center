@@ -9,6 +9,7 @@ mod native_oauth_import;
 mod oauth;
 mod oauth_claude;
 mod oauth_copilot;
+mod proxy_settings;
 mod quota;
 
 fn restrict_transport_proxy_capability(
@@ -32,6 +33,7 @@ pub(in crate::api) use native_oauth_import::{
     MAX_NATIVE_KIMI_COHORT_REQUEST, import_native_kimi_oauth_cohort,
     native_oauth_import_capabilities,
 };
+pub(in crate::api) use proxy_settings::get_upstream_proxy_settings;
 pub(in crate::api) use quota::upstream_quota;
 pub(in crate::api) use quota::{
     confirm_quota_reset, get_quota_reset, prepare_quota_reset, reconcile_quota_reset,
