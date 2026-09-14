@@ -984,7 +984,7 @@ paths:
               properties:
                 review_digest: { type: string, minLength: 1, maxLength: 128 }
       responses:
-        '204': { description: Approved inventory registered and validated, or exact replay. }
+        '204': { description: 'Approved inventory registered and validated, or exact replay.' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -1032,7 +1032,7 @@ paths:
       tags: [System]
       operationId: stageApplicationPluginInventory
       summary: Validate a preinstalled application plugin inventory (experimental)
-      description: Requires host-only MTC_PLUGIN_INVENTORY_FILE configuration; service images include experimental-plugin-revisions. Global operators only; no URL, path, Wasm, grant, or tenant override is accepted. Only already-approved unchanged contracts can be staged.
+      description: Requires host-only MTC_PLUGIN_INVENTORY_FILE configuration; service images include experimental-plugin-revisions. Global operators only; this staging endpoint accepts an inventory ID, never a URL, path, Wasm, grant, or tenant override. New contracts are permitted when the immutable inventory has explicit approved grants.
       security: [{ serviceBearer: [] }]
       x-required-scope: plugins:write
       x-global-operator-only: true
