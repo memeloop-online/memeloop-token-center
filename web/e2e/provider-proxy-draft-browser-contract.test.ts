@@ -123,7 +123,7 @@ test('independent proxy save updates concurrency metadata without dropping the p
     await row.getByRole('button', { name: '查看详情', exact: true }).click();
     await page.getByText('Codex 附加用量（代次 1 额度） · 供应商窗口', { exact: true }).waitFor();
     assert.match(await row.innerText(), /75/);
-    await page.getByRole('button', { name: '额度重置选项', exact: true }).click();
+    assert.equal(await quotaDetails.getByRole('region', { name: '额度重置', exact: true }).count(), 1);
     assert.equal(await page.getByRole('button', { name: '重置上游额度', exact: true }).isVisible(), true);
     await row.getByRole('button', { name: '收起详情', exact: true }).click();
     await row.getByRole('button', { name: '查看详情', exact: true }).click();
@@ -137,7 +137,7 @@ test('independent proxy save updates concurrency metadata without dropping the p
     await quotaDetails.getByRole('button', { name: '查看额度', exact: true }).waitFor();
     assert.match(await row.innerText(), /尚未读取/);
     assert.equal(await page.getByText('Codex 附加用量（代次 1 额度） · 供应商窗口', { exact: true }).count(), 0);
-    await page.getByRole('button', { name: '额度重置选项', exact: true }).click();
+    assert.equal(await quotaDetails.getByRole('region', { name: '额度重置', exact: true }).count(), 1);
     assert.equal(
       await page.getByRole('button', { name: '重置上游额度', exact: true }).isEnabled(),
       false,
@@ -150,7 +150,7 @@ test('independent proxy save updates concurrency metadata without dropping the p
     assert.match(await row.innerText(), /25/);
     assert.doesNotMatch(await row.innerText(), /75/);
     assert.equal(await page.getByText('Codex 附加用量（代次 1 额度） · 供应商窗口', { exact: true }).count(), 0);
-    assert.equal(await page.getByRole('button', { name: '额度重置选项', exact: true }).count(), 0);
+    assert.equal(await quotaDetails.getByRole('button', { name: '重置上游额度', exact: true }).count(), 0, 'unsupported new generation exposes no reset action');
     await row.getByRole('button', { name: '收起详情', exact: true }).click();
     await row.getByRole('button', { name: '查看详情', exact: true }).click();
     await page.getByText('Codex 附加用量（代次 2 额度） · 供应商窗口', { exact: true }).waitFor();

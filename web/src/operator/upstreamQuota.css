@@ -11,7 +11,8 @@
 .provider-account .upstream-quota span, .provider-account .upstream-quota small { font: inherit; color: inherit; }
 .upstream-quota p { margin: 8px 0; line-height: 1.5; }
 .upstream-quota small { display: block; margin-top: 8px; overflow-wrap: anywhere; }
-.upstream-quota-reset { background: var(--picker-surface); border: 1px solid var(--picker-border); border-radius: 8px; margin-top: 14px; padding: 14px; }
+.upstream-quota-reset { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; margin-top: 20px; padding: 0; }
+.upstream-quota-reset h3, .upstream-quota-reset p { margin: 0; }
 .upstream-quota .upstream-danger-zone { background: var(--form-danger-surface); border: 1px solid var(--form-danger); border-radius: 8px; margin-top: 14px; padding: 0 14px 12px; }
 .upstream-quota .upstream-danger-zone > summary { color: var(--form-danger); min-height: 44px; padding: 12px 0; }
 .upstream-quota .upstream-danger-zone > p { color: var(--picker-text); }

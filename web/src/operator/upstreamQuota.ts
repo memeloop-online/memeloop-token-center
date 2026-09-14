@@ -8,7 +8,7 @@ export interface UpstreamQuotaSnapshot {
   stale_after: number | null;
   stale: boolean;
   plan_type: string | null;
-  credits: { balance: string | null; unlimited: boolean | null; has_credits: boolean | null };
+  credits: { balance: string | null; unlimited: boolean | null; has_credits: boolean | null; source?: string | null };
   windows: {
     id: string;
     label: string;
@@ -125,9 +125,11 @@ export function quotaWindowPresentation(provider: string, window: UpstreamQuotaS
     const scopeKey = match?.[1] === 'code' ? 'quota.scopeCodex'
       : match?.[1] === 'code_review' ? 'quota.scopeCodexReview'
       : 'quota.scopeCodexAdditional';
-    const qualifier = scopeKey !== 'quota.scopeCodexAdditional' ? null
-      : match?.[1] ? match[1].replace(/[_.-]+/g, ' ').replace(/\s+/g, ' ').trim() || null
-      : window.label.trim() && window.label !== window.id ? window.label : null;
+    // Only use a separately supplied human label. Metered-feature IDs are not
+    // verified model names; retain them in the existing evidence tooltip.
+    const label = window.label.trim();
+    const qualifier = scopeKey === 'quota.scopeCodexAdditional' && label !== window.id
+      && !/[_.:]/.test(label) && /\s|[^\x00-\x7f]/.test(label) ? label : null;
     return { scopeKey, periodKey, supplierLabel: null, qualifier };
   }
   const supplierLabel = window.label.trim() && window.label !== window.id ? window.label : null;

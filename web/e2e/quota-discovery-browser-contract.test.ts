@@ -33,7 +33,8 @@ test('quota reset discovery survives missing and failed reads without performing
     await page.goto(`${base}/e2e/fixtures/quota-discovery.html`);
     for (const state of ['pending', 'failed', 'snapshot']) {
       const section = page.locator(`[data-state="${state}"]`);
-      await section.getByRole('button', { name: 'Quota reset options', exact: true }).click();
+      assert.equal(await section.getByRole('region', { name: 'Quota reset', exact: true }).count(), 1);
+      assert.equal(await section.getByRole('button', { name: 'Quota reset options', exact: true }).count(), 0);
       const reset = section.getByRole('button', { name: 'Reset upstream quota', exact: true });
       assert.equal(await reset.isEnabled(), state === 'snapshot');
       // Never click reset or issue a quota read, preparation, confirmation or reconciliation.
