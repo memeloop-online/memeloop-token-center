@@ -23,8 +23,11 @@ pub(in crate::api) async fn create_generation_for_modality(
     requested_modality: Option<&'static str>,
 ) -> Result<Response, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
-    let state = state.pin_application_plugins().await?;
-    let routing_selection_seed = Uuid::now_v7();
+    let mut state = state.pin_application_plugins().await?;
+    // The prepared routing plan and durable job share one identity. A replay
+    // returns the existing job below without replacing its saved snapshot.
+    let job_id = Uuid::now_v7();
+    let routing_selection_seed = job_id;
     let applied = apply_traffic_policy(
         &state,
         &key,
@@ -41,21 +44,15 @@ pub(in crate::api) async fn create_generation_for_modality(
             "generation input must be a JSON object".into(),
         ));
     }
-    let route = state
-        .db
-        .resolve_authorized_upstream_with_hint(
-            key.key_id,
-            key.tenant_id,
-            &body.model,
-            "generation",
-            RouteSelectionOptions {
-                upstream_account_hint: applied.upstream_account_hint,
-                selection_seed: routing_selection_seed,
-            },
-            state.config.key_pepper.as_bytes(),
-        )
-        .await?
-        .ok_or_else(|| AppError::Upstream("generation route is not configured".into()))?;
+    let route = crate::generation::group_routing::prepare_route(
+        &mut state,
+        &key,
+        &body.model,
+        applied.upstream_account_hint,
+        routing_selection_seed,
+        job_id,
+    )
+    .await?;
     let siliconflow_video = route.driver == "http-json"
         && crate::generation::is_siliconflow_video_profile(&route.config, &route.upstream_model);
     if !matches!(route.driver.as_str(), "volcengine-seedance" | "comfyui") && !siliconflow_video {
@@ -131,7 +128,7 @@ pub(in crate::api) async fn create_generation_for_modality(
         // settle exactly instead of rounding every image up to a whole MP.
         reservation_price.output_micros_per_million = generation_price.micros_per_unit;
     }
-    let job_id = Uuid::now_v7();
+    let routing_snapshot = crate::generation::group_routing::snapshot(&state)?;
     let archived = serde_json::to_vec(&json!({
         "model": body.model,
         "input": body.input
@@ -154,6 +151,7 @@ pub(in crate::api) async fn create_generation_for_modality(
                 estimated_units,
                 billing_unit: generation_price.billing_unit,
                 micros_per_unit: generation_price.micros_per_unit,
+                routing_snapshot,
             },
             idempotency.as_ref(),
         )

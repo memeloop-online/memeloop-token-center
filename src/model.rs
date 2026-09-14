@@ -1391,6 +1391,7 @@ pub struct OperatorGenerationJobView {
 
 #[derive(Clone, Debug)]
 pub struct GenerationJobWork {
+    pub routing_snapshot: Option<serde_json::Value>,
     pub job_id: Uuid,
     pub created_at: i64,
     /// Only evidence-confirmed quarantines receive a fresh, bounded poll window.

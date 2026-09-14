@@ -90,8 +90,14 @@ impl Database {
     pub async fn release_orphaned_reservations(&self, limit: i64) -> Result<u64, AppError> {
         let now = unix_millis();
         let cutoff = now.saturating_sub(30 * 60 * 1_000);
+        // A process can die after the durable send fence and before recording
+        // its unknown result, including requests without an idempotency key.
+        // Preserve reservation and archive evidence; never infer no-send from
+        // the absence of a terminal response.
+        sqlx::query("UPDATE request_records SET submission_uncertain_at = $1, error_code = 'image_submission_uncertain' WHERE completed_at IS NULL AND submission_started_at IS NOT NULL AND submission_uncertain_at IS NULL AND id IN (SELECT q.id FROM request_records q WHERE q.created_at < $2 AND q.completed_at IS NULL AND q.submission_started_at IS NOT NULL AND q.submission_uncertain_at IS NULL AND NOT EXISTS (SELECT 1 FROM synchronous_image_idempotency s WHERE s.request_id = q.id AND s.key_id = q.key_id AND s.status = 'pending' AND s.lease_expires_at > $1) ORDER BY q.created_at, q.id LIMIT $3)")
+            .bind(now).bind(cutoff).bind(limit.clamp(1, 1000)).execute(&self.pool).await?;
         let rows = sqlx::query(
-            "SELECT r.id, r.account_id, r.key_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.rate_window_start, q.id AS request_id, q.created_at AS request_created_at, q.tenant_id AS request_tenant_id, q.error_code AS pending_error_code, q.input_tokens AS pending_input_tokens, q.output_tokens AS pending_output_tokens, q.service_tier AS pending_service_tier FROM usage_reservations r LEFT JOIN request_records q ON q.reservation_id = r.id WHERE (r.status = 'reserved' OR (r.status = 'settled' AND q.id IS NOT NULL)) AND r.created_at < $1 AND q.completed_at IS NULL AND NOT EXISTS (SELECT 1 FROM generation_jobs g WHERE g.reservation_id = r.id) AND NOT EXISTS (SELECT 1 FROM synchronous_image_idempotency s WHERE s.reservation_id = r.id AND s.status = 'pending' AND s.lease_expires_at > $2) ORDER BY r.created_at, r.id LIMIT $3",
+            "SELECT r.id, r.account_id, r.key_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.rate_window_start, q.id AS request_id, q.created_at AS request_created_at, q.tenant_id AS request_tenant_id, q.error_code AS pending_error_code, q.input_tokens AS pending_input_tokens, q.output_tokens AS pending_output_tokens, q.service_tier AS pending_service_tier FROM usage_reservations r LEFT JOIN request_records q ON q.reservation_id = r.id WHERE (r.status = 'reserved' OR (r.status = 'settled' AND q.id IS NOT NULL)) AND r.created_at < $1 AND q.completed_at IS NULL AND q.submission_started_at IS NULL AND NOT EXISTS (SELECT 1 FROM generation_jobs g WHERE g.reservation_id = r.id) AND NOT EXISTS (SELECT 1 FROM synchronous_image_idempotency s WHERE s.reservation_id = r.id AND s.status = 'pending' AND s.lease_expires_at > $2) ORDER BY r.created_at, r.id LIMIT $3",
         )
         .bind(cutoff)
         .bind(now)
@@ -175,7 +181,12 @@ impl Database {
                         response_object: &response_object,
                         conversation: None,
                     })
-                    .await?;
+                    .await;
+                let result = match result {
+                    Ok(result) => result,
+                    Err(AppError::Conflict(_)) => continue,
+                    Err(error) => return Err(error),
+                };
                 if matches!(result, FinishProxyRequestResult::Finished { .. }) {
                     released = released.saturating_add(1);
                 }

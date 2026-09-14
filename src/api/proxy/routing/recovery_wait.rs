@@ -91,7 +91,7 @@ where
     }
 }
 
-pub(in crate::api::proxy) async fn wait(
+pub(crate) async fn wait(
     state: &AppState,
     request_id: Uuid,
     route: ResolvedUpstream,

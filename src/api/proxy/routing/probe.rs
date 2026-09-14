@@ -19,7 +19,7 @@ struct SharedProbeLimiter {
 static SHARED_PROBE_LIMITERS: OnceLock<Mutex<HashMap<ProbeKey, Weak<SharedProbeLimiter>>>> =
     OnceLock::new();
 
-pub(in crate::api::proxy) struct SharedProbePermit {
+pub(crate) struct SharedProbePermit {
     limiter: Arc<SharedProbeLimiter>,
 }
 
@@ -117,7 +117,7 @@ pub(in crate::api::proxy) async fn join_shared_probe(
 }
 
 #[derive(Clone, Copy)]
-pub(in crate::api::proxy) enum UpstreamAttemptTerminal {
+pub(crate) enum UpstreamAttemptTerminal {
     Succeeded,
     Inconclusive,
     Failed {
@@ -127,7 +127,7 @@ pub(in crate::api::proxy) enum UpstreamAttemptTerminal {
 }
 
 impl UpstreamAttemptTerminal {
-    pub(in crate::api::proxy) const fn invalid_response() -> Self {
+    pub(crate) const fn invalid_response() -> Self {
         Self::Failed {
             kind: UpstreamFailureKind::InvalidResponse,
             reason: UpstreamHealthReason::InvalidResponse,
@@ -141,7 +141,7 @@ impl UpstreamAttemptTerminal {
 /// durably delivered streaming output may independently release half-open
 /// admission without losing this attempt's fenced terminal responsibility.
 #[must_use]
-pub(in crate::api::proxy) struct UpstreamAttemptGuard {
+pub(crate) struct UpstreamAttemptGuard {
     state: Option<AppState>,
     request_id: Uuid,
     route_id: Uuid,
@@ -168,7 +168,7 @@ struct UpstreamAttemptRecord {
 
 impl UpstreamAttemptGuard {
     #[allow(clippy::too_many_arguments)]
-    pub(in crate::api::proxy) fn new(
+    pub(crate) fn new(
         state: &AppState,
         request_id: Uuid,
         route_id: Uuid,
@@ -296,7 +296,7 @@ impl UpstreamAttemptGuard {
         }
     }
 
-    pub(in crate::api::proxy) async fn complete(&mut self, terminal: UpstreamAttemptTerminal) {
+    pub(crate) async fn complete(&mut self, terminal: UpstreamAttemptTerminal) {
         let Some(state) = self.state.take() else {
             return;
         };
@@ -318,6 +318,26 @@ impl UpstreamAttemptGuard {
         )
         .await;
         self.stop_heartbeat();
+    }
+
+    /// A lost durable job fence grants no authority to publish an observation.
+    /// Release only this exact owned lease; never heal or record a failure.
+    pub(crate) async fn abandon_without_observe(&mut self) {
+        let state = self.state.take();
+        self.stop_heartbeat();
+        if let Some(state) = state
+            && self.owns_probe_lease
+            && let Some(token) = self.lease_token
+        {
+            let _ = state
+                .db
+                .release_upstream_account_probe(
+                    self.upstream_account_id,
+                    self.credential_generation,
+                    token,
+                )
+                .await;
+        }
     }
 
     fn stop_heartbeat(&mut self) {

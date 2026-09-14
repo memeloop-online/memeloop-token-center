@@ -126,6 +126,7 @@ pub(in crate::api) async fn sync_upstream_models(
     Query(query): Query<SyncUpstreamModelsQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "providers:write").await?;
+    let state = state.pin_application_plugins().await?;
     let tenant = account_tenant(&state, &service, account_id, query.tenant_external_id).await?;
     Ok(Json(
         sync_account_models(&state, account_id, &tenant, None).await?,
@@ -182,6 +183,8 @@ async fn sync_account_models(
     tenant_external_id: &str,
     blocking: Option<&crate::worker::BlockingTasks>,
 ) -> Result<UpstreamModelCatalogView, AppError> {
+    let pinned = state.clone().pin_application_plugins().await?;
+    let state = &pinned;
     let (account, credential) = state
         .db
         .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())

@@ -1,4 +1,16 @@
 use super::*;
+pub(crate) use routing::{RequestAttemptBudget as MediaAttemptBudget, wait_media_recovery};
+pub(crate) use routing::{
+    UpstreamAttemptGuard as MediaAttemptGuard, UpstreamAttemptTerminal as MediaAttemptTerminal,
+};
+
+pub(crate) async fn classify_media_rate_limit(
+    response: reqwest::Response,
+) -> crate::db::UpstreamFailureKind {
+    let (response, kind) = routing::classify_rate_limit(response.into()).await;
+    drop(response);
+    kind
+}
 
 #[path = "codex_transport.rs"]
 mod codex_transport;

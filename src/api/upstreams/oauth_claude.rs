@@ -23,6 +23,7 @@ pub(in crate::api) async fn start_claude_oauth(
     Json(body): Json<StartClaudeOAuthRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
+    let state = state.pin_application_plugins().await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
     let provider_config = if let Some(account_id) = body.upstream_account_id {
         state
@@ -76,6 +77,7 @@ pub(in crate::api) async fn complete_claude_oauth(
     Json(body): Json<CompleteClaudeOAuthRequest>,
 ) -> Result<Response, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
+    let state = state.pin_application_plugins().await?;
     match claude::complete_claude_login(
         &state.db,
         &state.http,
