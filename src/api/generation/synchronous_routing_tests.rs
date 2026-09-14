@@ -95,14 +95,22 @@ fn component(plan: &Value, observation: &Value) -> Vec<u8> {
 }
 
 async fn fixture(upstream: &MockServer) -> Fixture {
+    fixture_with_archive(upstream, crate::config::ArchiveBackend::Memory).await
+}
+
+async fn fixture_with_archive(
+    upstream: &MockServer,
+    archive_backend: crate::config::ArchiveBackend,
+) -> Fixture {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(
         "sqlite://{}?mode=rwc",
         directory.path().join("images.db").display()
     );
-    let mut state = AppState::initialize(Config::for_test(database_url.clone()))
-        .await
-        .unwrap();
+    let mut config = Config::for_test(database_url.clone());
+    config.archive_backend = archive_backend;
+    config.archive_path = Some(directory.path().join("archive").display().to_string());
+    let mut state = AppState::initialize(config).await.unwrap();
     let tenant_external = "synchronous-strategy";
     let account=state.db.create_upstream_account(CreateUpstreamAccountInput {
         tenant_external_id:tenant_external.into(), name:"image mock".into(), driver:"http-json".into(),
@@ -348,7 +356,9 @@ async fn image_claim_expired_before_send_can_be_taken_over_once() {
         .unwrap();
     pool.close().await;
     let response = post(fixture.state.clone(), &fixture.credential, "before-send").await;
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
 }
 
@@ -670,6 +680,107 @@ async fn truncated_successful_image_body_keeps_reservation_and_never_replays() {
 }
 
 #[tokio::test]
+async fn filesystem_staged_image_request_arms_once_and_replays_without_another_post() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"created":1,"data":[{"b64_json":"bW9jay1wbmc="}]})),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = fixture_with_archive(&upstream, crate::config::ArchiveBackend::Filesystem).await;
+    let response = post(
+        fixture.state.clone(),
+        &fixture.credential,
+        "filesystem-image",
+    )
+    .await;
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let row = sqlx::query("SELECT q.request_object, q.submission_started_at, r.status, r.actual_micros, a.bound_locator FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id JOIN archive_staging_attempts a ON a.owner_id = q.id AND a.owner_kind = 'synchronous_request' AND a.purpose = 'request' AND a.state = 'bound' WHERE q.key_id = $1")
+        .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();
+    let locator = row.get::<String, _>("request_object");
+    assert!(locator.starts_with("staging/synchronous/"));
+    assert_eq!(row.get::<String, _>("bound_locator"), locator);
+    assert!(row.get::<Option<i64>, _>("submission_started_at").is_some());
+    assert_eq!(row.get::<String, _>("status"), "settled");
+    assert_eq!(row.get::<i64, _>("actual_micros"), 300_000);
+    assert!(
+        fixture
+            ._directory
+            .path()
+            .join("archive")
+            .join(locator)
+            .is_file()
+    );
+    let replay = post(
+        fixture.state.clone(),
+        &fixture.credential,
+        "filesystem-image",
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn image_arm_rejects_staging_paths_without_matching_bound_request_receipt() {
+    for corruption in [
+        "owner_kind = 'proxy_request'",
+        "owner_id = '00000000-0000-0000-0000-000000000000'",
+        "purpose = 'response'",
+        "state = 'cleanup_pending'",
+        "bound_locator = bound_locator || '.other'",
+    ] {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        let fixture =
+            fixture_with_archive(&upstream, crate::config::ArchiveBackend::Filesystem).await;
+        let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+        // Simulate a pointer whose authoritative attach receipt no longer
+        // proves this request's durable body. The path itself remains valid.
+        let trigger = match corruption {
+            "owner_kind = 'proxy_request'" => sqlx::query(
+                "CREATE TRIGGER invalidate_request_receipt AFTER UPDATE OF state ON archive_staging_attempts WHEN NEW.state = 'bound' AND NEW.purpose = 'request' BEGIN UPDATE archive_staging_attempts SET owner_kind = 'proxy_request' WHERE attempt_id = NEW.attempt_id; END",
+            ),
+            "owner_id = '00000000-0000-0000-0000-000000000000'" => sqlx::query(
+                "CREATE TRIGGER invalidate_request_receipt AFTER UPDATE OF state ON archive_staging_attempts WHEN NEW.state = 'bound' AND NEW.purpose = 'request' BEGIN UPDATE archive_staging_attempts SET owner_id = '00000000-0000-0000-0000-000000000000' WHERE attempt_id = NEW.attempt_id; END",
+            ),
+            "purpose = 'response'" => sqlx::query(
+                "CREATE TRIGGER invalidate_request_receipt AFTER UPDATE OF state ON archive_staging_attempts WHEN NEW.state = 'bound' AND NEW.purpose = 'request' BEGIN UPDATE archive_staging_attempts SET purpose = 'response' WHERE attempt_id = NEW.attempt_id; END",
+            ),
+            "state = 'cleanup_pending'" => sqlx::query(
+                "CREATE TRIGGER invalidate_request_receipt AFTER UPDATE OF state ON archive_staging_attempts WHEN NEW.state = 'bound' AND NEW.purpose = 'request' BEGIN UPDATE archive_staging_attempts SET state = 'cleanup_pending' WHERE attempt_id = NEW.attempt_id; END",
+            ),
+            "bound_locator = bound_locator || '.other'" => sqlx::query(
+                "CREATE TRIGGER invalidate_request_receipt AFTER UPDATE OF state ON archive_staging_attempts WHEN NEW.state = 'bound' AND NEW.purpose = 'request' BEGIN UPDATE archive_staging_attempts SET bound_locator = bound_locator || '.other' WHERE attempt_id = NEW.attempt_id; END",
+            ),
+            _ => unreachable!("only the five static receipt corruptions are tested"),
+        };
+        trigger.execute(&pool).await.unwrap();
+        let response = post(fixture.state.clone(), &fixture.credential, "bad-receipt").await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{corruption}");
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+        let row = sqlx::query("SELECT q.submission_started_at, r.status, r.actual_micros FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id WHERE q.key_id = $1")
+            .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();
+        assert!(row.get::<Option<i64>, _>("submission_started_at").is_none());
+        assert_eq!(row.get::<String, _>("status"), "settled");
+        assert_eq!(row.get::<i64, _>("actual_micros"), 0);
+        pool.close().await;
+    }
+}
+
+#[tokio::test]
 async fn rejected_image_arm_cas_never_sends_and_settles_zero_without_uncertainty() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
@@ -854,24 +965,42 @@ async fn pending_image_arm_uses_durable_truth_and_preserves_unknown_query_failur
                 .await
                 .unwrap();
             let stale = unix_millis() - 31 * 60 * 1000;
+            let mut transaction = pool.begin().await.unwrap();
             sqlx::query("UPDATE request_records SET created_at=$1 WHERE id=$2")
                 .bind(stale)
                 .bind(request_id.to_string())
-                .execute(&pool)
+                .execute(&mut *transaction)
+                .await
+                .unwrap();
+            // The locator's immutable timestamp is part of the settlement CAS.
+            // Age both representations together when simulating old requests.
+            sqlx::query("UPDATE request_record_locators SET created_at=$1 WHERE id=$2")
+                .bind(stale)
+                .bind(request_id.to_string())
+                .execute(&mut *transaction)
                 .await
                 .unwrap();
             sqlx::query("UPDATE usage_reservations SET created_at=$1 WHERE id=$2")
                 .bind(stale)
                 .bind(reservation.id.to_string())
-                .execute(&pool)
+                .execute(&mut *transaction)
                 .await
                 .unwrap();
-            fixture
+            transaction.commit().await.unwrap();
+            let released = fixture
                 .state
                 .db
                 .release_orphaned_reservations(20)
                 .await
                 .unwrap();
+            assert_eq!(
+                released,
+                if scenario == "query_failed_after_commit" {
+                    0
+                } else {
+                    1
+                }
+            );
             let row = sqlx::query("SELECT r.status, r.actual_micros, q.completed_at, q.submission_uncertain_at FROM usage_reservations r JOIN request_records q ON q.reservation_id=r.id WHERE q.id=$1")
                 .bind(request_id.to_string()).fetch_one(&pool).await.unwrap();
             let listed = fixture

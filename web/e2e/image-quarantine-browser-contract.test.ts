@@ -50,6 +50,10 @@ test('quarantine review requires facts, preserves conflict draft and retry ident
     };
     await page.getByText('Select an explicit tenant first;', { exact: false }).waitFor(); assert.equal(reads, 0);
     await page.getByLabel('Fixture tenant').selectOption('alpha');
+    const openReview = page.getByRole('button', { name: 'Open manual review (tenant service credential required)', exact: true });
+    await openReview.waitFor();
+    assert.equal(reads, 0, 'selecting a tenant does not implicitly request privileged quarantine data');
+    await openReview.click();
     await selectDetails();
     await page.getByLabel('Verified resolution').selectOption('settle_confirmed');
     await page.getByLabel('Confirmed amount').fill('-1');
@@ -94,7 +98,11 @@ test('quarantine review requires facts, preserves conflict draft and retry ident
     await page.getByLabel('Fixture tenant').evaluate((node) => {
       const select = node as HTMLSelectElement; select.value = 'beta'; select.dispatchEvent(new Event('change', { bubbles: true }));
     });
+    await openReview.waitFor();
+    const beforeOpen = reads;
+    await openReview.click();
     await page.getByText('No image requests await review', { exact: false }).waitFor();
+    assert.equal(reads, beforeOpen + 1, 'changed scope requires a fresh explicit open before reading');
     assert.equal(await page.getByText('request-alpha', { exact: false }).count(), 0);
     assert.equal(await page.getByRole('dialog').count(), 0);
     assert.equal(await page.getByLabel('Confirmed amount').count(), 0, 'old tenant form is unmounted, not merely empty');
