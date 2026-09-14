@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, path::PathBuf};
 
 use clap::Parser;
 use memeloop_token_center::plugin_distribution::{
-    InstallPluginOptions, RegistryCredentials, install_plugin_oci,
+    CosignKeylessIdentity, InstallPluginOptions, RegistryCredentials, install_plugin_oci,
 };
 
 const MAX_SECRET_FILE_BYTES: u64 = 64 * 1024;
@@ -46,8 +46,19 @@ struct Arguments {
     allowed_sources: Vec<String>,
 
     /// Cosign public key PEM. Repeat during signing-key rotation.
-    #[arg(long = "cosign-public-key", required = true, num_args = 1..=8)]
+    #[arg(long = "cosign-public-key", required_unless_present = "cosign_certificate_identity", conflicts_with = "cosign_certificate_identity", num_args = 1..=8)]
     cosign_public_keys: Vec<PathBuf>,
+
+    /// Exact GitHub Actions workflow identity (not a regular expression).
+    #[arg(
+        long,
+        requires = "cosign_certificate_oidc_issuer",
+        conflicts_with = "cosign_public_keys"
+    )]
+    cosign_certificate_identity: Option<String>,
+
+    #[arg(long, requires = "cosign_certificate_identity")]
+    cosign_certificate_oidc_issuer: Option<String>,
 
     /// Mounted file containing the Basic-auth username.
     #[arg(long, env = "MTC_PLUGIN_REGISTRY_USERNAME_FILE")]
@@ -94,6 +105,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .collect::<BTreeSet<_>>(),
         credentials,
         cosign_public_keys: public_keys,
+        cosign_keyless: arguments
+            .cosign_certificate_identity
+            .zip(arguments.cosign_certificate_oidc_issuer)
+            .map(|(identity, issuer)| CosignKeylessIdentity { issuer, identity }),
     })
     .await?;
     #[cfg(feature = "experimental-plugin-revisions")]
@@ -170,7 +185,10 @@ fn register_inventory(
                     && grant.identity.provenance.as_ref().is_some_and(|receipt| {
                         receipt.source == installed.source
                             && receipt.digest == installed.digest
-                            && receipt.signature_policy == "cosign-public-key"
+                            && matches!(
+                                receipt.signature_policy.as_str(),
+                                "cosign-public-key" | "cosign-keyless"
+                            )
                     })
             })
         })

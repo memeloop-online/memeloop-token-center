@@ -202,6 +202,7 @@ async fn mock_artifact(title: &str, plugin_json: &[u8]) -> (MockServer, TempDir,
                 allowed_sources: BTreeSet::from([source]),
                 credentials: RegistryCredentials::Anonymous,
                 cosign_public_keys: vec![],
+                cosign_keyless: None,
             },
             plugin_json: plugin_json.to_vec(),
             plugin_root,
@@ -399,6 +400,7 @@ async fn wrong_key_and_tampered_payload_fail_before_registry_or_storage_access()
         allowed_sources: BTreeSet::from(["127.0.0.1:1/test/plugin".to_owned()]),
         credentials: RegistryCredentials::Anonymous,
         cosign_public_keys: vec![b"wrong-key".to_vec()],
+        cosign_keyless: None,
     };
     // The runner models official Cosign's fail-closed exit status: neither the
     // supplied key nor the digest-bound payload matches the trusted signature.
@@ -598,6 +600,7 @@ async fn signature_policy_rejects_before_registry_or_storage_access() {
         allowed_sources: BTreeSet::from(["127.0.0.1:1/test/plugin".to_owned()]),
         credentials: RegistryCredentials::Anonymous,
         cosign_public_keys: vec![],
+        cosign_keyless: None,
     };
     assert!(matches!(
         install_plugin_oci_with_verifier(&options, &RejectSignature, true)
@@ -606,6 +609,92 @@ async fn signature_policy_rejects_before_registry_or_storage_access() {
         PluginDistributionError::SignatureVerification
     ));
     assert!(!options.plugin_root.exists());
+}
+
+#[tokio::test]
+async fn keyless_verifier_pins_identity_and_keeps_transparency_checks() {
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let reference = format!("ghcr.io/memeloop-online/mtc-model-guard@{digest}");
+    let identity = CosignKeylessIdentity {
+        issuer: "https://token.actions.githubusercontent.com".into(),
+        identity: "https://github.com/memeloop-online/memeloop-token-center/.github/workflows/publish-first-party-plugin.yml@refs/heads/master".into(),
+    };
+    let runner = PolicyCosignRunner::new(&[], reference.clone());
+    let verifier = CosignKeylessSignatureVerifier {
+        identity: &identity,
+        runner: &runner,
+    };
+    verifier
+        .verify(&reference, &digest, &RegistryCredentials::Anonymous)
+        .await
+        .unwrap();
+    {
+        // End the synchronous guard's lexical scope before the next verifier
+        // await; explicit drop alone is not recognized by the Clippy gate.
+        let calls = runner.invocations.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[1].arguments,
+            vec![
+                OsString::from("verify"),
+                "--certificate-oidc-issuer".into(),
+                identity.issuer.clone().into(),
+                "--certificate-identity".into(),
+                identity.identity.clone().into(),
+                reference.clone().into(),
+            ]
+        );
+        assert!(
+            !calls[1]
+                .environment
+                .iter()
+                .any(|(key, _)| key.to_string_lossy().starts_with("COSIGN_"))
+        );
+        assert!(calls[1].key_path.is_none());
+    }
+    let wrong_version = PolicyCosignRunner::new(&[], reference.clone()).with_version("v3.1.3");
+    assert!(
+        CosignKeylessSignatureVerifier {
+            identity: &identity,
+            runner: &wrong_version
+        }
+        .verify(&reference, &digest, &RegistryCredentials::Anonymous)
+        .await
+        .is_err()
+    );
+    let mut wrong_issuer = identity.clone();
+    wrong_issuer.issuer = "https://untrusted.example".into();
+    assert!(
+        CosignKeylessSignatureVerifier {
+            identity: &wrong_issuer,
+            runner: &runner
+        }
+        .verify(&reference, &digest, &RegistryCredentials::Anonymous)
+        .await
+        .is_err()
+    );
+    let mut wildcard = identity.clone();
+    wildcard.identity.push('*');
+    assert!(!wildcard.valid());
+    assert!(
+        CosignKeylessSignatureVerifier {
+            identity: &identity,
+            runner: &ErrorCosignRunner
+        }
+        .verify(&reference, &digest, &RegistryCredentials::Anonymous)
+        .await
+        .is_err()
+    );
+    assert!(
+        verifier
+            .verify(
+                &reference,
+                &format!("sha256:{}", "b".repeat(64)),
+                &RegistryCredentials::Anonymous
+            )
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

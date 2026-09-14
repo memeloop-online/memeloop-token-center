@@ -1,0 +1,139 @@
+name: publish-first-party-plugin
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-first-party-model-guard
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/master' && github.repository == 'memeloop-online/memeloop-token-center'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      PLUGIN_SOURCE: ghcr.io/${{ github.repository_owner }}/mtc-model-guard
+      SIGNING_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/publish-first-party-plugin.yml@refs/heads/master
+      SIGNING_ISSUER: https://token.actions.githubusercontent.com
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+      - name: Resolve installer executable trust from reviewed master source
+        run: node ops/ci/resolve-first-party-plugin-installer.ts
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable action
+        with:
+          toolchain: 1.95.0
+          targets: wasm32-unknown-unknown
+      - uses: oras-project/setup-oras@ccb71166b124a8452d1b72c4476398a909ed4d63 # main (reviewed immutable commit)
+        with:
+          version: 1.3.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Require a published compatible installer and its patched verifier
+        run: |
+          docker pull "$INSTALLER_SOURCE@$INSTALLER_DIGEST"
+          actual_revision=$(docker image inspect "$INSTALLER_SOURCE@$INSTALLER_DIGEST" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
+          [[ "$actual_revision" == "$INSTALLER_SOURCE_REVISION" ]]
+          # Executable trust comes from the reviewed digest above. Help/version
+          # are compatibility checks only, never proof that an image is trusted.
+          docker run --rm --entrypoint /usr/local/bin/install-plugin-oci "$INSTALLER_SOURCE@$INSTALLER_DIGEST" --help | grep -- --cosign-certificate-identity
+          container=$(docker create "$INSTALLER_SOURCE@$INSTALLER_DIGEST")
+          trap 'docker rm "$container" >/dev/null' EXIT
+          mkdir -p "$RUNNER_TEMP/plugin-tools"
+          docker cp "$container:/usr/local/bin/cosign" "$RUNNER_TEMP/plugin-tools/cosign"
+          chmod 0555 "$RUNNER_TEMP/plugin-tools/cosign"
+          "$RUNNER_TEMP/plugin-tools/cosign" version --json | node ops/ci/first-party-plugin-command-output.ts cosign-version
+          echo "$RUNNER_TEMP/plugin-tools" >> "$GITHUB_PATH"
+      - name: Test and build the bounded first-party component
+        run: |
+          curl --fail --location --retry 3 --max-time 120 \
+            https://github.com/bytecodealliance/wasm-tools/releases/download/v1.252.0/wasm-tools-1.252.0-x86_64-linux.tar.gz \
+            --output "$RUNNER_TEMP/wasm-tools.tar.gz"
+          echo '097b1181d5b2bc3f2ebc44b4e72edf18308902023f1f1483a1a7dc1268ea988d  '"$RUNNER_TEMP/wasm-tools.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/wasm-tools.tar.gz" -C "$RUNNER_TEMP/plugin-tools" --strip-components=1
+          cargo test --locked --manifest-path plugin-sources/model-guard/Cargo.toml
+          cargo build --locked --release --target wasm32-unknown-unknown --manifest-path plugin-sources/model-guard/Cargo.toml
+          mkdir -p "$RUNNER_TEMP/plugin-package"
+          cp plugin-sources/model-guard/plugin.json "$RUNNER_TEMP/plugin-package/plugin.json"
+          wasm-tools component new plugin-sources/model-guard/target/wasm32-unknown-unknown/release/mtc_model_guard.wasm \
+            -o "$RUNNER_TEMP/plugin-package/plugin.wasm"
+          wasm-tools validate --features component-model "$RUNNER_TEMP/plugin-package/plugin.wasm"
+          printf '{"format_version":1}\n' > "$RUNNER_TEMP/plugin-package/config.json"
+      - name: Exercise the exact component in the real host before publication
+        env:
+          MTC_MODEL_GUARD_PACKAGE: ${{ runner.temp }}/plugin-package
+          CARGO_BUILD_JOBS: 2
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: cargo test --locked --test first_party_model_guard -- --ignored
+      - name: Publish exact plugin OCI media types, not an image or tar layer
+        working-directory: ${{ runner.temp }}/plugin-package
+        run: |
+          oras push "$PLUGIN_SOURCE:sha-$GITHUB_SHA" \
+            --artifact-type application/vnd.memeloop.token-center.plugin.v1 \
+            --config config.json:application/vnd.memeloop.token-center.plugin.config.v1+json \
+            --annotation "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --annotation "org.opencontainers.image.revision=$GITHUB_SHA" \
+            plugin.json:application/vnd.memeloop.token-center.plugin.manifest.v1+json \
+            plugin.wasm:application/vnd.wasm.content.layer.v1+wasm \
+            --format json > "$RUNNER_TEMP/plugin-push.json"
+          digest=$(node "$GITHUB_WORKSPACE/ops/ci/first-party-plugin-command-output.ts" oras-push "$RUNNER_TEMP/plugin-push.json")
+          echo "PLUGIN_DIGEST=$digest" >> "$GITHUB_ENV"
+      - name: Sign and verify exact GitHub OIDC identity using the reviewed verifier
+        run: |
+          cosign sign --yes "$PLUGIN_SOURCE@$PLUGIN_DIGEST"
+          cosign verify --certificate-identity "$SIGNING_IDENTITY" \
+            --certificate-oidc-issuer "$SIGNING_ISSUER" \
+            "$PLUGIN_SOURCE@$PLUGIN_DIGEST" > "$RUNNER_TEMP/plugin-signature-verification.json"
+          oras manifest fetch "$PLUGIN_SOURCE@$PLUGIN_DIGEST" --output "$RUNNER_TEMP/plugin-oci-manifest.json"
+      - name: Install signed published bytes with the real installer
+        env:
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/plugin-install" "$RUNNER_TEMP/plugin-registry"
+          umask 077
+          printf '%s' "$REGISTRY_USERNAME" > "$RUNNER_TEMP/plugin-registry/username"
+          printf '%s' "$REGISTRY_PASSWORD" > "$RUNNER_TEMP/plugin-registry/password"
+          sudo chown -R 10001:10001 "$RUNNER_TEMP/plugin-registry"
+          sudo chown 10001:10001 "$RUNNER_TEMP/plugin-install"
+          docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --tmpfs /tmp:rw,nosuid,nodev,size=32m \
+            --mount "type=bind,src=$RUNNER_TEMP/plugin-install,dst=/plugins" \
+            --mount "type=bind,src=$RUNNER_TEMP/plugin-registry,dst=/registry,readonly" \
+            --entrypoint /usr/local/bin/install-plugin-oci "$INSTALLER_SOURCE@$INSTALLER_DIGEST" \
+            "$PLUGIN_SOURCE@$PLUGIN_DIGEST" --plugin-dir /plugins --allowed-source "$PLUGIN_SOURCE" \
+            --cosign-certificate-identity "$SIGNING_IDENTITY" \
+            --cosign-certificate-oidc-issuer "$SIGNING_ISSUER" \
+            --registry-username-file /registry/username --registry-password-file /registry/password \
+            > "$RUNNER_TEMP/plugin-installation.json"
+          cmp "$RUNNER_TEMP/plugin-package/plugin.json" "$RUNNER_TEMP/plugin-install/mtc-model-guard/plugin.json"
+          cmp "$RUNNER_TEMP/plugin-package/plugin.wasm" "$RUNNER_TEMP/plugin-install/mtc-model-guard/plugin.wasm"
+          node ops/ci/first-party-plugin-release.ts "$RUNNER_TEMP"
+      - name: Preserve digest, signed manifest, component and installation evidence
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: mtc-model-guard-release-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/plugin-release.json
+            ${{ runner.temp }}/plugin-oci-manifest.json
+            ${{ runner.temp }}/plugin-signature-verification.json
+            ${{ runner.temp }}/plugin-installation.json
+            ${{ runner.temp }}/plugin-package/plugin.json
+            ${{ runner.temp }}/plugin-package/plugin.wasm
+          if-no-files-found: error
+          retention-days: 90

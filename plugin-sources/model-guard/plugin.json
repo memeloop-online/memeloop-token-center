@@ -1,0 +1,29 @@
+{
+  "id": "mtc-model-guard",
+  "version": "1.0.0",
+  "wit_version": "0.2.0",
+  "wasm": "plugin.wasm",
+  "capabilities": [],
+  "contributions": {
+    "traffic_policy": true,
+    "request_rewrite": false,
+    "providers": [],
+    "configuration": {
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["blocked_models"],
+        "properties": {
+          "blocked_models": {
+            "title": "Blocked model IDs (exact, case-sensitive)",
+            "type": "array",
+            "maxItems": 128,
+            "uniqueItems": true,
+            "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+          }
+        }
+      },
+      "default": { "blocked_models": [] }
+    }
+  }
+}

@@ -121,13 +121,17 @@ lock used to serialize inventory-file appends. Confirm these capabilities with
 the actual CSI/storage configuration before permitting multiple Control replicas.
 
 First-install acceptance requires a reviewed **plugin artifact** digest and its
-existing Cosign public key. A service/installer image digest is not a plugin
-artifact. Current service-image release workflows do not publish or sign the
+approved signing trust (an existing Cosign public key, or optional exact GitHub
+Actions keyless identity). A service/installer image digest is not a plugin
+artifact. Service-image release workflows do not publish or sign the
 example plugin packages. The policy-rewrite example changes requests and test
 group-routing components are fixtures; neither should be silently selected as a
-production smoke test. A first-party, no-network presentation-only package can be
-used after its artifact publishing identity and signing trust are explicitly
-approved. Then verify in the browser: install for review, inspect capabilities,
+production smoke test. The first-party Model Guard package has no network or
+rewrite capability and an empty default blocked-model list. Its separate manual
+[signed release workflow and availability checks](first-party-plugin-release.md)
+must succeed before it can be selected; checked-in source is not a release.
+After artifact publishing identity and signing trust are explicitly approved,
+verify in the browser: install for review, inspect capabilities,
 approve the exact digest, publish a revision, inspect audit/history, and roll back
 to the previous complete inventory. These steps need no paid upstream request.
 
