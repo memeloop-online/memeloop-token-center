@@ -79,7 +79,7 @@ export function OverviewPage({ credential, credentialView, onError, onOpenReques
     {limits && <article className="panel self-limit-snapshot"><LimitSnapshot value={limits} /></article>}
     <article className="panel self-history self-overview-recent">
       <div className="panel-title"><h2>{t('self.recent')}</h2><span>{t('self.loadedRequests', { count: formatNumber(recentRequests.length, locale) })}</span></div>
-      <RequestTable requests={recentRequests} currency={currentKey.currency} onSelect={onOpenRequest} onOpenSession={onOpenSession} />
+      <RequestTable requests={recentRequests} currency={currentKey.currency} credentialAlias={currentKey.alias} onSelect={onOpenRequest} onOpenSession={onOpenSession} />
     </article>
   </div>;
 }

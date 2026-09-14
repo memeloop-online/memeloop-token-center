@@ -99,6 +99,46 @@
   white-space: normal;
 }
 
+.request-credential-cell {
+  min-width: 12rem;
+  max-width: 18rem;
+  white-space: normal;
+}
+
+.request-credential-cell strong {
+  color: #f1fbfc;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.request-technical-info {
+  color: #79dfcf;
+  background: transparent;
+  border: 0;
+  margin-left: 0.35rem;
+  padding: 0.1rem 0.25rem;
+}
+
+.request-technical-info:hover { color: #d9fff9; }
+
+.request-duration-info[tabindex='0'] {
+  border-radius: 3px;
+  outline: 0;
+}
+
+.request-duration-info[tabindex='0']:focus-visible {
+  box-shadow: 0 0 0 2px #79dfcf;
+}
+
+.request-value-info[tabindex='0'] {
+  border-radius: 3px;
+  outline: 0;
+}
+
+.request-value-info[tabindex='0']:focus-visible {
+  box-shadow: 0 0 0 2px #79dfcf;
+}
+
 table.request-table .request-model-cell code {
   color: #f1fbfc;
   font-size: 0.88rem;
@@ -134,6 +174,50 @@ table.request-table .request-model-cell code {
 
 .request-traffic-metrics .metric-value {
   white-space: nowrap;
+}
+
+@media (min-width: 1100px) {
+  .metrics.request-traffic-metrics {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+  }
+
+  .request-table .request-time-cell {
+    min-width: 7.5rem;
+    max-width: 8.5rem;
+  }
+
+  .request-table .request-id-control.compact {
+    max-width: 6.5rem;
+  }
+
+  .request-model-cell {
+    min-width: 8rem;
+    max-width: 10rem;
+  }
+
+  .request-credential-cell {
+    min-width: 8rem;
+    max-width: 10rem;
+  }
+
+  .request-token-cell {
+    min-width: 8rem;
+  }
+
+  .request-cost-cell {
+    min-width: 5.5rem;
+  }
+
+  .request-session-cell {
+    min-width: 7rem;
+    width: 8rem;
+    max-width: 8rem;
+  }
+
+  .request-table th:nth-last-child(2),
+  .request-table td:nth-last-child(2) {
+    min-width: 5rem;
+  }
 }
 
 .table-scroll table {
@@ -196,9 +280,13 @@ table.request-table .request-model-cell code {
   white-space: nowrap;
 }
 
+.request-cost-cell { color: #f2d18b; }
+
 :root[data-theme='light'] .request-cost-cell {
   color: #17343a;
 }
+
+:root[data-theme='light'] .request-credential-cell strong { color: #17343a; }
 
 .request-token-cell small {
   color: var(--muted, #82979e);

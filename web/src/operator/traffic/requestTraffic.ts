@@ -188,7 +188,7 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
   if (createdAt === undefined) return previous;
   // Replayed starts must not regress an authoritative terminal history row.
   if (event.event_kind === 'started' && previous?.status_code != null) return previous;
-  return {
+  const request: RequestView = {
     ...previous,
     request_id: event.request_id,
     created_at: createdAt,
@@ -209,6 +209,9 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
     archive_state: mergeArchiveState(previous?.archive_state, event),
     session_context: mergeSessionContext(previous?.session_context, event),
   };
+  const credentialIdentity = event.credential_identity ?? previous?.credential_identity;
+  if (credentialIdentity !== undefined) request.credential_identity = credentialIdentity;
+  return request;
 }
 
 export function mergeLiveRequestEvents(
