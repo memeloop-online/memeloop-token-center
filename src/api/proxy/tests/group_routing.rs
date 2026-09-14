@@ -115,6 +115,8 @@ async fn install_strategy(
         .bind(fixture.accounts[0].to_string()).fetch_one(&pool).await.unwrap();
     let route_id: String = row.get("route_id");
     let generation: i64 = row.get("credential_generation");
+    sqlx::query("INSERT INTO model_route_included_provider_groups (tenant_id,model_route_id,provider_group_id,created_at) VALUES ($1,$2,$3,1)")
+        .bind(group.tenant_id.to_string()).bind(&route_id).bind(group.id.to_string()).execute(&pool).await.unwrap();
     pool.close().await;
     let directive = |cooldown, probe| {
         json!({
@@ -145,6 +147,50 @@ async fn install_strategy(
     .unwrap();
     fixture.state.plugins = PluginRuntime::load(root.to_str(), fixture.state.db.clone()).unwrap();
     (group.tenant_id, generation)
+}
+
+#[tokio::test]
+async fn installed_hook_without_group_configuration_skips_candidate_health_snapshot() {
+    let upstream = MockServer::start().await;
+    let label = "group-native-fast-path";
+    let mut fixture = resilient_route_fixture(label, &[(upstream.uri(), 0)]).await;
+    let (tenant, generation) = install_strategy(&mut fixture, label, 0).await;
+    assert!(fixture.state.plugins.has_group_routing_hooks());
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query("UPDATE provider_groups SET routing_strategy = NULL WHERE tenant_id = $1")
+        .bind(tenant.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    // This isolated test database intentionally makes the larger batch query
+    // impossible. The native-only path needs only the group existence query.
+    sqlx::query("DROP TABLE upstream_account_health")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut candidates = vec![crate::provider::AuthorizedUpstreamCandidate {
+        route_id: Uuid::now_v7(),
+        account_id: fixture.accounts[0],
+        driver: "openai".into(),
+        transport_revision: 1,
+        credential_generation: generation,
+    }];
+    let before = candidates.clone();
+    crate::group_routing::prepare(
+        &mut fixture.state,
+        tenant,
+        Uuid::nil(),
+        Uuid::now_v7(),
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        &mut candidates,
+    )
+    .await
+    .unwrap();
+    assert_eq!(before, candidates);
+    assert!(fixture.state.group_routing.is_none());
+    let metrics = fixture.state.metrics.render(&Default::default());
+    assert!(metrics.contains("phase=\"group_routing_plan\",outcome=\"returned\"} 0"));
+    pool.close().await;
 }
 
 struct HealthSnapshot {
