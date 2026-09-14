@@ -491,6 +491,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "plugin installation tasks and actor audit",
         sql: include_str!("../../../migrations/common/0092_plugin_installation_audit.sql"),
     },
+    Migration {
+        version: 93,
+        name: "request usage provenance",
+        sql: include_str!("../../../migrations/common/0093_request_usage_basis.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -967,6 +972,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 92,
         name: "plugin installation tasks and actor audit",
         sql: include_str!("../../../migrations/common/0092_plugin_installation_audit.sql"),
+    },
+    Migration {
+        version: 93,
+        name: "request usage provenance",
+        sql: include_str!("../../../migrations/common/0093_request_usage_basis.sql"),
     },
 ];
 

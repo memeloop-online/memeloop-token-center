@@ -2179,6 +2179,37 @@ async fn truncated_sse_upstream_endpoint(
     (endpoint, accepted)
 }
 
+async fn gated_completed_sse_upstream_endpoint(
+    prefix: String,
+    terminal: String,
+) -> (
+    String,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+    let accepted = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request_prefix = [0_u8; 4096];
+        assert!(stream.read(&mut request_prefix).await.unwrap() > 0);
+        let content_length = prefix.len() + terminal.len();
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(headers.as_bytes()).await.unwrap();
+        stream.write_all(prefix.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        terminal_rx.await.unwrap();
+        stream.write_all(terminal.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    (endpoint, terminal_tx, accepted)
+}
+
 async fn wait_for_request_settlement(fixture: &CodexRouteFixture, expected: usize) {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -3267,6 +3298,10 @@ async fn codex_retry_streaming_failure_is_redacted_and_records_failed_terminal()
         .unwrap();
     assert_eq!(rows[0].status_code, Some(502));
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
+    assert_eq!(
+        rows[0].usage_basis,
+        Some(crate::model::RequestUsageBasis::NotObserved)
+    );
     assert_eq!(rows[0].cost, "0");
     assert_eq!(
         rows[0].error_code.as_deref(),
@@ -3366,7 +3401,110 @@ async fn codex_streaming_output_then_failure_charges_the_contract_ceiling_once()
     assert_eq!(rows[0].status_code, Some(502));
     assert!(rows[0].input_tokens > 0);
     assert_eq!(rows[0].output_tokens, 64);
+    assert_eq!(
+        rows[0].usage_basis,
+        Some(crate::model::RequestUsageBasis::ContractCeiling)
+    );
     assert_ne!(rows[0].cost, "0");
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+}
+
+#[tokio::test]
+async fn completed_provider_usage_survives_a_later_downstream_disconnect() {
+    let fixture = codex_route_fixture("completed-usage-downstream-disconnect").await;
+    let prefix = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-usage-contract\"}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"delivered output\"}\n\n"
+    )
+    .to_owned();
+    let completed = completed_response_with_usage(3, 7);
+    let terminal = format!(
+        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{completed}}}\n\ndata: [DONE]\n\n"
+    );
+    let (endpoint, terminal_tx, upstream) =
+        gated_completed_sse_upstream_endpoint(prefix, terminal).await;
+
+    let response = send_codex_route_to_endpoint(
+        &fixture,
+        endpoint,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "disconnect after output", "stream": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let frame = futures_util::StreamExt::next(&mut body)
+                .await
+                .expect("stream remains open before the terminal gate")
+                .unwrap();
+            if String::from_utf8_lossy(&frame).contains("delivered output") {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    drop(body);
+    terminal_tx.send(()).unwrap();
+    upstream.await.unwrap();
+
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(499));
+    assert_eq!(rows[0].error_code.as_deref(), Some("client_cancelled"));
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 7));
+    assert_eq!(
+        rows[0].usage_basis,
+        Some(crate::model::RequestUsageBasis::ProviderReported)
+    );
+    assert_ne!(rows[0].cost, "0");
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+}
+
+#[tokio::test]
+async fn completed_provider_usage_is_not_charged_when_no_billable_frame_was_delivered() {
+    let fixture = codex_route_fixture("completed-usage-no-delivery").await;
+    let completed = completed_response_with_usage(3, 7);
+    let terminal = format!(
+        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{completed}}}\n\ndata: [DONE]\n\n"
+    );
+    let (endpoint, terminal_tx, upstream) =
+        gated_completed_sse_upstream_endpoint(String::new(), terminal).await;
+
+    let response = send_codex_route_to_endpoint(
+        &fixture,
+        endpoint,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "disconnect before output", "stream": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+    terminal_tx.send(()).unwrap();
+    upstream.await.unwrap();
+
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(499));
+    assert_eq!(rows[0].error_code.as_deref(), Some("client_cancelled"));
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
+    assert_eq!(
+        rows[0].usage_basis,
+        Some(crate::model::RequestUsageBasis::NotObserved)
+    );
+    assert_eq!(rows[0].cost, "0");
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
 }
 

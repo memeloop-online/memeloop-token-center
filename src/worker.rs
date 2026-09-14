@@ -507,6 +507,7 @@ mod tests {
         state
             .db
             .finish_proxy_request(FinishProxyRequest {
+                usage_basis: None,
                 first_output_ms: None,
                 generation_duration_ms: None,
                 request_id,
