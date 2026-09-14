@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::model::RequestUsageBasis;
 
 impl Database {
     pub async fn list_account_settlements(

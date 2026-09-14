@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::model::RequestUsageBasis;
 
 mod postgres;
 
