@@ -1,9 +1,9 @@
 import { lazy, Suspense, useMemo } from 'react';
 import { api } from '../api';
 import { costOption, latencyOption, throughputOption, type UsageChartCopy, type UsageChartFormatters } from '../charts/usageCharts';
-import { formatCurrency, formatMilliseconds, formatNumber, formatPercent } from '../format';
+import { formatCurrency, formatMetricDisplay, formatMilliseconds, formatPercent } from '../format';
 import { useI18n } from '../i18n';
-import type { OperatorUsageAnalysis, TypedFilterAst } from '../types';
+import type { OperatorUsageAnalysisTrends, TypedFilterAst } from '../types';
 import { requestDrilldownForOverviewBucket } from './overviewDrilldown';
 import { useOperatorResource } from './hooks/useOperatorResource';
 import { statsQuery } from './usageState';
@@ -11,12 +11,9 @@ import './overview.css';
 
 const EChart = lazy(() => import('../charts/EChart').then((module) => ({ default: module.EChart })));
 
-function formatCosts(costs: OperatorUsageAnalysis['time_series'][number]['costs'], locale: 'zh-CN' | 'en') {
-  if (!costs.length) return '—';
-  return [...costs]
-    .sort((left, right) => left.currency.localeCompare(right.currency))
-    .map(({ cost, currency }) => formatCurrency(cost, currency, locale))
-    .join(' · ');
+function CostLines({ costs, locale }: { costs: OperatorUsageAnalysisTrends['time_series'][number]['costs']; locale: 'zh-CN' | 'en' }) {
+  if (!costs.length) return <>—</>;
+  return <span className="usage-cost-lines">{[...costs].sort((left, right) => left.currency.localeCompare(right.currency)).map(({ cost, currency }) => <span key={currency} title={`${cost} ${currency}`}>{formatCurrency(cost, currency, locale)}</span>)}</span>;
 }
 
 /** Independent historical trends: a slow query cannot hide current traffic. */
@@ -27,7 +24,7 @@ export function OverviewTrends({ token, tenant, onDrilldown }: { token: string; 
       preset: '24h', granularity: 'hour', customFrom: '', customTo: '',
       filters: { model: '', keyId: '', upstreamId: '', protocol: '', status: '', errorCode: '' },
     });
-    return api<OperatorUsageAnalysis>(`/internal/v1/usage-analysis${query}`, token);
+    return api<OperatorUsageAnalysisTrends>(`/internal/v1/usage-analysis/trends${query}`, token);
   }, t('usage.loadFailed'));
   const stats = resource.state.kind === 'ready' ? resource.state.value : undefined;
   const copy: UsageChartCopy = useMemo(() => ({
@@ -41,7 +38,7 @@ export function OverviewTrends({ token, tenant, onDrilldown }: { token: string; 
     }),
     cost: (value, currency) => formatCurrency(value, currency, locale),
     duration: (value) => formatMilliseconds(value, locale),
-    number: (value) => formatNumber(value, locale),
+    number: (value) => formatMetricDisplay(value, locale).text,
     percent: (value) => formatPercent(value, locale),
   }), [locale]);
   const throughput = useMemo(() => throughputOption(stats?.time_series ?? [], copy, format), [stats, copy, format]);
@@ -81,7 +78,7 @@ export function OverviewTrends({ token, tenant, onDrilldown }: { token: string; 
           <thead><tr><th>{t('request.time')} · {stats.time_zone}</th><th>{copy.success}</th><th>{copy.failures}</th><th>{copy.averageLatency}</th><th>{copy.p95Latency}</th><th>{copy.cost}</th></tr></thead>
           <tbody>{stats.time_series.map((point) => <tr key={point.bucket_start}>
             <td>{onDrilldown ? <button type="button" className="table-link overview-trend-bucket" onClick={() => drillDown(point.bucket_start)}>{format.bucket(point.bucket_start)}</button> : format.bucket(point.bucket_start)}</td><td>{format.number(point.success)}</td><td>{format.number(point.failed)}</td>
-            <td>{formatMilliseconds(point.avg_duration_ms, locale)}</td><td>{formatMilliseconds(point.p95_duration_ms, locale)}</td><td>{formatCosts(point.costs, locale)}</td>
+            <td>{formatMilliseconds(point.avg_duration_ms, locale)}</td><td>{formatMilliseconds(point.p95_duration_ms, locale)}</td><td><CostLines costs={point.costs} locale={locale} /></td>
           </tr>)}</tbody>
         </table></div>
       </details>

@@ -445,6 +445,43 @@ async fn sqlite_global_model_history_indexes_drive_both_top_n_sources() {
 }
 
 #[tokio::test]
+async fn sqlite_response_id_conversation_candidates_use_key_scoped_top_one_index() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory
+            .path()
+            .join("conversation-candidates.db")
+            .display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    database.migrate().await.unwrap();
+
+    let index = "conversation_observations_key_response_time_idx";
+    let installed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = $1")
+            .bind(index)
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(installed, 1, "missing v82 index {index}");
+
+    let plan: Vec<String> = sqlx::query(
+        "EXPLAIN QUERY PLAN SELECT id FROM conversation_observations WHERE key_id = 'key-a' AND upstream_response_id = 'response-a' AND created_at <= 9223372036854775807 ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_all(&database.pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.try_get("detail").unwrap())
+    .collect();
+    assert!(
+        plan.iter().any(|detail| detail.contains(index)),
+        "response-id Top-1 lookup must use {index}: {plan:?}"
+    );
+}
+
+#[tokio::test]
 async fn sqlite_control_list_projection_indexes_are_covering() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(

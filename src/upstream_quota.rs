@@ -1,4 +1,5 @@
 //! Supplier quota projection; mutations live in the explicit durable reset workflow.
+mod kimi;
 mod normalize;
 pub(crate) mod reset;
 
@@ -22,7 +23,26 @@ const FRESH_MS: i64 = 30_000;
 const STALE_MS: i64 = 300_000;
 const MAX_ENTRIES: usize = 128;
 const BODY_LIMIT: usize = 1024 * 1024;
-type CacheKey = (Uuid, i64, i64);
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct CacheKey {
+    account: Uuid,
+    tenant: Uuid,
+    external_tenant: String,
+    generation: i64,
+    updated_at: i64,
+}
+
+impl CacheKey {
+    fn new(account: &UpstreamAccountView, tenant: &str) -> Self {
+        Self {
+            account: account.id,
+            tenant: account.tenant_id,
+            external_tenant: tenant.to_owned(),
+            generation: account.credential_generation,
+            updated_at: account.updated_at,
+        }
+    }
+}
 
 #[derive(Clone, Serialize)]
 pub(crate) struct QuotaSnapshot {
@@ -34,7 +54,14 @@ pub(crate) struct QuotaSnapshot {
     observed_at: Option<i64>,
     stale_after: Option<i64>,
     stale: bool,
+    freshness: &'static str,
     plan_type: Option<String>,
+    /// No current native adapter has a verified supplier workspace field.
+    workspace: Option<String>,
+    capabilities: QuotaCapabilities,
+    /// Subscription lifetime is not OAuth token lifetime. Unknown stays null.
+    subscription_active_until: Option<i64>,
+    reset_credits: Vec<ResetCredit>,
     windows: Vec<QuotaWindow>,
     credits: Credits,
     reset_capability: ResetCapability,
@@ -46,8 +73,11 @@ struct QuotaWindow {
     id: String,
     label: String,
     used_percent: Option<f64>,
+    used: Option<f64>,
     remaining: Option<f64>,
     limit: Option<f64>,
+    /// Supplier-declared unit only. Numeric values without one remain unknown.
+    unit: Option<String>,
     reset_at: Option<i64>,
     period_seconds: Option<i64>,
     source: &'static str,
@@ -56,11 +86,54 @@ struct QuotaWindow {
     limit_reached: Option<bool>,
 }
 
+#[derive(Clone, Serialize)]
+struct QuotaCapabilities {
+    read: bool,
+    plan: bool,
+    workspace: bool,
+    window_amounts: bool,
+    window_amount_unit: bool,
+    window_percent: bool,
+    reset_credit_expiry: bool,
+    subscription_expiry: bool,
+    /// These describe the quota GET itself, not the separately confirmed reset.
+    supplier_read_only: bool,
+    refreshes_credentials: bool,
+    consumes_reset_credit: bool,
+}
+
+impl QuotaCapabilities {
+    fn for_provider(provider: &str) -> Self {
+        Self {
+            read: matches!(provider, "openai-codex" | "kimi-oauth"),
+            plan: provider == "openai-codex",
+            workspace: false,
+            window_amounts: provider == "kimi-oauth",
+            window_amount_unit: false,
+            window_percent: matches!(provider, "openai-codex" | "kimi-oauth"),
+            reset_credit_expiry: provider == "openai-codex",
+            subscription_expiry: false,
+            supplier_read_only: true,
+            refreshes_credentials: false,
+            consumes_reset_credit: false,
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct ResetCredit {
+    status: Option<String>,
+    granted_at: Option<i64>,
+    expires_at: Option<i64>,
+    source: &'static str,
+}
+
 #[derive(Clone, Default, Serialize)]
 struct Credits {
     balance: Option<String>,
     unlimited: Option<bool>,
     has_credits: Option<bool>,
+    source: Option<&'static str>,
 }
 
 #[derive(Clone, Serialize)]
@@ -77,25 +150,43 @@ struct ResetCapability {
     applicable_credits: Option<i64>,
     reason: &'static str,
     credit_error_code: Option<&'static str>,
+    /// Server-held driver capability; fresh credit evidence is still required.
+    evidence: &'static str,
 }
 
 impl QuotaSnapshot {
     fn empty(account: &UpstreamAccountView, tenant: &str, error: Option<&'static str>) -> Self {
         let codex = account.driver == "openai-codex";
+        let known_read_adapter = matches!(account.driver.as_str(), "openai-codex" | "kimi-oauth");
         Self {
             contract_version: "upstream_quota_v1",
             upstream_account_id: account.id,
             tenant_external_id: tenant.to_owned(),
             provider: account.driver.clone(),
-            status: if codex { "error" } else { "unsupported" },
+            status: if QuotaCapabilities::for_provider(&account.driver).read {
+                "error"
+            } else {
+                "unsupported"
+            },
             observed_at: None,
             stale_after: None,
             stale: false,
+            freshness: "unobserved",
             plan_type: None,
+            workspace: None,
+            capabilities: QuotaCapabilities::for_provider(&account.driver),
+            subscription_active_until: None,
+            reset_credits: Vec::new(),
             windows: Vec::new(),
             credits: Credits::default(),
             reset_capability: ResetCapability {
-                provider_supported: codex.then_some(true),
+                provider_supported: if codex {
+                    Some(true)
+                } else if account.driver == "kimi-oauth" {
+                    Some(false)
+                } else {
+                    None
+                },
                 implementation_available: codex,
                 prepare_available: codex,
                 confirmation_required: codex,
@@ -105,9 +196,14 @@ impl QuotaSnapshot {
                 reason: if codex {
                     "quota_refresh_required"
                 } else {
-                    "quota_adapter_not_implemented"
+                    "quota_reset_not_supported"
                 },
                 credit_error_code: None,
+                evidence: if known_read_adapter {
+                    "server_driver_contract"
+                } else {
+                    "unknown_provider"
+                },
             },
             error_code: error,
         }
@@ -149,21 +245,19 @@ impl QuotaCache {
         tenant: &str,
     ) -> QuotaSnapshot {
         let empty = |error| QuotaSnapshot::empty(account, tenant, error);
-        if account.driver != "openai-codex" {
+        if !QuotaCapabilities::for_provider(&account.driver).read {
             return empty(None);
         }
-        let key = (
-            account.id,
-            account.credential_generation,
-            account.updated_at,
-        );
+        // Tenant is the authorized endpoint's canonical external ID. Include it
+        // even though account IDs are global: rename must not reuse old labels.
+        let key = CacheKey::new(account, tenant);
         let entry = {
             let mut entries = self.entries.lock().await;
             if !entries.contains_key(&key) && entries.len() >= MAX_ENTRIES {
                 let evict = entries
                     .iter()
                     .find(|(_, entry)| Arc::strong_count(entry) == 1)
-                    .map(|(key, _)| *key);
+                    .map(|(key, _)| key.clone());
                 if let Some(evict) = evict {
                     entries.remove(&evict);
                 } else {
@@ -199,10 +293,13 @@ impl QuotaCache {
             return fallback("quota_busy");
         };
         // Includes DNS/proxy setup, both GETs and bounded body decoding.
-        let result = tokio::time::timeout(
-            Duration::from_secs(8),
-            read_codex(state, account, credential, empty(None)),
-        )
+        let result = tokio::time::timeout(Duration::from_secs(8), async {
+            if account.driver == "kimi-oauth" {
+                kimi::read(state, credential, empty(None)).await
+            } else {
+                read_codex(state, account, credential, empty(None)).await
+            }
+        })
         .await
         .unwrap_or(Err("quota_timeout"));
         let mut value = match result {
@@ -212,8 +309,8 @@ impl QuotaCache {
             }
             Err(error) => fallback(error),
         };
-        if value.error_code.is_some() {
-            value.reset_capability.retryable = true;
+        if value.error_code.is_some() && value.reset_capability.implementation_available {
+            value.reset_capability.retryable = value.reset_capability.implementation_available;
             value.reset_capability.prepare_available =
                 value.reset_capability.implementation_available;
             value.reset_capability.reason = "quota_refresh_failed_retryable";
@@ -242,11 +339,14 @@ fn stale_or_error(
                 .is_some_and(|at| now.saturating_sub(at) <= STALE_MS) =>
         {
             value.stale = true;
+            value.freshness = "stale";
             value.error_code = empty.error_code;
-            value.reset_capability.retryable = true;
+            value.reset_capability.retryable = value.reset_capability.implementation_available;
             value.reset_capability.prepare_available =
                 value.reset_capability.implementation_available;
-            value.reset_capability.reason = "quota_refresh_failed_retryable";
+            if value.reset_capability.implementation_available {
+                value.reset_capability.reason = "quota_refresh_failed_retryable";
+            }
             value
         }
         _ => empty,
@@ -306,6 +406,7 @@ async fn read_codex(
         Err(error) => snapshot.reset_capability.credit_error_code = Some(error),
     }
     snapshot.status = "ready";
+    snapshot.freshness = "fresh";
     snapshot.observed_at = Some(observed_at);
     snapshot.stale_after = Some(observed_at + FRESH_MS);
     snapshot.finalize_reset_capability();
@@ -417,6 +518,10 @@ async fn get_json(
         .send()
         .await
         .map_err(|_| "quota_transport_failed")?;
+    decode_response(response).await
+}
+
+async fn decode_response(response: reqwest::Response) -> Result<Value, &'static str> {
     if !response.status().is_success() {
         return Err(match response.status().as_u16() {
             401 | 403 => "quota_not_authorized",
@@ -449,6 +554,83 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{header, method, path},
     };
+
+    #[test]
+    fn cache_identity_separates_tenant_rename_and_credential_generation() {
+        let mut account: UpstreamAccountView = serde_json::from_value(json!({
+            "id":Uuid::from_u128(1), "tenant_id":Uuid::from_u128(2), "name":"fixture",
+            "driver":"kimi-oauth", "auth_kind":"oauth", "connection_method":"native_oauth",
+            "credential_generation":1, "status":"active", "config":{}, "can_refresh":true,
+            "can_rotate":false, "can_reauthorize":true, "route_count":0, "created_at":0, "updated_at":10
+        })).unwrap();
+        let key = CacheKey::new(&account, "before-rename");
+        let renamed = CacheKey::new(&account, "after-rename");
+        account.credential_generation += 1;
+        let rotated = CacheKey::new(&account, "before-rename");
+        account.tenant_id = Uuid::from_u128(3);
+        let other_tenant = CacheKey::new(&account, "before-rename");
+        let entries = HashMap::from([
+            (key.clone(), 1),
+            (renamed.clone(), 2),
+            (rotated.clone(), 3),
+            (other_tenant.clone(), 4),
+        ]);
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries.get(&key), Some(&1));
+        assert_eq!(entries.get(&renamed), Some(&2));
+        assert_eq!(entries.get(&rotated), Some(&3));
+        assert_eq!(entries.get(&other_tenant), Some(&4));
+        let mut previous = QuotaSnapshot::empty(&account, "after-rename", None);
+        previous.observed_at = Some(1000);
+        previous.status = "ready";
+        let fallback = stale_or_error(
+            Some(previous.clone()),
+            QuotaSnapshot::empty(&account, "after-rename", Some("quota_timeout")),
+            1001,
+        );
+        assert_eq!(fallback.tenant_external_id, "after-rename");
+        assert_eq!(fallback.freshness, "stale");
+        assert_eq!(fallback.error_code, Some("quota_timeout"));
+        assert_eq!(
+            fallback.reset_capability.reason,
+            "quota_reset_not_supported"
+        );
+        let expired = stale_or_error(
+            Some(previous),
+            QuotaSnapshot::empty(&account, "after-rename", Some("quota_timeout")),
+            STALE_MS + 1001,
+        );
+        assert!(expired.observed_at.is_none());
+        assert_eq!(expired.status, "error");
+    }
+
+    #[test]
+    fn first_read_failure_retains_server_reset_capability_without_consuming() {
+        let account: UpstreamAccountView = serde_json::from_value(json!({
+            "id":Uuid::from_u128(1), "tenant_id":Uuid::from_u128(2), "name":"fixture",
+            "driver":"openai-codex", "auth_kind":"oauth", "connection_method":"native_oauth",
+            "credential_generation":1, "status":"active", "config":{}, "can_refresh":true,
+            "can_rotate":false, "can_reauthorize":true, "route_count":0, "created_at":0, "updated_at":10
+        })).unwrap();
+        let first_read_failure =
+            QuotaSnapshot::empty(&account, "tenant", Some("quota_transport_failed"));
+        assert_eq!(first_read_failure.freshness, "unobserved");
+        assert_eq!(
+            first_read_failure.reset_capability.provider_supported,
+            Some(true)
+        );
+        assert!(first_read_failure.reset_capability.implementation_available);
+        assert!(first_read_failure.reset_capability.prepare_available);
+        assert!(first_read_failure.reset_capability.confirmation_required);
+        assert_eq!(
+            first_read_failure.reset_capability.evidence,
+            "server_driver_contract"
+        );
+        assert!(first_read_failure.capabilities.supplier_read_only);
+        assert!(!first_read_failure.capabilities.refreshes_credentials);
+        assert!(!first_read_failure.capabilities.consumes_reset_credit);
+        assert!(first_read_failure.workspace.is_none());
+    }
 
     #[tokio::test]
     async fn quota_transport_only_gets_and_does_not_publish_error_bodies() {

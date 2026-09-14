@@ -39,6 +39,17 @@ test('uninstalling a manifest removes every plugin navigation, route, and card r
   assert.deepEqual(after.overviewCards, []);
 });
 
+test('projection presentation uses existing page/card registry with manifest revision and link grants', () => {
+  const installed = structuredClone(fixture.installed);
+  installed[0].contributions.operator_ui!.forEach((contribution) => { contribution.presentation = 'projection_v1'; });
+  const registry = registerOperatorPluginContributions(installed);
+  assert.equal(registry.overviewCards.length, 1);
+  assert.ok(registry.pages.size > 0);
+  const registered = registry.overviewCards[0]!;
+  assert.equal(registered.manifestRevision, JSON.stringify(installed[0]));
+  assert.deepEqual(registered.allowedLinkOrigins, installed[0].capabilities.flatMap((capability) => capability.kind === 'http' ? capability.allowed_origins : []));
+});
+
 test('render boundary remains core-owned typed JSON with no remote executable surface', async () => {
   const source = await readFile(new URL('../src/operator/pluginContributions.tsx', import.meta.url), 'utf8');
   assert.match(source, /renderer === 'typed_data_v1'/);

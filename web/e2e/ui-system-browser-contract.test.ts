@@ -4,14 +4,14 @@ import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
-import { createServer } from 'vite';
+import { createIsolatedFixtureServer as createServer } from './support/isolated-vite-server.js';
 import { fixtureAssets } from './support/fixture-assets.js';
 
 const routes = [
   { name: 'operator-overview', ready: '.overview-trend-card canvas', surface: '.overview-trend-card', action: '.overview-trend-data > summary' },
   { name: 'request-diagnostics', ready: '.request-diagnostics', surface: '.request-diagnostics', action: '.request-diagnostic-session' },
   { name: 'upstream-availability', ready: '.provider-availability', surface: '.provider-availability', action: '.provider-attempt-link' },
-  { name: 'operator-form-sections', ready: '.operator-form-section', surface: '.operator-form-section, .operator-form-advanced', action: '.operator-form-advanced > summary' },
+  { name: 'operator-form-sections', ready: '.mtc-form-section', surface: '.mtc-form-section, .form-journey-disclosure', action: '.form-journey-disclosure button[aria-expanded]' },
 ] as const;
 
 type SurfaceLayout = { client: number; scroll: number; left: number; right: number };
@@ -90,6 +90,7 @@ test('shared surfaces contain long content and retain keyboard actions across lo
     for (const route of routes) for (const locale of ['en', 'zh-CN']) {
       const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
       page.setDefaultTimeout(5_000);
+      if (route.name === 'request-diagnostics') await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: `http://127.0.0.1:${address.port}` });
       const errors: string[] = [];
       page.on('pageerror', error => errors.push(error.message));
       // Fixed wall time keeps credential expiry meaningful; timers/RAF run normally.
@@ -135,9 +136,9 @@ test('shared surfaces contain long content and retain keyboard actions across lo
         }
         if (route.name === 'operator-form-sections') {
           await page.keyboard.press('Enter');
-          assert.equal(await action.evaluate(element => (element.parentElement as HTMLDetailsElement).open), true, `${label}: keyboard disclosure`);
+          assert.equal(await action.getAttribute('aria-expanded'), 'true', `${label}: keyboard disclosure`);
           await page.keyboard.press('Enter');
-          assert.equal(await action.evaluate(element => (element.parentElement as HTMLDetailsElement).open), false, `${label}: keyboard collapse`);
+          assert.equal(await action.getAttribute('aria-expanded'), 'false', `${label}: keyboard collapse`);
           if (width <= 390) assert.ok(await page.locator('.rjsf > button[type="submit"]').evaluateAll(elements => elements.length > 0 && elements.every(element => element.getBoundingClientRect().height >= 44)), `${label}: every save target`);
         }
         if (route.name === 'request-diagnostics') {
@@ -160,7 +161,36 @@ test('shared surfaces contain long content and retain keyboard actions across lo
           for (const child of sessionCell.children) {
             assert.ok(child.left >= sessionCell.left && child.right <= sessionCell.right, `${label}: session child inside its table cell`);
           }
-          assert.match(sessionCell.children.at(-1)?.text ?? '', /agent_agent_agent_/, `${label}: full agent metadata retained for copying`);
+          assert.equal(await page.locator('.request-session-cell details, .request-session-cell summary').count(), 0, `${label}: metadata uses no disclosure triangle`);
+          const metadataToggle = page.getByRole('button', { name: locale === 'en' ? 'Task and agent details' : '任务与代理详情', exact: true }).first();
+          const metadata = page.locator('.request-session-metadata-popover').first();
+          const expectedMetadata = `turn · ${'agent_'.repeat(40)}`;
+          const collapsedHeight = await page.locator('tbody tr').first().evaluate(row => row.getBoundingClientRect().height);
+          assert.equal(await metadata.count(), 0, `${label}: secondary metadata starts outside the layout`);
+          await metadataToggle.focus();
+          assert.equal(await metadataToggle.evaluate(element => getComputedStyle(element).outlineStyle !== 'none'), true, `${label}: metadata focus visible`);
+          await page.keyboard.press('Enter');
+          assert.equal(await metadata.evaluate(element => element.matches(':popover-open')), true, `${label}: keyboard opens native popover`);
+          assert.equal(await metadataToggle.getAttribute('aria-expanded'), 'true', `${label}: trigger exposes popover state`);
+          assert.equal(await metadata.getAttribute('aria-modal'), 'false', `${label}: metadata does not block the request page`);
+          assert.equal(await metadata.locator('code').textContent(), expectedMetadata, `${label}: full metadata available without hover`);
+          const openHeight = await page.locator('tbody tr').first().evaluate(row => row.getBoundingClientRect().height);
+          assert.equal(openHeight, collapsedHeight, `${label}: popover does not expand the row`);
+          const metadataBounds = await metadata.evaluate(element => { const bounds = element.getBoundingClientRect(); return { left: bounds.left, right: bounds.right }; });
+          assert.ok(metadataBounds.left >= 0 && metadataBounds.right <= width, `${label}: metadata popover fits viewport`);
+          await page.keyboard.press('Tab');
+          const metadataCopy = metadata.getByRole('button', { name: locale === 'en' ? 'Copy' : '复制', exact: true });
+          assert.equal(await metadataCopy.evaluate(element => document.activeElement === element), true, `${label}: copy control follows trigger in keyboard order`);
+          await page.keyboard.press('Enter');
+          assert.equal(await page.evaluate(() => navigator.clipboard.readText()), expectedMetadata, `${label}: copy control writes the complete metadata`);
+          await page.keyboard.press('Escape');
+          assert.equal(await metadata.count(), 0, `${label}: Escape closes metadata popover`);
+          assert.equal(await metadataToggle.evaluate(element => document.activeElement === element), true, `${label}: Escape restores metadata trigger focus`);
+          const scrollRegion = page.getByRole('region', { name: locale === 'en' ? 'Request records (scroll horizontally)' : '请求记录（可横向滚动）' });
+          await scrollRegion.focus();
+          assert.equal(await scrollRegion.evaluate(element => document.activeElement === element), true, `${label}: horizontal table has an accessible keyboard entry`);
+          assert.equal(await scrollRegion.evaluate(element => getComputedStyle(element).outlineStyle !== 'none'), true, `${label}: table focus visible`);
+          if (width <= 390) assert.ok(await metadataToggle.evaluate(element => element.getBoundingClientRect().height >= 44), `${label}: metadata touch target`);
           if (theme === 'light') assert.equal(await action.evaluate(element => getComputedStyle(element).color), 'rgb(8, 121, 110)', `${label}: accessible light-theme link token`);
           if (width <= 390) assert.ok(await page.locator('.request-diagnostics .copy-control button').first().evaluate(element => element.getBoundingClientRect().height >= 44), `${label}: copy target`);
         }

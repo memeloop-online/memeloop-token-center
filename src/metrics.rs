@@ -10,6 +10,7 @@ use std::{
 };
 
 mod codex;
+pub(crate) mod plugin_execution;
 
 pub(crate) use codex::{CodexBadRequestClassification, CodexBadRequestRetry};
 
@@ -37,6 +38,7 @@ pub struct Metrics {
 }
 
 struct MetricsInner {
+    plugin_execution: plugin_execution::Counters,
     proxy_memory_rejections: [AtomicU64; 6],
     http: Mutex<BTreeMap<HttpLabels, RequestSeries>>,
     upstream: Mutex<BTreeMap<UpstreamLabels, RequestSeries>>,
@@ -60,6 +62,7 @@ struct MetricsInner {
 impl Default for MetricsInner {
     fn default() -> Self {
         Self {
+            plugin_execution: plugin_execution::Counters::default(),
             proxy_memory_rejections: std::array::from_fn(|_| AtomicU64::new(0)),
             http: Mutex::default(),
             upstream: Mutex::default(),
@@ -169,6 +172,7 @@ impl UpstreamHealthEvent {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UpstreamHealthReason {
+    RecoveryWaitCapacity,
     RateLimited,
     Unavailable,
     InvalidResponse,
@@ -180,6 +184,7 @@ pub enum UpstreamHealthReason {
 impl UpstreamHealthReason {
     const fn label(self) -> &'static str {
         match self {
+            Self::RecoveryWaitCapacity => "recovery_wait_capacity",
             Self::RateLimited => "rate_limited",
             Self::Unavailable => "unavailable",
             Self::InvalidResponse => "invalid_response",
@@ -335,6 +340,13 @@ impl Default for RequestSeries {
 }
 
 impl Metrics {
+    pub(crate) fn observe_plugin_execution(
+        &self,
+        phase: plugin_execution::Phase,
+        outcome: plugin_execution::Outcome,
+    ) {
+        self.inner.plugin_execution.observe(phase, outcome);
+    }
     pub fn process_runtime_metrics(&self) -> ProcessRuntimeMetrics {
         process_runtime_metrics(self.inner.process_started)
     }
@@ -566,6 +578,7 @@ impl Metrics {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let mut output = String::with_capacity(16 * 1024);
+        self.inner.plugin_execution.render(&mut output);
         output.push_str("# HELP memeloop_token_center_proxy_memory_rejections_total Capacity rejections by fixed admission stage.\n");
         output.push_str("# TYPE memeloop_token_center_proxy_memory_rejections_total counter\n");
         for stage in ProxyMemoryRejectionStage::ALL {
@@ -1105,6 +1118,54 @@ pub struct AllocatorRuntimeMetrics {
     pub retained_bytes: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub struct NativeAllocatorRuntimeMetrics {
+    pub arena_bytes: Option<usize>,
+    pub allocated_bytes: Option<usize>,
+    pub free_bytes: Option<usize>,
+    pub mmap_bytes: Option<usize>,
+    pub releasable_bytes: Option<usize>,
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[repr(C)]
+struct MallInfo2 {
+    arena: usize,
+    _ordinary_free_blocks: usize,
+    _small_free_blocks: usize,
+    _mmap_regions: usize,
+    mmap_bytes: usize,
+    _maximum_allocated: usize,
+    _small_free_bytes: usize,
+    allocated_bytes: usize,
+    free_bytes: usize,
+    releasable_bytes: usize,
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+unsafe extern "C" {
+    fn mallinfo2() -> MallInfo2;
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn native_allocator_runtime_metrics() -> NativeAllocatorRuntimeMetrics {
+    // Rust allocations use the configured prefixed jemalloc; mallinfo2 gives
+    // an independent main-arena signal for glibc-backed native dependencies.
+    let native = unsafe { mallinfo2() };
+    NativeAllocatorRuntimeMetrics {
+        arena_bytes: Some(native.arena),
+        allocated_bytes: Some(native.allocated_bytes),
+        free_bytes: Some(native.free_bytes),
+        mmap_bytes: Some(native.mmap_bytes),
+        releasable_bytes: Some(native.releasable_bytes),
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub fn native_allocator_runtime_metrics() -> NativeAllocatorRuntimeMetrics {
+    NativeAllocatorRuntimeMetrics::default()
+}
+
 #[cfg(not(target_env = "msvc"))]
 pub fn allocator_runtime_metrics() -> AllocatorRuntimeMetrics {
     if crate::jemalloc_control::advance_epoch().is_err() {
@@ -1141,6 +1202,25 @@ fn render_allocator(output: &mut String) {
             let _ = writeln!(
                 output,
                 "memeloop_token_center_allocator_bytes{{state=\"{state}\"}} {value}"
+            );
+        }
+    }
+    let native = native_allocator_runtime_metrics();
+    output.push_str(
+        "# HELP memeloop_token_center_native_allocator_bytes glibc main-arena allocator accounting for native dependencies.\n",
+    );
+    output.push_str("# TYPE memeloop_token_center_native_allocator_bytes gauge\n");
+    for (state, value) in [
+        ("arena", native.arena_bytes),
+        ("allocated", native.allocated_bytes),
+        ("free", native.free_bytes),
+        ("mmap", native.mmap_bytes),
+        ("releasable", native.releasable_bytes),
+    ] {
+        if let Some(value) = value {
+            let _ = writeln!(
+                output,
+                "memeloop_token_center_native_allocator_bytes{{state=\"{state}\"}} {value}"
             );
         }
     }

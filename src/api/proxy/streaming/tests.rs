@@ -1,5 +1,29 @@
 use super::*;
 
+#[tokio::test]
+async fn archive_eof_owner_keeps_the_body_open_until_settlement_handoff_finishes() {
+    let (body_sender, body_receiver) = tokio::sync::mpsc::channel(1);
+    let (settlement_sender, settlement_receiver) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let owner = tokio::spawn(hold_response_eof_until_archive_settles(
+        settlement_receiver,
+        body_sender.clone(),
+    ));
+    let settlement =
+        crate::response_archive_spool::ResponseArchiveSettlement::pending_for_test(released);
+    assert!(settlement_sender.send(Some(settlement)).is_ok());
+    drop(body_sender);
+    tokio::task::yield_now().await;
+    assert!(
+        !body_receiver.is_closed(),
+        "the independently owned sender must keep graceful HTTP drain open"
+    );
+
+    release.send(()).unwrap();
+    owner.await.unwrap();
+    assert!(body_receiver.is_closed());
+}
+
 fn batch_limit_chunk() -> Vec<u8> {
     b"data: {}\n\n".repeat(crate::api::limits::MAX_SSE_FRAMES_PER_NETWORK_CHUNK + 1)
 }

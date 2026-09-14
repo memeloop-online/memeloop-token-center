@@ -19,10 +19,18 @@ export interface RequestView {
   /** Stable final model-route assignment, not a routing-attempt history. */
   route_id?: string | null;
   currency?: string | null;
+  credential_identity?: RequestCredentialIdentity | null;
   error_code: string | null;
   /** Durable request/response archive convergence state. */
   archive_state?: RequestArchiveState;
   session_context?: RequestSessionContext | null;
+}
+
+export interface RequestCredentialIdentity {
+  tenant_external_id: string;
+  key_id: string;
+  key_alias: string;
+  principal_external_id: string;
 }
 
 /** Exclusive descending keyset cursor returned by the operator request API. */
@@ -113,6 +121,7 @@ export interface RequestEvent {
   cost: string;
   error_code: string | null;
   archive_state: RequestArchiveState;
+  credential_identity?: RequestCredentialIdentity | null;
 }
 
 export interface StatsBucket {
@@ -274,6 +283,17 @@ export interface OperatorUsageAnalysis {
   by_status: UsageAnalysisBucket[];
   errors: UsageAnalysisBucket[];
   heatmap: UsageAnalysisHeatmapBucket[];
+}
+
+export interface OperatorUsageAnalysisTrends {
+  from_created_at: number;
+  to_created_at: number;
+  granularity: 'hour' | 'day';
+  time_zone: 'UTC';
+  p95_is_approximate: true;
+  p95_method: 'fixed_histogram_upper_bound_capped_60000ms';
+  summary: UsageAnalysisMetrics;
+  time_series: UsageAnalysisTimeBucket[];
 }
 
 export interface SelfUsageAnalysis {
@@ -446,6 +466,7 @@ export interface ServiceTokenView {
   service_id: string;
   name: string;
   credential_generation: number;
+  credential_copy_available?: boolean;
   fingerprint: string;
   scopes: string[];
   tenant_external_id: string | null;
@@ -667,7 +688,7 @@ export interface PluginManifest {
 export type PluginOperatorUiSlot = 'operator.sidebar.tab' | 'operator.overview.card';
 export type PluginOperatorUiIcon = 'activity' | 'chart' | 'database' | 'heart' | 'plug' | 'shield';
 /** Closed core-owned data presentation; this is never a plugin browser-code entrypoint. */
-export type PluginOperatorUiPresentation = 'health_intelligence_v1';
+export type PluginOperatorUiPresentation = 'health_intelligence_v1' | 'projection_v1';
 
 export interface PluginOperatorUiContribution {
   id: string;
@@ -758,6 +779,8 @@ export interface UpstreamHealth {
   upstream_status?: number;
   latency_ms?: number;
   checked_at: number;
+  retry_at?: number;
+  source?: 'routing_state' | 'connection_probe' | 'local_state';
 }
 
 export interface ConfigurationSchemas {

@@ -3,7 +3,7 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
-import { createServer } from 'vite';
+import { createIsolatedFixtureServer as createServer } from './support/isolated-vite-server.js';
 
 test('advanced validation remains discoverable without losing field values or mobile readability', { timeout: 30_000 }, async (context) => {
   if (!existsSync(chromium.executablePath())) {
@@ -19,15 +19,16 @@ test('advanced validation remains discoverable without losing field values or mo
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-form-sections.html`);
     const timeout = page.getByRole('spinbutton', { name: 'Timeout seconds' });
-    const advanced = page.locator('.operator-form-advanced').filter({ hasText: 'Advanced network' });
+    const advanced = page.getByRole('button', { name: /Advanced network/ });
     await page.getByLabel('Connection name').waitFor();
-    assert.equal(await advanced.getAttribute('open'), null);
+    assert.equal(await advanced.getAttribute('aria-expanded'), 'false');
     await page.getByLabel('Required network scope').waitFor({ state: 'visible' });
     await page.getByLabel('Required video interface').waitFor({ state: 'visible' });
     await page.getByRole('button', { name: 'Save fixture' }).click();
     await timeout.waitFor({ state: 'visible' });
+    assert.equal(await timeout.evaluate(element => document.activeElement === element), true, 'validation opens and focuses the invalid advanced field');
     await timeout.fill('30');
-    await advanced.locator('summary').focus();
+    await advanced.focus();
     await page.keyboard.press('Enter');
     await timeout.waitFor({ state: 'hidden' });
     await page.keyboard.press('Enter');
@@ -35,21 +36,21 @@ test('advanced validation remains discoverable without losing field values or mo
     // Optional capabilities collapse, but adapter-required and unknown plugin
     // fields are never silently hidden. Disclosure retains entered values.
     await page.getByLabel('Plugin extension').waitFor({ state: 'visible' });
-    const capabilities = page.locator('.operator-form-advanced').filter({ hasText: 'Optional capabilities' });
-    assert.equal(await capabilities.getAttribute('open'), null);
-    await capabilities.locator('summary').focus();
+    const capabilities = page.getByRole('button', { name: /Optional capabilities/ });
+    assert.equal(await capabilities.getAttribute('aria-expanded'), 'false');
+    await capabilities.focus();
     await page.keyboard.press('Enter');
     await page.getByLabel('Image model').fill('image-example');
-    await capabilities.locator('summary').click();
+    await capabilities.click();
     await page.getByLabel('Image model').waitFor({ state: 'hidden' });
-    await capabilities.locator('summary').click();
+    await capabilities.click();
     assert.equal(await page.getByLabel('Image model').inputValue(), 'image-example');
     for (const theme of ['light', 'dark']) {
       await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
       assert.equal(await page.getByLabel('Connection name').evaluate(element => getComputedStyle(element).fontSize), '16px');
-      assert.equal(await capabilities.locator('label').first().evaluate(element => getComputedStyle(element).color),
-        await page.locator('.operator-form-section label').first().evaluate(element => getComputedStyle(element).color));
+      assert.equal(await page.getByLabel('Image model').evaluate(element => getComputedStyle(element).color),
+        await page.getByLabel('Connection name').evaluate(element => getComputedStyle(element).color));
       const artifacts = fileURLToPath(new URL('../e2e-artifacts/upstream-availability', import.meta.url));
       mkdirSync(artifacts, { recursive: true });
       await page.screenshot({ path: `${artifacts}/provider-form-${theme}-mobile.png`, fullPage: true });

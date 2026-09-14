@@ -233,6 +233,15 @@ pub struct RecoveredClientCredential {
     pub key: String,
 }
 
+/// A service credential that an explicitly authorized global management caller
+/// requested to copy. This is never included in service-token lists.
+#[derive(Serialize)]
+pub struct RecoveredServiceCredential {
+    pub service_id: Uuid,
+    pub credential_generation: i64,
+    pub token: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct KeyView {
     pub key_id: Uuid,
@@ -369,6 +378,7 @@ pub struct ServiceTokenView {
     pub status: String,
     pub credential_generation: i64,
     pub fingerprint: String,
+    pub credential_copy_available: bool,
     pub scopes: Vec<String>,
     pub tenant_external_id: Option<String>,
     pub created_at: i64,
@@ -384,6 +394,44 @@ pub struct LedgerEntryView {
     pub source: String,
     pub idempotency_key: Option<String>,
     pub created_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountSettlementKind {
+    Text,
+    Generation,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct AccountSettlementView {
+    pub settlement_id: Uuid,
+    pub settlement_sequence: i64,
+    pub request_id: Uuid,
+    pub kind: AccountSettlementKind,
+    pub account_id: Uuid,
+    pub key_id: Uuid,
+    pub model: String,
+    pub cost: String,
+    pub currency: String,
+    pub settled_at: i64,
+    pub completed_at: i64,
+    pub input_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct AccountSettlementCursor {
+    pub after_sequence: i64,
+    pub after_id: Uuid,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct AccountSettlementPage {
+    pub items: Vec<AccountSettlementView>,
+    pub next_cursor: Option<AccountSettlementCursor>,
 }
 
 /// Stable subscription identity plus the currently effective billing-cycle
@@ -1101,6 +1149,23 @@ pub struct UsageAnalysisResponse {
     pub by_status: Vec<UsageAnalysisBucket>,
     pub errors: Vec<UsageAnalysisBucket>,
     pub heatmap: Vec<UsageAnalysisHeatmapBucket>,
+}
+
+/// The bounded usage projection used by the operator overview.
+///
+/// Keeping this response distinct from [`UsageAnalysisResponse`] prevents overview
+/// refreshes from implicitly requesting dimensions, sessions, generation breakdowns,
+/// or the heatmap that only the complete usage page renders.
+#[derive(Clone, Debug, Serialize)]
+pub struct UsageAnalysisTrendsResponse {
+    pub from_created_at: i64,
+    pub to_created_at: i64,
+    pub granularity: String,
+    pub time_zone: String,
+    pub p95_is_approximate: bool,
+    pub p95_method: String,
+    pub summary: UsageAnalysisMetrics,
+    pub time_series: Vec<UsageAnalysisTimeBucket>,
 }
 
 /// Usage analytics safe to expose to one authenticated client credential.

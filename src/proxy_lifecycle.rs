@@ -9,7 +9,7 @@ use crate::{
         ArchiveStagingOwner, ArchiveStagingPurpose, ArchiveStagingWriteLease,
         BeginArchiveStagingInput, BeginArchiveStagingResult,
     },
-    db::{Database, FinishProxyRequest, FinishProxyRequestResult},
+    db::{Database, FinishProxyRequest, FinishProxyRequestResult, ProxyRequestUpstreamAttribution},
     error::AppError,
     model::UsageReservation,
 };
@@ -121,12 +121,14 @@ pub(crate) async fn finish_proxy_request_with_retry(
     database: &Database,
     input: FinishProxyRequest<'_>,
     archive_attempt: Option<&ProxyArchiveAttempt>,
+    upstream_attribution: ProxyRequestUpstreamAttribution,
 ) -> Result<FinishProxyRequestResult, AppError> {
     for delay in RETRY_DELAYS {
         match database
-            .finish_proxy_request_with_archive_staging(
+            .finish_proxy_request_with_archive_staging_and_upstream_attribution(
                 input.clone(),
                 archive_attempt.map(|attempt| &attempt.lease),
+                upstream_attribution,
             )
             .await
         {
@@ -136,9 +138,10 @@ pub(crate) async fn finish_proxy_request_with_retry(
         }
     }
     database
-        .finish_proxy_request_with_archive_staging(
+        .finish_proxy_request_with_archive_staging_and_upstream_attribution(
             input,
             archive_attempt.map(|attempt| &attempt.lease),
+            upstream_attribution,
         )
         .await
 }

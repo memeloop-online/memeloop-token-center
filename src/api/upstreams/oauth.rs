@@ -780,6 +780,8 @@ async fn refresh_managed_upstream_oauth_impl(
     {
         return Ok(replay);
     }
+    let request_guard =
+        crate::oauth::DurableOAuthRefreshRequestGuard::new(&state.db, account_id, idempotency_key);
     let refreshed: Result<UpstreamCredential, AppError> = async {
         let (account, credential) = state
             .db
@@ -797,6 +799,7 @@ async fn refresh_managed_upstream_oauth_impl(
                     &credential,
                     unix_millis(),
                     state.config.allow_oauth_loopback,
+                    &request_guard,
                 )
                 .await?
             }
@@ -806,6 +809,7 @@ async fn refresh_managed_upstream_oauth_impl(
                     &credential,
                     unix_millis(),
                     state.config.allow_oauth_loopback,
+                    &request_guard,
                 )
                 .await?
             }
@@ -814,6 +818,7 @@ async fn refresh_managed_upstream_oauth_impl(
                     &state.http,
                     &credential,
                     state.config.codex_test_loopback,
+                    &request_guard,
                 )
                 .await?
             }
@@ -842,6 +847,7 @@ async fn refresh_managed_upstream_oauth_impl(
                     &credential,
                     unix_millis(),
                     refresh_scope,
+                    &request_guard,
                 )
                 .await?
             }
@@ -853,6 +859,7 @@ async fn refresh_managed_upstream_oauth_impl(
                     &adapter,
                     &credential,
                     state.config.allow_oauth_loopback,
+                    &request_guard,
                 )
                 .await?
             }

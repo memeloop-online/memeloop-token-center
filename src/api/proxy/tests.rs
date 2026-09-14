@@ -26,6 +26,7 @@ mod ha_policy;
 mod kimi;
 mod memory_admission;
 mod memory_metrics;
+mod recovery_wait;
 mod sse_delivery;
 
 #[test]
@@ -3140,9 +3141,13 @@ async fn codex_retry_streaming_failure_is_redacted_and_records_failed_terminal()
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
-        .await
-        .unwrap();
+    let body = tokio::time::timeout(
+        Duration::from_secs(5),
+        to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY),
+    )
+    .await
+    .expect("redacted stream must complete with real database work")
+    .unwrap();
     let rendered = String::from_utf8(body.to_vec()).unwrap();
     assert!(rendered.contains("upstream request failed"));
     for secret in ["provider-secret", "secret-token"] {

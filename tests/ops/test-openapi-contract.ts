@@ -91,6 +91,23 @@ test("usage analysis contract is currency safe and canonical", () => {
   const metrics = document.components.schemas.UsageAnalysisMetrics; for (const field of ["requests", "success", "failed", "cached_input_tokens", "cache_write_tokens", "generation_units", "costs"]) assert.ok(metrics.required.includes(field)); assert.equal(metrics.properties.costs.type, "array"); assert.equal(metrics.properties.costs.items.$ref, "#/components/schemas/UsageAnalysisCost"); const hour = document.components.schemas.UsageAnalysisHeatmapBucket.allOf[0].properties.hour_of_week; assert.deepEqual([hour.minimum, hour.maximum], [0, 167]);
 });
 
+test("overview usage trends is an exact minimal projection of the full query contract", () => {
+  const document = cloneDocument();
+  const full = document.paths["/internal/v1/usage-analysis"].get;
+  const trends = document.paths["/internal/v1/usage-analysis/trends"].get;
+  assert.deepEqual(trends.security, full.security);
+  assert.equal(trends["x-required-scope"], full["x-required-scope"]);
+  assert.deepEqual(trends.parameters, full.parameters);
+  assert.equal(trends.responses["200"].content["application/json"].schema.$ref, "#/components/schemas/UsageAnalysisTrends");
+  const schema = document.components.schemas.UsageAnalysisTrends;
+  const expected = ["from_created_at", "to_created_at", "granularity", "time_zone", "p95_is_approximate", "p95_method", "summary", "time_series"];
+  assert.deepEqual(schema.required, expected);
+  assert.deepEqual(Object.keys(schema.properties), expected);
+  assert.equal(schema.additionalProperties, false);
+  assert.equal(schema.properties.summary.$ref, "#/components/schemas/UsageAnalysisMetrics");
+  assert.equal(schema.properties.time_series.items.$ref, "#/components/schemas/UsageAnalysisTimeBucket");
+});
+
 test("operator monitoring snapshot has explicit scope/window and bounded terminal drilldowns", () => {
   const document = cloneDocument(); const operation = document.paths["/internal/v1/monitoring-snapshot"].get;
   assert.equal(operation["x-required-scope"], "requests:read"); assert.deepEqual(operation.security, [{ serviceBearer: [] }]);
@@ -128,6 +145,27 @@ test("upstream availability requires both scopes and an explicit tenant/window",
   assert.equal(account.properties.metrics.$ref, "#/components/schemas/MonitoringMetrics");
   assert.equal(account.properties.terminal_outcomes.maxItems, 5);
   assert.equal(account.properties.terminal_outcomes.items.$ref, "#/components/schemas/MonitoringTerminalOutcome");
+});
+
+test("account settlements require both scopes and expose an immutable sequence cursor envelope", () => {
+  const document = cloneDocument(); const operation = document.paths["/internal/v1/accounts/{account_id}/settlements"].get;
+  assert.deepEqual(operation.security, [{ serviceBearer: [] }]);
+  assert.equal(operation["x-required-scope"], "credits:read");
+  assert.deepEqual(operation["x-required-scopes"], ["credits:read", "requests:read"]);
+  assert.deepEqual(operation.parameters.map((parameter: Obj) => parameter.$ref), ["#/components/parameters/AccountId", "#/components/parameters/SettlementListLimit500", "#/components/parameters/AfterSettlementSequence", "#/components/parameters/AfterSettlementId", "#/components/parameters/SettlementRequestKind", "#/components/parameters/SettlementRequestId"]);
+  assert.deepEqual(document.components.parameters.SettlementListLimit500.schema, { type: "integer", format: "int64", minimum: 1, maximum: 500, default: 100 });
+  assert.deepEqual(document.components.parameters.AfterSettlementSequence.schema, { type: "integer", format: "int64", minimum: 1 });
+  assert.deepEqual(document.components.parameters.AfterSettlementId.schema, { type: "string", format: "uuid" });
+  assert.deepEqual(document.components.parameters.SettlementRequestKind.schema, { $ref: "#/components/schemas/AccountSettlementKind" });
+  assert.deepEqual(document.components.parameters.SettlementRequestId.schema, { type: "string", format: "uuid" });
+  assert.equal(operation.responses["200"].headers["Cache-Control"].schema.const, "no-store");
+  assert.equal(operation.responses["200"].content["application/json"].schema.$ref, "#/components/schemas/AccountSettlementPage");
+  const page = document.components.schemas.AccountSettlementPage;
+  assert.equal(page.additionalProperties, false); assert.deepEqual(page.required, ["items", "next_cursor"]); assert.equal(page.properties.items.maxItems, 500); assert.equal(page.properties.items.items.$ref, "#/components/schemas/AccountSettlement"); assert.deepEqual(page.properties.next_cursor.oneOf, [{ $ref: "#/components/schemas/AccountSettlementCursor" }, { type: "null" }]);
+  const cursor = document.components.schemas.AccountSettlementCursor;
+  assert.equal(cursor.additionalProperties, false); assert.deepEqual(cursor.required, ["after_sequence", "after_id"]); assert.deepEqual(cursor.properties.after_sequence, { type: "integer", format: "int64" }); assert.deepEqual(cursor.properties.after_id, { type: "string", format: "uuid" });
+  const item = document.components.schemas.AccountSettlement;
+  assert.equal(item.additionalProperties, false); assert.deepEqual(item.required, ["settlement_id", "settlement_sequence", "request_id", "kind", "account_id", "key_id", "model", "cost", "currency", "settled_at", "completed_at", "input_tokens", "cached_input_tokens", "cache_write_tokens", "output_tokens"]); assert.deepEqual(document.components.schemas.AccountSettlementKind.enum, ["text", "generation"]); assert.deepEqual(item.properties.settlement_sequence, { type: "integer", format: "int64" }); assert.equal(item.properties.cost.$ref, "#/components/schemas/NonNegativeMoney"); for (const name of ["input_tokens", "cached_input_tokens", "cache_write_tokens", "output_tokens"]) assert.deepEqual(item.properties[name], { type: ["integer", "null"], format: "int64" });
 });
 
 test("OAuth reauthorization reuses the unified upstream resource", () => {

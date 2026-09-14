@@ -201,6 +201,11 @@ impl Database {
                     "generation job already has a different terminal result".into(),
                 ));
             }
+            super::super::super::billing::publish_generation_settlement_in_transaction(
+                &mut transaction,
+                input.job_id,
+            )
+            .await?;
             transaction.commit().await?;
             return Ok(existing_cost_micros);
         }
@@ -277,7 +282,8 @@ impl Database {
                 .await?;
             }
         }
-        aggregate_terminal_generation_job(&mut transaction, &input.job_id.to_string(), now).await?;
+        publish_generation_terminal_effects(&mut transaction, &input.job_id.to_string(), now)
+            .await?;
         let tenant_id: String = job.try_get("tenant_id")?;
         let key_id = key_id.to_string();
         let request_id = input.job_id.to_string();

@@ -2,6 +2,13 @@ use super::super::*;
 use super::accounts::upstream_account_view;
 use super::*;
 
+fn oauth_refresh_outcome_unknown() -> AppError {
+    AppError::Conflict(
+        "OAuth refresh outcome is unknown for this credential generation; authorize the upstream again before refreshing it"
+            .into(),
+    )
+}
+
 pub struct ReauthorizeUpstreamAccountInput {
     pub tenant_external_id: String,
     pub expected_updated_at: i64,
@@ -331,7 +338,7 @@ impl Database {
             })
             .transpose()?;
         let now = unix_millis();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write_transaction().await?;
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2 FOR UPDATE OF a"
@@ -579,7 +586,7 @@ impl Database {
                 return Ok(Some(view));
             }
             let pending = sqlx::query(
-                "SELECT credential_generation, pending_credential_ciphertext FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND idempotency_key = $2",
+                "SELECT credential_generation, pending_credential_ciphertext, request_started_at FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND idempotency_key = $2",
             )
             .bind(account_id.to_string())
             .bind(idempotency_key)
@@ -593,6 +600,12 @@ impl Database {
             let pending_ciphertext: Option<String> =
                 pending.try_get("pending_credential_ciphertext")?;
             let Some(pending_ciphertext) = pending_ciphertext else {
+                if pending
+                    .try_get::<Option<i64>, _>("request_started_at")?
+                    .is_some()
+                {
+                    return Err(oauth_refresh_outcome_unknown());
+                }
                 return Err(AppError::Conflict(
                     "OAuth refresh is already in progress for this Idempotency-Key".into(),
                 ));
@@ -653,7 +666,7 @@ impl Database {
         let generation: i64 = account.try_get("credential_generation")?;
         let lease_expires_at = now.saturating_add(UPSTREAM_OAUTH_REFRESH_LEASE_MILLIS);
         let leased = sqlx::query(
-            "INSERT INTO upstream_oauth_refresh_leases (account_id, credential_generation, idempotency_key, lease_expires_at, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(account_id) DO UPDATE SET credential_generation = excluded.credential_generation, idempotency_key = excluded.idempotency_key, pending_credential_ciphertext = NULL, pending_expires_at = NULL, lease_expires_at = excluded.lease_expires_at, created_at = excluded.created_at WHERE (upstream_oauth_refresh_leases.pending_credential_ciphertext IS NULL AND upstream_oauth_refresh_leases.lease_expires_at <= $5) OR upstream_oauth_refresh_leases.credential_generation <> excluded.credential_generation",
+            "INSERT INTO upstream_oauth_refresh_leases (account_id, credential_generation, idempotency_key, lease_expires_at, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(account_id) DO UPDATE SET credential_generation = excluded.credential_generation, idempotency_key = excluded.idempotency_key, pending_credential_ciphertext = NULL, pending_expires_at = NULL, request_started_at = NULL, lease_expires_at = excluded.lease_expires_at, created_at = excluded.created_at WHERE (upstream_oauth_refresh_leases.pending_credential_ciphertext IS NULL AND upstream_oauth_refresh_leases.request_started_at IS NULL AND upstream_oauth_refresh_leases.lease_expires_at <= $5) OR upstream_oauth_refresh_leases.credential_generation <> excluded.credential_generation",
         )
         .bind(account_id.to_string())
         .bind(generation)
@@ -663,12 +676,61 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         if leased.rows_affected() != 1 {
+            let current_lease = sqlx::query(
+                "SELECT request_started_at, pending_credential_ciphertext FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND credential_generation = $2",
+            )
+            .bind(account_id.to_string())
+            .bind(generation)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(current_lease) = current_lease {
+                let request_started_at: Option<i64> =
+                    current_lease.try_get("request_started_at")?;
+                let pending_ciphertext: Option<String> =
+                    current_lease.try_get("pending_credential_ciphertext")?;
+                if request_started_at.is_some() && pending_ciphertext.is_none() {
+                    return Err(oauth_refresh_outcome_unknown());
+                }
+            }
             return Err(AppError::Conflict(
                 "OAuth refresh is already in progress for this credential generation".into(),
             ));
         }
         tx.commit().await?;
         Ok(None)
+    }
+    /// Persist the one-way boundary immediately before a refresh-token request
+    /// is dispatched. Once set, neither abort nor lease expiry may make the
+    /// current credential generation eligible for another remote refresh.
+    pub async fn mark_upstream_oauth_refresh_request_started(
+        &self,
+        account_id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<(), AppError> {
+        validate_idempotency_key(idempotency_key, "Idempotency-Key")?;
+        let idempotency_key = idempotency_key.trim();
+        let now = unix_millis();
+        let mut tx = self
+            .begin_upstream_oauth_refresh_write_transaction(
+                account_id,
+                OAuthRefreshWritePhase::RequestStart,
+            )
+            .await?;
+        let started = sqlx::query(
+            "UPDATE upstream_oauth_refresh_leases SET request_started_at = $1 WHERE account_id = $2 AND idempotency_key = $3 AND request_started_at IS NULL AND pending_credential_ciphertext IS NULL AND credential_generation = (SELECT credential_generation FROM upstream_accounts WHERE id = $2)",
+        )
+        .bind(now)
+        .bind(account_id.to_string())
+        .bind(idempotency_key)
+        .execute(&mut *tx)
+        .await?;
+        if started.rows_affected() != 1 {
+            return Err(AppError::Conflict(
+                "OAuth refresh claim is missing, stale, or already dispatched".into(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(())
     }
     pub async fn finish_upstream_oauth_refresh(
         &self,
@@ -887,7 +949,7 @@ impl Database {
             )
             .await?;
         sqlx::query(
-            "DELETE FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND idempotency_key = $2 AND pending_credential_ciphertext IS NULL",
+            "DELETE FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND idempotency_key = $2 AND pending_credential_ciphertext IS NULL AND request_started_at IS NULL",
         )
         .bind(account_id.to_string())
         .bind(idempotency_key)
@@ -950,7 +1012,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<(Uuid, i64)>, AppError> {
         let rows = sqlx::query(
-            "SELECT a.id, a.credential_generation FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.status = 'active' AND a.auth_kind = 'oauth' AND a.oauth_session_id IS NOT NULL AND a.oauth_refresh_url IS NOT NULL AND a.driver <> 'cpa-gemini-oauth-legacy' AND c.expires_at IS NOT NULL AND c.expires_at <= $1 ORDER BY c.expires_at, a.id LIMIT $2",
+            "SELECT a.id, a.credential_generation FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.status = 'active' AND a.auth_kind = 'oauth' AND a.oauth_session_id IS NOT NULL AND a.oauth_refresh_url IS NOT NULL AND a.driver <> 'cpa-gemini-oauth-legacy' AND c.expires_at IS NOT NULL AND c.expires_at <= $1 AND NOT EXISTS (SELECT 1 FROM upstream_oauth_refresh_leases l WHERE l.account_id = a.id AND l.credential_generation = a.credential_generation AND l.request_started_at IS NOT NULL AND l.pending_credential_ciphertext IS NULL) ORDER BY c.expires_at, a.id LIMIT $2",
         )
         .bind(refresh_before)
         .bind(limit.clamp(1, 100))
@@ -1149,6 +1211,7 @@ mod tests {
         http::{Request, StatusCode, header},
     };
     use serde_json::{Value, json};
+    use tokio::io::AsyncReadExt;
     use tower::ServiceExt;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -1293,6 +1356,13 @@ mod tests {
             &mut phases,
             &resume,
             &competing_writer,
+            OAuthRefreshWritePhase::RequestStart,
+        )
+        .await;
+        pause_at_refresh_phase(
+            &mut phases,
+            &resume,
+            &competing_writer,
             OAuthRefreshWritePhase::Stage,
         )
         .await;
@@ -1412,6 +1482,13 @@ mod tests {
             &mut failure_phases,
             &failure_resume,
             &competing_writer,
+            OAuthRefreshWritePhase::RequestStart,
+        )
+        .await;
+        pause_at_refresh_phase(
+            &mut failure_phases,
+            &failure_resume,
+            &competing_writer,
             OAuthRefreshWritePhase::Abort,
         )
         .await;
@@ -1422,21 +1499,162 @@ mod tests {
         *state.db.oauth_refresh_write_phase_seam.lock().await = None;
         assert_eq!(failure_response.status(), StatusCode::BAD_GATEWAY);
         let failed_replays: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM credential_rotation_replays WHERE idempotency_key = $1",
+            "SELECT COUNT(*) FROM credential_rotation_replays WHERE idempotency_key = $1 AND response_ciphertext IS NULL",
         )
         .bind("oauth-refresh-write-admission-failure")
         .fetch_one(&state.db.pool)
         .await
         .unwrap();
-        assert_eq!(failed_replays, 0);
+        assert_eq!(failed_replays, 1);
         let failed_leases: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM upstream_oauth_refresh_leases WHERE account_id = $1",
+            "SELECT COUNT(*) FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND request_started_at IS NOT NULL AND pending_credential_ciphertext IS NULL",
         )
         .bind(failed.id.to_string())
         .fetch_one(&state.db.pool)
         .await
         .unwrap();
-        assert_eq!(failed_leases, 0);
+        assert_eq!(failed_leases, 1);
+        let same_key = state
+            .db
+            .begin_upstream_oauth_refresh(
+                failed.id,
+                "oauth-refresh-write-admission-failure",
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap_err();
+        assert!(same_key.to_string().contains("outcome is unknown"));
+        sqlx::query(
+            "UPDATE upstream_oauth_refresh_leases SET lease_expires_at = 0 WHERE account_id = $1",
+        )
+        .bind(failed.id.to_string())
+        .execute(&state.db.pool)
+        .await
+        .unwrap();
+        let expired_takeover = state
+            .db
+            .begin_upstream_oauth_refresh(
+                failed.id,
+                "oauth-refresh-expired-takeover",
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap_err();
+        assert!(expired_takeover.to_string().contains("outcome is unknown"));
         assert_eq!(oauth_server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn consumed_refresh_disconnect_is_not_replayed_on_the_next_attempt() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refresh_url = format!("http://{}/oauth/refresh", listener.local_addr().unwrap());
+        let (check_second, check_second_after_request) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let read = first.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request
+                    .windows(b"\r\n\r\n{}".len())
+                    .any(|window| window == b"\r\n\r\n{}")
+                {
+                    break;
+                }
+            }
+            assert!(
+                request
+                    .windows("refresh-once".len())
+                    .any(|window| window == b"refresh-once")
+            );
+            drop(first);
+            check_second_after_request.await.unwrap();
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_ok()
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory
+                .path()
+                .join("oauth-refresh-disconnect.db")
+                .display()
+        );
+        let state = AppState::initialize(Config::for_test(database_url))
+            .await
+            .unwrap();
+        let account = state
+            .db
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: "oauth-refresh-disconnect".into(),
+                    name: "cursor-refresh-disconnect".into(),
+                    driver: "http-json".into(),
+                    config: json!({"base_url": "https://api.example.test"}),
+                    credential: UpstreamCredential::OAuth {
+                        access_token: "access-before-disconnect".into(),
+                        refresh_token: Some("refresh-once".into()),
+                        expires_at: Some(0),
+                        header: "authorization".into(),
+                        prefix: "Bearer ".into(),
+                        adapter_state: None,
+                        proxy_url: None,
+                        proxy_network_scope: None,
+                    },
+                    oauth_session_id: Some(Uuid::from_u128(3)),
+                    oauth_driver: Some("cursor".into()),
+                    oauth_refresh_url: Some(refresh_url),
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let router = api::router_for_role(state.clone(), RuntimeRole::Control);
+        let refresh_request = |key: &str| {
+            Request::post(format!(
+                "/internal/v1/upstreams/{}/oauth/refresh",
+                account.id
+            ))
+            .header(header::AUTHORIZATION, "Bearer test-service-token")
+            .header("idempotency-key", key)
+            .body(Body::empty())
+            .unwrap()
+        };
+        let first = router
+            .clone()
+            .oneshot(refresh_request("oauth-refresh-disconnect-first"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+
+        sqlx::query(
+            "UPDATE upstream_oauth_refresh_leases SET lease_expires_at = 0 WHERE account_id = $1",
+        )
+        .bind(account.id.to_string())
+        .execute(&state.db.pool)
+        .await
+        .unwrap();
+        let second = router
+            .oneshot(refresh_request("oauth-refresh-disconnect-second"))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+        check_second.send(()).unwrap();
+        assert!(
+            !server.await.unwrap(),
+            "an expired lease must not resend a refresh token whose outcome is unknown"
+        );
+        let candidates = state
+            .db
+            .list_managed_oauth_refresh_candidates(unix_millis(), 20)
+            .await
+            .unwrap();
+        assert!(candidates.iter().all(|(id, _)| *id != account.id));
     }
 }

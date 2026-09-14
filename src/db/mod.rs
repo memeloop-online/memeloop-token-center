@@ -12,19 +12,23 @@ use sqlx::{
 use uuid::Uuid;
 
 use crate::{
-    conversation::{ConversationHints, RelationKind, build_prefix, extract_atoms},
+    conversation::{
+        ConversationHints, PrefixNode, RelationKind, SemanticAtom, build_prefix, extract_atoms,
+    },
     crypto,
     error::{AppError, LimitReason},
     model::{
-        ArchivedGenerationAsset, AuthenticatedKey, AuthenticatedService, ConversationClusterDetail,
-        ConversationClusterView, ConversationCursor, ConversationEdgeView, ConversationRequestView,
-        EnforcementMode, EntitlementReconcileResult, EntitlementView, GenerationAssetDownload,
-        GenerationAssetView, GenerationJobView, GenerationJobWork, GenerationPrice,
-        GenerationStagedAssets, IssuedKey, IssuedServiceToken, JSON_SAFE_INTEGER_MAX, KeyAliasView,
-        KeyBudgetSnapshot, KeyConcurrencySnapshot, KeyLimitSnapshot, KeyPolicy,
-        KeyRateLimitSnapshot, KeyView, LedgerEntryView, ManagedKeyView, ModelPrice, ModelPriceTier,
-        ModelPriceTierView, ModelPriceView, OperatorGenerationJobView, OperatorStats,
-        RecoveredClientCredential, RequestArchiveRefs, RequestArchiveState, RequestBillingView,
+        AccountSettlementCursor, AccountSettlementKind, AccountSettlementPage,
+        AccountSettlementView, ArchivedGenerationAsset, AuthenticatedKey, AuthenticatedService,
+        ConversationClusterDetail, ConversationClusterView, ConversationCursor,
+        ConversationEdgeView, ConversationRequestView, EnforcementMode, EntitlementReconcileResult,
+        EntitlementView, GenerationAssetDownload, GenerationAssetView, GenerationJobView,
+        GenerationJobWork, GenerationPrice, GenerationStagedAssets, IssuedKey, IssuedServiceToken,
+        JSON_SAFE_INTEGER_MAX, KeyAliasView, KeyBudgetSnapshot, KeyConcurrencySnapshot,
+        KeyLimitSnapshot, KeyPolicy, KeyRateLimitSnapshot, KeyView, LedgerEntryView,
+        ManagedKeyView, ModelPrice, ModelPriceTier, ModelPriceTierView, ModelPriceView,
+        OperatorGenerationJobView, OperatorStats, RecoveredClientCredential,
+        RecoveredServiceCredential, RequestArchiveRefs, RequestArchiveState, RequestBillingView,
         RequestCredentialIdentityView, RequestEventView, RequestGenerationUsageView,
         RequestLifecycleState, RequestProvenanceView, RequestSessionAssociation,
         RequestSessionContext, RequestTokenUsageView, RequestUsageView, RequestView, SelfStats,
@@ -39,7 +43,6 @@ use crate::{
 
 mod archive_spool;
 mod archive_staging;
-#[cfg(test)]
 pub(crate) use archive_spool::ArchiveSpoolChunk;
 pub(crate) use archive_spool::{ArchiveSpoolIdentity, ArchiveSpoolTask};
 mod billing;
@@ -52,6 +55,8 @@ mod monitoring_snapshot;
 mod oauth_sessions;
 mod plugin_configurations;
 mod plugin_kv;
+#[cfg(feature = "experimental-plugin-revisions")]
+mod plugin_revisions;
 mod providers;
 mod requests;
 mod rotation;
@@ -138,9 +143,10 @@ pub use requests::{
     StartProxyRequest, StatsFilter, normalize_proxy_usage,
 };
 pub(crate) use requests::{
-    ConversationObservationInput, MAX_STATS_RANGE_MILLIS, SwitchProxyCandidateInput,
-    allocate_request_event_cursor, attach_conversation_upstream_response_in_transaction,
-    price_token_usage, proxy_contract_ceiling_micros, record_request_finished_in_transaction,
+    ConversationObservationInput, MAX_STATS_RANGE_MILLIS, ProxyRequestUpstreamAttribution,
+    SwitchProxyCandidateInput, allocate_request_event_cursor,
+    attach_conversation_upstream_response_in_transaction, price_token_usage,
+    proxy_contract_ceiling_micros, record_request_finished_in_transaction,
     record_request_started_in_transaction, reserve_usage_in_transaction, search_prefix,
     settle_token_usage_in_transaction, settle_token_usage_in_transaction_with_charge,
     validate_numeric_range,
@@ -187,6 +193,7 @@ enum DatabaseBackend {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OAuthRefreshWritePhase {
     Claim,
+    RequestStart,
     Stage,
     Finalize,
     Abort,
