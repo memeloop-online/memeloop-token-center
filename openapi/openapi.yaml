@@ -7860,7 +7860,7 @@ components:
     MonitoringMetrics:
       type: object
       additionalProperties: false
-      required: [requests, successful_requests, failed_requests, avg_duration_ms, p95_duration_ms, costs]
+      required: [requests, successful_requests, failed_requests, avg_duration_ms, p95_duration_ms, p95_is_capped, costs]
       properties:
         requests: { type: integer, format: int64, minimum: 0 }
         successful_requests: { type: integer, format: int64, minimum: 0 }
@@ -7872,6 +7872,9 @@ components:
           minimum: 0
           maximum: 60000
           description: Fixed-histogram upper-bound approximation, capped at 60000 ms.
+        p95_is_capped:
+          type: boolean
+          description: True when P95 falls in the open-ended over-60000ms bucket. The numeric capped value is not an exact P95; false with null means no estimate.
         costs:
           type: array
           description: Stable ascending currency order; values from unlike currencies are never added.
@@ -8001,7 +8004,7 @@ components:
         units: { type: integer, format: int64, minimum: 0 }
     UsageAnalysisMetrics:
       type: object
-      required: [requests, success, failed, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, avg_duration_ms, p95_duration_ms, costs]
+      required: [requests, success, failed, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, avg_duration_ms, p95_duration_ms, p95_is_capped, costs]
       properties:
         requests: { type: integer, format: int64, minimum: 0 }
         success: { type: integer, format: int64, minimum: 0 }
@@ -8022,6 +8025,9 @@ components:
           minimum: 0
           maximum: 60000
           description: Fixed-histogram approximation; values above 60000 ms are capped.
+        p95_is_capped:
+          type: boolean
+          description: True when P95 falls in the open-ended over-60000ms bucket. Do not plot the capped numeric value as an exact latency.
         costs:
           type: array
           description: Stable ascending currency order; amounts from different currencies are never added.
