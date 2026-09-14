@@ -2,6 +2,14 @@ import type { ProviderType } from '../types.js';
 
 type JsonSchema = Record<string, unknown>;
 
+/** Creation support follows the native OAuth start contracts, not all OAuth plugins. */
+export function oauthCreationProxyMode(provider?: ProviderType): 'required' | 'optional' | 'none' {
+  if (provider?.oauth_adapter?.flow_kind === 'openai_device') return 'required';
+  if (provider?.source === 'builtin' && ((provider.id === 'cursor' && provider.oauth_adapter?.flow_kind === 'cursor_pkce')
+    || (provider.id === 'github-copilot' && provider.oauth_adapter?.flow_kind === 'github_device_copilot'))) return 'optional';
+  return 'none';
+}
+
 function objectValue(value: unknown): JsonSchema | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as JsonSchema
