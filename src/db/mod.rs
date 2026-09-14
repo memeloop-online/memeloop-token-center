@@ -141,9 +141,10 @@ pub use providers::{
     ModelPickerConfigurationAvailability, ModelPickerHealthEvidence, ModelPickerItem,
     ModelPickerNamedIdentity, ModelPickerProjectionFilter, ModelPickerProviderIdentity,
     ModelPickerSelectionIdentity, ModelPickerSelectionKind, ModelPickerSource,
-    ModelPickerSourceCapabilities, NativeOAuthImportAccountInput, NativeOAuthImportApproval,
-    NativeOAuthImportCohortResult, ReauthorizeUpstreamAccountInput, ReplaceModelCatalogResult,
-    UpdateModelRouteInput, UpdateUpstreamAccountInput, UpstreamModelCatalogView, UpstreamModelView,
+    ModelPickerSourceCapabilities, NativeCursorImportInput, NativeCursorImportResult,
+    NativeOAuthImportAccountInput, NativeOAuthImportApproval, NativeOAuthImportCohortResult,
+    ReauthorizeUpstreamAccountInput, ReplaceModelCatalogResult, UpdateModelRouteInput,
+    UpdateUpstreamAccountInput, UpstreamModelCatalogView, UpstreamModelView,
 };
 pub use requests::{
     AttachProxyArchiveResult, ConversationDetailFilter, ConversationListFilter,
