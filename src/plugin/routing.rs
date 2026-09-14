@@ -20,8 +20,26 @@ const EXECUTION_LIMIT: Duration = Duration::from_millis(100);
 #[serde(deny_unknown_fields)]
 pub struct GroupRoutingContribution {
     pub version: String,
+    #[serde(default, skip_serializing_if = "GroupRoutingHealthPolicy::is_plugin")]
+    pub health_policy: GroupRoutingHealthPolicy,
     pub schema: Value,
     pub default: Value,
+}
+
+/// Manifest-owned behavior, never an untrusted group configuration switch.
+/// Omitting the field preserves both old behavior and serialized fingerprints.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupRoutingHealthPolicy {
+    #[default]
+    Plugin,
+    Native,
+}
+
+impl GroupRoutingHealthPolicy {
+    fn is_plugin(&self) -> bool {
+        *self == Self::Plugin
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -214,6 +232,16 @@ fn validate_input(input: &GroupRoutingInput) -> Result<(), AppError> {
 }
 
 impl PluginRuntime {
+    pub(crate) fn group_routing_uses_native_health(&self, plugin_id: &str) -> bool {
+        self.plugins
+            .iter()
+            .find(|plugin| plugin.manifest.id == plugin_id)
+            .and_then(|plugin| plugin.manifest.contributions.group_routing.as_ref())
+            .is_some_and(|contribution| {
+                contribution.health_policy == GroupRoutingHealthPolicy::Native
+            })
+    }
+
     pub(crate) fn has_group_routing_hooks(&self) -> bool {
         self.plugins
             .iter()
@@ -376,6 +404,15 @@ mod tests {
                 "providers":[],"operator_ui":[],"service_data":[]
             })
         );
+        let legacy = serde_json::json!({"version":"group-routing-v1", "schema":{"type":"object"}, "default":{}});
+        let parsed: GroupRoutingContribution = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(parsed.health_policy, GroupRoutingHealthPolicy::Plugin);
+        assert_eq!(serde_json::to_value(parsed).unwrap(), legacy);
+        let mut native = legacy;
+        native["health_policy"] = serde_json::json!("native");
+        let parsed: GroupRoutingContribution = serde_json::from_value(native.clone()).unwrap();
+        assert_eq!(parsed.health_policy, GroupRoutingHealthPolicy::Native);
+        assert_eq!(serde_json::to_value(parsed).unwrap(), native);
     }
     fn fixture() -> (GroupRoutingInput, GroupRoutingPlan) {
         let candidate = GroupRoutingCandidate {
