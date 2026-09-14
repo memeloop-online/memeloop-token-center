@@ -52,7 +52,7 @@ pub(super) async fn ensure_baseline(
         });
     }
     let original_entitlement_micros: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(amount_micros), 0) FROM entitlement_usage_allocations WHERE usage_ledger_entry_id = $1",
+        "SELECT CAST(COALESCE(SUM(amount_micros), 0) AS BIGINT) FROM entitlement_usage_allocations WHERE usage_ledger_entry_id = $1",
     )
     .bind(input.settlement_id.to_string())
     .fetch_one(&mut **tx)

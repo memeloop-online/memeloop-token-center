@@ -136,7 +136,7 @@ async fn postgres_settlement_adjustments_serialize_versions_and_namespace_caps()
     );
     assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
     let cumulative: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(desired_rebate_micros), 0) FROM settlement_adjustment_states WHERE account_id = $1 AND settlement_id = $2",
+        "SELECT CAST(COALESCE(SUM(desired_rebate_micros), 0) AS BIGINT) FROM settlement_adjustment_states WHERE account_id = $1 AND settlement_id = $2",
     )
     .bind(fixture.account_id.to_string())
     .bind(fixture.settlement_id.to_string())
