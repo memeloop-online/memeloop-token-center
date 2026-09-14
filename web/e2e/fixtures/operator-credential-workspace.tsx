@@ -210,8 +210,10 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     if (url.pathname === '/internal/v1/keys' && method === 'POST') return json({ key_id: 'key-created', key: 'mts_fixture_created' });
     if (url.pathname === '/internal/v1/keys/key-form/policy' && method === 'PUT') return json({});
     if (url.pathname === '/internal/v1/keys') return json([
-      credential(localStorage.getItem('mtc-locale')?.startsWith('zh') ? '研发工作区' : 'Research workspace', 'tenant-a', 'key-form'),
+      // Match the API's descending (created_at, key_id) keyset order.
+      // These rows share a timestamp, and key-other sorts before key-form.
       ...(parameters.has('multiple-policies') ? [credential('Other workspace', 'tenant-a', 'key-other')] : []),
+      credential(localStorage.getItem('mtc-locale')?.startsWith('zh') ? '研发工作区' : 'Research workspace', 'tenant-a', 'key-form'),
     ]);
   }
   if (url.pathname.endsWith('credential-groups') || url.pathname.endsWith('route-groups')) return json([]);
