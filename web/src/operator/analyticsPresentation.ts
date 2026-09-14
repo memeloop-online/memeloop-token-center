@@ -25,9 +25,9 @@ export function analyticsAge(value: number | null | undefined, locale: Locale): 
 }
 
 export function histogramP95(value: number | null | undefined, capped: boolean | undefined, locale: Locale): FormattedValue {
-  if (value == null || !Number.isFinite(value)) return { text: '—' };
+  if (value == null || !Number.isFinite(value) || value < 0) return { text: '—' };
   const duration = analyticsDuration(value, locale);
-  if (capped === true) return { text: locale === 'zh-CN' ? '>1分钟' : '>1 min', title: locale === 'zh-CN' ? 'P95落在超过60秒的开放区间；精确值未知，不能以60秒作为实际P95。' : 'P95 is in the open-ended >60-second bucket. Its exact value is unknown, not 60 seconds.' };
+  if (capped === true) return { text: locale === 'zh-CN' ? '>1分钟' : '>1 min', title: locale === 'zh-CN' ? 'P95超过60秒；精确值未知，超过当前统计范围。' : 'P95 exceeds 60 seconds. Its exact value is unknown and outside the measured range.' };
   if (value >= 60_000 && capped === undefined) return { text: locale === 'zh-CN' ? '最高统计档' : 'Top histogram bucket', title: locale === 'zh-CN' ? '旧版数据将30–60秒和超过60秒的区间都记为60,000ms，无法区分是否截顶；不是实际P95。' : 'Legacy data maps both 30–60 seconds and >60 seconds to 60,000ms. The exact P95 and overflow state are unknown.' };
   return { text: `≤${duration.text}`, title: locale === 'zh-CN' ? `固定直方图P95所在区间的上界（${formatMilliseconds(value, locale)}），不是精确分位数。` : `Upper bound of the fixed-histogram P95 bucket (${formatMilliseconds(value, locale)}), not an exact percentile.` };
 }
@@ -49,7 +49,7 @@ export function metricArea(values: readonly (number | null)[]): string | undefin
   const flush = () => { if (run.length >= 2) segments.push(`M${run[0][0]},48 ${run.map(([x, y]) => `L${x},${y}`).join(' ')} L${run[run.length - 1][0]},48 Z`); run = []; };
   values.forEach((value, index) => {
     if (value === null || !Number.isFinite(value) || value < 0) { flush(); return; }
-    run.push([Number((index / (values.length - 1) * 200).toFixed(2)), Number((46 - value / maximum * 40).toFixed(2))]);
+    run.push([Number((index / (values.length - 1) * 200).toFixed(2)), Number((48 - value / maximum * 42).toFixed(2))]);
   });
   flush(); return segments.join(' ') || undefined;
 }
