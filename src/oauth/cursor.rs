@@ -98,6 +98,7 @@ fn default_refresh_url() -> String {
 
 #[derive(Clone, Debug)]
 pub struct StartCursorLogin {
+    pub application_plugin_revision: Option<i64>,
     pub tenant_external_id: String,
     pub account_name: String,
     pub provider_driver: String,
@@ -126,6 +127,8 @@ pub struct OAuthLoginStart {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CursorLoginState {
+    #[serde(default)]
+    application_plugin_revision: Option<i64>,
     session_id: Uuid,
     tenant_external_id: String,
     account_name: String,
@@ -143,6 +146,8 @@ struct CursorLoginState {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct CursorLoginSessionToken {
+    #[serde(default)]
+    application_plugin_revision: Option<i64>,
     session_id: Uuid,
     flow_kind: String,
     tenant_external_id: String,
@@ -152,6 +157,8 @@ struct CursorLoginSessionToken {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReadyCursorLogin {
+    #[serde(default)]
+    pub application_plugin_revision: Option<i64>,
     pub session_id: Uuid,
     pub tenant_external_id: String,
     pub account_name: String,
@@ -243,6 +250,7 @@ pub async fn start_cursor_login(
     let expires_at = now.saturating_add(10 * 60 * 1000);
     let session_id = Uuid::now_v7();
     let state = CursorLoginState {
+        application_plugin_revision: input.application_plugin_revision,
         session_id,
         tenant_external_id: input.tenant_external_id,
         account_name: input.account_name.trim().to_owned(),
@@ -257,6 +265,7 @@ pub async fn start_cursor_login(
         reauthorize: input.reauthorize,
     };
     let session = CursorLoginSessionToken {
+        application_plugin_revision: state.application_plugin_revision,
         session_id,
         flow_kind: if oauth_driver == "cursor" {
             "cursor_pkce"
@@ -301,6 +310,34 @@ pub struct CursorPollAuthority<'a> {
     pub required_tenant: Option<&'a str>,
     pub operator_service_id: Option<Uuid>,
     pub allow_test_loopback: bool,
+}
+
+pub(crate) fn cursor_login_application_revision(
+    session_token: &str,
+    key_material: &[u8],
+    now: i64,
+    authority: CursorPollAuthority<'_>,
+) -> Result<Option<i64>, AppError> {
+    let session: CursorLoginSessionToken =
+        open_private_json(session_token, key_material, CURSOR_SESSION_AAD)
+            .map_err(|_| AppError::BadRequest("invalid OAuth session token".into()))?;
+    if authority
+        .required_tenant
+        .is_some_and(|tenant| tenant != session.tenant_external_id)
+        || session.operator_service_id != authority.operator_service_id
+    {
+        return Err(AppError::Forbidden);
+    }
+    if session.expires_at <= now {
+        return Err(AppError::BadRequest("OAuth login session expired".into()));
+    }
+    if session
+        .application_plugin_revision
+        .is_some_and(|revision| revision <= 0)
+    {
+        return Err(AppError::Forbidden);
+    }
+    Ok(session.application_plugin_revision)
 }
 
 pub async fn poll_cursor_login(
@@ -352,6 +389,9 @@ pub async fn poll_cursor_login(
         } => {
             let login: ReadyCursorLogin =
                 open_private_json(&ready_ciphertext, key_material, CURSOR_READY_AAD)?;
+            if login.application_plugin_revision != session.application_plugin_revision {
+                return Err(AppError::Forbidden);
+            }
             if !providers.is_public(&login.provider_driver) {
                 let _ = db
                     .release_oauth_login_poll(session.session_id, lease_owner, now)
@@ -377,6 +417,9 @@ pub async fn poll_cursor_login(
             )?,
         ),
     };
+    if state.application_plugin_revision != session.application_plugin_revision {
+        return Err(AppError::Forbidden);
+    }
     if !providers.is_public(&state.provider_driver) {
         let _ = db
             .release_oauth_login_poll(state.session_id, lease_owner, now)
@@ -481,6 +524,7 @@ pub async fn poll_cursor_login(
         None
     };
     let ready = ReadyCursorLogin {
+        application_plugin_revision: state.application_plugin_revision,
         session_id: state.session_id,
         tenant_external_id: state.tenant_external_id,
         account_name: state.account_name,

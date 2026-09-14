@@ -494,8 +494,24 @@ async fn install_plugin_oci_with_verifier(
     sync_directory(&staging_path).await?;
 
     let target = options.plugin_root.join(&package.id);
-    atomic_noreplace_rename(&options.plugin_root, &staging_path, &package.id)?;
-    staging.disarm();
+    match atomic_noreplace_rename(&options.plugin_root, &staging_path, &package.id) {
+        Ok(()) => staging.disarm(),
+        Err(PluginDistributionError::TargetExists) => {
+            // A registration failure may follow a successful install. Reverify
+            // the signed artifact above, then compare every installed byte with
+            // this verified staging tree. A receipt alone is not authorization.
+            let existing = target.clone();
+            let verified = staging_path.clone();
+            let equal =
+                tokio::task::spawn_blocking(move || identical_packages(&existing, &verified))
+                    .await
+                    .map_err(|_| PluginDistributionError::Storage)??;
+            if !equal {
+                return Err(PluginDistributionError::TargetExists);
+            }
+        }
+        Err(error) => return Err(error),
+    }
     sync_directory(&options.plugin_root).await?;
 
     Ok(InstalledPlugin {
@@ -505,6 +521,64 @@ async fn install_plugin_oci_with_verifier(
         source,
         path: target,
     })
+}
+
+fn identical_packages(left: &Path, right: &Path) -> Result<bool, PluginDistributionError> {
+    use sha2::{Digest, Sha256};
+    use std::{collections::BTreeMap, io::Read};
+    fn fingerprint(root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>, PluginDistributionError> {
+        let mut pending = vec![PathBuf::new()];
+        let mut result = BTreeMap::new();
+        let mut total = 0u64;
+        let mut entries = 0usize;
+        while let Some(relative) = pending.pop() {
+            let path = root.join(&relative);
+            let metadata =
+                std::fs::symlink_metadata(&path).map_err(|_| PluginDistributionError::Storage)?;
+            if metadata.file_type().is_symlink() || relative.as_os_str().len() > MAX_PATH_BYTES {
+                return Err(PluginDistributionError::TargetExists);
+            }
+            if metadata.is_dir() {
+                for entry in
+                    std::fs::read_dir(&path).map_err(|_| PluginDistributionError::Storage)?
+                {
+                    let entry = entry.map_err(|_| PluginDistributionError::Storage)?;
+                    entries += 1;
+                    if entries > MAX_FILES * MAX_PATH_BYTES {
+                        return Err(PluginDistributionError::TargetExists);
+                    }
+                    pending.push(relative.join(entry.file_name()));
+                }
+            } else if metadata.is_file() {
+                if result.len() > MAX_FILES || metadata.len() > MAX_WASM_BYTES {
+                    return Err(PluginDistributionError::TargetExists);
+                }
+                let file =
+                    std::fs::File::open(path).map_err(|_| PluginDistributionError::Storage)?;
+                let mut reader = file.take(MAX_WASM_BYTES + 1);
+                let mut hash = Sha256::new();
+                let mut buffer = [0u8; 65536];
+                loop {
+                    let count = reader
+                        .read(&mut buffer)
+                        .map_err(|_| PluginDistributionError::Storage)?;
+                    if count == 0 {
+                        break;
+                    }
+                    total += count as u64;
+                    if total > MAX_TOTAL_BYTES + 16 * 1024 {
+                        return Err(PluginDistributionError::TargetExists);
+                    }
+                    hash.update(&buffer[..count]);
+                }
+                result.insert(relative, hash.finalize().to_vec());
+            } else {
+                return Err(PluginDistributionError::TargetExists);
+            }
+        }
+        Ok(result)
+    }
+    Ok(fingerprint(left)? == fingerprint(right)?)
 }
 
 #[cfg(target_os = "linux")]

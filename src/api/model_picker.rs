@@ -85,6 +85,7 @@ pub(super) async fn list_model_picker_options(
     if !service.allows("providers:read") {
         return Err(AppError::Forbidden);
     }
+    let state = state.pin_application_plugins().await?;
     let requested_tenant = query.tenant_external_id.trim().to_owned();
     if requested_tenant.is_empty()
         || requested_tenant.len() > 200

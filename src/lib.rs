@@ -211,6 +211,66 @@ impl AppState {
         Ok(self)
     }
 
+    /// Receipt for a state already pinned at the authenticated entry point.
+    pub(crate) fn application_plugin_revision(&self) -> Option<i64> {
+        #[cfg(feature = "experimental-plugin-revisions")]
+        {
+            self.pinned_application_plugins
+                .as_ref()
+                .map(|snapshot| snapshot.receipt.revision)
+        }
+        #[cfg(not(feature = "experimental-plugin-revisions"))]
+        {
+            None
+        }
+    }
+
+    /// Called on the router's startup state after session scope/expiry validation.
+    /// None means startup runtime, never permission to advance to today's head.
+    pub(crate) async fn pin_oauth_application_revision(
+        self,
+        revision: Option<i64>,
+    ) -> Result<Self, error::AppError> {
+        #[cfg(feature = "experimental-plugin-revisions")]
+        {
+            let mut state = self;
+            if let Some(revision) = revision {
+                let authority = state
+                    .application_plugins
+                    .as_ref()
+                    .ok_or(error::AppError::Forbidden)?;
+                let snapshot = authority.pin_historical(revision).await?;
+                return Ok(state.with_pinned_application_plugins(snapshot));
+            }
+            if state.pinned_application_plugins.is_some() {
+                return Err(error::AppError::Forbidden);
+            }
+            state.application_plugins_pinned = true;
+            Ok(state)
+        }
+        #[cfg(not(feature = "experimental-plugin-revisions"))]
+        {
+            if revision.is_some() {
+                return Err(error::AppError::Forbidden);
+            }
+            Ok(self)
+        }
+    }
+
+    /// Install one authoritative historical or current snapshot as an indivisible
+    /// request pin. Nested entry points must not replace it with today's head.
+    #[cfg(feature = "experimental-plugin-revisions")]
+    pub(crate) fn with_pinned_application_plugins(
+        mut self,
+        snapshot: Arc<plugin::application::ApplicationPluginSnapshot>,
+    ) -> Self {
+        self.plugins = snapshot.runtime.runtime().clone();
+        self.providers = snapshot.providers.clone();
+        self.pinned_application_plugins = Some(snapshot);
+        self.application_plugins_pinned = true;
+        self
+    }
+
     /// Called once at a request entry point. A cloned request state retains the
     /// atomic runtime/catalog pair through policy, prepare, retries and normalize.
     pub(crate) async fn pin_application_plugins(self) -> Result<Self, error::AppError> {
@@ -221,9 +281,7 @@ impl AppState {
                 && let Some(authority) = &state.application_plugins
             {
                 if let Some(snapshot) = authority.pin_if_published().await? {
-                    state.plugins = snapshot.runtime.runtime().clone();
-                    state.providers = snapshot.providers.clone();
-                    state.pinned_application_plugins = Some(snapshot);
+                    state = state.with_pinned_application_plugins(snapshot);
                 }
                 state.application_plugins_pinned = true;
             }

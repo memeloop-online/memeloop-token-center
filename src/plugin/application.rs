@@ -84,11 +84,44 @@ pub struct ApplicationPlugins {
     db: Database,
     inventory: tokio::sync::RwLock<BTreeMap<String, PreinstalledInventory>>,
     inventory_file: Option<PathBuf>,
+    inventory_stamp: tokio::sync::Mutex<Option<InventoryStamp>>,
+    #[cfg(test)]
+    inventory_reads: std::sync::atomic::AtomicUsize,
     snapshots: tokio::sync::Mutex<RevisionCache>,
     #[cfg(test)]
     compilations: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     compile_gate: std::sync::Mutex<Option<CompileGate>>,
+}
+
+#[derive(PartialEq, Eq)]
+struct InventoryStamp {
+    length: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    inode: (u64, u64, i64, i64),
+}
+
+impl InventoryStamp {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Result<Self, AppError> {
+        if !metadata.is_file() {
+            return Err(AppError::Forbidden);
+        }
+        Ok(Self {
+            length: metadata.len(),
+            modified: metadata.modified().map_err(|_| AppError::Internal)?,
+            #[cfg(unix)]
+            inode: {
+                use std::os::unix::fs::MetadataExt;
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec(),
+                )
+            },
+        })
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +213,9 @@ impl ApplicationPlugins {
             db,
             inventory: tokio::sync::RwLock::new(inventory),
             inventory_file: None,
+            inventory_stamp: tokio::sync::Mutex::new(None),
+            #[cfg(test)]
+            inventory_reads: std::sync::atomic::AtomicUsize::new(0),
             snapshots: tokio::sync::Mutex::new(RevisionCache::default()),
             #[cfg(test)]
             compilations: std::sync::atomic::AtomicUsize::new(0),
@@ -210,10 +246,25 @@ impl ApplicationPlugins {
         };
         use tokio::io::AsyncReadExt;
         const MAX_INVENTORY_BYTES: u64 = 4 * 1024 * 1024;
+        // Serialize refreshes and inspect the opened inode, not a separate
+        // pathname stat. Atomic rename cannot mix metadata from one revision
+        // with bytes from another. Unchanged inventories never parse again.
+        let mut cached_stamp = self.inventory_stamp.lock().await;
         let file = tokio::fs::File::open(path)
             .await
             .map_err(|_| AppError::Internal)?;
+        let stamp =
+            InventoryStamp::from_metadata(&file.metadata().await.map_err(|_| AppError::Internal)?)?;
+        if cached_stamp.as_ref() == Some(&stamp) {
+            return Ok(());
+        }
+        if stamp.length > MAX_INVENTORY_BYTES {
+            return Err(AppError::Forbidden);
+        }
         let mut bytes = Vec::new();
+        #[cfg(test)]
+        self.inventory_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         file.take(MAX_INVENTORY_BYTES + 1)
             .read_to_end(&mut bytes)
             .await
@@ -241,6 +292,7 @@ impl ApplicationPlugins {
             }
         }
         *inventory = incoming;
+        *cached_stamp = Some(stamp);
         Ok(())
     }
 
@@ -345,10 +397,17 @@ impl ApplicationPlugins {
         } else {
             "reload"
         };
-        self.stage(&input.inventory_id).await?;
         let hash = super::plugin_configuration_schema_digest(
             &json!({ "action": "publish", "inventory_id": input.inventory_id, "expected_revision": input.expected_revision }),
         )?;
+        if let Some(replay) = self
+            .db
+            .replay_application_plugin_operation(key, &hash)
+            .await?
+        {
+            return Ok(replay);
+        }
+        self.stage(&input.inventory_id).await?;
         self.db
             .publish_application_plugin(
                 &input.inventory_id,
@@ -371,6 +430,16 @@ impl ApplicationPlugins {
                 "rollback target must be an earlier revision".into(),
             ));
         }
+        let hash = super::plugin_configuration_schema_digest(
+            &json!({ "action": "rollback", "target_revision": input.target_revision, "expected_revision": input.expected_revision }),
+        )?;
+        if let Some(replay) = self
+            .db
+            .replay_application_plugin_operation(key, &hash)
+            .await?
+        {
+            return Ok(replay);
+        }
         let target = self
             .db
             .application_plugin_revision(input.target_revision)
@@ -379,9 +448,6 @@ impl ApplicationPlugins {
             .load(&target.inventory_id, target.revision, "rollback")
             .await?;
         validate_receipt(&candidate.receipt, &target)?;
-        let hash = super::plugin_configuration_schema_digest(
-            &json!({ "action": "rollback", "target_revision": input.target_revision, "expected_revision": input.expected_revision }),
-        )?;
         self.db
             .publish_application_plugin(
                 &target.inventory_id,
