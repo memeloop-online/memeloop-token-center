@@ -64,7 +64,7 @@ fn streaming_upstream_evidence(
     }
     if matches!(
         sse_summary.map(|summary| &summary.outcome),
-        Some(ResponsesSseOutcome::Failed)
+        Some(ResponsesSseOutcome::Failed | ResponsesSseOutcome::TerminatedIncomplete)
     ) {
         return StreamingUpstreamEvidence::Inconclusive;
     }
@@ -104,7 +104,9 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
     } = input;
     let protocol_error = match sse_summary.as_ref().map(|summary| &summary.outcome) {
         Some(ResponsesSseOutcome::Failed) => Some("upstream_failed_response"),
-        Some(ResponsesSseOutcome::Incomplete) => Some("upstream_incomplete_response"),
+        Some(ResponsesSseOutcome::Incomplete | ResponsesSseOutcome::TerminatedIncomplete) => {
+            Some("upstream_incomplete_response")
+        }
         Some(ResponsesSseOutcome::Completed { .. }) | None => None,
     };
     let (mut terminal_status, mut error_code) = match transport_error {
@@ -133,18 +135,28 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
     let mut charge_contract_ceiling = delivered_billable && error_code.is_some();
     let mut usage_basis = crate::model::RequestUsageBasis::NotObserved;
     // A downstream loss after the complete terminal was captured must not
-    // erase trustworthy provider usage. Incomplete/error frames are not proof;
-    // neither is an arbitrary buffered fragment. Keep the cancellation status.
-    let completed_usage = sse_summary
+    // erase trustworthy provider usage. A validated provider-declared incomplete
+    // terminal also carries final counters; an unknown EOF or error never does.
+    // Keep the cancellation status and validate reservation bounds below.
+    let terminal_usage = sse_summary
         .as_ref()
         .filter(|summary| {
-            matches!(summary.outcome, ResponsesSseOutcome::Completed { .. })
-                && !summary.usage_invalid
+            matches!(
+                summary.outcome,
+                ResponsesSseOutcome::Completed { .. } | ResponsesSseOutcome::TerminatedIncomplete
+            ) && !summary.usage_invalid
+                && !summary.protocol_invalid
+                && !summary.observed_protocol_invalid
+                && (!matches!(summary.outcome, ResponsesSseOutcome::TerminatedIncomplete)
+                    || matches!(
+                        transport_error,
+                        None | Some("downstream_disconnected" | "downstream_backpressure")
+                    ))
         })
         .and_then(|summary| summary.usage.clone());
     let mut usage = if error_code.is_some() {
         if delivered_billable {
-            if let Some(usage) = completed_usage {
+            if let Some(usage) = terminal_usage {
                 charge_contract_ceiling = false;
                 usage_basis = crate::model::RequestUsageBasis::ProviderReported;
                 usage
@@ -232,7 +244,11 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
             match sse_summary.as_ref().map(|summary| &summary.outcome) {
                 Some(ResponsesSseOutcome::Completed { response_id }) => response_id.clone(),
                 None => extract_response_id(&usage_capture),
-                Some(ResponsesSseOutcome::Failed | ResponsesSseOutcome::Incomplete) => None,
+                Some(
+                    ResponsesSseOutcome::Failed
+                    | ResponsesSseOutcome::Incomplete
+                    | ResponsesSseOutcome::TerminatedIncomplete,
+                ) => None,
             }
         } else {
             None

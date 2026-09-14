@@ -13,7 +13,7 @@ pub(crate) async fn classify_media_rate_limit(
 }
 
 #[path = "codex_transport.rs"]
-mod codex_transport;
+pub(in crate::api) mod codex_transport;
 
 mod buffered_upstream;
 mod chat_sse_usage;
