@@ -8,9 +8,11 @@ import type { KeyListCursor, KeyListPage, KeyView } from '../types.js';
 export const keyListPageSize = 100;
 const keyListFetchLimit = keyListPageSize + 1;
 
-export function keyListPath(tenant: string, cursor?: KeyListCursor) {
+export function keyListPath(tenant: string, cursor?: KeyListCursor, filters?: { search?: string; status?: string }) {
   const query = new URLSearchParams({ limit: String(keyListFetchLimit) });
   if (tenant) query.set('tenant_external_id', tenant);
+  if (filters?.search?.trim()) query.set('search', filters.search.trim());
+  if (filters?.status && filters.status !== 'all') query.set('status', filters.status);
   if (cursor) {
     query.set('before_created_at', String(cursor.before_created_at));
     query.set('before_id', cursor.before_id);

@@ -36,11 +36,13 @@ test('the saved status choice is scoped by resource kind and tenant, never by a 
   );
 });
 
-test('every status-bearing operator resource list uses the shared filter rather than a page-local disabled toggle', async () => {
+test('locally loaded operator resources share status filtering', async () => {
   const source = await readFile(new URL('../src/operator/pages/ManagementPages.tsx', import.meta.url), 'utf8');
   const tenantSource = await readFile(new URL('../src/operator/TenantManager.tsx', import.meta.url), 'utf8');
 
-  for (const resource of ['upstreams', 'model-routes', 'credentials', 'service-credentials']) {
+  // The credential directory filters on the server before its keyset limit;
+  // its status behavior is exercised through the real browser workspace.
+  for (const resource of ['upstreams', 'model-routes', 'service-credentials']) {
     assert.match(source, new RegExp(`useResourceListStatusFilter\\('${resource}'`));
   }
   assert.match(source, /<ResourceListStatusFilterControl filter=\{statusFilter\}/);

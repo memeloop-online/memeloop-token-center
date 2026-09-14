@@ -10,7 +10,7 @@ import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/operator/operator.css';
 
-type Scenario = 'all-tenants' | 'route-failure' | 'scope-race' | 'scope-lock' | 'client-recovery' | 'service-copy' | 'service-plaintext' | 'service-scope-aba' | 'client-form';
+type Scenario = 'all-tenants' | 'route-failure' | 'scope-race' | 'scope-lock' | 'client-recovery' | 'service-copy' | 'service-plaintext' | 'service-scope-aba' | 'client-form' | 'client-filter';
 
 interface RecordedRequest {
   method: string;
@@ -230,6 +230,14 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     return json([]);
   }
   if (url.pathname === '/internal/v1/keys') {
+    if (scenario === 'client-filter') {
+      const search = url.searchParams.get('search');
+      const status = url.searchParams.get('status');
+      return json([{
+        ...credential(search === '100%_literal' ? 'Matching older client' : 'Recent client', 'tenant-a', 'key-filter'),
+        status: status ?? 'revoked',
+      }]);
+    }
     const tenant = url.searchParams.get('tenant_external_id');
     if (scenario === 'client-recovery') return json([{
       ...credential('Recoverable client', 'tenant-a', 'key-recovery'),
