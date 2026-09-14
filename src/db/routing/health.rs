@@ -94,6 +94,36 @@ impl UpstreamFailureKind {
 }
 
 impl Database {
+    /// Observe current-generation routing suppression without claiming a probe
+    /// lease or changing circuit-breaker state. A catalog GET cannot prove that
+    /// generation requests have recovered their quota.
+    pub(crate) async fn upstream_manual_health_suppression(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        now: i64,
+    ) -> Result<Option<(String, i64)>, AppError> {
+        let row = sqlx::query(
+            "SELECT health.last_failure_kind, health.cooldown_until, health.probe_lease_until
+             FROM upstream_account_health health
+             JOIN upstream_accounts account ON account.id = health.upstream_account_id
+             WHERE account.id = $1 AND account.credential_generation = $2
+               AND health.credential_generation = $2 AND health.consecutive_failures > 0
+               AND (health.cooldown_until > $3 OR health.probe_lease_until > $3)",
+        )
+        .bind(upstream_account_id.to_string())
+        .bind(credential_generation)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            let cooldown: i64 = row.try_get("cooldown_until")?;
+            let lease: i64 = row.try_get("probe_lease_until")?;
+            Ok((row.try_get("last_failure_kind")?, cooldown.max(lease)))
+        })
+        .transpose()
+    }
+
     pub(crate) async fn upstream_quota_recovery_fence(
         &self,
         upstream_account_id: Uuid,
@@ -596,6 +626,64 @@ mod tests {
         .await
         .unwrap();
         (directory, database, account_id)
+    }
+
+    #[tokio::test]
+    async fn manual_health_observes_cooldown_without_claiming_or_clearing_it() {
+        let (_directory, database, account_id) = fixture().await;
+        database
+            .record_upstream_account_failure(account_id, 1, UpstreamFailureKind::RateLimited)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE upstream_account_health SET cooldown_until = 2000,
+             probe_lease_until = 0, last_failure_kind = 'quota_exhausted'
+             WHERE upstream_account_id = $1",
+        )
+        .bind(account_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                database
+                    .upstream_manual_health_suppression(account_id, 1, 1000)
+                    .await
+                    .unwrap(),
+                Some(("quota_exhausted".to_owned(), 2000))
+            );
+        }
+        assert_eq!(
+            database
+                .upstream_manual_health_suppression(account_id, 2, 1000)
+                .await
+                .unwrap(),
+            None,
+            "a stale credential generation cannot suppress the new one"
+        );
+        assert_eq!(
+            database
+                .upstream_manual_health_suppression(account_id, 1, 2000)
+                .await
+                .unwrap(),
+            None,
+            "reading health must not acquire a half-open lease"
+        );
+        sqlx::query(
+            "UPDATE upstream_account_health SET probe_lease_until = 3000,
+             last_failure_kind = 'rate_limited' WHERE upstream_account_id = $1",
+        )
+        .bind(account_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            database
+                .upstream_manual_health_suppression(account_id, 1, 2000)
+                .await
+                .unwrap(),
+            Some(("rate_limited".to_owned(), 3000))
+        );
     }
 
     #[tokio::test]
