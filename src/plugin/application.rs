@@ -1,4 +1,4 @@
-//! Draft application integration. No automatic production activation. Inventory
+//! Application integration. Host-configured production activation. Inventory
 //! roots and grants are provisioned by the host, never by management requests.
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -27,7 +27,8 @@ static COMPILATION_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
 
 /// Trusted deployment input. Each root must be a distinct immutable revision
 /// directory containing the complete required plugin set, not a mutable symlink.
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreinstalledInventory {
     pub root: PathBuf,
     pub grants: BTreeMap<String, Vec<PluginGrant>>,
@@ -42,6 +43,20 @@ pub struct ApplicationRevision {
     pub(crate) identity_digest: String,
     #[serde(skip)]
     pub(crate) contract_digest: String,
+}
+
+#[derive(Serialize)]
+pub struct ApplicationPluginStatus {
+    pub current: Option<ApplicationRevision>,
+    pub candidates: Vec<ApplicationPluginCandidate>,
+}
+
+#[derive(Serialize)]
+pub struct ApplicationPluginCandidate {
+    pub inventory_id: String,
+    pub staged: bool,
+    /// Host-approved versions only; filesystem roots and provenance stay private.
+    pub plugins: BTreeMap<String, Vec<String>>,
 }
 
 /// One indivisible request pin. Neither field is independently published.
@@ -121,6 +136,32 @@ impl LoadFailure {
 }
 
 impl ApplicationPlugins {
+    pub async fn status(&self) -> Result<ApplicationPluginStatus, AppError> {
+        let current = self.db.optional_application_plugin_head().await?;
+        let staged = self.db.staged_application_plugin_ids().await?;
+        Ok(ApplicationPluginStatus {
+            current,
+            candidates: self
+                .inventory
+                .iter()
+                .map(|(id, entry)| ApplicationPluginCandidate {
+                    inventory_id: id.clone(),
+                    staged: staged.contains(id),
+                    plugins: entry
+                        .grants
+                        .iter()
+                        .map(|(plugin, grants)| {
+                            (
+                                plugin.clone(),
+                                grants.iter().map(|grant| grant.version.clone()).collect(),
+                            )
+                        })
+                        .collect(),
+                })
+                .collect(),
+        })
+    }
+
     pub fn new(
         db: Database,
         inventory: BTreeMap<String, PreinstalledInventory>,
@@ -293,6 +334,22 @@ impl ApplicationPlugins {
         // The cache never supplies authority. Even a warm hit must read the
         // primary head and validate the exact immutable receipt on this request.
         let head = self.db.application_plugin_head().await?;
+        self.pin_revision(head).await
+    }
+
+    pub async fn pin_if_published(
+        self: &Arc<Self>,
+    ) -> Result<Option<Arc<ApplicationPluginSnapshot>>, AppError> {
+        match self.db.optional_application_plugin_head().await? {
+            Some(head) => self.pin_revision(head).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn pin_revision(
+        self: &Arc<Self>,
+        head: ApplicationRevision,
+    ) -> Result<Arc<ApplicationPluginSnapshot>, AppError> {
         let entry = self
             .inventory
             .get(&head.inventory_id)
