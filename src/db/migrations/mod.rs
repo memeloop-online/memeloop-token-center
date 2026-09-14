@@ -501,6 +501,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "client credential lifecycle and creation source",
         sql: include_str!("../../../migrations/common/0094_client_credential_lifecycle.sql"),
     },
+    Migration {
+        version: 96,
+        name: "native Kimi device OAuth sessions",
+        sql: include_str!("../../../migrations/sqlite/0096_kimi_device_oauth.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -987,6 +992,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 94,
         name: "client credential lifecycle and creation source",
         sql: include_str!("../../../migrations/common/0094_client_credential_lifecycle.sql"),
+    },
+    Migration {
+        version: 96,
+        name: "native Kimi device OAuth sessions",
+        sql: include_str!("../../../migrations/postgres/0096_kimi_device_oauth.sql"),
     },
 ];
 

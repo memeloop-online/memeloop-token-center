@@ -8,6 +8,7 @@ pub mod authorization_code;
 pub mod claude;
 pub mod codex_device;
 pub mod copilot;
+pub mod kimi_device;
 mod cursor;
 pub(crate) use cursor::cursor_login_application_revision;
 mod endpoint;

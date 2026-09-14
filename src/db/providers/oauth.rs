@@ -487,6 +487,7 @@ impl Database {
                 | "openai_codex_device"
                 | "anthropic_claude_manual_pkce"
                 | "github_copilot_device"
+                | "kimi-oauth"
         ) {
             return Err(AppError::BadRequest(
                 "unsupported OAuth reauthorization lifecycle".into(),
