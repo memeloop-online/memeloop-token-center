@@ -58,6 +58,7 @@ impl StreamState {
     }
 
     fn observe(&mut self, chunk: &[u8]) -> Result<(), &'static str> {
+        self.event_class = "sse";
         let framed = self.framer.push(chunk);
         if let Some(rejection) = framed.rejection {
             return Err(rejection.error_code());

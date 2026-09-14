@@ -118,9 +118,17 @@ async fn owned_failure_keeps_ingress_identity_clock_and_never_logs_payload() {
         .await;
     tokio::spawn(
         async move {
-            let reason = state
-                .observe(b"data: {\"choices\":\"canary-secret\"}\n\n")
-                .unwrap_err();
+            state
+                .observe(&data(
+                    json!({"id":"test", "object":"chat.completion.chunk", "model":"k3",
+                "choices":[{"index":0,"delta":{"content":"canary-secret"},"finish_reason":null}]}),
+                ))
+                .unwrap();
+            assert_eq!(state.event_class, "choice");
+            let mut oversized = b"data: canary-secret ".to_vec();
+            oversized.resize(crate::api::limits::MAX_RESPONSES_SSE_EVENT_BYTES + 1, b'x');
+            let reason = state.observe(&oversized).unwrap_err();
+            assert_eq!(state.event_class, "sse");
             state.report_failure("observe", reason);
         }
         .with_subscriber(dispatch),
@@ -132,7 +140,11 @@ async fn owned_failure_keeps_ingress_identity_clock_and_never_logs_payload() {
     assert!(!logged.contains("canary-secret"));
     let value: Value = serde_json::from_str(logged.trim()).unwrap();
     assert_eq!(value["fields"]["request_id"], id.to_string());
-    assert_eq!(value["fields"]["error_kind"], "choices_missing");
+    assert_eq!(
+        value["fields"]["error_kind"],
+        "upstream_response_event_too_large"
+    );
+    assert_eq!(value["fields"]["event_class"], "sse");
     assert_eq!(value["fields"]["phase"], "kimi_response_translation");
     assert!(value["fields"]["request_elapsed_ms"].as_i64().unwrap() >= 60_000);
 }
