@@ -682,6 +682,25 @@ impl Database {
         let request_hash = credential_rotation_request_hash(KEY_ROTATION_RESOURCE, key_id);
         let expires_at = now.saturating_add(CREDENTIAL_ROTATION_REPLAY_TTL_MILLIS);
         let mut tx = self.begin_write_transaction().await?;
+        // Share deletion's identity-first lock order. A committed deletion
+        // must fence both new rotations and previously issued replay secrets.
+        let select = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT account_id, alias, currency, credential_generation, status FROM key_records WHERE id = $1 FOR UPDATE"
+            }
+            DatabaseBackend::Sqlite => {
+                "SELECT account_id, alias, currency, credential_generation, status FROM key_records WHERE id = $1"
+            }
+        };
+        let row = sqlx::query(select)
+            .bind(key_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        let status: String = row.try_get("status")?;
+        if status != "active" {
+            return Err(AppError::Forbidden);
+        }
         if let Some(replay) = claim_credential_rotation(
             &mut tx,
             KEY_ROTATION_RESOURCE,
@@ -706,23 +725,6 @@ impl Database {
             return Ok(issued);
         }
 
-        let select = match self.backend {
-            DatabaseBackend::PostgreSql => {
-                "SELECT account_id, alias, currency, credential_generation, status FROM key_records WHERE id = $1 FOR UPDATE"
-            }
-            DatabaseBackend::Sqlite => {
-                "SELECT account_id, alias, currency, credential_generation, status FROM key_records WHERE id = $1"
-            }
-        };
-        let row = sqlx::query(select)
-            .bind(key_id.to_string())
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(AppError::NotFound)?;
-        let status: String = row.try_get("status")?;
-        if status != "active" {
-            return Err(AppError::Forbidden);
-        }
         let generation: i64 = row.try_get::<i64, _>("credential_generation")? + 1;
         let account_id: String = row.try_get("account_id")?;
         let alias: String = row.try_get("alias")?;

@@ -692,6 +692,19 @@ async fn exercise_credential_deletion(state: &AppState) {
     )
     .await;
     assert!(api_only.as_array().unwrap().is_empty());
+    let rotation_path = format!("/internal/v1/keys/{key_id}/rotate");
+    let rotation_idempotency = format!("delete-rotation-{tenant}");
+    let (status, rotated) = json_request(
+        state,
+        "POST",
+        &rotation_path,
+        BOOTSTRAP_TOKEN,
+        Some(&rotation_idempotency),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let issued = rotated;
     // A foreign identity makes the whole batch fail, even after a preceding
     // valid row was locked. There is no partial cross-tenant deletion.
     let foreign = create_credential(
@@ -714,6 +727,20 @@ async fn exercise_credential_deletion(state: &AppState) {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    let (replay_status, replay) = json_request(
+        state,
+        "POST",
+        &rotation_path,
+        BOOTSTRAP_TOKEN,
+        Some(&rotation_idempotency),
+        None,
+    )
+    .await;
+    assert_eq!(replay_status, StatusCode::OK);
+    assert!(
+        replay["key"] == issued["key"],
+        "failed deletion must preserve the rotation replay"
+    );
     assert!(
         state
             .db
@@ -775,6 +802,36 @@ async fn exercise_credential_deletion(state: &AppState) {
     )
     .await;
     assert!(rows.as_array().unwrap().is_empty());
+    let (replay_status, replay) = json_request(
+        state,
+        "POST",
+        &rotation_path,
+        BOOTSTRAP_TOKEN,
+        Some(&rotation_idempotency),
+        None,
+    )
+    .await;
+    assert_eq!(replay_status, StatusCode::FORBIDDEN);
+    assert!(
+        replay.get("key").is_none(),
+        "deleted credentials cannot return replay plaintext"
+    );
+    let evidence_pool = sqlx::AnyPool::connect(&state.config.database_url)
+        .await
+        .unwrap();
+    let remaining_ciphertexts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM credential_rotation_replays WHERE resource_kind = 'key' AND resource_id = $1 AND response_ciphertext IS NOT NULL")
+        .bind(key_id.to_string()).fetch_one(&evidence_pool).await.unwrap();
+    assert_eq!(
+        remaining_ciphertexts, 0,
+        "rotation material must actually be erased, not merely hidden by status"
+    );
+    let retained_replays: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM credential_rotation_replays WHERE resource_kind = 'key' AND resource_id = $1")
+        .bind(key_id.to_string()).fetch_one(&evidence_pool).await.unwrap();
+    assert_eq!(
+        retained_replays, 1,
+        "nonsecret idempotency history stays intact"
+    );
+    evidence_pool.close().await;
     let historical = state.db.key_view(&identity).await.unwrap();
     assert_eq!(historical.alias, "Preserved historical name");
     assert_eq!(historical.available_balance, "7");

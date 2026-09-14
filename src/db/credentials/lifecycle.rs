@@ -39,6 +39,8 @@ impl Database {
                 .bind(now).bind(key_id.to_string()).execute(&mut *tx).await?;
             sqlx::query("UPDATE key_credentials SET revoked_at = COALESCE(revoked_at, $1), secret_plaintext = NULL WHERE key_id = $2")
                 .bind(now).bind(key_id.to_string()).execute(&mut *tx).await?;
+            sqlx::query("UPDATE credential_rotation_replays SET response_ciphertext = NULL WHERE resource_kind = 'key' AND resource_id = $1")
+                .bind(key_id.to_string()).execute(&mut *tx).await?;
             remove_key_credential_recovery_secrets_in_transaction(
                 &mut tx,
                 *key_id,
