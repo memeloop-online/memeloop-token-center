@@ -97,7 +97,7 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     const tableId = recordedRow.locator('.request-id-control.compact code');
     assert.equal(await stage('read table request ID title', () => tableId.getAttribute('title'), history, current), requestId);
     assert.equal(await stage('read table request ID', () => tableId.textContent(), history, current), requestId);
-    assert.match(await stage('read recorded cache split', () => recordedRow.locator('.request-token-cell small').textContent(), history, current) ?? '', /Cache read 40.*Cache write 20/);
+    assert.match(await stage('read recorded cache split', () => recordedRow.locator('.request-token-cell .request-value-info').getAttribute('aria-label'), history, current) ?? '', /Cache read 40.*Cache write 20/);
     const recordedText = await stage('read recorded diagnostics', () => recorded.textContent(), history, current) ?? '';
     assert.match(recordedText, /http_429/);
     assert.match(recordedText, /Production Codex/);
