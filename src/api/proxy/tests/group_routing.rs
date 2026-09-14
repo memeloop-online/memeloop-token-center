@@ -201,6 +201,185 @@ struct HealthSnapshot {
     updated_at: i64,
 }
 
+#[tokio::test]
+#[ignore = "requires MTC_PREFERRED_ACCOUNT_PACKAGE built in CI"]
+async fn preferred_account_real_gateway_uses_order_without_overriding_native_health() {
+    let native = MockServer::start().await;
+    let preferred = MockServer::start().await;
+    for upstream in [&native, &preferred] {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(successful_chat_response())
+            .expect(1)
+            .mount(upstream)
+            .await;
+    }
+    let label = "preferred-account-native-health";
+    let mut fixture =
+        resilient_route_fixture(label, &[(native.uri(), 100), (preferred.uri(), 0)]).await;
+    let tenant_external_id = format!("resilient-{label}");
+    let group = fixture
+        .state
+        .db
+        .create_group(
+            GroupKind::Provider,
+            CreateGroupInput {
+                tenant_external_id: tenant_external_id.clone(),
+                name: "Preferred account".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let group = fixture
+        .state
+        .db
+        .replace_group_members(
+            GroupKind::Provider,
+            group.id,
+            ReplaceGroupMembersInput {
+                tenant_external_id: tenant_external_id.clone(),
+                member_ids: fixture.accounts.clone(),
+                expected_updated_at: group.updated_at,
+            },
+        )
+        .await
+        .unwrap();
+    fixture
+        .state
+        .db
+        .update_group_routing_strategy(
+            GroupKind::Provider,
+            group.id,
+            UpdateGroupRoutingStrategyInput {
+                tenant_external_id,
+                expected_updated_at: group.updated_at,
+                expected_strategy_version: group.strategy_version,
+                routing_strategy: Some(GroupRoutingStrategy {
+                    plugin_id: "mtc-preferred-account".into(),
+                    config: json!({"preferred_account_ids":[fixture.accounts[1].to_string()]}),
+                }),
+                routing_priority: 0,
+            },
+        )
+        .await
+        .unwrap();
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let rows = sqlx::query("SELECT route.id, route.upstream_account_id, account.credential_generation FROM model_routes route JOIN upstream_accounts account ON account.id = route.upstream_account_id WHERE route.tenant_id = $1 ORDER BY route.id")
+        .bind(group.tenant_id.to_string()).fetch_all(&pool).await.unwrap();
+    let mut candidates = Vec::new();
+    let mut preferred_generation = 0;
+    for row in rows {
+        let route: String = row.get("id");
+        let account: String = row.get("upstream_account_id");
+        let generation: i64 = row.get("credential_generation");
+        sqlx::query("INSERT INTO model_route_included_provider_groups (tenant_id,model_route_id,provider_group_id,created_at) VALUES ($1,$2,$3,1)")
+            .bind(group.tenant_id.to_string()).bind(&route).bind(group.id.to_string()).execute(&pool).await.unwrap();
+        let account_id = Uuid::parse_str(&account).unwrap();
+        if account_id == fixture.accounts[1] {
+            preferred_generation = generation;
+        }
+        candidates.push(crate::provider::AuthorizedUpstreamCandidate {
+            route_id: Uuid::parse_str(&route).unwrap(),
+            account_id,
+            driver: "openai".into(),
+            transport_revision: 1,
+            credential_generation: generation,
+        });
+    }
+    pool.close().await;
+    let source = std::path::PathBuf::from(
+        std::env::var("MTC_PREFERRED_ACCOUNT_PACKAGE").expect("real guest package required"),
+    );
+    let root = fixture._directory.path().join("preferred-plugins");
+    let package = root.join("mtc-preferred-account");
+    fs::create_dir_all(&package).unwrap();
+    for name in ["plugin.json", "plugin.wasm"] {
+        fs::copy(source.join(name), package.join(name)).unwrap();
+    }
+    fixture.state.plugins = PluginRuntime::load(root.to_str(), fixture.state.db.clone()).unwrap();
+    crate::group_routing::prepare(
+        &mut fixture.state,
+        group.tenant_id,
+        Uuid::from_u128(7),
+        Uuid::now_v7(),
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        &mut candidates,
+    )
+    .await
+    .unwrap();
+    assert_eq!(candidates[0].account_id, fixture.accounts[1]);
+    let snapshot = fixture.state.group_routing.as_ref().unwrap();
+    for candidate in &candidates {
+        assert!(
+            snapshot
+                .policy(
+                    candidate.route_id,
+                    candidate.account_id,
+                    candidate.credential_generation
+                )
+                .is_none(),
+            "order-only must never install recovery overrides"
+        );
+    }
+    let durable = crate::group_routing::durable::capture(&fixture.state)
+        .unwrap()
+        .unwrap();
+    assert!(durable["policies"].as_array().unwrap().is_empty());
+    let restored = crate::group_routing::durable::restore_selected(
+        &fixture.state,
+        Some(&durable),
+        group.tenant_id,
+        Some(candidates[0].route_id),
+        candidates[0].account_id,
+        Uuid::now_v7(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        restored
+            .group_routing
+            .as_ref()
+            .unwrap()
+            .policy(
+                candidates[0].route_id,
+                candidates[0].account_id,
+                preferred_generation
+            )
+            .is_none()
+    );
+    let response = send_resilient_chat(&fixture, None, false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(
+        preferred.received_requests().await.unwrap().len(),
+        1,
+        "native weighted/rendezvous selection must not overwrite the guest order"
+    );
+    assert!(native.received_requests().await.unwrap().is_empty());
+    fixture
+        .state
+        .db
+        .record_upstream_account_failure(
+            fixture.accounts[1],
+            preferred_generation,
+            UpstreamFailureKind::RateLimitedUntil {
+                until: unix_millis() + 60_000,
+                exhausted: true,
+            },
+        )
+        .await
+        .unwrap();
+    let response = send_resilient_chat(&fixture, None, false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(
+        preferred.received_requests().await.unwrap().len(),
+        1,
+        "known exhausted preferred account must not be contacted"
+    );
+    assert_eq!(native.received_requests().await.unwrap().len(), 1);
+}
+
 async fn health(fixture: &ResilientRouteFixture, tenant: Uuid, generation: i64) -> HealthSnapshot {
     let snapshot = fixture
         .state

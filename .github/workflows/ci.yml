@@ -226,6 +226,7 @@ jobs:
         with:
           toolchain: 1.95.0
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install PostgreSQL and SQLite migration clients
         timeout-minutes: 15
@@ -278,6 +279,21 @@ jobs:
               && mc admin policy create test mtc-list-only /tmp/minio-list-only-policy.json \
               && mc admin policy attach test mtc-list-only --user mtc-list-only'
       - run: cargo fmt --all -- --check
+      - name: Build the fixed preferred-account guest for real host acceptance
+        run: |
+          cargo fmt --manifest-path plugin-sources/preferred-account/Cargo.toml -- --check
+          cargo test --locked --manifest-path plugin-sources/preferred-account/Cargo.toml
+          cargo build --locked --release --target wasm32-unknown-unknown --manifest-path plugin-sources/preferred-account/Cargo.toml
+          curl --fail --location --retry 3 --max-time 120 \
+            https://github.com/bytecodealliance/wasm-tools/releases/download/v1.252.0/wasm-tools-1.252.0-x86_64-linux.tar.gz \
+            --output "$RUNNER_TEMP/preferred-wasm-tools.tar.gz"
+          echo '097b1181d5b2bc3f2ebc44b4e72edf18308902023f1f1483a1a7dc1268ea988d  '"$RUNNER_TEMP/preferred-wasm-tools.tar.gz" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/preferred-tools" "$RUNNER_TEMP/preferred-package"
+          tar -xzf "$RUNNER_TEMP/preferred-wasm-tools.tar.gz" -C "$RUNNER_TEMP/preferred-tools" --strip-components=1
+          cp plugin-sources/preferred-account/plugin.json "$RUNNER_TEMP/preferred-package/plugin.json"
+          "$RUNNER_TEMP/preferred-tools/wasm-tools" component new plugin-sources/preferred-account/target/wasm32-unknown-unknown/release/mtc_preferred_account.wasm \
+            -o "$RUNNER_TEMP/preferred-package/plugin.wasm"
+          "$RUNNER_TEMP/preferred-tools/wasm-tools" validate --features component-model "$RUNNER_TEMP/preferred-package/plugin.wasm"
       - name: Verify default plugin loader compatibility without revision feature
         run: cargo test --locked --no-default-features --test plugin_product loader_feature_boundary
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
@@ -290,6 +306,19 @@ jobs:
           MTC_TEST_S3_SECRET_KEY: token-center-test-secret
           MTC_TEST_S3_LIST_ONLY_ACCESS_KEY: mtc-list-only
           MTC_TEST_S3_LIST_ONLY_SECRET_KEY: mtc-list-only-secret
+      - name: Verify preferred-account guest through the real host and gateway
+        env:
+          MTC_PREFERRED_ACCOUNT_PACKAGE: ${{ runner.temp }}/preferred-package
+        run: |
+          cargo test --locked --all-features --test first_party_preferred_account -- --ignored
+          cargo test --locked --all-features --lib preferred_account_real_gateway -- --ignored
+      - name: Retain the tested preferred-account component
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: preferred-account-component-${{ github.sha }}
+          path: ${{ runner.temp }}/preferred-package/
+          if-no-files-found: error
+          retention-days: 14
 
   migration-smoke:
     needs: changes
