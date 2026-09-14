@@ -56,7 +56,7 @@ test('native OAuth creates with the chosen proxy, preserves direct choice, and r
       const start = page.getByRole('button', { name: '开始登录', exact: true });
       if (profile.endpoint !== 'codex') await page.getByRole('checkbox', { name: '使用账号网络代理' }).check();
       assert.equal(await start.isDisabled(), true);
-      const proxy = page.getByLabel('代理地址', { exact: true });
+      const proxy = page.getByLabel('代理地址 · 必填', { exact: true });
       await proxy.fill('socks5h://8.8.8.8:1080'); assert.equal(await start.isDisabled(), true);
       await proxy.fill('socks5h://10.0.0.8:1080'); assert.equal(await start.isEnabled(), true);
       for (const width of [390, 1440]) {
@@ -72,7 +72,7 @@ test('native OAuth creates with the chosen proxy, preserves direct choice, and r
     for (const profile of profiles.slice(1)) {
       const { page, posts } = await open(profile);
       await page.getByRole('checkbox', { name: '使用账号网络代理' }).check();
-      await page.getByLabel('代理地址', { exact: true }).fill('socks5h://10.0.0.9:1080');
+      await page.getByLabel('代理地址 · 必填', { exact: true }).fill('socks5h://10.0.0.9:1080');
       await choose(page, 'Codex'); await choose(page, profile.display_name);
       assert.equal(await page.getByRole('checkbox', { name: '使用账号网络代理' }).isChecked(), false, 'switching providers clears network choice and draft');
       await page.getByRole('button', { name: '开始登录', exact: true }).click();
