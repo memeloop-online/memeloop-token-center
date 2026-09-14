@@ -68,6 +68,11 @@ export function UpstreamConnection({ account, token, tenant, disabled, onChanged
   owner.current = scope;
   const saving = useRef(false);
   const readEpoch = useRef(0);
+  const lifecycle = useRef(0);
+  useLayoutEffect(() => {
+    lifecycle.current += 1;
+    return () => { lifecycle.current += 1; };
+  }, [scope]);
   useLayoutEffect(() => {
     setConnection(undefined); setReadError(false);
     setProxy(''); setEditing(false); setError(false); setSaved(false);
@@ -83,7 +88,7 @@ export function UpstreamConnection({ account, token, tenant, disabled, onChanged
         setReadError(true); return;
       }
       setConnection(result);
-    }).catch(() => { if (!controller.signal.aborted && owner.current === scope) setReadError(true); });
+    }).catch(() => { if (!controller.signal.aborted && owner.current === scope && readEpoch.current === epoch) setReadError(true); });
     return () => controller.abort();
   }, [scope, requested, disabled]);
   useLayoutEffect(() => {
@@ -97,6 +102,7 @@ export function UpstreamConnection({ account, token, tenant, disabled, onChanged
   async function save() {
     if (!valid || saving.current || disabled || !canEditProxy) return;
     saving.current = true;
+    const version = lifecycle.current;
     readEpoch.current += 1;
     setBusy(true); setError(false); setSaved(false);
     try {
@@ -104,14 +110,14 @@ export function UpstreamConnection({ account, token, tenant, disabled, onChanged
         method: 'PUT', headers: { 'Idempotency-Key': crypto.randomUUID() },
         body: JSON.stringify({ tenant_external_id: tenant, proxy_url: proxy.trim(), expected_updated_at: connection?.updated_at ?? account.updated_at, expected_credential_generation: account.credential_generation }),
       });
-      if (owner.current !== scope) return;
+      if (owner.current !== scope || lifecycle.current !== version) return;
       setConnection({ account_id: updated.id, proxy_url: proxy.trim(), updated_at: updated.updated_at, credential_generation: updated.credential_generation });
       onSaved?.(updated);
       setProxy(''); setSaved(true);
       await onChanged();
       setEditing(false);
-    } catch { if (owner.current === scope) setError(true); }
-    finally { saving.current = false; if (owner.current === scope) setBusy(false); }
+    } catch { if (owner.current === scope && lifecycle.current === version) setError(true); }
+    finally { saving.current = false; if (owner.current === scope && lifecycle.current === version) setBusy(false); }
   }
   return <section className="upstream-connection" aria-label={t('connection.title')}>
     {!embedded && <h3>{t('connection.title')}</h3>}
@@ -130,7 +136,7 @@ export function UpstreamConnection({ account, token, tenant, disabled, onChanged
     {readError && <p role="status">{copy.readFailed}</p>}
     {!requested && !disabled && <Button type="button" appearance="secondary" onClick={() => setRequested(true)}>{copy.viewProxy}</Button>}
     {canEditProxy && <><Button appearance="secondary" type="button" disabled={disabled || busy} onClick={() => { setEditing(!editing); setProxy(editing ? '' : connection?.proxy_url ?? ''); setError(false); setSaved(false); }}>{t(editing ? 'common.cancel' : 'connection.editProxy')}</Button>
-      {editing && <div className="upstream-proxy-editor" onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void save(); } }}>
+      {editing && <div className="upstream-proxy-editor" onKeyDown={(event) => { if (event.key === 'Enter' && event.target instanceof HTMLInputElement) { event.preventDefault(); void save(); } }}>
         <ProxyInput value={proxy} onChange={setProxy} disabled={busy} generic={!codex} />
         {proxy && <CopyButton value={proxy} label={copy.copyProxy} />}
         <Button appearance="primary" type="button" onClick={() => void save()} disabled={disabled || busy || !valid}>{t(busy ? 'common.loading' : 'connection.saveProxy')}</Button>
