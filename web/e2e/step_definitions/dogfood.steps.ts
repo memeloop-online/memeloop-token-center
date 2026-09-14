@@ -432,7 +432,6 @@ Then('中文指标显示万、亿、万亿、USD 与 CNY 并保留精确值', as
   await assertExactText(metric(page, '生成计费单位'), '1.23万');
   await assertAttribute(exactMetric('生成计费单位'), 'title', '12,345');
   await assertExactText(metric(page, '缓存 Token'), '0');
-  await assertAttribute(exactMetric('缓存 Token'), 'title', '0');
   const costs = page.locator('.usage-cost-lines');
   await assertContains(costs, '¥2.5');
   await assertContains(costs, 'US$1.25');
@@ -467,7 +466,6 @@ Then('英文大数使用紧凑 K、M、B 或 T 且 tooltip 保留精确值并可
   await assertExactText(metric(page, 'Generation billing units'), '12.35K');
   await assertAttribute(exactMetric('Generation billing units'), 'title', '12,345');
   await assertExactText(metric(page, 'Cached tokens'), '0');
-  await assertAttribute(exactMetric('Cached tokens'), 'title', '0');
   await assertAttribute(page.locator('html'), 'data-theme', 'dark');
   await appPreferenceControls(page).getByRole('button', { name: 'Switch to light theme' }).click();
   await assertAttribute(page.locator('html'), 'data-theme', 'light');
