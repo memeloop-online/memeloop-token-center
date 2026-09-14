@@ -180,8 +180,14 @@ pub(super) async fn observe_http(
     let started = Instant::now();
     let response = if let Some(route_class) = proxy_diagnostics::route_class(request.uri().path()) {
         let context = proxy_diagnostics::Context::new();
+        let ingress_request_id = proxy_diagnostics::ingress_request_id(
+            request
+                .headers()
+                .get(REQUEST_ID_HEADER)
+                .and_then(|value| value.to_str().ok()),
+        );
         proxy_diagnostics::CONTEXT.scope(context, async move {
-            tracing::info!(request_id = %context.request_id, route_class, phase = "gateway_entry", "proxy request entered gateway");
+            tracing::info!(request_id = %context.request_id, ?ingress_request_id, route_class, phase = "gateway_entry", "proxy request entered gateway");
             let phase = proxy_diagnostics::Phase::new(context, "gateway_response_headers");
             let mut response = next.run(request).await;
             phase.finish("completed", Some(response.status().as_u16()), None);

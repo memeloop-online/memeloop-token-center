@@ -6,6 +6,9 @@ JSON parsing, route preparation, and failed durable admission can return an ID
 without a request record: diagnostics deliberately do not make extra database
 writes, including when storage is unavailable. Ingress failures before MTC
 cannot produce these events; correlate those separately with ingress logs.
+`gateway_entry.ingress_request_id` separately records an incoming `x-request-id`
+only when it parses as a UUID; it never controls the server-owned request ID.
+Use this mapping to join ingress and MTC logs without logging arbitrary headers.
 
 `gateway_entry.route_class` distinguishes `responses` from
 `responses_compact`. The latter is diagnostic recognition, **not** a supported
@@ -28,6 +31,8 @@ An absent hint is not proof that the call was not client-side compaction.
 | terminal_delivery | Terminal handoff/gap acknowledgement and final downstream terminal-frame sends |
 | buffered_archive_settlement / stream_terminal_settlement | Terminal archive/account settlement work |
 | archive_terminal_handoff / archive_eof_drain | Wait for terminal ownership, then writer drain holding HTTP EOF |
+| response_spool_begin / response_spool_append / response_spool_seal | Actual writer database operation, distinguishing acknowledged, rejected and database_error |
+| response_spool_gap_write / response_spool_failed_fence | Owned gap write and failed-writer fence, including late database completion |
 | stream_owner | Streaming owner through terminal reconciliation and archive EOF drain |
 | gateway_response_headers | Entry-to-handler response; **not** end-to-end streaming completion |
 
@@ -38,6 +43,20 @@ proof of upstream delivery. `returned` means an owner returned after handling
 its own errors, not proof that persistence or network delivery succeeded.
 First-byte observations can be after bounded protocol sniffing/prefetching.
 None of these observations authorize retry, change billing, or set health.
+
+For a late `response_spool_writer` failure, first inspect correlated
+`response_spool_producer` and writer outcomes: `queue_capacity`, `queue_closed`,
+`terminal_sender_dropped` and `abandoned_before_*` are not database failures.
+An acknowledged-false write has a `response_spool_write_rejected` event with a
+fixed reason (owner/state/expiry/replay/sequence/capacity). Actual SQLx errors
+retain the existing safe `error_kind` under the `response_archive_database`
+span with the same request ID and operation phase, before conversion to
+`AppError::Internal`. This distinguishes pool timeout, query cancellation and
+other storage classes without retaining SQL messages or bound parameters.
+Normal per-chunk append events are DEBUG, not INFO. One INFO writer summary
+reports append attempts, acknowledged chunks/bytes, total append wait and maximum
+append wait on writer exit; rejected/error appends are WARN immediately. Existing
+log filtering controls detailed append output without a new diagnostic service.
 
 The MTC 503 JSON message `no healthy upstream is currently available` is produced
 after admission by `finish_unavailable` and normally has a durable error code.

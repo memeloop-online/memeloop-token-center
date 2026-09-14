@@ -48,6 +48,10 @@ pub(super) fn route_class(path: &str) -> Option<&'static str> {
     }
 }
 
+pub(super) fn ingress_request_id(value: Option<&str>) -> Option<Uuid> {
+    value.and_then(|value| Uuid::parse_str(value).ok())
+}
+
 pub(super) struct Phase {
     context: Context,
     phase: &'static str,
@@ -219,5 +223,8 @@ mod tests {
         );
         assert_eq!(route_class("/v1/responses/SECRET_CANARY"), None);
         assert_eq!(route_class("/v1/responses?api_key=SECRET_CANARY"), None);
+        assert_eq!(ingress_request_id(Some("SECRET_CANARY")), None);
+        let id = Uuid::new_v4();
+        assert_eq!(ingress_request_id(Some(&id.to_string())), Some(id));
     }
 }
