@@ -284,7 +284,7 @@ impl ResponseArchiveProducer {
     pub(crate) async fn begin(state: &AppState, identity: ArchiveSpoolIdentity) -> Option<Self> {
         let state = state.clone();
         let cleanup_state = state.clone();
-        match bounded_ack(move |_| async move {
+        match bounded_ack(&cleanup_state.clone(), move |_| async move {
             let producer = match Self::begin_inner(state.clone(), identity).await {
                 Ok(producer) => producer,
                 Err(error) => {
@@ -339,7 +339,7 @@ impl ResponseArchiveProducer {
         let seq = self.seq;
         let bytes = self.bytes;
         let cleanup_state = state.clone();
-        match bounded_ack(move |active| async move {
+        match bounded_ack(&cleanup_state.clone(), move |active| async move {
             let _memory = state.metrics.memory_usage(
                 crate::metrics::MemoryComponent::StreamCapture,
                 super::CHUNK_BYTES * 5,
@@ -446,7 +446,7 @@ impl ResponseArchiveProducer {
             bytes,
         } = self;
         let cleanup_state = state.clone();
-        bounded_ack(move |_| async move {
+        bounded_ack(&cleanup_state.clone(), move |_| async move {
             if let Err(error) = Self::seal_inner(state.clone(), identity, seq, bytes).await {
                 fence_failed_capture(&state, identity).await;
                 return Err(error);
@@ -485,15 +485,75 @@ impl ResponseArchiveProducer {
     }
 }
 
-async fn bounded_ack<T, Operation, Ack>(operation: Operation) -> Option<T>
+#[cfg(test)]
+static ACK_CLOCKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+pub(crate) struct CaptureAckClock {
+    database_url: String,
+    expired: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl CaptureAckClock {
+    pub(crate) fn expire(&self) {
+        self.expired.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for CaptureAckClock {
+    fn drop(&mut self) {
+        ACK_CLOCKS.lock().unwrap().remove(&self.database_url);
+    }
+}
+
+/// A fixture-local timer, not a longer production timeout. The test chooses
+/// when ACK time expires while real SQL and scheduler work can still progress.
+#[cfg(test)]
+pub(crate) fn capture_ack_clock_for_test(state: &AppState) -> CaptureAckClock {
+    let expired = Arc::new(tokio::sync::Notify::new());
+    let database_url = state.config.database_url.clone();
+    assert!(
+        ACK_CLOCKS
+            .lock()
+            .unwrap()
+            .insert(database_url.clone(), expired.clone())
+            .is_none()
+    );
+    CaptureAckClock {
+        database_url,
+        expired,
+    }
+}
+
+async fn bounded_ack<T, Operation, Ack>(state: &AppState, operation: Operation) -> Option<T>
 where
     T: Send + 'static,
     Operation: FnOnce(Arc<AtomicBool>) -> Ack,
     Ack: std::future::Future<Output = Result<CaptureAck<T>, AppError>> + Send + 'static,
 {
     let active = Arc::new(AtomicBool::new(true));
-    let result = super::await_owned_with_active(
-        super::ACK_TIMEOUT,
+    #[cfg(not(test))]
+    let _ = state;
+    #[cfg(test)]
+    let clock = ACK_CLOCKS
+        .lock()
+        .unwrap()
+        .get(&state.config.database_url)
+        .cloned();
+    let deadline = async {
+        #[cfg(test)]
+        if let Some(clock) = clock {
+            clock.notified().await;
+            return;
+        }
+        tokio::time::sleep(super::ACK_TIMEOUT).await;
+    };
+    let result = super::await_owned_until(
+        deadline,
         operation(active.clone()),
         "response_spool_ack",
         Some(active),

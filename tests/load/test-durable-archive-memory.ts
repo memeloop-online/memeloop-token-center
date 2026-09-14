@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { allocatorEvidence, inputPlan, memoryVerdict, nativeAllocatorEvidence, outputPlan, permitEvidence, planHash, requestPath, responsesInputPlan, responsesOutputPlan } from "../../ops/benchmark-durable-archive-memory.ts";
+import { allocatorEvidence, inputPlan, memoryVerdict, nativeAllocatorEnvironment, nativeAllocatorEvidence, NATIVE_MMAP_THRESHOLD_BYTES, outputPlan, permitEvidence, planHash, requestPath, responsesInputPlan, responsesOutputPlan } from "../../ops/benchmark-durable-archive-memory.ts";
 import { processMemoryFromProc } from "../../ops/benchmark-memory.ts";
 
 test("request and response plans have exact wire sizes and valid JSON", () => {
@@ -102,4 +102,13 @@ test("CI reuses its exact optimized binary and retains kernel RSS evidence", () 
   assert.match(harness, /process_memory/u);
   assert.match(harness, /mock_pid = process\.pid/u);
   assert.doesNotMatch(harness, /cargo\s+build/u);
+});
+
+test("production and durable acceptance fix the same native mmap threshold", () => {
+  assert.equal(NATIVE_MMAP_THRESHOLD_BYTES, 64 * 1024);
+  assert.deepEqual(nativeAllocatorEnvironment(), {
+    GLIBC_TUNABLES: "glibc.malloc.mmap_threshold=65536",
+  });
+  const dockerfile = readFileSync(new URL("../../Dockerfile", import.meta.url), "utf8");
+  assert.match(dockerfile, /GLIBC_TUNABLES=glibc\.malloc\.mmap_threshold=65536/u);
 });
