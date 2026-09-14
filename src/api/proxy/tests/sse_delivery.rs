@@ -1,5 +1,7 @@
 use super::*;
 
+mod incomplete_usage;
+
 async fn gated_sse_upstream(
     body: Vec<u8>,
 ) -> (

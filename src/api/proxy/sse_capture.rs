@@ -13,6 +13,7 @@ use super::{
 enum ResponsesSseEventKind {
     Lifecycle,
     Completed,
+    ProviderIncomplete,
     Failed,
     Other,
 }
@@ -22,15 +23,17 @@ impl ResponsesSseEventKind {
         match trim_ascii_whitespace(name) {
             b"response.created" | b"response.queued" | b"response.in_progress" => Self::Lifecycle,
             b"response.completed" | b"message_stop" => Self::Completed,
-            b"response.failed" | b"response.incomplete" | b"error" | b"response.error" => {
-                Self::Failed
-            }
+            b"response.incomplete" => Self::ProviderIncomplete,
+            b"response.failed" | b"error" | b"response.error" => Self::Failed,
             _ => Self::Other,
         }
     }
 
     fn is_response_lifecycle(self) -> bool {
-        matches!(self, Self::Lifecycle | Self::Completed | Self::Failed)
+        matches!(
+            self,
+            Self::Lifecycle | Self::Completed | Self::ProviderIncomplete | Self::Failed
+        )
     }
 }
 
@@ -43,6 +46,7 @@ pub(super) struct ResponsesSseCapture {
     observed_protocol_invalid: bool,
     terminal_success: bool,
     terminal_failure: bool,
+    terminal_incomplete: bool,
     usage: Option<TokenUsage>,
     usage_invalid: bool,
     require_explicit_completed: bool,
@@ -71,8 +75,12 @@ pub(super) struct SseDeliveryFrame {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ResponsesSseOutcome {
-    Completed { response_id: Option<String> },
+    Completed {
+        response_id: Option<String>,
+    },
     Failed,
+    /// A provider-declared terminal, not an EOF without a terminal.
+    TerminatedIncomplete,
     Incomplete,
 }
 
@@ -211,6 +219,8 @@ impl ResponsesSseCapture {
             ResponsesSseOutcome::Failed
         } else if self.invalid {
             ResponsesSseOutcome::Incomplete
+        } else if self.terminal_incomplete {
+            ResponsesSseOutcome::TerminatedIncomplete
         } else if self.terminal_success {
             ResponsesSseOutcome::Completed {
                 response_id: self.response_id,
@@ -270,7 +280,8 @@ impl ResponsesSseCapture {
             delivery.frames.push(SseDeliveryFrame {
                 bytes,
                 billable: matches!(class, ChatSseDeliveryClass::Billable),
-                terminal: !self.terminal_failure && (self.terminal_success || self.saw_done),
+                terminal: !self.terminal_failure
+                    && (self.terminal_success || self.terminal_incomplete || self.saw_done),
             });
         }
     }
@@ -359,6 +370,7 @@ impl ResponsesSseCapture {
                 self.usage_invalid = true;
             }
             match event_kind {
+                Some(ResponsesSseEventKind::ProviderIncomplete) => self.invalid = true,
                 Some(ResponsesSseEventKind::Completed) if self.require_explicit_completed => {
                     self.invalid = true;
                 }
@@ -395,12 +407,22 @@ impl ResponsesSseCapture {
             self.invalid = true;
             return ChatSseDeliveryClass::Billable;
         };
+        if self.terminal_incomplete {
+            self.invalid = true;
+            return ChatSseDeliveryClass::Control;
+        }
         let payload_kind = value
             .get("type")
             .and_then(Value::as_str)
             .map(|name| ResponsesSseEventKind::from_name(name.as_bytes()));
-        let usage = if self.responses_delivery == Some(ResponsesDeliveryContract::Codex) {
-            if payload_kind == Some(ResponsesSseEventKind::Completed) {
+        let provider_incomplete = payload_kind == Some(ResponsesSseEventKind::ProviderIncomplete);
+        let usage = if self.responses_delivery == Some(ResponsesDeliveryContract::Codex)
+            || provider_incomplete
+        {
+            if matches!(
+                payload_kind,
+                Some(ResponsesSseEventKind::Completed | ResponsesSseEventKind::ProviderIncomplete)
+            ) {
                 value
                     .get("response")
                     .filter(|response| response.is_object())
@@ -417,6 +439,16 @@ impl ResponsesSseCapture {
             Err(()) => self.usage_invalid = true,
             Ok(None) => {}
             Ok(Some(next)) => {
+                if provider_incomplete
+                    && self.usage.as_ref().is_some_and(|prior| {
+                        prior.input_tokens > next.input_tokens
+                            || prior.output_tokens > next.output_tokens
+                            || prior.cached_input_tokens > next.cached_input_tokens
+                            || prior.cache_write_tokens > next.cache_write_tokens
+                    })
+                {
+                    self.usage_invalid = true;
+                }
                 let current = self.usage.get_or_insert_with(TokenUsage::default);
                 if merge_streaming_usage(current, next).is_err() {
                     self.usage_invalid = true;
@@ -474,6 +506,7 @@ impl ResponsesSseCapture {
                 if self.require_explicit_completed
                     && (self.terminal_success
                         || self.terminal_failure
+                        || self.terminal_incomplete
                         || !matches!(event_response_id, Some(Some(_))))
                 {
                     self.invalid = true;
@@ -482,11 +515,24 @@ impl ResponsesSseCapture {
             }
             ResponsesSseEventKind::Failed => {
                 if self.require_explicit_completed
-                    && (self.terminal_success || self.terminal_failure)
+                    && (self.terminal_success || self.terminal_failure || self.terminal_incomplete)
                 {
                     self.invalid = true;
                 }
                 self.terminal_failure = true;
+            }
+            ResponsesSseEventKind::ProviderIncomplete => {
+                if self.terminal_success
+                    || self.terminal_failure
+                    || self.terminal_incomplete
+                    || !provider_incomplete
+                    || value.pointer("/response/status").and_then(Value::as_str)
+                        != Some("incomplete")
+                    || !matches!(event_response_id, Some(Some(_)))
+                {
+                    self.invalid = true;
+                }
+                self.terminal_incomplete = true;
             }
             ResponsesSseEventKind::Lifecycle | ResponsesSseEventKind::Other => {}
         }
@@ -505,8 +551,13 @@ impl ResponsesSseCapture {
             // delivered in a preceding event.
             (Some(ResponsesDeliveryContract::Compatible), ResponsesSseEventKind::Failed) => true,
             (_, ResponsesSseEventKind::Other) => true,
-            (_, ResponsesSseEventKind::Completed) => completed_response_has_billable_result(value),
+            (_, ResponsesSseEventKind::Completed | ResponsesSseEventKind::ProviderIncomplete) => {
+                completed_response_has_billable_result(value)
+            }
             (_, ResponsesSseEventKind::Lifecycle | ResponsesSseEventKind::Failed) => false,
         }
     }
 }
+
+#[cfg(test)]
+mod incomplete_tests;
