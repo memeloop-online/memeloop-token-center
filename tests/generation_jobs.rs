@@ -21,6 +21,8 @@ use memeloop_token_center::{
 use rust_decimal::Decimal;
 use serde_json::json;
 use sqlx::{AnyPool, Row};
+use std::sync::Arc;
+use tokio::sync::Barrier;
 use uuid::Uuid;
 
 #[path = "generation_jobs/settlement_feed.rs"]
@@ -99,6 +101,42 @@ async fn fixture_with_currency(
         .await
         .unwrap();
     (directory, database, key, upstream.id, price)
+}
+
+#[tokio::test]
+async fn sqlite_concurrent_generation_claims_serialize_without_busy() {
+    let (directory, database, key, upstream_id, price) = fixture().await;
+    let reservation = reserve(&database, &key, &price).await;
+    database
+        .create_generation_job(input(&key, upstream_id, reservation, &price))
+        .await
+        .unwrap();
+
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("generation.db").display()
+    );
+    let contender = Database::connect(&database_url).await.unwrap();
+    let start = Arc::new(Barrier::new(2));
+    let first_start = Arc::clone(&start);
+    let second_start = Arc::clone(&start);
+    let (first, second) = tokio::join!(
+        async move {
+            first_start.wait().await;
+            database.claim_generation_job("sqlite-claim-first").await
+        },
+        async move {
+            second_start.wait().await;
+            contender.claim_generation_job("sqlite-claim-second").await
+        }
+    );
+
+    let claims = [first.unwrap(), second.unwrap()];
+    assert_eq!(
+        claims.into_iter().flatten().count(),
+        1,
+        "concurrent SQLite claimers must serialize to one owner"
+    );
 }
 
 #[tokio::test]
