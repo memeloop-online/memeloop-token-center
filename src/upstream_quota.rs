@@ -57,6 +57,14 @@ struct QuotaRequestContext {
     endpoint_kind: &'static str,
 }
 
+#[derive(Clone)]
+struct CodexQuotaAuth<'a> {
+    credential_header: http::HeaderName,
+    credential_value: http::HeaderValue,
+    account: http::HeaderValue,
+    proxy_url: Option<&'a str>,
+}
+
 impl QuotaRequestContext {
     fn for_account(account: &UpstreamAccountView, endpoint_kind: &'static str) -> Self {
         Self {
@@ -587,24 +595,23 @@ async fn read_codex(
         .request_header(observation_started_at)
         .map_err(|_| "credential_invalid")?
         .ok_or("credential_invalid")?;
-    let proxy_url = credential.proxy().map(|(url, _)| url);
+    let auth = CodexQuotaAuth {
+        credential_header,
+        credential_value,
+        account: account_header,
+        proxy_url: credential.proxy().map(|(url, _)| url),
+    };
     let (usage, reset) = tokio::join!(
         get_codex_json(
             &http,
-            credential_header.clone(),
-            credential_value.clone(),
-            account_header.clone(),
-            proxy_url,
+            auth.clone(),
             USAGE_URL,
             QuotaRequestContext::for_account(account, "usage"),
             budget,
         ),
         get_codex_json(
             &http,
-            credential_header,
-            credential_value,
-            account_header,
-            proxy_url,
+            auth,
             CREDITS_URL,
             QuotaRequestContext::for_account(account, "credits"),
             budget,
@@ -735,10 +742,7 @@ async fn decode_response(
 
 async fn get_codex_json(
     http: &wreq::Client,
-    credential_header: http::HeaderName,
-    credential_value: http::HeaderValue,
-    account: http::HeaderValue,
-    proxy_url: Option<&str>,
+    auth: CodexQuotaAuth<'_>,
     url: &str,
     context: QuotaRequestContext,
     budget: QuotaBudget,
@@ -747,14 +751,14 @@ async fn get_codex_json(
     let mut request = http
         .get(url)
         .default_headers(false)
-        .header(credential_header, credential_value)
+        .header(auth.credential_header, auth.credential_value)
         .header(http::header::ACCEPT, "application/json")
         .header(http::header::ACCEPT_ENCODING, "identity")
         .header(
             http::header::USER_AGENT,
             crate::oauth::managed::codex::USER_AGENT,
         )
-        .header("chatgpt-account-id", account)
+        .header("chatgpt-account-id", auth.account)
         .header(
             "originator",
             if context.endpoint_kind == "credits" {
@@ -766,7 +770,7 @@ async fn get_codex_json(
     if context.endpoint_kind == "credits" {
         request = request.header("openai-beta", "codex-1");
     }
-    if let Some(proxy_url) = proxy_url {
+    if let Some(proxy_url) = auth.proxy_url {
         request =
             request.proxy(wreq::Proxy::all(proxy_url).map_err(|_| "quota_destination_invalid")?);
     }
@@ -997,10 +1001,12 @@ mod tests {
         let task = tokio::spawn(async move {
             get_codex_json(
                 &client,
-                http::header::AUTHORIZATION,
-                http::HeaderValue::from_static("Bearer fixture-token"),
-                http::HeaderValue::from_static("fixture-account"),
-                None,
+                CodexQuotaAuth {
+                    credential_header: http::header::AUTHORIZATION,
+                    credential_value: http::HeaderValue::from_static("Bearer fixture-token"),
+                    account: http::HeaderValue::from_static("fixture-account"),
+                    proxy_url: None,
+                },
                 &url,
                 context,
                 QuotaBudget {
@@ -1094,10 +1100,12 @@ mod tests {
         assert_eq!(
             get_codex_json(
                 &http,
-                credential_header.clone(),
-                credential_value.clone(),
-                account.clone(),
-                None,
+                CodexQuotaAuth {
+                    credential_header: credential_header.clone(),
+                    credential_value: credential_value.clone(),
+                    account: account.clone(),
+                    proxy_url: None,
+                },
                 &format!("{}/usage", server.uri()),
                 usage_context,
                 budget,
@@ -1109,10 +1117,12 @@ mod tests {
         assert_eq!(
             get_codex_json(
                 &http,
-                credential_header,
-                credential_value,
-                account,
-                None,
+                CodexQuotaAuth {
+                    credential_header,
+                    credential_value,
+                    account,
+                    proxy_url: None,
+                },
                 &format!("{}/credits", server.uri()),
                 credits_context,
                 budget,
