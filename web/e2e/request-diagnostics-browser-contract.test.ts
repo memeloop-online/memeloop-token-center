@@ -184,8 +184,15 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
         if (width < 600) {
           await recordedRow.evaluate((row) => row.scrollIntoView({ block: 'start' }));
           const priority = await recordedRow.evaluate((row) => {
-            const box = (selector: string) => { const element = row.querySelector<HTMLElement>(selector)!; const bounds = element.getBoundingClientRect(); return { top: bounds.top, bottom: bounds.bottom, left: bounds.left, right: bounds.right, text: element.innerText }; };
-            return { width: innerWidth, height: innerHeight, model: box('.request-model-cell'), credential: box('.request-credential-cell'), tokens: box('.request-token-cell'), cost: box('.request-cost-cell'), status: box('.request-status-cell'), time: box('.request-time-cell') };
+            const boxes = {} as Record<'model' | 'credential' | 'tokens' | 'cost' | 'status' | 'time', { top: number; bottom: number; left: number; right: number; text: string }>;
+            // Keep this browser closure self-contained: a named nested function
+            // can acquire a tsx __name helper that does not exist in the page.
+            for (const [name, selector] of [['model', '.request-model-cell'], ['credential', '.request-credential-cell'], ['tokens', '.request-token-cell'], ['cost', '.request-cost-cell'], ['status', '.request-status-cell'], ['time', '.request-time-cell']] as const) {
+              const element = row.querySelector<HTMLElement>(selector)!;
+              const bounds = element.getBoundingClientRect();
+              boxes[name] = { top: bounds.top, bottom: bounds.bottom, left: bounds.left, right: bounds.right, text: element.innerText };
+            }
+            return { width: innerWidth, height: innerHeight, ...boxes };
           });
           assert.ok(priority.model.top < priority.credential.top && priority.credential.top < priority.tokens.top, 'mobile rows lead with model and credential, followed by accounting facts');
           assert.ok(priority.time.top > priority.status.top, 'receipt metadata stays secondary to the outcome');
