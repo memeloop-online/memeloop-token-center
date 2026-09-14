@@ -5,6 +5,7 @@ import type { Locator, Page } from 'playwright';
 import { baseURL, eventually, model, requestJson, runtime, tenant } from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
 import { appPreferenceControls, openAppRoute } from './app-route.support.js';
+import { openIndividualAuthorization } from './form-disclosure.support.js';
 
 import { addTypedFilterCondition, assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertVisible, catalogModelSearch, connectOperator, credentialGroupObservations, groupedModel, metric, openCatalogModelPicker, openTypedFilterDialog, operatorTrafficPanel, uuidPattern } from './dogfood.support.js';
 When('上游授权方式包含 Codex、Claude、Copilot 和 Cursor 且仅显示产品接入方式', async function (this: DogfoodWorld) {
@@ -392,6 +393,7 @@ When('管理员用键盘创建提供商组和路由组', { timeout: 120_000 }, a
   const existingRoute = page.locator('tbody tr').filter({ hasText: model });
   await existingRoute.getByRole('button', { name: '编辑', exact: true }).click();
   const staleEditor = page.locator('.create-journey');
+  await openIndividualAuthorization(staleEditor, 'credential');
   const staleCredentialField = staleEditor.locator('.multi-combobox').filter({
     has: page.getByRole('combobox', { name: '授权给具体凭据', exact: true }),
   });
@@ -441,6 +443,7 @@ When('管理员用键盘创建提供商组和路由组', { timeout: 120_000 }, a
   assert.ok(routeGroupListId);
   await assertContains(routeEditor.locator(`#${routeGroupListId}`).getByRole('option'), '创建路由组“默认路由”');
   await routeGroupInput.press('Enter');
+  await openIndividualAuthorization(routeEditor, 'credential');
   const exactCredentialField = routeEditor.locator('.multi-combobox').filter({
     has: page.getByRole('combobox', { name: '授权给具体凭据', exact: true }),
   });
@@ -503,9 +506,15 @@ Then('提供商组参与路由候选而路由组参与凭据授权', async funct
   assert.equal(openedRoutingResponse.status(), 200, `${openedRoutingResponse.request().method()} ${openedRoutingResponse.url()} ${await openedRoutingResponse.text()}`);
   const routing = page.locator('.credential-active-editor .routing-editor');
   await assertVisible(routing);
-  const routeGroupInput = routing.getByRole('combobox', { name: '路由组', exact: true });
+  // `has` is evaluated relative to each field: do not embed the routing
+  // ancestor again, or an existing selected chip becomes unlocatable.
+  const routeGroupField = routing.locator('.multi-combobox').filter({ has: page.getByRole('combobox', { name: '路由组', exact: true }) });
+  const routeGroupInput = routeGroupField.getByRole('combobox', { name: '路由组', exact: true });
+  const selectedRouteGroups = routeGroupField.locator('.selection-chip-label');
   await routeGroupInput.fill('默认路由');
   await routeGroupInput.press('Enter');
+  await assertCount(selectedRouteGroups, 1);
+  await assertExactText(selectedRouteGroups, '默认路由');
   const routingSaved = page.waitForResponse((response) => response.url().endsWith(`/internal/v1/keys/${seed.clientKeyId}/routing`) && response.request().method() === 'PUT');
   await routing.getByRole('button', { name: '保存', exact: true }).click();
   const routingSavedResponse = await routingSaved;
@@ -513,13 +522,16 @@ Then('提供商组参与路由候选而路由组参与凭据授权', async funct
   const routingPayload = routingSavedResponse.request().postDataJSON() as Record<string, unknown>;
   assert.equal(Object.hasOwn(routingPayload, 'expected_updated_at'), false);
   assert.equal(typeof routingPayload.expected_grant_revision, 'number');
+  assert.ok(Array.isArray(routingPayload.route_group_ids));
+  assert.equal(routingPayload.route_group_ids.length, 1, 'saving the selected group must persist exactly one group grant');
   await credential.getByRole('button', { name: '更多操作', exact: true }).click();
   await page.getByRole('menuitem', { name: '路由权限', exact: true }).click();
-  await assertContains(routing, '默认路由');
+  await assertContains(selectedRouteGroups, '默认路由');
   await assertContains(routing, '当前共可使用');
 
   const credentialRoutingPath = `/internal/v1/keys/${seed.clientKeyId}/routing?tenant_external_id=${encodeURIComponent(tenant)}`;
-  const current = await requestJson<{ route_ids: string[]; grant_revision: number }>(credentialRoutingPath, { credential: seed.serviceCredential });
+  const current = await requestJson<{ route_ids: string[]; route_group_ids: string[]; grant_revision: number }>(credentialRoutingPath, { credential: seed.serviceCredential });
+  assert.deepEqual(current.route_group_ids, routingPayload.route_group_ids, 'the reopened selected chip corresponds to the authoritative persisted group grant');
   await requestJson(`/internal/v1/keys/${seed.clientKeyId}/routing`, {
     method: 'PUT',
     credential: seed.serviceCredential,
@@ -529,16 +541,21 @@ Then('提供商组参与路由候选而路由组参与凭据授权', async funct
   await routing.getByRole('button', { name: '保存', exact: true }).click();
   assert.equal((await staleSave).status(), 409);
   await assertContains(page.locator('.create-journey').getByRole('alert'), '你的草稿已保留');
-  await assertContains(routing, '默认路由');
+  await assertContains(selectedRouteGroups, '默认路由');
   await page.locator('.create-journey [data-workspace-toggle]').click();
   await credential.getByRole('button', { name: '更多操作', exact: true }).click();
   await page.getByRole('menuitem', { name: '路由权限', exact: true }).click();
-  await assertNotContains(routing, '默认路由');
+  await assertVisible(routeGroupInput);
+  await assertNoCount(selectedRouteGroups);
   await routeGroupInput.fill('默认路由');
   await routeGroupInput.press('Enter');
   const retrySave = page.waitForResponse((response) => response.url().endsWith(`/internal/v1/keys/${seed.clientKeyId}/routing`) && response.request().method() === 'PUT');
   await routing.getByRole('button', { name: '保存', exact: true }).click();
-  assert.equal((await retrySave).status(), 200);
+  const retryResponse = await retrySave;
+  assert.equal(retryResponse.status(), 200);
+  const retryPayload = retryResponse.request().postDataJSON() as Record<string, unknown>;
+  assert.deepEqual(retryPayload.route_group_ids, routingPayload.route_group_ids, 'retry regrants the same explicitly selected group, not catalog options');
+  assert.deepEqual(retryPayload.route_ids, current.route_ids, 'group changes must preserve existing individual route grants');
 });
 
 When('管理员创建凭据组并按组筛选凭据', async function (this: DogfoodWorld) {

@@ -37,6 +37,7 @@ import { providerConnectionCopy } from '../providerConnectionCopy';
 import { providerFormWidgets } from '../ProviderFormWidgets';
 import { appHref } from '../../app/routes';
 import { credentialFormTemplates } from '../CredentialFormTemplates';
+import { CredentialAuthorizationFields } from '../CredentialAuthorizationFields';
 import { Button, Combobox, Input, Option, Select, DetailTooltip, Disclosure, FormSection } from '../../design-system';
 import { JourneyDisclosure as AdvancedFormSection } from '../JourneyDisclosure';
 import { formJourneyCopy } from '../formJourneyCopy';
@@ -761,7 +762,9 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
     </AdvancedFormSection>
     </FormSection><FormSection title={journey.routeAccess} description={t('routes.accessHint')}>
     <MultiCombobox label={t('routes.routeGroups')} options={routeGroupOptions} value={routeGroupValue} onChange={(selected) => onChange({ ...draft, route_group_ids: selected.filter((item) => !item.created).map((item) => item.value), route_group_names: selected.filter((item) => item.created).map((item) => item.label) })} placeholder={t('routes.searchOrCreateRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} allowCreate createLabel={(name) => t('routes.createRouteGroupNamed', { name })} hint={t('routes.routeGroupsHint')} />
-    <ExactCredentialCombobox token={token} tenant={tenant} credentials={credentials} value={draft.granted_credential_ids} onChange={(granted_credential_ids) => onChange({ ...draft, granted_credential_ids })} />
+    <AdvancedFormSection action title={t('routes.individualGrants', { count: draft.granted_credential_ids.length })} description={t('routes.individualGrantsHint')}>
+      <ExactCredentialCombobox token={token} tenant={tenant} credentials={credentials} value={draft.granted_credential_ids} onChange={(granted_credential_ids) => onChange({ ...draft, granted_credential_ids })} />
+    </AdvancedFormSection>
     </FormSection>
     <section className="form-journey-preview" aria-label={journey.preview}>
       <h4>{journey.preview}</h4>
@@ -974,6 +977,8 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const [grant, setGrant] = useState({ amount: '', source: '' });
   const [busy, setBusy] = useState('');
   const [newRouteIds, setNewRouteIds] = useState<string[]>([]);
+  const [createCredentialDraft, setCreateCredentialDraft] = useState<Record<string, unknown>>();
+  const [policyDrafts, setPolicyDrafts] = useState<Record<string, KeyView['policy']>>({});
   const [newRouteGroupIds, setNewRouteGroupIds] = useState<string[]>([]);
   const [groupFilter, setGroupFilter] = useState('all');
   const [search, setSearch] = useState('');
@@ -1080,7 +1085,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
     secretRequest.current?.abort(); secretRequest.current = undefined; secretOperation.current = undefined; secretRef.current = undefined;
     routingSaveLock.current = undefined; scopeGeneration.current += 1; setValues([]); setRoutes([]); setEditingPolicy(undefined); setEditingRouting(undefined); setRoutingDraft(undefined);
     setRenaming(undefined); setAliasDraft(''); setLimitSnapshots({}); setGranting(undefined); setGrant({ amount: '', source: '' }); setBusy('');
-    setNewRouteIds([]); setNewRouteGroupIds([]); setGroupFilter('all'); setSearch(''); setNextCursor(undefined); setKeyListState('initial-loading'); setKeyError(''); setRouteError(''); setSecret(undefined); setMessage(''); setError(''); void load();
+    setPolicyDrafts({}); setCreateCredentialDraft(undefined); setNewRouteIds([]); setNewRouteGroupIds([]); setGroupFilter('all'); setSearch(''); setNextCursor(undefined); setKeyListState('initial-loading'); setKeyError(''); setRouteError(''); setSecret(undefined); setMessage(''); setError(''); void load();
     return () => { keyRequest.current?.controller.abort(); routeRequest.current?.controller.abort(); secretRequest.current?.abort(); };
   }, [token, tenant, writeTenant]);
   const loadMore = async () => {
@@ -1238,6 +1243,10 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
     try {
       await api(`/internal/v1/keys/${value.key_id}/${suffix}`, token, { method: suffix === 'alias' ? 'PATCH' : 'PUT', body: JSON.stringify(body) });
       if (!current()) return;
+      if (suffix === 'policy') setPolicyDrafts(current => {
+        const { [value.key_id]: _savedDraft, ...remaining } = current;
+        return remaining;
+      });
       setWorkspace(undefined); await load(); if (current()) setMessage(success);
     } catch (reason) { if (current()) setError(messageOf(reason, t('common.requestFailed'))); }
     finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); }
@@ -1246,10 +1255,9 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const credentialEditor = (value: KeyView) => <div ref={activeEditorRegion} className="credential-active-editor">
           {renaming === value.key_id && <div className="inline-editor form-panel"><h3>{t('credentials.renameFor', { alias: value.alias })}</h3><label>{t('schema.Credential alias')}<Input value={aliasDraft} maxLength={200} onChange={(event) => setAliasDraft(event.target.value)} /></label><Button appearance="primary" type="button" disabled={!canWrite || !aliasDraft.trim()} onClick={() => void saveCredentialConfiguration(value, 'alias', { alias: aliasDraft }, t('credentials.renamed', { alias: aliasDraft.trim() }))}>{t('common.save')}</Button></div>}
           {workspace?.kind === 'limits' && (limitSnapshots[value.key_id] ? <LimitSnapshot value={limitSnapshots[value.key_id]} /> : <p role="status">{t('common.loading')}</p>)}
-          {editingPolicy === value.key_id && policyFormSchema && <div className="inline-editor form-panel"><h3>{t('credentials.policyFor', { alias: value.alias })}</h3><CredentialPolicySummary policy={value.policy} currency={value.currency} /><Form key={`${value.key_id}-${locale}`} schema={localizeSchema(policyFormSchema as RJSFSchema, locale)} formData={value.policy} uiSchema={credentialPolicyUiSchema} fields={credentialFormFields} validator={validator} templates={credentialFormTemplates} widgets={fluentFormWidgets} onSubmit={({ formData }) => void saveCredentialConfiguration(value, 'policy', formData, t('credentials.policySaved'))}><Button appearance="primary" type="submit" disabled={!canWrite}>{t('common.save')}</Button></Form></div>}
+          {editingPolicy === value.key_id && policyFormSchema && <div className="inline-editor form-panel"><h3>{t('credentials.policyFor', { alias: value.alias })}</h3><CredentialPolicySummary policy={value.policy} currency={value.currency} /><Form key={value.key_id} schema={localizeSchema(policyFormSchema as RJSFSchema, locale)} formData={policyDrafts[value.key_id] ?? value.policy} onChange={({ formData }) => setPolicyDrafts(current => ({ ...current, [value.key_id]: formData }))} uiSchema={credentialPolicyUiSchema} fields={credentialFormFields} validator={validator} templates={credentialFormTemplates} widgets={fluentFormWidgets} onSubmit={({ formData }) => void saveCredentialConfiguration(value, 'policy', formData, t('credentials.policySaved'))}><Button appearance="primary" type="submit" disabled={!canWrite || Boolean(busy)}>{t('common.save')}</Button></Form></div>}
           {editingRouting === value.key_id && routingDraft && <div className="inline-editor form-panel routing-editor"><h3>{t('credentials.routingFor', { alias: value.alias })}</h3><p className="muted">{t('credentials.routingHint')}</p>
-            <MultiCombobox label={t('credentials.exactRoutes')} options={routeOptions} value={selections(routingDraft.route_ids, routeOptions)} onChange={(selected) => setRoutingDraft({ ...routingDraft, route_ids: selected.map((item) => item.value) })} placeholder={t('credentials.searchRoutes')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} />
-            <MultiCombobox label={t('credentials.routeGroups')} options={routeGroupOptions} value={selections(routingDraft.route_group_ids, routeGroupOptions)} onChange={(selected) => setRoutingDraft({ ...routingDraft, route_group_ids: selected.map((item) => item.value) })} placeholder={t('credentials.searchRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('credentials.existingGroupsOnly')} />
+            <CredentialAuthorizationFields routes={routeOptions} groups={routeGroupOptions} routeIds={routingDraft.route_ids} groupIds={routingDraft.route_group_ids} onRoutes={route_ids => setRoutingDraft({ ...routingDraft, route_ids })} onGroups={route_group_ids => setRoutingDraft({ ...routingDraft, route_group_ids })} />
             {routingDraft.effective_route_ids.length > 0 && <small className="field-hint">{t('credentials.effectiveRoutes', { count: formatNumber(routingDraft.effective_route_ids.length, locale) })}</small>}
             <Button appearance="primary" type="button" disabled={!canWrite || Boolean(busy)} onClick={() => void saveRouting(value, routingDraft)}>{t('common.save')}</Button>
           </div>}
@@ -1298,7 +1306,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
       {(error || routeError || routeGroups.error) && <div className="notice error" role="alert">{error || routeError || routeGroups.error}</div>}
       {activeCredential && credentialEditor(activeCredential)}
       <div hidden={workspace?.kind !== 'create'}>
-      {createFormSchema ? <Form key={`${tenant}-${writeTenant}-${locale}`} schema={localizeSchema(createFormSchema as RJSFSchema, locale)} uiSchema={credentialCreateUiSchema} fields={credentialFormFields} validator={validator} widgets={fluentFormWidgets} templates={credentialFormTemplates} onSubmit={async ({ formData }) => {
+      {createFormSchema ? <Form key={`${tenant}-${writeTenant}`} schema={localizeSchema(createFormSchema as RJSFSchema, locale)} formData={createCredentialDraft} onChange={({ formData }) => setCreateCredentialDraft(formData)} uiSchema={{ ...credentialCreateUiSchema, principal_external_id: { 'ui:help': t('credentials.principalHelp') } }} formContext={{ authorizationFields: <FormSection title={formJourneyCopy(locale).access} description={t('credentials.createRoutingHint')}><CredentialAuthorizationFields routes={routeOptions} groups={routeGroupOptions} routeIds={newRouteIds} groupIds={newRouteGroupIds} onRoutes={setNewRouteIds} onGroups={setNewRouteGroupIds} /></FormSection> }} fields={credentialFormFields} validator={validator} widgets={fluentFormWidgets} templates={credentialFormTemplates} onSubmit={async ({ formData }) => {
         if (!writeTenant) return;
         const operation = beginSecretOperation();
         if (!operation) return;
@@ -1310,17 +1318,14 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
         try {
           const created = await api<{ key: string; key_id: string }>('/internal/v1/keys', operationToken, { ...secretResponseRequestPolicy, method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: operationWriteTenant, route_ids: newRouteIds, route_group_ids: newRouteGroupIds }), signal: controller.signal });
           if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
-          setNewRouteIds([]); setNewRouteGroupIds([]); showSecret({ value: created.key, recovered: false, displayId: crypto.randomUUID() }); setMessage(t(newRouteIds.length || newRouteGroupIds.length ? 'credentials.created' : 'credentials.createdNoRoutes')); await load();
+          setCreateCredentialDraft(undefined); setNewRouteIds([]); setNewRouteGroupIds([]); showSecret({ value: created.key, recovered: false, displayId: crypto.randomUUID() }); setMessage(t(newRouteIds.length || newRouteGroupIds.length ? 'credentials.created' : 'credentials.createdNoRoutes')); await load();
         } catch (reason) {
           if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setError(messageOf(reason, t('common.requestFailed')));
         } finally {
           if (secretRequest.current === controller) secretRequest.current = undefined;
           if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) finishSecretOperation(operation);
         }
-      }}><FormSection title={formJourneyCopy(locale).access} description={t('credentials.createRoutingHint')}>
-        <MultiCombobox label={t('credentials.exactRoutes')} options={routeOptions} value={selections(newRouteIds, routeOptions)} onChange={(selected) => setNewRouteIds(selected.map((item) => item.value))} placeholder={t('credentials.searchRoutes')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} />
-        <MultiCombobox label={t('credentials.routeGroups')} options={routeGroupOptions} value={selections(newRouteGroupIds, routeGroupOptions)} onChange={(selected) => setNewRouteGroupIds(selected.map((item) => item.value))} placeholder={t('credentials.searchRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('credentials.existingGroupsOnly')} />
-      </FormSection><div className="journey-actions"><p>{newRouteIds.length || newRouteGroupIds.length ? t('credentials.createRoutingHint') : formJourneyCopy(locale).draftNoRoutes}</p><Button appearance="primary" type="submit" disabled={!canWrite || Boolean(busy) || Boolean(visibleSecret)}>{busy === 'create-credential' ? t('common.loading') : t('credentials.create')}</Button></div></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
+      }}><div className="journey-actions"><p>{newRouteIds.length || newRouteGroupIds.length ? t('credentials.createRoutingHint') : formJourneyCopy(locale).draftNoRoutes}</p><Button appearance="primary" type="submit" disabled={!canWrite || Boolean(busy) || Boolean(visibleSecret)}>{busy === 'create-credential' ? t('common.loading') : t('credentials.create')}</Button></div></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
       </div>
     </CreateJourney>
   </section>{writeTenant && <section className="credential-group-workspace"><Disclosure title={t('groups.credential.title')}><GroupManager kind="credential" token={token} tenant={writeTenant} groups={credentialGroups.groups} resources={values.filter(canManage).map((value) => ({ value: value.key_id, label: value.alias, description: value.key_id }))} onChanged={credentialGroups.load} /></Disclosure></section>}</>;

@@ -96,8 +96,10 @@ export function ModelPicker({ label, value, onChange, options, disabled = false,
     if (event.relatedTarget && !event.currentTarget.contains(event.relatedTarget as Node)) close();
   }}>
     <label id={`${id}-label`} htmlFor={`${id}-input`}>{label}</label>
+    {/* Open editable input on click/type/arrow, not focus: pointer focus happens
+        before native light dismissal and would close a just-opened popup. */}
     {editable ? <input ref={anchor} id={`${id}-input`} role="combobox" aria-autocomplete="list" aria-expanded={open} aria-controls={`${id}-list`} aria-activedescendant={activeId} aria-describedby={describedBy} aria-invalid={invalid} disabled={disabled} autoComplete="off" value={value}
-      onClick={show} onFocus={show} onKeyDown={keyboard} onChange={(event) => { onChange(event.target.value); onQueryChange?.(event.target.value); setActive(-1); show(); }} />
+      onClick={show} onKeyDown={keyboard} onChange={(event) => { onChange(event.target.value); onQueryChange?.(event.target.value); setActive(-1); show(); }} />
       : <button ref={anchor} id={`${id}-input`} type="button" className="secondary model-picker-trigger" aria-labelledby={`${id}-label ${id}-value`} aria-describedby={describedBy} aria-haspopup="dialog" aria-expanded={open} aria-controls={`${id}-popover`} disabled={disabled} onClick={() => open ? close() : show()} onKeyDown={keyboard}><span id={`${id}-value`}>{selected?.label || value || t('common.select')}</span><span aria-hidden="true">⌄</span></button>}
     {open && <section ref={panel} id={`${id}-popover`} className="shared-model-popover" popover="auto" style={position} role="dialog" aria-modal="false" aria-label={popupLabel || t('filter.catalogModels')} onToggle={(event) => { if (event.target === event.currentTarget && event.newState === 'closed') close(); }}>
       {!editable && <input ref={searchInput} autoFocus role="combobox" aria-label={t('filter.searchCatalog')} aria-autocomplete="list" aria-expanded="true" aria-controls={`${id}-list`} aria-activedescendant={activeId} placeholder={t('filter.searchCatalog')} value={search} onKeyDown={keyboard} onChange={(event) => { setSearch(event.target.value); onQueryChange?.(event.target.value); setActive(-1); }} />}

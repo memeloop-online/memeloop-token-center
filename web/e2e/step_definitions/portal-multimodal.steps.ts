@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { openIndividualAuthorization } from './form-disclosure.support.js';
 import { readFile } from 'node:fs/promises';
 import { Given, Then, When } from '@cucumber/cucumber';
 import type { Locator, Page } from 'playwright';
@@ -553,6 +554,7 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await credentialForm.locator('#root_initial_balance').fill('10');
   await assertNoCount(credentialForm.locator('#root_policy_allowed_models'));
   const newCredentialRoutes = credentialPanel.getByRole('combobox', { name: '具体路由', exact: true });
+  await openIndividualAuthorization(credentialPanel, 'model');
   await newCredentialRoutes.fill(imageModel);
   await newCredentialRoutes.press('Enter');
   await newCredentialRoutes.fill(videoModel);
