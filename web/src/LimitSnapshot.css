@@ -1,0 +1,4 @@
+.limit-snapshot h3 { margin-top: 0; }
+.limit-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr)); gap: 20px 28px; }
+.limit-cell { display: flex; flex-direction: column; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+.limit-cell > b, .limit-cell > small { color: var(--colorNeutralForeground2); font-size: 12px; font-weight: 400; }

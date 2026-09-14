@@ -133,6 +133,15 @@ export function formatCurrencyDisplay(value: string | number | null | undefined,
   return { text, title };
 }
 
+/** Compact monetary overview; retain the original decimal string in the tooltip. */
+export function formatCompactCurrency(value: string | number | null | undefined, currency: string, locale: Locale): FormattedValue {
+  const exact = formatCurrency(value, currency, locale);
+  const numeric = value == null || value === '' ? NaN : Number(value);
+  if (!Number.isFinite(numeric) || Math.abs(numeric) < 10_000) return formatCurrencyDisplay(value, currency, locale);
+  const compact = formatMetricDisplay(numeric, locale).text;
+  return { text: `${compact} ${currency}`, title: exact };
+}
+
 export function formatPercent(value: number | null | undefined, locale: Locale) {
   if (value === null || value === undefined || !Number.isFinite(value)) return '—';
   const options: Intl.NumberFormatOptions = {
