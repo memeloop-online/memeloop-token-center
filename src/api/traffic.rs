@@ -362,6 +362,8 @@ async fn apply_traffic_plugin(
         .resolved_traffic_configurations(key.tenant_id)
         .await?;
     let plugin_request = original_request_json.clone();
+    #[cfg(feature = "experimental-plugin-revisions")]
+    let application_snapshot = state.pinned_application_plugins.clone();
     let plugin_context = RequestContext {
         tenant_id: key.tenant_id.to_string(),
         principal_id: key.principal_id.to_string(),
@@ -378,6 +380,15 @@ async fn apply_traffic_plugin(
     let plugin_task = tokio::task::spawn_blocking(move || {
         let _plugin_permit = plugin_permit;
         let _temporary_memory = temporary_memory;
+        #[cfg(feature = "experimental-plugin-revisions")]
+        if let Some(snapshot) = application_snapshot {
+            return snapshot.runtime.apply_traffic_with_config_and_memory(
+                plugin_context,
+                &plugin_request,
+                &plugin_configurations,
+                memory.as_deref(),
+            );
+        }
         plugins.apply_traffic_with_config_and_memory(
             plugin_context,
             &plugin_request,

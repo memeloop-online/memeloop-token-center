@@ -176,6 +176,16 @@ impl RuntimeSnapshot {
         request: &serde_json::Value,
         configurations: &BTreeMap<String, serde_json::Value>,
     ) -> Result<TrafficDecision, AppError> {
+        self.apply_traffic_with_config_and_memory(context, request, configurations, None)
+    }
+
+    pub(crate) fn apply_traffic_with_config_and_memory(
+        &self,
+        context: types::RequestContext,
+        request: &serde_json::Value,
+        configurations: &BTreeMap<String, serde_json::Value>,
+        memory: Option<&crate::gateway_body::memory::ProxyMemoryReservation>,
+    ) -> Result<TrafficDecision, AppError> {
         let mut current = request.clone();
         let mut decision = TrafficDecision {
             allow: true,
@@ -198,8 +208,12 @@ impl RuntimeSnapshot {
             // budgets. Restrict this invocation to exactly one installed plugin.
             let mut runtime = self.runtime.clone();
             runtime.plugins = Arc::new(vec![plugin.clone()]);
-            let result =
-                runtime.apply_traffic_with_config(context.clone(), &current, configurations);
+            let result = runtime.apply_traffic_with_config_and_memory(
+                context.clone(),
+                &current,
+                configurations,
+                memory,
+            );
             let mut circuits = self.circuits.lock().map_err(|_| AppError::Internal)?;
             let circuit = circuits.entry(id.clone()).or_default();
             circuit.complete(&epoch, result.is_err(), Instant::now());
@@ -388,7 +402,11 @@ fn next_revision(state: &State, expected: u64) -> Result<u64, AppError> {
     expected.checked_add(1).ok_or(AppError::Internal)
 }
 
-fn snapshot(runtime: PluginRuntime, revision: u64, reason: RevisionReason) -> Arc<RuntimeSnapshot> {
+pub(super) fn snapshot(
+    runtime: PluginRuntime,
+    revision: u64,
+    reason: RevisionReason,
+) -> Arc<RuntimeSnapshot> {
     tracing::info!(
         event = "plugin_runtime_revision_published",
         schema_version = 1_u8,
@@ -403,7 +421,7 @@ fn snapshot(runtime: PluginRuntime, revision: u64, reason: RevisionReason) -> Ar
     })
 }
 
-fn validate_grants(
+pub(super) fn validate_grants(
     runtime: &PluginRuntime,
     grants: &BTreeMap<String, Vec<PluginGrant>>,
 ) -> Result<(), AppError> {

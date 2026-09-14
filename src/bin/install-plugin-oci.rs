@@ -20,6 +20,11 @@ struct Arguments {
     #[arg(long, env = "MTC_PLUGIN_DIR")]
     plugin_dir: PathBuf,
 
+    /// Install into a revision-specific root. Existing package IDs are never
+    /// overwritten; use a new inventory ID for each complete rollout inventory.
+    #[arg(long)]
+    inventory_id: Option<String>,
+
     /// Exact allowed registry/repository, for example ghcr.io/memeloop/plugins.
     #[arg(
         long = "allowed-source",
@@ -50,6 +55,20 @@ struct Arguments {
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let arguments = Arguments::parse();
     let credentials = credentials(&arguments)?;
+    let plugin_root = match &arguments.inventory_id {
+        Some(id) => {
+            if id.is_empty()
+                || id.len() > 64
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                return Err("invalid inventory ID".into());
+            }
+            arguments.plugin_dir.join(id)
+        }
+        None => arguments.plugin_dir.clone(),
+    };
     let public_keys = arguments
         .cosign_public_keys
         .iter()
@@ -57,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .collect::<Result<Vec<_>, _>>()?;
     let installed = install_plugin_oci(&InstallPluginOptions {
         reference: arguments.reference,
-        plugin_root: arguments.plugin_dir,
+        plugin_root,
         allowed_sources: arguments
             .allowed_sources
             .into_iter()

@@ -442,6 +442,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../../migrations/common/0082_conversation_candidate_indexes.sql"),
     },
     Migration {
+        version: 83,
+        name: "global application plugin revision authority",
+        sql: include_str!("../../../migrations/common/0083_application_plugin_revisions.sql"),
+    },
+    Migration {
         version: 84,
         name: "copyable credential plaintext",
         sql: include_str!("../../../migrations/common/0084_copyable_credential_plaintext.sql"),
@@ -872,6 +877,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 82,
         name: "bounded conversation candidate lookups",
         sql: include_str!("../../../migrations/common/0082_conversation_candidate_indexes.sql"),
+    },
+    Migration {
+        version: 83,
+        name: "global application plugin revision authority",
+        sql: include_str!("../../../migrations/common/0083_application_plugin_revisions.sql"),
     },
     Migration {
         version: 84,

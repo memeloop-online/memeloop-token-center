@@ -23,6 +23,7 @@ pub(in crate::api) async fn create_generation_for_modality(
     requested_modality: Option<&'static str>,
 ) -> Result<Response, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
+    let state = state.pin_application_plugins().await?;
     let routing_selection_seed = Uuid::now_v7();
     let applied = apply_traffic_policy(
         &state,
