@@ -108,6 +108,14 @@ impl Database {
         .to_hex()
         .to_string();
         let mut tx = self.begin_write_transaction().await?;
+        // Tenant lifecycle writers lock this row before touching scoped actor
+        // credentials. Preserve that order and retain the lock through replay
+        // or settlement, not merely through an earlier API authorization read.
+        let tenant = sqlx::query("UPDATE tenants SET updated_at = updated_at WHERE external_id = $1 AND status = 'active'")
+            .bind(input.tenant_external_id).execute(&mut *tx).await?;
+        if tenant.rows_affected() != 1 {
+            return Err(AppError::Forbidden);
+        }
         // Lock current service identity/credential, and recheck permission even
         // for replay. Revocation or tenant reassignment cannot race the write.
         let actor = sqlx::query("UPDATE service_principals SET updated_at = updated_at WHERE id = $1 AND status = 'active' AND credential_generation = $2")
@@ -122,9 +130,9 @@ impl Database {
         let scopes: Vec<String> =
             serde_json::from_str(&credential.try_get::<String, _>("scopes_json")?)
                 .map_err(|_| AppError::Internal)?;
-        if !scopes
-            .iter()
-            .any(|s| s == "*" || s == "generations:reconcile")
+        crate::db::credentials::validate_service_scopes(&scopes)
+            .map_err(|_| AppError::Forbidden)?;
+        if !scopes.iter().any(|s| s == "generations:reconcile")
             || credential
                 .try_get::<Option<String>, _>("tenant_external_id")?
                 .as_deref()

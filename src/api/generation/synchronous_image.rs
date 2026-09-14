@@ -80,7 +80,7 @@ pub(super) async fn image_idempotency_replay_response(
             format!("image request {request_id} with this Idempotency-Key is still in progress"),
         )),
         SynchronousImageIdempotencyClaim::Uncertain { request_id } => {
-            Ok(uncertain_image_response(request_id))
+            Ok(uncertain_image_response(request_id, None))
         }
         SynchronousImageIdempotencyClaim::Claimed => Err(AppError::Internal),
     }
@@ -146,11 +146,16 @@ pub(super) async fn submission_may_have_started(
     }
 }
 
-fn uncertain_image_response(request_id: Uuid) -> Response {
+fn uncertain_image_response(request_id: Uuid, reconciliation_available: Option<bool>) -> Response {
     let body = serde_json::to_vec(&json!({"error": {
         "code": "image_submission_uncertain",
-        "message": "Image submission may have executed; automatic retry is disabled. Reconcile this request before creating another submission.",
-        "retryable": false
+        "message": if reconciliation_available == Some(true) {
+            "Image submission may have executed; automatic retry is disabled. The request is recorded for reconciliation."
+        } else {
+            "Image submission may have executed; automatic retry is disabled. Check request status and reconcile once the request is listed."
+        },
+        "retryable": false,
+        "reconciliation_available": reconciliation_available
     }})).expect("static uncertainty response");
     Response::builder()
         .status(StatusCode::CONFLICT)
@@ -158,6 +163,21 @@ fn uncertain_image_response(request_id: Uuid) -> Response {
         .header(REQUEST_ID_HEADER, request_id.to_string())
         .body(Body::from(body))
         .expect("static uncertainty headers")
+}
+
+fn image_submission_state_unavailable(request_id: Uuid) -> Response {
+    let body = serde_json::to_vec(&json!({"error": {
+        "code": "image_submission_state_unavailable",
+        "message": "Submission state could not be confirmed or published. Do not resubmit. No refund or resubmission was initiated by this recovery attempt. Check this request after storage recovers; reconciliation availability is not confirmed.",
+        "retryable": false,
+        "reconciliation_available": false
+    }})).expect("static submission-state response");
+    Response::builder()
+        .status(StatusCode::CONFLICT)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(REQUEST_ID_HEADER, request_id.to_string())
+        .body(Body::from(body))
+        .expect("static submission-state headers")
 }
 
 async fn quarantine_image_request(context: &SyncImageRequest<'_>) -> Response {
@@ -172,12 +192,14 @@ async fn quarantine_image_request(context: &SyncImageRequest<'_>) -> Response {
         )
         .await
     {
-        // The acknowledged/possibly committed arm remains the durable fence
-        // even if publishing the richer uncertainty diagnostic fails.
+        // A pending arm is not proof that a quarantine row exists. Preserve
+        // the reservation and prohibit resubmission, but do not advertise a
+        // reconciliation action whose durable publication was not confirmed.
         tracing::warn!(request_id=%context.request_id, error_category=error.diagnostic_category(),
-            "image uncertainty publication failed; send fence retained");
+            "image uncertainty publication unavailable; this recovery attempt will not release or resubmit without authoritative verification");
+        return image_submission_state_unavailable(context.request_id);
     }
-    uncertain_image_response(context.request_id)
+    uncertain_image_response(context.request_id, Some(true))
 }
 
 pub(super) async fn execute_synchronous_image_request(

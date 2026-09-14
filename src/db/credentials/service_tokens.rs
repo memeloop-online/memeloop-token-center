@@ -416,7 +416,7 @@ fn validate_service_token_input(input: &CreateServiceTokenInput) -> Result<(), A
     Ok(())
 }
 
-fn validate_service_scopes(scopes: &[String]) -> Result<(), AppError> {
+pub(crate) fn validate_service_scopes(scopes: &[String]) -> Result<(), AppError> {
     if scopes.is_empty() || scopes.len() > SUPPORTED_SERVICE_SCOPES.len() {
         return Err(AppError::BadRequest(
             "service token must contain a bounded set of supported scopes".into(),

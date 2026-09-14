@@ -1,5 +1,80 @@
 use super::*;
 
+#[tokio::test]
+async fn image_resolution_and_receipt_replay_require_active_tenant_and_valid_exact_scope() {
+    for replay in [false, true] {
+        for mutation in ["archive", "wildcard", "mixed_wildcard", "unknown_scope"] {
+            let f = Fixture::new(true).await;
+            if replay {
+                f.db.resolve_image_generation_quarantine(f.input())
+                    .await
+                    .unwrap();
+            }
+            let before = sqlx::query(
+                "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = $1",
+            )
+            .bind(f.reservation.account_id.to_string())
+            .fetch_one(&f.db.pool)
+            .await
+            .unwrap();
+            let balance_before = (
+                before.get::<i64, _>("available_micros"),
+                before.get::<i64, _>("reserved_micros"),
+            );
+            // Capture the authorized identity before lifecycle/scope mutation;
+            // direct DB invocation tests beyond the earlier API boundary.
+            let captured = f.input();
+            if mutation == "archive" {
+                f.db.set_tenant_archived(&f.tenant, true, None)
+                    .await
+                    .unwrap();
+            } else {
+                let scopes = match mutation {
+                    "wildcard" => "[\"*\"]",
+                    "mixed_wildcard" => "[\"generations:reconcile\",\"*\"]",
+                    _ => "[\"generations:reconcile\",\"unknown:scope\"]",
+                };
+                sqlx::query("UPDATE service_credentials SET scopes_json = $1 WHERE service_principal_id = $2")
+                    .bind(scopes).bind(f.actor.to_string()).execute(&f.db.pool).await.unwrap();
+            }
+            assert!(
+                matches!(
+                    f.db.resolve_image_generation_quarantine(captured).await,
+                    Err(AppError::Forbidden)
+                ),
+                "{mutation}, replay={replay}"
+            );
+            let after = sqlx::query(
+                "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = $1",
+            )
+            .bind(f.reservation.account_id.to_string())
+            .fetch_one(&f.db.pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                (
+                    after.get::<i64, _>("available_micros"),
+                    after.get::<i64, _>("reserved_micros")
+                ),
+                balance_before
+            );
+            let receipts: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM image_generation_quarantine_resolutions")
+                    .fetch_one(&f.db.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(receipts, i64::from(replay));
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM usage_reservations WHERE id = $1")
+                    .bind(f.reservation.id.to_string())
+                    .fetch_one(&f.db.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(status, if replay { "settled" } else { "reserved" });
+        }
+    }
+}
+
 struct Fixture {
     _directory: tempfile::TempDir,
     db: Database,

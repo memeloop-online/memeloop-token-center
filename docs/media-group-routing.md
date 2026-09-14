@@ -35,8 +35,27 @@ not treated as proof that a provider can safely replay a request.
 
 Confirmed HTTP client rejection (excluding 408/425/429) retains the existing
 zero-charge failure settlement; authentication remains hard health evidence.
-Unknown outcomes are explicitly listed for manual reconciliation in the
-existing generation workspace. The operator must supply a tenant-scoped
+An acknowledged uncertainty publication lists the request for manual
+reconciliation in the existing generation workspace. Its response is
+`image_submission_uncertain` with `reconciliation_available: true`. A read-only
+idempotency replay may know only that submission was armed; it returns the same
+uncertainty code with `reconciliation_available: null` and asks the caller to
+check request status, without claiming that publication has completed.
+
+If arm confirmation or quarantine publication is unavailable, the response is
+`image_submission_state_unavailable`, `retryable: false`, and
+`reconciliation_available: false`. This is **not** a durable quarantine receipt
+or proof that an operator action already exists. Funds remain held; callers
+must not create another submission. Once storage recovers, the existing
+reservation reaper handles expired owners: an actual submission marker is
+published as uncertain and becomes listable while its reservation stays held;
+an absent marker with no live owner permits safe zero-cost termination instead.
+The reaper uses its existing 30-minute age threshold. Expired idempotency lookup
+also detects an armed request and prevents takeover, but its read-only result
+does not itself promise reconciliation publication. No automatic recovery path
+resends the POST or invents a reconciliation receipt.
+
+For a listed request, the operator must supply a tenant-scoped
 persistent service identity, current revision, evidence digest, idempotency
 key, and an explicit same-currency confirmed amount (zero for non-delivery).
 Resolution atomically audits and settles the original reservation, never

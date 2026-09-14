@@ -8,6 +8,10 @@ async fn async_quarantine_revalidates_current_tenant_service_for_resolution_and_
             "principal_revoked",
             "credential_revoked",
             "scope_removed",
+            "wildcard_only",
+            "mixed_wildcard",
+            "unknown_scope",
+            "tenant_archived",
             "global",
             "foreign_tenant",
             "rotation",
@@ -46,7 +50,34 @@ async fn async_quarantine_revalidates_current_tenant_service_for_resolution_and_
                     .await
                     .unwrap();
             }
+            let before = sqlx::query(
+                "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = $1",
+            )
+            .bind(f.key.account_id.to_string())
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+            let balance_before = (
+                before.get::<i64, _>("available_micros"),
+                before.get::<i64, _>("reserved_micros"),
+            );
             match mutation {
+                "mixed_wildcard" => {
+                    sqlx::query("UPDATE service_credentials SET scopes_json = '[\"generations:reconcile\",\"*\"]' WHERE service_principal_id = $1").bind(actor.to_string()).execute(&f.pool).await.unwrap();
+                }
+                "unknown_scope" => {
+                    sqlx::query("UPDATE service_credentials SET scopes_json = '[\"generations:reconcile\",\"unknown:scope\"]' WHERE service_principal_id = $1").bind(actor.to_string()).execute(&f.pool).await.unwrap();
+                }
+                "tenant_archived" => {
+                    f.state
+                        .db
+                        .set_tenant_archived(&f.tenant, true, None)
+                        .await
+                        .unwrap();
+                }
+                "wildcard_only" => {
+                    sqlx::query("UPDATE service_credentials SET scopes_json = '[\"*\"]' WHERE service_principal_id = $1").bind(actor.to_string()).execute(&f.pool).await.unwrap();
+                }
                 "principal_revoked" => {
                     f.state
                         .db
@@ -109,6 +140,20 @@ async fn async_quarantine_revalidates_current_tenant_service_for_resolution_and_
                     .await
                     .unwrap();
             assert_eq!(status, if replay { "running" } else { "submitting" });
+            let after = sqlx::query(
+                "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = $1",
+            )
+            .bind(f.key.account_id.to_string())
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                (
+                    after.get::<i64, _>("available_micros"),
+                    after.get::<i64, _>("reserved_micros")
+                ),
+                balance_before
+            );
         }
     }
 }

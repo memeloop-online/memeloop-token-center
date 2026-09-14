@@ -271,6 +271,7 @@ async fn image_invalid_body_observes_once_and_same_key_remains_uncertain_after_e
     let body: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body["error"]["code"], "image_submission_uncertain");
     assert_eq!(body["error"]["retryable"], false);
+    assert_eq!(body["error"]["reconciliation_available"], true);
     let health = fixture
         .state
         .db
@@ -301,6 +302,12 @@ async fn image_invalid_body_observes_once_and_same_key_remains_uncertain_after_e
     pool.close().await;
     let repeated = post(fixture.state.clone(), &fixture.credential, "invalid-image").await;
     assert_eq!(repeated.status(), StatusCode::CONFLICT);
+    let replay: Value =
+        serde_json::from_slice(&to_bytes(repeated.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert!(
+        replay["error"]["reconciliation_available"].is_null(),
+        "read-only replay must not claim publication readiness"
+    );
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
 }
 
@@ -703,7 +710,12 @@ async fn pending_image_arm_uses_durable_truth_and_preserves_unknown_query_failur
         ARM_CONFIRMED, ARM_NOT_STARTED, ARM_PENDING, SyncImageRequest, submission_may_have_started,
     };
     use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-    for scenario in ["not_started", "committed_ack_lost", "query_failed"] {
+    for scenario in [
+        "not_started",
+        "committed_ack_lost",
+        "query_failed",
+        "query_failed_after_commit",
+    ] {
         let upstream = MockServer::start().await;
         let fixture = fixture(&upstream).await;
         let key = fixture
@@ -747,7 +759,7 @@ async fn pending_image_arm_uses_durable_truth_and_preserves_unknown_query_failur
             StartSynchronousImageResult::Started(value) => value,
             _ => panic!("fresh request"),
         };
-        if scenario == "committed_ack_lost" {
+        if matches!(scenario, "committed_ack_lost" | "query_failed_after_commit") {
             // Leave local state Pending, simulating loss of the successful
             // transaction acknowledgement after the durable marker committed.
             fixture
@@ -758,7 +770,7 @@ async fn pending_image_arm_uses_durable_truth_and_preserves_unknown_query_failur
                 .unwrap();
         }
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-        if scenario == "query_failed" {
+        if scenario.starts_with("query_failed") {
             sqlx::query("CREATE TRIGGER fail_arm_confirmation BEFORE UPDATE OF completed_at ON request_records BEGIN SELECT RAISE(FAIL, 'confirmation unavailable'); END")
                 .execute(&pool).await.unwrap();
         }
@@ -797,6 +809,29 @@ async fn pending_image_arm_uses_durable_truth_and_preserves_unknown_query_failur
                 StatusCode::CONFLICT
             }
         );
+        let response: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        if scenario.starts_with("query_failed") {
+            assert_eq!(
+                response["error"]["code"],
+                "image_submission_state_unavailable"
+            );
+            assert_eq!(response["error"]["reconciliation_available"], false);
+            assert_eq!(response["error"]["retryable"], false);
+            assert!(
+                fixture
+                    .state
+                    .db
+                    .list_image_generation_quarantine("synchronous-strategy", 20, None)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        } else if scenario == "committed_ack_lost" {
+            assert_eq!(response["error"]["code"], "image_submission_uncertain");
+            assert_eq!(response["error"]["reconciliation_available"], true);
+        }
         let status: String =
             sqlx::query_scalar("SELECT status FROM usage_reservations WHERE id=$1")
                 .bind(reservation.id.to_string())
@@ -811,6 +846,66 @@ async fn pending_image_arm_uses_durable_truth_and_preserves_unknown_query_failur
                 "reserved"
             }
         );
+        if scenario.starts_with("query_failed") {
+            // Restore storage, then run the real maintenance recovery. No new
+            // submission, fake receipt or status-only rewrite is involved.
+            sqlx::query("DROP TRIGGER fail_arm_confirmation")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let stale = unix_millis() - 31 * 60 * 1000;
+            sqlx::query("UPDATE request_records SET created_at=$1 WHERE id=$2")
+                .bind(stale)
+                .bind(request_id.to_string())
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE usage_reservations SET created_at=$1 WHERE id=$2")
+                .bind(stale)
+                .bind(reservation.id.to_string())
+                .execute(&pool)
+                .await
+                .unwrap();
+            fixture
+                .state
+                .db
+                .release_orphaned_reservations(20)
+                .await
+                .unwrap();
+            let row = sqlx::query("SELECT r.status, r.actual_micros, q.completed_at, q.submission_uncertain_at FROM usage_reservations r JOIN request_records q ON q.reservation_id=r.id WHERE q.id=$1")
+                .bind(request_id.to_string()).fetch_one(&pool).await.unwrap();
+            let listed = fixture
+                .state
+                .db
+                .list_image_generation_quarantine("synchronous-strategy", 20, None)
+                .await
+                .unwrap();
+            if scenario == "query_failed_after_commit" {
+                assert_eq!(row.get::<String, _>("status"), "reserved");
+                assert!(row.get::<Option<i64>, _>("completed_at").is_none());
+                assert!(
+                    row.get::<Option<i64>, _>("submission_uncertain_at")
+                        .is_some()
+                );
+                assert_eq!(
+                    listed.len(),
+                    1,
+                    "committed fence must become actionable after recovery"
+                );
+            } else {
+                assert_eq!(row.get::<String, _>("status"), "settled");
+                assert_eq!(row.get::<i64, _>("actual_micros"), 0);
+                assert!(row.get::<Option<i64>, _>("completed_at").is_some());
+                assert!(
+                    row.get::<Option<i64>, _>("submission_uncertain_at")
+                        .is_none()
+                );
+                assert!(
+                    listed.is_empty(),
+                    "proven unsent request is safely closed, not quarantined"
+                );
+            }
+        }
         assert!(upstream.received_requests().await.unwrap().is_empty());
         pool.close().await;
     }

@@ -89,6 +89,14 @@ impl Database {
         .to_hex()
         .to_string();
         let mut transaction = self.begin_write_transaction().await?;
+        // Hold the same tenant row that lifecycle archive/rename updates use.
+        // Check before actor locks and before replay, so captured authorization
+        // cannot outlive an archive committed before this transaction.
+        let tenant = sqlx::query("UPDATE tenants SET updated_at = updated_at WHERE external_id = $1 AND status = 'active'")
+            .bind(input.tenant_external_id).execute(&mut *transaction).await?;
+        if tenant.rows_affected() != 1 {
+            return Err(AppError::Forbidden);
+        }
         let actor = sqlx::query("UPDATE service_principals SET updated_at = updated_at WHERE id = $1 AND status = 'active' AND credential_generation = $2")
             .bind(input.actor_service_id.to_string()).bind(input.actor_credential_generation).execute(&mut *transaction).await?;
         if actor.rows_affected() != 1 {
@@ -101,9 +109,9 @@ impl Database {
         let scopes: Vec<String> =
             serde_json::from_str(&credential.try_get::<String, _>("scopes_json")?)
                 .map_err(|_| AppError::Internal)?;
-        if !scopes
-            .iter()
-            .any(|scope| scope == "*" || scope == "generations:reconcile")
+        crate::db::credentials::validate_service_scopes(&scopes)
+            .map_err(|_| AppError::Forbidden)?;
+        if !scopes.iter().any(|scope| scope == "generations:reconcile")
             || credential
                 .try_get::<Option<String>, _>("tenant_external_id")?
                 .as_deref()
