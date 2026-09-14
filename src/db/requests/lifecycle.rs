@@ -127,15 +127,27 @@ impl Database {
         self.start_proxy_request_inner(input, None).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn start_proxy_request_with_archive(
         &self,
         input: StartProxyRequest<'_>,
         body: &bytes::Bytes,
         pepper: &[u8],
     ) -> Result<UsageReservation, AppError> {
+        self.start_proxy_request_with_archive_compression(input, body, pepper, false)
+            .await
+    }
+
+    pub(crate) async fn start_proxy_request_with_archive_compression(
+        &self,
+        input: StartProxyRequest<'_>,
+        body: &bytes::Bytes,
+        pepper: &[u8],
+        compression_enabled: bool,
+    ) -> Result<UsageReservation, AppError> {
         let started = std::time::Instant::now();
         let result = self
-            .start_proxy_request_inner(input, Some((body, pepper)))
+            .start_proxy_request_inner(input, Some((body, pepper, compression_enabled)))
             .await
             .map_err(|error| match error {
                 AppError::Storage(_) | AppError::Internal => AppError::Overloaded,
@@ -155,9 +167,9 @@ impl Database {
     async fn start_proxy_request_inner(
         &self,
         input: StartProxyRequest<'_>,
-        archive: Option<(&bytes::Bytes, &[u8])>,
+        archive: Option<(&bytes::Bytes, &[u8], bool)>,
     ) -> Result<UsageReservation, AppError> {
-        if archive.is_some_and(|(body, _)| body.len() > 64 * 1024 * 1024) {
+        if archive.is_some_and(|(body, _, _)| body.len() > 64 * 1024 * 1024) {
             return Err(AppError::Overloaded);
         }
         // A stable reservation UUID supplies the authenticated encryption owner
@@ -170,9 +182,15 @@ impl Database {
         };
         let purpose = crate::response_archive_spool::BufferedArchivePurpose::Request;
         let buffered_archive = archive
-            .map(|(body, pepper)| {
-                crate::response_archive_spool::BufferedArchive::new(identity, purpose, body, pepper)
-                    .map_err(|_| AppError::Overloaded)
+            .map(|(body, pepper, compression_enabled)| {
+                crate::response_archive_spool::BufferedArchive::new(
+                    identity,
+                    purpose,
+                    body,
+                    pepper,
+                    compression_enabled,
+                )
+                .map_err(|_| AppError::Overloaded)
             })
             .transpose()?;
         // Prepare the existing bounded first insert batch before opening the

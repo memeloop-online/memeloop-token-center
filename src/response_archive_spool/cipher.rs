@@ -32,6 +32,7 @@ fn aad(
     )
 }
 
+#[cfg(test)]
 pub(super) fn seal(
     identity: ArchiveSpoolIdentity,
     seq: i64,
@@ -47,6 +48,7 @@ pub(super) fn seal(
     )
 }
 
+#[cfg(test)]
 pub(super) fn seal_for_purpose(
     identity: ArchiveSpoolIdentity,
     seq: i64,
@@ -78,6 +80,7 @@ pub(super) fn seal_for_purpose_with_compression(
     })
 }
 
+#[cfg(test)]
 pub(super) fn seal_for_purpose_with_nonce(
     identity: ArchiveSpoolIdentity,
     seq: i64,

@@ -763,7 +763,7 @@ pub(super) async fn proxy(
     );
     let reservation = match state
         .db
-        .start_proxy_request_with_archive(
+        .start_proxy_request_with_archive_compression(
             StartProxyRequest {
                 request_id,
                 key: &key,
@@ -778,6 +778,7 @@ pub(super) async fn proxy(
             },
             &body,
             state.config.key_pepper.as_bytes(),
+            state.config.archive_spool_compression_enabled,
         )
         .await
     {
@@ -1659,6 +1660,7 @@ async fn finish_buffered_request_with_upstream_attribution(
             crate::response_archive_spool::BufferedArchivePurpose::Response,
             &body,
             request.state.config.key_pepper.as_bytes(),
+            request.state.config.archive_spool_compression_enabled,
         )
     } else {
         Err(AppError::Overloaded)
