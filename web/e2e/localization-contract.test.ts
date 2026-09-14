@@ -46,7 +46,8 @@ test('tenant copy stays action-focused and its active locale keys are not orphan
 });
 
 test('Chinese usage copy consistently uses 词元 instead of Token or Tokens', () => {
-  const exposed = Object.values(translationCatalogs['zh-CN']).filter((value) => /\bTokens?\b/i.test(value));
+  // Interpolation identifiers are protocol-independent keys, not visible copy.
+  const exposed = Object.values(translationCatalogs['zh-CN']).filter((value) => /\bTokens?\b/i.test(value.replace(/\{\{\w+\}\}/g, '')));
   assert.deepEqual(exposed, []);
   assert.equal(translationCatalogs['zh-CN']['usage.tokens'], '词元');
   assert.equal(translationCatalogs.en['usage.tokens'], 'Tokens');

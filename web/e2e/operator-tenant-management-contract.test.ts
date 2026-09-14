@@ -88,7 +88,10 @@ test('multi-tenant scope exposes tenant CRUD, dependency refusal, authorization 
   const browser = await chromium.launch({ executablePath, headless: true });
   try {
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
-    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await page.addInitScript(() => {
+      // Seed the initial locale without overwriting explicit changes on reload.
+      if (!localStorage.getItem('mtc-locale')) localStorage.setItem('mtc-locale', 'en');
+    });
     await page.goto(fixture(address.port, 'multiple'));
     await page.getByRole('heading', { name: 'Tenant management', exact: true }).waitFor();
     await page.evaluate(() => localStorage.setItem('mtc-locale', 'zh-CN'));

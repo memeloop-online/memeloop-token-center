@@ -229,7 +229,7 @@ const zh = {
   'sessions.unlinkedDetail': '这些请求没有会话信息。',
   'sessions.sessionTitle': '{{model}} 会话', 'sessions.credential': '凭据别名', 'sessions.lastActivity': '最后活动',
   'sessions.requests': '已计量请求', 'sessions.archivedOnly': '仅归档记录', 'sessions.activeRequests': '进行中', 'sessions.errors': '累计错误', 'sessions.tokens': '词元用量',
-  'sessions.archiveOnlyTitle': '历史记录（不计费）', 'sessions.archiveOnlySummary': '{{requests}} 条 · {{errors}} 条错误 · {{tokens}}词元· 平均 {{latency}}',
+  'sessions.archiveOnlyTitle': '历史记录（不计费）', 'sessions.archiveOnlySummary': '{{requests}} 条 · {{errors}} 条错误 · {{tokens}} 词元 · 平均 {{latency}}',
   'sessions.averageLatency': '平均延迟', 'sessions.cost': '费用', 'sessions.open': '打开 {{name}}', 'sessions.openTimeline': '查看时间线',
   'sessions.diagnostics': '技术信息', 'sessions.copy.session': '复制会话 ID', 'sessions.copy.credential': '复制凭据 ID',
   'sessions.logicalSession': '逻辑会话', 'sessions.timeline': '请求时间线', 'sessions.relationships': '已确认的关系',
