@@ -151,6 +151,12 @@ jobs:
       - run: npm ci --no-audit
       - run: npm run typecheck
       - run: npm run build
+      - name: Retain built browser app for read-only UI acceptance
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: browser-app-${{ github.sha }}
+          path: web/dist/
+          retention-days: 3
       - name: Install the Chromium driver used by Cucumber.js steps
         timeout-minutes: 15
         run: npx playwright install --with-deps chromium

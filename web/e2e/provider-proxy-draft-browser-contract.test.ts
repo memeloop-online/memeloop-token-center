@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
+import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 
 test('independent proxy save updates concurrency metadata without dropping the provider draft', { timeout: 60_000 }, async () => {
-  const server = await createIsolatedFixtureServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const server = await createIsolatedFixtureServer({ root, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen();
   const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
   const origin = `http://127.0.0.1:${address.port}`;
@@ -22,6 +24,34 @@ test('independent proxy save updates concurrency metadata without dropping the p
     // All saves below are handled by an explicit in-memory fixture. No server
     // mutation, real proxy connection, OAuth, quota action or model request runs.
     await page.goto(`${origin}/e2e/fixtures/form-journey.html?workflows&proxy-workflow`);
+    const row = page.locator('.provider-directory-row');
+    await row.waitFor();
+    assert.doesNotMatch(await row.innerText(), /account-native|openai-codex|credential_generation/);
+    assert.match(await row.innerText(), /尚未读取/);
+    assert.equal(await page.locator('.provider-detail-workspace').count(), 0);
+    assert.equal(await page.locator('.provider-directory details').count(), 0);
+    const artifacts = `${root}/e2e-artifacts/upstream-availability/provider-directory`;
+    await mkdir(artifacts, { recursive: true });
+    for (const [theme, width] of [['light', 1440], ['dark', 390]] as const) {
+      await page.setViewportSize({ width, height: 1000 });
+      await page.evaluate(theme => { document.documentElement.dataset.theme = theme; }, theme);
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth), false);
+      await page.screenshot({ path: `${artifacts}/list-${theme}-${width}.png`, fullPage: true });
+      await row.getByRole('button', { name: '查看详情', exact: true }).click();
+      await page.locator('.provider-detail-workspace').waitFor();
+      assert.equal(await page.locator('.provider-directory details').count(), 0);
+      assert.equal(await page.evaluate(() => window.formJourneyWrites), 0);
+      await page.screenshot({ path: `${artifacts}/detail-${theme}-${width}.png`, fullPage: true });
+      await row.getByRole('button', { name: '收起详情', exact: true }).click();
+    }
+    await row.getByRole('button', { name: '查看详情', exact: true }).click();
+    await page.getByRole('button', { name: '配置网络代理', exact: true }).click();
+    await page.locator('.upstream-proxy-editor input').fill('socks5h://10.0.0.20:1080');
+    assert.equal(await row.getByRole('button', { name: '收起详情', exact: true }).isEnabled(), false);
+    assert.equal(await row.getByRole('button', { name: '编辑', exact: true }).isEnabled(), false);
+    await page.getByRole('button', { name: '取消', exact: true }).click();
+    await row.getByRole('button', { name: '收起详情', exact: true }).click();
+    await page.setViewportSize({ width: 1440, height: 1000 });
     await page.getByText('账号设置与授权操作', { exact: true }).click();
     await page.getByRole('button', { name: '编辑', exact: true }).click();
     const workspace = page.locator('.provider-edit-workspace');

@@ -5,6 +5,7 @@ import { useI18n } from '../i18n';
 import { quotaReadErrorMessage, quotaUsedPercent, upstreamQuotaPath, type UpstreamQuotaSnapshot } from './upstreamQuota';
 import './upstreamQuota.css';
 import { UpstreamQuotaReset } from './UpstreamQuotaReset';
+import { Disclosure } from '../design-system';
 
 export function UpstreamQuotaDetails({ snapshot }: { snapshot: UpstreamQuotaSnapshot }) {
   const { locale, t } = useI18n();
@@ -55,8 +56,8 @@ export function UpstreamQuotaDetails({ snapshot }: { snapshot: UpstreamQuotaSnap
 }
 
 /** User-triggered read: never starts one upstream request per card on page load. */
-export function UpstreamQuota({ accountId, accountName = accountId, tenant, token }: { accountId: string; accountName?: string; tenant: string; token: string }) {
-  const { t } = useI18n();
+export function UpstreamQuota({ accountId, accountName = accountId, tenant, token, onSnapshot, initialSnapshot }: { accountId: string; accountName?: string; tenant: string; token: string; onSnapshot?: (snapshot: UpstreamQuotaSnapshot) => void; initialSnapshot?: UpstreamQuotaSnapshot }) {
+  const { t, locale } = useI18n();
   const [snapshot, setSnapshot] = useState<UpstreamQuotaSnapshot>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<'quota.readFailed' | 'quota.errorPermission'>();
@@ -65,7 +66,7 @@ export function UpstreamQuota({ accountId, accountName = accountId, tenant, toke
   scopeRef.current = scope;
   const requestRef = useRef<AbortController | null>(null);
   useEffect(() => {
-    setSnapshot(undefined); setBusy(false); setError(undefined);
+    setSnapshot(initialSnapshot); setBusy(false); setError(undefined);
     return () => requestRef.current?.abort();
   }, [scope]);
   async function load() {
@@ -79,6 +80,7 @@ export function UpstreamQuota({ accountId, accountName = accountId, tenant, toke
       if (scopeRef.current !== scope || controller.signal.aborted) return;
       if (value.upstream_account_id !== accountId || value.tenant_external_id !== tenant || value.contract_version !== 'upstream_quota_v1') throw new Error('Quota scope mismatch');
       setSnapshot(value);
+      onSnapshot?.(value);
     } catch (reason) {
       if (scopeRef.current === scope && !controller.signal.aborted) setError(reason instanceof ApiError && [401, 403].includes(reason.status) ? 'quota.errorPermission' : 'quota.readFailed');
     } finally {
@@ -91,6 +93,6 @@ export function UpstreamQuota({ accountId, accountName = accountId, tenant, toke
     {!snapshot && busy && <div className="upstream-quota-loading" role="status"><span>{t('common.loading')}</span><div className="upstream-quota-skeleton" aria-hidden="true"><i /><i /></div></div>}
     {!snapshot && !busy && !error && <p>{t(tenant ? 'quota.notLoaded' : 'quota.selectTenant')}</p>}
     {snapshot && <UpstreamQuotaDetails snapshot={snapshot} />}
-    {snapshot && snapshot.reset_capability.provider_supported === true && snapshot.reset_capability.implementation_available && <details className="upstream-danger-zone"><summary>{t('quota.resetAction')}</summary><p>{t('quota.resetWarning')}</p><UpstreamQuotaReset key={scope} accountId={accountId} accountName={accountName} tenant={tenant} token={token} snapshot={snapshot} /></details>}
+    {snapshot && snapshot.reset_capability.provider_supported === true && snapshot.reset_capability.implementation_available && <Disclosure title={locale.startsWith('zh') ? '额度重置选项' : 'Quota reset options'}><p>{t('quota.resetWarning')}</p><UpstreamQuotaReset key={scope} accountId={accountId} accountName={accountName} tenant={tenant} token={token} snapshot={snapshot} /></Disclosure>}
   </section>;
 }

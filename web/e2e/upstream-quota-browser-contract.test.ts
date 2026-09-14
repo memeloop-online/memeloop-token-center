@@ -84,7 +84,7 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     assert.deepEqual(await page.evaluate(() => [window.quotaReads, window.quotaWrites]), [0, 0]);
     await view.click();
     await page.getByText('Primary window', { exact: true }).waitFor();
-    await page.locator('.upstream-danger-zone > summary').click();
+    await page.getByRole('button', { name: 'Quota reset options', exact: true }).click();
     const reset = page.getByRole('button', { name: 'Reset upstream quota', exact: true });
     await reset.hover();
     assert.deepEqual(await page.evaluate(() => [window.quotaReads, window.quotaPrepares, window.quotaConfirms, window.quotaWrites]), [1, 0, 0, 0]);
@@ -103,7 +103,7 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     // Fresh mount starts an independent operation; only explicit confirmation consumes.
     await page.goto(quotaUrl);
     await view.click();
-    await page.locator('.upstream-danger-zone > summary').click();
+    await page.getByRole('button', { name: 'Quota reset options', exact: true }).click();
     await reset.click();
     await dialog.getByRole('button', { name: 'Confirm and continue', exact: true }).click();
     const reconcile = page.getByRole('button', { name: 'Reconcile upstream quota (read only)', exact: true });

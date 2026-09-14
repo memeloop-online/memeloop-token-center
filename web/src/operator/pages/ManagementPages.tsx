@@ -3,7 +3,7 @@ import RjsfForm, { type FormProps } from '@rjsf/core/lib/components/Form.js';
 import type { RJSFSchema } from '@rjsf/utils';
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { ApiError, api, apiRead } from '../../api';
-import { formatCurrency, formatNumber } from '../../format';
+import { formatCurrency, formatNumber, formatPercent } from '../../format';
 import { localizeSchema, useI18n } from '../../i18n';
 import { LimitSnapshot } from '../../LimitSnapshot';
 import { ModelPicker } from '../../ModelPicker';
@@ -29,6 +29,7 @@ import {
 import { directCredentialSchema, supportsDirectConnection } from '../providerConnectionMethods';
 import { UpstreamAvailability } from '../UpstreamAvailability';
 import { UpstreamQuota } from '../UpstreamQuota';
+import { quotaUsedPercent, type UpstreamQuotaSnapshot } from '../upstreamQuota';
 import { connectionSchema, isPrivateProxyUrl, ProxyInput, UpstreamConnection } from '../UpstreamConnection';
 import { upstreamFormTemplates } from '../UpstreamFormTemplates';
 import { credentialFormTemplates } from '../CredentialFormTemplates';
@@ -40,6 +41,7 @@ import { CredentialActionMenu } from '../CredentialActionMenu';
 import { fluentFormWidgets } from '../FluentFormWidgets';
 import '../formJourney.css';
 import '../providerEditLayout.css';
+import '../providerDirectory.css';
 import { credentialCreateSchema, credentialCreateUiSchema, credentialFormFields, credentialPolicySchema, credentialPolicyUiSchema } from '../CredentialForm';
 import { upstreamAvailabilityPath, type UpstreamAvailabilityWindow } from '../upstreamAvailabilityWindow';
 import { useOperatorResource, type ResourceState } from '../hooks/useOperatorResource';
@@ -84,6 +86,8 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   const [editing, setEditing] = useState<UpstreamAccount>();
   const [reauthorizing, setReauthorizing] = useState<UpstreamAccount>();
   const [providerWorkspaceOpen, setProviderWorkspaceOpen] = useState(false);
+  const [providerDetail, setProviderDetail] = useState<string>();
+  const [quotaSummaries, setQuotaSummaries] = useState<Record<string, UpstreamQuotaSnapshot>>({});
   const [providerCreateGeneration, setProviderCreateGeneration] = useState(0);
   const [proxyEditorOpen, setProxyEditorOpen] = useState(false);
   const [providerEditDraft, setProviderEditDraft] = useState<Record<string, unknown>>();
@@ -144,6 +148,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     },
   };
   useEffect(() => {
+    setProviderDetail(undefined); setQuotaSummaries({});
     setProviderEditDraft(undefined); setMethod('direct'); setDriver(''); setRotating(undefined); setEditing(undefined); setReauthorizing(undefined); setProviderWorkspaceOpen(false);
     setBusy(''); setHealth({}); setDeletionReadiness({}); setMessage(''); setError('');
   }, [token, tenant, writeTenant]);
@@ -238,45 +243,65 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} /><section ref={providerList} className="provider-layout">
     <article className="panel provider-list"><div className="panel-title"><div><h2>{t('providers.title')}</h2><p className="muted">{t('providers.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>
       {error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{availabilityError && <div className="notice error" role="alert">{availabilityError}</div>}{message && <div ref={providerSuccess} tabIndex={-1} className="notice success" role="status">{message}</div>}
-      <div className="account-list">{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('status.active')} empty={t('providers.empty')} />}{statusFilter.values.map((value) => {
+      <div className="account-list provider-directory">{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('status.active')} empty={t('providers.empty')} />}{statusFilter.values.map((value) => {
         const providerAvailable = providers.some((provider) => provider.id === value.driver);
         const currentHealth = providerAvailable ? health[value.id] : undefined;
         const manageable = canManage(value);
         const memberships = providerGroups.groups.filter((group) => group.member_ids.includes(value.id));
         const currentReadiness = deletionReadiness[value.id];
         const deletionBlockers = currentReadiness ? deletionMessages(currentReadiness) : [];
+        const detailOpen = providerDetail === value.id;
+        const providerName = providers.find(provider => provider.id === value.driver)?.display_name ?? (locale.startsWith('zh') ? '其他服务' : 'Other service');
+        const facts = availabilityWindow?.tenant_external_id === value.tenant_external_id ? availabilityWindow.accounts.find(account => account.upstream_account_id === value.id) : undefined;
+        const terminal = facts ? facts.metrics.successful_requests + facts.metrics.failed_requests : 0;
+        const quota = quotaSummaries[value.id];
+        const quotaPercents = quota?.windows.map(quotaUsedPercent).filter((percent): percent is number => percent !== null) ?? [];
+        const quotaText = !quota ? (locale.startsWith('zh') ? '尚未读取' : 'Not checked')
+          : quota.status === 'unsupported' ? (locale.startsWith('zh') ? '暂不支持查询' : 'Not supported')
+          : quota.status === 'error' ? (locale.startsWith('zh') ? '读取失败' : 'Read failed')
+          : quotaPercents.length ? (locale.startsWith('zh') ? `最高已用 ${formatPercent(Math.max(...quotaPercents) / 100, locale)}` : `Up to ${formatPercent(Math.max(...quotaPercents) / 100, locale)} used`)
+          : (locale.startsWith('zh') ? '暂无用量数据' : 'Usage unavailable');
         return <div className="account provider-account" data-upstream-id={value.id} key={value.id}>
-          <div className="account-main">
-            <b>{value.name}</b>
-            <span>{value.driver} · {t('providers.method')}: {enumLabel(t, 'auth', value.connection_method)}{value.tenant_external_id ? ` · ${value.tenant_external_id}` : ''}</span>
+          <div className="provider-directory-row">
+            <div className="provider-directory-identity">
+            <DetailTooltip content={`${providerName} · ${value.driver} · ID: ${value.id}${value.tenant_external_id ? ` · ${value.tenant_external_id}` : ''}`}><b tabIndex={0}>{value.name}</b></DetailTooltip>
+            <span>{providerName} · {enumLabel(t, 'auth', value.connection_method)}</span>
             {memberships.length > 0 && <div className="table-chip-list provider-group-summary" aria-label={t('groups.provider.title')}>{memberships.map((group) => <span key={group.id}>{group.name}</span>)}</div>}
             {!providerAvailable && <span className="pill">{t('providers.retired')}</span>}
-            <small>{value.id}</small>
-            <UpstreamConnection key={`connection\0${token}\0${writeTenant}\0${value.id}`} account={value} token={token} tenant={writeTenant} disabled={!manageable || Boolean(busy)} onChanged={onChanged} />
+            </div>
+            <div className="provider-directory-summary"><span className={`status ${value.status === 'active' ? 'ok' : 'pending'}`}>{enumLabel(t, 'status', value.status)}</span><span>{t('providers.routes', { count: formatNumber(value.route_count, locale) })}</span></div>
+            <div className="provider-directory-summary"><small>{t('providers.recentAvailability')}</small><span>{availabilityLoading ? t('common.loading') : !facts ? (locale.startsWith('zh') ? '暂无可用数据' : 'Unavailable') : terminal > 0 ? `${formatPercent(facts.metrics.successful_requests / terminal, locale)} ${locale.startsWith('zh') ? '成功' : 'successful'}` : locale.startsWith('zh') ? '暂无请求记录' : 'No recent requests'}</span></div>
+            <div className="provider-directory-summary"><small>{t('quota.title')}</small><span>{quotaText}</span>{quota && (quota.stale || (quota.stale_after !== null && quota.stale_after <= Date.now())) && <small>{t('quota.stale')}</small>}</div>
+            <div className="provider-directory-actions">
+              <Button appearance="secondary" type="button" aria-expanded={detailOpen} disabled={Boolean(busy) || proxyEditorOpen} onClick={() => setProviderDetail(detailOpen ? undefined : value.id)}>{detailOpen ? (locale.startsWith('zh') ? '收起详情' : 'Close details') : (locale.startsWith('zh') ? '查看详情' : 'View details')}</Button>
+              {providerAvailable && <Button appearance="subtle" type="button" data-inline-edit-trigger={value.id} disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={(event) => { rememberTrigger(value.id, event.currentTarget); setProviderDetail(undefined); setProviderEditDraft(undefined); setEditing(value); }}>{t('providers.edit')}</Button>}
+            </div>
+          </div>
+          {detailOpen && <section className="provider-detail-workspace" aria-label={locale.startsWith('zh') ? `${value.name} · 详情` : `${value.name} · Details`}>
+            <div className="provider-detail-heading"><h3>{value.name}</h3><DetailTooltip content={`ID: ${value.id} · ${t('providers.generation')} ${value.credential_generation}`}><span tabIndex={0}>{locale.startsWith('zh') ? '账户信息' : 'Account information'}</span></DetailTooltip></div>
+            <div className="account-main">
+            <UpstreamConnection key={`connection\0${token}\0${writeTenant}\0${value.id}`} account={value} token={token} tenant={writeTenant} disabled={!manageable || Boolean(busy)} onChanged={onChanged} onEditingChange={setProxyEditorOpen} />
             {value.credential_expires_at && <small>{t('providers.expires')}: {new Date(value.credential_expires_at).toLocaleString(locale)}</small>}
-            <details className="upstream-health-details"><summary>{t('providers.recentAvailability')} · {currentHealth ? t(currentHealth.status === 'healthy' ? 'providers.healthy' : 'providers.unhealthy') : t('providers.manualHealthCheck')}</summary><UpstreamAvailability account={value} snapshot={availabilitySnapshot} window={availabilityWindow} loading={availabilityLoading} manualHealth={currentHealth} onOpenRequest={onOpenRequest} /></details>
-            <UpstreamQuota key={`${token}\0${tenant}\0${value.id}`} accountId={value.id} accountName={value.name} tenant={value.tenant_external_id ?? tenant} token={token} />
+            <Disclosure title={t('providers.recentAvailability')}><UpstreamAvailability account={value} snapshot={availabilitySnapshot} window={availabilityWindow} loading={availabilityLoading} manualHealth={currentHealth} onOpenRequest={onOpenRequest} /></Disclosure>
+            <UpstreamQuota key={`${token}\0${tenant}\0${value.id}`} accountId={value.id} accountName={value.name} tenant={value.tenant_external_id ?? tenant} token={token} initialSnapshot={quota} onSnapshot={snapshot => setQuotaSummaries(current => ({ ...current, [value.id]: snapshot }))} />
             {currentReadiness && <small className={`status ${currentReadiness.can_delete ? 'ok' : 'pending'}`}>{deletionBlockers.join(' · ')}</small>}
           </div>
           <div className="account-meta">
-            <span className={`status ${value.status === 'active' ? 'ok' : 'pending'}`}>{enumLabel(t, 'status', value.status)}</span>
-            <span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span>
-            <span className="pill">{t('providers.routes', { count: formatNumber(value.route_count, locale) })}</span>
-            <details className="upstream-secondary-actions"><summary>{t('connection.manageAccount')}</summary><div className="row-actions">
+            <Disclosure title={t('connection.manageAccount')}><div className="row-actions">
               {providerAvailable && <>
-                <button type="button" className="secondary" data-inline-edit-trigger={value.id} disabled={!manageable || Boolean(busy)} onClick={(event) => { rememberTrigger(value.id, event.currentTarget); setProviderEditDraft(undefined); setEditing(value); }}>{t('providers.edit')}</button>
-                <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void checkHealth(value)}>{t('providers.runManualHealthCheck')}</button>
-                {value.can_refresh && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void refreshOAuth(value)}>{t('providers.refreshAuthorization')}</button>}
-                {value.can_reauthorize && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setReauthorizing(value)}>{t('providers.reauthorize')}</button>}
-                {value.can_rotate && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setRotating(value)}>{t('providers.rotateCredential')}</button>}
+                <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => void checkHealth(value)}>{t('providers.runManualHealthCheck')}</Button>
+                {value.can_refresh && <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => void refreshOAuth(value)}>{t('providers.refreshAuthorization')}</Button>}
+                {value.can_reauthorize && <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => { setProviderDetail(undefined); setReauthorizing(value); }}>{t('providers.reauthorize')}</Button>}
+                {value.can_rotate && <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => { setProviderDetail(undefined); setRotating(value); }}>{t('providers.rotateCredential')}</Button>}
               </>}
-            </div></details>
-            <details className="upstream-danger-zone"><summary>{t('connection.dangerZone')}</summary><p>{t('connection.dangerHint')}</p><div className="row-actions">
-              {value.auth_kind === 'oauth' && <button type="button" className="danger" disabled={!manageable || Boolean(busy)} onClick={() => void disconnectOAuth(value)}>{t('providers.disconnect')}</button>}
-              {(value.status === 'active' || providerAvailable) && <button type="button" className="danger" disabled={!manageable || Boolean(busy)} onClick={() => void setStatus(value, value.status === 'active' ? 'disabled' : 'active')}>{value.status === 'active' ? t('providers.disable') : t('providers.enable')}</button>}
-              <button type="button" className="danger" title={deletionBlockers.length > 0 ? deletionBlockers.join(' ') : undefined} disabled={!manageable || Boolean(busy)} onClick={() => void remove(value)}>{t('common.remove')}</button>
-            </div></details>
+            </div></Disclosure>
+            <Disclosure title={t('connection.dangerZone')}><p>{t('connection.dangerHint')}</p><div className="row-actions">
+              {value.auth_kind === 'oauth' && <Button appearance="secondary" type="button" className="danger" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => void disconnectOAuth(value)}>{t('providers.disconnect')}</Button>}
+              {(value.status === 'active' || providerAvailable) && <Button appearance="secondary" type="button" className="danger" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => void setStatus(value, value.status === 'active' ? 'disabled' : 'active')}>{value.status === 'active' ? t('providers.disable') : t('providers.enable')}</Button>}
+              <Button appearance="secondary" type="button" className="danger" title={deletionBlockers.length > 0 ? deletionBlockers.join(' ') : undefined} disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => void remove(value)}>{t('common.remove')}</Button>
+            </div></Disclosure>
           </div>
+          </section>}
         </div>;
       })}</div>
     </article>
