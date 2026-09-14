@@ -21,6 +21,11 @@ test('installer executable selection is master-reviewed, unavailable by default 
     { source_revision: 'master' }, { executable_path: '/tmp/attacker' },
   ]) assert.throws(() => installerEnvironment({ ...approved, ...change }));
   const workflow = readFileSync(join(root, '.github/workflows/publish-first-party-plugin.yml'), 'utf8');
+  // Match the existing repository release-packaging contract, including the
+  // human-readable annotation beside each immutable action revision.
+  for (const line of workflow.split('\n').filter((line) => /^\s*(?:-\s+)?uses:/.test(line))) {
+    assert.match(line, /uses:\s+(?:\.\/\S+|\S+@[0-9a-fA-F]{40}\s+#\s+\S+)/);
+  }
   assert.doesNotMatch(workflow, /inputs\.|installer_digest:/);
   assert(workflow.indexOf('resolve-first-party-plugin-installer.ts') < workflow.indexOf('docker/login-action@'));
   assert(workflow.indexOf('actual_revision=$(docker image inspect') < workflow.indexOf('docker run --rm'));
