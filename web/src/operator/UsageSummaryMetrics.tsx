@@ -1,3 +1,4 @@
+import { LocalSettlementNotice, localSettlementLabel } from '../LocalSettlementNotice';
 import { displayTimeZone } from '../charts/displayTimeZone';
 import { totalTokens } from '../charts/usageCharts';
 import { formatCurrencyDisplay, formatMetricDisplay, formatPercent } from '../format';
@@ -19,7 +20,7 @@ export function UsageSummaryMetrics({ stats }: { stats: OperatorUsageAnalysis })
     {numeric(t('usage.requests'), summary.requests, points.map((point) => point.requests))}
     <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={t('usage.successRate')} value={formatPercent(rate, locale)} ratio={rate} tone="positive" />
     {numeric(t('usage.failures'), summary.failed, points.map((point) => point.failed), 'negative')}
-    <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={t('usage.cost')} value={summary.costs.length ? <span className="usage-cost-lines">{summary.costs.map(({ cost, currency }) => { const display = formatCurrencyDisplay(cost, currency, locale); return <span key={currency} title={display.title}>{display.text}</span>; })}</span> : '—'} formatSample={(_value, index) => { const cost = points[index].costs.find(item => item.currency === currency); return cost ? formatCurrencyDisplay(cost.cost, cost.currency, locale).title ?? '—' : '—'; }} trend={currency ? points.map((point) => point.costs.some(cost => cost.currency === currency) ? Number(point.costs.find(cost => cost.currency === currency)!.cost) : null) : undefined} />
+    <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={localSettlementLabel(locale)} labelContent={<LocalSettlementNotice />} value={summary.costs.length ? <span className="usage-cost-lines">{summary.costs.map(({ cost, currency }) => { const display = formatCurrencyDisplay(cost, currency, locale); return <span key={currency} title={display.title}>{display.text}</span>; })}</span> : '—'} formatSample={(_value, index) => { const cost = points[index].costs.find(item => item.currency === currency); return cost ? formatCurrencyDisplay(cost.cost, cost.currency, locale).title ?? '—' : '—'; }} trend={currency ? points.map((point) => point.costs.some(cost => cost.currency === currency) ? Number(point.costs.find(cost => cost.currency === currency)!.cost) : null) : undefined} />
     {numeric(t('usage.totalTokens'), totalTokens(summary), points.map(totalTokens))}
     {numeric(t('usage.generationUnits'), summary.generation_units, points.map((point) => point.generation_units))}
     {numeric(t('usage.cachedTokens'), summary.cached_input_tokens, points.map((point) => point.cached_input_tokens))}

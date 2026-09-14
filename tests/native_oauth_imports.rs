@@ -199,6 +199,10 @@ async fn native_kimi_cohort_contract_is_atomic_rotatable_and_secret_free() {
         capabilities["atomic_cohort_contracts"],
         json!(["atomic_kimi_cohort_v2"])
     );
+    assert_eq!(
+        capabilities["credential_lifecycle_policies"]["kimi"]["expired_access_token"],
+        "managed_refresh_required"
+    );
 
     let tenant = "native-kimi-cohort";
     let mut accounts = vec![
@@ -215,6 +219,8 @@ async fn native_kimi_cohort_contract_is_atomic_rotatable_and_secret_free() {
             "2099-01-01T00:00:00Z",
         ),
     ];
+    accounts[0]["document"]["proxy_url"] = json!("socks5h://10.0.0.1:1080");
+    accounts[0]["source_document_sha256"] = json!(digest(&accounts[0]["document"]));
     let create = cohort_request(tenant, accounts.clone());
     let mut unknown = create.clone();
     unknown["unexpected"] = json!(true);
@@ -260,12 +266,17 @@ async fn native_kimi_cohort_contract_is_atomic_rotatable_and_secret_free() {
         created["accounts"][0]["import_source_identity_hash"],
         "e".repeat(64)
     );
+    assert_eq!(created["accounts"][0]["has_proxy"], true);
+    assert_eq!(created["accounts"][0]["proxy_scheme"], "socks5h");
+    assert_eq!(created["accounts"][0]["proxy_remote_dns"], true);
+    assert_eq!(created["accounts"][1]["has_proxy"], false);
     let response = String::from_utf8(bytes).unwrap();
     for forbidden in [
         "auth/second.json",
         "auth/first.json",
         "fixture-second",
         "fixture-first",
+        "10.0.0.1",
     ] {
         assert!(!response.contains(forbidden));
     }
@@ -350,19 +361,39 @@ async fn native_kimi_cohort_contract_is_atomic_rotatable_and_secret_free() {
             account('b', "auth/b.json", "expired", "2000-01-01T00:00:00Z"),
         ],
     );
-    assert_eq!(
-        call(&state, "POST", COHORT, &issued.token, Some(&expired))
-            .await
-            .0,
-        StatusCode::BAD_REQUEST
-    );
+    let (status, imported_expired, _) =
+        call(&state, "POST", COHORT, &issued.token, Some(&expired)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(imported_expired["disposition"], "created");
+    assert!(imported_expired["accounts"].as_array().unwrap().iter().all(
+        |account| account["status"] == "active"
+            && account["credential_generation"] == 1
+            && account["route_count"] == 0
+    ));
+    let expired_id =
+        Uuid::parse_str(imported_expired["accounts"][1]["id"].as_str().unwrap()).unwrap();
     assert!(
         state
             .db
-            .list_upstream_accounts(expired_tenant)
+            .list_managed_oauth_refresh_candidates(memeloop_token_center::db::unix_millis(), 100)
             .await
             .unwrap()
-            .is_empty()
+            .contains(&(expired_id, 1))
+    );
+
+    let missing_expiry_tenant = "native-kimi-missing-expiry";
+    let missing_expiry = cohort_request(
+        missing_expiry_tenant,
+        vec![
+            account('6', "auth/6.json", "missing-a", ""),
+            account('7', "auth/7.json", "missing-b", ""),
+        ],
+    );
+    assert_eq!(
+        call(&state, "POST", COHORT, &issued.token, Some(&missing_expiry),)
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
     );
 
     let foreign_tenant = "native-kimi-foreign";

@@ -26,7 +26,7 @@ test('Codex window cadence follows supplier duration before internal primary or 
   assert.equal(quotaWindowPresentation('openai-codex', { ...window, period_seconds: 604_800 }).periodKey, 'quota.periodWeekly');
   assert.equal(quotaWindowPresentation('openai-codex', { ...window, period_seconds: null }).periodKey, 'quota.periodPrimary');
   assert.equal(quotaWindowPresentation('openai-codex', { ...window, id: 'code_review:primary_window' }).scopeKey, 'quota.scopeCodexReview');
-  assert.equal(quotaWindowPresentation('openai-codex', { ...window, id: 'bengalfox_tokens:primary_window' }).qualifier, 'bengalfox tokens');
+  assert.equal(quotaWindowPresentation('openai-codex', { ...window, id: 'bengalfox_tokens:primary_window' }).qualifier, null, 'internal feature names are not model identities');
   assert.equal(quotaWindowPresentation('openai-codex', { ...window, id: 'legacy-primary', label: 'Supplier feature' }).qualifier, 'Supplier feature');
 });
 

@@ -4,6 +4,7 @@ import test from 'node:test';
 
 import { formatMetricNumber } from '../src/format.js';
 import { translationCatalogs } from '../src/i18n.js';
+import { tenantDisplayName } from '../src/tenantDisplayName.js';
 
 test('Chinese and English translation catalogs expose the same keys', () => {
   const chineseKeys = Object.keys(translationCatalogs['zh-CN']).sort();
@@ -44,9 +45,19 @@ test('tenant copy stays action-focused and its active locale keys are not orphan
   assert.doesNotMatch(manager, /window\.(?:confirm|prompt)/);
 });
 
-test('Chinese copy does not leak English plural Tokens', () => {
-  const exposed = Object.values(translationCatalogs['zh-CN']).filter((value) => /\bTokens\b/.test(value));
+test('Chinese usage copy consistently uses 词元 instead of Token or Tokens', () => {
+  // Interpolation identifiers are protocol-independent keys, not visible copy.
+  const exposed = Object.values(translationCatalogs['zh-CN']).filter((value) => /\bTokens?\b/i.test(value.replace(/\{\{\w+\}\}/g, '')));
   assert.deepEqual(exposed, []);
+  assert.equal(translationCatalogs['zh-CN']['usage.tokens'], '词元');
+  assert.equal(translationCatalogs.en['usage.tokens'], 'Tokens');
+});
+
+test('default tenant is localized for display without changing external IDs or custom names', () => {
+  assert.equal(tenantDisplayName('default', 'zh-CN'), '默认');
+  assert.equal(tenantDisplayName('default', 'en'), 'default');
+  assert.equal(tenantDisplayName('Default', 'zh-CN'), 'Default');
+  assert.equal(tenantDisplayName('default-project', 'zh-CN'), 'default-project');
 });
 
 test('application rail uses localized product labels instead of OP or SELF abbreviations', async () => {

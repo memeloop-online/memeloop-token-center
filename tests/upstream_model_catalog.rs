@@ -441,8 +441,8 @@ async fn codex_catalog_sync_preserves_bound_for_explicit_custom_route() {
     );
 
     // Catalog pruning may serialize before a new explicit-custom route. The
-    // association transaction must recreate its transport reservation bound
-    // before publishing that route.
+    // association transaction must not invent financial exposure while
+    // publishing that route. It remains pending transport metadata.
     state
         .db
         .create_model_route(CreateModelRouteInput {
@@ -460,9 +460,10 @@ async fn codex_catalog_sync_preserves_bound_for_explicit_custom_route() {
         .upstream_account_with_credential(account.id, state.config.key_pepper.as_bytes())
         .await
         .unwrap();
-    assert_eq!(
-        updated.config["reservation_token_bounds"]["unused-custom-model"],
-        1_000_000_000
+    assert!(
+        updated.config["reservation_token_bounds"]
+            .get("unused-custom-model")
+            .is_none()
     );
 }
 
@@ -1229,7 +1230,7 @@ async fn postgres_catalog_race_fixture(
 }
 
 #[tokio::test]
-async fn postgres_route_then_catalog_preserves_the_committed_custom_bound() {
+async fn postgres_route_then_catalog_keeps_missing_custom_bound_unknown() {
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         eprintln!("skipping PostgreSQL route/catalog interleaving: MTC_TEST_POSTGRES_URL is unset");
         return;
@@ -1344,9 +1345,10 @@ async fn postgres_route_then_catalog_preserves_the_committed_custom_bound() {
             .await
             .expect("load route-first config");
     let config: Value = serde_json::from_str(&config_json).expect("route-first config JSON");
-    assert_eq!(
-        config["reservation_token_bounds"][custom_model.as_str()],
-        1_000_000_000
+    assert!(
+        config["reservation_token_bounds"]
+            .get(custom_model.as_str())
+            .is_none()
     );
     assert_eq!(config["reservation_token_bounds"]["catalog-model"], 272_000);
     assert!(
@@ -1362,7 +1364,7 @@ async fn postgres_route_then_catalog_preserves_the_committed_custom_bound() {
 }
 
 #[tokio::test]
-async fn postgres_catalog_then_route_recreates_the_required_custom_bound_atomically() {
+async fn postgres_catalog_then_route_keeps_missing_custom_bound_unknown() {
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         eprintln!("skipping PostgreSQL catalog/route interleaving: MTC_TEST_POSTGRES_URL is unset");
         return;
@@ -1476,9 +1478,10 @@ async fn postgres_catalog_then_route_recreates_the_required_custom_bound_atomica
             .await
             .expect("load catalog-first config");
     let config: Value = serde_json::from_str(&config_json).expect("catalog-first config JSON");
-    assert_eq!(
-        config["reservation_token_bounds"][custom_model.as_str()],
-        1_000_000_000
+    assert!(
+        config["reservation_token_bounds"]
+            .get(custom_model.as_str())
+            .is_none()
     );
     assert_eq!(config["reservation_token_bounds"]["catalog-model"], 272_000);
     assert!(

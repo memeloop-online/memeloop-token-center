@@ -86,6 +86,7 @@ pub(in crate::api::proxy) struct CandidatePreparationSummary {
     unavailable_snapshot: usize,
     protocol_mismatch: usize,
     incompatible_usage: usize,
+    reservation_metadata_unavailable: usize,
     skipped_incompatible_strict_route: bool,
     skipped_local_protocol_mismatch: bool,
     skipped_kimi_protocol_mismatch: bool,
@@ -163,6 +164,23 @@ pub(in crate::api::proxy) async fn next_planned_proxy_candidate(
         }
         let route_id = route.route_id;
         let account_id = route.account_id;
+        if codex_transport::is_driver(&route.driver)
+            && codex_transport::trusted_reservation_token_bound(
+                &route.config,
+                &route.upstream_model,
+            )
+            .is_err()
+        {
+            summary.reservation_metadata_unavailable += 1;
+            tracing::warn!(
+                request_id = %request.request_id,
+                %route_id,
+                upstream_account_id = %account_id,
+                stage = "candidate_reservation_metadata_unavailable",
+                "Codex candidate awaits verified model reservation metadata; no reservation or dispatch"
+            );
+            continue;
+        }
         return plan_proxy_route(ProxyRoutePlanInput {
             request,
             route,
@@ -188,6 +206,7 @@ pub(in crate::api::proxy) async fn next_planned_proxy_candidate(
         unavailable_snapshot = summary.unavailable_snapshot,
         protocol_mismatch = summary.protocol_mismatch,
         incompatible_usage = summary.incompatible_usage,
+        reservation_metadata_unavailable = summary.reservation_metadata_unavailable,
         "authorized candidate preparation exhausted without dispatch"
     );
     Ok(None)
@@ -208,6 +227,11 @@ pub(in crate::api::proxy) fn exhausted_candidate_error(
     }
     if summary.skipped_incompatible_strict_route {
         validate_openai_chat_choice_count(request_json)?;
+    }
+    if summary.reservation_metadata_unavailable > 0 {
+        return Ok(AppError::Upstream(
+            "Codex model reservation metadata is not configured; synchronize the account model catalog or configure a verified bound for this exact model".into(),
+        ));
     }
     Ok(AppError::Overloaded)
 }

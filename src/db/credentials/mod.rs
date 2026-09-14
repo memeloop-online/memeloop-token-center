@@ -1,6 +1,7 @@
 use super::*;
 
 mod keys;
+mod lifecycle;
 mod recovery;
 mod service_tokens;
 

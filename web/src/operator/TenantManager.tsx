@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { DrawerFrame } from '../components';
 import { useI18n } from '../i18n';
+import { tenantDisplayName } from '../tenantDisplayName';
 import type { TenantManagementView } from '../types';
 import { ResourceListStatusEmpty, ResourceListStatusFilterControl, useResourceListStatusFilter } from './ResourceListStatusFilter';
 import { messageOf } from './scope/operatorShared';
@@ -25,7 +26,7 @@ type TenantDialog = {
  * rejected while the tenant still owns data.
  */
 export function TenantManager({ token, onChanged }: Props) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const [values, setValues] = useState<TenantManagementView[]>();
   const [name, setName] = useState('');
   const [loading, setLoading] = useState(false);
@@ -75,7 +76,7 @@ export function TenantManager({ token, onChanged }: Props) {
         body: JSON.stringify({ external_id: externalId }),
       });
       setName('');
-      setMessage(t('tenants.created', { tenant: created.external_id }));
+      setMessage(t('tenants.created', { tenant: tenantDisplayName(created.external_id, locale) }));
       await refresh();
     } catch (reason) {
       setError(messageOf(reason, t('common.requestFailed')));
@@ -103,7 +104,7 @@ export function TenantManager({ token, onChanged }: Props) {
       const updated = await api<TenantManagementView>(`${managementPath}/${encodeURIComponent(value.external_id)}`, token, {
         method: 'PATCH', body: JSON.stringify({ external_id: externalId }),
       });
-      setMessage(t('tenants.renamed', { tenant: updated.external_id }));
+      setMessage(t('tenants.renamed', { tenant: tenantDisplayName(updated.external_id, locale) }));
       await refresh();
       setDialog(undefined);
     } catch (reason) {
@@ -118,7 +119,7 @@ export function TenantManager({ token, onChanged }: Props) {
     setBusy(`${action}-${value.external_id}`); setMessage(''); setError('');
     try {
       const updated = await api<TenantManagementView>(`${managementPath}/${encodeURIComponent(value.external_id)}/${action}`, token, { method: 'POST' });
-      setMessage(t(status === 'archived' ? 'tenants.archivedMessage' : 'tenants.restored', { tenant: updated.external_id }));
+      setMessage(t(status === 'archived' ? 'tenants.archivedMessage' : 'tenants.restored', { tenant: tenantDisplayName(updated.external_id, locale) }));
       await refresh();
       setDialog(undefined);
     } catch (reason) {
@@ -132,7 +133,7 @@ export function TenantManager({ token, onChanged }: Props) {
     setBusy(`delete-${value.external_id}`); setMessage(''); setError('');
     try {
       await api<void>(`${managementPath}/${encodeURIComponent(value.external_id)}`, token, { method: 'DELETE' });
-      setMessage(t('tenants.deleted', { tenant: value.external_id }));
+      setMessage(t('tenants.deleted', { tenant: tenantDisplayName(value.external_id, locale) }));
       await refresh();
       setDialog(undefined);
     } catch (reason) {
@@ -198,7 +199,7 @@ export function TenantManager({ token, onChanged }: Props) {
         {statusFilter.values.map((value) => {
           const isDefault = value.external_id === 'default';
           return <div className="managed-resource" key={value.external_id}>
-            <div className="managed-resource-header"><div><b>{value.external_id}</b><span className={`status ${value.status === 'active' ? 'ok' : 'pending'}`}>{t(`tenants.${value.status}`)}</span></div></div>
+            <div className="managed-resource-header"><div><b>{tenantDisplayName(value.external_id, locale)}</b><span className={`status ${value.status === 'active' ? 'ok' : 'pending'}`}>{t(`tenants.${value.status}`)}</span></div></div>
             {!isDefault && <div className="row-actions">
                 <button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => openDialog('rename', value)}>{t('tenants.rename')}</button>
                 {value.status === 'active'
@@ -210,7 +211,7 @@ export function TenantManager({ token, onChanged }: Props) {
       </div>}
     </div>
     {dialog && <DrawerFrame title={dialogTitle} eyebrow={t('tenants.title')} onClose={closeDialog}>
-      <p className="tenant-dialog-object"><code>{dialog.tenant.external_id}</code></p>
+      <p className="tenant-dialog-object"><code>{tenantDisplayName(dialog.tenant.external_id, locale)}</code></p>
       <p className="tenant-dialog-impact">{dialogImpact}</p>
       {dialog.kind === 'rename' && <label className="tenant-dialog-input">{t('tenants.name')}<input autoFocus value={renameDraft} maxLength={200} onChange={(event) => setRenameDraft(event.target.value)} /></label>}
       {error && <div className="notice error" role="alert">{error}</div>}

@@ -17,7 +17,7 @@ const resetCapability: UpstreamQuotaSnapshot['reset_capability'] = {
 const retained: UpstreamQuotaSnapshot = {
   contract_version: 'upstream_quota_v1', upstream_account_id: 'retained', tenant_external_id: 'default', provider: 'openai-codex',
   status: 'ready', observed_at: Date.UTC(2026, 8, 14, 12, 25, 44), stale_after: Date.UTC(2026, 8, 14, 12, 26, 14), stale: true, plan_type: 'Plus',
-  credits: { balance: '0', unlimited: false, has_credits: true },
+  credits: { balance: '0', unlimited: false, has_credits: true, source: 'codex_usage' },
   windows: [{ id: 'code:primary_window', label: 'code:primary_window', used_percent: 0, remaining: null, limit: null, reset_at: null, period_seconds: 18_000, source: 'codex_usage', reset_is_estimated: false, allowed: true, limit_reached: false }],
   reset_capability: resetCapability, error_code: 'quota_transport_failed',
 };
@@ -33,6 +33,8 @@ function Preview() {
     <h1>Quota semantics · no network</h1>
     <section className="upstream-quota" aria-label="Retained failed refresh" data-case="retained"><UpstreamQuotaDetails snapshot={retained} /></section>
     <section className="upstream-quota" aria-label="Failed refresh without observation" data-case="unobserved"><UpstreamQuotaDetails snapshot={unobserved} /></section>
+    <section className="upstream-quota" aria-label="Unmapped supplier feature" data-case="unmapped"><UpstreamQuotaDetails snapshot={{ ...retained, credits: { balance: '0', unlimited: false, has_credits: true }, windows: [{ ...retained.windows[0], id: 'Codex_bengalfox:primary_window', label: 'Codex_bengalfox' }] }} /></section>
+    <section className="upstream-quota" aria-label="Supplier credits without balance" data-case="missing-balance"><UpstreamQuotaDetails snapshot={{ ...retained, credits: { balance: null, source: 'codex_usage', unlimited: null, has_credits: true } }} /></section>
   </article></main>;
 }
 

@@ -10,7 +10,7 @@ import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/operator/operator.css';
 
-type Scenario = 'all-tenants' | 'route-failure' | 'scope-race' | 'scope-lock' | 'client-recovery' | 'service-copy' | 'service-plaintext' | 'service-scope-aba' | 'client-form' | 'client-filter';
+type Scenario = 'all-tenants' | 'route-failure' | 'scope-race' | 'scope-lock' | 'client-recovery' | 'service-copy' | 'service-plaintext' | 'service-scope-aba' | 'client-form' | 'client-filter' | 'client-lifecycle';
 
 interface RecordedRequest {
   method: string;
@@ -39,7 +39,8 @@ declare global {
 
 const parameters = new URLSearchParams(location.search);
 const scenario = (parameters.get('scenario') ?? 'all-tenants') as Scenario;
-const initialTenant = scenario === 'all-tenants' ? '' : 'tenant-a';
+const initialTenant = scenario === 'all-tenants' ? '' : scenario === 'client-lifecycle' ? 'default' : 'tenant-a';
+const deletedClientIds = new Set<string>();
 
 const pendingIssues: Array<(response: Response) => void> = [];
 const pendingRouting: Array<(response: Response) => void> = [];
@@ -169,7 +170,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     credentials: init?.credentials,
     referrerPolicy: init?.referrerPolicy,
     hasSignal: Boolean(init?.signal),
-    ...(scenario === 'client-form' && typeof init?.body === 'string' ? { body: init.body } : {}),
+    ...((scenario === 'client-form' || scenario === 'client-lifecycle') && typeof init?.body === 'string' ? { body: init.body } : {}),
   });
   if (url.pathname === '/internal/v1/schemas') {
     return json({
@@ -204,6 +205,12 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   if (url.pathname === '/internal/v1/keys/key-recovery/credential-recovery/copy' && method === 'POST') {
     return json({ key_id: 'key-recovery', credential_generation: 1, key: 'mts_client_recovered' });
   }
+  if (scenario === 'client-lifecycle' && url.pathname === '/internal/v1/keys/delete') {
+    const body = JSON.parse(String(init?.body));
+    if (body.tenant_external_id !== 'default' || body.key_ids.length > 100) return json({}, 400);
+    for (const id of body.key_ids) deletedClientIds.add(id);
+    return json({ deleted_key_ids: body.key_ids });
+  }
   if (scenario === 'client-form') {
     if (url.pathname === '/internal/v1/upstreams' && parameters.has('account-catalog-failure') && document.documentElement.dataset.accountCatalogAvailable !== 'true') return json({ error: { message: 'fixture catalog unavailable' } }, 503);
     if (url.pathname === '/internal/v1/keys/key-form/routing') return json({ ...routingResponse, route_ids: ['00000000-0000-4000-8000-000000000004'], effective_route_ids: ['00000000-0000-4000-8000-000000000004'] });
@@ -231,6 +238,14 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     return json([]);
   }
   if (url.pathname === '/internal/v1/keys') {
+    if (scenario === 'client-lifecycle') {
+      const source = url.searchParams.get('creation_source');
+      const rows = [
+        { ...credential('Manual workspace', 'default', 'key-manual'), creation_source: 'manual' },
+        { ...credential('API workspace', 'default', 'key-api'), creation_source: 'api' },
+      ];
+      return json(rows.filter(row => !deletedClientIds.has(row.key_id) && (!source || row.creation_source === source || (source === 'manual_or_unknown' && row.creation_source === 'manual'))));
+    }
     if (scenario === 'client-filter') {
       const search = url.searchParams.get('search');
       const status = url.searchParams.get('status');

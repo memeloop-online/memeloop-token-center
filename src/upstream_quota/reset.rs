@@ -39,8 +39,11 @@ async fn fresh_snapshot(
         .permits
         .try_acquire()
         .map_err(|_| temporarily_unavailable())?;
+    let timeout = codex_quota_budget(&account.config)
+        .map_err(|_| temporarily_unavailable())?
+        .total;
     tokio::time::timeout(
-        Duration::from_secs(8),
+        timeout,
         read_codex(
             state,
             account,

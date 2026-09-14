@@ -57,7 +57,7 @@ impl CodexClients {
         self.client(key, policy)
     }
 
-    /// Directory reads share the generation transport's TLS profile and cache.
+    /// Control-plane reads share the generation transport's TLS profile and cache.
     pub(crate) fn account_snapshot(
         &self,
         account: &crate::provider::UpstreamAccountView,

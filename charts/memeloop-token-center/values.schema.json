@@ -70,7 +70,7 @@
       ],
       "properties": {
         "enabled": { "type": "boolean" },
-        "schemaVersion": { "type": "integer", "const": 93 },
+        "schemaVersion": { "type": "integer", "const": 94 },
         "backoffLimit": { "type": "integer", "minimum": 0, "maximum": 20 },
         "activeDeadlineSeconds": { "type": "integer", "minimum": 30 },
         "ttlSecondsAfterFinished": { "type": "integer", "minimum": 0 },
@@ -251,12 +251,56 @@
     "plugins": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "mountPath", "existingConfigMap", "existingClaim", "ociInstaller"],
+      "required": ["enabled", "mountPath", "existingConfigMap", "existingClaim", "ociInstaller", "runtimeInventory"],
       "properties": {
         "enabled": { "type": "boolean" },
         "mountPath": { "type": "string", "pattern": "^/", "minLength": 2 },
         "existingConfigMap": { "type": "string" },
         "existingClaim": { "type": "string" },
+        "runtimeInventory": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "existingClaim", "persistence", "installationEnabled", "policyConfigMap", "cosignPublicKeysSecret", "registrySecrets", "tmpSizeLimit"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "existingClaim": { "type": "string" },
+            "persistence": {
+              "type": "object", "additionalProperties": false,
+              "required": ["create", "storageClass", "size"],
+              "properties": {
+                "create": { "type": "boolean" },
+                "storageClass": { "type": "string" },
+                "size": { "$ref": "#/definitions/resourceQuantity" }
+              }
+            },
+            "installationEnabled": { "type": "boolean" },
+            "policyConfigMap": { "type": "string" },
+            "cosignPublicKeysSecret": { "$ref": "#/properties/plugins/properties/ociInstaller/properties/cosignPublicKeysSecret" },
+            "registrySecrets": {
+              "type": "array", "maxItems": 16,
+              "items": {
+                "type": "object", "additionalProperties": false,
+                "required": ["name", "keys"],
+                "properties": {
+                  "name": { "type": "string", "minLength": 1 },
+                  "keys": {
+                    "type": "array", "minItems": 1, "maxItems": 16, "uniqueItems": true,
+                    "items": { "$ref": "#/properties/plugins/properties/ociInstaller/properties/cosignPublicKeysSecret/properties/keys/items" }
+                  }
+                }
+              }
+            },
+            "tmpSizeLimit": { "$ref": "#/definitions/resourceQuantity" }
+          },
+          "allOf": [
+            { "if": { "properties": { "installationEnabled": { "const": true } } },
+              "then": { "properties": {
+                "enabled": { "const": true },
+                "policyConfigMap": { "minLength": 1 },
+                "cosignPublicKeysSecret": { "properties": { "name": { "minLength": 1 }, "keys": { "minItems": 1 } } }
+              } } }
+          ]
+        },
         "ociInstaller": {
           "type": "object",
           "additionalProperties": false,

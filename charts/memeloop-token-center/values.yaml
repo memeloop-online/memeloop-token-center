@@ -15,7 +15,7 @@ migration:
   enabled: true
   # Must equal the greatest migration registered by the release binary.
   # The packaging contract rejects drift between this value and migrations/.
-  schemaVersion: 93
+  schemaVersion: 94
   # The hook is the only component that applies schema migrations. Application
   # Deployments always set MTC_RUN_MIGRATIONS_ON_START=false.
   backoffLimit: 4
@@ -195,6 +195,26 @@ plugins:
   mountPath: /var/lib/memeloop-token-center/plugins
   existingConfigMap: ""
   existingClaim: ""
+  # Shared immutable inventories; separate from the legacy startup plugin mount.
+  # The existing PVC must support concurrent multi-node mounts (normally RWX)
+  # and coherent POSIX locks, hard links, rename and fsync.
+  runtimeInventory:
+    enabled: false
+    existingClaim: ""
+    persistence:
+      create: false
+      storageClass: ""
+      size: 1Gi
+    installationEnabled: false
+    # Host-owned policy.json; paths refer to the mounts documented in the guide.
+    policyConfigMap: ""
+    cosignPublicKeysSecret:
+      name: ""
+      keys: []
+    # Each entry: {name: existing-secret, keys: [selected-key-name, ...]}.
+    # Mounted only into Control at /var/run/mtc-plugin-registry/<index>/.
+    registrySecrets: []
+    tmpSizeLimit: 16Mi
   ociInstaller:
     enabled: false
     image:

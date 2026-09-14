@@ -3,6 +3,7 @@ use super::super::*;
 pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
     let authenticated = Router::new()
         .route("/internal/v1/keys", get(list_keys).post(create_key))
+        .route("/internal/v1/keys/delete", post(delete_client_credentials))
         .route("/internal/v1/keys/{key_id}/rotate", post(rotate_key))
         .route(
             "/internal/v1/keys/{key_id}/credential-recovery",

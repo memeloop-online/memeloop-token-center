@@ -32,7 +32,24 @@ test('analytics background exposes actual indexed buckets through pointer, keybo
       if(width===2560)assert.ok(await page.locator('.app-main-content').evaluate(el=>el.getBoundingClientRect().width)>2500,'analytics must not retain 2048px shell cap');
       if(width===2560)assert.ok(await page.locator('.usage-page').evaluate(el=>el.getBoundingClientRect().width)>2400,'late operator CSS must not restore the 1360px inner page cap');
     }
-    assert.equal(await page.getByRole('slider').count(),2,'missing series must not invent samples');
+    assert.equal(await page.getByRole('slider').count(),3,'missing series must not invent samples');
     await page.getByRole('slider',{name:'All zero'}).focus();assert.match(await page.getByRole('slider',{name:'All zero'}).getAttribute('aria-valuetext')??'',/: 0$/);
+    const settlement = page.getByRole('slider', { name: 'Local settlement' });
+    const notice = settlement.locator('.metric-label span[tabindex]');
+    for (const action of ['pointer', 'keyboard', 'touch']) {
+      await page.mouse.move(1, 1);
+      await settlement.focus();
+      await page.keyboard.press('Escape');
+      if (action === 'pointer') await notice.hover();
+      if (action === 'keyboard') await page.keyboard.press('Tab');
+      if (action === 'touch') await notice.tap();
+      const tooltip = page.getByRole('tooltip').filter({ hasText: /不是供应商实际消耗或发票|not supplier consumption or an invoice/ });
+      await tooltip.waitFor();
+      assert.equal(await page.getByRole('tooltip').count(), 1, `${action}: detail must not also expose a trend tooltip`);
+      assert.match(await tooltip.textContent() ?? '', /保守上限|conservative ceiling/);
+      assert.equal(await settlement.locator('.metric-value').textContent(), '$0.123456');
+      await page.keyboard.press('Escape');
+      await tooltip.waitFor({ state: 'hidden' });
+    }
   }finally{await browser.close();await server.close();}
 });
