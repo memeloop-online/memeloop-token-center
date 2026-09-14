@@ -4,6 +4,7 @@ const tokenCount = (value: unknown): value is number => typeof value === 'number
 
 /** Missing cache telemetry cannot establish an uncached-input count. */
 export function nonCachedRequestInput(request: RequestView): number | null {
+  if (request.status_code === null) return null;
   const { input_tokens: input, cached_input_tokens: cached, cache_write_tokens: written } = request;
   if (!tokenCount(input) || !tokenCount(cached) || !tokenCount(written) || cached + written > input) return null;
   return input - cached - written;
@@ -24,12 +25,14 @@ export function requestTableCopy(locale: string) {
     tpsHint: '输出 Token ÷ 请求总耗时（秒），包含等待与首字延迟，不代表纯生成速度。',
     tpsMissing: '缺少有效的输出 Token 或请求耗时，无法计算。', tpsRunning: '请求进行中，完成后计算。',
     cacheMissing: '缓存明细缺失或不一致，无法确定非缓存输入；完整已知用量见详情。',
+    pendingUsage: '请求进行中，用量与费用尚未结算。',
   } : {
     total: 'Total', input: 'Uncached input', output: 'Output', unknown: 'Not recorded', unnamed: 'Unnamed credential',
     missingCredential: 'Credential not recorded', averageTps: 'Average TPS',
     tpsHint: 'Output tokens ÷ total request seconds, including waiting and first-token latency; not pure decoding speed.',
     tpsMissing: 'Valid output tokens or request duration are missing; the rate cannot be calculated.', tpsRunning: 'Calculated when the request finishes.',
     cacheMissing: 'Cache telemetry is missing or inconsistent, so uncached input is unknown. Known usage remains in details.',
+    pendingUsage: 'The request is running; usage and cost have not been settled.',
   };
 }
 

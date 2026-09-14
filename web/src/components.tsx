@@ -253,9 +253,10 @@ export function RequestTable({
             const durationSummary = request.completed_at != null
               ? `${t('request.completedAt')}: ${new Date(request.completed_at).toLocaleString(locale)}`
               : '';
-            const cost = currencyForRequest ? formatCurrencyDisplay(request.cost, currencyForRequest, locale) : { text: '—' };
+            const pending = request.status_code === null;
+            const cost = pending ? { text: '—', title: copy.pendingUsage } : currencyForRequest ? formatCurrencyDisplay(request.cost, currencyForRequest, locale) : { text: '—' };
             const tokenDisplay = formatMetricDisplay(request.input_tokens + request.output_tokens, locale);
-            const tokenDetails = requestTokenDetails(request, locale, t);
+            const tokenDetails = pending ? copy.pendingUsage : requestTokenDetails(request, locale, t);
             const duration = formatDurationDisplay(request.duration_ms, locale);
             const uncachedInput = nonCachedRequestInput(request);
             const averageTps = averageRequestOutputTps(request);
@@ -267,8 +268,8 @@ export function RequestTable({
               <td className="request-time-cell"><time>{new Date(request.created_at).toLocaleString(locale)}</time><RequestIdentifier requestId={request.request_id} compact /></td>
               <td className="request-credential-cell"><DetailTooltip content={credentialDetails}><strong tabIndex={0}>{credentialLabel}</strong></DetailTooltip></td>
               <td className="request-model-cell"><DetailTooltip content={technicalSummary}><span className="request-routing-info" tabIndex={0}><code>{request.model}</code>{upstreamName && <small className="request-upstream-name">{upstreamName}</small>}</span></DetailTooltip></td>
-              <td className="request-token-cell"><DetailTooltip content={tokenDetails}><span className="request-value-info request-token-total" aria-label={`${copy.total} ${tokenDisplay.text} (${tokenDetails})`} tabIndex={0}>{copy.total} <span>{tokenDisplay.text}</span></span></DetailTooltip>
-                <span className="request-token-primary"><span>{copy.input} <b>{uncachedInput === null ? <DetailTooltip content={copy.cacheMissing}><span tabIndex={0}>—</span></DetailTooltip> : formatMetricDisplay(uncachedInput, locale).text}</b></span><span>{copy.output} <b>{formatMetricDisplay(request.output_tokens, locale).text}</b></span></span>
+              <td className="request-token-cell"><DetailTooltip content={tokenDetails}><span className="request-value-info request-token-total" aria-label={pending ? copy.pendingUsage : `${copy.total} ${tokenDisplay.text} (${tokenDetails})`} tabIndex={0}>{pending ? t('common.running') : <>{copy.total} <span>{tokenDisplay.text}</span></>}</span></DetailTooltip>
+                <span className="request-token-primary"><span>{copy.input} <b>{uncachedInput === null ? <DetailTooltip content={pending ? copy.pendingUsage : copy.cacheMissing}><span tabIndex={0}>—</span></DetailTooltip> : formatMetricDisplay(uncachedInput, locale).text}</b></span><span>{copy.output} <b>{pending ? '—' : formatMetricDisplay(request.output_tokens, locale).text}</b></span></span>
               </td>
               <td className="request-cost-cell"><span className="request-value-info" title={cost.title} aria-label={cost.title ? `${cost.text} (${cost.title})` : undefined} tabIndex={cost.title ? 0 : undefined}>{cost.text}</span></td>
               {showsSession && <td className="request-session-cell">

@@ -14,6 +14,7 @@ test('uncached input uses both recorded cache components and does not fabricate 
   assert.equal(nonCachedRequestInput({ ...request, cached_input_tokens: undefined }), null);
   assert.equal(nonCachedRequestInput({ ...request, cache_write_tokens: undefined }), null);
   assert.equal(nonCachedRequestInput({ ...request, cached_input_tokens: 150 }), null);
+  assert.equal(nonCachedRequestInput({ ...request, status_code: null, input_tokens: 0, cached_input_tokens: 0, cache_write_tokens: 0 }), null);
   assert.equal(nonCachedRequestInput({ ...request, input_tokens: 0, cached_input_tokens: 0, cache_write_tokens: 0 }), 0);
 });
 

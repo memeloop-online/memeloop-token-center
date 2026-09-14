@@ -121,6 +121,11 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     assert.equal(await recordedRow.locator('.request-tps-cell').innerText(), '25.93', '32 output tokens / 1.234 recorded seconds');
     assert.equal(await page.locator('tbody tr').nth(1).locator('.request-tps-cell').innerText(), '—', 'missing duration never becomes zero TPS');
     assert.match(await page.locator('tbody tr').nth(1).locator('.request-token-primary').innerText(), /Uncached input\s*—[\s\S]*Output\s*32/);
+    const runningRow = page.locator('tbody tr').nth(2);
+    assert.match(await runningRow.locator('.request-token-cell').innerText(), /Running/);
+    assert.doesNotMatch(await runningRow.locator('.request-token-cell').innerText(), /0/, 'unsettled zero-valued counters are not presented as measured usage');
+    assert.equal(await runningRow.locator('.request-cost-cell').innerText(), '—');
+    assert.equal(await runningRow.locator('.request-tps-cell').innerText(), '—');
     assert.match(await page.locator('tbody tr').nth(1).locator('.request-token-cell .request-value-info').getAttribute('aria-label') ?? '', /Input tokens: 160.*Output tokens: 32/);
     assert.equal((await stage('read historical table currency', () => page!.locator('tbody tr').nth(1).locator('.request-cost-cell').textContent(), history, current))?.trim(), '—', 'an explicit historical null currency must not inherit the current credential currency');
 
