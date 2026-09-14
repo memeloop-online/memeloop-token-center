@@ -20,8 +20,19 @@ image/source evidence, then use a reviewed master PR to set
 `.github/first-party-plugin-installer-trust.json` to `status: "ready"`, its exact
 `sha256:...` digest and full `source_revision`. The repository is fixed to
 `ghcr.io/memeloop-online/memeloop-token-center-plugin-installer`. This change
-intentionally leaves the record `awaiting-reviewed-installer-release` with null
-digest/revision: no compatible published image is currently claimed.
+pins the compatible installer from successful master
+[CI run 34891993755](https://github.com/memeloop-online/memeloop-token-center/actions/runs/34891993755),
+source `69b03ff0f37f76458bd6b49a05faa9aa43383493`, digest
+`sha256:5d01c0a753358c241fa01ae3c94afe1dd71ec4c1708711dd64f774f49488a980`.
+The same run's `ghcr-release-69b03ff0f37f76458bd6b49a05faa9aa43383493`
+and `image-digest-plugin-installer-69b03ff0f37f76458bd6b49a05faa9aa43383493`
+artifacts bind the release manifest, image metadata, OCI index and BuildKit
+SPDX/SLSA statements. Independent registry reads confirmed the immutable digest,
+the statement subjects, source/revision labels and patched Cosign
+`v3.1.3-mtc.3` label. This is a reviewed CI-image pin, not a claim that BuildKit
+statements are independently signed or that the plugin is already published.
+It supports Model Guard; future packages requiring a newer installer schema must
+first obtain a newly reviewed compatible image pin.
 
 Only after that review is merged, manually dispatch
 `.github/workflows/publish-first-party-plugin.yml` from `master`. There is no
