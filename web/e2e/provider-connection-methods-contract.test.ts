@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { directCredentialSchema, supportsDirectConnection } from '../src/operator/providerConnectionMethods.js';
+import { directCredentialSchema, oauthCreationProxyMode, supportsDirectConnection } from '../src/operator/providerConnectionMethods.js';
 import type { ProviderType } from '../src/types.js';
 
 const dualMethodProvider: ProviderType = {
@@ -40,4 +40,14 @@ test('OAuth-only providers are not shown as direct credential providers', () => 
   };
   assert.equal(supportsDirectConnection(oauthOnly), false);
   assert.equal(directCredentialSchema(oauthOnly.credential_schema), undefined);
+});
+
+test('native creation proxy policy preserves Codex and does not invent Kimi or plugin support', () => {
+  assert.equal(oauthCreationProxyMode(dualMethodProvider), 'required');
+  for (const [id, flow] of [['cursor', 'cursor_pkce'], ['github-copilot', 'github_device_copilot']] as const) {
+    const provider = { ...dualMethodProvider, id, source: 'builtin', oauth_adapter: { ...dualMethodProvider.oauth_adapter!, flow_kind: flow } };
+    assert.equal(oauthCreationProxyMode(provider), 'optional');
+    assert.equal(oauthCreationProxyMode({ ...provider, source: 'plugin' }), 'none');
+  }
+  assert.equal(oauthCreationProxyMode({ ...dualMethodProvider, id: 'kimi-oauth', oauth_adapter: undefined }), 'none');
 });

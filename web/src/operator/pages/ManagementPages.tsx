@@ -27,7 +27,7 @@ import {
   ownsKeyListRequest, shouldLoadCredentialRoutes,
   type KeyListLoadState, type KeyListRequestIdentity,
 } from '../keyPagination';
-import { directCredentialSchema, supportsDirectConnection } from '../providerConnectionMethods';
+import { directCredentialSchema, oauthCreationProxyMode, supportsDirectConnection } from '../providerConnectionMethods';
 import { UpstreamAvailability, manualHealthLabel } from '../UpstreamAvailability';
 import { QuotaResetCreditExpiry, UpstreamQuota } from '../UpstreamQuota';
 import { quotaSummaryPresentation } from '../upstreamQuota';
@@ -374,13 +374,17 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
   const [session, setSession] = useState<{ login_url?: string; verification_url?: string; user_code?: string; session_token: string; expires_at?: number; poll_after_seconds?: number }>();
   const [manualCode, setManualCode] = useState('');
   const [proxyUrl, setProxyUrl] = useState('');
+  const [useProxy, setUseProxy] = useState(false);
+  const proxyMode = oauthCreationProxyMode(selectedProvider);
+  const needsProxy = !existing && (proxyMode === 'required' || (proxyMode === 'optional' && useProxy));
+  const proxyValid = !needsProxy || isPrivateProxyUrl(proxyUrl.trim());
   const [authorizing, setAuthorizing] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
-  const reset = () => { setSession(undefined); setManualCode(''); setProxyUrl(''); setMessage(''); setError(''); };
-  useEffect(() => { setSession(undefined); setManualCode(''); setProxyUrl(''); setMessage(''); setError(''); }, [tenant]);
+  const reset = () => { setSession(undefined); setManualCode(''); setProxyUrl(''); setUseProxy(false); setMessage(''); setError(''); };
+  useEffect(() => { reset(); }, [token, tenant]);
   const start = async (providerConfig?: unknown) => {
-    if (!tenant || !selectedProvider || !name.trim() || authorizing || session) return;
+    if (!tenant || !selectedProvider || !name.trim() || authorizing || session || !proxyValid) return;
     if (selectedProvider.oauth_adapter?.flow_kind === 'openai_device') {
       if (!existing && !isPrivateProxyUrl(proxyUrl.trim())) return;
       if (existing && (existing.has_proxy === false || (existing.has_proxy === true && existing.proxy_scheme !== 'socks5h'))) { setError(t('connection.reauthorizationProxy')); return; }
@@ -388,6 +392,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
     setAuthorizing(true);
     try {
       const target = existing ? { upstream_account_id: existing.id } : {};
+      const proxy = needsProxy ? { proxy_url: proxyUrl.trim() } : {};
       const flow = selectedProvider.oauth_adapter?.flow_kind;
       if (flow === 'openai_device') {
         setSession(await api('/internal/v1/oauth/codex/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, ...(!existing ? { proxy_url: proxyUrl.trim() } : {}), ...target }) }));
@@ -395,13 +400,13 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
       } else if (flow === 'claude_manual_pkce') {
         setSession(await api('/internal/v1/oauth/claude/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, ...target }) }));
       } else if (flow === 'github_device_copilot') {
-        setSession(await api('/internal/v1/oauth/copilot/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, ...target }) }));
+        setSession(await api('/internal/v1/oauth/copilot/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, ...proxy, ...target }) }));
       } else if (flow === 'cursor_pkce' && selectedProvider.source === 'builtin') {
-        setSession(await api('/internal/v1/oauth/cursor/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, provider_driver: selectedProvider.id, provider_config: existing?.config ?? { base_url: 'https://api2.cursor.sh', network_scope: 'public' }, ...target }) }));
+        setSession(await api('/internal/v1/oauth/cursor/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, provider_driver: selectedProvider.id, provider_config: existing?.config ?? { base_url: 'https://api2.cursor.sh', network_scope: 'public' }, ...proxy, ...target }) }));
       } else {
         setSession(await api('/internal/v1/oauth/provider-adapter/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, provider_driver: selectedProvider.id, provider_config: existing?.config ?? providerConfig, ...target }) }));
       }
-      setMessage(''); setError('');
+      setProxyUrl(''); setMessage(''); setError('');
     } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
     finally { setAuthorizing(false); }
   };
@@ -432,14 +437,17 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
     {oauthProviders.length === 0 ? <div className="empty">{t('providers.noAdapter')}</div> : <>
     <ModelPicker label={t('providers.provider')} disabled={Boolean(existing) || authorizing || Boolean(session) || nativeLocked} value={providerChoice} onChange={(next) => { setProviderChoice(next); setName(oauthProviders.find(value => value.id === next)?.display_name ?? ''); reset(); }} options={oauthProviders.map(value => ({ key: value.id, value: value.id, label: value.display_name, provider: value.display_name, upstream: '', capabilities: value.protocols }))} />
     {selectedProvider?.oauth_adapter?.flow_kind === 'authorization_code_pkce' ? <AuthorizationCodeConnection key={`${token}\0${tenant}\0${selectedProvider.id}`} token={token} tenant={tenant} provider={selectedProvider} existing={existing} onChanged={onChanged} onLock={setNativeLocked} /> : <>
-    <label>{t('providers.name')} · {t('connection.required')}<input required maxLength={200} readOnly={Boolean(existing)} disabled={authorizing || Boolean(session)} value={name} onChange={(event) => setName(event.target.value)} /></label>
-    {selectedProvider?.oauth_adapter?.flow_kind === 'openai_device' && !session && <section className="upstream-connection">
+    <label>{t('providers.name')} · {t('connection.required')}<Input required maxLength={200} readOnly={Boolean(existing)} disabled={authorizing || Boolean(session)} value={name} onChange={(event) => setName(event.target.value)} /></label>
+    {proxyMode !== 'none' && !session && <section className="upstream-connection">
       <h3>{t('connection.title')}</h3>
-      <p className="field-hint">{formJourneyCopy(locale).codexProxy}</p>
-      {!existing ? <ProxyInput value={proxyUrl} onChange={setProxyUrl} disabled={authorizing} /> : <p>{t(existing.has_proxy === undefined ? 'connection.proxyUnknown' : existing.has_proxy ? 'connection.proxyConfigured' : 'connection.proxyMissing')}</p>}
-      <p><b>{t('connection.baseUrl')}</b> · {t('connection.fixed')}</p><code>https://chatgpt.com/backend-api/codex</code>
+      {proxyMode === 'required' && <p className="field-hint">{formJourneyCopy(locale).codexProxy}</p>}
+      {!existing && proxyMode === 'optional' && <Checkbox checked={useProxy} disabled={authorizing} label={locale.startsWith('zh') ? '使用账号网络代理' : 'Use an account network proxy'} onChange={(_, data) => { setUseProxy(data.checked === true); setProxyUrl(''); }} />}
+      {needsProxy && <ProxyInput value={proxyUrl} onChange={setProxyUrl} disabled={authorizing} hint={proxyMode === 'optional' ? (locale.startsWith('zh') ? '由全局管理员配置私网或 Tailnet IP 的 socks5h:// 代理，用于登录及该账号后续请求。' : 'A global administrator can configure a private or Tailnet IP socks5h:// proxy for login and subsequent account requests.') : undefined} />}
+      {existing && <p>{t(existing.has_proxy === undefined ? 'connection.proxyUnknown' : existing.has_proxy ? 'connection.proxyConfigured' : 'connection.directEgress')} · {locale.startsWith('zh') ? '重新授权沿用当前账号连接设置；可在账号编辑页调整。' : 'Reauthorization reuses this account’s connection settings; change them in the account editor.'}</p>}
+      {!existing && proxyMode === 'optional' && !useProxy && <p className="field-hint">{t('connection.directEgress')}</p>}
+      {proxyMode === 'required' && <><p><b>{t('connection.baseUrl')}</b> · {t('connection.fixed')}</p><code>https://chatgpt.com/backend-api/codex</code></>}
     </section>}
-    {selectedProvider && selectedProvider.source !== 'builtin' && !session ? <Form key={`${selectedProvider.id}-${locale}`} schema={localizeSchema(selectedProvider.config_schema as RJSFSchema, locale)} formData={existing?.config} readonly={Boolean(existing)} validator={validator} templates={schemaFormTemplates} onSubmit={({ formData }) => void start(formData)}><button type="submit" disabled={!tenant || authorizing}>{t('common.startLogin')}</button></Form> : <div className="button-row"><button type="button" onClick={() => void start()} disabled={!tenant || !name.trim() || authorizing || Boolean(session) || (!existing && selectedProvider?.oauth_adapter?.flow_kind === 'openai_device' && !isPrivateProxyUrl(proxyUrl.trim()))}>{t(authorizing ? 'common.loading' : 'common.startLogin')}</button>{session && <><a className="button secondary" href={session.verification_url ?? session.login_url} target="_blank" rel="noreferrer">{t('common.openAuthorization')}</a>{selectedProvider?.oauth_adapter?.flow_kind !== 'claude_manual_pkce' && <button type="button" onClick={() => void poll()}>{t('common.checkAuthorization')}</button>}</>}</div>}
+    {selectedProvider && selectedProvider.source !== 'builtin' && !session ? <Form key={`${selectedProvider.id}-${locale}`} schema={localizeSchema(selectedProvider.config_schema as RJSFSchema, locale)} formData={existing?.config} readonly={Boolean(existing)} validator={validator} templates={schemaFormTemplates} widgets={fluentFormWidgets} onSubmit={({ formData }) => void start(formData)}><button type="submit" disabled={!tenant || authorizing || !proxyValid}>{t('common.startLogin')}</button></Form> : <div className="button-row"><button type="button" onClick={() => void start()} disabled={!tenant || !name.trim() || authorizing || Boolean(session) || !proxyValid}>{t(authorizing ? 'common.loading' : 'common.startLogin')}</button>{session && <><a className="button secondary" href={session.verification_url ?? session.login_url} target="_blank" rel="noreferrer">{t('common.openAuthorization')}</a>{selectedProvider?.oauth_adapter?.flow_kind !== 'claude_manual_pkce' && <button type="button" onClick={() => void poll()}>{t('common.checkAuthorization')}</button>}</>}</div>}
     {session && selectedProvider?.oauth_adapter?.flow_kind === 'claude_manual_pkce' && <div className="manual-authorization"><label>{t('providers.manualCode')}<input value={manualCode} onChange={(event) => setManualCode(event.target.value)} placeholder={t('providers.manualCodeHint')} /></label><button type="button" disabled={!manualCode.includes('#')} onClick={() => void complete()}>{t('providers.completeAuthorization')}</button></div>}
     {existing && selectedProvider?.oauth_adapter?.flow_kind === 'openai_device' && !session && <p>{t('connection.reauthorizationProxy')}</p>}
     {session?.user_code && <div className="device-authorization" role="status"><p>{t('providers.codexSecurity')}</p><b>{t('providers.deviceCode')}</b><code>{session.user_code}</code></div>}
