@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
+import { PortalMountNodeProvider } from '@fluentui/react-components';
 import { CopyButton } from './CopyButton.js';
 import type { RequestView, StatsBucket } from './types.js';
 import { useI18n } from './i18n.js';
@@ -325,6 +326,9 @@ export function DrawerFrame({
   const { t } = useI18n();
   const titleId = useId();
   const drawerRef = useRef<HTMLElement>(null);
+  // Owned floating content must stay inside the modal subtree. The default
+  // body portal is background content and is intentionally made inert below.
+  const [portalMountNode, setPortalMountNode] = useState<HTMLDivElement | null>(null);
   const previousFocus = useRef<HTMLElement | null>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
@@ -382,7 +386,8 @@ export function DrawerFrame({
       <button className="close" type="button" onClick={() => onCloseRef.current()} aria-label={t('common.close')}>×</button>
       <span className="eyebrow">{eyebrow}</span>
       <h2 id={titleId}>{title}</h2>
-      {children}
+      <div ref={setPortalMountNode} className="drawer-owned-portals" />
+      {portalMountNode && <PortalMountNodeProvider value={portalMountNode}>{children}</PortalMountNodeProvider>}
     </aside>
   </div>;
 }
