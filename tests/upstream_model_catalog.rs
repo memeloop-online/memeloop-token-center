@@ -686,6 +686,59 @@ async fn aggregate_uses_only_provider_groups_and_exclusion_wins() {
         .await
         .unwrap();
 
+    // Metadata discovery must expand configured groups without consulting the
+    // catalog-dependent eligible-candidate view (the catalog may be missing).
+    let (selected, _) = state
+        .db
+        .create_routed_model_route(CreateRoutedModelRouteInput {
+            tenant_external_id: "aggregate-tenant".into(),
+            public_model: "hidden-selected".into(),
+            upstream_model: "hidden-selected".into(),
+            protocol: "openai".into(),
+            priority: 0,
+            enabled: false,
+            upstream_account_ids: vec![accounts[1].id],
+            included_provider_group_ids: vec![included.id],
+            excluded_provider_group_ids: vec![excluded.id],
+            route_group_ids: Vec::new(),
+            route_group_names: Vec::new(),
+            granted_credential_ids: Vec::new(),
+            custom_model_confirmed: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        state
+            .db
+            .configured_upstream_model_ids(accounts[0].id)
+            .await
+            .unwrap(),
+        vec!["hidden-selected"]
+    );
+    for account in [&accounts[1], &accounts[2]] {
+        assert!(
+            state
+                .db
+                .configured_upstream_model_ids(account.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    state
+        .db
+        .archive_model_route(selected.id, "aggregate-tenant", selected.updated_at)
+        .await
+        .unwrap();
+    assert!(
+        state
+            .db
+            .configured_upstream_model_ids(accounts[0].id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
     let view = state
         .db
         .aggregate_upstream_models(
