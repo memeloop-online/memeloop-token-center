@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { ModelRouteView, ProviderType, UpstreamAccount } from '../src/types';
-import { credentialRouteOptions } from '../src/operator/credentialRouteOptions';
+import type { ModelRouteView, ProviderType, UpstreamAccount } from '../src/types.js';
+import { credentialRouteOptions } from '../src/operator/credentialRouteOptions.js';
 
 const route = (id: string, overrides: Partial<ModelRouteView> = {}): ModelRouteView => ({ id, public_model: 'Sol', upstream_model: 'sol', protocol: 'openai', enabled: true, priority: 1, created_at: 1, updated_at: 1, grant_revision: 1, ...overrides });
 test('route grant identity, candidate count and unavailable reasons are independent from model labels', () => {
