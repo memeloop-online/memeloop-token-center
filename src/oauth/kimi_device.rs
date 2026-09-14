@@ -290,6 +290,8 @@ pub async fn poll_kimi_device_login(
     .await
 }
 
+// Private endpoint seam retains the production poll's explicit authority inputs.
+#[allow(clippy::too_many_arguments)]
 async fn poll_at(
     db: &Database,
     http: &reqwest::Client,
@@ -314,6 +316,9 @@ async fn poll_at(
     .await
 }
 
+// Clock injection keeps expiry tests deterministic without sleeping or changing
+// production authority/transport inputs (as in authorization_code's test seams).
+#[allow(clippy::too_many_arguments)]
 async fn poll_at_with_clock(
     db: &Database,
     http: &reqwest::Client,
