@@ -9,6 +9,7 @@ CREATE TABLE application_plugin_installations (
     status TEXT NOT NULL CHECK (status IN ('installing', 'review', 'registered', 'failed')),
     review_digest TEXT,
     review_json TEXT,
+    checkpoints_json TEXT NOT NULL DEFAULT '{}',
     failure_category TEXT,
     lease_until BIGINT NOT NULL,
     created_at BIGINT NOT NULL,

@@ -16,11 +16,14 @@ test('Operator plugin page installs, explicitly reviews, publishes and rolls bac
   assert.ok(address && typeof address === 'object');
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
+  // The application defaults to Chinese. This contract uses English labels,
+  // so establish the locale before I18nProvider reads persisted preferences.
+  await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
   try {
     let current = { revision: 1, inventory_id: 'baseline', reason: 'initial' };
     const revisions = [current];
     const candidates = [{ inventory_id: 'baseline', staged: true, plugins: {} as Record<string, string[]> }];
-    let job: { id: string; inventory_id: string; actor: string; status: string; packages: string[]; review_digest: string; review: unknown; failure_category: null; created_at: number; updated_at: number } | undefined;
+    let job: { id: string; inventory_id: string; actor: string; status: string; packages: string[]; completed_packages: number; review_digest: string; review: unknown; failure_category: null; created_at: number; updated_at: number } | undefined;
     const writes: { path: string; body: any; key?: string }[] = [];
     await page.route('**/internal/v1/plugin-runtime**', async route => {
       const request = route.request();
@@ -35,7 +38,7 @@ test('Operator plugin page installs, explicitly reviews, publishes and rolls bac
       const body = request.postDataJSON();
       writes.push({ path, body, key: request.headers()['idempotency-key'] });
       if (path.endsWith('/installations')) {
-        job = { id: 'job', inventory_id: body.inventory_id, packages: body.packages, actor: 'service:operator', status: 'review', review_digest: 'review-exact', review: { plugins: [{ id: 'new-plugin', version: '1.0.0', wit_version: '0.2.0', capabilities: [{ kind: 'http', allowed_origins: ['https://api.example.com'] }], contributions: {} }] }, failure_category: null, created_at: 1, updated_at: 2 };
+        job = { id: 'job', inventory_id: body.inventory_id, packages: body.packages, completed_packages: 1, actor: 'service:operator', status: 'review', review_digest: 'review-exact', review: { plugins: [{ id: 'new-plugin', version: '1.0.0', wit_version: '0.2.0', capabilities: [{ kind: 'http', allowed_origins: ['https://api.example.com'] }], contributions: {} }] }, failure_category: null, created_at: 1, updated_at: 2 };
         await route.fulfill({ status: 202, json: job });
       } else if (path.endsWith('/approve')) {
         assert.equal(body.review_digest, 'review-exact');

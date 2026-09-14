@@ -5675,13 +5675,14 @@ components:
     PluginInstallation:
       type: object
       additionalProperties: false
-      required: [id, inventory_id, actor, status, packages, review_digest, review, failure_category, created_at, updated_at]
+      required: [id, inventory_id, actor, status, packages, completed_packages, review_digest, review, failure_category, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
         inventory_id: { type: string }
         actor: { type: string, description: Service identity or bootstrap marker; never a credential. }
         status: { type: string, enum: [installing, review, registered, failed, interrupted] }
         packages: { type: array, maxItems: 16, items: { type: string } }
+        completed_packages: { type: integer, minimum: 0, maximum: 16 }
         review_digest: { type: [string, 'null'] }
         review:
           type: [object, 'null']

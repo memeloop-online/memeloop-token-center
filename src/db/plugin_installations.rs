@@ -1,5 +1,7 @@
 use super::*;
-use crate::plugin::application::installation::{InstallationRecord, PluginAuditEntry};
+use crate::plugin::application::installation::{
+    InstallationRecord, PackageCheckpoint, PluginAuditEntry,
+};
 
 impl Database {
     pub(crate) async fn replay_plugin_installation(
@@ -46,7 +48,7 @@ impl Database {
     }
 
     pub(crate) async fn plugin_installations(&self) -> Result<Vec<InstallationRecord>, AppError> {
-        sqlx::query("SELECT id,idempotency_hash,request_hash,inventory_id,packages_json,actor,attempt_id,status,review_digest,NULL AS review_json,failure_category,lease_until,created_at,updated_at FROM application_plugin_installations ORDER BY created_at DESC, id DESC LIMIT 100")
+        sqlx::query("SELECT id,idempotency_hash,request_hash,inventory_id,packages_json,actor,attempt_id,status,review_digest,NULL AS review_json,checkpoints_json,failure_category,lease_until,created_at,updated_at FROM application_plugin_installations ORDER BY created_at DESC, id DESC LIMIT 100")
             .fetch_all(&self.pool).await?.into_iter().map(installation_record).collect()
     }
 
@@ -111,6 +113,44 @@ impl Database {
         .await?;
         tx.commit().await?;
         Ok((self.plugin_installation(&record.id).await?, true))
+    }
+
+    pub(crate) async fn renew_plugin_installation(
+        &self,
+        id: &str,
+        attempt: &str,
+    ) -> Result<(), AppError> {
+        let now = unix_millis();
+        let until = now + 270_000;
+        let mut tx = self.pool.begin().await?;
+        let locked = sqlx::query("UPDATE application_plugin_install_lock SET lease_until=$1 WHERE scope='global' AND operation_id=$2 AND lease_until > $3")
+            .bind(until).bind(attempt).bind(now).execute(&mut *tx).await?.rows_affected();
+        let changed = sqlx::query("UPDATE application_plugin_installations SET lease_until=$1 WHERE id=$2 AND attempt_id=$3 AND status='installing' AND lease_until > $4")
+            .bind(until).bind(id).bind(attempt).bind(now).execute(&mut *tx).await?.rows_affected();
+        if locked != 1 || changed != 1 {
+            return Err(AppError::Conflict("installation lease changed".into()));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn checkpoint_plugin_installation(
+        &self,
+        id: &str,
+        attempt: &str,
+        checkpoints: &std::collections::BTreeMap<String, PackageCheckpoint>,
+    ) -> Result<(), AppError> {
+        let encoded = serde_json::to_string(checkpoints).map_err(|_| AppError::Internal)?;
+        if checkpoints.len() > 16 || encoded.len() > 65536 {
+            return Err(AppError::Forbidden);
+        }
+        let now = unix_millis();
+        let changed = sqlx::query("UPDATE application_plugin_installations SET checkpoints_json=$1, updated_at=$2 WHERE id=$3 AND attempt_id=$4 AND status='installing' AND lease_until > $2 AND EXISTS (SELECT 1 FROM application_plugin_install_lock WHERE scope='global' AND operation_id=$4 AND lease_until > $2)")
+            .bind(encoded).bind(now).bind(id).bind(attempt).execute(&self.pool).await?.rows_affected();
+        if changed != 1 {
+            return Err(AppError::Conflict("installation attempt changed".into()));
+        }
+        Ok(())
     }
 
     pub(crate) async fn finish_plugin_installation(
@@ -246,7 +286,12 @@ fn installation_record(row: AnyRow) -> Result<InstallationRecord, AppError> {
     if status == "installing" && lease_until <= unix_millis() {
         status = "interrupted".into();
     }
+    let checkpoints: std::collections::BTreeMap<String, PackageCheckpoint> =
+        serde_json::from_str(&row.try_get::<String, _>("checkpoints_json")?)
+            .map_err(|_| AppError::Internal)?;
     Ok(InstallationRecord {
+        completed_packages: checkpoints.len(),
+        checkpoints,
         id: row.try_get("id")?,
         inventory_id: row.try_get("inventory_id")?,
         actor: row.try_get("actor")?,

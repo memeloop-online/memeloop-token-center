@@ -5,7 +5,11 @@ use std::{collections::BTreeSet, process::Stdio};
 use tokio::io::AsyncReadExt;
 
 const INSTALLER: &str = "/usr/local/bin/install-plugin-oci";
-const INSTALL_DEADLINE: Duration = Duration::from_secs(240);
+// A complete inventory can contain sixteen packages. Each package can contain
+// 64 layers plus config/manifest and up to eight signature-key attempts. Bound
+// each package, not the aggregate; committed packages survive interrupted work.
+const PACKAGE_DEADLINE: Duration = Duration::from_secs(3 * 60 * 60);
+const LEASE_RENEWAL: Duration = Duration::from_secs(30);
 static INSTALL_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
 
@@ -15,6 +19,13 @@ struct InstallPolicy {
     plugin_root: PathBuf,
     allowed_sources: BTreeSet<String>,
     cosign_public_keys: Vec<PathBuf>,
+    #[serde(default)]
+    source_credentials: BTreeMap<String, CredentialFiles>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialFiles {
     registry_username_file: Option<PathBuf>,
     registry_password_file: Option<PathBuf>,
     registry_bearer_token_file: Option<PathBuf>,
@@ -51,6 +62,16 @@ pub struct InstallationRecord {
     pub lease_until: i64,
     pub created_at: i64,
     pub updated_at: i64,
+    pub completed_packages: usize,
+    #[serde(skip)]
+    pub(crate) checkpoints: BTreeMap<String, PackageCheckpoint>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(crate) struct PackageCheckpoint {
+    trust_digest: String,
+    plugin_id: String,
+    tree_digest: String,
 }
 
 #[derive(Serialize)]
@@ -108,13 +129,12 @@ impl ApplicationPlugins {
                 .cosign_public_keys
                 .iter()
                 .any(|path| !path.is_absolute())
-            || [
-                &policy.registry_username_file,
-                &policy.registry_password_file,
-                &policy.registry_bearer_token_file,
-            ]
-            .iter()
-            .any(|path| path.as_ref().is_some_and(|path| !path.is_absolute()))
+            || policy
+                .source_credentials
+                .iter()
+                .any(|(source, credentials)| {
+                    !policy.allowed_sources.contains(source) || !credentials.valid()
+                })
         {
             return Err(AppError::Forbidden);
         }
@@ -254,15 +274,11 @@ impl ApplicationPlugins {
             let attempt_id = record.attempt_id.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let result = tokio::time::timeout(
-                    INSTALL_DEADLINE,
-                    authority.perform_install(&id, &input, &policy),
-                )
-                .await;
-                let review = match result {
-                    Ok(Ok(review)) => Some(review),
-                    _ => None,
-                };
+                let work = authority.perform_install(&id, &attempt_id, &input, &policy);
+                let result = authority
+                    .with_installation_lease(&id, &attempt_id, work)
+                    .await;
+                let review = result.ok();
                 let _ = authority
                     .db
                     .finish_plugin_installation(
@@ -281,6 +297,7 @@ impl ApplicationPlugins {
     async fn perform_install(
         &self,
         operation_id: &str,
+        attempt_id: &str,
         input: &InstallPluginRequest,
         policy: &InstallPolicy,
     ) -> Result<(String, serde_json::Value), AppError> {
@@ -295,43 +312,18 @@ impl ApplicationPlugins {
         if !parent.is_dir() || parent.file_type().is_symlink() {
             return Err(AppError::Forbidden);
         }
-        let marker = inventory_root.join(".mtc-install-owner");
-        match tokio::fs::create_dir(&inventory_root).await {
-            Ok(()) => {
-                use tokio::io::AsyncWriteExt;
-                let mut file = tokio::fs::OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .open(&marker)
-                    .await
-                    .map_err(|_| AppError::Internal)?;
-                file.write_all(operation_id.as_bytes())
-                    .await
-                    .map_err(|_| AppError::Internal)?;
-                file.sync_all().await.map_err(|_| AppError::Internal)?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let metadata = tokio::fs::symlink_metadata(&inventory_root)
-                    .await
-                    .map_err(|_| AppError::Internal)?;
-                if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                    return Err(AppError::Forbidden);
-                }
-                let file = tokio::fs::File::open(&marker)
-                    .await
-                    .map_err(|_| AppError::Forbidden)?;
-                let mut owner = Vec::new();
-                file.take(65)
-                    .read_to_end(&mut owner)
-                    .await
-                    .map_err(|_| AppError::Internal)?;
-                if owner != operation_id.as_bytes() {
-                    return Err(AppError::Forbidden);
-                }
-            }
-            Err(_) => return Err(AppError::Internal),
-        }
+        let claim_root = inventory_root.clone();
+        let owner = operation_id.to_owned();
+        tokio::task::spawn_blocking(move || claim_inventory_root(&claim_root, &owner))
+            .await
+            .map_err(|_| AppError::Internal)??;
+        let mut checkpoints = self.db.plugin_installation(operation_id).await?.checkpoints;
         for reference in &input.packages {
+            if let Some(checkpoint) = checkpoints.get(reference) {
+                if checkpoint_matches(&inventory_root, reference, &trust, checkpoint).await? {
+                    continue;
+                }
+            }
             let mut command = tokio::process::Command::new(INSTALLER);
             command
                 .arg(reference)
@@ -354,26 +346,22 @@ impl ApplicationPlugins {
             for key in &policy.cosign_public_keys {
                 command.arg("--cosign-public-key").arg(key);
             }
-            for (flag, path) in [
-                ("--registry-username-file", &policy.registry_username_file),
-                ("--registry-password-file", &policy.registry_password_file),
-                (
-                    "--registry-bearer-token-file",
-                    &policy.registry_bearer_token_file,
-                ),
-            ] {
-                if let Some(path) = path {
-                    command.arg(flag).arg(path);
-                }
+            if let Some(credentials) = policy.credentials_for(reference) {
+                credentials.apply(&mut command);
             }
-            if !command
-                .status()
+            if !tokio::time::timeout(PACKAGE_DEADLINE, command.status())
                 .await
+                .map_err(|_| AppError::Overloaded)?
                 .map_err(|_| AppError::Internal)?
                 .success()
             {
                 return Err(AppError::Internal);
             }
+            let checkpoint = package_checkpoint(&inventory_root, reference, &trust).await?;
+            checkpoints.insert(reference.clone(), checkpoint);
+            self.db
+                .checkpoint_plugin_installation(operation_id, attempt_id, &checkpoints)
+                .await?;
         }
         let runtime = self
             .review_runtime(policy.plugin_root.join(&input.inventory_id))
@@ -388,6 +376,15 @@ impl ApplicationPlugins {
             return Err(AppError::Forbidden);
         }
         Ok((digest, review))
+    }
+
+    async fn with_installation_lease<T>(
+        &self,
+        id: &str,
+        attempt: &str,
+        work: impl std::future::Future<Output = Result<T, AppError>>,
+    ) -> Result<T, AppError> {
+        run_with_lease(work, || self.db.renew_plugin_installation(id, attempt)).await
     }
 
     async fn review_runtime(&self, root: PathBuf) -> Result<PluginRuntime, AppError> {
@@ -438,11 +435,19 @@ impl ApplicationPlugins {
         }
         let root = policy.plugin_root.join(&record.inventory_id);
         let runtime = self.review_runtime(root.clone()).await?;
-        if review_digest(&runtime, &trust_digest(&policy).await?)? != digest {
+        let trust = trust_digest(&policy).await?;
+        if review_digest(&runtime, &trust)? != digest {
             return Err(AppError::Conflict(
                 "installed bytes or signing trust changed after review; install a new inventory"
                     .into(),
             ));
+        }
+        for (reference, checkpoint) in &record.checkpoints {
+            if !checkpoint_matches(&root, reference, &trust, checkpoint).await? {
+                return Err(AppError::Conflict(
+                    "installed package changed after verification".into(),
+                ));
+            }
         }
         runtime.validate_stored_configurations().await?;
         let identities = runtime.package_identities();
@@ -473,6 +478,267 @@ impl ApplicationPlugins {
             .register_plugin_installation(id, digest, actor)
             .await
     }
+}
+
+async fn run_with_lease<T, R: std::future::Future<Output = Result<(), AppError>>>(
+    work: impl std::future::Future<Output = Result<T, AppError>>,
+    mut renew: impl FnMut() -> R,
+) -> Result<T, AppError> {
+    tokio::pin!(work);
+    let mut renewal = tokio::time::interval(LEASE_RENEWAL);
+    renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            result = &mut work => return result,
+            _ = renewal.tick() => {
+                tokio::time::timeout(Duration::from_secs(10), renew())
+                    .await.map_err(|_| AppError::Overloaded)??;
+            }
+        }
+    }
+}
+
+impl CredentialFiles {
+    fn valid(&self) -> bool {
+        let basic = self.registry_username_file.is_some() && self.registry_password_file.is_some();
+        let partial =
+            self.registry_username_file.is_some() != self.registry_password_file.is_some();
+        !partial
+            && !(basic && self.registry_bearer_token_file.is_some())
+            && [
+                &self.registry_username_file,
+                &self.registry_password_file,
+                &self.registry_bearer_token_file,
+            ]
+            .iter()
+            .all(|path| path.as_ref().is_none_or(|path| path.is_absolute()))
+    }
+
+    fn apply(&self, command: &mut tokio::process::Command) {
+        for (flag, path) in [
+            ("--registry-username-file", &self.registry_username_file),
+            ("--registry-password-file", &self.registry_password_file),
+            (
+                "--registry-bearer-token-file",
+                &self.registry_bearer_token_file,
+            ),
+        ] {
+            if let Some(path) = path {
+                command.arg(flag).arg(path);
+            }
+        }
+    }
+}
+
+impl InstallPolicy {
+    fn credentials_for(&self, reference: &str) -> Option<&CredentialFiles> {
+        let (source, _) = reference.rsplit_once("@sha256:")?;
+        self.source_credentials.get(source)
+    }
+}
+
+// The final name never exists without a complete, durable owner receipt. A
+// killed creator leaves only an unreferenced hidden temporary directory; retries
+// can claim the final name without deleting or adopting arbitrary existing roots.
+#[cfg(target_os = "linux")]
+fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppError> {
+    use rustix::fs::{Mode, OFlags, RenameFlags, open, renameat_with};
+    use std::io::{Read, Write};
+    let parent = root.parent().ok_or(AppError::Forbidden)?;
+    let name = root.file_name().ok_or(AppError::Forbidden)?;
+    let temporary = parent.join(format!(".mtc-inventory-claim-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir(&temporary).map_err(|_| AppError::Internal)?;
+    let marker = temporary.join(".mtc-install-owner");
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+            .map_err(|_| AppError::Internal)?;
+        file.write_all(owner.as_bytes())
+            .map_err(|_| AppError::Internal)?;
+        file.sync_all().map_err(|_| AppError::Internal)?;
+        std::fs::File::open(&temporary)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| AppError::Internal)?;
+        let directory = open(
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| AppError::Internal)?;
+        match renameat_with(
+            &directory,
+            temporary.file_name().ok_or(AppError::Internal)?,
+            &directory,
+            name,
+            RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => {}
+            Err(error) if error == rustix::io::Errno::EXIST => {
+                let metadata = std::fs::symlink_metadata(root).map_err(|_| AppError::Forbidden)?;
+                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                    return Err(AppError::Forbidden);
+                }
+                let existing_marker = root.join(".mtc-install-owner");
+                let metadata =
+                    std::fs::symlink_metadata(&existing_marker).map_err(|_| AppError::Forbidden)?;
+                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                    return Err(AppError::Forbidden);
+                }
+                let mut existing = Vec::new();
+                std::fs::File::open(existing_marker)
+                    .map_err(|_| AppError::Forbidden)?
+                    .take(65)
+                    .read_to_end(&mut existing)
+                    .map_err(|_| AppError::Internal)?;
+                if existing != owner.as_bytes() {
+                    return Err(AppError::Forbidden);
+                }
+            }
+            Err(_) => return Err(AppError::Internal),
+        }
+        std::fs::File::open(parent)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| AppError::Internal)
+    })();
+    // Only files created by this invocation, never an existing inventory.
+    let _ = std::fs::remove_file(marker);
+    let _ = std::fs::remove_dir(temporary);
+    result
+}
+
+#[cfg(not(target_os = "linux"))]
+fn claim_inventory_root(_root: &std::path::Path, _owner: &str) -> Result<(), AppError> {
+    Err(AppError::Forbidden)
+}
+
+async fn package_checkpoint(
+    root: &std::path::Path,
+    reference: &str,
+    trust: &str,
+) -> Result<PackageCheckpoint, AppError> {
+    let root = root.to_owned();
+    let reference = reference.to_owned();
+    let trust = trust.to_owned();
+    let permit = tokio::time::timeout(ADMISSION_WAIT, COMPILATION_PERMITS.clone().acquire_owned())
+        .await
+        .map_err(|_| AppError::Overloaded)?
+        .map_err(|_| AppError::Internal)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        use std::io::Read;
+        let (source, digest) = reference.rsplit_once('@').ok_or(AppError::Forbidden)?;
+        let mut found = None;
+        let mut count = 0;
+        for entry in std::fs::read_dir(&root).map_err(|_| AppError::Internal)? {
+            let entry = entry.map_err(|_| AppError::Internal)?;
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            count += 1;
+            if count > 16 {
+                return Err(AppError::Forbidden);
+            }
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|_| AppError::Internal)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(AppError::Forbidden);
+            }
+            let mut receipt = Vec::new();
+            std::fs::File::open(path.join(".mtc-oci-install.json"))
+                .map_err(|_| AppError::Forbidden)?
+                .take(16385)
+                .read_to_end(&mut receipt)
+                .map_err(|_| AppError::Internal)?;
+            if receipt.len() > 16384 {
+                return Err(AppError::Forbidden);
+            }
+            let receipt: super::super::PluginInstallProvenance =
+                serde_json::from_slice(&receipt).map_err(|_| AppError::Forbidden)?;
+            if receipt.source != source
+                || receipt.digest != digest
+                || receipt.signature_policy != "cosign-public-key"
+            {
+                continue;
+            }
+            let manifest = super::super::validate_plugin_package(&path)?;
+            if entry.file_name() != std::ffi::OsStr::new(&manifest.id) || found.is_some() {
+                return Err(AppError::Forbidden);
+            }
+            found = Some(PackageCheckpoint {
+                trust_digest: trust.clone(),
+                plugin_id: manifest.id,
+                tree_digest: package_tree_digest(&path)?,
+            });
+        }
+        found.ok_or(AppError::Forbidden)
+    })
+    .await
+    .map_err(|_| AppError::Internal)?
+}
+
+async fn checkpoint_matches(
+    root: &std::path::Path,
+    reference: &str,
+    trust: &str,
+    checkpoint: &PackageCheckpoint,
+) -> Result<bool, AppError> {
+    if checkpoint.trust_digest != trust {
+        return Ok(false);
+    }
+    let actual = package_checkpoint(root, reference, trust).await?;
+    Ok(actual.plugin_id == checkpoint.plugin_id && actual.tree_digest == checkpoint.tree_digest)
+}
+
+fn package_tree_digest(root: &std::path::Path) -> Result<String, AppError> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut pending = vec![PathBuf::new()];
+    let mut files = BTreeMap::new();
+    let mut entries = 0;
+    let mut total = 0;
+    while let Some(relative) = pending.pop() {
+        let path = root.join(&relative);
+        let metadata = std::fs::symlink_metadata(&path).map_err(|_| AppError::Internal)?;
+        if metadata.file_type().is_symlink() || relative.as_os_str().len() > 240 {
+            return Err(AppError::Forbidden);
+        }
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(path).map_err(|_| AppError::Internal)? {
+                let entry = entry.map_err(|_| AppError::Internal)?;
+                entries += 1;
+                if entries > 64 * 240 {
+                    return Err(AppError::Forbidden);
+                }
+                pending.push(relative.join(entry.file_name()));
+            }
+        } else if metadata.is_file() {
+            if files.len() >= 65 || metadata.len() > 64 * 1024 * 1024 {
+                return Err(AppError::Forbidden);
+            }
+            let mut file = std::fs::File::open(path)
+                .map_err(|_| AppError::Internal)?
+                .take(64 * 1024 * 1024 + 1);
+            let mut hash = Sha256::new();
+            let mut buffer = [0u8; 65536];
+            loop {
+                let count = file.read(&mut buffer).map_err(|_| AppError::Internal)?;
+                if count == 0 {
+                    break;
+                }
+                total += count;
+                if total > 80 * 1024 * 1024 + 16384 {
+                    return Err(AppError::Forbidden);
+                }
+                hash.update(&buffer[..count]);
+            }
+            files.insert(relative, format!("{:x}", hash.finalize()));
+        } else {
+            return Err(AppError::Forbidden);
+        }
+    }
+    super::super::plugin_configuration_schema_digest(&json!(files))
 }
 
 fn review_digest(runtime: &PluginRuntime, trust: &str) -> Result<String, AppError> {
@@ -968,6 +1234,25 @@ mod tests {
         assert!(
             state
                 .db
+                .renew_plugin_installation(&old.id, &old.attempt_id)
+                .await
+                .is_err()
+        );
+        assert!(
+            state
+                .db
+                .checkpoint_plugin_installation(&old.id, &old.attempt_id, &BTreeMap::new())
+                .await
+                .is_err()
+        );
+        state
+            .db
+            .renew_plugin_installation(&new.id, &new.attempt_id)
+            .await
+            .unwrap();
+        assert!(
+            state
+                .db
                 .finish_plugin_installation(&old.id, &old.attempt_id, None)
                 .await
                 .is_err()
@@ -985,5 +1270,174 @@ mod tests {
             state.db.plugin_installation(&new.id).await.unwrap().status,
             "failed"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interrupted_private_claims_never_poison_final_inventory_name() {
+        let directory = tempfile::tempdir().unwrap();
+        // Simulate SIGKILL before marker creation, midway through writing it,
+        // and after marker completion but before the atomic rename.
+        for (index, contents) in [None, Some(""), Some("own"), Some("owner")]
+            .into_iter()
+            .enumerate()
+        {
+            let temporary = directory
+                .path()
+                .join(format!(".mtc-inventory-claim-crashed-{index}"));
+            std::fs::create_dir(&temporary).unwrap();
+            if let Some(contents) = contents {
+                std::fs::write(temporary.join(".mtc-install-owner"), contents).unwrap();
+            }
+        }
+        let root = directory.path().join("inventory");
+        claim_inventory_root(&root, "owner").unwrap();
+        assert_eq!(
+            std::fs::read(root.join(".mtc-install-owner")).unwrap(),
+            b"owner"
+        );
+        claim_inventory_root(&root, "owner").unwrap();
+        assert!(claim_inventory_root(&root, "another-owner").is_err());
+        // An arbitrary preexisting empty directory still must not be adopted.
+        let unrelated = directory.path().join("unrelated");
+        std::fs::create_dir(&unrelated).unwrap();
+        assert!(claim_inventory_root(&unrelated, "owner").is_err());
+    }
+
+    #[test]
+    fn registry_credentials_are_exact_source_scoped_and_unmapped_is_anonymous() {
+        let policy: InstallPolicy = serde_json::from_value(json!({
+            "plugin_root":"/var/lib/plugins", "cosign_public_keys":["/run/trust/pub.pem"],
+            "allowed_sources":["private.example/team","vendor.example/plugin","private.example/other"],
+            "source_credentials":{"private.example/team":{"registry_username_file":"/run/private/user","registry_password_file":"/run/private/password"}}
+        })).unwrap();
+        for (source, expected) in [
+            ("private.example/team", 4),
+            ("vendor.example/plugin", 0),
+            ("private.example/other", 0),
+        ] {
+            let mut command = tokio::process::Command::new(INSTALLER);
+            if let Some(credentials) =
+                policy.credentials_for(&format!("{source}@sha256:{}", "a".repeat(64)))
+            {
+                assert!(credentials.valid());
+                credentials.apply(&mut command);
+            }
+            assert_eq!(command.as_std().get_args().count(), expected, "{source}");
+        }
+        assert!(
+            serde_json::from_value::<InstallPolicy>(json!({
+                "plugin_root":"/var/lib/plugins", "cosign_public_keys":["/run/trust/pub.pem"],
+                "allowed_sources":["private.example/team","vendor.example/plugin"],
+                "registry_bearer_token_file":"/run/private/token"
+            }))
+            .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn legal_slow_packages_progress_beyond_old_aggregate_deadline() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let renewals = AtomicUsize::new(0);
+        let complete = AtomicUsize::new(0);
+        let work = async {
+            for _ in 0..16 {
+                // Multiple legal sub-60s operations per package; total far
+                // exceeds 240s without ever exceeding the per-package bound.
+                tokio::time::timeout(PACKAGE_DEADLINE, async {
+                    for _ in 0..6 {
+                        tokio::time::sleep(Duration::from_secs(50)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                complete.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        };
+        run_with_lease(work, || {
+            renewals.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(complete.load(Ordering::SeqCst), 16);
+        assert!(renewals.load(Ordering::SeqCst) >= 160);
+        let failed = run_with_lease(
+            async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(())
+            },
+            || std::future::ready(Err(AppError::Forbidden)),
+        )
+        .await;
+        assert!(failed.is_err(), "lost ownership must cancel work");
+    }
+
+    #[tokio::test]
+    async fn durable_checkpoint_skips_only_exact_bytes_under_unchanged_trust() {
+        let (directory, state, record, _) = fixture().await;
+        let root = directory.path().join("private-install-root/installed");
+        let reference = &record.packages[0];
+        let checkpoint = package_checkpoint(&root, reference, "trust").await.unwrap();
+        assert!(
+            checkpoint_matches(&root, reference, "trust", &checkpoint)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !checkpoint_matches(&root, reference, "rotated", &checkpoint)
+                .await
+                .unwrap()
+        );
+        // Include non-Wasm assets; a manifest/provenance-only hash is not enough.
+        std::fs::write(root.join("new-plugin/asset.txt"), b"changed bytes").unwrap();
+        assert!(
+            !checkpoint_matches(&root, reference, "trust", &checkpoint)
+                .await
+                .unwrap()
+        );
+        let (active, _) = state
+            .db
+            .begin_plugin_installation(
+                "progress",
+                &json!([reference]),
+                "hash",
+                "progress-key",
+                "bootstrap",
+                crate::db::unix_millis() + 270000,
+            )
+            .await
+            .unwrap();
+        let checkpoints = BTreeMap::from([(reference.clone(), checkpoint)]);
+        state
+            .db
+            .checkpoint_plugin_installation(&active.id, &active.attempt_id, &checkpoints)
+            .await
+            .unwrap();
+        state
+            .db
+            .finish_plugin_installation(&active.id, &active.attempt_id, None)
+            .await
+            .unwrap();
+        let (retry, run) = state
+            .db
+            .begin_plugin_installation(
+                "progress",
+                &json!([reference]),
+                "hash",
+                "progress-key",
+                "bootstrap",
+                crate::db::unix_millis() + 270000,
+            )
+            .await
+            .unwrap();
+        assert!(run);
+        assert_eq!(retry.completed_packages, 1);
+        assert_eq!(
+            retry.checkpoints[reference].tree_digest,
+            checkpoints[reference].tree_digest
+        );
+        assert_ne!(active.attempt_id, retry.attempt_id);
     }
 }

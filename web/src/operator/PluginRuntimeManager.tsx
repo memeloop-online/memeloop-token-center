@@ -9,7 +9,7 @@ interface RuntimeStatus { current: Revision | null; candidates: Candidate[] }
 interface Installation {
   id: string; inventory_id: string; actor: string; status: string; packages: string[];
   review_digest: string | null; review: { plugins: PluginManifest[] } | null;
-  failure_category: string | null; created_at: number; updated_at: number;
+  failure_category: string | null; created_at: number; updated_at: number; completed_packages: number;
 }
 interface Audit { id: string; actor: string; action: string; inventory_id: string | null; revision: number | null; outcome: string; created_at: number }
 interface History { installation_enabled: boolean; installations: Installation[]; revisions: Revision[]; audit: Audit[] }
@@ -149,7 +149,7 @@ export function PluginRuntimeManager({ token, onPublished }: { token: string; on
       <h3>{text.tasks}</h3>
       {history.installations.length === 0 && <p className="muted">{text.empty}</p>}
       {history.installations.map((job) => <section className="managed-resource" key={job.id}>
-        <b>{job.inventory_id}</b> <span className="pill">{job.status}</span><p className="muted">{new Date(job.updated_at).toLocaleString(locale)} · {job.actor}</p>
+        <b>{job.inventory_id}</b> <span className="pill">{job.status}</span><p className="muted">{job.completed_packages ?? 0}/{job.packages.length} · {new Date(job.updated_at).toLocaleString(locale)} · {job.actor}</p>
         {job.failure_category && <p role="alert">{job.failure_category}</p>}
         {job.review_digest && <button type="button" className="secondary" onClick={() => void review(job)}>{text.review}</button>}
         {reviews[job.id]?.review && <details open><summary>{text.review}</summary><pre style={{ maxHeight: '24rem', overflow: 'auto', whiteSpace: 'pre-wrap' }}>{JSON.stringify(reviews[job.id].review, null, 2)}</pre></details>}

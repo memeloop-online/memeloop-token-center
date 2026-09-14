@@ -23,9 +23,13 @@ the inventory as `{}` when there are no preinstalled candidates. A policy is:
   "plugin_root": "/var/lib/token-center/plugin-inventories",
   "allowed_sources": ["ghcr.io/example/plugin"],
   "cosign_public_keys": ["/run/plugin-trust/publisher.pem"],
-  "registry_username_file": null,
-  "registry_password_file": null,
-  "registry_bearer_token_file": null
+  "source_credentials": {
+    "ghcr.io/example/plugin": {
+      "registry_username_file": "/run/plugin-registry/username",
+      "registry_password_file": "/run/plugin-registry/password",
+      "registry_bearer_token_file": null
+    }
+  }
 }
 ```
 
@@ -73,12 +77,28 @@ closed and is never replaced with a newer runtime.
    changes. The current catalog is refreshed after either activation action.
 
 Installation tasks are globally serialized with a database lease and a local
-permit. Each task has a 240-second execution deadline, with a 270-second durable
-lease. Restart/lease expiry produces an `interrupted` state; operators can retry
+permit. A 270-second durable lease renews every 30 seconds while an attempt is
+alive; losing ownership cancels its subprocess. Each package has a three-hour
+hard ceiling, covering 64 layers/config/manifest (each network operation is
+bounded at 120 seconds), eight signing-key attempts and local validation. The
+complete set has no shorter aggregate deadline that would starve later packages.
+Restart/lease expiry produces an `interrupted` state; operators can retry
 the existing task without retaining a browser-generated idempotency key. Retry
-re-verifies signatures and exactly matches existing files; it never overwrites a
-different artifact. Root ownership markers and attempt IDs prevent an unrelated
-directory or a late completion from impersonating the current attempt.
+uses database checkpoints for completed packages: unchanged current signing
+trust and an exact bounded full-tree hash allow skipping their downloads. Changed
+trust requires signature verification again; changed bytes never gain approval.
+The UI reports committed package progress. Uncheckpointed packages are verified
+and exactly compared by the installer; different artifacts are never overwritten.
+Root ownership markers are fsynced in temporary directories before atomic
+no-replace publication; a crash before publication cannot poison the inventory
+ID. Attempt IDs fence progress and late completion. Abandoned hidden temporary
+directories are not executable inventory roots and can be removed during host
+storage maintenance after confirming no installation is running.
+
+Credentials are bound to exact allowed source names through `source_credentials`.
+Unmapped sources always use anonymous authentication, including another repository
+on the same registry. Use `{}` for all-public packages. Unscoped top-level registry
+credential fields are rejected, not silently forwarded to every allowed source.
 
 Reviews are capped at 4 MiB and fetched individually rather than included in
 every status poll. History and audit pages contain at most 100 records, with
