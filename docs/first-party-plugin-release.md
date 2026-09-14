@@ -29,11 +29,24 @@ preserves the existing candidate order. Explicit configuration only reorders
 already eligible candidates; `health_policy: "native"` preserves the host's
 health admission and feedback behavior. It does not infer quota/reset state or
 enable stickiness. It requires an installer containing the PR209 manifest schema.
-Until its own successful release produces `installation_verified: true`, this
-package remains **not published / unavailable for installation**. Model Guard's
-evidence does not establish Preferred Account's compatibility or publication.
-Never substitute an image digest, fixture Wasm, fabricated signature, branch tag
-or locally compiled file.
+Preferred Account 1.0.0 is published at:
+
+```text
+ghcr.io/memeloop-online/mtc-preferred-account@sha256:5d1239faff9b3e3202dc9e5a18151b307760389292b31597191ed9fd7cde7700
+```
+
+[Release run 34906157801](https://github.com/memeloop-online/memeloop-token-center/actions/runs/34906157801)
+at source `c9bb43ea596a24616f874b320effddaf7b7ba057` passed its own native guest,
+component host and real gateway fixtures, exact-identity keyless signing and
+verification, and real installation with the compatible installer pinned below.
+Artifact `mtc-preferred-account-release-c9bb43ea596a24616f874b320effddaf7b7ba057`
+contains `plugin-release.json` with `installation_verified: true` and the exact
+manifest/Wasm bytes. This is independent of Model Guard's evidence; it does not
+install into production or bind any provider/route group. Authenticated
+installation was tested; anonymous installation is not established. For any
+other version without its own successful evidence, report **unavailable** rather
+than substituting an image digest, fixture Wasm, fabricated signature, branch
+tag or locally compiled file.
 
 The release coordinator must first publish a service/plugin-installer release
 containing optional keyless support. Review that release's existing immutable
