@@ -39,7 +39,10 @@ export class DogfoodWorld extends World {
       if (response.status() >= 400 && response.status() < 500) {
         // Diagnostic only: preserve existing expected-auth-error assertions.
         // No origin, query, credentials, request body or response body is logged.
-        this.clientErrorPaths.push(`${response.status()} ${new URL(response.url()).pathname}`);
+        const path = new URL(response.url()).pathname;
+        const category = ['/internal/v1/plugin-runtime', '/internal/v1/plugin-runtime/history'].includes(path)
+          ? path : path.startsWith('/internal/') ? '/internal/[other]' : '/[other]';
+        this.clientErrorPaths.push(`${response.status()} ${category}`);
       }
       if (response.status() < 500) return;
       // Keep CI diagnostics safe: a pathname carries neither query values,

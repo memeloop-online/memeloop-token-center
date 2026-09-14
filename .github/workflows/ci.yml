@@ -184,6 +184,8 @@ jobs:
       - name: Build the browser-test service before Cucumber.js starts it
         run: cargo build --locked --manifest-path ../Cargo.toml --features experimental-plugin-revisions --bin memeloop-token-center
       - run: npm run test:e2e
+        env:
+          MTC_E2E_BINARY: ${{ github.workspace }}/target/debug/memeloop-token-center
 
   rust:
     needs: changes
