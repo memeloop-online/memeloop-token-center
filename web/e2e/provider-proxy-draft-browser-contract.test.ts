@@ -52,7 +52,13 @@ test('independent proxy save updates concurrency metadata without dropping the p
     await page.getByRole('button', { name: '取消', exact: true }).click();
     await row.getByRole('button', { name: '收起详情', exact: true }).click();
     await page.setViewportSize({ width: 1440, height: 1000 });
+    await row.getByRole('button', { name: '查看详情', exact: true }).click();
+    await page.locator('.create-journey [data-workspace-toggle]').click();
+    assert.equal(await page.locator('.provider-detail-workspace').count(), 0, 'creating uses the sole work area');
+    assert.equal(await row.getByRole('button', { name: '查看详情', exact: true }).isEnabled(), false);
+    await page.locator('.create-journey [data-workspace-toggle]').click();
     await page.getByRole('button', { name: '编辑', exact: true }).click();
+    assert.equal(await row.getByRole('button', { name: '查看详情', exact: true }).isEnabled(), false, 'another detail cannot replace an unsaved edit');
     const workspace = page.locator('.provider-edit-workspace');
     const name = workspace.getByLabel('上游名称', { exact: false });
     await name.fill('保留名称草稿');
