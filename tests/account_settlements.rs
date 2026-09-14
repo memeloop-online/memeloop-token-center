@@ -2,9 +2,15 @@
 mod helpers;
 #[path = "account_settlements/support.rs"]
 mod support;
-use axum::http::{StatusCode, header};
-use helpers::{assert_sanitized, get_json};
+use axum::{
+    body::{Body, to_bytes},
+    http::{Request, StatusCode, header},
+};
+use helpers::{assert_sanitized, get_json, service_token};
+use memeloop_token_center::api;
+use serde_json::{Value, json};
 use support::Fixture;
+use tower::ServiceExt;
 
 #[tokio::test]
 async fn sqlite_account_settlement_feed_is_scoped_paged_and_exact() {
@@ -169,4 +175,109 @@ async fn sqlite_account_settlement_feed_is_scoped_paged_and_exact() {
         let (status, _, body) = get_json(&fixture.state, &path, &fixture.target_token).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
     }
+}
+
+#[tokio::test]
+async fn attributed_settlement_adjustment_is_scope_bound_idempotent_and_sanitized() {
+    let fixture = Fixture::new().await;
+    let settlements_path = format!(
+        "/internal/v1/accounts/{}/settlements?request_kind=text&request_id={}",
+        fixture.target.account_id, fixture.text_request_id
+    );
+    let (status, _, settlement_page) =
+        get_json(&fixture.state, &settlements_path, &fixture.target_token).await;
+    assert_eq!(status, StatusCode::OK, "{settlement_page}");
+    let settlement_id = settlement_page["items"][0]["settlement_id"]
+        .as_str()
+        .unwrap();
+    let path = format!(
+        "/internal/v1/accounts/{}/settlements/{settlement_id}/adjustments",
+        fixture.target.account_id
+    );
+    let body = json!({
+        "namespace": "memeloop-cloud:usage-discount",
+        "request_kind": "text",
+        "request_id": fixture.text_request_id,
+        "currency": "USD",
+        "version": 1,
+        "desired_rebate": "1",
+        "decision_digest": "a".repeat(64),
+        "source": "cloud-settlement-discount"
+    });
+
+    let send = |token: &str, idempotency_key: &str, body: Value| {
+        let state = fixture.state.clone();
+        let path = path.clone();
+        let token = token.to_owned();
+        let idempotency_key = idempotency_key.to_owned();
+        async move {
+            let response =
+                api::router_for_role(state, memeloop_token_center::config::RuntimeRole::Control)
+                    .oneshot(
+                        Request::put(&path)
+                            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .header("idempotency-key", idempotency_key)
+                            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            let response: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                    .unwrap();
+            (status, headers, response)
+        }
+    };
+
+    let (status, _, denied) = send(&fixture.credits_only_token, "credit-only", body.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+
+    let writer = service_token(
+        &fixture.state,
+        "settlement-adjustment-writer",
+        vec!["settlements:adjust"],
+        Some(fixture.target_tenant.clone()),
+    )
+    .await;
+    let (status, headers, created) = send(&writer, "settlement-rebate-1", body.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(
+        headers
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(created["desired_rebate"], "1");
+    assert_eq!(created["applied_delta"], "1");
+    assert_eq!(created["cumulative_rebate"], "1");
+    assert_eq!(created["remaining_rebate"], "2");
+    assert_eq!(created["replayed"], false);
+    for secret in [
+        "decision_digest",
+        "source",
+        "idempotency_key",
+        "request_object",
+        "response_object",
+    ] {
+        assert!(created.get(secret).is_none(), "response exposed {secret}");
+    }
+
+    let event_id = created["event_id"].clone();
+    let (status, _, replay) = send(&writer, "settlement-rebate-1", body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay["event_id"], event_id);
+    assert_eq!(replay["replayed"], true);
+
+    let other_writer = service_token(
+        &fixture.state,
+        "other-settlement-adjustment-writer",
+        vec!["settlements:adjust"],
+        Some(fixture.other_tenant.clone()),
+    )
+    .await;
+    let (status, _, cross_tenant) = send(&other_writer, "other-tenant-rebate", body).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{cross_tenant}");
 }
