@@ -119,7 +119,11 @@ async fn settlement_feed_insert_failure_rolls_back_and_replay_is_idempotent() {
     let fixture = fixture(EnforcementMode::Prepaid).await;
     let request_id = Uuid::now_v7();
     let reservation = start(&fixture, request_id).await;
-    let before = fixture.database.list_requests(fixture.key.key_id, 10).await.unwrap();
+    let before = fixture
+        .database
+        .list_requests(fixture.key.key_id, 10)
+        .await
+        .unwrap();
     assert_eq!(before[0].usage_basis, None);
 
     // `request_id` is a test-generated UUID and SQLite trigger definitions cannot bind it.
@@ -174,14 +178,36 @@ async fn settlement_feed_insert_failure_rolls_back_and_replay_is_idempotent() {
     assert_eq!(account_sequence(&fixture).await, 1);
     // The terminal record, list/event projection and immutable ledger feed
     // agree on provenance after the same transaction; replay cannot duplicate it.
-    let requests = fixture.database.list_requests(fixture.key.key_id, 10).await.unwrap();
-    assert_eq!(requests[0].usage_basis, Some(RequestUsageBasis::ProviderReported));
-    assert_eq!(serde_json::to_value(&requests[0]).unwrap()["usage_basis"], "provider_reported");
-    let events = fixture.database.request_events_after("settlement-feed", 0, None, 10).await.unwrap();
-    assert!(events.iter().any(|event| event.request_id == request_id && event.usage_basis == Some(RequestUsageBasis::ProviderReported)));
-    let feed = fixture.database.list_account_settlements(fixture.account_id, 10, None, None).await.unwrap();
+    let requests = fixture
+        .database
+        .list_requests(fixture.key.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        requests[0].usage_basis,
+        Some(RequestUsageBasis::ProviderReported)
+    );
+    assert_eq!(
+        serde_json::to_value(&requests[0]).unwrap()["usage_basis"],
+        "provider_reported"
+    );
+    let events = fixture
+        .database
+        .request_events_after("settlement-feed", 0, None, 10)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| event.request_id == request_id
+        && event.usage_basis == Some(RequestUsageBasis::ProviderReported)));
+    let feed = fixture
+        .database
+        .list_account_settlements(fixture.account_id, 10, None, None)
+        .await
+        .unwrap();
     assert_eq!(feed.items.len(), 1);
-    assert_eq!(feed.items[0].usage_basis, Some(RequestUsageBasis::ProviderReported));
+    assert_eq!(
+        feed.items[0].usage_basis,
+        Some(RequestUsageBasis::ProviderReported)
+    );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM ledger_entries WHERE source = $1")
             .bind(reservation.id.to_string())

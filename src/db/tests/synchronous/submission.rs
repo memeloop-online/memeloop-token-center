@@ -104,7 +104,7 @@ async fn durable_send_blocks_duplicate_owner_takeover_and_generic_refund() {
             .unwrap();
         let generic_expiry = database
             .finish_proxy_request(FinishProxyRequest {
-            usage_basis: None,
+                usage_basis: None,
                 first_output_ms: None,
                 generation_duration_ms: None,
                 request_id,

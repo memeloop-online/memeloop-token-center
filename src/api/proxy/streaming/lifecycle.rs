@@ -135,10 +135,13 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
     // A downstream loss after the complete terminal was captured must not
     // erase trustworthy provider usage. Incomplete/error frames are not proof;
     // neither is an arbitrary buffered fragment. Keep the cancellation status.
-    let completed_usage = sse_summary.as_ref().filter(|summary| {
-        matches!(summary.outcome, ResponsesSseOutcome::Completed { .. })
-            && !summary.usage_invalid
-    }).and_then(|summary| summary.usage.clone());
+    let completed_usage = sse_summary
+        .as_ref()
+        .filter(|summary| {
+            matches!(summary.outcome, ResponsesSseOutcome::Completed { .. })
+                && !summary.usage_invalid
+        })
+        .and_then(|summary| summary.usage.clone());
     let mut usage = if error_code.is_some() {
         if delivered_billable {
             if let Some(usage) = completed_usage {

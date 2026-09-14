@@ -1246,9 +1246,13 @@ fn request_credential_identity_from_row(
     }))
 }
 
-pub(super) fn request_usage_basis_from_row(row: &AnyRow) -> Result<Option<crate::model::RequestUsageBasis>, AppError> {
+pub(super) fn request_usage_basis_from_row(
+    row: &AnyRow,
+) -> Result<Option<crate::model::RequestUsageBasis>, AppError> {
     row.try_get::<Option<String>, _>("usage_basis")?
-        .map(|value| crate::model::RequestUsageBasis::from_storage(&value).ok_or(AppError::Internal))
+        .map(|value| {
+            crate::model::RequestUsageBasis::from_storage(&value).ok_or(AppError::Internal)
+        })
         .transpose()
 }
 

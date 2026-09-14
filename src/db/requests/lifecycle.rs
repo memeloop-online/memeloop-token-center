@@ -1581,7 +1581,14 @@ pub(crate) async fn record_request_finished_in_transaction(
     completed_at: i64,
     project_aggregates: bool,
 ) -> Result<bool, AppError> {
-    record_request_finished_with_basis_in_transaction(tx, request, completed_at, project_aggregates, None).await
+    record_request_finished_with_basis_in_transaction(
+        tx,
+        request,
+        completed_at,
+        project_aggregates,
+        None,
+    )
+    .await
 }
 
 async fn record_request_finished_with_basis_in_transaction(
