@@ -28,8 +28,10 @@ Hard quota/rate-limit/authentication evidence is never shortened by a strategy.
 Terminal observe feeds bounded transient cooldown into the existing fenced
 health update; observe never initiates waiting, probing, or request replay.
 
-No configured group means the native path performs no hook calls or candidate
-policy queries beyond the bounded tenant configuration-existence check.
+With no installed routing hooks, the native entrance performs no added database
+query or candidate cloning; any stale binding remains inert native fallback.
+With installed hooks but no configured group, the native path performs no hook
+calls or candidate policy queries beyond the bounded tenant existence check.
 Invalid/missing/trapping strategy code records
 `group_routing_native_fallback` and retains native handling of that bucket's
 authorized candidates. `group_routing_observe_fallback` retains native terminal
@@ -45,6 +47,10 @@ revive hard quota/authentication evidence. Invalid received responses complete
 as failed attempts without replay. The component normalization adapter currently
 classifies guest traps and malformed output alike as response-processing
 failures; local capacity/storage failures remain inconclusive.
+This also fixes a pre-existing component-path bug: that path previously skipped
+core health admission entirely. Native selection and ordering remain unchanged,
+but an unconfigured component account with known hard isolation evidence is now
+correctly blocked by the existing native health policy, just like direct providers.
 
 Asynchronous media jobs and the media synchronous-entry path are not wired to
 this contract yet; their durable strategy/revision pinning is separate pending

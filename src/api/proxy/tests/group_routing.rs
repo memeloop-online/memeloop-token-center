@@ -459,3 +459,93 @@ async fn gateway_component_hard_quota_survives_invalid_strategy_native_fallback(
     assert_eq!(after.consecutive_failures, before.consecutive_failures);
     assert_eq!(after.probe_lease_until, 0);
 }
+
+#[tokio::test]
+async fn gateway_component_without_configured_strategy_dispatches_healthy_account() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/vendor/infer"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"vendor_answer":"legacy-result"})),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let label = "component-no-strategy-legacy";
+    let mut fixture = resilient_route_fixture(label, &[(upstream.uri(), 0)]).await;
+    let (tenant, generation) = install_strategy(&mut fixture, label, 12345).await;
+    install_component_provider(&mut fixture).await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query("UPDATE provider_groups SET routing_strategy = NULL WHERE tenant_id = $1")
+        .bind(tenant.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let before = health(&fixture, tenant, generation).await;
+    // An installed plugin alone is not an opted-in group strategy. The native
+    // core health gate admits a healthy component without scheduling hooks.
+    let response = send_resilient_chat(&fixture, None, false).await;
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "normalized by component"
+    );
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    let after = health(&fixture, tenant, generation).await;
+    assert_eq!(after.last_failure_kind, before.last_failure_kind);
+    assert_eq!(after.cooldown_until, before.cooldown_until);
+    assert_eq!(after.consecutive_failures, before.consecutive_failures);
+    assert_eq!(after.probe_lease_until, before.probe_lease_until);
+    assert_eq!(after.updated_at, before.updated_at);
+}
+
+#[tokio::test]
+async fn gateway_component_without_configured_strategy_still_blocks_hard_quota() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"vendor_answer":"must-not-send"})),
+        )
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    let label = "component-no-strategy-hard-quota";
+    let mut fixture = resilient_route_fixture(label, &[(upstream.uri(), 0)]).await;
+    let (tenant, generation) = install_strategy(&mut fixture, label, 12345).await;
+    install_component_provider(&mut fixture).await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query("UPDATE provider_groups SET routing_strategy = NULL WHERE tenant_id = $1")
+        .bind(tenant.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    fixture
+        .state
+        .db
+        .record_upstream_account_failure(
+            fixture.accounts[0],
+            generation,
+            UpstreamFailureKind::RateLimitedUntil {
+                until: unix_millis() + 60_000,
+                exhausted: true,
+            },
+        )
+        .await
+        .unwrap();
+    let before = health(&fixture, tenant, generation).await;
+    let response = send_resilient_chat(&fixture, None, false).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+    let after = health(&fixture, tenant, generation).await;
+    assert_eq!(after.last_failure_kind, "quota_exhausted");
+    assert_eq!(after.cooldown_until, before.cooldown_until);
+    assert_eq!(after.consecutive_failures, before.consecutive_failures);
+    assert_eq!(after.probe_lease_until, 0);
+    assert_eq!(after.updated_at, before.updated_at);
+}

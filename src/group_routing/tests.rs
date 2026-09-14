@@ -24,6 +24,10 @@ async fn blocked_snapshot_with_maximum_candidates_cannot_extend_frozen_deadline(
     tokio::time::pause();
     let started = tokio::time::Instant::now();
     let deadline = started + Duration::from_millis(25);
+    // The real proxy entrance with no installed hooks must not query this
+    // exhausted pool or clone candidates before freezing its core budget.
+    assert!(candidate_snapshot_if_enabled(&state, &candidates).is_none());
+    assert_eq!(tokio::time::Instant::now(), started);
     prepare(
         &mut state,
         tenant,

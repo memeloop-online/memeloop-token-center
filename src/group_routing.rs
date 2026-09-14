@@ -22,6 +22,18 @@ type BucketMember = (
 type StrategyBuckets = BTreeMap<(std::cmp::Reverse<i32>, String), Vec<BucketMember>>;
 type CandidateKey = (Uuid, Uuid, i64);
 
+/// The native/no-hook entrance is synchronous: do not add an unbounded
+/// configuration query before the core scheduling deadline has been frozen.
+pub(crate) fn candidate_snapshot_if_enabled(
+    state: &AppState,
+    candidates: &[AuthorizedUpstreamCandidate],
+) -> Option<Vec<AuthorizedUpstreamCandidate>> {
+    state
+        .plugins
+        .has_group_routing_hooks()
+        .then(|| candidates.to_vec())
+}
+
 fn planned_candidate<'a>(
     input: &'a GroupRoutingInput,
     directive: &GroupRoutingDirective,

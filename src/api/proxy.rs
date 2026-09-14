@@ -859,9 +859,8 @@ pub(in crate::api) async fn proxy_with_identity(
         )
         .await?;
     retain_pinned_text_candidates(&state, pinned_route, &mut candidates)?;
-    let strategy_candidates = (state.plugins.has_group_routing_hooks()
-        || state.db.has_group_routing_strategies(key.tenant_id).await?)
-        .then(|| candidates.clone());
+    let strategy_candidates =
+        crate::group_routing::candidate_snapshot_if_enabled(&state, &candidates);
     let request_context = ProxyRequestContext {
         state: &state,
         key: &key,
