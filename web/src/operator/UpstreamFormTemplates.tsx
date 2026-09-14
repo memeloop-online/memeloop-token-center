@@ -16,10 +16,10 @@ function UpstreamObjectTemplate(props: ObjectFieldTemplateProps) {
   if (props.fieldPathId.path.length === 0 && props.schema.properties?.name && props.schema.properties?.config) {
     const identity = props.properties.filter((field) => field.name !== 'config' && field.name !== 'credential');
     return <div className="upstream-form-sections">
-      {props.registry.formContext?.providerEdit && identity.length === 1 && identity[0].name === 'name'
-        ? identity[0].content
-        : <FormSection title={t('connection.identitySection')}>{identity.map((field) => field.content)}</FormSection>}
+      <FormSection title={t('connection.identitySection')}>{identity.map((field) => field.content)}</FormSection>
+      {props.registry.formContext?.providerAuthentication}
       {props.properties.find((field) => field.name === 'config')?.content}
+      {props.registry.formContext?.providerRouting}
       {props.properties.some(field => field.name === 'credential') && <FormSection title={copy.authentication} description={copy.authenticationHint}>{props.properties.find(field => field.name === 'credential')?.content}</FormSection>}
     </div>;
   }
@@ -33,8 +33,9 @@ function UpstreamObjectTemplate(props: ObjectFieldTemplateProps) {
     const main = props.properties.filter((field) => !field.hidden && !optionalNetwork.includes(field.name) && !optionalCapabilities.includes(field.name));
     return <div className="upstream-form-sections">
       {props.properties.filter(field => field.hidden).map(field => field.content)}
-      {main.length > 0 && <FormSection title={t('connection.endpointSection')}>
+      {(main.length > 0 || props.registry.formContext?.providerConnection) && <FormSection title={props.registry.formContext?.providerConnectionTitle ?? t('connection.endpointSection')}>
         <ObjectFieldTemplate {...props} title="" properties={main} />
+        {props.registry.formContext?.providerConnection}
       </FormSection>}
       {network.length > 0 && <AdvancedFormSection title={t('connection.advancedSection')} description={t('connection.advancedHint')} invalid={network.some((field) => Boolean(props.errorSchema?.[field.name]))}>{network.map((field) => field.content)}</AdvancedFormSection>}
       {capabilities.length > 0 && <AdvancedFormSection title={t('connection.capabilitiesSection')} description={t('connection.capabilitiesHint')} invalid={capabilities.some((field) => Boolean(props.errorSchema?.[field.name]))}>{capabilities.map((field) => field.content)}</AdvancedFormSection>}

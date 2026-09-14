@@ -21,6 +21,7 @@ const workflows = new URLSearchParams(location.search).has('workflows');
 const existingRoute = { id: 'route-existing', tenant_external_id: 'fixture', public_model: 'research-model', upstream_model: 'fixture-model', protocol: 'openai', upstream_account_ids: ['account-native'], enabled: true, priority: 0, grant_revision: 1, created_at: 1, updated_at: 1 };
 let routeRows = [existingRoute];
 const account = { id: 'account-native', tenant_external_id: 'fixture', name: '研发订阅', driver: 'openai-codex', auth_kind: 'oauth', connection_method: 'oauth', status: 'active', config: { base_url: 'https://chatgpt.com/backend-api/codex' }, has_proxy: true, proxy_scheme: 'socks5h', proxy_remote_dns: true, can_update_transport_proxy: true, credential_generation: 1, route_count: 1, updated_at: 1 };
+let proxyUrl = 'socks5h://fixture-user:fixture-password@10.0.0.15:1080';
 window.fetch = async (input, init) => {
   const path = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, location.origin).pathname;
   const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
@@ -37,6 +38,7 @@ window.fetch = async (input, init) => {
       if (path.endsWith('/transport-proxy')) {
         if (data.expected_credential_generation !== account.credential_generation) throw new Error('fixture credential revision mismatch');
         account.credential_generation++;
+        proxyUrl = data.proxy_url;
       } else {
         account.name = data.name;
       }
@@ -51,6 +53,10 @@ window.fetch = async (input, init) => {
     return new Response(JSON.stringify({ ...existingRoute, ...data }));
   }
   window.formJourneyReads.push(path);
+  if (path === '/internal/v1/upstreams/account-native/transport-proxy') {
+    if (init?.cache !== 'no-store') throw new Error('Proxy reads must not be cached');
+    return new Response(JSON.stringify({ account_id: account.id, proxy_url: proxyUrl, supported: true, proxy_network_scope: 'private', updated_at: account.updated_at, credential_generation: account.credential_generation }), { headers: { 'Cache-Control': 'private, no-store' } });
+  }
   if (new URLSearchParams(location.search).has('quota-generation') && path === '/internal/v1/upstreams/account-native/quota') {
     const generation = account.credential_generation;
     const snapshot: UpstreamQuotaSnapshot = {
