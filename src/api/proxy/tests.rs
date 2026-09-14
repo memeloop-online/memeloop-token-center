@@ -22,6 +22,7 @@ use crate::{
 };
 
 mod archive_terminal;
+mod buffered_responses_incomplete;
 mod chat_sse_usage;
 mod codex_quota;
 mod filter_assistant;

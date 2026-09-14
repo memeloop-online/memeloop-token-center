@@ -579,6 +579,29 @@ async fn finish_non_sse_proxy_response(
         _ => Ok(()),
     };
     if let Err(error_code) = validation {
+        if matches!(protocol, Protocol::OpenAiResponses)
+            && let Some(usage) = trusted_buffered_responses_incomplete_usage(&response_body)
+        {
+            // A provider-declared terminal is not a successful completion, but
+            // its complete counters must not be discarded as unobserved usage.
+            // This is the same atomic buffered settlement used for success;
+            // neither the response status nor retry eligibility is promoted.
+            let result = finish_buffered_request(
+                buffered_request,
+                StatusCode::BAD_GATEWAY,
+                Bytes::from_static(
+                    b"{\"error\":{\"message\":\"upstream response was incomplete\",\"type\":\"upstream_error\"}}",
+                ),
+                "application/json",
+                (usage, crate::model::RequestUsageBasis::ProviderReported),
+                Some("upstream_incomplete_response".to_owned()),
+            )
+            .await;
+            upstream_attempt
+                .complete(UpstreamAttemptTerminal::Inconclusive)
+                .await;
+            return result;
+        }
         let result = finish_proxy_failure(buffered_request, error_code).await;
         upstream_attempt
             .complete(UpstreamAttemptTerminal::invalid_response())
@@ -1566,6 +1589,34 @@ fn validate_buffered_responses_success(body: &[u8]) -> Result<(), &'static str> 
         }
         Some(_) => Err("upstream_invalid_response"),
     }
+}
+
+fn trusted_buffered_responses_incomplete_usage(body: &[u8]) -> Option<TokenUsage> {
+    let value = crate::api::sse::parse_unique_json(body).ok()?;
+    if value.get("object").and_then(Value::as_str) != Some("response")
+        || value.get("status").and_then(Value::as_str) != Some("incomplete")
+        || !value.get("error").is_some_and(Value::is_null)
+        || value.get("type").is_some()
+        || !matches!(
+            value
+                .pointer("/incomplete_details/reason")
+                .and_then(Value::as_str),
+            Some("max_output_tokens" | "content_filter")
+        )
+        || !value
+            .get("output")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().all(Value::is_object))
+    {
+        return None;
+    }
+    value
+        .get("id")
+        .and_then(Value::as_str)
+        .and_then(safe_response_id)?;
+    // Reuse the typed terminal accounting contract from streaming incomplete
+    // and Codex buffered Responses, not the permissive generic JSON extractor.
+    codex_transport::canonical_responses_usage(&value).ok()
 }
 
 fn validate_buffered_chat_success(body: &[u8]) -> Result<(), &'static str> {
