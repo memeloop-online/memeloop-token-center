@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { rejected, run } from './contract-helpers.ts';
+import { rejected, repository, run } from './contract-helpers.ts';
 
 type Change = readonly [status: string, ...paths: string[]];
 
@@ -29,6 +29,73 @@ const webOnly = { rust: 'false', web: 'true', migration: 'false', memory: 'false
 const staticContractsOnly = { rust: 'false', web: 'false', migration: 'false', memory: 'false', plugin_installer: 'false' };
 const full = { rust: 'true', web: 'true', migration: 'true', memory: 'true', plugin_installer: 'false' };
 const fullPlugin = { ...full, plugin_installer: 'true' };
+
+test('verified merge scope ignores a stale event base and fails closed for an unverified checkout', () => {
+  const temporary = mkdtempSync(join(tmpdir(), 'mtc-ci-merge-scope-contract-'));
+  const env = {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_AUTHOR_NAME: 'CI fixture', GIT_AUTHOR_EMAIL: 'fixture@example.test',
+    GIT_COMMITTER_NAME: 'CI fixture', GIT_COMMITTER_EMAIL: 'fixture@example.test',
+    GIT_AUTHOR_DATE: '2026-01-01T00:00:00Z', GIT_COMMITTER_DATE: '2026-01-01T00:00:00Z',
+  };
+  const git = (...args: string[]): string => run('git', args, { cwd: temporary, env }).trim();
+  const commit = (message: string, ...parents: string[]): string => git(
+    'commit-tree', git('write-tree'), ...parents.flatMap((parent) => ['-p', parent]), '-m', message,
+  );
+  try {
+    git('init', '--quiet', '--initial-branch=fixture');
+    mkdirSync(join(temporary, 'src'));
+    mkdirSync(join(temporary, 'web'));
+    writeFileSync(join(temporary, 'src/runtime.rs'), 'old base\n');
+    writeFileSync(join(temporary, 'web/App.tsx'), 'old UI\n');
+    git('add', '.');
+    const eventBase = commit('original event base');
+    writeFileSync(join(temporary, 'web/App.tsx'), 'new UI\n');
+    git('add', 'web/App.tsx');
+    const prHead = commit('web-only PR', eventBase);
+    git('read-tree', eventBase);
+    writeFileSync(join(temporary, 'src/runtime.rs'), 'unrelated base advance\n');
+    git('add', 'src/runtime.rs');
+    const actualBase = commit('base advanced after event snapshot', eventBase);
+    git('read-tree', prHead);
+    git('add', 'src/runtime.rs');
+    const merge = commit('actual checked out merge', actualBase, prHead);
+    git('update-ref', 'HEAD', merge);
+    assert.match(git('diff', '--name-only', eventBase, merge), /^src\/runtime\.rs$/m,
+      'the stale event-base comparison must reproduce the unrelated runtime change');
+
+    const resolve = (checkout: string, head: string): { scopes: Record<string, string>; evidence: Record<string, unknown> } => {
+      const output = join(temporary, 'scope-output.txt');
+      writeFileSync(output, '');
+      const result = run(process.execPath, [join(repository, 'ops/ci/detect-expensive-ci-scopes.ts'), 'pull_request', '--verified-merge', output], {
+        cwd: temporary, env: { ...env, BASE_SHA: eventBase, GITHUB_SHA: checkout, PR_HEAD_SHA: head },
+      });
+      return {
+        scopes: Object.fromEntries(readFileSync(output, 'utf8').trim().split('\n').map((line) => line.split('=', 2))),
+        evidence: JSON.parse(result),
+      };
+    };
+    const verified = resolve(merge, prHead);
+    assert.deepEqual(verified.scopes, webOnly);
+    assert.equal(verified.evidence.comparison_base, actualBase);
+    assert.equal(verified.evidence.change_count, 1);
+    assert.equal(verified.evidence.force_full, false);
+    for (const [checkout, head] of [[merge, actualBase], [merge, 'not-a-sha'], [prHead, prHead]]) {
+      const fallback = resolve(checkout!, head!);
+      assert.deepEqual(fallback.scopes, fullPlugin);
+      assert.equal(fallback.evidence.force_full, true);
+    }
+    git('update-ref', 'HEAD', prHead);
+    assert.deepEqual(resolve(prHead, prHead).scopes, fullPlugin, 'one-parent checkout must not grant skips');
+    const octopus = commit('unexpected three-parent merge', actualBase, prHead, eventBase);
+    git('update-ref', 'HEAD', octopus);
+    assert.deepEqual(resolve(octopus, prHead).scopes, fullPlugin, 'three-parent checkout must not grant skips');
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
 
 test('scope matrix skips expensive service gates only for web or static-contract pull requests', () => {
   const matrix: readonly [label: string, changes: readonly Change[], expected: Record<string, string>][] = [

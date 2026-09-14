@@ -1571,22 +1571,30 @@ async fn postgres_usage_analysis_grouping_sets_match_currency_safe_contract() {
         now.saturating_sub(86_400_000)
     );
     let full_capture = LogCapture::default();
+    let capture = LogCapture::default();
+    // Keep both dispatchers owned by this test, not only by the temporarily
+    // instrumented futures. tracing-core's single-dispatch registration fast
+    // path consults the registering thread's default: another parallel usage
+    // test without a subscriber can otherwise cache this shared callsite as
+    // disabled. Two live dispatchers use the registry and rebuild its interest
+    // before either captured request, without installing a global subscriber.
+    let full_dispatch = full_capture.dispatch();
+    let trends_dispatch = capture.dispatch();
     let (status, body) = get_json(&state, &path, &service.token)
-        .with_subscriber(full_capture.dispatch())
+        .with_subscriber(full_dispatch.clone())
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let full_analysis_events = full_capture.analysis_events();
     assert_eq!(full_analysis_events.len(), 1);
     assert_eq!(full_analysis_events[0]["projection"], "full");
     assert_eq!(full_analysis_events[0]["business_statement_count"], 4);
-    let capture = LogCapture::default();
     let trends_path = path.replacen(
         "/internal/v1/usage-analysis",
         "/internal/v1/usage-analysis/trends",
         1,
     );
     let (trends_status, trends) = get_json(&state, &trends_path, &service.token)
-        .with_subscriber(capture.dispatch())
+        .with_subscriber(trends_dispatch.clone())
         .await;
     assert_eq!(trends_status, StatusCode::OK, "{trends}");
     assert_trends_match_full(&body, &trends);
@@ -1598,6 +1606,7 @@ async fn postgres_usage_analysis_grouping_sets_match_currency_safe_contract() {
     );
     assert_eq!(analysis_events[0]["projection"], "trends");
     assert_eq!(analysis_events[0]["business_statement_count"], 1);
+    drop((full_dispatch, trends_dispatch));
     assert_eq!(body["summary"]["requests"], 2);
     assert_eq!(body["summary"]["input_tokens"], 40);
     assert_eq!(body["summary"]["cached_input_tokens"], 14);
