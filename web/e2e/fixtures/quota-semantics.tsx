@@ -34,6 +34,7 @@ function Preview() {
     <section className="upstream-quota" aria-label="Retained failed refresh" data-case="retained"><UpstreamQuotaDetails snapshot={retained} /></section>
     <section className="upstream-quota" aria-label="Failed refresh without observation" data-case="unobserved"><UpstreamQuotaDetails snapshot={unobserved} /></section>
     <section className="upstream-quota" aria-label="Unmapped supplier feature" data-case="unmapped"><UpstreamQuotaDetails snapshot={{ ...retained, credits: { balance: '0', unlimited: false, has_credits: true }, windows: [{ ...retained.windows[0], id: 'Codex_bengalfox:primary_window', label: 'Codex_bengalfox' }] }} /></section>
+    <section className="upstream-quota" aria-label="Supplier credits without balance" data-case="missing-balance"><UpstreamQuotaDetails snapshot={{ ...retained, credits: { balance: null, source: 'codex_usage', unlimited: null, has_credits: true } }} /></section>
   </article></main>;
 }
 

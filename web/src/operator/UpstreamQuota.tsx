@@ -23,7 +23,7 @@ export function UpstreamQuotaDetails({ snapshot, refreshError }: { snapshot: Ups
       {hasObservation && snapshot.plan_type && <b>{snapshot.plan_type}</b>}
       <span>{snapshot.observed_at === null ? t('quota.notObserved') : t(observation === 'historical' ? 'quota.lastObservedAt' : 'quota.observedAt', { time: new Date(snapshot.observed_at).toLocaleString(locale) })}</span>
       {observation === 'historical' && <span className="status pending">{t('quota.historical')}</span>}
-      {hasObservation && snapshot.credits.source === 'codex_usage' && snapshot.credits.balance !== null && <span>{t(observation === 'historical' ? 'quota.lastObservedBalance' : 'quota.balance', { amount: snapshot.credits.balance })}</span>}
+      {hasObservation && snapshot.credits.source === 'codex_usage' && typeof snapshot.credits.balance === 'string' && snapshot.credits.balance.trim() !== '' && <span>{t(observation === 'historical' ? 'quota.lastObservedBalance' : 'quota.balance', { amount: snapshot.credits.balance })}</span>}
       {hasObservation && snapshot.credits.source === 'codex_usage' && snapshot.credits.unlimited === true && <span>{t(observation === 'historical' ? 'quota.lastObservedUnlimitedCredits' : 'quota.unlimitedCredits')}</span>}
     </div>
     {snapshot.status === 'unsupported' && <p>{t('quota.readUnsupported')}</p>}
