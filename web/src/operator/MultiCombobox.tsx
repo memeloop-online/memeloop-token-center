@@ -7,6 +7,7 @@ export interface ComboboxOption {
   label: string;
   description?: string;
   created?: boolean;
+  disabled?: boolean;
 }
 
 interface MultiComboboxProps {
@@ -73,6 +74,7 @@ export function MultiCombobox({
   }, [expanded, activeIndex, id, panel]);
 
   const choose = (item: ComboboxOption) => {
+    if (item.disabled) return;
     onChange([...value, item]);
     setQuery('');
     onQueryChange?.('');
@@ -150,6 +152,8 @@ export function MultiCombobox({
           role="option"
           tabIndex={-1}
           aria-selected={index === activeIndex}
+          aria-disabled={item.disabled || undefined}
+          disabled={item.disabled}
           className={index === activeIndex ? 'active' : ''}
           id={`${id}-option-${index}`}
           key={item.value}

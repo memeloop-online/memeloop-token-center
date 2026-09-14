@@ -205,8 +205,16 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     return json({ key_id: 'key-recovery', credential_generation: 1, key: 'mts_client_recovered' });
   }
   if (scenario === 'client-form') {
-    if (url.pathname === '/internal/v1/route-groups') return json([{ id: '00000000-0000-4000-8000-000000000002', name: 'Research group', member_ids: [], member_count: 0, created_at: 1, updated_at: 1 }]);
-    if (url.pathname === '/internal/v1/model-routes') return json([{ id: '00000000-0000-4000-8000-000000000001', public_model: 'Research model', enabled: true, tenant_external_id: 'tenant-a' }]);
+    if (url.pathname === '/internal/v1/keys/key-form/routing') return json({ ...routingResponse, route_ids: ['00000000-0000-4000-8000-000000000004'], effective_route_ids: ['00000000-0000-4000-8000-000000000004'] });
+    if (url.pathname === '/internal/v1/provider-types') return json([{ id: 'kimi', display_name: 'Kimi' }]);
+    if (url.pathname === '/internal/v1/upstreams') return json([{ id: 'account-personal', name: 'Personal Kimi', driver: 'kimi', status: 'active' }, { id: 'account-team', name: 'Team Kimi', driver: 'kimi', status: 'active' }]);
+    if (url.pathname === '/internal/v1/route-groups') return json([{ id: '00000000-0000-4000-8000-000000000002', name: 'Research group', member_ids: ['00000000-0000-4000-8000-000000000001'], member_count: 1, created_at: 1, updated_at: 1 }]);
+    if (url.pathname === '/internal/v1/model-routes') return json([
+      { id: '00000000-0000-4000-8000-000000000001', public_model: 'Research model', upstream_model: 'kimi-research', protocol: 'openai', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-personal'] },
+      { id: '00000000-0000-4000-8000-000000000003', public_model: 'Research model', upstream_model: 'kimi-research', protocol: 'openai', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-team'] },
+      { id: '00000000-0000-4000-8000-000000000004', public_model: 'Spark disabled', enabled: false, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: [] },
+      { id: '00000000-0000-4000-8000-000000000005', public_model: 'Empty route', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: [] },
+    ]);
     if (url.pathname === '/internal/v1/keys' && method === 'POST') return json({ key_id: 'key-created', key: 'mts_fixture_created' });
     if (url.pathname === '/internal/v1/keys/key-form/policy' && method === 'PUT') return json({});
     if (url.pathname === '/internal/v1/keys') return json([
