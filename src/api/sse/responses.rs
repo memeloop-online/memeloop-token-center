@@ -313,7 +313,8 @@ impl ResponsesStreamingSanitizer {
                         .and_then(Value::as_str)
                         .is_none()
                     || value.get("response").is_none_or(|response| {
-                        crate::api::codex_transport::canonical_responses_usage(response).is_err()
+                        crate::api::proxy::codex_transport::canonical_responses_usage(response)
+                            .is_err()
                     })))
             || value.get("error").is_some_and(|error| !error.is_null())
             || value
