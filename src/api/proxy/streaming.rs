@@ -73,6 +73,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         // Streaming responses outlive the handler response. Keep the workload
         // permit inside this task until archive and billing finalization end.
         let _proxy_lifecycle_permit = proxy_lifecycle_permit;
+        let archive_memory = memory.clone();
         let _request_memory = memory;
         let _stream_activity = stream_activity;
         let _upstream_activity = upstream_activity;
@@ -97,8 +98,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let mut archive_sender = crate::response_archive_spool::ResponseArchiveProducer::begin(
                 &background_state,
                 spool_identity,
-            )
-            .await;
+                archive_memory,
+            );
             let mut usage_capture = Vec::new();
             let mut capture_memory = background_state
                 .metrics
@@ -288,7 +289,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         if let Some(spool) = archive_sender.as_mut()
                             && !spool
                                 .append(delivery_frames.iter().map(|f| f.bytes.clone()).collect())
-                                .await
                         {
                             tracing::warn!(%request_id, stage = "response_spool_ack", "proxy archive gap");
                             drop(archive_sender.take());
@@ -385,14 +385,16 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 // not leave a complete-looking archive prefix behind.
                 drop(archive_sender.take());
             }
-            // Success terminals and EOF are downstream commit markers. First
-            // make the complete capture recoverable (or record an honest gap).
-            // S3 upload remains asynchronous and is never awaited here.
-            let spool_sealed = match archive_sender.take() {
-                Some(spool) => spool.seal().await,
-                None => false,
+            // Success terminals and EOF transfer the bounded capture to its
+            // owned writer. The terminal frame does not wait for database
+            // drain; the writer keeps the row capturing until seal commits.
+            let archive_settlement: Option<
+                crate::response_archive_spool::ResponseArchiveSettlement,
+            > = match archive_sender.take() {
+                Some(spool) => spool.seal(),
+                None => None,
             };
-            if !spool_sealed {
+            if archive_settlement.is_none() {
                 crate::response_archive_spool::mark_gap(
                     &background_state,
                     spool_identity,
@@ -446,9 +448,15 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                     }
                 }
             }
-            drop(body_sender);
             drop(terminal_frames);
             terminal_memory.set_bytes(0);
+            if let Some(settlement) = archive_settlement {
+                settlement.wait().await;
+            }
+            // Keep the HTTP body owner alive through writer settlement so
+            // graceful connection drain cannot discard an accepted in-memory
+            // tail. Terminal bytes were already sent above; only EOF waits.
+            drop(body_sender);
             let gap_response = format!("gap://{request_id}/response");
             let stored_response = gap_response.clone();
             let response_archive_attempt = None;

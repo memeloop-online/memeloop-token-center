@@ -205,7 +205,7 @@ async fn incomplete_or_failed_tail_revokes_held_success_terminal() {
 }
 
 #[tokio::test]
-async fn terminal_delivery_observes_sealed_spool_or_explicit_capture_gap() {
+async fn terminal_delivery_transfers_capture_to_the_owned_writer_or_records_a_gap() {
     for fail_append in [false, true] {
         let upstream = MockServer::start().await;
         let payload = concat!(
@@ -241,13 +241,23 @@ async fn terminal_delivery_observes_sealed_spool_or_explicit_capture_gap() {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         assert_eq!(body.as_ref(), payload.as_bytes());
-        // No polling: receipt of terminal/EOF itself guarantees that capture
-        // is no longer left as an unrecoverable "capturing" success.
         let (state, gap_reason): (String, Option<String>) =
-            sqlx::query_as("SELECT state, last_error_code FROM response_archive_spools")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    let row: (String, Option<String>) = sqlx::query_as(
+                        "SELECT state, last_error_code FROM response_archive_spools",
+                    )
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    if matches!(row.0.as_str(), "pending" | "gap") {
+                        break row;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the owned writer must eventually seal or fence the capture");
         assert_eq!(state, if fail_append { "gap" } else { "pending" });
         assert_eq!(
             gap_reason.as_deref(),

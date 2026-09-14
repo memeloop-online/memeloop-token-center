@@ -3105,10 +3105,6 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
 #[tokio::test]
 async fn codex_retry_streaming_failure_is_redacted_and_records_failed_terminal() {
     let fixture = codex_route_fixture("retry-stream-failure").await;
-    // This is the byte-redaction/settlement contract, not the ACK latency gate.
-    // Keep ACK time controlled while real SQLite runs under parallel CI load;
-    // the dedicated late-ACK test below still explicitly expires the same timer.
-    let _ack_clock = crate::response_archive_spool::capture_ack_clock_for_test(&fixture.state);
     let upstream = MockServer::start().await;
     let failed = concat!(
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-failed\"}}\n\n",
