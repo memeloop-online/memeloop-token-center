@@ -14,7 +14,12 @@ export function providerEditShape(variant: string | null) {
       properties: {
         network_scope: { type: 'string', const: 'public' },
         reservation_token_bounds: { type: 'object', description: 'Conservative token reservation bounds keyed by exact upstream model.', additionalProperties: { type: 'integer', minimum: 1 } },
-        transport_policy: { type: 'object', properties: { connect_attempts: { type: 'integer', minimum: 1 }, connect_timeout_millis: { type: 'integer', minimum: 1 } } },
+        transport_policy: { type: 'object', properties: {
+          connect_attempts: { type: 'integer', minimum: 1 },
+          connect_timeout_millis: { type: 'integer', minimum: 1, description: 'Pre-delivery connection deadline; must be lower than the total request timeout.' },
+          read_timeout_millis: { type: 'integer', minimum: 1, description: 'Maximum inactivity from response headers to the first body read and between later body reads.' },
+          request_timeout_millis: { type: 'integer', minimum: 1, description: 'One absolute budget from the first send through the complete response body, including the sole permitted classified HTTP 400 replay.' },
+        } },
       },
     },
   };

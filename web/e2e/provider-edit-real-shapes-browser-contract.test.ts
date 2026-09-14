@@ -34,6 +34,8 @@ test('real Codex config shapes keep proxy primary and preserve advanced edits an
       assert.equal(await retry.getAttribute('aria-expanded'), 'false');
       await retry.focus(); await page.keyboard.press('Enter');
       await workspace.getByLabel('连接尝试次数').waitFor();
+      assert.doesNotMatch(await workspace.innerText(), /Pre-delivery|Maximum inactivity|One absolute budget/);
+      await workspace.getByText('建立连接的等待时限，必须小于请求总超时。', { exact: true }).waitFor();
       await retry.click();
       await advanced.focus(); await page.keyboard.press('Enter');
       await workspace.getByLabel('网络访问范围', { exact: false }).waitFor();

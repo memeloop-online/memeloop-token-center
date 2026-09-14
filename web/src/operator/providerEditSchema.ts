@@ -21,5 +21,16 @@ export function providerEditSchema(schema: RJSFSchema, locale: string): RJSFSche
       field.description = zh ? zhHint : enHint;
     }
   }
+  const policy = properties.properties?.transport_policy;
+  if (zh && policy && typeof policy === 'object') {
+    for (const [name, description] of Object.entries({
+      connect_timeout_millis: '建立连接的等待时限，必须小于请求总超时。',
+      read_timeout_millis: '收到响应头后等待首段内容，以及后续相邻内容之间允许的最长无数据时间。',
+      request_timeout_millis: '从首次发送到完整接收响应的总时限，包含系统允许的重放。',
+    })) {
+      const field = policy.properties?.[name];
+      if (field && typeof field === 'object') field.description = description;
+    }
+  }
   return result;
 }
