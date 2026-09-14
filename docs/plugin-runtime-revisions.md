@@ -60,16 +60,19 @@ memory and epoch deadlines remain in force.
 Plugin model/account outputs remain untrusted preferences. Core authorization
 must revalidate model/route access and restrict account hints to authorized
 candidates; this manager neither computes candidates nor grants tenant,
-credential or route permissions. Provider-catalog replacement and management
-authorization need an application-level atomic integration before exposing any
-reload endpoint. No deployment or runtime acceptance is claimed by this
-contract alone.
+credential or route permissions. The application integration now publishes
+runtime and provider catalog together, as described in
+[Installed plugin hot revisions](plugin-runtime-application-draft.md). The
+primitive library contract alone is still not deployment acceptance.
 
-## Required production integration (not implemented)
+## Application integration and host deployment obligations
 
-Do not enable application reload merely by removing the feature gate. The
-following boundaries must be delivered together before this draft can become a
-production hot-reload feature:
+Application publication is implemented behind the feature and explicit host
+inventory opt-in. The signed OCI installer can append reviewed new inventories
+at runtime; Control supports discovery, staging, CAS publication and rollback.
+New provider/OAuth contracts and supported declarative UI contributions need no
+restart. A browser installation/upload surface and revision-log UI are not
+delivered by these primitives. The following remain required boundaries:
 
 - A separately provisioned, host-authorized grant document and verification
   keys, mounted independently of candidate packages. The installer must verify
@@ -108,9 +111,9 @@ failover implementation. Existing work remains separate:
 | Hook execution diagnostics | PR #87 bounds and classifies traffic-hook execution. Revision publication diagnostics here describe lifecycle changes, not hook execution or delivery. |
 | Transport timeouts | PR #75 concerns transport-policy behavior, not plugin inventory or authorization. |
 | Configuration consistency | PR #59 follows these primitives; this change does not freeze multiple database configuration rows atomically. |
-| Application publication | PR #68 proposes request/application revision pinning and requires separate migration ownership and review. It is not included or enabled here. |
+| Application publication | Implemented by the feature-gated application authority, migration 83, host inventory and Control CAS endpoints. Runtime and catalog share one request pin; new inventories are discovered without restart. |
 
-A future versioned candidate/health/cooldown/attempt-policy contract must expose
+The versioned [group-routing contract](plugin-group-routing-v1.md) exposes
 only the host-authorized candidate set and credential-free, generation-bound
 observations. Plugin output may not add candidates, clear host breakers, widen
 attempt/deadline limits, or authorize a second dispatch. A policy runtime circuit
