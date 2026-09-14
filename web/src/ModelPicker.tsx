@@ -68,7 +68,13 @@ export function ModelPicker({ label, value, onChange, options, disabled = false,
     .sort((a, b) => (a.providerGroup ?? '').localeCompare(b.providerGroup ?? '') || a.provider.localeCompare(b.provider) || a.upstream.localeCompare(b.upstream) || a.label.localeCompare(b.label)), [options, query]);
   const selected = options.find((option) => option.value === value);
   const close = (restore = false) => { setOpen(false); setActive(-1); if (restore) anchor.current?.focus(); };
-  const show = () => { if (!open) { setSearch(''); setActive(-1); onOpen?.(); setOpen(true); } };
+  const show = () => {
+    if (!open) { setSearch(''); setActive(-1); onOpen?.(); setOpen(true); }
+    // Clicking an editable anchor can light-dismiss the native layer before
+    // its queued toggle reaches React. Reopen the same panel in that window.
+    const element = panel.current;
+    if (element && !element.matches(':popover-open')) element.showPopover();
+  };
   const selectable = matching.filter((option) => !option.disabled);
   const activeOption = active >= 0 && !matching[active]?.disabled ? matching[active] : selectable[0];
   const choose = (option: ModelPickerOption) => { if (option.disabled) return; onChange(option.value); close(true); };
@@ -101,7 +107,10 @@ export function ModelPicker({ label, value, onChange, options, disabled = false,
     {editable ? <input ref={anchor} id={`${id}-input`} role="combobox" aria-autocomplete="list" aria-expanded={open} aria-controls={`${id}-list`} aria-activedescendant={activeId} aria-describedby={describedBy} aria-invalid={invalid} disabled={disabled} autoComplete="off" value={value}
       onClick={show} onKeyDown={keyboard} onChange={(event) => { onChange(event.target.value); onQueryChange?.(event.target.value); setActive(-1); show(); }} />
       : <button ref={anchor} id={`${id}-input`} type="button" className="secondary model-picker-trigger" aria-labelledby={`${id}-label ${id}-value`} aria-describedby={describedBy} aria-haspopup="dialog" aria-expanded={open} aria-controls={`${id}-popover`} disabled={disabled} onClick={() => open ? close() : show()} onKeyDown={keyboard}><span id={`${id}-value`}>{selected?.label || value || t('common.select')}</span><span aria-hidden="true">⌄</span></button>}
-    {open && <section ref={panel} id={`${id}-popover`} className="shared-model-popover" popover="auto" style={position} role="dialog" aria-modal="false" aria-label={popupLabel || t('filter.catalogModels')} onToggle={(event) => { if (event.target === event.currentTarget && event.newState === 'closed') close(); }}>
+    {open && <section ref={panel} id={`${id}-popover`} className="shared-model-popover" popover="auto" style={position} role="dialog" aria-modal="false" aria-label={popupLabel || t('filter.catalogModels')} onToggle={(event) => {
+      if (event.target === event.currentTarget && panel.current === event.currentTarget
+        && event.newState === 'closed' && !event.currentTarget.matches(':popover-open')) close();
+    }}>
       {!editable && <input ref={searchInput} autoFocus role="combobox" aria-label={t('filter.searchCatalog')} aria-autocomplete="list" aria-expanded="true" aria-controls={`${id}-list`} aria-activedescendant={activeId} placeholder={t('filter.searchCatalog')} value={search} onKeyDown={keyboard} onChange={(event) => { setSearch(event.target.value); onQueryChange?.(event.target.value); setActive(-1); }} />}
       <small className="model-picker-keyboard-hint">{t('modelPicker.keyboardHint')}</small>
       {loading && <small role="status">{t('common.loading')}</small>}
