@@ -56,12 +56,12 @@ export function UpstreamQuotaDetails({ snapshot }: { snapshot: UpstreamQuotaSnap
 }
 
 /** User-triggered read: never starts one upstream request per card on page load. */
-export function UpstreamQuota({ accountId, accountName = accountId, tenant, token, onSnapshot, initialSnapshot }: { accountId: string; accountName?: string; tenant: string; token: string; onSnapshot?: (snapshot: UpstreamQuotaSnapshot) => void; initialSnapshot?: UpstreamQuotaSnapshot }) {
+export function UpstreamQuota({ accountId, accountName = accountId, credentialGeneration, tenant, token, onSnapshot, initialSnapshot }: { accountId: string; accountName?: string; credentialGeneration: number; tenant: string; token: string; onSnapshot?: (snapshot: UpstreamQuotaSnapshot) => void; initialSnapshot?: UpstreamQuotaSnapshot }) {
   const { t } = useI18n();
   const [snapshot, setSnapshot] = useState<UpstreamQuotaSnapshot | undefined>(initialSnapshot);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<'quota.readFailed' | 'quota.errorPermission'>();
-  const scope = `${token}\0${tenant}\0${accountId}`;
+  const scope = `${token}\0${tenant}\0${accountId}\0${credentialGeneration}`;
   const scopeRef = useRef(scope);
   scopeRef.current = scope;
   const requestRef = useRef<AbortController | null>(null);

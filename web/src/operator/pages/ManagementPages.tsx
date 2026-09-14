@@ -87,7 +87,9 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   const [reauthorizing, setReauthorizing] = useState<UpstreamAccount>();
   const [providerWorkspaceOpen, setProviderWorkspaceOpen] = useState(false);
   const [providerDetail, setProviderDetail] = useState<string>();
-  const [quotaSummaries, setQuotaSummaries] = useState<Record<string, UpstreamQuotaSnapshot>>({});
+  const [quotaSummaries, setQuotaSummaries] = useState<Record<string, { generation: number; snapshot: UpstreamQuotaSnapshot }>>({});
+  const quotaScope = useRef({ token, tenant, values });
+  quotaScope.current = { token, tenant, values };
   const [providerCreateGeneration, setProviderCreateGeneration] = useState(0);
   const [proxyEditorOpen, setProxyEditorOpen] = useState(false);
   const [providerEditDraft, setProviderEditDraft] = useState<Record<string, unknown>>();
@@ -255,7 +257,9 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
         const providerName = providers.find(provider => provider.id === value.driver)?.display_name ?? t('providerDirectory.other');
         const facts = availabilityWindow && availabilityWindow.tenant_external_id === (value.tenant_external_id ?? tenant) ? availabilityWindow.accounts.find(account => account.upstream_account_id === value.id) : undefined;
         const terminal = facts ? facts.metrics.successful_requests + facts.metrics.failed_requests : 0;
-        const quota = quotaSummaries[value.id];
+        const cachedQuota = quotaSummaries[value.id];
+        const generation = value.credential_generation;
+        const quota = cachedQuota?.generation === generation ? cachedQuota.snapshot : undefined;
         const quotaPercents = quota?.windows.map(quotaUsedPercent).filter((percent): percent is number => percent !== null) ?? [];
         const quotaText = !quota ? t('providerDirectory.notChecked')
           : quota.status === 'unsupported' ? t('providerDirectory.unsupported')
@@ -284,7 +288,12 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             <UpstreamConnection key={`connection\0${token}\0${writeTenant}\0${value.id}`} account={value} token={token} tenant={writeTenant} disabled={!manageable || Boolean(busy)} onChanged={onChanged} onEditingChange={setProxyEditorOpen} />
             {value.credential_expires_at && <small>{t('providers.expires')}: {new Date(value.credential_expires_at).toLocaleString(locale)}</small>}
             <Disclosure title={t('providers.recentAvailability')}><UpstreamAvailability account={value} snapshot={availabilitySnapshot} window={availabilityWindow} loading={availabilityLoading} manualHealth={currentHealth} onOpenRequest={onOpenRequest} /></Disclosure>
-            <UpstreamQuota key={`${token}\0${tenant}\0${value.id}`} accountId={value.id} accountName={value.name} tenant={value.tenant_external_id ?? tenant} token={token} initialSnapshot={quota} onSnapshot={snapshot => setQuotaSummaries(current => ({ ...current, [value.id]: snapshot }))} />
+            <UpstreamQuota key={`${token}\0${tenant}\0${value.id}\0${generation}`} accountId={value.id} accountName={value.name} credentialGeneration={generation} tenant={value.tenant_external_id ?? tenant} token={token} initialSnapshot={quota} onSnapshot={snapshot => setQuotaSummaries(current => {
+              // A late read owns the generation captured when it began, never
+              // the current account's newer generation after a credential change.
+              if (quotaScope.current.token !== token || quotaScope.current.tenant !== tenant || !quotaScope.current.values.some(account => account.id === value.id && account.credential_generation === generation)) return current;
+              return { ...current, [value.id]: { generation, snapshot } };
+            })} />
             {currentReadiness && <small className={`status ${currentReadiness.can_delete ? 'ok' : 'pending'}`}>{deletionBlockers.join(' · ')}</small>}
           </div>
           <div className="account-meta">

@@ -73,6 +73,42 @@ test('independent proxy save updates concurrency metadata without dropping the p
     await save.click();
     await page.locator('.provider-list').getByText('保留名称草稿', { exact: true }).waitFor();
     assert.equal(await page.evaluate(() => window.formJourneyWrites), 2, 'provider save succeeds against the new revision without retries');
+    // Credential-generation change invalidates both the cached summary and
+    // reset capability. These reads and the proxy update are in-memory only;
+    // no reset endpoint (not even preparation) is allowed by this fixture.
+    await page.goto(`${origin}/e2e/fixtures/form-journey.html?workflows&proxy-workflow&quota-generation`);
+    await row.getByRole('button', { name: '查看详情', exact: true }).click();
+    await page.getByRole('button', { name: '查看额度', exact: true }).click();
+    await page.getByText('代次 1 额度', { exact: true }).waitFor();
+    assert.match(await row.innerText(), /75/);
+    await page.getByRole('button', { name: '额度重置选项', exact: true }).click();
+    assert.equal(await page.getByRole('button', { name: '重置上游额度', exact: true }).isVisible(), true);
+    await row.getByRole('button', { name: '收起详情', exact: true }).click();
+    await row.getByRole('button', { name: '查看详情', exact: true }).click();
+    await page.getByText('代次 1 额度', { exact: true }).waitFor();
+    await page.evaluate(() => { window.deferNextFormQuotaRead = true; });
+    await page.getByRole('button', { name: '刷新额度', exact: true }).click();
+    await page.waitForFunction(() => window.formJourneyReads.filter(path => path.endsWith('/quota')).length === 2);
+    await page.getByRole('button', { name: '配置网络代理', exact: true }).click();
+    await page.locator('.upstream-proxy-editor input').fill('socks5h://10.0.0.30:1080');
+    await page.getByRole('button', { name: '保存网络代理', exact: true }).click();
+    await page.getByRole('button', { name: '查看额度', exact: true }).waitFor();
+    assert.match(await row.innerText(), /尚未读取/);
+    assert.equal(await page.getByText('代次 1 额度', { exact: true }).count(), 0);
+    assert.equal(await page.getByRole('button', { name: '额度重置选项', exact: true }).count(), 0);
+    assert.equal(await page.getByRole('button', { name: '重置上游额度', exact: true }).count(), 0);
+    await page.getByRole('button', { name: '查看额度', exact: true }).click();
+    await page.getByText('代次 2 额度', { exact: true }).waitFor();
+    await page.evaluate(() => window.releaseFormQuotaRead());
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    assert.match(await row.innerText(), /25/);
+    assert.doesNotMatch(await row.innerText(), /75/);
+    assert.equal(await page.getByText('代次 1 额度', { exact: true }).count(), 0);
+    assert.equal(await page.getByRole('button', { name: '额度重置选项', exact: true }).count(), 0);
+    await row.getByRole('button', { name: '收起详情', exact: true }).click();
+    await row.getByRole('button', { name: '查看详情', exact: true }).click();
+    await page.getByText('代次 2 额度', { exact: true }).waitFor();
+    assert.equal(await page.evaluate(() => window.formJourneyWrites), 1, 'only the mocked proxy change was written; no reset operation was attempted');
     assert.deepEqual(errors, []);
   } finally { await browser.close(); await server.close(); }
 });

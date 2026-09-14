@@ -5,6 +5,7 @@ import { MtcFluentProvider } from '../../src/design-system';
 import { ProvidersPage, RoutesPage } from '../../src/operator/pages/ManagementPages';
 import { AppShell } from '../../src/app/AppShell';
 import type { AppRouteKey } from '../../src/app/routes';
+import type { UpstreamQuotaSnapshot } from '../../src/operator/upstreamQuota';
 import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/operator/operator.css';
@@ -13,6 +14,9 @@ import '../../src/app-shell.css';
 import type {} from '../support/form-journey-globals';
 window.formJourneyReads = []; window.formJourneyWrites = 0;
 window.failNextFormWrite = false;
+window.deferNextFormQuotaRead = false;
+let releaseQuota: (() => void) | undefined;
+window.releaseFormQuotaRead = () => { if (!releaseQuota) throw new Error('No pending quota read'); releaseQuota(); releaseQuota = undefined; };
 const workflows = new URLSearchParams(location.search).has('workflows');
 const existingRoute = { id: 'route-existing', tenant_external_id: 'fixture', public_model: 'research-model', upstream_model: 'fixture-model', protocol: 'openai', upstream_account_ids: ['account-native'], enabled: true, priority: 0, grant_revision: 1, created_at: 1, updated_at: 1 };
 let routeRows = [existingRoute];
@@ -47,6 +51,23 @@ window.fetch = async (input, init) => {
     return new Response(JSON.stringify({ ...existingRoute, ...data }));
   }
   window.formJourneyReads.push(path);
+  if (new URLSearchParams(location.search).has('quota-generation') && path === '/internal/v1/upstreams/account-native/quota') {
+    const generation = account.credential_generation;
+    const snapshot: UpstreamQuotaSnapshot = {
+      contract_version: 'upstream_quota_v1', upstream_account_id: account.id, tenant_external_id: 'fixture', provider: account.driver,
+      status: 'ready', observed_at: Date.now(), stale_after: null, stale: false, plan_type: null, error_code: null,
+      credits: { balance: null, unlimited: null, has_credits: null },
+      windows: [{ id: 'primary', label: `代次 ${generation} 额度`, used_percent: generation === 1 ? 75 : 25, remaining: null, limit: null, reset_at: null, period_seconds: null, source: 'provider_usage', reset_is_estimated: false, allowed: true, limit_reached: false }],
+      reset_capability: { provider_supported: generation === 1, implementation_available: generation === 1, prepare_available: generation === 1, confirmation_required: true, retryable: false, available_credits: 1, applicable_credits: 1, reason: null, credit_error_code: null },
+    };
+    if (window.deferNextFormQuotaRead) {
+      window.deferNextFormQuotaRead = false;
+      // Deliberately ignore AbortSignal, and preserve the old generation's
+      // response, so the component must fence a late result itself.
+      return new Promise<Response>(resolve => { releaseQuota = () => resolve(new Response(JSON.stringify(snapshot))); });
+    }
+    return new Response(JSON.stringify(snapshot));
+  }
   const providers = [{ id: 'openai-codex', display_name: 'Codex 订阅', source: 'builtin', protocols: ['openai'],
     credential_schema: { type: 'object', properties: { type: { const: 'oauth' } } }, config_schema: { type: 'object', properties: { base_url: { type: 'string', const: 'https://chatgpt.com/backend-api/codex', readOnly: true } } }, oauth_adapter: { flow_kind: 'openai_device' } },
   { id: 'http-json', display_name: '自部署模型', source: 'builtin', protocols: ['openai'], credential_schema: { type: 'object', properties: { api_key: { type: 'string', title: 'API key', writeOnly: true } } },
