@@ -22,6 +22,59 @@ pub struct ReauthorizeUpstreamAccountInput {
 }
 
 impl Database {
+    /// Read a completed, exact replay before transport validation performs DNS work.
+    /// A concurrent miss is still serialized by the transactional rotation claim.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upstream_transport_proxy_rotation_replay(
+        &self,
+        account_id: Uuid,
+        tenant_external_id: &str,
+        proxy_url: &str,
+        expected_updated_at: i64,
+        expected_credential_generation: i64,
+        idempotency_key: &str,
+        key_material: &[u8],
+    ) -> Result<Option<UpstreamAccountView>, AppError> {
+        validate_idempotency_key(idempotency_key, "Idempotency-Key")?;
+        let idempotency_key = idempotency_key.trim();
+        let request_hash = upstream_transport_proxy_request_hash(
+            account_id,
+            tenant_external_id,
+            proxy_url,
+            expected_updated_at,
+            expected_credential_generation,
+            key_material,
+        );
+        let row = sqlx::query(
+            "SELECT resource_kind, resource_id, request_hash, response_ciphertext, expires_at FROM credential_rotation_replays WHERE idempotency_key = $1",
+        )
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        if row.try_get::<String, _>("resource_kind")? != UPSTREAM_TRANSPORT_PROXY_ROTATION_RESOURCE
+            || row.try_get::<String, _>("resource_id")? != account_id.to_string()
+            || row.try_get::<String, _>("request_hash")? != request_hash
+        {
+            return Err(AppError::BadRequest(
+                "Idempotency-Key was already used for a different credential rotation".into(),
+            ));
+        }
+        open_rotation_replay(
+            super::super::rotation::RotationReplay {
+                response_ciphertext: row.try_get("response_ciphertext")?,
+                expires_at: row.try_get("expires_at")?,
+            },
+            UPSTREAM_TRANSPORT_PROXY_ROTATION_RESOURCE,
+            account_id,
+            idempotency_key,
+            &request_hash,
+            key_material,
+            unix_millis(),
+        )
+        .map(Some)
+    }
+
     async fn begin_upstream_oauth_refresh_write_transaction(
         &self,
         account_id: Uuid,

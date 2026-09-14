@@ -645,6 +645,23 @@ pub(in crate::api) async fn rotate_codex_transport_proxy(
         .db
         .require_upstream_tenant(account_id, &body.tenant_external_id)
         .await?;
+    if let Some(account) = state
+        .db
+        .upstream_transport_proxy_rotation_replay(
+            account_id,
+            &body.tenant_external_id,
+            &body.proxy_url,
+            body.expected_updated_at,
+            body.expected_credential_generation,
+            idempotency_key,
+            state.config.key_pepper.as_bytes(),
+        )
+        .await?
+    {
+        return Ok(Json(super::config_secrets::public_account(
+            &state, account,
+        )?));
+    }
     let (current_account, credential, _, _) = state
         .db
         .upstream_account_with_current_credential(account_id, state.config.key_pepper.as_bytes())

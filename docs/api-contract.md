@@ -51,9 +51,10 @@ reactivated or routed without an explicit supported configuration.
 OpenAI Codex account configuration always identifies the fixed official
 `https://chatgpt.com/backend-api/codex` upstream; a SOCKS endpoint is transport
 state inside the encrypted OAuth credential and is never represented as
-`config.base_url`. Upstream responses expose only `has_proxy`, the SOCKS scheme,
+`config.base_url`. Ordinary upstream metadata responses expose only `has_proxy`, the SOCKS scheme,
 remote-DNS semantics, a host-free label and a pepper-keyed fingerprint. They
-never expose a proxy URL, host, port, username or password. The
+never expose a proxy URL, host, port, username or password.
+
 The explicit `GET /internal/v1/upstreams/{account_id}/transport-proxy` requires
 `providers:write`, global-operator authority, and an owning `tenant_external_id`.
 It returns the complete proxy URL (including proxy username/password), private
