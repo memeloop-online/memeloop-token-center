@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -44,13 +44,24 @@ test('installer executable selection is master-reviewed, unavailable by default 
 });
 
 test('Model Guard default has no rewrite, provider, or host capability', () => {
-  const manifest = JSON.parse(readFileSync(join(root, 'plugins/first-party/model-guard/plugin.json'), 'utf8'));
+  const manifest = JSON.parse(readFileSync(join(root, 'plugin-sources/model-guard/plugin.json'), 'utf8'));
   assert.deepEqual(manifest.capabilities, []);
   assert.deepEqual(manifest.contributions.providers, []);
   assert.equal(manifest.contributions.traffic_policy, true);
   assert.equal(manifest.contributions.request_rewrite, false);
   assert.deepEqual(manifest.contributions.configuration.default, { blocked_models: [] });
   assert.equal(manifest.contributions.configuration.schema.additionalProperties, false);
+});
+
+test('unbuilt plugin sources do not pollute the existing loadable plugin root', () => {
+  assert(existsSync(join(root, 'plugin-sources/model-guard/Cargo.toml')));
+  for (const entry of readdirSync(join(root, 'plugins'), { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+    const packageRoot = join(root, 'plugins', entry.name);
+    assert(existsSync(join(packageRoot, 'plugin.json')), `${entry.name} must be an actual package, not a source grouping directory`);
+    const manifest = JSON.parse(readFileSync(join(packageRoot, 'plugin.json'), 'utf8'));
+    if (manifest.wasm) assert(existsSync(join(packageRoot, manifest.wasm)), `${entry.name} requires its built component`);
+  }
 });
 
 test('keyless Helm mode omits signing-key Secrets but keeps host-owned policy', () => {
@@ -75,7 +86,7 @@ test('release evidence binds manifest and component bytes and rejects tampering'
     mkdirSync(join(directory, 'plugin-package'));
     mkdirSync(join(directory, 'plugin-install/mtc-model-guard'), { recursive: true });
     const files = [
-      ['plugin.json', readFileSync(join(root, 'plugins/first-party/model-guard/plugin.json'))],
+      ['plugin.json', readFileSync(join(root, 'plugin-sources/model-guard/plugin.json'))],
       ['plugin.wasm', Buffer.from('synthetic test bytes')],
     ] as const;
     for (const [name, bytes] of files) writeFileSync(join(directory, 'plugin-package', name), bytes);

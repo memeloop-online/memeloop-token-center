@@ -66,11 +66,11 @@ jobs:
             --output "$RUNNER_TEMP/wasm-tools.tar.gz"
           echo '097b1181d5b2bc3f2ebc44b4e72edf18308902023f1f1483a1a7dc1268ea988d  '"$RUNNER_TEMP/wasm-tools.tar.gz" | sha256sum --check
           tar -xzf "$RUNNER_TEMP/wasm-tools.tar.gz" -C "$RUNNER_TEMP/plugin-tools" --strip-components=1
-          cargo test --locked --manifest-path plugins/first-party/model-guard/Cargo.toml
-          cargo build --locked --release --target wasm32-unknown-unknown --manifest-path plugins/first-party/model-guard/Cargo.toml
+          cargo test --locked --manifest-path plugin-sources/model-guard/Cargo.toml
+          cargo build --locked --release --target wasm32-unknown-unknown --manifest-path plugin-sources/model-guard/Cargo.toml
           mkdir -p "$RUNNER_TEMP/plugin-package"
-          cp plugins/first-party/model-guard/plugin.json "$RUNNER_TEMP/plugin-package/plugin.json"
-          wasm-tools component new plugins/first-party/model-guard/target/wasm32-unknown-unknown/release/mtc_model_guard.wasm \
+          cp plugin-sources/model-guard/plugin.json "$RUNNER_TEMP/plugin-package/plugin.json"
+          wasm-tools component new plugin-sources/model-guard/target/wasm32-unknown-unknown/release/mtc_model_guard.wasm \
             -o "$RUNNER_TEMP/plugin-package/plugin.wasm"
           wasm-tools validate --features component-model "$RUNNER_TEMP/plugin-package/plugin.wasm"
           printf '{"format_version":1}\n' > "$RUNNER_TEMP/plugin-package/config.json"

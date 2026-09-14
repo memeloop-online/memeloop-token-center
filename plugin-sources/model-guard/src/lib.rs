@@ -1,6 +1,6 @@
 //! Opt-in model admission policy. No request parsing, rewriting, host calls,
 //! credential access, provider contribution or externally visible side effects.
-wit_bindgen::generate!({ path: "../../../wit/token-center.wit", world: "plugin" });
+wit_bindgen::generate!({ path: "../../wit/token-center.wit", world: "plugin" });
 
 use memeloop::token_center::types::{Decision, Metering, RequestContext};
 

@@ -3,7 +3,7 @@
 ## Availability is explicit
 
 `mtc-model-guard` is the first-party configurable admission package in
-`plugins/first-party/model-guard`. Default `blocked_models: []` allows all models;
+`plugin-sources/model-guard`. Default `blocked_models: []` allows all models;
 only an administrator's explicit configuration enables a denial. It has no
 request rewrite, provider/OAuth, network, KV or UI-code contribution. It uses the
 existing Plugins configuration editor, not a separate administration application.
