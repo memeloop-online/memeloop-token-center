@@ -67,7 +67,7 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
   const address = server.httpServer?.address();
   assert.ok(address && typeof address !== 'string');
   const browser = await chromium.launch({ executablePath, headless: true });
-  const context = await browser.newContext();
+  const context = await browser.newContext({ hasTouch: true });
   const history: string[] = [];
   const current = { value: 'create browser context' };
   const pageErrors: string[] = [];
@@ -181,6 +181,33 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
         assert.ok(layout.compactIdScrollWidth >= layout.compactIdClientWidth, `${theme} ${width}px request ID remains safely clipped in its cell`);
         assert.equal(layout.diagnostics.length, 2, `${theme} ${width}px fixture must retain both recorded and historical diagnostic surfaces`);
         for (const diagnostics of layout.diagnostics) assert.ok(diagnostics.scrollWidth <= diagnostics.clientWidth, `${theme} ${width}px each detail diagnostics surface must remain contained`);
+        if (width < 600) {
+          await recordedRow.evaluate((row) => row.scrollIntoView({ block: 'start' }));
+          const priority = await recordedRow.evaluate((row) => {
+            const boxes = {} as Record<'model' | 'credential' | 'tokens' | 'cost' | 'status' | 'time', { top: number; bottom: number; left: number; right: number; text: string }>;
+            // Keep this browser closure self-contained: a named nested function
+            // can acquire a tsx __name helper that does not exist in the page.
+            for (const [name, selector] of [['model', '.request-model-cell'], ['credential', '.request-credential-cell'], ['tokens', '.request-token-cell'], ['cost', '.request-cost-cell'], ['status', '.request-status-cell'], ['time', '.request-time-cell']] as const) {
+              const element = row.querySelector<HTMLElement>(selector)!;
+              const bounds = element.getBoundingClientRect();
+              boxes[name] = { top: bounds.top, bottom: bounds.bottom, left: bounds.left, right: bounds.right, text: element.innerText };
+            }
+            return { width: innerWidth, height: innerHeight, ...boxes };
+          });
+          assert.ok(priority.model.top < priority.credential.top && priority.credential.top < priority.tokens.top, 'mobile rows lead with model and credential, followed by accounting facts');
+          assert.ok(priority.time.top > priority.status.top, 'receipt metadata stays secondary to the outcome');
+          for (const key of ['model', 'credential', 'tokens', 'cost', 'status'] as const) {
+            const value = priority[key];
+            assert.ok(value.text.trim() && value.left >= 0 && value.right <= priority.width && value.top >= 0 && value.bottom <= priority.height, `${theme} ${width}px ${key} must be readable together without horizontal scrolling or hover`);
+          }
+          assert.equal(layout.tableScrollWidth, layout.tableClientWidth, 'mobile request cards do not require horizontal panning');
+          await recordedRow.locator('.request-routing-info').tap();
+          await page.getByRole('tooltip').filter({ hasText: upstreamId }).waitFor();
+          await recordedRow.locator('.request-credential-cell [tabindex="0"]').focus();
+          assert.equal(await recordedRow.locator('.request-credential-cell [tabindex="0"]').evaluate((element) => document.activeElement === element), true, 'credential identity remains keyboard reachable');
+        } else {
+          assert.equal(await page.locator('.request-table').evaluate((element) => getComputedStyle(element).display), 'table', 'wider viewports retain the existing desktop table');
+        }
         if (width === 390) {
           await mkdir(artifactRoot, { recursive: true });
           await page.screenshot({ path: join(artifactRoot, `request-diagnostics-${theme}-390.png`), fullPage: true });
