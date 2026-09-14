@@ -713,6 +713,48 @@ mod tests {
             )
             .is_err()
         );
+        let reference = OAuthLoginSessionReference {
+            session_id: session.session_id,
+            flow_kind: FLOW.into(),
+            tenant_external_id: session.tenant_external_id.clone(),
+            operator_service_id: None,
+            expires_at: session.expires_at,
+        };
+        let OAuthLoginClaim::Claimed {
+            lease_owner,
+            state_ciphertext,
+        } = db
+            .claim_oauth_login_poll(&reference, 1001, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("expected initial lease")
+        };
+        let mut login: LoginState = open_private_json(&state_ciphertext, key, STATE_AAD).unwrap();
+        login.exchange_started = true;
+        db.replace_oauth_login_poll_state(
+            session.session_id,
+            lease_owner,
+            seal_private_json(&login, key, STATE_AAD).unwrap(),
+        )
+        .await
+        .unwrap();
+        let reclaimed = complete(
+            &db,
+            &reqwest::Client::new(),
+            &started.session_token,
+            "http://127.0.0.1:51121/oauth-callback?code=fixture&state=unused",
+            Some("fixture-tenant"),
+            None,
+            key,
+            31_002,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(reclaimed, Err(AppError::Conflict(_))),
+            "a dispatched code exchange must not be retried after lease takeover"
+        );
     }
 
     #[tokio::test]
