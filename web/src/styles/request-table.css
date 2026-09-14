@@ -176,6 +176,11 @@ table.request-table .request-model-cell code {
   white-space: nowrap;
 }
 
+.request-traffic-metrics .metric {
+  border: 0;
+  padding: 0.8rem 1rem;
+}
+
 @media (min-width: 1100px) {
   .metrics.request-traffic-metrics {
     grid-template-columns: repeat(6, minmax(0, 1fr));
@@ -249,9 +254,11 @@ table.request-table .request-model-cell code {
 .request-id-control.compact {
   margin-top: 0.25rem;
   max-width: 18rem;
+  cursor: help;
 }
 
 .request-id-control.compact code {
+  display: none;
   color: var(--muted, #82979e);
   font-size: 0.7rem;
   overflow: hidden;

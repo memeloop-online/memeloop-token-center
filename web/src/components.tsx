@@ -2,7 +2,7 @@ import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { CopyButton } from './CopyButton.js';
 import type { RequestView, StatsBucket } from './types.js';
 import { useI18n } from './i18n.js';
-import { formatCurrency, formatCurrencyDisplay, formatMetricDisplay, formatMetricNumber, formatMilliseconds, formatNumber } from './format.js';
+import { formatCurrency, formatCurrencyDisplay, formatDurationDisplay, formatMetricDisplay, formatMetricNumber, formatMilliseconds, formatNumber } from './format.js';
 import { useAnchoredPopover } from './useAnchoredPopover.js';
 
 export function Shell({ children, operator = false }: { children: ReactNode; operator?: boolean }) {
@@ -122,7 +122,7 @@ function RequestTokenSummary({ request }: { request: RequestView }) {
 
 function RequestIdentifier({ requestId, compact = false }: { requestId: string; compact?: boolean }) {
   const { t } = useI18n();
-  return <span className={`request-id-control${compact ? ' compact' : ''}`}>
+  return <span className={`request-id-control${compact ? ' compact' : ''}`} title={compact ? requestId : undefined} aria-label={compact ? `${t('request.request')}: ${requestId}` : undefined}>
     <code title={requestId}>{requestId}</code>
     <CopyButton value={requestId} label={t('common.copy')} />
   </span>;
@@ -253,7 +253,7 @@ export function RequestTable({
             const cost = currencyForRequest ? formatCurrencyDisplay(request.cost, currencyForRequest, locale) : { text: '—' };
             const tokenDisplay = formatMetricDisplay(request.input_tokens + request.output_tokens, locale);
             const tokenDetails = requestTokenDetails(request, locale, t);
-            const durationText = request.duration_ms === null ? '—' : `${formatNumber(request.duration_ms, locale, 2)} ms`;
+            const duration = formatDurationDisplay(request.duration_ms, locale);
             return <tr key={request.request_id}>
               <td className="request-time-cell"><time>{new Date(request.created_at).toLocaleString(locale)}</time><RequestIdentifier requestId={request.request_id} compact /></td>
               <td className="request-credential-cell"><strong>{request.credential_identity?.key_alias ?? credentialAlias ?? t('common.none')}</strong>{technicalSummary && <button type="button" className="request-technical-info" title={technicalSummary} aria-label={technicalSummary}>ⓘ</button>}</td>
@@ -271,7 +271,7 @@ export function RequestTable({
                 {sessionMeta && <RequestSessionMetadata value={sessionMeta} />}
               </td>}
               <td><span className={`status ${request.status_code && request.status_code < 400 ? 'ok' : request.status_code ? 'bad' : 'pending'}`} title={request.error_code ?? undefined} aria-label={request.error_code ? `${request.status_code ?? t('common.running')}: ${request.error_code}` : undefined}>{request.status_code ?? t('common.running')}</span>{request.error_code && <span className="visually-hidden">{request.error_code}</span>}</td>
-              <td><span className="request-duration-info" title={durationSummary || undefined} aria-label={durationSummary ? `${durationText}; ${durationSummary}` : undefined} tabIndex={durationSummary ? 0 : undefined}>{durationText}</span></td>
+              <td><span className="request-duration-info" title={[duration.title, durationSummary].filter(Boolean).join(' · ') || undefined} aria-label={[duration.text, duration.title, durationSummary].filter(Boolean).join(' · ') || undefined} tabIndex={duration.title || durationSummary ? 0 : undefined}>{duration.text}</span></td>
               {onSelect && <td><button className="secondary table-action" type="button" onClick={() => onSelect(request)} aria-label={t('request.openDetail', { model: request.model })}>{t('request.inspect')}</button></td>}
             </tr>
           })}

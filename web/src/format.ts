@@ -158,6 +158,13 @@ export function formatMilliseconds(value: number | null | undefined, locale: Loc
   return `${formatNumber(value, locale, 2)} ms`;
 }
 
+export function formatDurationDisplay(value: number | null | undefined, locale: Locale): FormattedValue {
+  const title = formatMilliseconds(value, locale);
+  if (title === '—' || value === null || value === undefined || !Number.isFinite(value)) return { text: title };
+  if (Math.abs(value) < 1_000) return { text: title };
+  return { text: `${formatNumber(value / 1_000, locale, 2)} s`, title };
+}
+
 /** A compact elapsed time for dashboard freshness, distinct from request latency. */
 export function formatElapsedTime(value: number | null | undefined, locale: Locale) {
   if (value === null || value === undefined || !Number.isFinite(value) || value < 0) return '—';

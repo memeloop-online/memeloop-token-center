@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
-import { formatMilliseconds, formatNumber, formatPercent } from '../src/format.js';
+import { formatDurationDisplay, formatMilliseconds, formatNumber, formatPercent } from '../src/format.js';
 import { requestOverviewFacts } from './fixtures/request-overview-facts.js';
 
 test('request popover stays non-modal across themes, locales and widths; models retain distinct account facts', { timeout: 60_000 }, async (t) => {
@@ -92,4 +92,10 @@ test('request popover stays non-modal across themes, locales and widths; models 
     await browser.close();
     await server.close();
   }
+});
+
+test('request duration display adapts units without losing exact milliseconds', () => {
+  assert.deepEqual(formatDurationDisplay(0, 'en'), { text: '0 ms' });
+  assert.deepEqual(formatDurationDisplay(999, 'en'), { text: '999 ms' });
+  assert.deepEqual(formatDurationDisplay(1_000, 'en'), { text: '1 s', title: '1,000 ms' });
 });
