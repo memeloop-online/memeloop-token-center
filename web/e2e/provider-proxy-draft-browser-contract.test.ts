@@ -88,8 +88,9 @@ test('independent proxy save updates concurrency metadata without dropping the p
     await page.locator('.provider-list').getByText('保留名称草稿', { exact: true }).waitFor();
     assert.equal(await page.evaluate(() => window.formJourneyWrites), 2, 'provider save succeeds against the new revision without retries');
     // Credential-generation change invalidates both the cached summary and
-    // reset capability. These reads and the proxy update are in-memory only;
-    // no reset endpoint (not even preparation) is allowed by this fixture.
+    // reset capability. Unknown discovery remains visible, but cannot prepare
+    // a reset. These reads and the proxy update are in-memory only; no reset
+    // endpoint (not even preparation) is allowed by this fixture.
     await page.goto(`${origin}/e2e/fixtures/form-journey.html?workflows&proxy-workflow&quota-generation`);
     await row.getByRole('button', { name: '查看详情', exact: true }).click();
     await page.getByRole('button', { name: '查看额度', exact: true }).click();
@@ -109,8 +110,12 @@ test('independent proxy save updates concurrency metadata without dropping the p
     await page.getByRole('button', { name: '查看额度', exact: true }).waitFor();
     assert.match(await row.innerText(), /尚未读取/);
     assert.equal(await page.getByText('代次 1 额度', { exact: true }).count(), 0);
-    assert.equal(await page.getByRole('button', { name: '额度重置选项', exact: true }).count(), 0);
-    assert.equal(await page.getByRole('button', { name: '重置上游额度', exact: true }).count(), 0);
+    await page.getByRole('button', { name: '额度重置选项', exact: true }).click();
+    assert.equal(
+      await page.getByRole('button', { name: '重置上游额度', exact: true }).isEnabled(),
+      false,
+      'unknown capability must not allow reset preparation after a credential-generation change',
+    );
     await page.getByRole('button', { name: '查看额度', exact: true }).click();
     await page.getByText('代次 2 额度', { exact: true }).waitFor();
     await page.evaluate(() => window.releaseFormQuotaRead());

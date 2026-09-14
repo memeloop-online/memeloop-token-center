@@ -97,7 +97,7 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     const tableId = recordedRow.locator('.request-id-control.compact code');
     assert.equal(await stage('read table request ID title', () => tableId.getAttribute('title'), history, current), requestId);
     assert.equal(await stage('read table request ID', () => tableId.textContent(), history, current), requestId);
-    assert.match(await stage('read recorded cache split', () => recordedRow.locator('.request-token-cell small').textContent(), history, current) ?? '', /Cache read 40.*Cache write 20/);
+    assert.match(await stage('read recorded cache split', () => recordedRow.locator('.request-token-cell .request-value-info').getAttribute('aria-label'), history, current) ?? '', /Cache read 40.*Cache write 20/);
     const recordedText = await stage('read recorded diagnostics', () => recorded.textContent(), history, current) ?? '';
     assert.match(recordedText, /http_429/);
     assert.match(recordedText, /Production Codex/);
@@ -109,8 +109,8 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     assert.match(historicalGapText, /Final route ID—/);
     assert.doesNotMatch(historicalGapText, /Cache read|Cache write/, 'missing historical cache fields must remain absent rather than becoming zero-valued rows');
     assert.match(historicalGapText, /Input tokens: 160.*Output tokens: 32/, 'known input/output must remain visible when historical cache telemetry is missing');
-    assert.match(await recordedRow.locator('.request-upstream-cell').textContent() ?? '', /Production Codex.*e82ea007/, 'operator rows retain both the readable account name and durable ID');
-    assert.match(await page.locator('tbody tr').nth(1).locator('.request-token-cell').textContent() ?? '', /Input tokens: 160.*Output tokens: 32/);
+    assert.match(await recordedRow.locator('.request-technical-info').getAttribute('title') ?? '', /Production Codex.*e82ea007/, 'operator rows retain both the readable account name and durable ID in request metadata');
+    assert.match(await page.locator('tbody tr').nth(1).locator('.request-token-cell .request-value-info').getAttribute('aria-label') ?? '', /Input tokens: 160.*Output tokens: 32/);
     assert.equal((await stage('read historical table currency', () => page!.locator('tbody tr').nth(1).locator('.request-cost-cell').textContent(), history, current))?.trim(), '—', 'an explicit historical null currency must not inherit the current credential currency');
 
     assert.equal(await stage('check Clipboard API', () => page!.evaluate(() => typeof navigator.clipboard?.writeText), history, current), 'function', 'the fixture must exercise the browser Clipboard API');

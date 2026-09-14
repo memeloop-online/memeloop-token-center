@@ -124,9 +124,9 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
   singletonTenants.resolve();
   await waitForSingleTenantScope(page, 'singleton-tenant');
   // This scenario opens the settings route. Its first tenant-scoped resource
-  // reads are the model-route catalog and the filter-assistant settings, not
-  // the traffic-page requests used by other operator scenarios.
-  const resourcePaths = ['/internal/v1/model-routes', '/internal/v1/filter-assistant/settings'];
+  // reads are the bounded model-picker projection and filter-assistant
+  // settings, not the traffic-page requests used by other operator scenarios.
+  const resourcePaths = ['/internal/v1/model-picker-options', '/internal/v1/filter-assistant/settings'];
   await eventually(() => assert.ok(observed.filter((value) => value.credential === 'singleton-credential'
     && resourcePaths.includes(value.path)).length >= 2));
   const singletonResources = observed.filter((value) => value.credential === 'singleton-credential'

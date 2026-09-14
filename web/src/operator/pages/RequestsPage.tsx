@@ -310,7 +310,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
       <Metric label={t('usage.successRate')} value={formatPercent(summary.successRate, locale)} tone="positive" />
       <Metric label={t('usage.average')} value={formatMilliseconds(summary.averageDurationMs, locale)} />
     </section>}
-    <RequestTable requests={requests} showRoutingDetails upstreamNames={new Map(upstreams.map((account) => [account.id, account.name]))} onSelect={(request) => void onSelect(request)} onOpenSession={onOpenSession} />
+    <RequestTable requests={requests} upstreamNames={new Map(upstreams.map((account) => [account.id, account.name]))} onSelect={(request) => void onSelect(request)} onOpenSession={onOpenSession} />
     {hasOlder && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('traffic.loadOlder')}</button></div>}
   </article>;
 }
