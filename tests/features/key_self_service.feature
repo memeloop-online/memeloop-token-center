@@ -138,6 +138,7 @@ Feature: Stable key identity and read-only self-service statistics
     And the client calls model "cursor-public"
     Then the response status is 200
     And the refreshed Cursor account keeps its id and uses generation 2
+    When the service disconnects the Cursor OAuth account before reauthorization
     When the service starts reauthorization for the Cursor OAuth account
     And the service polls the completed Cursor OAuth reauthorization
     And the client calls model "cursor-public"

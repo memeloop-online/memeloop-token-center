@@ -383,6 +383,8 @@ pub(in crate::api) struct StartCursorOAuthRequest {
     endpoints: Option<CursorOAuthEndpoints>,
     #[serde(default)]
     upstream_account_id: Option<Uuid>,
+    #[serde(default)]
+    proxy_url: Option<String>,
 }
 
 pub(in crate::api) async fn start_cursor_oauth(
@@ -393,6 +395,19 @@ pub(in crate::api) async fn start_cursor_oauth(
     let service = require_service(&headers, &state, "oauth:write").await?;
     let state = state.pin_application_plugins().await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
+    if body.upstream_account_id.is_some() && body.proxy_url.is_some() {
+        return Err(AppError::BadRequest(
+            "reauthorization cannot change the transport proxy; use the transport-proxy endpoint"
+                .into(),
+        ));
+    }
+    if let Some(proxy_url) = body.proxy_url.as_deref() {
+        require_global_service(&service)?;
+        crate::provider::validate_oauth_remote_dns_proxy_url(
+            proxy_url,
+            state.config.allow_oauth_loopback,
+        )?;
+    }
     if !state.providers.is_public(&body.provider_driver) {
         return Err(AppError::BadRequest(format!(
             "unknown provider driver: {}",
@@ -409,6 +424,27 @@ pub(in crate::api) async fn start_cursor_oauth(
         "cursor",
     )
     .await?;
+    let session_proxy_url = if let Some(target) = reauthorize.as_ref() {
+        state
+            .db
+            .upstream_oauth_reauthorization_proxy_snapshot(
+                target.account_id,
+                &body.tenant_external_id,
+                target.expected_updated_at,
+                target.expected_credential_generation,
+                "cursor",
+                state.config.key_pepper.as_bytes(),
+            )
+            .await?
+    } else {
+        body.proxy_url
+    };
+    if let Some(proxy_url) = session_proxy_url.as_deref() {
+        crate::provider::validate_oauth_remote_dns_proxy_url(
+            proxy_url,
+            state.config.allow_oauth_loopback,
+        )?;
+    }
     validate_provider_config_schema(&state, &body.provider_driver, &body.provider_config)?;
     validate_upstream_destination(
         &body.provider_driver,
@@ -434,6 +470,7 @@ pub(in crate::api) async fn start_cursor_oauth(
                 provider_config: body.provider_config,
                 endpoints,
                 oauth_driver: "cursor".to_owned(),
+                proxy_url: session_proxy_url,
                 reauthorize,
             },
             service.service_id,
@@ -514,6 +551,7 @@ pub(in crate::api) async fn start_provider_adapter_oauth(
                     refresh_url: adapter.refresh_url.clone(),
                 },
                 oauth_driver: "provider_adapter".to_owned(),
+                proxy_url: None,
                 reauthorize,
             },
             service.service_id,
@@ -883,13 +921,23 @@ async fn refresh_managed_upstream_oauth_impl(
                 } else {
                     OutboundScope::Public
                 };
-                let refresh_http = network::client_for_url(
-                    &state.http,
-                    &refresh_url,
-                    refresh_scope,
-                    state.config.allow_oauth_loopback,
-                )
-                .await?;
+                let refresh_http = if credential.proxy().is_some() {
+                    network::client_for_oauth_url_no_retry(
+                        &state.http,
+                        &refresh_url,
+                        credential.proxy(),
+                        state.config.allow_oauth_loopback,
+                    )
+                    .await?
+                } else {
+                    network::client_for_url(
+                        &state.http,
+                        &refresh_url,
+                        refresh_scope,
+                        state.config.allow_oauth_loopback,
+                    )
+                    .await?
+                };
                 refresh_cursor_credential(
                     &refresh_http,
                     &refresh_url,
@@ -957,6 +1005,8 @@ fn supports_oauth_refresh_proxy(driver: &str) -> bool {
         crate::oauth::codex_device::OAUTH_DRIVER
             | crate::oauth::managed::kimi::PROVIDER_DRIVER
             | crate::oauth::authorization_code::FLOW
+            | crate::oauth::copilot::OAUTH_DRIVER
+            | "cursor"
     )
 }
 
@@ -975,12 +1025,11 @@ mod oauth_proxy_tests {
         assert!(supports_oauth_refresh_proxy(
             crate::oauth::authorization_code::FLOW
         ));
-        for driver in [
-            crate::oauth::claude::OAUTH_DRIVER,
-            crate::oauth::copilot::OAUTH_DRIVER,
-            "cursor",
-            "provider_adapter",
-        ] {
+        assert!(supports_oauth_refresh_proxy(
+            crate::oauth::copilot::OAUTH_DRIVER
+        ));
+        assert!(supports_oauth_refresh_proxy("cursor"));
+        for driver in [crate::oauth::claude::OAUTH_DRIVER, "provider_adapter"] {
             assert!(!supports_oauth_refresh_proxy(driver), "{driver}");
         }
     }

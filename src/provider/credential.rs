@@ -470,6 +470,29 @@ pub(crate) fn validate_codex_proxy_url(value: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+pub(crate) fn validate_oauth_remote_dns_proxy_url(
+    value: &str,
+    allow_test_loopback: bool,
+) -> Result<(), AppError> {
+    validate_proxy_url(value)?;
+    let parsed = url::Url::parse(value)
+        .map_err(|_| AppError::BadRequest("upstream proxy URL is invalid".into()))?;
+    let test_loopback = allow_test_loopback
+        && parsed
+            .host_str()
+            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|address| address.is_loopback());
+    if parsed.scheme() != "socks5h"
+        || (!has_safe_private_ip_literal_host(&parsed) && !test_loopback)
+    {
+        return Err(AppError::BadRequest(
+            "OAuth authorization requires a private IP-literal socks5h proxy with remote DNS"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn deserialize_adapter_state<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
 where
     D: Deserializer<'de>,
@@ -861,6 +884,23 @@ mod proxy_tests {
                 *current_scope = scope;
             }
             assert!(credential.validate(0).is_err());
+        }
+    }
+
+    #[test]
+    fn native_oauth_remote_dns_proxy_requires_socks5h_private_literal() {
+        validate_oauth_remote_dns_proxy_url("socks5h://100.64.0.16:1080", false).unwrap();
+        validate_oauth_remote_dns_proxy_url("socks5h://127.0.0.1:1080", true).unwrap();
+        for proxy in [
+            "socks5://100.64.0.16:1080",
+            "socks5h://proxy.internal:1080",
+            "socks5h://8.8.8.8:1080",
+            "socks5h://127.0.0.1:1080",
+        ] {
+            assert!(
+                validate_oauth_remote_dns_proxy_url(proxy, false).is_err(),
+                "{proxy}"
+            );
         }
     }
 }

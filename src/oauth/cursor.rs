@@ -105,6 +105,7 @@ pub struct StartCursorLogin {
     pub provider_config: Value,
     pub endpoints: CursorOAuthEndpoints,
     pub oauth_driver: String,
+    pub proxy_url: Option<String>,
     pub reauthorize: Option<OAuthReauthorizationTarget>,
 }
 
@@ -139,6 +140,8 @@ struct CursorLoginState {
     verifier: String,
     poll_url: String,
     refresh_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy_url: Option<String>,
     expires_at: i64,
     #[serde(default)]
     reauthorize: Option<OAuthReauthorizationTarget>,
@@ -261,6 +264,7 @@ pub async fn start_cursor_login(
         verifier,
         poll_url: poll_url.to_string(),
         refresh_url: refresh_url.to_string(),
+        proxy_url: input.proxy_url,
         expires_at,
         reauthorize: input.reauthorize,
     };
@@ -445,13 +449,23 @@ pub async fn poll_cursor_login(
         .query_pairs_mut()
         .append_pair("uuid", &state.uuid)
         .append_pair("verifier", &state.verifier);
-    let outbound_http = network::client_for_url(
-        http,
-        poll_url.as_str(),
-        scope,
-        authority.allow_test_loopback,
-    )
-    .await?;
+    let outbound_http = if let Some(proxy_url) = state.proxy_url.as_deref() {
+        network::client_for_oauth_url_no_retry(
+            http,
+            poll_url.as_str(),
+            Some((proxy_url, OutboundScope::Private)),
+            authority.allow_test_loopback,
+        )
+        .await?
+    } else {
+        network::client_for_url(
+            http,
+            poll_url.as_str(),
+            scope,
+            authority.allow_test_loopback,
+        )
+        .await?
+    };
     let response = outbound_http
         .get(poll_url)
         .send()
@@ -539,8 +553,8 @@ pub async fn poll_cursor_login(
             header: "authorization".to_owned(),
             prefix: "Bearer ".to_owned(),
             adapter_state,
-            proxy_url: None,
-            proxy_network_scope: None,
+            proxy_network_scope: state.proxy_url.as_ref().map(|_| OutboundScope::Private),
+            proxy_url: state.proxy_url,
         },
         reauthorize: state.reauthorize,
     };
@@ -673,8 +687,8 @@ pub async fn refresh_cursor_credential(
         header: "authorization".to_owned(),
         prefix: "Bearer ".to_owned(),
         adapter_state,
-        proxy_url: None,
-        proxy_network_scope: None,
+        proxy_url: credential.proxy().map(|(url, _)| url.to_owned()),
+        proxy_network_scope: credential.proxy().map(|(_, scope)| scope),
     })
 }
 

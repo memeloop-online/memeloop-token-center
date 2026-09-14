@@ -50,6 +50,7 @@ pub struct StartCopilotDeviceLogin {
     pub account_name: String,
     pub operator_service_id: Option<Uuid>,
     pub provider_config: Value,
+    pub proxy_url: Option<String>,
     pub reauthorize: Option<OAuthReauthorizationTarget>,
 }
 
@@ -109,6 +110,8 @@ struct LoginState {
     device_code: String,
     poll_interval_seconds: u64,
     expires_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy_url: Option<String>,
     reauthorize: Option<OAuthReauthorizationTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     authorization: Option<GitHubAuthorization>,
@@ -303,17 +306,28 @@ async fn start_at(
         .append_pair("client_id", CLIENT_ID)
         .append_pair("scope", REQUESTED_SCOPE)
         .finish();
-    let response = oauth_client(http, &endpoints.device_code, allow_test_loopback)
-        .await?
-        .post(&endpoints.device_code)
-        .header(ACCEPT, "application/json")
-        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .header(USER_AGENT, USER_AGENT_VALUE)
-        .body(form)
-        .timeout(REQUEST_TIMEOUT)
-        .send()
-        .await
-        .map_err(|_| upstream_error())?;
+    if let Some(proxy_url) = input.proxy_url.as_deref() {
+        crate::provider::validate_oauth_remote_dns_proxy_url(proxy_url, allow_test_loopback)?;
+    }
+    let response = oauth_client(
+        http,
+        &endpoints.device_code,
+        input
+            .proxy_url
+            .as_deref()
+            .map(|proxy| (proxy, OutboundScope::Private)),
+        allow_test_loopback,
+    )
+    .await?
+    .post(&endpoints.device_code)
+    .header(ACCEPT, "application/json")
+    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+    .header(USER_AGENT, USER_AGENT_VALUE)
+    .body(form)
+    .timeout(REQUEST_TIMEOUT)
+    .send()
+    .await
+    .map_err(|_| upstream_error())?;
     if !response.status().is_success() {
         return Err(upstream_error());
     }
@@ -347,6 +361,7 @@ async fn start_at(
         device_code: response.device_code,
         poll_interval_seconds,
         expires_at,
+        proxy_url: input.proxy_url,
         reauthorize: input.reauthorize,
         authorization: None,
     };
@@ -479,8 +494,17 @@ async fn poll_at(
         validate_authorization(&authorization)?;
         authorization
     } else {
-        let device_result =
-            poll_device_token(http, &state.device_code, allow_test_loopback, endpoints).await;
+        let device_result = poll_device_token(
+            http,
+            &state.device_code,
+            state
+                .proxy_url
+                .as_deref()
+                .map(|proxy| (proxy, OutboundScope::Private)),
+            allow_test_loopback,
+            endpoints,
+        )
+        .await;
         let device = match device_result {
             Ok(DeviceOutcome::Pending { interval }) => {
                 let next_interval = interval
@@ -570,6 +594,10 @@ async fn poll_at(
         let user = fetch_user(
             http,
             &authorization.github_token,
+            state
+                .proxy_url
+                .as_deref()
+                .map(|proxy| (proxy, OutboundScope::Private)),
             allow_test_loopback,
             endpoints,
         )
@@ -579,6 +607,10 @@ async fn poll_at(
             http,
             &authorization.github_token,
             now,
+            state
+                .proxy_url
+                .as_deref()
+                .map(|proxy| (proxy, OutboundScope::Private)),
             allow_test_loopback,
             endpoints,
         )
@@ -623,8 +655,8 @@ async fn poll_at(
             adapter_state: Some(
                 serde_json::to_value(adapter_state).map_err(|_| AppError::Internal)?,
             ),
-            proxy_url: None,
-            proxy_network_scope: None,
+            proxy_network_scope: state.proxy_url.as_ref().map(|_| OutboundScope::Private),
+            proxy_url: state.proxy_url,
         },
         stable_account_id,
         login: user.login,
@@ -751,6 +783,7 @@ enum DeviceOutcome {
 async fn poll_device_token(
     http: &reqwest::Client,
     device_code: &str,
+    proxy: Option<(&str, OutboundScope)>,
     allow_test_loopback: bool,
     endpoints: &Endpoints,
 ) -> Result<DeviceOutcome, AppError> {
@@ -759,7 +792,7 @@ async fn poll_device_token(
         .append_pair("device_code", device_code)
         .append_pair("grant_type", DEVICE_GRANT_TYPE)
         .finish();
-    let response = oauth_client(http, &endpoints.access_token, allow_test_loopback)
+    let response = oauth_client(http, &endpoints.access_token, proxy, allow_test_loopback)
         .await?
         .post(&endpoints.access_token)
         .header(ACCEPT, "application/json")
@@ -805,10 +838,11 @@ async fn poll_device_token(
 async fn fetch_user(
     http: &reqwest::Client,
     github_token: &str,
+    proxy: Option<(&str, OutboundScope)>,
     allow_test_loopback: bool,
     endpoints: &Endpoints,
 ) -> Result<GitHubUser, AppError> {
-    let response = oauth_client(http, &endpoints.github_user, allow_test_loopback)
+    let response = oauth_client(http, &endpoints.github_user, proxy, allow_test_loopback)
         .await?
         .get(&endpoints.github_user)
         .header(ACCEPT, "application/vnd.github+json")
@@ -835,22 +869,31 @@ async fn exchange_copilot(
     http: &reqwest::Client,
     github_token: &str,
     now: i64,
+    proxy: Option<(&str, OutboundScope)>,
     allow_test_loopback: bool,
     endpoints: &Endpoints,
 ) -> Result<ExchangedToken, AppError> {
-    exchange_copilot_inner(http, github_token, now, allow_test_loopback, endpoints)
-        .await
-        .map_err(|_| upstream_error())
+    exchange_copilot_inner(
+        http,
+        github_token,
+        now,
+        proxy,
+        allow_test_loopback,
+        endpoints,
+    )
+    .await
+    .map_err(|_| upstream_error())
 }
 
 async fn exchange_copilot_inner(
     http: &reqwest::Client,
     github_token: &str,
     now: i64,
+    proxy: Option<(&str, OutboundScope)>,
     allow_test_loopback: bool,
     endpoints: &Endpoints,
 ) -> Result<ExchangedToken, ExchangeError> {
-    let response = oauth_client(http, &endpoints.copilot_token, allow_test_loopback)
+    let response = oauth_client(http, &endpoints.copilot_token, proxy, allow_test_loopback)
         .await
         .map_err(|_| ExchangeError::Failed)?
         .get(&endpoints.copilot_token)
@@ -945,10 +988,15 @@ async fn refresh_at(
     let mut state: AdapterState =
         serde_json::from_value(value.clone()).map_err(|_| invalid_state())?;
     validate_state(&state)?;
+    if let Some((proxy_url, _)) = credential.proxy() {
+        crate::provider::validate_oauth_remote_dns_proxy_url(proxy_url, allow_test_loopback)?;
+    }
+    let proxy = credential.proxy();
     let copilot = exchange_copilot_inner(
         http,
         &state.github_token,
         now,
+        proxy,
         allow_test_loopback,
         endpoints,
     )
@@ -963,6 +1011,7 @@ async fn refresh_at(
             let refreshed = refresh_github(
                 http,
                 refresh_token.as_deref().unwrap_or_default(),
+                proxy,
                 allow_test_loopback,
                 endpoints,
                 request_guard,
@@ -980,6 +1029,7 @@ async fn refresh_at(
                 http,
                 &state.github_token,
                 now,
+                proxy,
                 allow_test_loopback,
                 endpoints,
             )
@@ -1001,14 +1051,15 @@ async fn refresh_at(
         header: "authorization".into(),
         prefix: "Bearer ".into(),
         adapter_state: Some(serde_json::to_value(state).map_err(|_| AppError::Internal)?),
-        proxy_url: None,
-        proxy_network_scope: None,
+        proxy_url: credential.proxy().map(|(url, _)| url.to_owned()),
+        proxy_network_scope: credential.proxy().map(|(_, scope)| scope),
     })
 }
 
 async fn refresh_github(
     http: &reqwest::Client,
     refresh_token: &str,
+    proxy: Option<(&str, OutboundScope)>,
     allow_test_loopback: bool,
     endpoints: &Endpoints,
     request_guard: &dyn OAuthRefreshRequestGuard,
@@ -1019,7 +1070,7 @@ async fn refresh_github(
         .append_pair("grant_type", "refresh_token")
         .append_pair("refresh_token", refresh_token)
         .finish();
-    let client = oauth_client(http, &endpoints.access_token, allow_test_loopback).await?;
+    let client = oauth_client(http, &endpoints.access_token, proxy, allow_test_loopback).await?;
     let request = client
         .post(&endpoints.access_token)
         .header(ACCEPT, "application/json")
@@ -1043,9 +1094,10 @@ async fn refresh_github(
 async fn oauth_client(
     http: &reqwest::Client,
     endpoint: &str,
+    proxy: Option<(&str, OutboundScope)>,
     allow_test_loopback: bool,
 ) -> Result<reqwest::Client, AppError> {
-    network::client_for_url(http, endpoint, OutboundScope::Public, allow_test_loopback)
+    network::client_for_oauth_url_no_retry(http, endpoint, proxy, allow_test_loopback)
         .await
         .map_err(|_| upstream_error())
 }
@@ -1252,11 +1304,19 @@ fn upstream_error() -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use super::*;
-    use crate::db::CreateUpstreamAccountInput;
+    use crate::db::{CreateUpstreamAccountInput, ReauthorizeUpstreamAccountInput};
     use serde_json::json;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        sync::Mutex,
+    };
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{body_string_contains, header, method, path},
@@ -1273,6 +1333,55 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    async fn socks5h_proxy(
+        target: std::net::SocketAddr,
+    ) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let hosts = Arc::new(Mutex::new(Vec::new()));
+        let recorded = hosts.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut client, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let mut greeting = [0_u8; 2];
+                    client.read_exact(&mut greeting).await.unwrap();
+                    assert_eq!(greeting[0], 5);
+                    let mut methods = vec![0_u8; usize::from(greeting[1])];
+                    client.read_exact(&mut methods).await.unwrap();
+                    assert!(methods.contains(&0));
+                    client.write_all(&[5, 0]).await.unwrap();
+
+                    let mut request = [0_u8; 4];
+                    client.read_exact(&mut request).await.unwrap();
+                    assert_eq!(&request, &[5, 1, 0, 3]);
+                    let mut length = [0_u8; 1];
+                    client.read_exact(&mut length).await.unwrap();
+                    let mut hostname = vec![0_u8; usize::from(length[0])];
+                    client.read_exact(&mut hostname).await.unwrap();
+                    let hostname = String::from_utf8(hostname).unwrap();
+                    let mut port = [0_u8; 2];
+                    client.read_exact(&mut port).await.unwrap();
+                    assert_eq!(u16::from_be_bytes(port), target.port());
+                    recorded.lock().await.push(hostname);
+
+                    let mut upstream = TcpStream::connect(target).await.unwrap();
+                    client
+                        .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                        .await
+                        .unwrap();
+                    tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        (format!("socks5h://{address}"), hosts, task)
     }
 
     async fn sqlite_database() -> (tempfile::TempDir, String, Database) {
@@ -1296,6 +1405,7 @@ mod tests {
                 "network_scope": "public",
                 "reservation_token_bounds": {}
             }),
+            proxy_url: None,
             reauthorize: Some(OAuthReauthorizationTarget {
                 account_id: Uuid::nil(),
                 expected_updated_at: 42,
@@ -1394,6 +1504,7 @@ mod tests {
             let result = poll_device_token(
                 &reqwest::Client::new(),
                 "device-secret",
+                None,
                 true,
                 &Endpoints::test(&server.uri()),
             )
@@ -1758,6 +1869,211 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn account_socks5h_proxy_carries_device_login_and_short_token_remint() {
+        let server = MockServer::start().await;
+        let flow_now = crate::db::unix_millis();
+        let target = *server.address();
+        // This name is intentionally absent from local DNS. The complete
+        // lifecycle succeeds only if SOCKS5H carries it to the proxy.
+        let origin = format!("http://copilot-oauth.test:{}", target.port());
+        let endpoints = Endpoints::test(&origin);
+        let (proxy_url, proxy_hosts, proxy_task) = socks5h_proxy(target).await;
+        mount_start(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/login/oauth/access_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "github-proxy-secret",
+                "token_type": "bearer",
+                "scope": "repo workflow"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/user"))
+            .and(header("authorization", "Bearer github-proxy-secret"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"id": 12345, "login": "octocat"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/copilot_internal/v2/token"))
+            .and(header("authorization", "Bearer github-proxy-secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "token": "proxied-short-token",
+                "expires_at": (flow_now + 1_800_000) / 1_000,
+                "refresh_in": 900,
+                "endpoints": {"api": DEFAULT_COPILOT_API_ENDPOINT}
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let (_directory, _url, database) = sqlite_database().await;
+        let initial_credential = credential(oauth_state("github.com:12345"))
+            .with_transport_proxy(proxy_url.clone())
+            .unwrap();
+        let account = database
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: "tenant-a".into(),
+                    name: "octocat-copilot".into(),
+                    driver: PROVIDER_DRIVER.into(),
+                    config: input().provider_config,
+                    credential: initial_credential,
+                    oauth_session_id: Some(Uuid::now_v7()),
+                    oauth_driver: Some(OAUTH_DRIVER.into()),
+                    oauth_refresh_url: Some(TOKEN_ENDPOINT.into()),
+                },
+                KEY,
+            )
+            .await
+            .unwrap();
+        let (disconnected, oauth_driver, _) = database
+            .disconnect_upstream_oauth(account.id, "tenant-a", account.updated_at, KEY)
+            .await
+            .unwrap();
+        assert_eq!(oauth_driver, OAUTH_DRIVER);
+        let retained_proxy = database
+            .upstream_oauth_reauthorization_proxy_snapshot(
+                account.id,
+                "tenant-a",
+                disconnected.updated_at,
+                disconnected.credential_generation,
+                OAUTH_DRIVER,
+                KEY,
+            )
+            .await
+            .unwrap();
+        let mut start = input();
+        start.proxy_url = retained_proxy;
+        start.reauthorize = Some(OAuthReauthorizationTarget {
+            account_id: account.id,
+            expected_updated_at: disconnected.updated_at,
+            expected_credential_generation: disconnected.credential_generation,
+        });
+        let started = start_at(
+            &database,
+            &reqwest::Client::new(),
+            start,
+            KEY,
+            flow_now,
+            true,
+            &endpoints,
+        )
+        .await
+        .unwrap();
+        let scope = CopilotDevicePollScope {
+            required_tenant: Some("tenant-a"),
+            operator_service_id: None,
+        };
+        let checkpoint = poll_at(
+            &database,
+            &reqwest::Client::new(),
+            &started.session_token,
+            PollRuntime {
+                key_material: KEY,
+                now: flow_now + 1_000,
+                scope,
+                allow_test_loopback: true,
+                endpoints: &endpoints,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            checkpoint,
+            CopilotDevicePollResult::Pending {
+                retry_after_seconds: 1
+            }
+        ));
+        let ready = poll_at(
+            &database,
+            &reqwest::Client::new(),
+            &started.session_token,
+            PollRuntime {
+                key_material: KEY,
+                now: flow_now + 2_000,
+                scope,
+                allow_test_loopback: true,
+                endpoints: &endpoints,
+            },
+        )
+        .await
+        .unwrap();
+        let CopilotDevicePollResult::Ready { login, .. } = ready else {
+            panic!("expected proxied ready result")
+        };
+        assert_eq!(
+            login.credential.proxy(),
+            Some((proxy_url.as_str(), OutboundScope::Private))
+        );
+        let current = database
+            .upstream_oauth_identity_credential(account.id, KEY)
+            .await
+            .unwrap();
+        assert_eq!(
+            copilot_account_id(&current).unwrap(),
+            login.stable_account_id
+        );
+        let reauthorized = database
+            .reauthorize_upstream_account(
+                account.id,
+                ReauthorizeUpstreamAccountInput {
+                    tenant_external_id: login.tenant_external_id.clone(),
+                    expected_updated_at: disconnected.updated_at,
+                    expected_credential_generation: disconnected.credential_generation,
+                    driver: PROVIDER_DRIVER.into(),
+                    oauth_session_id: login.session_id,
+                    oauth_driver: OAUTH_DRIVER.into(),
+                    oauth_refresh_url: Some(TOKEN_ENDPOINT.into()),
+                    provider_config: Some(login.provider_config.clone()),
+                    credential: login.credential.clone(),
+                },
+                KEY,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reauthorized.id, account.id);
+        assert_eq!(reauthorized.credential_generation, 2);
+        assert_eq!(reauthorized.status, "active");
+        let (_, installed) = database
+            .upstream_account_with_credential(account.id, KEY)
+            .await
+            .unwrap();
+        assert_eq!(
+            installed.proxy(),
+            Some((proxy_url.as_str(), OutboundScope::Private))
+        );
+        let refreshed = refresh_at(
+            &reqwest::Client::new(),
+            &login.credential,
+            flow_now + 3_000,
+            true,
+            &endpoints,
+            &crate::oauth::TEST_OAUTH_REFRESH_REQUEST_GUARD,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            refreshed.proxy(),
+            Some((proxy_url.as_str(), OutboundScope::Private))
+        );
+        server.verify().await;
+        let hosts = proxy_hosts.lock().await.clone();
+        assert_eq!(hosts.len(), 5, "every OAuth operation must use the proxy");
+        assert!(
+            hosts
+                .iter()
+                .all(|hostname| hostname == "copilot-oauth.test"),
+            "SOCKS5H must receive the original target hostname: {hosts:?}"
+        );
+        proxy_task.abort();
+    }
+
+    #[tokio::test]
     async fn transient_completion_failure_reuses_checkpoint_not_consumed_device_code() {
         let server = MockServer::start().await;
         mount_start(&server).await;
@@ -1922,6 +2238,7 @@ mod tests {
                 &reqwest::Client::new(),
                 "raw-token",
                 NOW,
+                None,
                 true,
                 &Endpoints::test(&server.uri()),
             )
@@ -1950,6 +2267,7 @@ mod tests {
                 &reqwest::Client::new(),
                 "raw-super-secret",
                 NOW,
+                None,
                 true,
                 &Endpoints::test(&server.uri()),
             )

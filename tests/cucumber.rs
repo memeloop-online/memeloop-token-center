@@ -3,6 +3,7 @@ use std::{
     fmt,
     panic::AssertUnwindSafe,
     str::FromStr,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -24,7 +25,12 @@ use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
 use sqlx::{AnyPool, Row};
 use tempfile::TempDir;
-use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::{Mutex, watch},
+    task::JoinHandle,
+};
 use uuid::Uuid;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -59,6 +65,11 @@ struct TokenCenterWorld {
     cursor_login_url: String,
     cursor_account_id: Option<Uuid>,
     cursor_generation: i64,
+    cursor_updated_at: i64,
+    cursor_mock_origin: String,
+    cursor_proxy_url: String,
+    cursor_proxy_hosts: Arc<Mutex<Vec<String>>>,
+    cursor_proxy_task: Option<JoinHandle<()>>,
     current_service_token: String,
     old_service_token: String,
     stable_service_id: Option<Uuid>,
@@ -103,6 +114,11 @@ impl Default for TokenCenterWorld {
             cursor_login_url: String::new(),
             cursor_account_id: None,
             cursor_generation: 0,
+            cursor_updated_at: 0,
+            cursor_mock_origin: String::new(),
+            cursor_proxy_url: String::new(),
+            cursor_proxy_hosts: Arc::new(Mutex::new(Vec::new())),
+            cursor_proxy_task: None,
             current_service_token: String::new(),
             old_service_token: String::new(),
             stable_service_id: None,
@@ -150,7 +166,59 @@ impl Drop for TokenCenterWorld {
         if let Some(task) = self.worker_task.take() {
             task.abort();
         }
+        if let Some(task) = self.cursor_proxy_task.take() {
+            task.abort();
+        }
     }
+}
+
+async fn spawn_cursor_socks5h_proxy(
+    target: std::net::SocketAddr,
+) -> (String, Arc<Mutex<Vec<String>>>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_address = listener.local_addr().unwrap();
+    let requested_hosts = Arc::new(Mutex::new(Vec::new()));
+    let recorded = requested_hosts.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut client, _)) = listener.accept().await else {
+                return;
+            };
+            let recorded = recorded.clone();
+            tokio::spawn(async move {
+                let mut greeting = [0_u8; 2];
+                client.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(greeting[0], 5);
+                let mut methods = vec![0_u8; usize::from(greeting[1])];
+                client.read_exact(&mut methods).await.unwrap();
+                assert!(methods.contains(&0));
+                client.write_all(&[5, 0]).await.unwrap();
+
+                let mut request = [0_u8; 4];
+                client.read_exact(&mut request).await.unwrap();
+                assert_eq!(&request, &[5, 1, 0, 3]);
+                let mut hostname_length = [0_u8; 1];
+                client.read_exact(&mut hostname_length).await.unwrap();
+                let mut hostname = vec![0_u8; usize::from(hostname_length[0])];
+                client.read_exact(&mut hostname).await.unwrap();
+                let hostname = String::from_utf8(hostname).unwrap();
+                let mut port = [0_u8; 2];
+                client.read_exact(&mut port).await.unwrap();
+                assert_eq!(u16::from_be_bytes(port), target.port());
+                recorded.lock().await.push(hostname);
+
+                let mut upstream = TcpStream::connect(target).await.unwrap();
+                client
+                    .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                    .await
+                    .unwrap();
+                tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+    (format!("socks5h://{proxy_address}"), requested_hosts, task)
 }
 
 fn spawn_test_worker(state: AppState) -> (watch::Sender<bool>, JoinHandle<()>) {
@@ -5623,6 +5691,12 @@ async fn oauth_upstream_retains_id(world: &mut TokenCenterWorld) {
 
 #[given("the mock Cursor OAuth server and compatible upstream are ready")]
 async fn mock_cursor_oauth(world: &mut TokenCenterWorld) {
+    let target = *world.mock.as_ref().expect("mock server").address();
+    let (proxy_url, proxy_hosts, proxy_task) = spawn_cursor_socks5h_proxy(target).await;
+    world.cursor_mock_origin = format!("http://localhost:{}", target.port());
+    world.cursor_proxy_url = proxy_url;
+    world.cursor_proxy_hosts = proxy_hosts;
+    world.cursor_proxy_task = Some(proxy_task);
     Mock::given(method("GET"))
         .and(path("/cursor/auth/poll"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -5661,7 +5735,7 @@ async fn mock_cursor_oauth(world: &mut TokenCenterWorld) {
 
 #[when("the service starts a Cursor OAuth login")]
 async fn start_cursor_oauth(world: &mut TokenCenterWorld) {
-    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    let mock_url = world.cursor_mock_origin.clone();
     let response = world
         .client
         .post(format!(
@@ -5673,6 +5747,7 @@ async fn start_cursor_oauth(world: &mut TokenCenterWorld) {
             "account_name": "cursor-oauth",
             "provider_driver": "http-json",
             "provider_config": {"base_url": mock_url},
+            "proxy_url": world.cursor_proxy_url.clone(),
             "endpoints": {
                 "login_url": format!("{mock_url}/cursor/loginDeepControl"),
                 "poll_url": format!("{mock_url}/cursor/auth/poll"),
@@ -5723,6 +5798,9 @@ async fn poll_cursor_oauth(world: &mut TokenCenterWorld) {
     assert_eq!(response.status(), StatusCode::CREATED);
     let value: Value = response.json().await.expect("Cursor account JSON");
     assert_eq!(value["auth_kind"], "oauth");
+    assert_eq!(value["has_proxy"], true);
+    assert_eq!(value["proxy_scheme"], "socks5h");
+    assert_eq!(value["proxy_remote_dns"], true);
     assert!(value.get("credential").is_none());
     assert!(value["config"].get("oauth").is_none());
     assert_eq!(value["can_refresh"], true);
@@ -5735,6 +5813,7 @@ async fn poll_cursor_oauth(world: &mut TokenCenterWorld) {
     world.cursor_generation = value["credential_generation"]
         .as_i64()
         .expect("Cursor generation");
+    world.cursor_updated_at = value["updated_at"].as_i64().expect("Cursor updated_at");
     let retry = poll().await.expect("retry completed Cursor OAuth poll");
     assert_eq!(retry.status(), StatusCode::OK);
     let retry_value: Value = retry.json().await.expect("retried Cursor account JSON");
@@ -5781,12 +5860,16 @@ async fn refresh_cursor_oauth(world: &mut TokenCenterWorld) {
     assert_eq!(response.status(), StatusCode::OK);
     let value: Value = response.json().await.expect("refreshed Cursor account");
     assert_eq!(value["id"], account_id.to_string());
+    assert_eq!(value["has_proxy"], true);
+    assert_eq!(value["proxy_scheme"], "socks5h");
+    assert_eq!(value["proxy_remote_dns"], true);
     assert!(value.get("credential").is_none());
     assert!(!value.to_string().contains("cursor-access-2"));
     assert!(!value.to_string().contains("cursor-refresh-1"));
     world.cursor_generation = value["credential_generation"]
         .as_i64()
         .expect("refreshed generation");
+    world.cursor_updated_at = value["updated_at"].as_i64().expect("refreshed updated_at");
 }
 
 #[then("the refreshed Cursor account keeps its id and uses generation 2")]
@@ -5809,9 +5892,35 @@ async fn refreshed_cursor_account_is_stable(world: &mut TokenCenterWorld) {
     }));
 }
 
+#[when("the service disconnects the Cursor OAuth account before reauthorization")]
+async fn disconnect_cursor_oauth_before_reauthorization(world: &mut TokenCenterWorld) {
+    let account_id = world.cursor_account_id.expect("Cursor account id");
+    let response = world
+        .client
+        .post(format!(
+            "{}/internal/v1/upstreams/{account_id}/oauth/disconnect",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .json(&json!({"expected_updated_at": world.cursor_updated_at}))
+        .send()
+        .await
+        .expect("disconnect Cursor OAuth before reauthorization");
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = response.json().await.expect("disconnected Cursor account");
+    let account = &value["account"];
+    assert_eq!(account["id"], account_id.to_string());
+    assert_eq!(account["status"], "disabled");
+    assert_eq!(account["credential_generation"], world.cursor_generation);
+    assert_eq!(account["has_proxy"], true);
+    world.cursor_updated_at = account["updated_at"]
+        .as_i64()
+        .expect("disconnected updated_at");
+}
+
 #[when("the service starts reauthorization for the Cursor OAuth account")]
 async fn start_cursor_oauth_reauthorization(world: &mut TokenCenterWorld) {
-    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    let mock_url = world.cursor_mock_origin.clone();
     let account_id = world.cursor_account_id.expect("Cursor account id");
     let response = world
         .client
@@ -5877,6 +5986,7 @@ async fn poll_cursor_oauth_reauthorization(world: &mut TokenCenterWorld) {
             .to_string()
     );
     assert_eq!(value["credential_generation"], 3);
+    assert_eq!(value["status"], "active");
     assert_eq!(value["route_count"], 1);
     assert_eq!(value["can_reauthorize"], true);
     assert!(value.get("credential").is_none());
@@ -5905,6 +6015,15 @@ async fn reauthorized_cursor_account_is_stable(world: &mut TokenCenterWorld) {
         .filter(|route| route.upstream_account_id == world.cursor_account_id.unwrap())
         .count();
     assert_eq!(cursor_routes, 1);
+    let proxy_hosts = world.cursor_proxy_hosts.lock().await;
+    assert!(
+        proxy_hosts.len() >= 4,
+        "Cursor OAuth, refresh and routed calls must use the account proxy: {proxy_hosts:?}"
+    );
+    assert!(
+        proxy_hosts.iter().all(|host| host == "localhost"),
+        "SOCKS5H must receive the original target hostname: {proxy_hosts:?}"
+    );
 }
 
 #[when(expr = "the service creates a key for principal {string} allowing model {string}")]

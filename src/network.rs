@@ -189,6 +189,52 @@ pub async fn client_for_config_url_no_retry(
     .await
 }
 
+/// Build a no-retry client for a server-owned OAuth endpoint and an optional
+/// account-bound remote-DNS proxy. Callers own the provider endpoint allowlist;
+/// this layer owns the SOCKS5H transport boundary. When a proxy is present the
+/// target hostname is deliberately not resolved locally.
+pub(crate) async fn client_for_oauth_url_no_retry(
+    shared_http: &reqwest::Client,
+    value: &str,
+    proxy: Option<(&str, OutboundScope)>,
+    allow_test_loopback: bool,
+) -> Result<reqwest::Client, AppError> {
+    let target = checked_http_url(value)?;
+    let Some((proxy_url, proxy_scope)) = proxy else {
+        return client_for_url(
+            shared_http,
+            value,
+            OutboundScope::Public,
+            allow_test_loopback,
+        )
+        .await;
+    };
+    if proxy_scope != OutboundScope::Private {
+        return Err(AppError::BadRequest(
+            "OAuth proxy endpoint is outside the approved private network".into(),
+        ));
+    }
+    if target.scheme() != "https" && !allow_test_loopback {
+        return Err(AppError::BadRequest(
+            "OAuth endpoints must use HTTPS".into(),
+        ));
+    }
+    let proxy = checked_proxy_url(proxy_url)?;
+    let test_loopback = allow_test_loopback
+        && proxy
+            .host_str()
+            .and_then(|host| host.parse::<IpAddr>().ok())
+            .is_some_and(|address| address.is_loopback());
+    if proxy.scheme() != "socks5h" || (!has_safe_private_ip_literal_host(&proxy) && !test_loopback)
+    {
+        return Err(AppError::BadRequest(
+            "OAuth authorization requires a private IP-literal socks5h proxy with remote DNS"
+                .into(),
+        ));
+    }
+    crate::build_no_retry_http_client(Some(proxy_url), &[]).map_err(|_| AppError::Internal)
+}
+
 async fn config_url_client(
     shared_private_client: &reqwest::Client,
     value: &str,
@@ -239,13 +285,13 @@ async fn config_url_client(
 
     let proxy = checked_proxy_url(proxy_url)?;
     let proxy_resolves_target = proxy.scheme() == "socks5h";
-    if proxy_resolves_target && !has_safe_private_ip_literal_host(&proxy) {
+    let (proxy_host, proxy_addresses, proxy_test_loopback) =
+        validated_endpoint(&proxy, proxy_scope, allow_test_loopback).await?;
+    if proxy_resolves_target && !has_safe_private_ip_literal_host(&proxy) && !proxy_test_loopback {
         return Err(AppError::BadRequest(
             "remote-DNS SOCKS5 proxies must use an explicitly private IP endpoint".into(),
         ));
     }
-    let (proxy_host, proxy_addresses, proxy_test_loopback) =
-        validated_endpoint(&proxy, proxy_scope, allow_test_loopback).await?;
     let private_proxy = proxy_scope == OutboundScope::Private
         && proxy_addresses
             .iter()
