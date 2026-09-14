@@ -348,6 +348,15 @@ async fn metered_usage_projection_is_exactly_once_and_skips_prepaid_hot_rows() {
         .authenticate_key(&issued.key, pepper)
         .await
         .unwrap();
+    database
+        .grant(
+            issued.account_id,
+            Decimal::ONE,
+            "metered-projection-grant",
+            "metered-projection-grant",
+        )
+        .await
+        .unwrap();
     let price = database
         .upsert_model_price("metered-projection", "USD", Decimal::ONE, Decimal::ONE)
         .await
@@ -406,6 +415,16 @@ async fn metered_usage_projection_is_exactly_once_and_skips_prepaid_hot_rows() {
         })
         .await
         .unwrap();
+    let reversal = database
+        .reverse_grant(
+            issued.account_id,
+            "metered-projection-grant",
+            "metered-projection-reversal",
+            "metered-projection-reversal-before-worker",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(reversal, AppError::BadRequest(_)));
     assert!(
         database
             .request_events_after("metered-projection", 0, None, 500)
@@ -465,6 +484,14 @@ async fn metered_usage_projection_is_exactly_once_and_skips_prepaid_hot_rows() {
         assert!(public_event.get(forbidden).is_none());
     }
 
+    sqlx::query(
+        "UPDATE account_usage_state SET settled_lifetime_micros = $1 WHERE account_id = $2",
+    )
+    .bind(i64::MAX - 1)
+    .bind(issued.account_id.to_string())
+    .execute(&database.pool)
+    .await
+    .unwrap();
     let projector = Uuid::now_v7();
     let tasks = database
         .claim_metered_usage_projection_tasks(projector, 32)
@@ -472,6 +499,29 @@ async fn metered_usage_projection_is_exactly_once_and_skips_prepaid_hot_rows() {
         .unwrap();
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].reservation_id, reservation.id);
+    let overflow = database
+        .project_claimed_metered_usage_projection_task(projector, reservation.id)
+        .await
+        .unwrap_err();
+    assert!(matches!(overflow, AppError::Conflict(_)));
+    let overflow_state: (i64, String, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT settled_lifetime_micros FROM account_usage_state WHERE account_id = $1),
+            (SELECT typeof(settled_lifetime_micros) FROM account_usage_state WHERE account_id = $2),
+            (SELECT COUNT(*) FROM metered_usage_projection_outbox WHERE reservation_id = $3 AND projected_at IS NULL)",
+    )
+    .bind(issued.account_id.to_string())
+    .bind(issued.account_id.to_string())
+    .bind(reservation.id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(overflow_state, (i64::MAX - 1, "integer".to_owned(), 1));
+    sqlx::query("UPDATE account_usage_state SET settled_lifetime_micros = 0 WHERE account_id = $1")
+        .bind(issued.account_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
     assert!(
         database
             .project_claimed_metered_usage_projection_task(projector, reservation.id)
@@ -492,7 +542,7 @@ async fn metered_usage_projection_is_exactly_once_and_skips_prepaid_hot_rows() {
             .is_empty()
     );
 
-    let projection: (i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+    let projection: (i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
             (SELECT COUNT(*) FROM metered_usage_projection_outbox WHERE reservation_id = $1 AND projected_at IS NOT NULL),
             (SELECT COALESCE(SUM(requests), 0) FROM usage_daily_aggregates WHERE key_id = $2),
@@ -501,7 +551,8 @@ async fn metered_usage_projection_is_exactly_once_and_skips_prepaid_hot_rows() {
             (SELECT COALESCE(SUM(requests), 0) FROM usage_analysis_daily WHERE key_id = $5 AND source_kind = 'request'),
             (SELECT COALESCE(SUM(requests), 0) FROM session_usage_totals WHERE key_id = $6),
             (SELECT settled_lifetime_micros FROM key_budget_state WHERE key_id = $7),
-            (SELECT available_micros FROM credit_accounts WHERE id = $8)",
+            (SELECT settled_lifetime_micros FROM account_usage_state WHERE account_id = $8),
+            (SELECT available_micros FROM credit_accounts WHERE id = $9)",
     )
     .bind(reservation.id.to_string())
     .bind(key.key_id.to_string())
@@ -511,10 +562,11 @@ async fn metered_usage_projection_is_exactly_once_and_skips_prepaid_hot_rows() {
     .bind(key.key_id.to_string())
     .bind(key.key_id.to_string())
     .bind(issued.account_id.to_string())
+    .bind(issued.account_id.to_string())
     .fetch_one(&database.pool)
     .await
     .unwrap();
-    assert_eq!(projection, (1, 1, 1, 1, 1, 1, 0, 1_000_000));
+    assert_eq!(projection, (1, 1, 1, 1, 1, 1, 0, 2, 2_000_000));
 }
 
 #[tokio::test]
