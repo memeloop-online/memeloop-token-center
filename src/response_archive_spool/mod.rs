@@ -4,6 +4,9 @@ mod cipher;
 mod producer;
 mod upload;
 
+#[cfg(test)]
+pub(crate) mod fence_probe;
+
 use std::{
     future::Future,
     sync::{
@@ -27,7 +30,7 @@ pub(crate) use producer::pause_next_begin_for_test;
 #[cfg(test)]
 pub(crate) use producer::pause_next_request_preseal_for_test;
 pub(crate) use producer::{BufferedArchive, PreparedArchiveBatch};
-pub(crate) use producer::{ResponseArchiveProducer, ResponseArchiveSettlement, mark_gap};
+pub(crate) use producer::{ResponseArchiveProducer, ResponseArchiveSettlement};
 pub(crate) use upload::run;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
