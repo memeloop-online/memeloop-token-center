@@ -8,6 +8,7 @@ pub mod claude;
 pub mod codex_device;
 pub mod copilot;
 mod cursor;
+pub(crate) use cursor::cursor_login_application_revision;
 mod endpoint;
 pub(crate) mod managed;
 
@@ -128,6 +129,7 @@ mod tests {
         let started = start_cursor_login(
             &database,
             StartCursorLogin {
+                application_plugin_revision: None,
                 tenant_external_id: "default".to_owned(),
                 account_name: "cursor-one".to_owned(),
                 provider_driver: "http-json".to_owned(),
@@ -163,6 +165,7 @@ mod tests {
         let private = start_cursor_login(
             &database,
             StartCursorLogin {
+                application_plugin_revision: None,
                 tenant_external_id: "default".to_owned(),
                 account_name: "plugin-oauth".to_owned(),
                 provider_driver: "plugin-provider".to_owned(),
@@ -275,6 +278,7 @@ mod tests {
         let started = start_cursor_login(
             &database,
             StartCursorLogin {
+                application_plugin_revision: None,
                 tenant_external_id: "tenant-a".to_owned(),
                 account_name: "cursor-one".to_owned(),
                 provider_driver: "http-json".to_owned(),
@@ -318,6 +322,7 @@ mod tests {
         let started = start_cursor_login(
             &database,
             StartCursorLogin {
+                application_plugin_revision: None,
                 tenant_external_id: "retired-provider-poll".to_owned(),
                 account_name: "retired-provider".to_owned(),
                 provider_driver: "retired-plugin-provider".to_owned(),
@@ -379,6 +384,7 @@ mod tests {
         let started = start_cursor_login(
             &database,
             StartCursorLogin {
+                application_plugin_revision: None,
                 tenant_external_id: "cursor-replay".to_owned(),
                 account_name: "cursor-primary".to_owned(),
                 provider_driver: "http-json".to_owned(),

@@ -427,6 +427,7 @@ pub(in crate::api) async fn start_cursor_oauth(
         start_cursor_login(
             &state.db,
             StartCursorLogin {
+                application_plugin_revision: state.application_plugin_revision(),
                 tenant_external_id: body.tenant_external_id,
                 account_name: body.account_name,
                 provider_driver: body.provider_driver,
@@ -502,6 +503,7 @@ pub(in crate::api) async fn start_provider_adapter_oauth(
         start_cursor_login(
             &state.db,
             StartCursorLogin {
+                application_plugin_revision: state.application_plugin_revision(),
                 tenant_external_id: body.tenant_external_id,
                 account_name: body.account_name,
                 provider_driver: body.provider_driver,
@@ -534,7 +536,17 @@ pub(in crate::api) async fn poll_cursor_oauth(
     Json(body): Json<PollCursorOAuthRequest>,
 ) -> Result<Response, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
-    let state = state.pin_application_plugins().await?;
+    let revision = crate::oauth::cursor_login_application_revision(
+        &body.session_token,
+        state.config.key_pepper.as_bytes(),
+        unix_millis(),
+        crate::oauth::CursorPollAuthority {
+            required_tenant: service.tenant_external_id.as_deref(),
+            operator_service_id: service.service_id,
+            allow_test_loopback: state.config.allow_oauth_loopback,
+        },
+    )?;
+    let state = state.pin_oauth_application_revision(revision).await?;
     match poll_cursor_login(
         &state.db,
         &state.providers,

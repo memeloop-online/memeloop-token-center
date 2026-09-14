@@ -2,6 +2,24 @@ use super::*;
 use crate::plugin::application::ApplicationRevision;
 
 impl Database {
+    pub(crate) async fn replay_application_plugin_operation(
+        &self,
+        key: &str,
+        hash: &str,
+    ) -> Result<Option<ApplicationRevision>, AppError> {
+        let row = sqlx::query("SELECT request_hash, result_revision FROM application_plugin_operations WHERE idempotency_key = $1")
+            .bind(key).fetch_optional(&self.pool).await?;
+        let Some(row) = row else { return Ok(None) };
+        if row.try_get::<String, _>("request_hash")? != hash {
+            return Err(AppError::Conflict(
+                "idempotency key was used for another operation".into(),
+            ));
+        }
+        let revision: Option<i64> = row.try_get("result_revision")?;
+        let revision = revision.ok_or(AppError::Internal)?;
+        self.application_plugin_revision(revision).await.map(Some)
+    }
+
     pub(crate) async fn staged_application_plugin_ids(&self) -> Result<Vec<String>, AppError> {
         Ok(sqlx::query_scalar(
             "SELECT inventory_id FROM application_plugin_candidates ORDER BY inventory_id",

@@ -17,6 +17,10 @@ Atomically append new IDs to this file after installation on every replica;
 neither new contributions nor publication/rollback require a rebuild or restart.
 Observed IDs, grants and roots cannot be changed or removed. The file is bounded
 to 4 MiB and malformed updates fail closed without altering the database head.
+The authority caches its last validated file identity, length and modification
+metadata (including inode/device/change time on Unix). Requests inspect the open
+file's metadata; an unchanged inventory is neither reread nor reparsed. Atomic
+replacement is detected even for a same-length file.
 
 Absent configuration preserves the startup runtime. An empty `{}` inventory is
 valid and exposes an empty management status. Before the first publication,
@@ -36,6 +40,8 @@ replay returns the original revision receipt; a different request with the same
 key conflicts. Rollback selects a historical inventory and publishes a strictly
 new revision, never rewinding head. Identity and contract digests are internal
 metadata and are not included in the API receipt.
+Committed publish/rollback replay checks the durable operation/hash first and
+does not require package files or compilation capacity to reproduce its receipt.
 
 Migration 81 is reserved for OAuth authority (#103), and 82 for conversation
 query indexes. This stack must retain both migrations when integrated with master;
@@ -56,6 +62,11 @@ pin the same runtime/catalog pair as execution, after authenticating the caller.
 Provider account management, OAuth adapter start/poll, model discovery and worker
 refresh also pin it. Durable work can pin an exact historical revision without
 substituting the latest catalog when that historical inventory is missing.
+Cursor/provider-adapter login tokens and encrypted database state/ready payloads
+retain the application revision from start. Poll verifies tenant/operator/expiry
+before pinning that exact historical catalog through completion and consumed
+replay. Sessions predating publication explicitly use startup state, not the new
+head. Missing historical authority fails before outbound polling or consumption.
 
 ## Trusted inventory and management boundary
 
@@ -112,8 +123,11 @@ atomically appends that ID under an exclusive sibling file lock. It preserves
 file permissions and fsyncs publication. For a multi-package set, use these flags
 only on the final package install. Staging then verifies every package's manifest,
 component and provenance before publication; registration alone never activates
-code. Failed registration leaves the verified package installed but inactive;
-the host can correct and atomically append the reviewed entry separately.
+code. Failed registration leaves the verified package installed but inactive.
+Retry re-verifies the signature and compares the complete installed package
+against fresh verified artifact bytes (manifest, component, assets and receipt);
+only exact matches can continue to registration. An existing identical inventory
+entry is a successful replay; differing bytes or grants never get overwritten.
 This PR supplies the CLI registration and existing Control activation chain;
 browser installation/upload and revision-log presentation are separate surfaces.
 
