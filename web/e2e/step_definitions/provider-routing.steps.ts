@@ -472,7 +472,7 @@ Then('提供商组参与路由候选而路由组参与凭据授权', async funct
   const page = this.requirePage();
   const seed = runtime.requireSeed();
   await openAppRoute(page, 'operator', 'credentials');
-  const credential = page.locator('.managed-resource').filter({ hasText: seed.clientKeyId });
+  const credential = page.locator('.managed-resource').filter({ has: page.locator(`b[title*="${seed.clientKeyId}"]`) });
   const openedRouting = page.waitForResponse((response) => response.url().includes(`/internal/v1/keys/${seed.clientKeyId}/routing`) && response.request().method() === 'GET');
   await credential.getByRole('button', { name: '更多操作', exact: true }).click();
   await page.getByRole('menuitem', { name: '路由权限', exact: true }).click();
@@ -550,8 +550,8 @@ When('管理员创建凭据组并按组筛选凭据', async function (this: Dogf
   await connectOperator(this, 'dark');
   await openAppRoute(page, 'operator', 'credentials');
   await page.getByLabel('按凭据组筛选').selectOption({ label: '测试凭据' });
-  await assertCount(page.locator('.managed-resource').filter({ hasText: seed.clientKeyId }), 1);
-  await assertNoCount(page.locator('.managed-resource').filter({ hasText: seed.otherClientKeyId }));
+  await assertCount(page.locator('.managed-resource').filter({ has: page.locator(`b[title*="${seed.clientKeyId}"]`) }), 1);
+  await assertNoCount(page.locator('.managed-resource').filter({ has: page.locator(`b[title*="${seed.otherClientKeyId}"]`) }));
 });
 
 Then('凭据组只用于分类且不改变凭据授权或可用模型', async function (this: DogfoodWorld) {
@@ -566,7 +566,7 @@ Then('凭据组只用于分类且不改变凭据授权或可用模型', async fu
   assert.deepEqual(routingAfter, before.routing, '凭据组成员变更不应改变路由授权摘要');
   assert.deepEqual(modelsAfter, before.models, '凭据组成员变更不应改变可用模型');
   await page.getByLabel('按凭据组筛选').selectOption('all');
-  const credential = page.locator('.managed-resource').filter({ hasText: seed.clientKeyId });
+  const credential = page.locator('.managed-resource').filter({ has: page.locator(`b[title*="${seed.clientKeyId}"]`) });
   await credential.getByRole('button', { name: '更多操作', exact: true }).click();
   await page.getByRole('menuitem', { name: '路由权限', exact: true }).click();
   const routing = page.locator('.credential-active-editor .routing-editor');

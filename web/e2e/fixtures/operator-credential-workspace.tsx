@@ -220,9 +220,13 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     const tenant = url.searchParams.get('tenant_external_id');
     if (scenario === 'client-recovery') return json([{
       ...credential('Recoverable client', 'tenant-a', 'key-recovery'),
+      policy: { ...credential('unused', 'tenant-a', 'unused').policy, enforcement_mode: 'metered_unlimited' },
       credential_recovery_available: true,
     }]);
-    if (scenario === 'all-tenants') return json([credential('All tenant client', 'tenant-visible', 'key-all')]);
+    if (scenario === 'all-tenants') return json([{
+      ...credential('All tenant client', 'tenant-visible', 'key-all'),
+      available_balance: '9223372036854.775807',
+    }]);
     if ((scenario === 'scope-race' || scenario === 'scope-lock') && tenant === 'tenant-a') {
       // Deliberately ignore the aborted signal.  The component must reject this
       // stale result instead of releasing the active tenant-b request.
