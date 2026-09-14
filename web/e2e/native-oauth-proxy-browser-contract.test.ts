@@ -64,7 +64,9 @@ test('native OAuth creates with the chosen proxy, preserves direct choice, and r
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
         await page.screenshot({ path: `${screenshotRoot}/native-oauth-${profile.endpoint}-${width}.png` });
       }
-      await start.click(); assert.equal(posts.length, 1); assert.equal(posts[0].body.proxy_url, 'socks5h://10.0.0.8:1080');
+      await start.click();
+      await page.getByText('MOCK-CODE', { exact: true }).waitFor({ state: 'visible' });
+      assert.equal(posts.length, 1); assert.equal(posts[0].body.proxy_url, 'socks5h://10.0.0.8:1080');
       assert.equal(posts[0].body.tenant_external_id, 'fixture-a'); assert.equal('upstream_account_id' in posts[0].body, false);
       assert.equal(await page.locator('input').evaluateAll(inputs => inputs.some(input => input instanceof HTMLInputElement && input.value.includes('10.0.0.8'))), false, 'successful start clears the proxy draft');
       await page.close();
@@ -76,10 +78,12 @@ test('native OAuth creates with the chosen proxy, preserves direct choice, and r
       await choose(page, 'Codex'); await choose(page, profile.display_name);
       assert.equal(await page.getByRole('checkbox', { name: '使用账号网络代理' }).isChecked(), false, 'switching providers clears network choice and draft');
       await page.getByRole('button', { name: '开始登录', exact: true }).click();
+      await page.getByText('MOCK-CODE', { exact: true }).waitFor({ state: 'visible' });
       assert.equal(posts.length, 1); assert.equal('proxy_url' in posts[0].body, false, 'direct choice never carries a prior provider proxy'); await page.close();
       const existing = await open(profile, true);
       assert.equal(await existing.page.getByRole('checkbox', { name: '使用账号网络代理' }).count(), 0);
       await existing.page.getByRole('button', { name: '开始登录', exact: true }).click();
+      await existing.page.getByText('MOCK-CODE', { exact: true }).waitFor({ state: 'visible' });
       assert.equal(existing.posts.length, 1); assert.equal(existing.posts[0].body.upstream_account_id, 'existing-account'); assert.equal('proxy_url' in existing.posts[0].body, false, 'reauthorization reuses the backend account proxy'); await existing.page.close();
     }
   } finally { await browser.close(); await server.close(); }
