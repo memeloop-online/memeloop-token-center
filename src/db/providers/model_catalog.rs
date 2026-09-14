@@ -83,6 +83,27 @@ impl Database {
         credential_generation: i64,
         lease_id: Uuid,
     ) -> Result<bool, AppError> {
+        self.claim_upstream_model_catalog_sync_with_timeout(
+            account_id,
+            tenant_external_id,
+            credential_generation,
+            lease_id,
+            8_000,
+        )
+        .await
+    }
+
+    pub async fn claim_upstream_model_catalog_sync_with_timeout(
+        &self,
+        account_id: Uuid,
+        tenant_external_id: &str,
+        credential_generation: i64,
+        lease_id: Uuid,
+        request_timeout_millis: u64,
+    ) -> Result<bool, AppError> {
+        if !(1..=1_260_000).contains(&request_timeout_millis) {
+            return Err(AppError::BadRequest("invalid model catalog timeout".into()));
+        }
         let mut transaction = self.begin_write_transaction().await?;
         let account_sql = match self.backend {
             DatabaseBackend::PostgreSql => {
@@ -129,7 +150,7 @@ impl Database {
         .bind(credential_generation)
         .bind(now)
         .bind(lease_id.to_string())
-        .bind(now.saturating_add(30_000))
+        .bind(now.saturating_add((request_timeout_millis as i64).saturating_add(22_000)))
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;

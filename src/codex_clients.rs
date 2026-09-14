@@ -15,15 +15,25 @@ struct ClientKey {
 
 impl ClientKey {
     fn new(route: &ResolvedUpstream, policy: CodexTransportPolicy) -> Self {
+        Self::for_account(
+            route.account_id,
+            route.transport_revision,
+            &route.credential,
+            policy,
+        )
+    }
+
+    fn for_account(
+        account_id: uuid::Uuid,
+        revision: i64,
+        credential: &crate::provider::UpstreamCredential,
+        policy: CodexTransportPolicy,
+    ) -> Self {
         Self {
-            account_id: route.account_id,
-            revision: route.transport_revision,
+            account_id,
+            revision,
             proxy_fingerprint: Sha256::digest(
-                route
-                    .credential
-                    .proxy()
-                    .map_or("", |(url, _)| url)
-                    .as_bytes(),
+                credential.proxy().map_or("", |(url, _)| url).as_bytes(),
             )
             .into(),
             timeouts: [
@@ -44,6 +54,27 @@ impl CodexClients {
     pub(crate) fn snapshot(&self, route: &ResolvedUpstream) -> Result<wreq::Client, &'static str> {
         let policy = CodexTransportPolicy::parse(route.config.get("transport_policy"))?;
         let key = ClientKey::new(route, policy);
+        self.client(key, policy)
+    }
+
+    /// Directory reads share the generation transport's TLS profile and cache.
+    pub(crate) fn account_snapshot(
+        &self,
+        account: &crate::provider::UpstreamAccountView,
+        credential: &crate::provider::UpstreamCredential,
+    ) -> Result<wreq::Client, &'static str> {
+        let policy = CodexTransportPolicy::parse(account.config.get("transport_policy"))?;
+        self.client(
+            ClientKey::for_account(account.id, account.updated_at, credential, policy),
+            policy,
+        )
+    }
+
+    fn client(
+        &self,
+        key: ClientKey,
+        policy: CodexTransportPolicy,
+    ) -> Result<wreq::Client, &'static str> {
         let mut clients = self
             .clients
             .lock()
@@ -83,6 +114,16 @@ mod tests {
         };
         let policy = CodexTransportPolicy::default();
         let first = ClientKey::new(&route, policy);
+        assert!(
+            first
+                == ClientKey::for_account(
+                    route.account_id,
+                    route.transport_revision,
+                    &route.credential,
+                    policy
+                ),
+            "directory and generation share the same account client key"
+        );
         assert!(first == ClientKey::new(&route, policy));
         route.transport_revision += 1;
         assert!(first != ClientKey::new(&route, policy));
