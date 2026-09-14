@@ -17,5 +17,10 @@ function Lifecycle() {
       resources={['sol', 'terra', 'luna', 'kimi'].map(value => ({ value, label: value }))}
       onChanged={async () => setGroups(await api<GroupView[]>(`/internal/v1/provider-groups?tenant_external_id=${tenant}`, 'test'))} /></>;
 }
+function StrategyFixture() {
+  const [group, setGroup] = useState(initial);
+  return <><button onClick={() => setGroup({ ...initial, name: 'Group externally updated', updated_at: 3, strategy_version: 4, routing_strategy: { plugin_id: 'weighted', config: { factor: 99 } } })}>External strategy update</button>
+    <GroupManager kind={kind} token="test" tenant="tenant" resources={[]} onChanged={async () => {}} groups={[group]} /></>;
+}
 createRoot(document.getElementById('root')!).render(<I18nProvider>{new URLSearchParams(location.search).has('lifecycle')
-  ? <Lifecycle /> : <GroupManager kind={kind} token="test" tenant="tenant" resources={[]} onChanged={async () => {}} groups={[initial]} />}</I18nProvider>);
+  ? <Lifecycle /> : <StrategyFixture />}</I18nProvider>);

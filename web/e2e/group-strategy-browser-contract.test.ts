@@ -44,11 +44,15 @@ test('group strategy schema validation, CAS refresh preservation, native reset a
     assert.equal(writes.length, 0, 'schema invalid configuration cannot be sent');
     await factor.fill('7');
     await page.getByLabel('Overlapping group priority').fill('10');
+    await page.getByRole('button', { name: 'External strategy update', exact: true }).click();
+    await page.waitForFunction(() => document.querySelector<HTMLInputElement>('.group-rename input')?.value === 'Group externally updated');
+    assert.equal(await factor.inputValue(), '7', 'external strategy version cannot replace the local draft');
     await page.getByRole('button', { name: 'Save group strategy' }).click();
     await page.getByText(/Its version was refreshed/).waitFor();
     assert.equal(await factor.inputValue(), '7');
     assert.equal(await page.getByLabel('Overlapping group priority').inputValue(), '10');
     assert.equal(writes[0].expected_strategy_version, 2);
+    assert.equal(writes[0].expected_updated_at, 1, 'external strategy update must preserve the old CAS and produce the explicit conflict, not silently authorize overwriting it');
     await page.getByRole('button', { name: 'Save group strategy' }).click();
     await page.getByText('Group strategy saved', { exact: true }).waitFor();
     assert.equal(writes[1].expected_strategy_version, 4);

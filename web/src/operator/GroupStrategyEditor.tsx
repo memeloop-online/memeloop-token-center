@@ -33,7 +33,9 @@ export function GroupStrategyEditor({ kind, token, tenant, group, onChanged, onS
   const [needsRefresh, setNeedsRefresh] = useState(false);
   const mounted = useRef(true);
   useEffect(() => {
-    setSnapshot(current => group.updated_at > current.updated_at ? group : current);
+    // Rename/member writes share updated_at but do not change strategy content.
+    // A different strategy version must still conflict with our retained draft.
+    setSnapshot(current => group.updated_at > current.updated_at && (group.strategy_version ?? 0) === (current.strategy_version ?? 0) ? group : current);
   }, [group]);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   useEffect(() => {
