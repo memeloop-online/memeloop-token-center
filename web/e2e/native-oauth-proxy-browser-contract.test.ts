@@ -9,6 +9,7 @@ test('native OAuth creates with the chosen proxy, preserves direct choice, and r
   const root = fileURLToPath(new URL('..', import.meta.url));
   const server = await createIsolatedFixtureServer({ root, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen(); const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const fixtureUrl = `http://127.0.0.1:${address.port}/e2e/fixtures/authorization-code.html?full-page`;
   const browser = await chromium.launch({ headless: true });
   const profiles = [
     { id: 'openai-codex', display_name: 'Codex', flow_kind: 'openai_device', endpoint: 'codex' },
@@ -34,7 +35,7 @@ test('native OAuth creates with the chosen proxy, preserves direct choice, and r
       if (path.endsWith('/transport-proxy')) return route.fulfill({ json: { account_id: account.id, credential_generation: 2, updated_at: 3, proxy_url: 'socks5h://10.0.0.8:1080' } });
       return route.fulfill({ json: [] });
     });
-    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/authorization-code.html?full-page`);
+    await page.goto(fixtureUrl);
     if (reauthorize) {
       await page.locator('[data-inline-edit-trigger="existing-account"]').click();
       await page.getByRole('button', { name: '重新授权', exact: true }).click();
@@ -65,7 +66,7 @@ test('native OAuth creates with the chosen proxy, preserves direct choice, and r
       }
       await start.click(); assert.equal(posts.length, 1); assert.equal(posts[0].body.proxy_url, 'socks5h://10.0.0.8:1080');
       assert.equal(posts[0].body.tenant_external_id, 'fixture-a'); assert.equal('upstream_account_id' in posts[0].body, false);
-      assert.equal(await page.locator('input').evaluateAll(inputs => inputs.some(input => input.value.includes('10.0.0.8'))), false, 'successful start clears the proxy draft');
+      assert.equal(await page.locator('input').evaluateAll(inputs => inputs.some(input => input instanceof HTMLInputElement && input.value.includes('10.0.0.8'))), false, 'successful start clears the proxy draft');
       await page.close();
     }
     for (const profile of profiles.slice(1)) {
