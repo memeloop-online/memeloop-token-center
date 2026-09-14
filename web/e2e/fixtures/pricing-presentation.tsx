@@ -13,6 +13,7 @@ import '../../src/theme.css';
 
 const policy = { requests_per_minute: 4294967295, tokens_per_minute: 9007199254740991, max_concurrency: 4294967295, daily_budget: null, weekly_budget: '1234567', lifetime_budget: null };
 const workspace = new URLSearchParams(location.search).has('workspace');
+const catalogFailure = new URLSearchParams(location.search).has('catalog-failure');
 const tableStates = new URLSearchParams(location.search).has('table-states');
 function TableStates() {
   const [usageState, setUsageState] = useState('ready');
@@ -31,9 +32,11 @@ let releaseUsage: ((response: Response) => void) | undefined;
 const respond = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
 if (workspace) {
   window.fetch = async (input, options) => {
-    const path = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, location.origin).pathname;
+    const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, location.origin);
+    const path = url.pathname;
     if (path.endsWith('/usage-summary')) return new Promise<Response>(resolve => { releaseUsage = resolve; });
-    if (path === '/internal/v1/model-prices') return respond(['active-model', 'unused-model'].map(model => ({
+    if (path === '/internal/v1/model-prices' && catalogFailure && url.searchParams.has('after_model')) return respond({ error: { code: 'unavailable', message: 'Fixture second catalog page unavailable' } }, 503);
+    if (path === '/internal/v1/model-prices') return respond((catalogFailure ? Array.from({ length: 200 }, (_, index) => index === 0 ? 'active-model' : `saved-${String(index).padStart(4, '0')}`) : ['active-model', 'unused-model']).map(model => ({
       model, currency: 'USD', input_per_million: '2', output_per_million: '8', source: 'models.dev', updated_at: 1000,
       tiers: [{ service_tier: 'default', input_per_million: '2', cached_input_per_million: '0.2', cache_write_per_million: '2', output_per_million: '8', source: 'models.dev', updated_at: 1000, cache_price_estimated: false }],
     })));

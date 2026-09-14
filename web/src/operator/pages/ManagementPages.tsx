@@ -469,6 +469,7 @@ function Pricing({ token, tenant, writeTenant = tenant, schemas, schemasLoading 
   const [displayCurrency, setDisplayCurrency] = useState('USD');
   const [loadedCurrency, setLoadedCurrency] = useState('');
   const [pricingLoading, setPricingLoading] = useState(false);
+  const [priceCatalogFailed, setPriceCatalogFailed] = useState(false);
   const [usageFailed, setUsageFailed] = useState(false);
   const [usageLoading, setUsageLoading] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);
@@ -496,7 +497,7 @@ function Pricing({ token, tenant, writeTenant = tenant, schemas, schemasLoading 
     // with the first price page rather than holding it behind a long catalog
     // walk (or re-reading it for every currency switch).
     setBasePricingScope(loadScope);
-    setPricingLoading(true); setPrices([]); setGenerationPrices([]);
+    setPricingLoading(true); setPriceCatalogFailed(false); setPrices([]); setGenerationPrices([]);
     // Publish each independent price table as soon as it arrives. Usage does
     // not vary by currency and must never gate price rendering.
     const results = await Promise.allSettled([
@@ -511,6 +512,7 @@ function Pricing({ token, tenant, writeTenant = tenant, schemas, schemasLoading 
     ]);
     if (!current()) return;
     setLoadedCurrency(requestedCurrency); setPricingLoading(false);
+    setPriceCatalogFailed(results[0].status === 'rejected');
     const failures = results.filter((result) => result.status === 'rejected');
     setError(failures.length ? t('pricing.partialLoad', { count: formatNumber(failures.length, locale) }) : '');
   };
@@ -594,7 +596,7 @@ function Pricing({ token, tenant, writeTenant = tenant, schemas, schemasLoading 
       {syncResult && <><div className="source-status">{syncResult.sourceResults.map((source) => <div className={`source-card ${source.error ? 'failed' : 'healthy'}`} key={source.source}><b>{source.source}</b><span>{source.error ? t('pricing.sourceFailed') : t('pricing.sourceHealthy', { count: formatNumber(source.models, locale) })}</span>{source.error && <small>{source.error}</small>}</div>)}</div><div className="notice success"><b>{t('pricing.result')}</b> · {t('pricing.imported', { count: formatNumber(syncResult.imported, locale) })} · {t('pricing.candidates', { count: formatNumber(syncResult.candidates.length, locale) })} · {t('pricing.unmatched', { count: formatNumber(syncResult.unmatched.length, locale) })} · {t('pricing.preserved', { count: formatNumber(syncResult.preserved.length, locale) })}</div>
         {(syncResult.candidates.length > 0 || syncResult.unmatched.length > 0) && <div className="sync-details"><h3>{t('pricing.candidateDetails')}</h3>{syncResult.candidates.map((candidate) => <Disclosure key={candidate.model} title={`${candidate.model} · ${t('pricing.candidateCount', { count: formatNumber(candidate.candidates.length, locale) })}`}><div className="candidate-list">{candidate.candidates.map((match) => <div key={`${match.source}-${match.sourceModelId}-${match.serviceTier}`}><b>{match.sourceModelId}</b><span>{match.source} · {match.serviceTier} · {match.reason}</span><code>{t('pricing.input')}: {formatCurrency(match.inputPerMillion, renderCurrency, locale)} · {t('pricing.output')}: {formatCurrency(match.outputPerMillion, renderCurrency, locale)}</code></div>)}</div></Disclosure>)}{syncResult.unmatched.length > 0 && <Disclosure title={t('pricing.unmatchedModels')}><div className="model-name-list">{syncResult.unmatched.map((name) => <code key={name}>{name}</code>)}</div></Disclosure>}</div>}
       </>}
-      <PricingTable rows={rows} currency={renderCurrency} loading={pricingLoading} usageLoading={usageLoading} usageFailed={usageFailed} />
+      <PricingTable rows={rows} currency={renderCurrency} loading={pricingLoading} catalogFailed={priceCatalogFailed} usageLoading={usageLoading} usageFailed={usageFailed} />
     </article>
     <article className="panel"><div className="panel-title"><h2>{t('pricing.generationPrices')}</h2><span>{formatNumber(generationPrices.length, locale)}</span></div><div className="table-scroll"><table><thead><tr><th>{t('pricing.model')}</th><th>{t('pricing.currency')}</th><th>{t('self.units')}</th><th>{t('pricing.unitPrice')}</th></tr></thead><tbody>{generationPrices.map((price) => <tr key={`${price.currency}-${price.model}`}><td><code>{price.model}</code></td><td>{price.currency}</td><td>{enumLabel(t, 'billingUnit', price.billing_unit)}</td><td>{formatCurrency(price.price_per_unit, price.currency, locale)}</td></tr>)}</tbody></table>{generationPrices.length === 0 && <div className="empty">{t('pricing.noGenerationPrices')}</div>}</div></article>
 
