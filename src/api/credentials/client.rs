@@ -101,7 +101,9 @@ pub(in crate::api) async fn list_keys(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    if search.is_some_and(|value| value.len() > 200 || value.chars().any(char::is_control)) {
+    if search
+        .is_some_and(|value| value.chars().count() > 200 || value.chars().any(char::is_control))
+    {
         return Err(AppError::BadRequest(
             "search must contain at most 200 non-control characters".into(),
         ));
