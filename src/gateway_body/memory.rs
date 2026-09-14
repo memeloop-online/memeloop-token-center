@@ -46,6 +46,8 @@ pub(crate) struct ProxyMemoryBudget {
     permits: Arc<Semaphore>,
     retained_requests: Arc<Semaphore>,
     #[cfg(test)]
+    retained_wait_started: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
     response_wait_started: Arc<tokio::sync::Notify>,
 }
 
@@ -55,6 +57,8 @@ impl ProxyMemoryBudget {
             capacity: bytes as usize,
             permits: Arc::new(Semaphore::new(bytes as usize / UNIT_BYTES)),
             retained_requests: Arc::new(Semaphore::new(bytes as usize / 4 / UNIT_BYTES)),
+            #[cfg(test)]
+            retained_wait_started: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             response_wait_started: Arc::new(tokio::sync::Notify::new()),
         }
@@ -70,6 +74,8 @@ impl ProxyMemoryBudget {
             retained: Mutex::new(None),
             json_body_ceiling: AtomicUsize::new(0),
             json_node_ceiling: AtomicUsize::new(0),
+            #[cfg(test)]
+            retained_wait_started: self.retained_wait_started.clone(),
             #[cfg(test)]
             response_wait_started: self.response_wait_started.clone(),
         })
@@ -98,6 +104,11 @@ impl ProxyMemoryBudget {
     }
 
     #[cfg(test)]
+    pub(crate) async fn wait_for_retained_reservation_for_test(&self) {
+        self.retained_wait_started.notified().await;
+    }
+
+    #[cfg(test)]
     pub(crate) async fn wait_for_response_reservation_for_test(&self) {
         self.response_wait_started.notified().await;
     }
@@ -113,6 +124,8 @@ pub(crate) struct ProxyMemoryReservation {
     json_body_ceiling: AtomicUsize,
     json_node_ceiling: AtomicUsize,
     #[cfg(test)]
+    retained_wait_started: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
     response_wait_started: Arc<tokio::sync::Notify>,
 }
 
@@ -125,14 +138,25 @@ impl ProxyMemoryReservation {
         bytes.saturating_mul(CAPTURE_MEMORY_WEIGHT) <= self.response_bytes.load(Ordering::Acquire)
     }
 
-    pub(crate) fn try_finalize_request(&self) -> bool {
+    pub(crate) async fn finalize_request(&self, deadline: tokio::time::Instant) -> bool {
         let Ok(held) = self.held.lock() else {
             return false;
         };
         let Ok(units) = u32::try_from(held.0.div_ceil(UNIT_BYTES)) else {
             return false;
         };
-        let Ok(permit) = self.retained_requests.clone().try_acquire_many_owned(units) else {
+        drop(held);
+        #[cfg(test)]
+        self.retained_wait_started.notify_one();
+        let Ok(permit) = tokio::time::timeout_at(
+            deadline,
+            self.retained_requests.clone().acquire_many_owned(units),
+        )
+        .await
+        else {
+            return false;
+        };
+        let Ok(permit) = permit else {
             return false;
         };
         let Ok(mut retained) = self.retained.lock() else {
@@ -140,6 +164,16 @@ impl ProxyMemoryReservation {
         };
         *retained = Some(permit);
         true
+    }
+
+    /// An actual SSE response does not allocate a buffered response body. It
+    /// remains charged to the process-wide lifecycle budget, but must stop
+    /// occupying the retained-request partition reserved for paths that can
+    /// still need a maximum buffered response.
+    pub(crate) fn release_retained_request_for_stream(&self) {
+        if let Ok(mut retained) = self.retained.lock() {
+            *retained = None;
+        }
     }
 
     pub(crate) async fn reserve_buffered_response(
@@ -378,10 +412,14 @@ mod tests {
         let budget = ProxyMemoryBudget::new(crate::config::DEFAULT_PROXY_MEMORY_BUDGET_BYTES);
         let first = budget.reservation();
         assert!(first.try_grow(16 * 1024 * 1024, 3));
-        assert!(first.try_finalize_request());
+        assert!(
+            first
+                .finalize_request(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+                .await
+        );
         let second = budget.reservation();
         assert!(second.try_grow(16 * 1024 * 1024, 3));
-        assert!(!second.try_finalize_request());
+        assert!(!second.finalize_request(tokio::time::Instant::now()).await);
         drop(second);
         assert!(
             first
@@ -401,7 +439,13 @@ mod tests {
         for _ in 0..4 {
             let request = budget.reservation();
             assert!(request.try_grow(1024, 3));
-            assert!(request.try_finalize_request());
+            assert!(
+                request
+                    .finalize_request(
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(1)
+                    )
+                    .await
+            );
             assert!(
                 request
                     .reserve_buffered_response(
@@ -436,5 +480,100 @@ mod tests {
                 )
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn retained_wait_is_fifo_and_bounded_before_upstream_dispatch() {
+        let budget = ProxyMemoryBudget::new(crate::config::DEFAULT_PROXY_MEMORY_BUDGET_BYTES);
+        let held = budget.reservation();
+        assert!(held.try_grow(16 * 1024 * 1024, 3));
+        assert!(
+            held.finalize_request(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+                .await
+        );
+        budget.wait_for_retained_reservation_for_test().await;
+        let first_waiter = budget.reservation();
+        assert!(first_waiter.try_grow(64 * 1024 * 1024, 1));
+        let waiting = first_waiter.clone();
+        let first_task = tokio::spawn(async move {
+            waiting
+                .finalize_request(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+                .await
+        });
+        budget.wait_for_retained_reservation_for_test().await;
+        let second_waiter = budget.reservation();
+        assert!(second_waiter.try_grow(16 * 1024 * 1024, 1));
+        let waiting = second_waiter.clone();
+        let second_task = tokio::spawn(async move {
+            waiting
+                .finalize_request(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+                .await
+        });
+        budget.wait_for_retained_reservation_for_test().await;
+        assert!(!first_task.is_finished());
+        assert!(!second_task.is_finished());
+        drop(held);
+        assert!(first_task.await.expect("first retained admission task"));
+        tokio::task::yield_now().await;
+        assert!(!second_task.is_finished());
+        first_waiter.release_retained_request_for_stream();
+        assert!(second_task.await.expect("second retained admission task"));
+        assert_eq!(budget.snapshot().2, 16 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn confirmed_streams_release_retained_partition_without_blocking_buffered_progress() {
+        let budget = ProxyMemoryBudget::new(crate::config::DEFAULT_PROXY_MEMORY_BUDGET_BYTES);
+        let first_stream = budget.reservation();
+        assert!(first_stream.try_grow(16 * 1024 * 1024, 3));
+        assert!(
+            first_stream
+                .finalize_request(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+                .await
+        );
+        first_stream.release_retained_request_for_stream();
+        let second_stream = budget.reservation();
+        assert!(second_stream.try_grow(16 * 1024 * 1024, 3));
+        assert!(
+            second_stream
+                .finalize_request(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+                .await
+        );
+        second_stream.release_retained_request_for_stream();
+
+        let buffered = budget.reservation();
+        assert!(buffered.try_grow(16 * 1024 * 1024, 3));
+        assert!(
+            buffered
+                .finalize_request(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+                .await
+        );
+        assert_eq!(
+            budget.snapshot(),
+            (
+                144 * 1024 * 1024,
+                256 * 1024 * 1024,
+                48 * 1024 * 1024,
+                64 * 1024 * 1024
+            )
+        );
+
+        let waiting = buffered.clone();
+        let task = tokio::spawn(async move {
+            waiting
+                .reserve_buffered_response(
+                    MAX_BUFFERED_RESPONSE_BYTES,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .await
+        });
+        budget.wait_for_response_reservation_for_test().await;
+        assert!(!task.is_finished());
+        drop(first_stream);
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        drop(second_stream);
+        assert!(task.await.expect("buffered response admission task"));
+        assert!(buffered.has_buffered_response());
     }
 }
