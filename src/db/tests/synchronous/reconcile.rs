@@ -276,6 +276,12 @@ async fn manual_image_resolution_rejects_stale_authority_amount_currency_and_rev
         f.db.resolve_image_generation_quarantine(excessive).await,
         Err(AppError::Conflict(_))
     ));
+    let mut overflow = f.input();
+    overflow.confirmed_cost_micros = i64::MAX;
+    assert!(matches!(
+        f.db.resolve_image_generation_quarantine(overflow).await,
+        Err(AppError::BadRequest(_))
+    ));
     let receipts: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM image_generation_quarantine_resolutions")
             .fetch_one(&f.db.pool)
@@ -355,4 +361,77 @@ async fn concurrent_image_resolution_has_one_receipt_and_one_charge() {
             .await
             .unwrap();
     assert_eq!(cost, 500);
+}
+
+#[tokio::test]
+async fn manual_image_confirmation_rejects_accounting_overflow_without_sqlite_real_promotion() {
+    for target in ["lifetime", "day", "account", "pending_metered"] {
+        let f = Fixture::new(true).await;
+        let near_max = i64::MAX - 100;
+        match target {
+            "lifetime" => {
+                sqlx::query(
+                    "UPDATE key_budget_state SET settled_lifetime_micros = $1 WHERE key_id = $2",
+                )
+                .bind(near_max)
+                .bind(f.key.key_id.to_string())
+                .execute(&f.db.pool)
+                .await
+                .unwrap();
+            }
+            "day" => {
+                sqlx::query("INSERT INTO key_budget_daily_rollups (key_id,day_bucket,settled_micros) VALUES ($1,$2,$3) ON CONFLICT(key_id,day_bucket) DO UPDATE SET settled_micros = excluded.settled_micros")
+                .bind(f.key.key_id.to_string()).bind(unix_millis() / 86_400_000).bind(near_max).execute(&f.db.pool).await.unwrap();
+            }
+            "pending_metered" => {
+                sqlx::query("INSERT INTO metered_usage_projection_outbox (reservation_id, account_id, key_id, actual_micros, created_at) VALUES ($1,$2,$3,$4,1)")
+                    .bind(f.reservation.id.to_string()).bind(f.reservation.account_id.to_string()).bind(f.key.key_id.to_string()).bind(near_max).execute(&f.db.pool).await.unwrap();
+            }
+            _ => {
+                sqlx::query("INSERT INTO account_usage_state (account_id,settled_lifetime_micros,updated_at) VALUES ($1,$2,1) ON CONFLICT(account_id) DO UPDATE SET settled_lifetime_micros = excluded.settled_lifetime_micros")
+                .bind(f.reservation.account_id.to_string()).bind(near_max).execute(&f.db.pool).await.unwrap();
+            }
+        }
+        assert!(
+            matches!(
+                f.db.resolve_image_generation_quarantine(f.input()).await,
+                Err(AppError::Conflict(_))
+            ),
+            "{target} overflow must reject confirmation"
+        );
+        let receipt_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM image_generation_quarantine_resolutions")
+                .fetch_one(&f.db.pool)
+                .await
+                .unwrap();
+        assert_eq!(receipt_count, 0);
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM usage_reservations WHERE id = $1")
+                .bind(f.reservation.id.to_string())
+                .fetch_one(&f.db.pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "reserved");
+        let stored: i64 = match target {
+            "lifetime" => sqlx::query_scalar("SELECT settled_lifetime_micros FROM key_budget_state WHERE key_id = $1").bind(f.key.key_id.to_string()).fetch_one(&f.db.pool).await.unwrap(),
+            "day" => sqlx::query_scalar("SELECT settled_micros FROM key_budget_daily_rollups WHERE key_id = $1 AND day_bucket = $2").bind(f.key.key_id.to_string()).bind(unix_millis() / 86_400_000).fetch_one(&f.db.pool).await.unwrap(),
+            "pending_metered" => sqlx::query_scalar("SELECT actual_micros FROM metered_usage_projection_outbox WHERE reservation_id = $1").bind(f.reservation.id.to_string()).fetch_one(&f.db.pool).await.unwrap(),
+            _ => sqlx::query_scalar("SELECT settled_lifetime_micros FROM account_usage_state WHERE account_id = $1").bind(f.reservation.account_id.to_string()).fetch_one(&f.db.pool).await.unwrap(),
+        };
+        assert_eq!(stored, near_max, "unchanged i64 proves no REAL promotion");
+    }
+    let f = Fixture::new(false).await;
+    sqlx::query(
+        "UPDATE usage_reservations SET enforcement_mode = 'metered_unlimited' WHERE id = $1",
+    )
+    .bind(f.reservation.id.to_string())
+    .execute(&f.db.pool)
+    .await
+    .unwrap();
+    let mut excessive = f.input();
+    excessive.confirmed_cost_micros = i64::MAX;
+    assert!(matches!(
+        f.db.resolve_image_generation_quarantine(excessive).await,
+        Err(AppError::BadRequest(_))
+    ));
 }

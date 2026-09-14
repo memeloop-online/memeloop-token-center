@@ -320,7 +320,7 @@ fn validate(input: &ResolveImageGenerationQuarantine<'_>) -> Result<(), AppError
         || !hex(input.expected_revision)
         || !hex(input.evidence_digest)
         || !matches!(input.action, "not_delivered" | "settle_confirmed")
-        || input.confirmed_cost_micros < 0
+        || !(0..=9_007_199_254_740_991).contains(&input.confirmed_cost_micros)
         || (input.action == "not_delivered" && input.confirmed_cost_micros != 0)
         || input.currency.len() != 3
         || !input.currency.bytes().all(|b| b.is_ascii_uppercase())

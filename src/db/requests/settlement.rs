@@ -817,10 +817,50 @@ pub(crate) async fn settle_confirmed_image_charge_in_transaction(
     now: i64,
     confirmed: i64,
 ) -> Result<i64, AppError> {
-    if confirmed < 0 {
+    if !(0..=9_007_199_254_740_991).contains(&confirmed) {
         return Err(AppError::BadRequest(
-            "confirmed cost cannot be negative".into(),
+            "confirmed cost must be a nonnegative JavaScript-safe integer".into(),
         ));
+    }
+    // Only this evidence-confirmed entry point adds stricter arithmetic guards;
+    // retain native charging policy and its existing reservation cap unchanged.
+    let (lifetime, _) = lock_key_budget_state(tx, reservation.key_id, now).await?;
+    let overflow =
+        || AppError::Conflict("confirmed charge would overflow an accounting total".into());
+    lifetime.checked_add(confirmed).ok_or_else(overflow)?;
+    let daily = key_budget_daily_settled(tx, reservation.key_id, now).await?;
+    daily.checked_add(confirmed).ok_or_else(overflow)?;
+    sqlx::query("UPDATE credit_accounts SET updated_at = updated_at WHERE id = $1")
+        .bind(reservation.account_id.to_string())
+        .execute(&mut **tx)
+        .await?;
+    let account = sqlx::query("SELECT a.available_micros, COALESCE(s.settled_lifetime_micros, 0) AS lifetime FROM credit_accounts a LEFT JOIN account_usage_state s ON s.account_id = a.id WHERE a.id = $1")
+        .bind(reservation.account_id.to_string()).fetch_one(&mut **tx).await?;
+    // Include durable metered charges still awaiting projection. SUM itself
+    // fails on SQLite integer overflow; PostgreSQL's numeric SUM is explicitly
+    // cast back to BIGINT, so neither backend can silently promote SQL addition.
+    let pending_metered: i64 = sqlx::query_scalar("SELECT CAST(COALESCE(SUM(actual_micros), 0) AS BIGINT) FROM metered_usage_projection_outbox WHERE account_id = $1 AND projected_at IS NULL")
+        .bind(reservation.account_id.to_string()).fetch_one(&mut **tx).await?;
+    account
+        .try_get::<i64, _>("lifetime")?
+        .checked_add(pending_metered)
+        .and_then(|value| value.checked_add(confirmed))
+        .ok_or_else(overflow)?;
+    if reservation.enforcement_mode.enforces_prepaid_limits() {
+        let released = reservation
+            .reserved_micros
+            .checked_sub(confirmed)
+            .ok_or_else(overflow)?
+            .max(0);
+        let overage = confirmed
+            .checked_sub(reservation.reserved_micros)
+            .ok_or_else(overflow)?
+            .max(0);
+        account
+            .try_get::<i64, _>("available_micros")?
+            .checked_add(released)
+            .and_then(|balance| balance.checked_sub(overage))
+            .ok_or_else(overflow)?;
     }
     let charged = settle_token_usage_with_explicit_charge(
         tx,

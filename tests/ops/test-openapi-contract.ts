@@ -282,6 +282,8 @@ test("image quarantine reconciliation never implies successful delivery or a res
   assert.deepEqual(body.required, ["tenant_external_id", "expected_revision", "action", "confirmed_cost_micros", "currency", "evidence_digest"]);
   assert.equal(body.properties.confirmed_cost_micros.format, "int64");
   assert.equal(body.properties.confirmed_cost_micros.minimum, 0);
+  assert.equal(body.properties.confirmed_cost_micros.maximum, Number.MAX_SAFE_INTEGER);
+  assert.equal(document.components.schemas.ImageGenerationQuarantineResolution.properties.confirmed_cost_micros.maximum, Number.MAX_SAFE_INTEGER);
   assert.equal(body.allOf[0].then.properties.confirmed_cost_micros.const, 0);
   assert.deepEqual(document.components.schemas.ImageGenerationQuarantineResolution.properties.resulting_status.enum, ["failed"]);
   const metadata = document.components.schemas.ImageGenerationQuarantine;

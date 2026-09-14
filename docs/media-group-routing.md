@@ -42,6 +42,9 @@ key, and an explicit same-currency confirmed amount (zero for non-delivery).
 Resolution atomically audits and settles the original reservation, never
 resends the request and never fabricates a successful image. A ledger that
 cannot apply the exact confirmed amount rejects the whole resolution.
+Confirmed amounts are nonnegative integer micro-units capped at
+9,007,199,254,740,991 (the API/UI exact-integer bound); accounting additions
+are checked before mutation, and any overflow or budget shortfall rolls back.
 
 Async jobs retain their existing pre-send quarantine and fixed upstream job
 identity: polling never reroutes or resubmits. Existing completed idempotency
