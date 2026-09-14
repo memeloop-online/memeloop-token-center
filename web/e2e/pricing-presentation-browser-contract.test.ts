@@ -59,8 +59,8 @@ test('pricing comparison, deferred usage, provenance and editor drafts remain tr
     await manual.getByRole('button', { name: 'Set model prices', exact: true }).click();
     const model = manual.getByRole('combobox', { name: 'Model', exact: true });
     await model.fill('fixture-edit');
-    const input = manual.getByLabel('Input / million tokens', { exact: true });
-    const output = manual.getByLabel('Output / million tokens', { exact: true });
+    const input = manual.getByLabel('Input / million tokens*', { exact: true });
+    const output = manual.getByLabel('Output / million tokens*', { exact: true });
     await input.fill('2'); await output.fill('8');
     await manual.getByRole('button', { name: 'Close', exact: true }).click();
     await manual.getByRole('button', { name: 'Set model prices', exact: true }).click();
