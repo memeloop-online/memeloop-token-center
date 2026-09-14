@@ -3,6 +3,15 @@
 use std::time::Instant;
 use uuid::Uuid;
 
+mod downstream_body;
+
+pub(super) fn observe_response(
+    response: axum::response::Response,
+    context: Context,
+) -> axum::response::Response {
+    downstream_body::observe_response(response, context)
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct Context {
     pub(super) request_id: Uuid,

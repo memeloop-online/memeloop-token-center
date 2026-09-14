@@ -5,6 +5,8 @@ pub(super) enum BoundedUpstreamError {
     ContentEncoding,
     MemoryCapacity,
     Timeout,
+    ReadTimeout,
+    RequestTimeout,
     ResponseTooLarge,
     Stream,
 }
@@ -15,8 +17,18 @@ impl BoundedUpstreamError {
             Self::ContentEncoding => "upstream_invalid_content_encoding",
             Self::MemoryCapacity => "upstream_response_memory_capacity",
             Self::Timeout => "upstream_timeout",
+            Self::ReadTimeout => upstream_response::UPSTREAM_READ_TIMEOUT,
+            Self::RequestTimeout => upstream_response::UPSTREAM_REQUEST_TIMEOUT,
             Self::ResponseTooLarge => "upstream_response_too_large",
             Self::Stream => "upstream_stream",
+        }
+    }
+
+    fn from_stream_error(error: &str) -> Self {
+        match error {
+            upstream_response::UPSTREAM_READ_TIMEOUT => Self::ReadTimeout,
+            upstream_response::UPSTREAM_REQUEST_TIMEOUT => Self::RequestTimeout,
+            _ => Self::Stream,
         }
     }
 }
@@ -77,7 +89,7 @@ pub(super) async fn read_bounded_upstream(
     {
         // Never retain or display reqwest's error: its URL can contain
         // credential-bearing upstream configuration.
-        let chunk = chunk.map_err(|_| BoundedUpstreamError::Stream)?;
+        let chunk = chunk.map_err(BoundedUpstreamError::from_stream_error)?;
         if !chunk.is_empty()
             && let Some(phase) = first_byte.take()
         {
@@ -96,4 +108,39 @@ pub(super) async fn read_bounded_upstream(
         return Err(BoundedUpstreamError::MemoryCapacity);
     }
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn buffered_reader_preserves_only_allowlisted_transport_timeouts() {
+        for (upstream_error, expected) in [
+            (
+                upstream_response::UPSTREAM_READ_TIMEOUT,
+                "upstream_read_timeout",
+            ),
+            (
+                upstream_response::UPSTREAM_REQUEST_TIMEOUT,
+                "upstream_request_timeout",
+            ),
+            ("SECRET_PROVIDER_ERROR_CANARY", "upstream_stream"),
+        ] {
+            let response = UpstreamResponse::Prefetched {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                version: http::Version::HTTP_11,
+                content_length: None,
+                stream: Box::pin(futures_util::stream::iter([Err(upstream_error)])),
+            };
+            let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(
+                crate::config::DEFAULT_PROXY_MEMORY_BUDGET_BYTES,
+            );
+            let memory = budget.reservation();
+            let result =
+                read_bounded_upstream(response, 1024, &memory, Instant::now(), false).await;
+            assert_eq!(result.unwrap_err().code(), expected);
+        }
+    }
 }
