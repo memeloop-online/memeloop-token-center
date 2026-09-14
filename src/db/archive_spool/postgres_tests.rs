@@ -122,7 +122,7 @@ async fn postgres_request_preseal_and_capture_do_not_hold_the_event_cursor() {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let waiting: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock' AND query LIKE 'SELECT cipher_bytes FROM response_archive_spool_budget%FOR UPDATE%'",
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock' AND query LIKE 'SELECT cipher_bytes%FROM response_archive_spool_budget%FOR UPDATE%'",
             )
             .bind(&fixture.schema)
             .fetch_one(&fixture.admin)
@@ -261,7 +261,7 @@ async fn postgres_response_writer_does_not_block_streaming_on_the_budget_lock() 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let waiting: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock' AND query LIKE 'SELECT cipher_bytes FROM response_archive_spool_budget%FOR UPDATE%'",
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock' AND query LIKE 'SELECT cipher_bytes%FROM response_archive_spool_budget%FOR UPDATE%'",
             )
             .bind(&application_name)
             .fetch_one(&fixture.admin)

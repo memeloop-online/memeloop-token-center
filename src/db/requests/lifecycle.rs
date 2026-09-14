@@ -1,3 +1,4 @@
+use super::super::archive_spool::BudgetHold;
 use super::super::archive_staging::bind_archive_staging_attempt_in_transaction;
 use super::super::*;
 use super::conversations::{
@@ -8,6 +9,7 @@ use super::settlement::resize_usage_reservation_in_transaction;
 use crate::archive_staging::{
     ArchiveStagingOwner, ArchiveStagingPurpose, ArchiveStagingWriteLease,
 };
+use tracing::Instrument;
 
 pub struct NewRequest {
     pub request_id: Uuid,
@@ -207,13 +209,18 @@ impl Database {
         };
         // Always acquire the spool budget before request/account locks, matching
         // the archive worker's budget -> request lock order.
-        let (mut transaction, now) = if archive.is_some() {
-            self.spool_transaction()
+        let (mut transaction, now, mut hold) = if archive.is_some() {
+            let (tx, now, hold) = self
+                .tracked_spool_transaction("request_admission", Some(input.request_id))
                 .await
-                .map_err(|_| AppError::Overloaded)?
+                .map_err(|_| AppError::Overloaded)?;
+            (tx, now, Some(hold))
         } else {
-            (self.begin_write_transaction().await?, unix_millis())
+            (self.begin_write_transaction().await?, unix_millis(), None)
         };
+        BudgetHold::set_phase(&mut hold, "key_account_reservation");
+        let reservation_span = tracing::info_span!("archive_budget_reservation", request_id = %input.request_id,
+            backend_pid = ?hold.as_ref().and_then(BudgetHold::backend_pid));
         let reservation = super::settlement::reserve_usage_with_id_in_transaction(
             &mut transaction,
             input.key,
@@ -223,7 +230,9 @@ impl Database {
             now,
             reservation_id,
         )
+        .instrument(reservation_span)
         .await?;
+        BudgetHold::set_phase(&mut hold, "request_record");
         let started_request = NewRequest {
             request_id: input.request_id,
             key_id: input.key.key_id,
@@ -239,10 +248,11 @@ impl Database {
             insert_request_started_record_in_transaction(&mut transaction, &started_request, now)
                 .await
         {
-            transaction.rollback().await?;
+            BudgetHold::rollback_optional(transaction, hold).await?;
             return Err(error);
         }
         if let Some(archive) = buffered_archive {
+            BudgetHold::set_phase(&mut hold, "archive_capture");
             let prepared_request_batch = prepared_request_batch.ok_or(AppError::Internal)?;
             let capture_started = std::time::Instant::now();
             if !self
@@ -269,18 +279,21 @@ impl Database {
         // Acquire the globally serialized event cursor only after all archive
         // batches are inserted. The event and admission remain one commit,
         // without holding the cross-tenant cursor during compression/inserts.
+        BudgetHold::set_phase(&mut hold, "event_cursor");
         insert_request_started_event_in_transaction(&mut transaction, &started_request, now)
             .await?;
         // No cancellation deadline: only a positively observed COMMIT permits
         // dispatch. Unknown COMMIT returns unavailable, leaving orphan recovery
         // to settle any admission which actually committed without dispatch.
-        transaction.commit().await.map_err(|error| {
-            if archive.is_some() {
-                AppError::Overloaded
-            } else {
-                error.into()
-            }
-        })?;
+        BudgetHold::commit_optional(transaction, hold)
+            .await
+            .map_err(|error| {
+                if archive.is_some() {
+                    AppError::Overloaded
+                } else {
+                    error.into()
+                }
+            })?;
         Ok(reservation)
     }
 
@@ -779,15 +792,20 @@ impl Database {
             Some(archive) => Some(archive.prepare_first_batch().await?),
             None => None,
         };
-        let (mut transaction, now, created_at, reservation_row, trusted_reservation) = loop {
+        let (mut transaction, now, created_at, reservation_row, trusted_reservation, mut hold) = loop {
             // Preparing immutable content must not hold either shared lock:
             // spool_transaction takes the global archive budget row, and the
             // final observation takes the explicit-session advisory lock.
-            let mut transaction = if buffered_archive.is_some() && preparation_complete {
-                self.spool_transaction().await?.0
+            let (mut transaction, mut hold) = if buffered_archive.is_some() && preparation_complete
+            {
+                let (tx, _, hold) = self
+                    .tracked_spool_transaction("buffered_terminal", Some(input.request_id))
+                    .await?;
+                (tx, Some(hold))
             } else {
-                self.begin_write_transaction().await?
+                (self.begin_write_transaction().await?, None)
             };
+            BudgetHold::set_phase(&mut hold, "terminal_owner");
             // SQLite's BEGIN IMMEDIATE can wait for an earlier terminal writer.
             // Capture the observation boundary only after that wait so live writes
             // cannot acquire timestamps in the opposite order from their commits.
@@ -865,7 +883,7 @@ impl Database {
                     input.request_id,
                 )
                 .await?;
-                transaction.commit().await?;
+                BudgetHold::commit_optional(transaction, hold).await?;
                 return Ok(result);
             }
 
@@ -1006,7 +1024,7 @@ impl Database {
                     // content, but must still restart to acquire the budget
                     // before the request row, preserving the old lock order.
                     if content_materialized || buffered_archive.is_some() {
-                        transaction.commit().await?;
+                        BudgetHold::commit_optional(transaction, hold).await?;
                         continue;
                     }
                 }
@@ -1017,6 +1035,7 @@ impl Database {
                 created_at,
                 reservation_row,
                 trusted_reservation,
+                hold,
             );
         };
 
@@ -1043,6 +1062,7 @@ impl Database {
         }
 
         if let Some(archive) = buffered_archive {
+            BudgetHold::set_phase(&mut hold, "archive_capture");
             let capture_started = std::time::Instant::now();
             if !self
                 .capture_buffered_archive_body_in_transaction(
@@ -1071,7 +1091,7 @@ impl Database {
             )
             .await?
         {
-            transaction.rollback().await?;
+            BudgetHold::rollback_optional(transaction, hold).await?;
             return Err(AppError::Conflict(
                 "proxy response archive writer was fenced".into(),
             ));
@@ -1108,6 +1128,7 @@ impl Database {
         // Persist the complete observation in the durable outbox instead; a
         // bounded projector transaction later performs the semantic writes and
         // reclassifies the initially-unlinked request fact atomically.
+        BudgetHold::set_phase(&mut hold, "conversation_projection");
         if let Some(conversation) = input.conversation {
             if conversation.key.tenant_id != input.tenant_id
                 || conversation.key.key_id != input.reservation.key_id
@@ -1153,6 +1174,7 @@ impl Database {
                 }
             }
         }
+        BudgetHold::set_phase(&mut hold, "key_account_settlement");
         let reservation_status: String = reservation_row.try_get("status")?;
         let cost_micros = match reservation_status.as_str() {
             "reserved" => {
@@ -1193,6 +1215,7 @@ impl Database {
         } else {
             input.usage_basis
         };
+        BudgetHold::set_phase(&mut hold, "terminal_facts_and_event");
         let finished = record_request_finished_with_basis_in_transaction(
             &mut transaction,
             &FinishRequest {
@@ -1222,7 +1245,7 @@ impl Database {
                 "request terminal ownership changed".into(),
             ));
         }
-        transaction.commit().await?;
+        BudgetHold::commit_optional(transaction, hold).await?;
         Ok(FinishProxyRequestResult::Finished {
             cost_micros,
             usage_invalid,
