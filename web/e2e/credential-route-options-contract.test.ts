@@ -19,3 +19,15 @@ test('route grant identity, candidate count and unavailable reasons are independ
   assert.equal(options[4].disabled, true);
   assert.equal(options[5].disabled, false, 'missing catalog metadata must not be misreported as an empty candidate set');
 });
+
+test('technical IDs are tooltip details and duplicate labels use collision-safe short suffixes', () => {
+  const first = '00000000-0000-4000-8000-00000000abcd';
+  const second = '00000000-0000-4000-8000-00000001abcd';
+  const options = credentialRouteOptions([route(first), route(second)], [], [], 'zh-CN');
+  assert.notEqual(options[0].label, options[1].label);
+  for (const option of options) {
+    assert.equal(option.label.includes(option.value), false);
+    assert.equal(option.description.includes(option.value), false);
+    assert.ok(option.details.includes(option.value));
+  }
+});

@@ -232,7 +232,7 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
       const client = await browser.newPage({ viewport: { width: 390, height: 844 } });
       client.setDefaultTimeout(5_000);
       await client.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
-      await client.goto(fixture('client-form'));
+      await client.goto(`${fixture('client-form')}&account-catalog-failure`);
       const english = locale === 'en';
       const modeLabel = english ? 'Metering and limit mode' : '计量与限额模式';
       await client.getByText(english ? 'Research workspace' : '研发工作区', { exact: true }).waitFor();
@@ -266,6 +266,9 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
 
       const create = client.locator('.create-journey');
       await create.locator(':scope > .journey-heading [data-workspace-toggle]').click();
+      const retryCatalog = create.getByRole('button', { name: english ? 'Retry account catalog' : '重试读取目录', exact: true });
+      await retryCatalog.click();
+      await retryCatalog.waitFor({ state: 'hidden' });
       const routes = create.getByRole('combobox', { name: english ? 'Specific routes' : '具体路由', exact: true });
       const groups = create.getByRole('combobox', { name: english ? 'Route groups' : '路由组', exact: true });
       await groups.waitFor();
@@ -275,6 +278,11 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
       assert.equal(await client.getByRole('option').filter({ hasText: 'Spark disabled' }).isDisabled(), true);
       await routes.press('Enter');
       assert.equal(await create.locator('.selection-chip').count(), 0, 'disabled routes cannot become implicit new grants');
+      await routes.fill('');
+      await routes.press('ArrowUp');
+      assert.match(await routes.evaluate(input => document.getElementById(input.getAttribute('aria-activedescendant')!)?.textContent ?? ''), /Team Kimi/, 'ArrowUp skips trailing disabled candidates');
+      await routes.press('ArrowDown');
+      assert.match(await routes.evaluate(input => document.getElementById(input.getAttribute('aria-activedescendant')!)?.textContent ?? ''), /Team Kimi/, 'ArrowDown never parks on a disabled candidate');
       await routes.fill('Research model');
       await client.getByRole('option').filter({ hasText: 'Personal Kimi' }).waitFor();
       assert.equal(await client.getByRole('option').count(), 2, 'equal model names on different account routes remain separate');
@@ -287,8 +295,10 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
       await groups.press('Enter');
       await groups.press('Escape');
       const preview = create.getByRole('region', { name: english ? 'Authorization scope preview' : '授权范围预览' });
-      await preview.getByRole('button', { name: /^Research group/ }).click();
-      await preview.getByText('Kimi → Personal Kimi → Research model', { exact: true }).first().waitFor();
+      await preview.getByText('Kimi → Personal Kimi → Research model', { exact: true }).waitFor();
+      assert.equal(await preview.getByRole('listitem').count(), 1, 'direct and group grants share one preview row with both sources');
+      assert.match(await preview.innerText(), /Research group/);
+      assert.match(await preview.innerText(), english ? /Direct grant/ : /直接授权/);
       assert.equal(await preview.getByText(/Team Kimi/).count(), 0, 'a dedicated route and its group must not authorize the other account');
       assert.equal(await create.getByRole('link', { name: /dedicated route|专用路由/ }).getAttribute('href'), '/operator?view=routes');
       assert.equal(await create.locator('.schema-array').count(), 0, 'routing IDs have one named control each');

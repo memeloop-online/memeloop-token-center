@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { apiRead } from '../api';
 import { appHref } from '../app/routes';
-import { Disclosure } from '../design-system';
+import { Button, DetailTooltip } from '../design-system';
 import { useI18n } from '../i18n';
 import type { GroupView, ModelRouteView, ProviderType, UpstreamAccount } from '../types';
 import { CredentialAuthorizationFields } from './CredentialAuthorizationFields';
@@ -13,6 +13,7 @@ export function CredentialRouteAuthorization({ token, tenant, routes, groups, ro
 }) {
   const { locale } = useI18n();
   const zh = locale.startsWith('zh');
+  const [retry, setRetry] = useState(0);
   const [catalog, setCatalog] = useState<{ token: string; tenant: string; accounts: UpstreamAccount[]; providers: ProviderType[]; failed: boolean }>();
   useEffect(() => {
     const controller = new AbortController();
@@ -26,21 +27,24 @@ export function CredentialRouteAuthorization({ token, tenant, routes, groups, ro
       if (!controller.signal.aborted) setCatalog({ token, tenant, accounts: [], providers: [], failed: true });
     });
     return () => controller.abort();
-  }, [token, tenant]);
+  }, [token, tenant, retry]);
   const current = catalog?.token === token && catalog.tenant === tenant ? catalog : undefined;
   const options = credentialRouteOptions(routes, current?.accounts ?? [], current?.providers ?? [], locale);
   const selectedGroups = groupIds.map(id => groups.find(group => group.id === id));
   const effectiveIds = [...new Set([...routeIds, ...selectedGroups.flatMap(group => group?.member_ids ?? [])])];
   const describe = (id: string) => options.find(option => option.value === id);
   return <>
-    <p className="field-hint">{zh ? '授权覆盖整条路由的所有候选账号。只限某一账号的特定模型，请选择该账号的专用路由；路由组可复用这些路由。' : 'A grant covers every candidate account in a route. To restrict a model to one account, choose its dedicated route; route groups can reuse those routes.'} <a href={appHref('operator', 'routes')} target="_blank" rel="noopener noreferrer">{zh ? '新建或查看专用路由（新标签页）' : 'Create or inspect a dedicated route (new tab)'}</a></p>
-    {!current ? <small role="status">{zh ? '正在读取账号目录…' : 'Loading account catalog…'}</small> : current.failed && <small role="status">{zh ? '账号目录读取失败；保留账号 ID，不代表无账号。' : 'Account catalog could not be read; IDs remain visible. This does not mean accounts are absent.'}</small>}
+    <p className="field-hint">{zh ? '只授权某一账号，请选择该账号的专用路由。' : 'To authorize one account, choose its dedicated route.'} <a href={appHref('operator', 'routes')} target="_blank" rel="noopener noreferrer">{zh ? '新建或查看专用路由（新标签页）' : 'Create or inspect a dedicated route (new tab)'}</a> <DetailTooltip content={zh ? '授权包含整条路由的候选账号。路由组可复用这些路由，后续修改共享路由或组成员也会改变授权范围。' : 'Grants cover every candidate account in a route. Groups reuse these routes; later shared-route or group changes also change the scope.'}><Button appearance="subtle" type="button">{zh ? '授权范围说明' : 'About grant scope'}</Button></DetailTooltip></p>
+    {!current ? <small role="status">{zh ? '正在读取账号目录…' : 'Loading account catalog…'}</small> : current.failed && <div><small role="status">{zh ? '账号目录读取失败' : 'Account catalog could not be read'}</small> <Button appearance="subtle" type="button" onClick={() => { setCatalog(undefined); setRetry(value => value + 1); }}>{zh ? '重试读取目录' : 'Retry account catalog'}</Button></div>}
     <CredentialAuthorizationFields routes={options} groups={groups.map(group => ({ value: group.id, label: group.name, description: `${group.member_ids.length} ${zh ? '条路由' : 'routes'}` }))} routeIds={routeIds} groupIds={groupIds} onRoutes={onRoutes} onGroups={onGroups} />
     <section style={{ overflowWrap: 'anywhere' }} aria-label={zh ? '授权范围预览' : 'Authorization scope preview'}>
       <h4>{zh ? '授权范围预览' : 'Authorization scope preview'}</h4>
-      <p className="field-hint">{zh ? '下列为当前配置，不是连通性检查。共享路由或组成员后续变更会改变授权范围；此处不会修改它们。' : 'This is current configuration, not a connectivity check. Later changes to shared routes or group membership change the scope; this editor does not modify them.'}</p>
-      {selectedGroups.map((group, index) => <Disclosure key={groupIds[index]} title={`${group?.name ?? groupIds[index]} · ${group ? `${group.member_ids.length} ${zh ? '条路由' : 'routes'}` : (zh ? '组目录未知' : 'Group catalog unknown')}`}><ul>{group?.member_ids.map(id => <li key={id}><span>{describe(id)?.label ?? id}</span><p className="field-hint">{describe(id)?.description ?? (zh ? '路由目录未知' : 'Route catalog unknown')}</p></li>)}</ul></Disclosure>)}
-      <ul>{effectiveIds.map(id => <li key={id}><span>{describe(id)?.label ?? id}</span><p className="field-hint">{describe(id)?.description ?? (zh ? '路由目录未知；保留已有授权' : 'Route catalog unknown; existing grant retained')}</p></li>)}</ul>
+      {selectedGroups.some(group => !group) && <small>{zh ? '部分路由组目录不可用' : 'Some route groups are unavailable in the catalog'}</small>}
+      <ul>{effectiveIds.map(id => {
+        const option = describe(id);
+        const sources = [...(routeIds.includes(id) ? [zh ? '直接授权' : 'Direct grant'] : []), ...selectedGroups.filter(group => group?.member_ids.includes(id)).map(group => group!.name)];
+        return <li key={id}><DetailTooltip content={option?.details ?? id}><span tabIndex={0}>{option?.label ?? `${zh ? '未知路由' : 'Unknown route'} …${id.slice(-6)}`}</span></DetailTooltip><p className="field-hint">{option?.description ?? (zh ? '路由目录未知' : 'Route catalog unknown')} · {sources.join(' / ')}</p></li>;
+      })}</ul>
       {!effectiveIds.length && <small>{zh ? '尚无已知路由授权' : 'No known route grants yet'}</small>}
     </section>
   </>;
