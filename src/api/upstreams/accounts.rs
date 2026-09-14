@@ -25,6 +25,7 @@ pub(in crate::api) async fn create_upstream(
     Json(body): Json<CreateUpstreamRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "providers:write").await?;
+    let state = state.pin_application_plugins().await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
     if !state.providers.is_public(&body.driver) {
         return Err(AppError::BadRequest("unknown provider driver".into()));
@@ -293,6 +294,7 @@ pub(in crate::api) async fn list_upstreams(
     Query(query): Query<UpstreamListQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "providers:read").await?;
+    let state = state.pin_application_plugins().await?;
     let tenant = management_tenant(&service, query.tenant_external_id)?;
     let mut values = state
         .db
@@ -327,6 +329,7 @@ pub(in crate::api) async fn get_upstream_deletion_readiness(
     Query(query): Query<UpstreamDeletionReadinessQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "providers:read").await?;
+    let state = state.pin_application_plugins().await?;
     require_service_tenant(&service, &query.tenant_external_id)?;
     Ok(Json(
         state
@@ -365,6 +368,7 @@ pub(in crate::api) async fn update_upstream(
     Json(mut body): Json<UpdateUpstreamRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "providers:write").await?;
+    let state = state.pin_application_plugins().await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
     state
         .db
@@ -455,6 +459,7 @@ pub(in crate::api) async fn set_upstream_status(
     Json(body): Json<SetUpstreamStatusRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "providers:write").await?;
+    let state = state.pin_application_plugins().await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
     state
         .db
@@ -531,6 +536,7 @@ pub(in crate::api) async fn delete_upstream(
     Query(query): Query<DeleteUpstreamQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "providers:write").await?;
+    let state = state.pin_application_plugins().await?;
     require_service_tenant(&service, &query.tenant_external_id)?;
     state
         .db
@@ -555,6 +561,7 @@ pub(in crate::api) async fn rotate_upstream_credential(
     Json(body): Json<RotateUpstreamCredentialRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "providers:write").await?;
+    let state = state.pin_application_plugins().await?;
     let idempotency_key = headers
         .get("idempotency-key")
         .ok_or_else(|| AppError::BadRequest("Idempotency-Key is required".into()))?
@@ -634,6 +641,7 @@ pub(in crate::api) async fn rotate_codex_transport_proxy(
     Json(body): Json<RotateCodexTransportProxyRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "providers:write").await?;
+    let state = state.pin_application_plugins().await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
     require_global_service(&service)?;
     let idempotency_key = headers

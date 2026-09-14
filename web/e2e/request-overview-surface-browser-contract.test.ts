@@ -4,7 +4,8 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
-import { formatDurationDisplay, formatMilliseconds, formatNumber, formatPercent } from '../src/format.js';
+import { formatCurrencyDisplay, formatDurationDisplay, formatNumber, formatPercent } from '../src/format.js';
+import { analyticsDuration, histogramP95 } from '../src/operator/analyticsPresentation.js';
 import { requestOverviewFacts } from './fixtures/request-overview-facts.js';
 
 test('request popover stays non-modal across themes, locales and widths; models retain distinct account facts', { timeout: 60_000 }, async (t) => {
@@ -41,9 +42,9 @@ test('request popover stays non-modal across themes, locales and widths; models 
         const values = await row.locator('.monitoring-metric-list dd').allTextContents();
         assert.deepEqual(values.slice(0, 4), [formatNumber(fact.metrics.requests, locale),
           formatPercent(fact.metrics.successful_requests / fact.metrics.requests, locale),
-          formatMilliseconds(fact.metrics.avg_duration_ms, locale), formatMilliseconds(fact.metrics.p95_duration_ms, locale)]);
+          analyticsDuration(fact.metrics.avg_duration_ms, locale).text, histogramP95(fact.metrics.p95_duration_ms, fact.metrics.p95_is_capped, locale).text]);
         const cost = fact.metrics.costs[0];
-        assert.equal(await row.locator('.monitoring-cost-lines > span').getAttribute('title'), `${cost.cost} ${cost.currency}`);
+        assert.equal(await row.locator('.monitoring-cost-lines > span').getAttribute('title'), formatCurrencyDisplay(cost.cost, cost.currency, locale).title);
         const outcome = fact.terminal_outcomes[0];
         assert.equal(await row.locator('.monitoring-outcomes li').count(), 1);
         assert.equal(await row.locator('time').getAttribute('datetime'), new Date(outcome.created_at).toISOString());

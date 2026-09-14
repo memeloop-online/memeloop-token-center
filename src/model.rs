@@ -989,6 +989,8 @@ pub struct MonitoringMetrics {
     pub failed_requests: i64,
     pub avg_duration_ms: Option<f64>,
     pub p95_duration_ms: Option<i64>,
+    /// True when the percentile falls above the final finite histogram bound.
+    pub p95_is_capped: bool,
     /// Stable ascending currency order. Unlike currencies are never added.
     pub costs: Vec<UsageAnalysisCost>,
 }
@@ -1096,6 +1098,8 @@ pub struct UsageAnalysisMetrics {
     pub generation_units: i64,
     pub avg_duration_ms: Option<f64>,
     pub p95_duration_ms: Option<i64>,
+    /// The legacy numeric value is capped at 60 seconds, not an exact percentile.
+    pub p95_is_capped: bool,
     pub costs: Vec<UsageAnalysisCost>,
 }
 

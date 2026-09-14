@@ -406,8 +406,6 @@ jobs:
     if: needs.changes.outputs.memory == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 35
-    env:
-      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -415,26 +413,45 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: 1.95.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          shared-key: memory-release
-      - name: Build the exact-revision optimized service binary
-        env:
-          MTC_BUILD_GIT_SHA: ${{ github.sha }}
+      - id: release-input
+        name: Resolve Docker-native release binary identity
         run: |
-          MTC_BUILD_TIMESTAMP=$(git show -s --format=%cI HEAD)
-          MTC_BUILD_TARGET=$(rustc -vV | sed -n 's/^host: //p')
-          export MTC_BUILD_TIMESTAMP MTC_BUILD_TARGET
-          cargo build --locked --release --features experimental-plugin-revisions --bin memeloop-token-center
+          echo "timestamp=$(git show -s --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
+          echo 'target=linux/amd64' >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build, runtime-smoke, and export the exact Docker-native service input
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile
+          target: release-input-export
+          platforms: linux/amd64
+          outputs: type=local,dest=${{ runner.temp }}/release-service-input
+          build-args: |
+            MTC_BUILD_GIT_SHA_INPUT=${{ github.sha }}
+            MTC_BUILD_TIMESTAMP_INPUT=${{ steps.release-input.outputs.timestamp }}
+            MTC_BUILD_TARGET_INPUT=${{ steps.release-input.outputs.target }}
+          cache-from: type=gha,scope=service
+          cache-to: type=gha,mode=max,scope=service
       - name: Seal the binary identity for same-run acceptance
         run: >-
           node ops/ci/create-memory-binary-manifest.ts
-          target/release/memeloop-token-center
+          "$RUNNER_TEMP/release-service-input/memeloop-token-center"
           "$GITHUB_SHA"
           "$RUNNER_TEMP/memory-binary"
+      - name: Copy the Docker-native runtime libraries into the sealed artifact
+        run: |
+          install -m 0644 "$RUNNER_TEMP/release-service-input/libgcc_s.so.1" \
+            "$RUNNER_TEMP/memory-binary/libgcc_s.so.1"
+          install -m 0644 "$RUNNER_TEMP/release-service-input/libstdc++.so.6" \
+            "$RUNNER_TEMP/memory-binary/libstdc++.so.6"
+      - name: Seal the complete Docker-native service release input
+        run: >-
+          node ops/ci/create-release-service-input-manifest.ts
+          "$RUNNER_TEMP/memory-binary"
+          "$GITHUB_SHA"
+      - name: Normalize exported binary permissions for artifact transport
+        run: chmod 0644 "$RUNNER_TEMP/memory-binary/memeloop-token-center"
       - name: Upload the exact-revision memory acceptance binary
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
         with:
@@ -455,6 +472,40 @@ jobs:
     with:
       revision: ${{ github.sha }}
       binary_artifact: memory-binary-${{ github.sha }}
+
+  release-input-assembly:
+    if: github.event_name == 'pull_request' && needs.changes.outputs.memory == 'true'
+    needs: [changes, memory-binary]
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+      - name: Download the actual same-run service input artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: memory-binary-${{ github.sha }}
+          path: ${{ runner.temp }}/release-service-input
+      - name: Verify the actual same-run Docker-native service input
+        run: >-
+          node ops/ci/verify-release-service-input.ts
+          "$RUNNER_TEMP/release-service-input"
+          "$GITHUB_SHA"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Assemble and runtime-smoke the final image from the downloaded input
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile.release
+          platforms: linux/amd64
+          outputs: type=cacheonly
+          build-contexts: |
+            release-input=${{ runner.temp }}/release-service-input
+          cache-from: type=gha,scope=service
 
   publish-ghcr:
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
@@ -477,7 +528,7 @@ jobs:
       matrix:
         include:
           - image: ghcr.io/${{ github.repository_owner }}/memeloop-token-center
-            dockerfile: Dockerfile
+            dockerfile: Dockerfile.release
             cache_scope: service
           - image: ghcr.io/${{ github.repository_owner }}/memeloop-token-center-plugin-installer
             dockerfile: Dockerfile.plugin-installer
@@ -489,6 +540,16 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
+      - name: Download the same-run Docker-native service input
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: memory-binary-${{ github.sha }}
+          path: ${{ runner.temp }}/release-service-input
+      - name: Verify the exact Docker-native service input
+        run: >-
+          node ops/ci/verify-release-service-input.ts
+          "$RUNNER_TEMP/release-service-input"
+          "$GITHUB_SHA"
       - name: Validate shared immutable release inputs
         env:
           RELEASE_REGISTRY: ghcr.io/${{ github.repository_owner }}
@@ -526,6 +587,8 @@ jobs:
             MTC_BUILD_GIT_SHA_INPUT=${{ github.sha }}
             MTC_BUILD_TIMESTAMP_INPUT=${{ github.event.head_commit.timestamp }}
             MTC_BUILD_TARGET_INPUT=linux/amd64
+          build-contexts: |
+            release-input=${{ runner.temp }}/release-service-input
           cache-from: type=gha,scope=${{ matrix.cache_scope }}
           cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
           provenance: mode=max

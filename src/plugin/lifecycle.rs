@@ -619,6 +619,7 @@ mod tests {
                 component: None,
                 configuration_validator: None,
                 routing_validator: None,
+                routing_fingerprint: String::new(),
                 identity: identity(),
             }]),
             ..PluginRuntime::default()
@@ -660,6 +661,7 @@ mod tests {
                 component: None,
                 configuration_validator: None,
                 routing_validator: None,
+                routing_fingerprint: String::new(),
                 identity: identity(),
             }]),
             ..PluginRuntime::default()

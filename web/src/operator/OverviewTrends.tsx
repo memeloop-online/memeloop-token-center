@@ -1,11 +1,13 @@
 import { lazy, Suspense, useMemo } from 'react';
 import { api } from '../api';
 import { costOption, latencyOption, throughputOption, type UsageChartCopy, type UsageChartFormatters } from '../charts/usageCharts';
-import { formatCurrency, formatMetricDisplay, formatMilliseconds, formatPercent } from '../format';
+import { formatCurrencyDisplay, formatMetricDisplay, formatPercent } from '../format';
 import { useI18n } from '../i18n';
 import type { OperatorUsageAnalysisTrends, TypedFilterAst } from '../types';
 import { requestDrilldownForOverviewBucket } from './overviewDrilldown';
 import { useOperatorResource } from './hooks/useOperatorResource';
+import type { ResourceState } from './hooks/useOperatorResource';
+import { analyticsDuration, finiteP95Points, histogramP95 } from './analyticsPresentation';
 import { statsQuery } from './usageState';
 import './overview.css';
 
@@ -13,20 +15,24 @@ const EChart = lazy(() => import('../charts/EChart').then((module) => ({ default
 
 function CostLines({ costs, locale }: { costs: OperatorUsageAnalysisTrends['time_series'][number]['costs']; locale: 'zh-CN' | 'en' }) {
   if (!costs.length) return <>—</>;
-  return <span className="usage-cost-lines">{[...costs].sort((left, right) => left.currency.localeCompare(right.currency)).map(({ cost, currency }) => <span key={currency} title={`${cost} ${currency}`}>{formatCurrency(cost, currency, locale)}</span>)}</span>;
+  return <span className="usage-cost-lines">{[...costs].sort((left, right) => left.currency.localeCompare(right.currency)).map(({ cost, currency }) => <span key={currency} title={formatCurrencyDisplay(cost, currency, locale).title}>{formatCurrencyDisplay(cost, currency, locale).text}</span>)}</span>;
 }
 
 /** Independent historical trends: a slow query cannot hide current traffic. */
-export function OverviewTrends({ token, tenant, onDrilldown }: { token: string; tenant: string; onDrilldown?: (ast: TypedFilterAst) => void }) {
-  const { locale, t } = useI18n();
-  const resource = useOperatorResource(Boolean(token), `${token}\0${tenant}`, () => {
+export function useOverviewTrendResource(token: string, tenant: string) {
+  const { t } = useI18n();
+  return useOperatorResource(Boolean(token), `${token}\0${tenant}`, () => {
     const query = statsQuery(tenant, {
       preset: '24h', granularity: 'hour', customFrom: '', customTo: '',
       filters: { model: '', keyId: '', upstreamId: '', protocol: '', status: '', errorCode: '' },
     });
     return api<OperatorUsageAnalysisTrends>(`/internal/v1/usage-analysis/trends${query}`, token);
   }, t('usage.loadFailed'));
-  const stats = resource.state.kind === 'ready' ? resource.state.value : undefined;
+}
+
+export function OverviewTrends({ state, onDrilldown }: { state: ResourceState<OperatorUsageAnalysisTrends>; onDrilldown?: (ast: TypedFilterAst) => void }) {
+  const { locale, t } = useI18n();
+  const stats = state.kind === 'ready' ? state.value : undefined;
   const copy: UsageChartCopy = useMemo(() => ({
     requests: t('usage.requests'), success: t('traffic.success'), failures: t('traffic.failure'),
     averageLatency: t('usage.average'), p95Latency: t('usage.p95Approx'),
@@ -36,13 +42,13 @@ export function OverviewTrends({ token, tenant, onDrilldown }: { token: string; 
     bucket: (value) => new Date(value).toLocaleString(locale, {
       month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'UTC',
     }),
-    cost: (value, currency) => formatCurrency(value, currency, locale),
-    duration: (value) => formatMilliseconds(value, locale),
+    cost: (value, currency) => formatCurrencyDisplay(value, currency, locale).text,
+    duration: (value) => analyticsDuration(value, locale).text,
     number: (value) => formatMetricDisplay(value, locale).text,
     percent: (value) => formatPercent(value, locale),
   }), [locale]);
   const throughput = useMemo(() => throughputOption(stats?.time_series ?? [], copy, format), [stats, copy, format]);
-  const latency = useMemo(() => latencyOption(stats?.time_series ?? [], copy, format), [stats, copy, format]);
+  const latency = useMemo(() => latencyOption(finiteP95Points(stats?.time_series ?? []), copy, format), [stats, copy, format]);
   const costs = useMemo(() => costOption(stats?.time_series ?? [], copy, format), [stats, copy, format]);
   const trendCards = [
     { id: 'throughput', title: t('usage.throughput'), option: throughput },
@@ -56,10 +62,11 @@ export function OverviewTrends({ token, tenant, onDrilldown }: { token: string; 
   };
 
   return <section className="overview-trends" aria-label={t('usage.trend')}>
-    {resource.state.kind === 'failed' && <div className="notice error" role="alert">{resource.state.message}</div>}
-    {resource.state.kind === 'ready' && resource.state.refreshError && <div className="notice error" role="alert">{resource.state.refreshError}</div>}
-    {!stats && resource.state.kind !== 'failed' && <div className="panel empty" role="status">{t('common.loading')}</div>}
+    {state.kind === 'failed' && <div className="notice error" role="alert">{state.message}</div>}
+    {state.kind === 'ready' && state.refreshError && <div className="notice error" role="alert">{state.refreshError}</div>}
+    {!stats && state.kind !== 'failed' && <div className="panel empty" role="status">{t('common.loading')}</div>}
     {stats && <>
+      <p className="analytics-p95-note">{locale === 'zh-CN' ? 'P95为直方图区间上界；超出最高档或旧版无法确定的值不绘制为精确延迟。' : 'P95 uses histogram upper bounds. Overflow and ambiguous legacy values leave gaps instead of exact latency points.'}</p>
       <div className="overview-trend-grid">
         {trendCards.map(({ id, title, option }) => <article className={`panel overview-trend-card${id === 'throughput' ? ' overview-trend-primary' : ''}`} key={id}>
           <div className="panel-title"><h2>{title}</h2><span>{stats.time_zone}</span></div>
@@ -78,7 +85,7 @@ export function OverviewTrends({ token, tenant, onDrilldown }: { token: string; 
           <thead><tr><th>{t('request.time')} · {stats.time_zone}</th><th>{copy.success}</th><th>{copy.failures}</th><th>{copy.averageLatency}</th><th>{copy.p95Latency}</th><th>{copy.cost}</th></tr></thead>
           <tbody>{stats.time_series.map((point) => <tr key={point.bucket_start}>
             <td>{onDrilldown ? <button type="button" className="table-link overview-trend-bucket" onClick={() => drillDown(point.bucket_start)}>{format.bucket(point.bucket_start)}</button> : format.bucket(point.bucket_start)}</td><td>{format.number(point.success)}</td><td>{format.number(point.failed)}</td>
-            <td>{formatMilliseconds(point.avg_duration_ms, locale)}</td><td>{formatMilliseconds(point.p95_duration_ms, locale)}</td><td><CostLines costs={point.costs} locale={locale} /></td>
+            <td title={analyticsDuration(point.avg_duration_ms, locale).title}>{analyticsDuration(point.avg_duration_ms, locale).text}</td><td title={histogramP95(point.p95_duration_ms, point.p95_is_capped, locale).title}>{histogramP95(point.p95_duration_ms, point.p95_is_capped, locale).text}</td><td><CostLines costs={point.costs} locale={locale} /></td>
           </tr>)}</tbody>
         </table></div>
       </details>

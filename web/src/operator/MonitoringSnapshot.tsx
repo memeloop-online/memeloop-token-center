@@ -1,14 +1,15 @@
-import { Metric, NumberMetric } from '../components';
-import { formatCurrency, formatElapsedTime, formatMetricDisplay, formatMilliseconds, formatPercent } from '../format';
+import { formatCurrencyDisplay, formatMetricDisplay, formatPercent } from '../format';
 import { useI18n } from '../i18n';
-import type { MonitoringHealth, OperatorMonitoringSnapshot, UsageAnalysisCost } from '../types';
+import type { MonitoringHealth, OperatorMonitoringSnapshot, UsageAnalysisCost, UsageAnalysisTimeBucket } from '../types';
 import { monitoringModelGroups } from './monitoringAccountGroups';
+import { AnalyticsMetric } from './AnalyticsMetric';
+import { analyticsAge, analyticsDuration, finiteP95Points, histogramP95 } from './analyticsPresentation';
 
 function CostLines({ costs }: { costs: UsageAnalysisCost[] }) {
   const { locale } = useI18n();
   if (!costs.length) return <>—</>;
   return <span className="monitoring-cost-lines">{costs.map(({ currency, cost }) => (
-    <span key={currency} title={`${cost} ${currency}`}>{formatCurrency(cost, currency, locale)}</span>
+    <span key={currency} title={formatCurrencyDisplay(cost, currency, locale).title}>{formatCurrencyDisplay(cost, currency, locale).text}</span>
   ))}</span>;
 }
 
@@ -29,8 +30,7 @@ function Freshness({ snapshot }: { snapshot: OperatorMonitoringSnapshot }) {
   const freshness = snapshot.freshness;
   if (freshness.latest_terminal_created_at === null) return <span>{t('monitoring.noTerminalTraffic')}</span>;
   const occurred = new Date(freshness.latest_terminal_created_at).toLocaleString(locale);
-  const age = formatElapsedTime(freshness.age_millis, locale);
-  return <span title={occurred}>{t('monitoring.freshnessAge', { age })}</span>;
+  return <span title={occurred}>{analyticsAge(freshness.age_millis, locale)}</span>;
 }
 
 function MonitoringMetricList({ metrics }: { metrics: OperatorMonitoringSnapshot['summary'] }) {
@@ -40,17 +40,21 @@ function MonitoringMetricList({ metrics }: { metrics: OperatorMonitoringSnapshot
   return <dl className="monitoring-metric-list">
     <div><dt>{t('usage.requests')}</dt><dd title={formatMetricDisplay(metrics.requests, locale).title}>{formatMetricDisplay(metrics.requests, locale).text}</dd></div>
     <div><dt>{t('usage.successRate')}</dt><dd>{formatPercent(successRate, locale)}</dd></div>
-    <div><dt>{t('usage.average')}</dt><dd>{formatMilliseconds(metrics.avg_duration_ms, locale)}</dd></div>
-    <div><dt>{t('usage.p95Approx')}</dt><dd>{formatMilliseconds(metrics.p95_duration_ms, locale)}</dd></div>
+    <div><dt>{t('usage.average')}</dt><dd title={analyticsDuration(metrics.avg_duration_ms, locale).title}>{analyticsDuration(metrics.avg_duration_ms, locale).text}</dd></div>
+    <div><dt>{t('usage.p95Approx')}</dt><dd title={histogramP95(metrics.p95_duration_ms, metrics.p95_is_capped, locale).title}>{histogramP95(metrics.p95_duration_ms, metrics.p95_is_capped, locale).text}</dd></div>
     <div><dt>{t('traffic.cost')}</dt><dd><CostLines costs={metrics.costs} /></dd></div>
   </dl>;
 }
 
-export function MonitoringSnapshot({ snapshot }: { snapshot: OperatorMonitoringSnapshot }) {
+export function MonitoringSnapshot({ snapshot, points = [] }: { snapshot: OperatorMonitoringSnapshot; points?: UsageAnalysisTimeBucket[] }) {
   const { locale, t } = useI18n();
   const summary = snapshot.summary;
   const successRate = summary.requests > 0 ? summary.successful_requests / summary.requests : null;
   const range = `${new Date(snapshot.from_created_at).toLocaleString(locale)} – ${new Date(snapshot.to_created_at).toLocaleString(locale)}`;
+  const count = (value: number) => formatMetricDisplay(value, locale);
+  const average = analyticsDuration(summary.avg_duration_ms, locale);
+  const p95 = histogramP95(summary.p95_duration_ms, summary.p95_is_capped, locale);
+  const currency = summary.costs.length === 1 ? summary.costs[0].currency : undefined;
   return <section className="operator-monitoring" aria-labelledby="monitoring-heading">
     <article className="panel">
       <div className="panel-title monitoring-heading">
@@ -58,14 +62,14 @@ export function MonitoringSnapshot({ snapshot }: { snapshot: OperatorMonitoringS
         <RoutingStatusBadge health={snapshot.health} />
       </div>
       <section className="metrics operator-monitoring-metrics monitoring-metrics-grid" aria-label={t('monitoring.summary')}>
-        <NumberMetric label={t('usage.requests')} value={summary.requests} />
-        <NumberMetric label={t('traffic.success')} value={summary.successful_requests} tone="positive" />
-        <NumberMetric label={t('traffic.failure')} value={summary.failed_requests} tone="negative" />
-        <Metric label={t('usage.successRate')} value={formatPercent(successRate, locale)} tone="positive" />
-        <Metric label={t('usage.average')} value={formatMilliseconds(summary.avg_duration_ms, locale)} />
-        <Metric label={t('usage.p95Approx')} value={formatMilliseconds(summary.p95_duration_ms, locale)} />
-        <Metric label={t('traffic.cost')} value={<CostLines costs={summary.costs} />} />
-        <Metric label={t('monitoring.freshness')} value={<Freshness snapshot={snapshot} />} />
+        <AnalyticsMetric label={t('usage.requests')} value={count(summary.requests).text} title={count(summary.requests).title} trend={points.map((point) => point.requests)} />
+        <AnalyticsMetric label={t('traffic.success')} value={count(summary.successful_requests).text} title={count(summary.successful_requests).title} tone="positive" trend={points.map((point) => point.success)} ratio={successRate} />
+        <AnalyticsMetric label={t('traffic.failure')} value={count(summary.failed_requests).text} title={count(summary.failed_requests).title} tone="negative" trend={points.map((point) => point.failed)} ratio={successRate === null ? null : 1 - successRate} />
+        <AnalyticsMetric label={t('usage.successRate')} value={formatPercent(successRate, locale)} tone="positive" ratio={successRate} />
+        <AnalyticsMetric label={t('usage.average')} value={average.text} title={average.title} trend={points.map((point) => point.avg_duration_ms)} />
+        <AnalyticsMetric label={t('usage.p95Approx')} value={p95.text} title={p95.title} trend={finiteP95Points(points).map((point) => point.p95_duration_ms)} />
+        <AnalyticsMetric label={t('traffic.cost')} value={<CostLines costs={summary.costs} />} trend={currency ? points.map((point) => Number(point.costs.find((cost) => cost.currency === currency)?.cost ?? 0)) : undefined} />
+        <AnalyticsMetric label={t('monitoring.freshness')} value={<Freshness snapshot={snapshot} />} />
       </section>
     </article>
     <article className="panel monitoring-top-panel">
@@ -78,16 +82,16 @@ export function MonitoringSnapshot({ snapshot }: { snapshot: OperatorMonitoringS
           const metrics = value.metrics;
           return <li key={`${value.upstream_account_id}\0${index}`} data-upstream-account-id={value.upstream_account_id}>
             <div className="monitoring-top-heading">
-              <div><b>{value.upstream_name}</b><code title={value.upstream_account_id}>{value.upstream_account_id}</code></div>
+              <div><b title={`${locale === 'zh-CN' ? '账号 ID' : 'Account ID'}: ${value.upstream_account_id}`}>{value.upstream_name === value.upstream_account_id ? (locale === 'zh-CN' ? '未命名账号' : 'Unnamed account') : value.upstream_name}</b></div>
               <RoutingStatusBadge health={value.health} />
             </div>
             <MonitoringMetricList metrics={metrics} />
             <ol className="monitoring-outcomes" aria-label={t('monitoring.terminalOutcomes')}>
               {value.terminal_outcomes.slice(0, 5).map((outcome) => <li key={`${outcome.source}\0${outcome.id}`}>
-                <time dateTime={new Date(outcome.created_at).toISOString()}>{new Date(outcome.created_at).toLocaleString(locale)}</time>
+                <time dateTime={new Date(outcome.created_at).toISOString()} title={new Date(outcome.created_at).toLocaleString(locale)}>{analyticsAge(Math.max(0, snapshot.generated_at - outcome.created_at), locale)}</time>
                 <span className={`status ${outcome.status === 'success' ? 'ok' : 'bad'}`}>{t(`monitoring.outcome.${outcome.status}`)}</span>
                 <span>{t(`monitoring.source.${outcome.source}`)}</span>
-                <span>{formatMilliseconds(outcome.duration_ms, locale)}</span>
+                <span title={analyticsDuration(outcome.duration_ms, locale).title}>{analyticsDuration(outcome.duration_ms, locale).text}</span>
                 {outcome.error_code && <code>{outcome.error_code}</code>}
               </li>)}
             </ol>

@@ -50,6 +50,7 @@ test('release contains only runtime images and no retired migration delivery sur
   assert.equal(parsed.concurrency?.['cancel-in-progress'], "${{ github.event_name == 'pull_request' }}");
   const memoryBinary = parsed.jobs?.['memory-binary'];
   const memoryAcceptance = parsed.jobs?.['memory-acceptance'];
+  const releaseInputAssembly = parsed.jobs?.['release-input-assembly'];
   const rust = parsed.jobs?.rust;
   const web = parsed.jobs?.web;
   const migration = parsed.jobs?.['migration-smoke'];
@@ -63,11 +64,23 @@ test('release contains only runtime images and no retired migration delivery sur
   const imageServiceBuilds = dockerfile.split('\n').filter((line) => /\bcargo\s+build\b/.test(line));
   assert.equal(imageServiceBuilds.length, 2);
   for (const line of imageServiceBuilds) assert.ok(hasRuntimeFeature(line), 'service image must include the installed-revision runtime');
-  for (const [name, job] of [['memory-binary', memoryBinary], ['web', web]] as const) {
+  for (const [name, job] of [['web', web]] as const) {
     const serviceBuilds = job?.steps?.filter((step) => /\bcargo\s+build\b/.test(step.run ?? '')) ?? [];
     assert.equal(serviceBuilds.length, 1, `${name} must build the service binary once`);
     assert.ok(hasRuntimeFeature(serviceBuilds[0]?.run ?? ''), `${name} must test the production service feature set`);
   }
+  const memoryDockerBuild = memoryBinary?.steps?.find((step) => step.uses?.startsWith('docker/build-push-action@'));
+  assert.equal(memoryDockerBuild?.with?.target, 'release-input-export');
+  assert.equal(memoryDockerBuild?.with?.platforms, 'linux/amd64');
+  assert.equal(memoryDockerBuild?.with?.outputs, 'type=local,dest=${{ runner.temp }}/release-service-input');
+  assert.equal(memoryDockerBuild?.with?.['cache-from'], 'type=gha,scope=service');
+  assert.equal(memoryDockerBuild?.with?.['cache-to'], 'type=gha,mode=max,scope=service');
+  assert.match(String(memoryDockerBuild?.with?.['build-args']), /MTC_BUILD_GIT_SHA_INPUT=\$\{\{ github\.sha \}\}/);
+  assert.match(String(memoryDockerBuild?.with?.['build-args']), /MTC_BUILD_TARGET_INPUT=\$\{\{ steps\.release-input\.outputs\.target \}\}/);
+  contains('Dockerfile', 'FROM scratch AS release-input-export');
+  contains('Dockerfile', 'FROM ${RUNTIME_IMAGE} AS release-input-smoke');
+  contains('Dockerfile.release', 'COPY --chmod=0555 --from=release-input /memeloop-token-center /usr/local/bin/memeloop-token-center');
+  contains('Dockerfile.release', 'COPY --from=web-builder /build/web/dist /usr/share/memeloop-token-center/web');
   assert.equal(memoryBinary?.if, "needs.changes.outputs.memory == 'true'");
   assert.equal(memoryAcceptance?.if, "needs.changes.outputs.memory == 'true'");
   assert.equal(rust?.if, "needs.changes.outputs.rust == 'true'");
@@ -84,6 +97,18 @@ test('release contains only runtime images and no retired migration delivery sur
   assert.deepEqual(new Set(memoryAcceptanceNeeds), new Set(['changes', 'memory-binary']));
   assert.equal(memoryAcceptance?.uses, './.github/workflows/memory-acceptance.yml');
   assert.equal(memoryAcceptance?.with?.binary_artifact, 'memory-binary-${{ github.sha }}');
+  assert.equal(releaseInputAssembly?.if, "github.event_name == 'pull_request' && needs.changes.outputs.memory == 'true'");
+  const releaseInputAssemblyNeeds = Array.isArray(releaseInputAssembly?.needs)
+    ? releaseInputAssembly.needs
+    : releaseInputAssembly?.needs === undefined ? [] : [releaseInputAssembly.needs];
+  assert.deepEqual(new Set(releaseInputAssemblyNeeds), new Set(['changes', 'memory-binary']));
+  const assemblyDownload = releaseInputAssembly?.steps?.find((step) => step.uses?.startsWith('actions/download-artifact@'));
+  assert.equal(assemblyDownload?.with?.name, 'memory-binary-${{ github.sha }}');
+  assert.equal(assemblyDownload?.with?.path, '${{ runner.temp }}/release-service-input');
+  const assemblyBuild = releaseInputAssembly?.steps?.find((step) => step.uses?.startsWith('docker/build-push-action@'));
+  assert.equal(assemblyBuild?.with?.file, 'Dockerfile.release');
+  assert.equal(assemblyBuild?.with?.outputs, 'type=cacheonly');
+  assert.match(String(assemblyBuild?.with?.['build-contexts']), /^release-input=\$\{\{ runner\.temp \}\}\/release-service-input\s*$/);
   for (const jobName of ['repository-security', 'dependency-security', 'api-contract', 'packaging']) {
     assert.equal(parsed.jobs?.[jobName]?.if, undefined, `${jobName} must remain unconditional`);
   }
@@ -107,6 +132,9 @@ test('release contains only runtime images and no retired migration delivery sur
   assert.match(serializedMatrix, /memeloop-token-center/);
   assert.match(serializedMatrix, /memeloop-token-center-plugin-installer/);
   assert.doesNotMatch(serializedMatrix, /importer/);
+  const servicePublisher = publishSteps.find((step) => step.id === 'build');
+  assert.match(String(servicePublisher?.with?.['build-contexts']), /^release-input=\$\{\{ runner\.temp \}\}\/release-service-input\s*$/);
+  assert.match(serializedMatrix, /Dockerfile\.release/);
   const packaging = parsed.jobs?.packaging;
   const cachedPluginBuild = packaging?.steps?.find((step) => step.name === 'Build the cached hardened plugin installer contract image');
   assert.equal(cachedPluginBuild?.with?.['cache-from'], 'type=gha,scope=plugin-installer');

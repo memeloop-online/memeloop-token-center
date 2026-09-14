@@ -165,6 +165,8 @@ export interface UsageAnalysisMetrics {
   generation_units: number;
   avg_duration_ms: number | null;
   p95_duration_ms: number | null;
+  /** Absent on older servers; never infer a precise 60-second P95 from that case. */
+  p95_is_capped?: boolean;
   costs: UsageAnalysisCost[];
 }
 
@@ -216,6 +218,7 @@ export interface MonitoringMetrics {
   failed_requests: number;
   avg_duration_ms: number | null;
   p95_duration_ms: number | null;
+  p95_is_capped?: boolean;
   /** Amounts are currency-separated and sorted by currency by the API. */
   costs: UsageAnalysisCost[];
 }

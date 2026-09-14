@@ -546,6 +546,121 @@ async fn assert_control_revision(state: &AppState, version: &str, revision: i64)
 }
 
 #[tokio::test]
+async fn running_authority_admits_new_contract_and_pins_history_without_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let empty_root = directory.path().join("empty-root");
+    std::fs::create_dir(&empty_root).unwrap();
+    let inventory_path = directory.path().join("inventory.json");
+    let mut trusted = BTreeMap::from([(
+        "empty".into(),
+        PreinstalledInventory {
+            root: empty_root,
+            grants: BTreeMap::new(),
+        },
+    )]);
+    std::fs::write(&inventory_path, serde_json::to_vec(&trusted).unwrap()).unwrap();
+    let mut config = Config::for_test(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("dynamic.db").display()
+    ));
+    config.plugin_inventory_file = Some(inventory_path.to_str().unwrap().into());
+    let state = AppState::initialize(config.clone()).await.unwrap();
+    let authority = state.application_plugins.clone().unwrap();
+    authority
+        .publish(publish("empty", 0), "empty-initial")
+        .await
+        .unwrap();
+    let previous = state.clone().pin_application_plugins().await.unwrap();
+    assert!(previous.providers.get(PROVIDER).is_none());
+
+    // The new signed package, provider/OAuth contract and host grant did not
+    // exist when either AppState or the authority was created.
+    let new_root = directory.path().join("new-root");
+    write_inventory(&new_root, false);
+    trusted.extend(inventory(&state.db, &[("new", new_root)]));
+    std::fs::write(&inventory_path, serde_json::to_vec(&trusted).unwrap()).unwrap();
+    assert_eq!(authority.status().await.unwrap().candidates.len(), 2);
+    authority
+        .publish(publish("new", 1), "new-contract")
+        .await
+        .unwrap();
+    let current = state.clone().pin_application_plugins().await.unwrap();
+    assert!(
+        current
+            .providers
+            .get(PROVIDER)
+            .unwrap()
+            .oauth_adapter
+            .is_some()
+    );
+    assert_provider_phases(&current, false).await;
+    assert!(previous.providers.get(PROVIDER).is_none());
+    assert!(
+        authority
+            .pin_historical(1)
+            .await
+            .unwrap()
+            .providers
+            .get(PROVIDER)
+            .is_none()
+    );
+    let listed = control_get(&state, "/internal/v1/provider-types").await;
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|provider| provider["id"] == PROVIDER)
+    );
+    authority
+        .rollback(
+            RollbackApplicationPlugin {
+                target_revision: 1,
+                expected_revision: 2,
+            },
+            "rollback-contract",
+        )
+        .await
+        .unwrap();
+    assert!(
+        state
+            .clone()
+            .pin_application_plugins()
+            .await
+            .unwrap()
+            .providers
+            .get(PROVIDER)
+            .is_none()
+    );
+    assert!(
+        authority
+            .pin_historical(2)
+            .await
+            .unwrap()
+            .providers
+            .get(PROVIDER)
+            .is_some()
+    );
+    let restarted = AppState::initialize(config).await.unwrap();
+    assert!(
+        restarted
+            .application_plugins
+            .unwrap()
+            .pin_historical(2)
+            .await
+            .unwrap()
+            .providers
+            .get(PROVIDER)
+            .is_some()
+    );
+
+    // A host publication cannot silently mutate or remove an observed ID.
+    trusted.remove("empty");
+    std::fs::write(&inventory_path, serde_json::to_vec(&trusted).unwrap()).unwrap();
+    assert!(authority.status().await.is_err());
+}
+
+#[tokio::test]
 async fn configured_empty_inventory_preserves_baseline_and_reports_no_revision() {
     let directory = tempfile::tempdir().unwrap();
     let inventory_path = directory.path().join("empty.json");

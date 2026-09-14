@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { formatElapsedTime } from '../src/format.js';
+import { analyticsAge } from '../src/operator/analyticsPresentation.js';
 import type { OperatorMonitoringSnapshot } from '../src/types.js';
 
 const pageSource = await readFile(new URL('../src/operator/pages/OperatorPages.tsx', import.meta.url), 'utf8');
@@ -52,7 +53,9 @@ test('monitoring freshness renders localized elapsed hours, minutes, and seconds
   assert.equal(formatElapsedTime(5_534_801, 'en'), '1h 32m 14s');
   assert.equal(formatElapsedTime(5_534_801, 'zh-CN'), '1小时32分14秒');
   assert.equal(formatElapsedTime(999, 'en'), '0h 0m 0s');
-  assert.match(componentSource, /formatElapsedTime\(freshness\.age_millis, locale\)/);
+  assert.equal(analyticsAge(8_000, 'zh-CN'), '8秒前');
+  assert.equal(analyticsAge(5_534_801, 'en'), '1 hr. ago');
+  assert.match(componentSource, /analyticsAge\(freshness\.age_millis, locale\)/);
   assert.match(componentSource, /title=\{occurred\}/);
   assert.doesNotMatch(componentSource, /formatMilliseconds\(freshness\.age_millis, locale\)/);
 });

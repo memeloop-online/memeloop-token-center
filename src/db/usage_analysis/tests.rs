@@ -2,6 +2,36 @@ use std::collections::BTreeMap;
 
 use sqlx::Row;
 
+#[test]
+fn p95_disambiguates_finite_upper_bound_and_open_ended_bucket() {
+    use super::{approximate_p95, histogram_p95_is_capped};
+    let mut buckets = [0_i64; 12];
+    assert!(!histogram_p95_is_capped(0, &buckets));
+    buckets[10] = 95;
+    buckets[11] = 5;
+    assert_eq!(approximate_p95(100, &buckets), Some(60_000));
+    assert!(!histogram_p95_is_capped(100, &buckets));
+    buckets[10] = 94;
+    buckets[11] = 6;
+    assert_eq!(approximate_p95(100, &buckets), Some(60_000));
+    assert!(histogram_p95_is_capped(100, &buckets));
+    let metrics = UsageMetricsAccumulator {
+        duration_count: 100,
+        duration_buckets: buckets,
+        ..Default::default()
+    }
+    .finish();
+    assert!(metrics.p95_is_capped);
+    let unavailable = UsageMetricsAccumulator {
+        duration_count: 100,
+        duration_buckets: buckets,
+        ..Default::default()
+    }
+    .finish_without_p95();
+    assert_eq!(unavailable.p95_duration_ms, None);
+    assert!(!unavailable.p95_is_capped);
+}
+
 use super::{
     Database, DatabaseBackend, UsageAnalysisBucketPlan, UsageAnalysisGranularity,
     UsageMetricsAccumulator, session_usage_dimension_sql, usage_analysis_heatmap_sql,
