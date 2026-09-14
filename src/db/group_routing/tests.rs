@@ -104,7 +104,7 @@ async fn overlapping_strategies_are_deterministic_scoped_and_do_not_grant_routes
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(selected.id, format!("route:{}", Uuid::from_u128(20)));
+    assert_eq!(selected.id, format!("{}:route", Uuid::from_u128(20)));
     assert_eq!((selected.priority, selected.version), (10, 7));
     assert_eq!(selected.strategy.plugin_id, "fixture");
     sqlx::query("UPDATE provider_groups SET routing_priority = 11 WHERE id = $1")
@@ -117,7 +117,7 @@ async fn overlapping_strategies_are_deterministic_scoped_and_do_not_grant_routes
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(selected.id, format!("provider:{}", Uuid::from_u128(30)));
+    assert_eq!(selected.id, format!("{}:provider", Uuid::from_u128(30)));
     assert_eq!(selected.priority, 11);
     // Neither route membership nor its strategy adds a credential grant.
     let grants = db

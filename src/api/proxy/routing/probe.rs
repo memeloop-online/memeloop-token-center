@@ -377,10 +377,15 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
             kind: UpstreamFailureKind::RateLimited | UpstreamFailureKind::RateLimitedUntil { .. },
             ..
         } => GroupRoutingOutcome::HardQuota,
+        UpstreamAttemptTerminal::Failed {
+            kind: UpstreamFailureKind::Authentication,
+            ..
+        } => GroupRoutingOutcome::Authentication,
         UpstreamAttemptTerminal::Failed { .. } => GroupRoutingOutcome::TransientFailure,
     };
     let directive = crate::group_routing::observe(
         &state,
+        request_id,
         route_id,
         upstream_account_id,
         credential_generation,
@@ -388,7 +393,17 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
     )
     .await;
     let mut health = state.config.upstream_health;
-    if let Some(directive) = directive {
+    if let Some(directive) = directive
+        && matches!(
+            terminal,
+            UpstreamAttemptTerminal::Failed {
+                kind: UpstreamFailureKind::Connection
+                    | UpstreamFailureKind::Unavailable
+                    | UpstreamFailureKind::InvalidResponse,
+                ..
+            }
+        )
+    {
         // Only transient failures consume plugin cooldown. Typed 429/reset
         // evidence, lease ownership and uncertain POST handling remain core.
         let cooldown = directive.cooldown_ms.min(60_000) as i64;

@@ -131,6 +131,7 @@ async fn invariants(database: &Database, peer: &Database) {
         );
     }
     for kind in [
+        UpstreamFailureKind::Authentication,
         UpstreamFailureKind::RateLimited,
         UpstreamFailureKind::RateLimitedUntil {
             until: unix_millis() + 3_600_000,

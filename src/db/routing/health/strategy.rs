@@ -20,10 +20,10 @@ impl GroupRoutingHealth {
     }
 
     pub(crate) fn effective_cooldown_until(&self, override_ms: Option<u64>) -> i64 {
-        if self.is_transient() {
-            if let Some(duration) = override_ms {
-                return self.updated_at.saturating_add(duration.min(60_000) as i64);
-            }
+        if self.is_transient()
+            && let Some(duration) = override_ms
+        {
+            return self.updated_at.saturating_add(duration.min(60_000) as i64);
         }
         self.cooldown_until
     }

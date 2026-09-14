@@ -644,6 +644,7 @@ async fn execute_component_primary(
     price: &crate::model::ModelPrice,
     mut primary: PlannedProxyRoute,
     original_body_length: usize,
+    recovery_wait_deadline: tokio::time::Instant,
 ) -> Result<Response, AppError> {
     let readiness = match refresh_route_snapshot(request.state, &mut primary.route).await {
         Ok(readiness) => readiness,
@@ -660,6 +661,62 @@ async fn execute_component_primary(
     if readiness != PreparedRouteReadiness::Ready {
         return finish_unavailable(&request, readiness.error_code(), None).await;
     }
+    // Component requests are buffered and never replayed. A configured group
+    // still has to pass the same generation-fenced health gate before send.
+    // Keep the native component path unchanged when no policy was selected.
+    let upstream_attempt = if let Some(snapshot) = request.state.group_routing.as_ref()
+        && let Some(policy) = snapshot.policy(
+            primary.route.route_id,
+            primary.route.account_id,
+            primary.route.credential_generation,
+        ) {
+        let admission = request
+            .state
+            .db
+            .claim_upstream_account_attempt_with_strategy(
+                snapshot.tenant_id,
+                primary.route.account_id,
+                primary.route.credential_generation,
+                request.state.config.upstream_health,
+                policy.allow_probe(),
+                Some(policy.cooldown_ms()),
+                false,
+            )
+            .await?;
+        match admission {
+            UpstreamAttemptAdmission::Unavailable {
+                transient_wait_eligible: true,
+                ..
+            } => {
+                let Some((route, _, guard)) = routing::recovery_wait::wait(
+                    request.state,
+                    request.request_id,
+                    primary.route.clone(),
+                    recovery_wait_deadline,
+                )
+                .await?
+                else {
+                    return finish_unavailable(&request, "upstream_unavailable", None).await;
+                };
+                primary.route = route;
+                Some(guard)
+            }
+            UpstreamAttemptAdmission::Unavailable { .. } => {
+                return finish_unavailable(&request, "upstream_unavailable", None).await;
+            }
+            admission => Some(UpstreamAttemptGuard::new(
+                request.state,
+                request.request_id,
+                primary.route.route_id,
+                primary.route.account_id,
+                primary.route.credential_generation,
+                admission,
+                None,
+            )),
+        }
+    } else {
+        None
+    };
     let mut active_route = match materialize_proxy_route(request.state, primary).await {
         Ok(prepared) => prepared,
         Err(_) => return finish_proxy_failure(&request, "provider_candidate_invalid").await,
@@ -705,6 +762,7 @@ async fn execute_component_primary(
         &active_route.route.credential,
         prepared,
         component_context,
+        upstream_attempt,
     )
     .await
 }
@@ -951,6 +1009,7 @@ pub(super) async fn proxy(
             &price,
             primary,
             request_body_length,
+            recovery_wait_deadline,
         )
         .await;
     }
@@ -1456,6 +1515,7 @@ struct BufferedRequest<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn execute_component_provider(
     request: BufferedRequest<'_>,
     driver: &str,
@@ -1464,6 +1524,7 @@ async fn execute_component_provider(
     credential: &UpstreamCredential,
     prepared: PreparedProviderRequest,
     context: RequestContext,
+    mut upstream_attempt: Option<UpstreamAttemptGuard>,
 ) -> Result<Response, AppError> {
     let target = match component_provider_url(base_url, &prepared.path) {
         Ok(target) => target,
@@ -1536,12 +1597,50 @@ async fn execute_component_provider(
                 is_connect = error.is_connect(),
                 "component provider upstream request failed"
             );
+            if let Some(attempt) = upstream_attempt.as_mut() {
+                attempt
+                    .complete(UpstreamAttemptTerminal::Failed {
+                        kind: crate::db::UpstreamFailureKind::Connection,
+                        reason: UpstreamHealthReason::Connection,
+                    })
+                    .await;
+            }
             return finish_component_provider_failure(&request, "upstream_connection").await;
         }
     };
     let upstream_status = upstream.status();
     if !upstream_status.is_success() && !upstream_status.is_redirection() {
-        drop(upstream);
+        if let Some(attempt) = upstream_attempt.as_mut() {
+            let terminal = if upstream_status == StatusCode::TOO_MANY_REQUESTS {
+                let (response, kind) = routing::classify_rate_limit(upstream.into()).await;
+                drop(response);
+                UpstreamAttemptTerminal::Failed {
+                    kind,
+                    reason: UpstreamHealthReason::RateLimited,
+                }
+            } else {
+                drop(upstream);
+                if matches!(
+                    upstream_status,
+                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+                ) {
+                    UpstreamAttemptTerminal::Failed {
+                        kind: crate::db::UpstreamFailureKind::Authentication,
+                        reason: UpstreamHealthReason::Unavailable,
+                    }
+                } else if upstream_status.is_server_error() {
+                    UpstreamAttemptTerminal::Failed {
+                        kind: crate::db::UpstreamFailureKind::Unavailable,
+                        reason: UpstreamHealthReason::Unavailable,
+                    }
+                } else {
+                    UpstreamAttemptTerminal::Inconclusive
+                }
+            };
+            attempt.complete(terminal).await;
+        } else {
+            drop(upstream);
+        }
         return finish_buffered_request(
             &request,
             upstream_status,
@@ -1660,7 +1759,7 @@ async fn execute_component_provider(
         .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
         .map(|(_, value)| value.as_str())
         .unwrap_or("application/json");
-    finish_buffered_request(
+    let result = finish_buffered_request(
         &request,
         status,
         Bytes::from(normalized.body),
@@ -1668,7 +1767,17 @@ async fn execute_component_provider(
         usage,
         None,
     )
-    .await
+    .await;
+    // A component's 2xx headers or normalized output do not prove recovery.
+    // Only a successful durable terminal settlement may heal the probe.
+    if let Some(attempt) = upstream_attempt.as_mut()
+        && result
+            .as_ref()
+            .is_ok_and(|response| response.status().is_success())
+    {
+        attempt.complete(UpstreamAttemptTerminal::Succeeded).await;
+    }
+    result
 }
 
 async fn finish_component_provider_failure(

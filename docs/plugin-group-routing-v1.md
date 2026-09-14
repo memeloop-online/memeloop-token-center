@@ -34,8 +34,9 @@ Invalid/missing/trapping strategy code records
 `group_routing_native_fallback` and retains native handling of that bucket's
 authorized candidates. `group_routing_observe_fallback` retains native terminal
 health handling. No configuration, credentials, payloads or plugin error text
-are logged. A group version changing during snapshot collection also falls
-back; a running request never switches to the newer config or plugin runtime.
+are logged. One database statement pins every candidate's applicable group,
+priority, membership, nullable configuration and version together; a running
+request never switches to newer config or plugin runtime.
 
 ## ABI
 

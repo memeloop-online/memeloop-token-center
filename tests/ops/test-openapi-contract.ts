@@ -205,6 +205,30 @@ test("retired migration and archive-import surfaces are absent from the public c
   assert.ok(!scopes.some((scope) => scope.startsWith("imports:session_archive:" + "quarantine:")));
 });
 
+test("group routing strategy contracts require tenant scope and dual CAS without credential strategies", () => {
+  const document = cloneDocument();
+  for (const family of ["provider-groups", "route-groups"]) {
+    const operation = document.paths[`/internal/v1/${family}/{group_id}/routing-strategy`].put;
+    assert.deepEqual(operation.security, [{ serviceBearer: [] }]);
+    assert.equal(operation["x-required-scope"], "routes:write");
+    assert.equal(operation.requestBody.content["application/json"].schema.$ref, "#/components/schemas/UpdateGroupRoutingStrategyRequest");
+    assert.equal(operation.responses["409"].$ref, "#/components/responses/Conflict");
+    assert.equal(operation.responses["404"].$ref, "#/components/responses/NotFound");
+  }
+  assert.ok(!document.paths["/internal/v1/credential-groups/{group_id}/routing-strategy"]);
+  const request = document.components.schemas.UpdateGroupRoutingStrategyRequest;
+  assert.equal(request.additionalProperties, false);
+  for (const field of ["tenant_external_id", "expected_updated_at", "expected_strategy_version", "routing_priority"]) assert.ok(request.required.includes(field));
+  assert.equal(request.properties.expected_strategy_version.minimum, 0);
+  assert.equal(request.properties.routing_priority.format, "int32");
+  for (const field of ["routing_strategy", "routing_priority", "strategy_version"]) assert.ok(document.components.schemas.Group.required.includes(field));
+  assert.deepEqual(document.components.schemas.NullableGroupRoutingStrategy.oneOf, [{ $ref: "#/components/schemas/GroupRoutingStrategy" }, { type: "null" }]);
+  const catalog = document.paths["/internal/v1/plugins/group-routing-strategies"].get;
+  assert.equal(catalog["x-required-scope"], "routes:read");
+  assert.deepEqual(catalog.security, [{ serviceBearer: [] }]);
+  assert.deepEqual(document.components.schemas.GroupRoutingStrategyCatalogEntry.required, ["id", "version", "schema", "default"]);
+});
+
 test("ContractFailure remains a distinct error type", () => assert.ok(new ContractFailure("x") instanceof Error));
 
 test("generation quarantine has dedicated tenant-bound reconciliation authority", () => {
