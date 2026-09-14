@@ -778,7 +778,22 @@ mod tests {
         let task = tokio::spawn(bounded_json_response(client.get(url), budget));
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut bytes = [0; 4096];
-        socket.read(&mut bytes).await.unwrap();
+        let mut received = 0;
+        loop {
+            assert!(
+                received < bytes.len(),
+                "catalog request headers exceed fixture bound"
+            );
+            let count = socket.read(&mut bytes[received..]).await.unwrap();
+            assert_ne!(count, 0, "catalog request ended before complete headers");
+            received += count;
+            if bytes[..received]
+                .windows(4)
+                .any(|window| window == b"\r\n\r\n")
+            {
+                break;
+            }
+        }
         (socket, task)
     }
 
