@@ -128,15 +128,18 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
   loadArchiveDetail?: SessionReplayArchiveLoader;
 }) {
   const { t } = useI18n();
-  const [archivePage, setArchivePage] = useState<{ sessionId: string; scopeKey: string; loader?: SessionReplayArchiveLoader; values: RequestDetail[] }>({ sessionId: '', scopeKey: '', values: [] });
-  const archiveDetails = archivePage.sessionId === detail.session_id && archivePage.scopeKey === scopeKey && archivePage.loader === loadArchiveDetail ? archivePage.values : [];
+  const orderedRequests = [...detail.requests].sort(requestOrder).slice(0, SESSION_REPLAY_MAX_REQUESTS);
+  const visibleRevisions = new Map(orderedRequests.map(request => [request.request_id, archiveRevision(request)]));
+  const [archivePage, setArchivePage] = useState<{ sessionId: string; scopeKey: string; loader?: SessionReplayArchiveLoader; values: RequestDetail[]; revisions: Map<string, string> }>({ sessionId: '', scopeKey: '', values: [], revisions: new Map() });
+  // Scope and per-request freshness are checked during render, before effect cleanup.
+  const archiveDetails = archivePage.sessionId === detail.session_id && archivePage.scopeKey === scopeKey && archivePage.loader === loadArchiveDetail
+    ? archivePage.values.filter(request => visibleRevisions.has(request.request_id) && archivePage.revisions.get(request.request_id) === visibleRevisions.get(request.request_id)) : [];
   const readScope = useRef<ReplayReadScope | undefined>(undefined);
   const [mismatchedIds, setMismatchedIds] = useState<Set<string>>(new Set());
   const [archiveLoading, setArchiveLoading] = useState(Boolean(loadArchiveDetail));
   const entryRefs = useRef(new Map<number, HTMLElement>());
   const [selectedTurn, setSelectedTurn] = useState<number>();
 
-  const orderedRequests = [...detail.requests].sort(requestOrder).slice(0, SESSION_REPLAY_MAX_REQUESTS);
   const requestKey = JSON.stringify(orderedRequests.map(archiveRevision));
   // Live list refreshes create fresh objects even when archive inputs are unchanged.
   // Keep the bounded read batch stable so a busy session cannot starve its replay.
@@ -148,7 +151,7 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
 
   function publish(scope: ReplayReadScope) {
     if (!current(scope)) return;
-    setArchivePage({ sessionId: scope.sessionId, scopeKey: scope.scopeKey, loader: scope.loader, values: [...scope.cache.values()] });
+    setArchivePage({ sessionId: scope.sessionId, scopeKey: scope.scopeKey, loader: scope.loader, values: [...scope.cache.values()], revisions: new Map(scope.finished) });
     setMismatchedIds(new Set(scope.mismatched));
     setArchiveLoading([...scope.wanted].some(([id, value]) => scope.finished.get(id) !== value.revision));
   }
@@ -184,7 +187,7 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
   }
 
   useEffect(() => {
-    setArchivePage({ sessionId: detail.session_id, scopeKey, loader: loadArchiveDetail, values: [] });
+    setArchivePage({ sessionId: detail.session_id, scopeKey, loader: loadArchiveDetail, values: [], revisions: new Map() });
     setMismatchedIds(new Set());
     setSelectedTurn(undefined);
     setArchiveLoading(Boolean(loadArchiveDetail));
