@@ -3,6 +3,52 @@ use crate::db::UpstreamAttemptAdmission;
 use std::time::Duration;
 use uuid::Uuid;
 
+const TEST_PROBE_LEASE_MILLIS: i64 = 1_000;
+const TEST_PROBE_HEARTBEAT_MILLIS: i64 = 25;
+
+async fn wait_for_heartbeat_beyond_deadline(
+    pool: &sqlx::AnyPool,
+    account: Uuid,
+    initial_deadline: i64,
+) -> i64 {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while unix_millis() <= initial_deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let post_deadline_lease = loop {
+            let now = unix_millis();
+            let lease_until: i64 = sqlx::query_scalar(
+                "SELECT probe_lease_until FROM upstream_account_health WHERE upstream_account_id=$1",
+            )
+            .bind(account.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if lease_until > now {
+                break lease_until;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        // Prove that the detached committed task renews again after the lease
+        // that existed at caller cancellation has elapsed.
+        loop {
+            let lease_until: i64 = sqlx::query_scalar(
+                "SELECT probe_lease_until FROM upstream_account_health WHERE upstream_account_id=$1",
+            )
+            .bind(account.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if lease_until > post_deadline_lease && lease_until > unix_millis() {
+                return lease_until;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("committed completion must outlive the caller's original probe deadline")
+}
+
 #[tokio::test]
 async fn committed_observation_survives_caller_cancellation_and_keeps_probe_heartbeat() {
     let directory = tempfile::tempdir().unwrap();
@@ -11,8 +57,8 @@ async fn committed_observation_survives_caller_cancellation_and_keeps_probe_hear
         directory.path().join("committed-health.db").display()
     );
     let mut config = crate::config::Config::for_test(url.clone());
-    config.upstream_health.probe_lease_millis = 100;
-    config.upstream_health.probe_heartbeat_millis = 10;
+    config.upstream_health.probe_lease_millis = TEST_PROBE_LEASE_MILLIS;
+    config.upstream_health.probe_heartbeat_millis = TEST_PROBE_HEARTBEAT_MILLIS;
     let state = AppState::initialize(config).await.unwrap();
     let pool = sqlx::AnyPool::connect(&url).await.unwrap();
     let tenant = Uuid::now_v7();
@@ -52,18 +98,15 @@ async fn committed_observation_survives_caller_cancellation_and_keeps_probe_hear
         .unwrap();
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let lease_until: i64 = sqlx::query_scalar(
+    let initial_deadline: i64 = sqlx::query_scalar(
         "SELECT probe_lease_until FROM upstream_account_health WHERE upstream_account_id=$1",
     )
     .bind(account.to_string())
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(
-        lease_until > unix_millis(),
-        "committed completion must retain its own heartbeat after caller cancellation"
-    );
+    let renewed = wait_for_heartbeat_beyond_deadline(&pool, account, initial_deadline).await;
+    assert!(renewed > unix_millis());
     gate.release.notify_one();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
