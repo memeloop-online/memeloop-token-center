@@ -15,7 +15,7 @@ const formatCurrency = (value: string, currency: string, locale: Locale) => form
 const formatMilliseconds = (value: number | null, locale: Locale) => formatDurationDisplay(value, locale).text;
 
 /** A user agent is evidence, not a human actor name. Keep its raw value in detail. */
-function clientLabel(value: string | undefined) {
+function clientLabel(value: string | null | undefined) {
   return value?.trim().split(/[\s/;(]/, 1)[0] || undefined;
 }
 
@@ -267,7 +267,7 @@ function SessionActivity({ detail, summary, currency, loading, onSelect }: {
             <header><div><DetailTooltip content={`${t('sessions.client')}: ${request.structure?.client_name || actor}\n${t('sessions.diagnostics')}: ${request.request_id}\n${request.protocol}`}><b className="session-event-model" tabIndex={0}>{request.model}</b></DetailTooltip><span className={`status ${status}`}>{request.status_code ?? t('common.running')}</span>{task && <span className="pill">{task}</span>}{relations.map((relation) => <span className="session-relation" key={`${relation.from_request_id ?? 'root'}-${relation.relation}`}>{t(`conversationRelation.${relation.relation}`)}</span>)}</div><time dateTime={new Date(request.created_at).toISOString()}>{new Date(request.created_at).toLocaleString(locale)}</time></header>
             <div className="session-event-request"><span>{actor}</span></div>
             {parent && <p className="session-event-parent">← {parent}</p>}
-            <footer><DetailTooltip content={`${t('sessions.tokens')}: ${request.input_tokens + request.output_tokens}\n${t('sessions.averageLatency')}: ${request.duration_ms ?? '—'} ms\n${t('sessions.cost')}: ${request.cost} ${request.currency ?? currency ?? summaryCurrency ?? ''}`}><span tabIndex={0}>{eventMetrics(request).join(' · ')}</span></DetailTooltip>{request.error_code && <code className="error-code">{request.error_code}</code>}<button type="button" className="secondary session-event-open" disabled={loading} onClick={() => onSelect(request)}>{t('request.inspect')}</button></footer>
+            <footer><DetailTooltip content={`${t('sessions.tokens')}: ${request.input_tokens + request.output_tokens}\n${t('sessions.averageLatency')}: ${request.duration_ms == null ? '—' : `${request.duration_ms} ms`}\n${t('sessions.cost')}: ${request.cost} ${request.currency ?? currency ?? summaryCurrency ?? ''}`.trim()}><span tabIndex={0}>{eventMetrics(request).join(' · ')}</span></DetailTooltip>{request.error_code && <code className="error-code">{request.error_code}</code>}<button type="button" className="secondary session-event-open" disabled={loading} onClick={() => onSelect(request)}>{t('request.inspect')}</button></footer>
           </article>
         </li>;
       })}</ol>
