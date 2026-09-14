@@ -1152,7 +1152,7 @@ async fn postgres_conversation_projection_prematerializes_before_the_session_loc
 }
 
 #[tokio::test]
-async fn postgres_proxy_conversation_finish_lock_does_not_block_same_key_admission() {
+async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         return;
     };
@@ -1344,6 +1344,52 @@ async fn postgres_proxy_conversation_finish_lock_does_not_block_same_key_admissi
     )
     .await;
 
+    let request_b_json = serde_json::json!({"messages": [{
+        "role": "user", "content": format!("independent-context-{unique}")
+    }]});
+    let hints_b = ConversationHints {
+        session_id: Some(format!("admission-lock-{unique}")),
+        ..ConversationHints::default()
+    };
+    // The observed unique-row wait above is our database barrier: A is still
+    // preparing its content. B must finish on the SAME explicit session while
+    // that wait remains blocked, not merely pass same-key admission.
+    let finished_b = if let Ok(Ok(reservation_b)) = &started_b {
+        Some(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                database.finish_proxy_request(FinishProxyRequest {
+                    request_id: request_b,
+                    tenant_id: key.tenant_id,
+                    reservation: reservation_b,
+                    input_token_ceiling: 100,
+                    output_token_ceiling: 100,
+                    requested_service_tier: None,
+                    status_code: 200,
+                    duration_ms: 1,
+                    usage: TokenUsage {
+                        input_tokens: 5,
+                        output_tokens: 3,
+                        ..TokenUsage::default()
+                    },
+                    charge_contract_ceiling: false,
+                    error_code: None,
+                    response_object: "objects/blake3/postgres-admission-lock-response-b",
+                    conversation: Some(ProxyConversationInput {
+                        key: &key,
+                        request_json: &request_b_json,
+                        hints: &hints_b,
+                        client_name: Some("codex"),
+                        upstream_response_id: None,
+                    }),
+                }),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+
     // Always release the blocker before interpreting B's result so a regression fails
     // promptly instead of leaving the spawned finish waiting on test teardown.
     blocker.rollback().await.unwrap();
@@ -1371,11 +1417,26 @@ async fn postgres_proxy_conversation_finish_lock_does_not_block_same_key_admissi
     .fetch_one(&inspection)
     .await
     .unwrap();
-    assert_eq!(materialized, (151, 151));
+    assert_eq!(materialized, (152, 152));
     let reservation_b = started_b
         .expect("same-key request B admission must complete within five seconds")
         .unwrap();
+    assert_eq!(
+        finished_b
+            .expect("B must have been admitted")
+            .expect("same-session B must finish while A waits for immutable content")
+            .unwrap(),
+        FinishProxyRequestResult::Finished {
+            cost_micros: 8,
+            usage_invalid: false,
+        }
+    );
 
+    // A finished-owner replay with brand-new content must not prepare any
+    // tenant atoms/nodes, or repeated forged payloads could grow hidden rows.
+    let replay_json = serde_json::json!({"messages": [{
+        "role": "user", "content": format!("must-not-materialize-{unique}")
+    }]});
     let finish_b_result = database
         .finish_proxy_request(FinishProxyRequest {
             request_id: request_b,
@@ -1394,17 +1455,40 @@ async fn postgres_proxy_conversation_finish_lock_does_not_block_same_key_admissi
             charge_contract_ceiling: false,
             error_code: None,
             response_object: "objects/blake3/postgres-admission-lock-response-b",
-            conversation: None,
+            conversation: Some(ProxyConversationInput {
+                key: &key,
+                request_json: &replay_json,
+                hints: &hints_b,
+                client_name: Some("codex"),
+                upstream_response_id: None,
+            }),
         })
         .await
         .unwrap();
     assert_eq!(
         finish_b_result,
-        FinishProxyRequestResult::Finished {
+        FinishProxyRequestResult::AlreadyFinished {
+            status_code: 200,
             cost_micros: 8,
-            usage_invalid: false,
+            error_code: None,
+            response_object: "objects/blake3/postgres-admission-lock-response-b".to_owned(),
         }
     );
+    let replay_atoms: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM semantic_atoms WHERE tenant_id = $1")
+            .bind(key.tenant_id.to_string())
+            .fetch_one(&inspection)
+            .await
+            .unwrap();
+    assert_eq!(replay_atoms, 152);
+    let observations: (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(DISTINCT cluster_id) FROM conversation_observations WHERE key_id = $1",
+    )
+    .bind(key.key_id.to_string())
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(observations, (2, 1));
 
     for (reservation_id, expected_cost) in [(reservation_a.id, 18_i64), (reservation_b.id, 8)] {
         let reservation_row: (String, Option<i64>) =
