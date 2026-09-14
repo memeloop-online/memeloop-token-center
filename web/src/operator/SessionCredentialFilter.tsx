@@ -42,8 +42,8 @@ export function SessionCredentialFilter({ value, sessions, token, tenant, onChan
   return <label htmlFor={id}>{t('sessions.credential')}
     <Combobox id={id} freeform value={query} selectedOptions={value ? [value] : []}
       placeholder={t('sessions.searchPlaceholder')}
-      onChange={event => { const next = event.target.value; setQuery(next); if (!next || /^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(next)) onChange(next); }}
-      onOptionSelect={(_, data) => { onChange(data.optionValue ?? ''); setQuery(data.optionText ?? ''); }}>
+      onChange={event => { const next = event.target.value; setQuery(next); const valid = !next || /^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(next); event.target.setCustomValidity(valid ? '' : t('groups.noMatches')); if (valid) onChange(next); }}
+      onOptionSelect={(_, data) => { (document.getElementById(id) as HTMLInputElement | null)?.setCustomValidity(''); onChange(data.optionValue ?? ''); setQuery(data.optionText ?? ''); }}>
       <Option value="" text={t('common.all')}>{t('common.all')}</Option>
       {matches.map(option => <Option key={option.id} value={option.id} text={option.label}>{option.label}</Option>)}
     </Combobox>
