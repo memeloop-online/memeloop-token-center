@@ -23,15 +23,17 @@ fn data(value: Value) -> Vec<u8> {
 }
 
 #[test]
-fn failed_done_preserves_first_contract_reason_and_observed_usage() {
+fn invalid_usage_fails_on_its_frame_without_waiting_for_done() {
     let mut state = state();
-    state
-        .observe(&data(
-            json!({"id":"test", "object":"chat.completion.chunk", "model":"k3",
+    let result = state.observe(&data(
+        json!({"id":"test", "object":"chat.completion.chunk", "model":"k3",
         "choices":[{"index":0,"delta":{"content":"canary-content"},"finish_reason":null}],
         "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}),
-        ))
-        .unwrap();
+    ));
+    assert_eq!(result, Err("chat_usage_sequence"));
+    assert!(state.usage_observed);
+    assert!(!state.done_observed);
+    assert_eq!(state.event_class, "choice");
     assert_eq!(
         state.observe(b"data: [DONE]\n\n"),
         Err("chat_usage_sequence")
@@ -47,9 +49,11 @@ fn translation_reasons_distinguish_usage_finish_and_limits_without_payload() {
     let mut state = state();
     assert_eq!(
         state.observe(b"data: {\"choices\":\"canary-secret\"}\n\n"),
-        Err("choices_missing")
+        Err("kimi_choices_type")
     );
-    assert_eq!(state.translator.finish(), Err("finish_reason_missing"));
+    // Schema rejection now happens before any translator output is created.
+    assert!(state.pending.is_empty());
+    assert_eq!(state.translator.finish(), Err("empty_stream"));
     let mut translator =
         responses::Stream::new(responses::Context::new(&json!({"model":"kimi-k3"})));
     translator
@@ -93,6 +97,38 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
     fn make_writer(&'a self) -> Self::Writer {
         self.clone()
     }
+}
+
+#[test]
+fn schema_failure_logs_the_first_frame_category_without_provider_field_names() {
+    let capture = Capture::default();
+    let _other_dispatch = tracing::Dispatch::new(tracing_subscriber::registry());
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(capture.clone())
+            .finish(),
+    );
+    tracing::dispatcher::with_default(&dispatch, || {
+        let mut state = state();
+        let reason = state
+            .observe(&data(json!({
+                "id":"test", "object":"chat.completion.chunk", "model":"k3",
+                "choices":[{"index":0,"delta":{"content":"canary-secret"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2,"canary-secret":1}
+            })))
+            .unwrap_err();
+        assert_eq!(reason, "kimi_usage_unknown_field");
+        assert!(!state.done_observed);
+        state.report_failure("observe", reason);
+    });
+    let logged = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert!(!logged.contains("canary-secret"));
+    let value: Value = serde_json::from_str(logged.trim()).unwrap();
+    assert_eq!(value["fields"]["error_kind"], "kimi_usage_unknown_field");
+    assert_eq!(value["fields"]["event_class"], "choice");
+    assert_eq!(value["fields"]["done_observed"], false);
 }
 
 #[tokio::test]

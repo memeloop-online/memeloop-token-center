@@ -12,6 +12,33 @@ fn usage() -> Value {
     json!({"prompt_tokens":5,"completion_tokens":2,"total_tokens":7})
 }
 
+#[tokio::test]
+async fn malformed_accounting_never_completes_responses_or_validates_native_chat_usage() {
+    for usage in crate::api::kimi_transport::usage::invalid_examples() {
+        let chunk = wire(Some("stop"), usage, json!({"content":"fixture"}));
+        let mut native = ResponsesSseCapture::for_kimi_chat_usage();
+        native.push(&chunk);
+        native.push(b"data: [DONE]\n\n");
+        let summary = native.finish_summary();
+        assert!(summary.usage_invalid);
+        assert!(summary.usage.is_none());
+        let output = state(vec![Ok(chunk), Ok(Bytes::from_static(b"data: [DONE]\n\n"))])
+            .into_stream()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(output.iter().any(Result::is_err));
+        let text = String::from_utf8(
+            output
+                .into_iter()
+                .filter_map(Result::ok)
+                .flatten()
+                .collect(),
+        )
+        .unwrap();
+        assert!(!text.contains("response.completed"));
+    }
+}
+
 fn state(chunks: Vec<Result<Bytes, &'static str>>) -> StreamState {
     StreamState {
         upstream: Box::pin(futures_util::stream::iter(chunks)),
