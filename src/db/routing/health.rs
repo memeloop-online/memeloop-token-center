@@ -37,6 +37,7 @@ pub(crate) enum UpstreamAttemptAdmission {
         cooldown_until: i64,
         probe_lease_until: i64,
         shared_probe_eligible: bool,
+        transient_wait_eligible: bool,
     },
 }
 
@@ -216,6 +217,27 @@ impl Database {
         credential_generation: i64,
         health: UpstreamHealthConfig,
     ) -> Result<UpstreamAttemptAdmission, AppError> {
+        self.claim_upstream_attempt_inner(upstream_account_id, credential_generation, health, false)
+            .await
+    }
+
+    pub(crate) async fn claim_transient_recovery_attempt(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        health: UpstreamHealthConfig,
+    ) -> Result<UpstreamAttemptAdmission, AppError> {
+        self.claim_upstream_attempt_inner(upstream_account_id, credential_generation, health, true)
+            .await
+    }
+
+    async fn claim_upstream_attempt_inner(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        health: UpstreamHealthConfig,
+        transient_only: bool,
+    ) -> Result<UpstreamAttemptAdmission, AppError> {
         let now = unix_millis();
         let row = sqlx::query(
             "SELECT health.consecutive_failures, health.cooldown_until, health.probe_lease_until,
@@ -236,6 +258,7 @@ impl Database {
                 cooldown_until: 0,
                 probe_lease_until: 0,
                 shared_probe_eligible: false,
+                transient_wait_eligible: false,
             });
         };
         let Some(consecutive_failures) = row.try_get::<Option<i64>, _>("consecutive_failures")?
@@ -248,13 +271,17 @@ impl Database {
         let cooldown_until: i64 = row.try_get("cooldown_until")?;
         let probe_lease_until: i64 = row.try_get("probe_lease_until")?;
         let last_failure_kind: String = row.try_get("last_failure_kind")?;
-        if cooldown_until > now || probe_lease_until > now {
+        if cooldown_until > now
+            || probe_lease_until > now
+            || (transient_only && last_failure_kind != "unavailable")
+        {
             return Ok(UpstreamAttemptAdmission::Unavailable {
                 cooldown_until,
                 probe_lease_until,
                 shared_probe_eligible: last_failure_kind == "connection"
                     && cooldown_until <= now
                     && probe_lease_until > now,
+                transient_wait_eligible: last_failure_kind == "unavailable",
             });
         }
         let lease_token = Uuid::now_v7();
@@ -266,6 +293,7 @@ impl Database {
                AND credential_generation = $5
                AND cooldown_until <= $3
                AND probe_lease_until <= $3
+               AND ($6 = 0 OR last_failure_kind = 'unavailable')
                AND EXISTS (
                  SELECT 1 FROM upstream_accounts account
                  WHERE account.id = upstream_account_health.upstream_account_id
@@ -278,6 +306,7 @@ impl Database {
         .bind(now)
         .bind(upstream_account_id.to_string())
         .bind(credential_generation)
+        .bind(i64::from(transient_only))
         .execute(&self.pool)
         .await?;
         Ok(if result.rows_affected() == 1 {
@@ -287,6 +316,7 @@ impl Database {
                 cooldown_until,
                 probe_lease_until,
                 shared_probe_eligible: false,
+                transient_wait_eligible: last_failure_kind == "unavailable",
             }
         })
     }
@@ -626,6 +656,81 @@ mod tests {
         .await
         .unwrap();
         (directory, database, account_id)
+    }
+
+    #[tokio::test]
+    async fn transient_recovery_is_generation_fenced_single_probe_and_excludes_hard_isolation() {
+        let (_directory, database, account) = fixture().await;
+        database
+            .record_upstream_account_failure(account, 1, UpstreamFailureKind::Unavailable)
+            .await
+            .unwrap();
+        assert!(matches!(
+            database
+                .claim_transient_recovery_attempt(account, 1, UpstreamHealthConfig::DEFAULT)
+                .await
+                .unwrap(),
+            UpstreamAttemptAdmission::Unavailable {
+                transient_wait_eligible: true,
+                ..
+            }
+        ));
+        for kind in [
+            "quota_exhausted",
+            "rate_limited",
+            "credential",
+            "invalid_response",
+        ] {
+            sqlx::query("UPDATE upstream_account_health SET cooldown_until = 0, last_failure_kind = $1 WHERE upstream_account_id = $2")
+                .bind(kind).bind(account.to_string()).execute(&database.pool).await.unwrap();
+            assert!(matches!(
+                database
+                    .claim_transient_recovery_attempt(account, 1, UpstreamHealthConfig::DEFAULT)
+                    .await
+                    .unwrap(),
+                UpstreamAttemptAdmission::Unavailable {
+                    transient_wait_eligible: false,
+                    ..
+                }
+            ));
+        }
+        sqlx::query("UPDATE upstream_account_health SET cooldown_until = 0, last_failure_kind = 'unavailable' WHERE upstream_account_id = $1")
+            .bind(account.to_string()).execute(&database.pool).await.unwrap();
+        assert!(matches!(
+            database
+                .claim_transient_recovery_attempt(account, 2, UpstreamHealthConfig::DEFAULT)
+                .await
+                .unwrap(),
+            UpstreamAttemptAdmission::Unavailable {
+                transient_wait_eligible: false,
+                ..
+            }
+        ));
+        let (first, second) = tokio::join!(
+            database.claim_transient_recovery_attempt(account, 1, UpstreamHealthConfig::DEFAULT),
+            database.claim_transient_recovery_attempt(account, 1, UpstreamHealthConfig::DEFAULT),
+        );
+        let results = [first.unwrap(), second.unwrap()];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, UpstreamAttemptAdmission::Probe { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(
+                    result,
+                    UpstreamAttemptAdmission::Unavailable {
+                        transient_wait_eligible: true,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

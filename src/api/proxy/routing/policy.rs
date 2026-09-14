@@ -8,6 +8,19 @@ pub(in crate::api::proxy) struct RequestAttemptBudget {
 }
 
 impl RequestAttemptBudget {
+    pub(in crate::api::proxy) fn recovery_wait_deadline(
+        &self,
+        health: crate::config::UpstreamHealthConfig,
+    ) -> tokio::time::Instant {
+        // Reuse the existing configured cooldown + one probe lease, frozen
+        // once with this request; never extend its original network budget.
+        let millis = health
+            .unavailable_cooldown_millis
+            .saturating_add(health.probe_lease_millis)
+            .max(0) as u64;
+        let cap = tokio::time::Instant::now() + std::time::Duration::from_millis(millis);
+        self.deadline.map_or(cap, |deadline| deadline.min(cap))
+    }
     pub(in crate::api::proxy) fn from_primary(route: &ResolvedUpstream) -> Result<Self, AppError> {
         if !codex_transport::is_driver(&route.driver) {
             return Ok(Self {
