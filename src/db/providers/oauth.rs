@@ -112,6 +112,11 @@ impl Database {
             .ok_or(AppError::NotFound)?;
         let driver: String = row.try_get("driver")?;
         if driver == crate::oauth::codex_device::PROVIDER_DRIVER {
+            if row.try_get::<String, _>("auth_kind")? != "oauth" {
+                return Err(AppError::BadRequest(
+                    "Codex transport proxy updates require an OAuth credential".into(),
+                ));
+            }
             crate::provider::validate_codex_proxy_url(&proxy_url)?;
         }
         let generation: i64 = row.try_get("credential_generation")?;
