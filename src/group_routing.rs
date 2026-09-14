@@ -1,4 +1,6 @@
 //! Request-owned group policy. Authorization and health leases stay in core.
+#[cfg(test)]
+pub(crate) mod test_observe_gate;
 use crate::{
     AppState,
     error::AppError,
@@ -334,6 +336,8 @@ pub(crate) async fn observe(
     generation: i64,
     outcome: GroupRoutingOutcome,
 ) -> Option<GroupRoutingDirective> {
+    #[cfg(test)]
+    test_observe_gate::wait(request_id).await;
     let snapshot = state.group_routing.as_ref()?;
     let policy = snapshot.policy(route, account, generation)?;
     let mut candidate = policy.candidate.clone();

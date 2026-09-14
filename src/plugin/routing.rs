@@ -361,6 +361,22 @@ impl PluginRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absent_group_capability_preserves_existing_serialized_contract() {
+        let contributions = serde_json::to_value(PluginContributions::default()).unwrap();
+        assert!(
+            contributions.get("group_routing").is_none(),
+            "adding a null field would change every existing application's pinned contract digest"
+        );
+        assert_eq!(
+            contributions,
+            serde_json::json!({
+                "traffic_policy":false,"request_rewrite":false,"configuration":null,
+                "providers":[],"operator_ui":[],"service_data":[]
+            })
+        );
+    }
     fn fixture() -> (GroupRoutingInput, GroupRoutingPlan) {
         let candidate = GroupRoutingCandidate {
             tenant_id: "tenant".into(),

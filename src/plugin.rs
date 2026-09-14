@@ -120,7 +120,7 @@ pub struct PluginManifest {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginContributions {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_routing: Option<routing::GroupRoutingContribution>,
     #[serde(default)]
     pub traffic_policy: bool,

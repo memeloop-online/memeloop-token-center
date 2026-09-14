@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+mod observe_heartbeat_tests;
 use crate::metrics::{UpstreamHealthEvent, UpstreamHealthReason};
 use std::{
     collections::HashMap,
@@ -295,10 +297,12 @@ impl UpstreamAttemptGuard {
     }
 
     pub(in crate::api::proxy) async fn complete(&mut self, terminal: UpstreamAttemptTerminal) {
-        self.stop_heartbeat();
         let Some(state) = self.state.take() else {
             return;
         };
+        // Observe may wait for bounded component capacity. Keep renewing the
+        // owner fence until its conclusive database transition has finished;
+        // short probe leases must not expire during plugin observation.
         record_terminal(
             UpstreamAttemptRecord {
                 state,
@@ -313,6 +317,7 @@ impl UpstreamAttemptGuard {
             terminal,
         )
         .await;
+        self.stop_heartbeat();
     }
 
     fn stop_heartbeat(&mut self) {
