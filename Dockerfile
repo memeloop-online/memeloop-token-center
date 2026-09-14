@@ -48,7 +48,13 @@ RUN MTC_BUILD_GIT_SHA="${MTC_BUILD_GIT_SHA_INPUT}" \
     && rm -rf target /usr/local/cargo/registry /usr/local/cargo/git
 
 FROM ${RUNTIME_IMAGE}
-ENV LD_LIBRARY_PATH=/usr/local/lib
+# SQLite copies every bound archive ciphertext through libc. Keep those
+# transient ~114 KiB allocations out of glibc arenas so they are unmapped when
+# the statement clears its bindings instead of fragmenting long-lived heaps.
+# Deployments can override this standard glibc tunable through the container
+# environment when profiling a different libc workload.
+ENV LD_LIBRARY_PATH=/usr/local/lib \
+    GLIBC_TUNABLES=glibc.malloc.mmap_threshold=65536
 COPY --from=builder /tmp/libgcc_s.so.1 /usr/local/lib/libgcc_s.so.1
 COPY --from=builder /tmp/libstdc++.so.6 /usr/local/lib/libstdc++.so.6
 COPY --from=builder /tmp/memeloop-token-center /usr/local/bin/memeloop-token-center
