@@ -783,7 +783,7 @@ pub(super) async fn proxy(
     // FIFO, and occurs after durable admission but before any upstream send.
     if !buffered_request
         .memory
-        .finalize_request(Instant::now() + RETAINED_REQUEST_ADMISSION_WAIT)
+        .finalize_request(tokio::time::Instant::now() + RETAINED_REQUEST_ADMISSION_WAIT)
         .await
     {
         state
