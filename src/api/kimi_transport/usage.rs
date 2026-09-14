@@ -14,10 +14,10 @@ pub(in crate::api) fn normalize(value: &Value) -> Result<Value, &'static str> {
             *details = serde_json::json!({});
         }
         let details = details.as_object_mut().ok_or("kimi_usage_details_type")?;
-        if let Some(nested) = details.get("cached_tokens") {
-            if nested.as_u64() != Some(cached) {
-                return Err("kimi_cached_tokens_conflict");
-            }
+        if let Some(nested) = details.get("cached_tokens")
+            && nested.as_u64() != Some(cached)
+        {
+            return Err("kimi_cached_tokens_conflict");
         }
         details.insert("cached_tokens".into(), cached.into());
     }
