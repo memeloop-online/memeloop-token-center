@@ -48,8 +48,17 @@ test('slow replay reads survive live metadata refresh, publish incrementally and
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-replay.html?live=1`);
     await page.locator('.session-replay-entry.message.user').waitFor();
     assert.equal(await page.locator('.session-replay-entry.tool-result').count(), 0, 'fast content appears before the deliberately slow tool archive');
+    for (let index = 4; index < 7; index += 1) {
+      await page.getByRole('button', { name: 'Append live request', exact: true }).click();
+      await page.waitForFunction(id => window.sessionReplayReads[id] === 1, `additional-${index}`);
+    }
+    assert.equal(await page.evaluate(() => window.sessionReplayReads['replay-r2']), 1, 'new live requests never abort or restart an unchanged slow read');
+    assert.equal(await page.evaluate(() => window.sessionReplayAborts), 0);
     await page.getByRole('button', { name: 'Switch replay scope', exact: true }).click();
     assert.equal(await page.locator('.session-replay-entry.message').count(), 0, 'the previous scope is hidden immediately, before the new read completes');
+    await page.getByRole('button', { name: 'Resume scope reads', exact: true }).click();
+    await page.locator('.session-replay-entry.message.user').waitFor();
+    await page.getByRole('button', { name: 'Release slow archive', exact: true }).click();
     await page.locator('.session-replay-entry.tool-result').waitFor();
     assert.equal(await page.evaluate(() => window.sessionReplayReads['replay-r1']), 2, 'metadata-only refreshes never restart completed or in-flight reads');
     assert.equal(await page.evaluate(() => window.sessionReplayReads['replay-r2']), 2);

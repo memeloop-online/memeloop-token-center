@@ -26,7 +26,7 @@ test('replay reads are bounded, abortable, and accept only an exact request and 
   assert.match(replayView, /SESSION_REPLAY_MAX_REQUESTS/);
   assert.match(replayView, /REPLAY_ARCHIVE_CONCURRENCY = 4/);
   assert.match(replayView, /const controller = new AbortController\(\)/);
-  assert.match(replayView, /candidate\.request_id !== request\.request_id \|\| candidate\.session_context\?\.session_id !== detail\.session_id/);
+  assert.match(replayView, /candidate\.request_id !== request\.request_id \|\| candidate\.session_context\?\.session_id !== scope\.sessionId/);
   assert.match(replayView, /controller\.abort\(\)/);
   assert.match(replayView, /projectSessionReplay\(detail\.session_id, archiveDetails\)/);
   assert.match(replayView, /outside_session/);

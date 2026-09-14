@@ -70,16 +70,32 @@ const liveFixture = new URLSearchParams(location.search).has('live');
 declare global { interface Window { sessionReplayReads: Record<string, number>; sessionReplayAborts: number } }
 window.sessionReplayReads = {};
 window.sessionReplayAborts = 0;
+let slowReleased = false;
+let scopePaused = false;
+const slowWaiters = new Set<() => void>();
+const scopeWaiters = new Set<() => void>();
+function waitForRelease(waiters: Set<() => void>, signal: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    const release = () => { waiters.delete(release); resolve(); };
+    waiters.add(release);
+    signal.addEventListener('abort', () => { waiters.delete(release); window.sessionReplayAborts += 1; reject(signal.reason); }, { once: true });
+  });
+}
+function releaseAll(waiters: Set<() => void>) { for (const release of [...waiters]) release(); }
 async function loadArchive(requestView: ConversationRequest, signal: AbortSignal) {
   window.sessionReplayReads[requestView.request_id] = (window.sessionReplayReads[requestView.request_id] ?? 0) + 1;
+  if (liveFixture && scopePaused) await waitForRelease(scopeWaiters, signal);
+  if (liveFixture && requestView.request_id === 'replay-r2' && !slowReleased) await waitForRelease(slowWaiters, signal);
   await new Promise<void>((resolve, reject) => {
-    const timer = window.setTimeout(resolve, liveFixture ? requestView.request_id === 'replay-r2' ? 600 : 80 : 12);
+    const timer = window.setTimeout(resolve, 12);
     signal.addEventListener('abort', () => { window.sessionReplayAborts += 1; window.clearTimeout(timer); reject(signal.reason); }, { once: true });
   });
   if (requestView.request_id === 'replay-r3' && requestView.archive_state === 'bound') return archive(requestView, null,
     { output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Late archive arrived' }] }] });
   if (requestView.archive_state === 'gap') throw new Error('fixture archive no longer available');
   const value = archives.get(requestView.request_id);
+  if (requestView.request_id.startsWith('additional-')) return archive(requestView, null,
+    { output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Additional completed archive' }] }] });
   if (!value) throw new Error('fixture archive unavailable');
   return value;
 }
@@ -93,7 +109,13 @@ function Fixture() {
     return () => window.clearInterval(timer);
   }, []);
   return <I18nProvider><main className="main" data-fixture-ready="session-replay">
-    {liveFixture && <><button onClick={() => setScope('scope-b')}>Switch replay scope</button><button onClick={() => setCurrent(value => ({ ...value, requests: value.requests.map(request => request.request_id === 'replay-r3' ? { ...request, archive_state: 'bound' } : request) }))}>Finish late archive</button></>}
+    {liveFixture && <>
+      <button onClick={() => setCurrent(value => ({ ...value, requests: [...value.requests, request(`additional-${value.requests.length}`, value.requests.length + 1)] }))}>Append live request</button>
+      <button onClick={() => { scopePaused = true; setScope('scope-b'); }}>Switch replay scope</button>
+      <button onClick={() => { scopePaused = false; releaseAll(scopeWaiters); }}>Resume scope reads</button>
+      <button onClick={() => { slowReleased = true; releaseAll(slowWaiters); }}>Release slow archive</button>
+      <button onClick={() => setCurrent(value => ({ ...value, requests: value.requests.map(request => request.request_id === 'replay-r3' ? { ...request, archive_state: 'bound' } : request) }))}>Finish late archive</button>
+    </>}
     {liveFixture && <button onClick={() => setCurrent(value => ({ ...value, requests: value.requests.map(request => request.request_id === 'replay-r1' ? { ...request, archive_state: 'gap' } : request) }))}>Invalidate complete archive</button>}
     <SessionReplayPanel detail={current} scopeKey={scope} loadArchiveDetail={loadArchive} />
   </main></I18nProvider>;

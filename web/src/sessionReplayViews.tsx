@@ -15,6 +15,18 @@ const REPLAY_EXPAND_TEXT_LENGTH = 1_600;
 
 export type SessionReplayArchiveLoader = (request: RequestView, signal: AbortSignal) => Promise<RequestDetail>;
 
+interface ReplayReadScope {
+  sessionId: string;
+  scopeKey: string;
+  loader: SessionReplayArchiveLoader;
+  disposed: boolean;
+  wanted: Map<string, { request: RequestView; revision: string }>;
+  jobs: Map<string, { controller: AbortController; revision: string }>;
+  cache: Map<string, RequestDetail>;
+  finished: Map<string, string>;
+  mismatched: Set<string>;
+}
+
 interface ReplayEntry {
   item: SessionReplayItem;
   index: number;
@@ -118,12 +130,9 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
   const { t } = useI18n();
   const [archivePage, setArchivePage] = useState<{ sessionId: string; scopeKey: string; loader?: SessionReplayArchiveLoader; values: RequestDetail[] }>({ sessionId: '', scopeKey: '', values: [] });
   const archiveDetails = archivePage.sessionId === detail.session_id && archivePage.scopeKey === scopeKey && archivePage.loader === loadArchiveDetail ? archivePage.values : [];
-  const archiveCache = useRef(new Map<string, RequestDetail>());
-  const archiveRevisions = useRef(new Map<string, string>());
-  const archiveOwner = useRef<{ sessionId: string; scopeKey: string; loader?: SessionReplayArchiveLoader }>({ sessionId: '', scopeKey: '' });
+  const readScope = useRef<ReplayReadScope | undefined>(undefined);
   const [mismatchedIds, setMismatchedIds] = useState<Set<string>>(new Set());
   const [archiveLoading, setArchiveLoading] = useState(Boolean(loadArchiveDetail));
-  const sequence = useRef(0);
   const entryRefs = useRef(new Map<number, HTMLElement>());
   const [selectedTurn, setSelectedTurn] = useState<number>();
 
@@ -133,73 +142,80 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
   // Keep the bounded read batch stable so a busy session cannot starve its replay.
   const sourceRequests = useMemo(() => orderedRequests, [requestKey]);
 
-  useEffect(() => {
-    if (!loadArchiveDetail) {
-      archiveCache.current.clear();
-      archiveRevisions.current.clear();
-      setArchivePage({ sessionId: detail.session_id, scopeKey, values: [] });
-      setArchiveLoading(false);
-      return undefined;
-    }
-    const current = ++sequence.current;
-    const controller = new AbortController();
-    if (archiveOwner.current.sessionId !== detail.session_id || archiveOwner.current.scopeKey !== scopeKey || archiveOwner.current.loader !== loadArchiveDetail) {
-      archiveCache.current.clear();
-      archiveRevisions.current.clear();
-      archiveOwner.current = { sessionId: detail.session_id, scopeKey, loader: loadArchiveDetail };
-    }
-    const activeIds = new Set(sourceRequests.map(request => request.request_id));
-    for (const id of archiveRevisions.current.keys()) if (!activeIds.has(id)) {
-      archiveCache.current.delete(id);
-      archiveRevisions.current.delete(id);
-    }
-    for (const request of sourceRequests) {
-      const revision = archiveRevision(request);
-      if (archiveRevisions.current.get(request.request_id) !== revision) archiveCache.current.delete(request.request_id);
-      archiveRevisions.current.set(request.request_id, revision);
-    }
-    const publish = () => setArchivePage({ sessionId: detail.session_id, scopeKey, loader: loadArchiveDetail, values: [...archiveCache.current.values()] });
-    publish();
-    setMismatchedIds(new Set());
-    setSelectedTurn(undefined);
-    if (!sourceRequests.length) {
-      setArchiveLoading(false);
-      return () => controller.abort();
-    }
-    setArchiveLoading(true);
+  function current(scope: ReplayReadScope) {
+    return !scope.disposed && readScope.current === scope;
+  }
 
-    void (async () => {
-      const mismatched = new Set<string>();
-      let cursor = 0;
-      const loadNext = async () => {
-        while (!controller.signal.aborted) {
-          const request = sourceRequests[cursor++];
-          if (!request) return;
-          if (archiveCache.current.get(request.request_id)?.archive_complete) continue;
-          try {
-            const candidate = await loadArchiveDetail(request, AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]));
-            if (controller.signal.aborted || current !== sequence.current) return;
-            if (candidate.request_id !== request.request_id || candidate.session_context?.session_id !== detail.session_id) {
-              mismatched.add(request.request_id);
-            } else {
-              archiveCache.current.set(request.request_id, candidate);
-              // Show each completed read immediately; one slow archive must not
-              // hide the rest of a conversation or discard finished live work.
-              publish();
-            }
-          } catch {
-            // Archive read failures remain an explicit archive-unavailable entry.
+  function publish(scope: ReplayReadScope) {
+    if (!current(scope)) return;
+    setArchivePage({ sessionId: scope.sessionId, scopeKey: scope.scopeKey, loader: scope.loader, values: [...scope.cache.values()] });
+    setMismatchedIds(new Set(scope.mismatched));
+    setArchiveLoading([...scope.wanted].some(([id, value]) => scope.finished.get(id) !== value.revision));
+  }
+
+  function pump(scope: ReplayReadScope) {
+    if (!current(scope)) return;
+    for (const [id, value] of scope.wanted) {
+      if (scope.jobs.size >= REPLAY_ARCHIVE_CONCURRENCY) break;
+      if (scope.jobs.has(id) || scope.finished.get(id) === value.revision) continue;
+      const controller = new AbortController();
+      const job = { controller, revision: value.revision };
+      scope.jobs.set(id, job);
+      void (async () => {
+        try {
+          const request = value.request;
+          const candidate = await scope.loader(request, AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]));
+          if (!current(scope) || scope.jobs.get(id) !== job) return;
+          if (candidate.request_id !== request.request_id || candidate.session_context?.session_id !== scope.sessionId) scope.mismatched.add(id);
+          else scope.cache.set(id, candidate);
+          scope.finished.set(id, value.revision);
+        } catch {
+          if (current(scope) && scope.jobs.get(id) === job) scope.finished.set(id, value.revision);
+        } finally {
+          // An obsolete finally must never restart work for a replaced scope or revision.
+          if (current(scope) && scope.jobs.get(id) === job) {
+            scope.jobs.delete(id);
+            pump(scope);
+            publish(scope);
           }
         }
-      };
-      await Promise.all(Array.from({ length: Math.min(REPLAY_ARCHIVE_CONCURRENCY, sourceRequests.length) }, loadNext));
-      if (controller.signal.aborted || current !== sequence.current) return;
-      publish();
-      setMismatchedIds(mismatched);
-      setArchiveLoading(false);
-    })();
+      })();
+    }
+  }
 
-    return () => controller.abort();
+  useEffect(() => {
+    setArchivePage({ sessionId: detail.session_id, scopeKey, loader: loadArchiveDetail, values: [] });
+    setMismatchedIds(new Set());
+    setSelectedTurn(undefined);
+    setArchiveLoading(Boolean(loadArchiveDetail));
+    if (!loadArchiveDetail) { readScope.current = undefined; return; }
+    const scope: ReplayReadScope = {
+      sessionId: detail.session_id, scopeKey, loader: loadArchiveDetail, disposed: false,
+      wanted: new Map(), jobs: new Map(), cache: new Map(), finished: new Map(), mismatched: new Set(),
+    };
+    readScope.current = scope;
+    return () => {
+      scope.disposed = true;
+      for (const job of scope.jobs.values()) job.controller.abort();
+      scope.jobs.clear(); scope.cache.clear(); scope.finished.clear(); scope.wanted.clear(); scope.mismatched.clear();
+    };
+  }, [detail.session_id, scopeKey, loadArchiveDetail]);
+
+  useEffect(() => {
+    const scope = readScope.current;
+    if (!scope || !current(scope)) return;
+    const wanted = new Map(sourceRequests.map(request => [request.request_id, { request, revision: archiveRevision(request) }]));
+    for (const [id, previous] of scope.wanted) {
+      if (wanted.get(id)?.revision === previous.revision) continue;
+      const obsolete = scope.jobs.get(id);
+      scope.jobs.delete(id);
+      obsolete?.controller.abort();
+      scope.cache.delete(id); scope.finished.delete(id); scope.mismatched.delete(id);
+    }
+    scope.wanted = wanted;
+    setSelectedTurn(undefined);
+    pump(scope);
+    publish(scope);
   }, [detail.session_id, scopeKey, loadArchiveDetail, requestKey, sourceRequests]);
 
   if (!loadArchiveDetail) return null;
