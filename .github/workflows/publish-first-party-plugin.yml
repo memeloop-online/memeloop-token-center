@@ -2,11 +2,6 @@ name: publish-first-party-plugin
 
 on:
   workflow_dispatch:
-    inputs:
-      installer_digest:
-        description: 'Published plugin-installer sha256 digest with keyless support (not a tag)'
-        type: string
-        required: true
 
 permissions:
   contents: read
@@ -17,7 +12,7 @@ concurrency:
 
 jobs:
   publish:
-    if: github.ref == 'refs/heads/master'
+    if: github.ref == 'refs/heads/master' && github.repository == 'memeloop-online/memeloop-token-center'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -26,8 +21,6 @@ jobs:
       id-token: write
     env:
       PLUGIN_SOURCE: ghcr.io/${{ github.repository_owner }}/mtc-model-guard
-      INSTALLER_SOURCE: ghcr.io/${{ github.repository_owner }}/memeloop-token-center-plugin-installer
-      INSTALLER_DIGEST: ${{ inputs.installer_digest }}
       SIGNING_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/publish-first-party-plugin.yml@refs/heads/master
       SIGNING_ISSUER: https://token.actions.githubusercontent.com
     steps:
@@ -37,6 +30,8 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
+      - name: Resolve installer executable trust from reviewed master source
+        run: node ops/ci/resolve-first-party-plugin-installer.ts
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable action
         with:
           toolchain: 1.95.0
@@ -51,8 +46,11 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Require a published compatible installer and its patched verifier
         run: |
-          [[ "$INSTALLER_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
           docker pull "$INSTALLER_SOURCE@$INSTALLER_DIGEST"
+          actual_revision=$(docker image inspect "$INSTALLER_SOURCE@$INSTALLER_DIGEST" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
+          [[ "$actual_revision" == "$INSTALLER_SOURCE_REVISION" ]]
+          # Executable trust comes from the reviewed digest above. Help/version
+          # are compatibility checks only, never proof that an image is trusted.
           docker run --rm --entrypoint /usr/local/bin/install-plugin-oci "$INSTALLER_SOURCE@$INSTALLER_DIGEST" --help | grep -- --cosign-certificate-identity
           container=$(docker create "$INSTALLER_SOURCE@$INSTALLER_DIGEST")
           trap 'docker rm "$container" >/dev/null' EXIT
@@ -95,7 +93,7 @@ jobs:
             --format json > "$RUNNER_TEMP/plugin-push.json"
           digest=$(node -e 'const p=JSON.parse(require("fs").readFileSync(process.argv[1]));if(!/^sha256:[a-f0-9]{64}$/.test(p.digest))process.exit(1);process.stdout.write(p.digest)' "$RUNNER_TEMP/plugin-push.json")
           echo "PLUGIN_DIGEST=$digest" >> "$GITHUB_ENV"
-      - name: Sign and independently verify exact GitHub OIDC identity
+      - name: Sign and verify exact GitHub OIDC identity using the reviewed verifier
         run: |
           cosign sign --yes "$PLUGIN_SOURCE@$PLUGIN_DIGEST"
           cosign verify --certificate-identity "$SIGNING_IDENTITY" \

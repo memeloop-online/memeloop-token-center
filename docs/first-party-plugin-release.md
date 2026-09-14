@@ -15,9 +15,23 @@ published digest**. Until a successful `publish-first-party-plugin` run produces
 digest, fixture Wasm, fabricated signature, branch tag or locally compiled file.
 
 The release coordinator must first publish a service/plugin-installer release
-containing optional keyless support. Then manually dispatch
-`.github/workflows/publish-first-party-plugin.yml` from `master`, supplying that
-plugin-installer image's immutable `sha256:...` digest. This is a separate,
+containing optional keyless support. Review that release's existing immutable
+image/source evidence, then use a reviewed master PR to set
+`.github/first-party-plugin-installer-trust.json` to `status: "ready"`, its exact
+`sha256:...` digest and full `source_revision`. The repository is fixed to
+`ghcr.io/memeloop-online/memeloop-token-center-plugin-installer`. This change
+intentionally leaves the record `awaiting-reviewed-installer-release` with null
+digest/revision: no compatible published image is currently claimed.
+
+Only after that review is merged, manually dispatch
+`.github/workflows/publish-first-party-plugin.yml` from `master`. There is no
+installer input: dispatch cannot select executable code. Before registry login,
+image execution or signing, a trusted source helper rejects an unavailable,
+malformed or different-repository trust record. The pulled image must also have
+the reviewed source-revision label before any executable is run. Help and version
+checks establish compatibility only; they do not establish executable trust.
+Changing the executable digest requires another reviewed source change, never
+an environment override or self-reported verification result. This is a separate,
 explicitly scheduled workload; it is not triggered by PRs or master pushes and
 does not compete automatically with service release jobs. Its host integration
 test builds the host with two jobs; allow the coordinator to schedule capacity.

@@ -41,5 +41,6 @@ writeFileSync(join(root, 'plugin-release.json'), `${JSON.stringify({
   workflow_run: `https://github.com/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`,
   signature: { policy: 'cosign-keyless', issuer: process.env.SIGNING_ISSUER, identity: process.env.SIGNING_IDENTITY },
   installer_reference: `${process.env.INSTALLER_SOURCE}@${process.env.INSTALLER_DIGEST}`,
+  installer_source_revision: process.env.INSTALLER_SOURCE_REVISION,
   files, installation_verified: true, registry_access: 'workflow-token; anonymous access not established',
 }, null, 2)}\n`);

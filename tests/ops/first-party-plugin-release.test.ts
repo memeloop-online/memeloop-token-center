@@ -5,9 +5,26 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
+import { installerEnvironment } from '../../ops/ci/resolve-first-party-plugin-installer.ts';
 
 const root = new URL('../../', import.meta.url).pathname;
 const hash = (bytes: Buffer) => `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+
+test('installer executable selection is master-reviewed, unavailable by default and not dispatch-controlled', () => {
+  const trust = JSON.parse(readFileSync(join(root, '.github/first-party-plugin-installer-trust.json'), 'utf8'));
+  assert.throws(() => installerEnvironment({ ...trust, status: 'awaiting-reviewed-installer-release', digest: null, source_revision: null }), /plugin release unavailable/);
+  const approved = { ...trust, status: 'ready', digest: `sha256:${'a'.repeat(64)}`, source_revision: 'b'.repeat(40) };
+  assert.equal(installerEnvironment(approved), `INSTALLER_SOURCE=${trust.repository}\nINSTALLER_DIGEST=${approved.digest}\nINSTALLER_SOURCE_REVISION=${approved.source_revision}\n`);
+  for (const change of [
+    { repository: 'ghcr.io/attacker/installer' }, { digest: 'latest' },
+    { digest: `${approved.digest}\nGITHUB_TOKEN=attacker` }, { source_revision: null },
+    { source_revision: 'master' }, { executable_path: '/tmp/attacker' },
+  ]) assert.throws(() => installerEnvironment({ ...approved, ...change }));
+  const workflow = readFileSync(join(root, '.github/workflows/publish-first-party-plugin.yml'), 'utf8');
+  assert.doesNotMatch(workflow, /inputs\.|installer_digest:/);
+  assert(workflow.indexOf('resolve-first-party-plugin-installer.ts') < workflow.indexOf('docker/login-action@'));
+  assert(workflow.indexOf('actual_revision=$(docker image inspect') < workflow.indexOf('docker run --rm'));
+});
 
 test('Model Guard default has no rewrite, provider, or host capability', () => {
   const manifest = JSON.parse(readFileSync(join(root, 'plugins/first-party/model-guard/plugin.json'), 'utf8'));
