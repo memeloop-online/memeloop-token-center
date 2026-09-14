@@ -248,6 +248,43 @@ static PAUSE_NEXT_BEGIN_ACK: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 #[cfg(test)]
+static PAUSE_NEXT_BEGIN: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, BeginAckPause>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn pause_next_begin_for_test(
+    state: &AppState,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered, entering) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let mut pauses = PAUSE_NEXT_BEGIN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        pauses
+            .insert(state.config.database_url.clone(), (entered, released))
+            .is_none()
+    );
+    (entering, release)
+}
+
+#[cfg(test)]
+async fn pause_begin_for_test(state: &AppState) {
+    let pause = PAUSE_NEXT_BEGIN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&state.config.database_url);
+    if let Some((entered, released)) = pause {
+        let _ = entered.send(());
+        let _ = released.await;
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn pause_next_begin_ack_for_test(
     state: &AppState,
 ) -> (
@@ -597,6 +634,8 @@ async fn run_response_archive_writer(
     terminal: tokio::sync::oneshot::Receiver<Bytes>,
     active: Arc<AtomicBool>,
 ) -> Result<(), AppError> {
+    #[cfg(test)]
+    pause_begin_for_test(&state).await;
     let mut writer = ResponseArchiveWriter::begin_inner(state.clone(), identity).await?;
     #[cfg(test)]
     pause_begin_ack_for_test(&state).await;

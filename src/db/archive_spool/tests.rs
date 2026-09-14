@@ -610,6 +610,15 @@ async fn identity_sequence_replay_and_exact_quota() {
         tenant_id: Uuid::new_v4(),
         ..id
     };
+    sqlx::query(
+        "UPDATE request_records SET completed_at = 2, response_object = 'archive/already-bound' WHERE id = $1",
+    )
+    .bind(id.request_id.to_string())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert!(!db.begin_response_archive_spool(id).await.unwrap());
+    terminal(&db, id).await;
     assert!(!db.begin_response_archive_spool(alien).await.unwrap());
     assert!(db.begin_response_archive_spool(id).await.unwrap());
     assert!(db.begin_response_archive_spool(id).await.unwrap());

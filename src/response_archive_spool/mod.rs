@@ -23,6 +23,8 @@ pub(crate) use producer::fail_next_append_for_test;
 #[cfg(test)]
 pub(crate) use producer::pause_next_begin_ack_for_test;
 #[cfg(test)]
+pub(crate) use producer::pause_next_begin_for_test;
+#[cfg(test)]
 pub(crate) use producer::pause_next_request_preseal_for_test;
 pub(crate) use producer::{BufferedArchive, PreparedArchiveBatch};
 pub(crate) use producer::{ResponseArchiveProducer, ResponseArchiveSettlement, mark_gap};

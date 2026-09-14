@@ -193,10 +193,22 @@ async fn incomplete_or_failed_tail_revokes_held_success_terminal() {
         assert!(!text.contains("private provider detail"));
         if expected_gap {
             let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-            let state: String = sqlx::query_scalar("SELECT state FROM response_archive_spools")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+            let state = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(state) =
+                        sqlx::query_scalar::<_, String>("SELECT state FROM response_archive_spools")
+                            .fetch_optional(&pool)
+                            .await
+                            .unwrap()
+                        && state == "gap"
+                    {
+                        break state;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("owned writer must durably fence the incomplete capture");
             assert_eq!(state, "gap");
             pool.close().await;
         }
@@ -228,6 +240,8 @@ async fn terminal_delivery_transfers_capture_to_the_owned_writer_or_records_a_ga
         )
         .await;
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+        let begin_pause = (!fail_append)
+            .then(|| crate::response_archive_spool::pause_next_begin_for_test(&fixture.state));
         if fail_append {
             // A SQLite RAISE(ABORT) queues transaction rollback when SQLx drops
             // the failed append. Under executor load that rollback can delay
@@ -239,7 +253,34 @@ async fn terminal_delivery_transfers_capture_to_the_owned_writer_or_records_a_ga
         }
         let response = send_resilient_chat(&fixture, None, true).await;
         assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body =
+            tokio::spawn(async move { to_bytes(response.into_body(), 1024 * 1024).await.unwrap() });
+        if let Some((entering, release)) = begin_pause {
+            tokio::time::timeout(Duration::from_secs(1), entering)
+                .await
+                .expect("owned writer must reach the deterministic pre-begin pause")
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let row: Option<(String, Option<i64>, Option<String>)> = sqlx::query_as(
+                        "SELECT id, completed_at, response_object FROM request_records",
+                    )
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap();
+                    if let Some((request_id, Some(_), Some(response_object))) = row
+                        && response_object == format!("gap://{request_id}/response")
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("short stream must finalize before the paused writer begins");
+            release.send(()).unwrap();
+        }
+        let body = body.await.unwrap();
         assert_eq!(body.as_ref(), payload.as_bytes());
         let (state, gap_reason): (String, Option<String>) =
             tokio::time::timeout(std::time::Duration::from_secs(1), async {
