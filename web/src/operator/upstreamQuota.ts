@@ -34,6 +34,19 @@ export interface UpstreamQuotaSnapshot {
     credit_error_code: string | null;
   };
   error_code: string | null;
+  reset_credits?: { status: string | null; granted_at: number | null; expires_at: number | null; source: string }[];
+}
+
+/** The next expiration belongs to reset opportunities, not a usage window. */
+export function quotaResetCreditExpiry(snapshot: UpstreamQuotaSnapshot, now = Date.now()): { state: 'known' | 'unknown' | 'none'; at?: number } {
+  if (snapshot.reset_capability.credit_error_code) return { state: 'unknown' };
+  const credits = snapshot.reset_credits;
+  if (!credits) return { state: snapshot.reset_capability.available_credits === 0 ? 'none' : 'unknown' };
+  const available = credits.filter(credit => credit.status === 'available');
+  if (credits.some(credit => credit.status === null) || available.some(credit => credit.expires_at === null || credit.granted_at === null || !Number.isFinite(credit.expires_at) || !Number.isFinite(credit.granted_at))) return { state: 'unknown' };
+  const upcoming = available.filter(credit => credit.granted_at! <= now && credit.expires_at! > now).map(credit => credit.expires_at!);
+  if (upcoming.length) return { state: 'known', at: Math.min(...upcoming) };
+  return { state: credits.length === 0 && snapshot.reset_capability.available_credits !== 0 ? 'unknown' : 'none' };
 }
 
 export function upstreamQuotaPath(accountId: string, tenant: string) {

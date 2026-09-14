@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import { formatElapsedTime, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
-import { quotaObservationState, quotaReadErrorMessage, quotaSourceLabel, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaPath, type UpstreamQuotaSnapshot } from './upstreamQuota';
+import { quotaObservationState, quotaReadErrorMessage, quotaResetCreditExpiry, quotaSourceLabel, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaPath, type UpstreamQuotaSnapshot } from './upstreamQuota';
+import type { QuotaReadState } from './useUpstreamQuotaReads';
 import './upstreamQuota.css';
 import { UpstreamQuotaReset } from './UpstreamQuotaReset';
 import { Disclosure, DetailTooltip } from '../design-system';
@@ -57,9 +58,22 @@ export function UpstreamQuotaDetails({ snapshot, refreshError }: { snapshot: Ups
       <b>{t('quota.resetCapability')}</b>
       <p>{t(resetMessage)}</p>
       {reset.available_credits !== null && <span>{t('quota.resetCredits', { available: formatNumber(reset.available_credits, locale), applicable: reset.applicable_credits === null ? '—' : formatNumber(reset.applicable_credits, locale) })}</span>}
+      {snapshot.provider === 'openai-codex' && <QuotaResetCreditExpiry snapshot={snapshot} now={now} />}
       {reset.credit_error_code && <p>{t('quota.resetCreditsUnavailable')} {t(quotaReadErrorMessage(reset.credit_error_code))}</p>}
     </div>
   </div>;
+}
+
+export function QuotaResetCreditExpiry({ snapshot, now }: { snapshot: UpstreamQuotaSnapshot; now?: number }) {
+  const { t, locale } = useI18n();
+  const [clock, setClock] = useState(Date.now);
+  useEffect(() => {
+    if (now !== undefined) return;
+    const timer = window.setInterval(() => setClock(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, [now]);
+  const expiry = quotaResetCreditExpiry(snapshot, now ?? clock);
+  return <span data-reset-credit-expiry={expiry.state}>{t(expiry.state === 'known' ? 'quota.creditExpiresAt' : expiry.state === 'none' ? 'quota.noUnexpiredCredits' : 'quota.creditExpiryUnknown', { time: expiry.at === undefined ? '—' : new Date(expiry.at).toLocaleString(locale) })}</span>;
 }
 
 /** Capability discovery must remain visible even when the first read fails.
@@ -84,11 +98,14 @@ export function UpstreamQuotaResetSection({ accountId, accountName, tenant, toke
 }
 
 /** User-triggered read: never starts one upstream request per card on page load. */
-export function UpstreamQuota({ accountId, accountName = accountId, credentialGeneration, tenant, token, onSnapshot, onRefreshFailed, initialSnapshot }: { accountId: string; accountName?: string; credentialGeneration: number; tenant: string; token: string; onSnapshot?: (snapshot: UpstreamQuotaSnapshot) => void; onRefreshFailed?: () => void; initialSnapshot?: UpstreamQuotaSnapshot }) {
+export function UpstreamQuota({ accountId, accountName = accountId, credentialGeneration, tenant, token, onSnapshot, onRefreshFailed, initialSnapshot, readState, onRefresh, refreshDisabled = false }: { accountId: string; accountName?: string; credentialGeneration: number; tenant: string; token: string; onSnapshot?: (snapshot: UpstreamQuotaSnapshot) => void; onRefreshFailed?: () => void; initialSnapshot?: UpstreamQuotaSnapshot; readState?: QuotaReadState; onRefresh?: () => void; refreshDisabled?: boolean }) {
   const { t } = useI18n();
-  const [snapshot, setSnapshot] = useState<UpstreamQuotaSnapshot | undefined>(initialSnapshot);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<'quota.readFailed' | 'quota.errorPermission'>();
+  const [localSnapshot, setSnapshot] = useState<UpstreamQuotaSnapshot | undefined>(initialSnapshot);
+  const [localBusy, setBusy] = useState(false);
+  const [localError, setError] = useState<'quota.readFailed' | 'quota.errorPermission'>();
+  const snapshot = onRefresh ? readState?.snapshot : localSnapshot;
+  const busy = onRefresh ? Boolean(readState?.busy) : localBusy;
+  const error = onRefresh ? readState?.error : localError;
   const scope = `${token}\0${tenant}\0${accountId}\0${credentialGeneration}`;
   const scopeRef = useRef(scope);
   scopeRef.current = scope;
@@ -98,6 +115,7 @@ export function UpstreamQuota({ accountId, accountName = accountId, credentialGe
     return () => requestRef.current?.abort();
   }, [scope]);
   async function load() {
+    if (onRefresh) { onRefresh(); return; }
     if (busy || !tenant || !token) return;
     const controller = new AbortController();
     requestRef.current?.abort();
@@ -119,7 +137,7 @@ export function UpstreamQuota({ accountId, accountName = accountId, credentialGe
     }
   }
   return <section className="upstream-quota" aria-label={t('quota.title')} aria-busy={busy}>
-    <div className="upstream-quota-heading"><h3>{t('quota.title')}</h3><button type="button" className="secondary" disabled={busy || !tenant} onClick={() => void load()}>{t(busy ? 'common.loading' : snapshot ? 'quota.refresh' : 'quota.view')}</button></div>
+    <div className="upstream-quota-heading"><h3>{t('quota.title')}</h3><button type="button" className="secondary" disabled={busy || !tenant || refreshDisabled} onClick={() => void load()}>{t(busy ? 'common.loading' : snapshot ? 'quota.refresh' : 'quota.view')}</button></div>
     {error && !snapshot && <div className="notice error" role="alert"><p>{t(error)}</p></div>}
     {!snapshot && busy && <div className="upstream-quota-loading" role="status"><span>{t('common.loading')}</span><div className="upstream-quota-skeleton" aria-hidden="true"><i /><i /></div></div>}
     {!snapshot && !busy && !error && <p>{t(tenant ? 'quota.notLoaded' : 'quota.selectTenant')}</p>}

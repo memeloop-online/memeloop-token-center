@@ -28,8 +28,9 @@ import {
 } from '../keyPagination';
 import { directCredentialSchema, supportsDirectConnection } from '../providerConnectionMethods';
 import { UpstreamAvailability, manualHealthLabel } from '../UpstreamAvailability';
-import { UpstreamQuota } from '../UpstreamQuota';
-import { quotaSummaryPresentation, type UpstreamQuotaSnapshot } from '../upstreamQuota';
+import { QuotaResetCreditExpiry, UpstreamQuota } from '../UpstreamQuota';
+import { quotaSummaryPresentation } from '../upstreamQuota';
+import { useUpstreamQuotaReads } from '../useUpstreamQuotaReads';
 import { connectionSchema, isPrivateProxyUrl, ProxyInput, UpstreamConnection } from '../UpstreamConnection';
 import { upstreamFormTemplates } from '../UpstreamFormTemplates';
 import { providerEditSchema } from '../providerEditSchema';
@@ -95,9 +96,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   const [reauthorizing, setReauthorizing] = useState<UpstreamAccount>();
   const [providerWorkspaceOpen, setProviderWorkspaceOpen] = useState(false);
   const [providerDetail, setProviderDetail] = useState<string>();
-  const [quotaSummaries, setQuotaSummaries] = useState<Record<string, { generation: number; snapshot?: UpstreamQuotaSnapshot; refreshFailed: boolean }>>({});
-  const quotaScope = useRef({ token, tenant, values });
-  quotaScope.current = { token, tenant, values };
+  const quotaReads = useUpstreamQuotaReads(token, tenant, values);
   const [providerCreateGeneration, setProviderCreateGeneration] = useState(0);
   const [proxyEditorOpen, setProxyEditorOpen] = useState(false);
   const [providerEditDraft, setProviderEditDraft] = useState<Record<string, unknown>>();
@@ -158,7 +157,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     },
   };
   useEffect(() => {
-    setProviderDetail(undefined); setQuotaSummaries({});
+    setProviderDetail(undefined);
     setProviderEditDraft(undefined); setMethod('direct'); setDriver(''); setRotating(undefined); setEditing(undefined); setReauthorizing(undefined); setProviderWorkspaceOpen(false);
     setBusy(''); setHealth({}); setDeletionReadiness({}); setMessage(''); setError('');
   }, [token, tenant, writeTenant]);
@@ -281,6 +280,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   const providerWorkspaceActive = providerWorkspaceOpen || Boolean(editing || rotating || reauthorizing);
   return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} /><section ref={providerList} className="provider-layout">
     <article className="panel provider-list"><div className="panel-title"><div><h2>{t('providers.title')}</h2><p className="muted">{t('providers.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>
+      <div className="row-actions quota-read-toolbar"><Button appearance="secondary" type="button" disabled={!token || !values.some(account => account.status === 'active' && Boolean(account.tenant_external_id ?? tenant)) || Boolean(quotaReads.progress?.busy) || Object.values(quotaReads.entries).some(entry => entry.busy)} onClick={() => void quotaReads.readAll()}>{t('quota.refreshAll')}</Button>{quotaReads.progress && <span role="status">{t(quotaReads.progress.busy ? 'quota.batchProgress' : 'quota.batchComplete', { done: formatNumber(quotaReads.progress.done, locale), total: formatNumber(quotaReads.progress.total, locale) })}</span>}</div>
       {error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{availabilityError && <div className="notice error" role="alert">{availabilityError}</div>}{message && <div ref={providerSuccess} tabIndex={-1} className="notice success" role="status">{message}</div>}
       <div className="account-list provider-directory">{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('status.active')} empty={t('providers.empty')} />}{statusFilter.values.map((value) => {
         const providerAvailable = providers.some((provider) => provider.id === value.driver);
@@ -293,7 +293,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
         const providerName = providers.find(provider => provider.id === value.driver)?.display_name ?? t('providerDirectory.other');
         const facts = availabilityWindow && availabilityWindow.tenant_external_id === (value.tenant_external_id ?? tenant) ? availabilityWindow.accounts.find(account => account.upstream_account_id === value.id) : undefined;
         const terminal = facts ? facts.metrics.successful_requests + facts.metrics.failed_requests : 0;
-        const cachedQuota = quotaSummaries[value.id];
+        const cachedQuota = quotaReads.entries[value.id];
         const generation = value.credential_generation;
         const quota = cachedQuota?.generation === generation ? cachedQuota.snapshot : undefined;
         const quotaRefreshFailed = Boolean(cachedQuota?.generation === generation && cachedQuota.refreshFailed);
@@ -309,8 +309,9 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             </div>
             <div className="provider-directory-summary"><span className={`status ${value.status === 'active' ? 'ok' : 'pending'}`}>{enumLabel(t, 'status', value.status)}</span><span>{t('providers.routes', { count: formatNumber(value.route_count, locale) })}</span></div>
             <div className="provider-directory-summary"><small>{t('providers.recentAvailability')}</small><span>{availabilityLoading ? t('common.loading') : !facts ? t('providerDirectory.unavailable') : terminal > 0 ? t('providerDirectory.successful', { percent: formatPercent(facts.metrics.successful_requests / terminal, locale) }) : t('providerDirectory.noRequests')}</span></div>
-            <div className="provider-directory-summary"><small>{t('quota.title')}</small><span>{quotaText}</span></div>
+            <div className="provider-directory-summary" aria-busy={Boolean(cachedQuota?.generation === generation && cachedQuota.busy)}><small>{t('quota.title')}</small><span role="status">{cachedQuota?.generation === generation && cachedQuota.busy ? t('quota.refreshing') : cachedQuota?.generation === generation && cachedQuota.queued ? t('quota.queued') : quotaText}</span>{quota?.provider === 'openai-codex' && <QuotaResetCreditExpiry snapshot={quota} />}</div>
             <div className="provider-directory-actions">
+              <Button appearance="secondary" type="button" disabled={!token || !(value.tenant_external_id ?? tenant) || value.status !== 'active' || Boolean(quotaReads.progress?.busy) || Boolean(cachedQuota?.generation === generation && cachedQuota.busy)} onClick={() => void quotaReads.read(value)}>{t('quota.refreshAccount')}</Button>
               <Button appearance="secondary" type="button" aria-expanded={detailOpen} aria-controls={`provider-details-${value.id}`} disabled={Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} onClick={() => setProviderDetail(detailOpen ? undefined : value.id)}>{t(detailOpen ? 'providerDirectory.close' : 'providerDirectory.open')}</Button>
               {providerAvailable && <Button appearance="subtle" type="button" data-inline-edit-trigger={value.id} disabled={!manageable || Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} onClick={(event) => { rememberTrigger(value.id, event.currentTarget); setProviderDetail(undefined); setProviderEditDraft(undefined); setEditing(value); }}>{t('providers.edit')}</Button>}
             </div>
@@ -321,16 +322,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             <UpstreamConnection key={`connection\0${token}\0${writeTenant}\0${value.id}`} readOnOpen account={value} token={token} tenant={writeTenant} disabled={!manageable || Boolean(busy)} onChanged={onChanged} onEditingChange={setProxyEditorOpen} />
             {value.credential_expires_at && <small>{t('providers.expires')}: {new Date(value.credential_expires_at).toLocaleString(locale)}</small>}
             <Disclosure title={currentHealth ? `${t('providers.recentAvailability')} · ${t(manualHealthLabel(currentHealth))}` : t('providers.recentAvailability')}><UpstreamAvailability account={value} snapshot={availabilitySnapshot} window={availabilityWindow} loading={availabilityLoading} manualHealth={currentHealth} onOpenRequest={onOpenRequest} /></Disclosure>
-            <UpstreamQuota key={`${token}\0${tenant}\0${value.id}\0${generation}`} accountId={value.id} accountName={value.name} credentialGeneration={generation} tenant={value.tenant_external_id ?? tenant} token={token} initialSnapshot={quota} onSnapshot={snapshot => setQuotaSummaries(current => {
-              // A late read owns the generation captured when it began, never
-              // the current account's newer generation after a credential change.
-              if (quotaScope.current.token !== token || quotaScope.current.tenant !== tenant || !quotaScope.current.values.some(account => account.id === value.id && account.credential_generation === generation)) return current;
-              return { ...current, [value.id]: { generation, snapshot, refreshFailed: false } };
-            })} onRefreshFailed={() => setQuotaSummaries(current => {
-              if (quotaScope.current.token !== token || quotaScope.current.tenant !== tenant || !quotaScope.current.values.some(account => account.id === value.id && account.credential_generation === generation)) return current;
-              const previous = current[value.id];
-              return { ...current, [value.id]: { generation, snapshot: previous?.generation === generation ? previous.snapshot : undefined, refreshFailed: true } };
-            })} />
+            <UpstreamQuota key={`${token}\0${tenant}\0${value.id}\0${generation}`} accountId={value.id} accountName={value.name} credentialGeneration={generation} tenant={value.tenant_external_id ?? tenant} token={token} readState={cachedQuota?.generation === generation ? cachedQuota : undefined} onRefresh={() => void quotaReads.read(value)} refreshDisabled={Boolean(quotaReads.progress?.busy)} />
             {currentReadiness && <small className={`status ${currentReadiness.can_delete ? 'ok' : 'pending'}`}>{deletionBlockers.join(' · ')}</small>}
           </div>
           <div className="account-meta">
