@@ -750,11 +750,21 @@ async fn image_arm_rejects_staging_paths_without_matching_bound_request_receipt(
         // Simulate a pointer whose authoritative attach receipt no longer
         // proves this request's durable body. The path itself remains valid.
         let trigger = match corruption {
-            "owner_kind = 'proxy_request'" => sqlx::query("CREATE TRIGGER invalidate_request_receipt AFTER UPDATE OF state ON archive_staging_attempts WHEN NEW.state = 'bound' AND NEW.purpose = 'request' BEGIN UPDATE archive_staging_attempts SET owner_kind = 'proxy_request' WHERE attempt_id = NEW.attempt_id; END"),
-            "owner_id = '00000000-0000-0000-0000-000000000000'" => sqlx::query("CREATE TRIGGER invalidate_request_receipt AFTER UPDATE OF state ON archive_staging_attempts WHEN NEW.state = 'bound' AND NEW.purpose = 'request' BEGIN UPDATE archive_staging_attempts SET owner_id = '00000000-0000-0000-0000-000000000000' WHERE attempt_id = NEW.attempt_id; END"),
-            "purpose = 'response'" => sqlx::query("CREATE TRIGGER invalidate_request_receipt AFTER UPDATE OF state ON archive_staging_attempts WHEN NEW.state = 'bound' AND NEW.purpose = 'request' BEGIN UPDATE archive_staging_attempts SET purpose = 'response' WHERE attempt_id = NEW.attempt_id; END"),
-            "state = 'cleanup_pending'" => sqlx::query("CREATE TRIGGER invalidate_request_receipt AFTER UPDATE OF state ON archive_staging_attempts WHEN NEW.state = 'bound' AND NEW.purpose = 'request' BEGIN UPDATE archive_staging_attempts SET state = 'cleanup_pending' WHERE attempt_id = NEW.attempt_id; END"),
-            "bound_locator = bound_locator || '.other'" => sqlx::query("CREATE TRIGGER invalidate_request_receipt AFTER UPDATE OF state ON archive_staging_attempts WHEN NEW.state = 'bound' AND NEW.purpose = 'request' BEGIN UPDATE archive_staging_attempts SET bound_locator = bound_locator || '.other' WHERE attempt_id = NEW.attempt_id; END"),
+            "owner_kind = 'proxy_request'" => sqlx::query(
+                "CREATE TRIGGER invalidate_request_receipt AFTER UPDATE OF state ON archive_staging_attempts WHEN NEW.state = 'bound' AND NEW.purpose = 'request' BEGIN UPDATE archive_staging_attempts SET owner_kind = 'proxy_request' WHERE attempt_id = NEW.attempt_id; END",
+            ),
+            "owner_id = '00000000-0000-0000-0000-000000000000'" => sqlx::query(
+                "CREATE TRIGGER invalidate_request_receipt AFTER UPDATE OF state ON archive_staging_attempts WHEN NEW.state = 'bound' AND NEW.purpose = 'request' BEGIN UPDATE archive_staging_attempts SET owner_id = '00000000-0000-0000-0000-000000000000' WHERE attempt_id = NEW.attempt_id; END",
+            ),
+            "purpose = 'response'" => sqlx::query(
+                "CREATE TRIGGER invalidate_request_receipt AFTER UPDATE OF state ON archive_staging_attempts WHEN NEW.state = 'bound' AND NEW.purpose = 'request' BEGIN UPDATE archive_staging_attempts SET purpose = 'response' WHERE attempt_id = NEW.attempt_id; END",
+            ),
+            "state = 'cleanup_pending'" => sqlx::query(
+                "CREATE TRIGGER invalidate_request_receipt AFTER UPDATE OF state ON archive_staging_attempts WHEN NEW.state = 'bound' AND NEW.purpose = 'request' BEGIN UPDATE archive_staging_attempts SET state = 'cleanup_pending' WHERE attempt_id = NEW.attempt_id; END",
+            ),
+            "bound_locator = bound_locator || '.other'" => sqlx::query(
+                "CREATE TRIGGER invalidate_request_receipt AFTER UPDATE OF state ON archive_staging_attempts WHEN NEW.state = 'bound' AND NEW.purpose = 'request' BEGIN UPDATE archive_staging_attempts SET bound_locator = bound_locator || '.other' WHERE attempt_id = NEW.attempt_id; END",
+            ),
             _ => unreachable!("only the five static receipt corruptions are tested"),
         };
         trigger.execute(&pool).await.unwrap();
