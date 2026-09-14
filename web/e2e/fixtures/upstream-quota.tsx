@@ -21,6 +21,11 @@ const snapshot: UpstreamQuotaSnapshot = {
   reset_capability: { provider_supported: mode === 'unsupported' ? false : true, implementation_available: mode === 'reset' || mode === 'unknown', prepare_available: mode === 'reset' || mode === 'unknown', confirmation_required: mode === 'reset' || mode === 'unknown', retryable: false, available_credits: 2, applicable_credits: 1, reason: null, credit_error_code: null },
   error_code: mode === 'stale-error' ? 'quota_destination_invalid' : mode === 'rate-limited' ? 'quota_rate_limited' : null,
 };
+if (mode === 'kimi') {
+  snapshot.provider = 'kimi-oauth'; snapshot.stale = false; snapshot.stale_after = now + 300_000;
+  snapshot.reset_capability = { ...snapshot.reset_capability, provider_supported: false, implementation_available: false, prepare_available: false, available_credits: null, applicable_credits: null };
+  snapshot.windows = snapshot.windows.map((window, index) => ({ ...window, id: index ? 'summary' : 'limit-0', label: index ? 'summary' : 'limit-0', source: 'kimi_usage', unit: null, used_percent: index ? 25 : 0, remaining: 100, limit: 100, reset_at: now + (index ? 604_800_000 : 18_000_000) }));
+}
 declare global { interface Window { quotaReads: number; quotaWrites: number; quotaPrepares: number; quotaConfirms: number; quotaStatuses: number; quotaReconciles: number } }
 window.quotaReads = 0; window.quotaWrites = 0;
 window.quotaPrepares = 0; window.quotaConfirms = 0;
