@@ -285,13 +285,15 @@ async fn terminal_delivery_transfers_capture_to_the_owned_writer_or_records_a_ga
         let (state, gap_reason): (String, Option<String>) =
             tokio::time::timeout(std::time::Duration::from_secs(1), async {
                 loop {
-                    let row: (String, Option<String>) = sqlx::query_as(
+                    let row: Option<(String, Option<String>)> = sqlx::query_as(
                         "SELECT state, last_error_code FROM response_archive_spools",
                     )
-                    .fetch_one(&pool)
+                    .fetch_optional(&pool)
                     .await
                     .unwrap();
-                    if matches!(row.0.as_str(), "pending" | "gap") {
+                    if let Some(row) = row
+                        && matches!(row.0.as_str(), "pending" | "gap")
+                    {
                         break row;
                     }
                     tokio::task::yield_now().await;
