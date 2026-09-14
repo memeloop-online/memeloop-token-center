@@ -60,8 +60,8 @@ fn quota_reqwest_error_kind(
     }
 }
 
-fn quota_reqwest_error_code(error: &reqwest::Error) -> &'static str {
-    if error.is_timeout() {
+fn quota_reqwest_error_code(is_timeout: bool) -> &'static str {
+    if is_timeout {
         "quota_timeout"
     } else {
         "quota_transport_failed"
@@ -366,7 +366,7 @@ impl QuotaCache {
         let refresh_started = tokio::time::Instant::now();
         let result = match tokio::time::timeout(Duration::from_secs(8), async {
             if account.driver == "kimi-oauth" {
-                kimi::read(state, credential, empty(None)).await
+                kimi::read(state, account, credential, empty(None)).await
             } else {
                 read_codex(state, account, credential, empty(None)).await
             }
@@ -629,7 +629,7 @@ async fn get_json(
         .await
         .map_err(|error| {
             log_quota_request_error(context, "send", &error, started);
-            quota_reqwest_error_code(&error)
+            quota_reqwest_error_code(error.is_timeout())
         })?;
     decode_response(response, context, started).await
 }
@@ -657,7 +657,7 @@ async fn decode_response(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
             log_quota_request_error(context, "body", &error, started);
-            quota_reqwest_error_code(&error)
+            quota_reqwest_error_code(error.is_timeout())
         })?;
         if bytes.len().saturating_add(chunk.len()) > BODY_LIMIT {
             return Err("quota_response_too_large");
@@ -765,6 +765,8 @@ mod tests {
             quota_reqwest_error_kind(false, false, false, false),
             "other"
         );
+        assert_eq!(quota_reqwest_error_code(true), "quota_timeout");
+        assert_eq!(quota_reqwest_error_code(false), "quota_transport_failed");
     }
 
     #[tokio::test]
