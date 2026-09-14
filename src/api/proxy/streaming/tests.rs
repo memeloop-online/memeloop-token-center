@@ -1,6 +1,102 @@
 use super::*;
 
 #[tokio::test]
+async fn ready_upstream_evidence_wins_when_downstream_is_already_closed() {
+    let (body_sender, body_receiver) = tokio::sync::mpsc::channel(1);
+    drop(body_receiver);
+
+    match poll_upstream_or_downstream_closed(&body_sender, std::future::ready("terminal")).await {
+        DownstreamAwarePoll::Upstream {
+            value,
+            downstream_closed,
+        } => {
+            assert_eq!(value, "terminal");
+            assert!(
+                downstream_closed,
+                "the caller must restrict follow-up polls to pending sanitizer evidence"
+            );
+        }
+        DownstreamAwarePoll::DownstreamClosed => {
+            panic!("an already-ready terminal item must win the cancellation race")
+        }
+    }
+}
+
+#[tokio::test]
+async fn downstream_close_interrupts_a_pending_upstream_poll() {
+    let (body_sender, body_receiver) = tokio::sync::mpsc::channel(1);
+    drop(body_receiver);
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(100),
+        poll_upstream_or_downstream_closed(&body_sender, std::future::pending::<()>()),
+    )
+    .await
+    .expect("receiver closure must wake the blocked poll without a wall-clock wait");
+    assert!(matches!(result, DownstreamAwarePoll::DownstreamClosed));
+}
+
+#[test]
+fn observed_downstream_close_keeps_cancellation_attribution() {
+    for error in [
+        "upstream_stream",
+        "upstream_timeout",
+        "upstream_invalid_response",
+        "upstream_incomplete_response",
+    ] {
+        assert_eq!(
+            transport_error_with_downstream_precedence(true, error),
+            "downstream_disconnected"
+        );
+        assert_eq!(
+            transport_error_with_downstream_precedence(false, error),
+            error
+        );
+    }
+}
+
+#[test]
+fn send_disconnect_only_finishes_nonempty_pending_terminal_delivery() {
+    let completed = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-ready\",\"usage\":{\"input_tokens\":3,\"output_tokens\":7}}}\n\n";
+    let mut sanitizer = crate::api::sse::ResponsesStreamingSanitizer::default();
+    assert!(sanitizer.push(completed).unwrap().is_empty());
+    assert!(pending_delivery_can_advance(
+        Some(&sanitizer),
+        completed.len()
+    ));
+    let mut transport_error = Some("downstream_disconnected");
+    let mut downstream_closed = false;
+    assert!(resume_pending_delivery_after_send_disconnect(
+        &mut transport_error,
+        &mut downstream_closed,
+        Some(&sanitizer)
+    ));
+    assert_eq!(transport_error, None);
+    assert!(downstream_closed);
+    assert!(
+        !pending_delivery_can_advance(Some(&sanitizer), 0),
+        "empty ready chunks cannot advance framing and must not starve cancellation"
+    );
+    transport_error = Some("delivery_state");
+    downstream_closed = false;
+    assert!(!resume_pending_delivery_after_send_disconnect(
+        &mut transport_error,
+        &mut downstream_closed,
+        Some(&sanitizer)
+    ));
+    assert_eq!(transport_error, Some("delivery_state"));
+    assert!(!downstream_closed);
+
+    assert!(!sanitizer.finish().unwrap().is_empty());
+    transport_error = Some("downstream_disconnected");
+    assert!(!resume_pending_delivery_after_send_disconnect(
+        &mut transport_error,
+        &mut downstream_closed,
+        Some(&sanitizer)
+    ));
+}
+
+#[tokio::test]
 async fn archive_eof_owner_keeps_the_body_open_until_settlement_handoff_finishes() {
     let (body_sender, body_receiver) = tokio::sync::mpsc::channel(1);
     let (settlement_sender, settlement_receiver) = tokio::sync::oneshot::channel();

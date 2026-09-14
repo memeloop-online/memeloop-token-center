@@ -3492,7 +3492,8 @@ async fn completed_provider_usage_survives_a_later_downstream_disconnect() {
     let fixture = codex_route_fixture("completed-usage-downstream-disconnect").await;
     let prefix = concat!(
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-usage-contract\"}}\n\n",
-        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"delivered output\"}\n\n"
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"delivered output\"}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"buffered output\"}\n\n"
     )
     .to_owned();
     let completed = completed_response_with_usage(3, 7);
@@ -3510,6 +3511,11 @@ async fn completed_provider_usage_survives_a_later_downstream_disconnect() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
+    let request_id = response.headers()[REQUEST_ID_HEADER]
+        .to_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
     let mut body = response.into_body().into_data_stream();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -3524,9 +3530,33 @@ async fn completed_provider_usage_survives_a_later_downstream_disconnect() {
     })
     .await
     .unwrap();
-    drop(body);
     terminal_tx.send(()).unwrap();
     upstream.await.unwrap();
+
+    // The extra prefix frame occupies the one-slot downstream channel while
+    // the provider terminal is captured and sealed. Waiting for the durable
+    // spool state proves the completed usage is already authoritative before
+    // the later receiver drop; no scheduler delay is part of this boundary.
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let state: Option<String> = sqlx::query_scalar(
+                "SELECT state FROM response_archive_spools WHERE request_id = $1",
+            )
+            .bind(request_id.to_string())
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            if state.as_deref() == Some("pending") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the provider terminal must be sealed before downstream cancellation");
+    pool.close().await;
+    drop(body);
 
     wait_for_request_settlement(&fixture, 1).await;
     let rows = fixture
@@ -3544,6 +3574,91 @@ async fn completed_provider_usage_survives_a_later_downstream_disconnect() {
     );
     assert_ne!(rows[0].cost, "0");
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+}
+
+#[tokio::test]
+async fn downstream_disconnect_settles_without_waiting_for_stalled_upstream() {
+    let fixture = codex_route_fixture("downstream-disconnect-stalled-upstream").await;
+    let prefix = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-cancelled\"}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"delivered before cancellation\"}\n\n"
+    )
+    .to_owned();
+    let completed = completed_response_with_usage(3, 7);
+    let terminal = format!(
+        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{completed}}}\n\ndata: [DONE]\n\n"
+    );
+    let (endpoint, terminal_tx, upstream) =
+        gated_completed_sse_upstream_endpoint(prefix, terminal).await;
+
+    let response = send_codex_route_to_endpoint(
+        &fixture,
+        endpoint,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "cancel stalled stream", "stream": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let frame = futures_util::StreamExt::next(&mut body)
+                .await
+                .expect("the delivered prefix remains readable")
+                .unwrap();
+            if String::from_utf8_lossy(&frame).contains("delivered before cancellation") {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    drop(body);
+
+    // Do not release the upstream terminal gate until after durable
+    // settlement. This is the regression boundary: cancellation itself must
+    // wake the producer rather than waiting for another provider byte.
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(499));
+    assert_eq!(rows[0].error_code.as_deref(), Some("client_cancelled"));
+    assert_eq!(
+        rows[0].usage_basis,
+        Some(crate::model::RequestUsageBasis::ContractCeiling)
+    );
+    assert_ne!(rows[0].cost, "0");
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let states: Vec<String> = sqlx::query_scalar(
+                "SELECT state FROM response_archive_spools WHERE request_id = $1",
+            )
+            .bind(rows[0].request_id.to_string())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            if states == ["gap"] {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the sole archive owner must fence the cancelled capture once");
+    pool.close().await;
+
+    // The mock provider is intentionally still blocked. Abort only its local
+    // socket task after the assertion; the proxy has already dropped its read.
+    upstream.abort();
+    drop(terminal_tx);
+    assert!(upstream.await.unwrap_err().is_cancelled());
 }
 
 #[tokio::test]

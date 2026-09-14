@@ -11,6 +11,63 @@ use delivery::{CapturedSseDelivery, capture_sse_delivery, downstream_stream_fail
 use lifecycle::{StreamingFinalizationInput, finalize_streaming_lifecycle};
 use terminal_delivery::{ResponsesTerminalDelivery, TerminalEof};
 
+enum DownstreamAwarePoll<T> {
+    Upstream { value: T, downstream_closed: bool },
+    DownstreamClosed,
+}
+
+async fn poll_upstream_or_downstream_closed<T>(
+    body_sender: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    upstream: impl std::future::Future<Output = T>,
+) -> DownstreamAwarePoll<T> {
+    tokio::select! {
+        // If both sides became ready before this poll, retain the already
+        // available upstream item. It may contain authoritative completed
+        // usage needed for settlement. The caller observes `is_closed` and
+        // only polls again to finish protocol evidence already buffered by the
+        // sanitizer; a pending provider read loses immediately to `closed`.
+        biased;
+        value = upstream => DownstreamAwarePoll::Upstream {
+            value,
+            downstream_closed: body_sender.is_closed(),
+        },
+        _ = body_sender.closed() => DownstreamAwarePoll::DownstreamClosed,
+    }
+}
+
+fn transport_error_with_downstream_precedence(
+    downstream_closed: bool,
+    error: &'static str,
+) -> &'static str {
+    if downstream_closed {
+        "downstream_disconnected"
+    } else {
+        error
+    }
+}
+
+fn pending_delivery_can_advance(
+    sanitizer: Option<&crate::api::sse::ResponsesStreamingSanitizer>,
+    raw_chunk_len: usize,
+) -> bool {
+    raw_chunk_len > 0 && sanitizer.is_some_and(|sanitizer| sanitizer.has_pending_delivery())
+}
+
+fn resume_pending_delivery_after_send_disconnect(
+    transport_error: &mut Option<&'static str>,
+    downstream_closed: &mut bool,
+    sanitizer: Option<&crate::api::sse::ResponsesStreamingSanitizer>,
+) -> bool {
+    if *transport_error != Some("downstream_disconnected")
+        || !sanitizer.is_some_and(|sanitizer| sanitizer.has_pending_delivery())
+    {
+        return false;
+    }
+    *downstream_closed = true;
+    *transport_error = None;
+    true
+}
+
 pub(super) struct StreamingResponse<'a> {
     pub(super) state: &'a AppState,
     pub(super) upstream: UpstreamResponse,
@@ -157,6 +214,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let mut terminal_memory = background_state
                 .metrics
                 .memory_usage(crate::metrics::MemoryComponent::StreamCapture, 0);
+            let mut downstream_closed_observed = false;
+            let mut downstream_ready_bytes = 0_usize;
             loop {
                 let mut flushing_terminal = false;
                 let next = if let Some(chunk) = terminal_delivery.take_pending() {
@@ -165,10 +224,32 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 } else if !terminal_delivery.upstream_poll_allowed() {
                     break;
                 } else {
-                    match tokio::time::timeout_at(stream_deadline, upstream_stream.next()).await {
-                        Ok(next) => next,
+                    match tokio::time::timeout_at(
+                        stream_deadline,
+                        poll_upstream_or_downstream_closed(&body_sender, upstream_stream.next()),
+                    )
+                    .await
+                    {
+                        Ok(DownstreamAwarePoll::Upstream {
+                            value: next,
+                            downstream_closed,
+                        }) => {
+                            downstream_closed_observed |= downstream_closed;
+                            if downstream_closed {
+                                drop(archive_sender.take());
+                            }
+                            next
+                        }
+                        Ok(DownstreamAwarePoll::DownstreamClosed) => {
+                            transport_error = Some("downstream_disconnected");
+                            drop(archive_sender.take());
+                            break;
+                        }
                         Err(_) => {
-                            transport_error = Some("upstream_timeout");
+                            transport_error = Some(transport_error_with_downstream_precedence(
+                                downstream_closed_observed || body_sender.is_closed(),
+                                "upstream_timeout",
+                            ));
                             drop(archive_sender.take());
                             let _ = tokio::time::timeout(
                                 MAX_DOWNSTREAM_SEND_WAIT,
@@ -187,7 +268,12 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 let Some(next) = next else {
                     match terminal_delivery.finish_at_eof(responses_streaming_sanitizer.as_mut()) {
                         TerminalEof::Flush => continue,
-                        TerminalEof::Complete => break,
+                        TerminalEof::Complete => {
+                            if downstream_closed_observed {
+                                transport_error = Some("downstream_disconnected");
+                            }
+                            break;
+                        }
                         TerminalEof::Error(error_code) => {
                             let protocol_rejection_stage = responses_streaming_sanitizer
                                 .as_ref()
@@ -199,7 +285,10 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 protocol_rejection_stage,
                                 "Responses upstream stream rejected at EOF"
                             );
-                            transport_error = Some(error_code);
+                            transport_error = Some(transport_error_with_downstream_precedence(
+                                downstream_closed_observed || body_sender.is_closed(),
+                                error_code,
+                            ));
                             drop(archive_sender.take());
                             let _ = tokio::time::timeout(
                                 MAX_DOWNSTREAM_SEND_WAIT,
@@ -217,6 +306,18 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 };
                 match next {
                     Ok(raw_chunk) => {
+                        let raw_chunk_len = raw_chunk.len();
+                        if downstream_closed_observed && !flushing_terminal {
+                            downstream_ready_bytes =
+                                downstream_ready_bytes.saturating_add(raw_chunk_len);
+                            if downstream_ready_bytes
+                                > crate::api::limits::MAX_RESPONSES_SSE_TERMINAL_HOLD_BYTES
+                            {
+                                transport_error = Some("downstream_disconnected");
+                                drop(archive_sender.take());
+                                break;
+                            }
+                        }
                         if !raw_chunk.is_empty()
                             && let Some(phase) = first_byte.take()
                         {
@@ -231,7 +332,10 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             );
                             response_bytes = response_bytes.saturating_add(raw_chunk.len());
                             if response_bytes > MAX_PROXY_RESPONSE_BODY {
-                                transport_error = Some("upstream_response_too_large");
+                                transport_error = Some(transport_error_with_downstream_precedence(
+                                    downstream_closed_observed || body_sender.is_closed(),
+                                    "upstream_response_too_large",
+                                ));
                                 drop(archive_sender.take());
                                 let _ = tokio::time::timeout(
                                     MAX_DOWNSTREAM_SEND_WAIT,
@@ -263,7 +367,12 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                             protocol_rejection_stage = sanitizer.last_rejection_stage(),
                                             "Responses upstream stream rejected by protocol sanitizer"
                                         );
-                                        transport_error = Some(error_code);
+                                        transport_error =
+                                            Some(transport_error_with_downstream_precedence(
+                                                downstream_closed_observed
+                                                    || body_sender.is_closed(),
+                                                error_code,
+                                            ));
                                         drop(archive_sender.take());
                                         let _ = tokio::time::timeout(
                                             MAX_DOWNSTREAM_SEND_WAIT,
@@ -287,6 +396,15 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         // SSE event. Empty partial output must not occupy the
                         // bounded archive channel or cancel a healthy archive.
                         if chunk.is_empty() {
+                            let terminal_evidence_pending = pending_delivery_can_advance(
+                                responses_streaming_sanitizer.as_ref(),
+                                raw_chunk_len,
+                            );
+                            if downstream_closed_observed && !terminal_evidence_pending {
+                                transport_error = Some("downstream_disconnected");
+                                drop(archive_sender.take());
+                                break;
+                            }
                             continue;
                         }
                         if capture_json_usage {
@@ -307,7 +425,10 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         ) {
                             Ok(delivery) => delivery,
                             Err(rejection) => {
-                                transport_error = Some(rejection.error_code());
+                                transport_error = Some(transport_error_with_downstream_precedence(
+                                    downstream_closed_observed || body_sender.is_closed(),
+                                    rejection.error_code(),
+                                ));
                                 drop(archive_sender.take());
                                 let _ = tokio::time::timeout(
                                     MAX_DOWNSTREAM_SEND_WAIT,
@@ -333,6 +454,19 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             tracing::warn!(%request_id, stage = "response_spool_ack", "proxy archive gap");
                             drop(archive_sender.take());
                         }
+                        // A successful Responses terminal is held privately
+                        // until EOF validates its tail. Once the receiver is
+                        // gone, do not attempt more downstream sends, but do
+                        // allow immediately-ready fragments/EOF to complete
+                        // that already-started evidence. The next pending read
+                        // is interrupted by `body_sender.closed()` above.
+                        if downstream_closed_observed
+                            && responses_streaming_sanitizer
+                                .as_ref()
+                                .is_some_and(|sanitizer| sanitizer.has_pending_delivery())
+                        {
+                            continue;
+                        }
                         for frame in delivery_frames {
                             let frame = match terminal_frames.hold(frame) {
                                 Ok(Some(frame)) => frame,
@@ -342,7 +476,10 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 }
                                 Err(()) => {
                                     transport_error =
-                                        Some("upstream_response_event_batch_too_large");
+                                        Some(transport_error_with_downstream_precedence(
+                                            downstream_closed_observed || body_sender.is_closed(),
+                                            "upstream_response_event_batch_too_large",
+                                        ));
                                     break;
                                 }
                             };
@@ -378,6 +515,19 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         }
                         if transport_error.is_some() {
                             drop(archive_sender.take());
+                            if resume_pending_delivery_after_send_disconnect(
+                                &mut transport_error,
+                                &mut downstream_closed_observed,
+                                responses_streaming_sanitizer.as_ref(),
+                            ) {
+                                // The receiver can disappear after the poll
+                                // snapshot, while an earlier part of this same
+                                // raw chunk is being delivered. Preserve a
+                                // success terminal already held from the rest
+                                // of the chunk under the same immediate-ready
+                                // and byte-bounded rule used above.
+                                continue;
+                            }
                             if transport_error == Some("delivery_state") {
                                 let _ = tokio::time::timeout(
                                     MAX_DOWNSTREAM_SEND_WAIT,
@@ -392,12 +542,20 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             }
                             break;
                         }
+                        if downstream_closed_observed {
+                            transport_error = Some("downstream_disconnected");
+                            drop(archive_sender.take());
+                            break;
+                        }
                         if strict_chat_terminal_ready {
                             break;
                         }
                     }
                     Err(error_code) => {
-                        transport_error = Some(error_code);
+                        transport_error = Some(transport_error_with_downstream_precedence(
+                            downstream_closed_observed || body_sender.is_closed(),
+                            error_code,
+                        ));
                         drop(archive_sender.take());
                         let _ = tokio::time::timeout(
                             MAX_DOWNSTREAM_SEND_WAIT,

@@ -158,9 +158,15 @@ impl ResponsesStreamingSanitizer {
         Ok(Bytes::from(output))
     }
 
-    #[cfg(test)]
     pub(in crate::api) fn is_complete(&self) -> bool {
         self.framer.is_complete()
+    }
+
+    /// Whether a receiver cancellation may still be followed by immediately
+    /// ready bytes that complete an event or release a validated success at
+    /// EOF. This never authorizes waiting for another provider byte.
+    pub(in crate::api) fn has_pending_delivery(&self) -> bool {
+        !self.is_complete() || self.terminal_hold.is_active()
     }
 
     /// Release a successful terminal only after upstream EOF confirms there

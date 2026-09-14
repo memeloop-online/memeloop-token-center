@@ -253,8 +253,11 @@ fn terminal_hold_releases_only_after_complete_eof_framing_and_is_bounded() {
     let completed = b"event: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-hold\"}}\r\n\r\n";
     let mut sanitizer = ResponsesStreamingSanitizer::default();
     assert!(sanitizer.push(completed).unwrap().is_empty());
+    assert!(sanitizer.has_pending_delivery());
     assert!(sanitizer.push(b"data: [DONE]\r\n\r\n").unwrap().is_empty());
+    assert!(sanitizer.has_pending_delivery());
     let terminal = sanitizer.finish().unwrap();
+    assert!(!sanitizer.has_pending_delivery());
     assert!(String::from_utf8_lossy(&terminal).contains("response.completed"));
     assert!(terminal.ends_with(b"data: [DONE]\r\n\r\n"));
 
