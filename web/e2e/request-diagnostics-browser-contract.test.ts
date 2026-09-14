@@ -206,6 +206,7 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
         assert.equal(accountDisplay.whiteSpace, 'nowrap');
         assert.equal(accountDisplay.ellipsis, 'ellipsis');
         assert.equal(accountDisplay.overflow, 'hidden');
+        assert.equal(await recordedRow.locator('.request-upstream-name').evaluate(element => getComputedStyle(element).minInlineSize), '100%', 'the subtitle fills its cell without contributing a fixed intrinsic column width');
         assert.ok(accountDisplay.height <= accountDisplay.lineHeight + 1, `${theme} ${width}px account never wraps an orphan letter`);
         assert.ok(accountDisplay.scrollWidth > accountDisplay.clientWidth, 'long fixture account uses real truncation, not a shortened value');
         assert.equal(await recordedRow.locator('.request-model-cell code').textContent(), 'fixture-long-model-name-for-request-observability');
