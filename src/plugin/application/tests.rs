@@ -188,6 +188,46 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
     first.db.migrate().await.unwrap();
     first.db.migrate().await.unwrap();
 
+    // Cold concurrent pins must converge to the same runtime/catalog/circuit
+    // object, not merely equivalent freshly compiled executables.
+    let before = authority_a
+        .compilations
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let barrier = Arc::new(tokio::sync::Barrier::new(8));
+    let mut pins = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let authority = authority_a.clone();
+        let barrier = barrier.clone();
+        pins.spawn(async move {
+            barrier.wait().await;
+            authority.pin().await.unwrap()
+        });
+    }
+    let initial = pins.join_next().await.unwrap().unwrap();
+    while let Some(pin) = pins.join_next().await {
+        assert!(Arc::ptr_eq(&initial, &pin.unwrap()));
+    }
+    assert_eq!(
+        authority_a
+            .compilations
+            .load(std::sync::atomic::Ordering::Relaxed),
+        before + 1
+    );
+
+    // A matching revision number is not sufficient authority for a warm hit.
+    // Simulate a corrupt/mismatched primary receipt without touching the package.
+    sqlx::query("UPDATE application_plugin_candidates SET identity_digest = 'mismatched' WHERE inventory_id = 'a'")
+        .execute(&first.db.pool).await.unwrap();
+    assert!(authority_a.pin().await.is_err());
+    sqlx::query(
+        "UPDATE application_plugin_candidates SET identity_digest = $1 WHERE inventory_id = 'a'",
+    )
+    .bind(&initial.receipt.identity_digest)
+    .execute(&first.db.pool)
+    .await
+    .unwrap();
+    assert!(Arc::ptr_eq(&initial, &authority_a.pin().await.unwrap()));
+
     // A request is blocked after policy; B publishes while it is parked. No
     // sleeps, time thresholds, or notification delivery are involved.
     let (policy_done, wait_policy) = tokio::sync::oneshot::channel();
@@ -322,6 +362,24 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
         assert_eq!(one.await.unwrap().unwrap().revision, 5);
         assert_eq!(two.await.unwrap().unwrap().revision, 5);
     }
+
+    // Bound manager-owned history while an old request remains independently
+    // pinned. Each new revision still follows the current database authority.
+    for index in 0..4 {
+        let current = first.db.application_plugin_head().await.unwrap();
+        authority_a
+            .publish(
+                publish("a", current.revision),
+                &format!("cache-bound-{index}"),
+            )
+            .await
+            .unwrap();
+        let newest = authority_a.pin().await.unwrap();
+        assert_eq!(newest.receipt.revision, current.revision + 1);
+        assert!(authority_a.snapshots.lock().await.len() <= CACHED_REVISIONS);
+    }
+    assert_eq!(initial.receipt.revision, 1);
+    assert_eq!(authority_a.snapshots.lock().await.len(), CACHED_REVISIONS);
 
     // Tampering cannot change a persisted inventory identity, and an absent
     // local package cannot fall back to the old AppState startup runtime.

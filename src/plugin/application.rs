@@ -1,6 +1,11 @@
 //! Draft application integration. No automatic production activation. Inventory
 //! roots and grants are provisioned by the host, never by management requests.
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    path::PathBuf,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -10,6 +15,14 @@ use super::{
     lifecycle::{self, PluginGrant, RevisionReason, RuntimeSnapshot},
 };
 use crate::{db::Database, error::AppError, provider::ProviderCatalog};
+
+const CACHED_REVISIONS: usize = 2;
+const ADMISSION_WAIT: Duration = Duration::from_secs(5);
+const COMPILATION_DEADLINE: Duration = Duration::from_secs(35);
+// Shared by request pinning and administrative staging across all AppStates.
+// An abandoned blocking compilation retains its permit until it really ends.
+static COMPILATION_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
 
 /// Trusted deployment input. Each root must be a distinct immutable revision
 /// directory containing the complete required plugin set, not a mutable symlink.
@@ -55,6 +68,9 @@ pub struct ApplicationPlugins {
     db: Database,
     inventory: BTreeMap<String, PreinstalledInventory>,
     contract_digest: String,
+    snapshots: tokio::sync::Mutex<VecDeque<Arc<ApplicationPluginSnapshot>>>,
+    #[cfg(test)]
+    compilations: std::sync::atomic::AtomicUsize,
 }
 
 impl ApplicationPlugins {
@@ -73,6 +89,9 @@ impl ApplicationPlugins {
             db,
             inventory,
             contract_digest: contract_digest(baseline)?,
+            snapshots: tokio::sync::Mutex::new(VecDeque::new()),
+            #[cfg(test)]
+            compilations: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -85,9 +104,18 @@ impl ApplicationPlugins {
         validate_inventory_id(id)?;
         let entry = self.inventory.get(id).cloned().ok_or(AppError::Forbidden)?;
         let db = self.db.clone();
-        // Compilation and disk validation are off the async executor. The draft
-        // deliberately has no stale cache fallback if a replica lacks a package.
-        let runtime = tokio::task::spawn_blocking(move || {
+        let permit =
+            tokio::time::timeout(ADMISSION_WAIT, COMPILATION_PERMITS.clone().acquire_owned())
+                .await
+                .map_err(|_| AppError::Overloaded)?
+                .map_err(|_| AppError::Internal)?;
+        #[cfg(test)]
+        self.compilations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Build only on cache miss/staging. Neither timeout nor caller cancellation
+        // releases capacity while Wasmtime compilation still occupies a thread.
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let metadata =
                 std::fs::symlink_metadata(&entry.root).map_err(|_| AppError::Internal)?;
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -97,9 +125,11 @@ impl ApplicationPlugins {
             let runtime = PluginRuntime::load(Some(root), db).map_err(|_| AppError::Internal)?;
             lifecycle::validate_grants(&runtime, &entry.grants)?;
             Ok::<_, AppError>(runtime)
-        })
-        .await
-        .map_err(|_| AppError::Internal)??;
+        });
+        let runtime = tokio::time::timeout(COMPILATION_DEADLINE, task)
+            .await
+            .map_err(|_| AppError::Overloaded)?
+            .map_err(|_| AppError::Internal)??;
         let contract_digest = contract_digest(&runtime)?;
         if contract_digest != self.contract_digest {
             return Err(AppError::Forbidden);
@@ -204,12 +234,46 @@ impl ApplicationPlugins {
     }
 
     pub async fn pin(&self) -> Result<Arc<ApplicationPluginSnapshot>, AppError> {
+        // The cache never supplies authority. Even a warm hit must read the
+        // primary head and validate the exact immutable receipt on this request.
         let head = self.db.application_plugin_head().await?;
+        let entry = self
+            .inventory
+            .get(&head.inventory_id)
+            .ok_or(AppError::Forbidden)?;
+        let metadata = tokio::fs::symlink_metadata(&entry.root)
+            .await
+            .map_err(|_| AppError::Internal)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(AppError::Forbidden);
+        }
+        // Hold the lock through loading/publication: concurrent cold pins join
+        // one compilation instead of each producing a new engine and epoch task.
+        let mut snapshots = tokio::time::timeout(ADMISSION_WAIT, self.snapshots.lock())
+            .await
+            .map_err(|_| AppError::Overloaded)?;
+        if let Some(snapshot) = snapshots
+            .iter()
+            .find(|snapshot| snapshot.receipt.revision == head.revision)
+        {
+            if snapshot.receipt.inventory_id != head.inventory_id
+                || snapshot.receipt.reason != head.reason
+            {
+                return Err(AppError::Forbidden);
+            }
+            validate_receipt(&snapshot.receipt, &head)?;
+            return Ok(snapshot.clone());
+        }
         let snapshot = self
             .load(&head.inventory_id, head.revision, &head.reason)
             .await?;
         validate_receipt(&snapshot.receipt, &head)?;
-        Ok(Arc::new(snapshot))
+        let snapshot = Arc::new(snapshot);
+        if snapshots.len() == CACHED_REVISIONS {
+            snapshots.pop_front();
+        }
+        snapshots.push_back(snapshot.clone());
+        Ok(snapshot)
     }
 }
 

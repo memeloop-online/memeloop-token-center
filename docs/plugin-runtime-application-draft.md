@@ -84,9 +84,21 @@ replay, lost-notification behavior, restart, monotonic rollback, migration repla
 missing packages, database failure, tampered input, and management authorization.
 PostgreSQL schema UUIDs only isolate test data; they do not drive scheduling.
 
-This first draft intentionally reloads and compiles the selected immutable local
-inventory during admission rather than introducing an unproven stale cache.
-It therefore has **not** passed a production performance or rollout gate. The
+Each authority retains at most two compiled revision snapshots. Every request
+still reads the primary database head, checks the local inventory root and validates
+the exact cached receipt; database/identity/missing-root failures never fall back
+to a cached older revision. Concurrent cold pins share one publication under a
+bounded-wait mutex. A process-wide owned permit admits one compilation at a time,
+including staging; an abandoned blocking task retains its permit until it finishes.
+Waits are capped at five seconds and compilation waits at 35 seconds. Immutable
+compiled bytes remain valid if the package files later change; staging and fresh
+loads still revalidate those bytes. Inventory roots must remain read-only.
+
+Eviction drops only cache ownership, never an in-flight request pin. The retained
+runtime also retains its revision circuit state across requests. CI extends the
+existing SQLite/PostgreSQL authority exercise with concurrent Arc identity,
+single-compilation and bounded-history checks; warm DB/missing-root failures remain
+covered. This has **not** passed a production performance or rollout gate. The
 feature remains off by default and host opt-in is not wired into the executable.
 It does not implement arbitrary schema/provider-contract changes, strict
 configuration revocation, UI changes, or health/archive changes.
