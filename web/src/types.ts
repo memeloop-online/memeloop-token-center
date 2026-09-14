@@ -395,6 +395,8 @@ export interface KeyView {
   fingerprint?: string | null;
   /** Plaintext is never listed; this only enables the explicit copy action. */
   credential_recovery_available?: boolean;
+  creation_source?: 'manual' | 'api' | 'unknown';
+  archived_at?: number | null;
 }
 
 /** Public fields accepted by the managed-key keyset endpoint. */

@@ -7,6 +7,8 @@ pub(in crate::api) struct CreateKeyRequest {
     tenant_external_id: String,
     principal_external_id: String,
     alias: String,
+    #[serde(default = "default_creation_source")]
+    creation_source: String,
     #[serde(default = "default_currency")]
     currency: String,
     #[serde(default)]
@@ -31,6 +33,10 @@ fn zero_amount() -> String {
     "0".to_owned()
 }
 
+fn default_creation_source() -> String {
+    "api".to_owned()
+}
+
 pub(in crate::api) async fn create_key(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -51,7 +57,7 @@ pub(in crate::api) async fn create_key(
         .map(str::to_owned);
     let issued = state
         .db
-        .create_key_with_routing(
+        .create_key_with_source(
             CreateKeyInput {
                 tenant_external_id: body.tenant_external_id,
                 principal_external_id: body.principal_external_id,
@@ -64,6 +70,7 @@ pub(in crate::api) async fn create_key(
             &body.route_ids,
             &body.route_group_ids,
             state.config.key_pepper.as_bytes(),
+            &body.creation_source,
         )
         .await?;
     Ok((StatusCode::CREATED, Json(issued)))
@@ -77,6 +84,7 @@ pub(in crate::api) struct KeysQuery {
     key_id: Option<Uuid>,
     search: Option<String>,
     status: Option<String>,
+    creation_source: Option<String>,
     #[serde(default = "default_key_list_limit")]
     limit: i64,
     before_created_at: Option<i64>,
@@ -133,6 +141,13 @@ pub(in crate::api) async fn list_keys(
         query.before_id,
         "credential",
     )?;
+    if query
+        .creation_source
+        .as_deref()
+        .is_some_and(|value| !matches!(value, "manual" | "api" | "unknown" | "manual_or_unknown"))
+    {
+        return Err(AppError::BadRequest("invalid creation_source".into()));
+    }
     Ok(Json(
         state
             .db
@@ -144,8 +159,32 @@ pub(in crate::api) async fn list_keys(
                 before,
                 search,
                 query.status.as_deref(),
+                query.creation_source.as_deref(),
             )
             .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct DeleteClientCredentialsRequest {
+    tenant_external_id: String,
+    key_ids: Vec<Uuid>,
+}
+
+pub(in crate::api) async fn delete_client_credentials(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DeleteClientCredentialsRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "keys:write").await?;
+    require_service_tenant(&service, &body.tenant_external_id)?;
+    let deleted_key_ids = state
+        .db
+        .delete_client_credentials(&body.tenant_external_id, &body.key_ids)
+        .await?;
+    Ok(Json(
+        serde_json::json!({ "deleted_key_ids": deleted_key_ids }),
     ))
 }
 
