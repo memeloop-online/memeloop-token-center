@@ -44,8 +44,9 @@ test('operator restores an allowed tenant and otherwise selects an explicit tena
   assert.equal(tenantForCredential([{ external_id: 'one' }, { external_id: 'two' }], ''), 'one');
 });
 
-test('credential review defaults to active and mutation scopes remain explicit', () => {
-  assert.match(managementPages, /useResourceListStatusFilter\('credentials', tenant, nonStatusFilteredValues, \(value\) => \(value\.status \?\? 'active'\) === 'active'\)/);
+test('mutation scopes remain explicit and shared local filters retain their preference', () => {
+  // Credential status is now server-paginated. Its initial active query and
+  // user-driven transitions are covered by the actual workspace browser test.
   assert.match(resourceListStatusFilter, /return window\.localStorage\.getItem\(key\) === 'all' \? 'all' : 'normal';/);
   assert.match(resourceListStatusFilter, /useState<ResourceListStatusSelection>\(\(\) => readSelection\(storageKey\)\)/);
   assert.match(scope, /const writeTenant = state\.tenant;/);

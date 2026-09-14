@@ -22,7 +22,7 @@ import { ResourceListStatusEmpty, ResourceListStatusFilterControl, useResourceLi
 import { UpstreamModelCombobox } from '../UpstreamModelCombobox';
 import {
   applyKeyPage, canLoadMoreKeys, canReadCredentialLimits, canWriteCredential,
-  credentialListPresentation, keyListPath, matchesCredentialSearch,
+  credentialListPresentation, keyListPath,
   ownsKeyListRequest, shouldLoadCredentialRoutes,
   type KeyListLoadState, type KeyListRequestIdentity,
 } from '../keyPagination';
@@ -979,6 +979,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const [newRouteGroupIds, setNewRouteGroupIds] = useState<string[]>([]);
   const [groupFilter, setGroupFilter] = useState('all');
   const [search, setSearch] = useState('');
+  const [serverStatus, setServerStatus] = useState('active');
   const [nextCursor, setNextCursor] = useState<KeyListCursor>();
   const [keyListState, setKeyListState] = useState<KeyListLoadState>('idle');
   const [keyError, setKeyError] = useState('');
@@ -1060,9 +1061,8 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
     }
     const request = startKeyRequest('initial-loading');
     setKeyError('');
-    void loadRoutes(loadToken, loadTenant, scopeGeneration.current);
     try {
-      const keyRows = await apiRead<KeyView[]>(keyListPath(loadTenant), loadToken, { signal: request.controller.signal });
+      const keyRows = await apiRead<KeyView[]>(keyListPath(loadTenant, undefined, { search, status: serverStatus }), loadToken, { signal: request.controller.signal });
       if (!ownsKeyRequest(request) || request.controller.signal.aborted) return;
       const page = applyKeyPage([], keyRows);
       keyRequest.current = undefined;
@@ -1082,16 +1082,23 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
     secretRequest.current?.abort(); secretRequest.current = undefined; secretOperation.current = undefined; secretRef.current = undefined;
     routingSaveLock.current = undefined; scopeGeneration.current += 1; setValues([]); setRoutes([]); setEditingPolicy(undefined); setEditingRouting(undefined); setRoutingDraft(undefined);
     setRenaming(undefined); setAliasDraft(''); setLimitSnapshots({}); setGranting(undefined); setGrant({ amount: '', source: '' }); setBusy('');
-    setPolicyDrafts({}); setCreateCredentialDraft(undefined); setNewRouteIds([]); setNewRouteGroupIds([]); setGroupFilter('all'); setSearch(''); setNextCursor(undefined); setKeyListState('initial-loading'); setKeyError(''); setRouteError(''); setSecret(undefined); setMessage(''); setError(''); void load();
+    setPolicyDrafts({}); setCreateCredentialDraft(undefined); setNewRouteIds([]); setNewRouteGroupIds([]); setGroupFilter('all'); setSearch(''); setNextCursor(undefined); setKeyListState('initial-loading'); setKeyError(''); setRouteError(''); setSecret(undefined); setMessage(''); setError('');
+    void loadRoutes(token, tenant, scopeGeneration.current);
     return () => { keyRequest.current?.controller.abort(); routeRequest.current?.controller.abort(); secretRequest.current?.abort(); };
   }, [token, tenant, writeTenant]);
+  useEffect(() => {
+    setValues([]); setNextCursor(undefined); setKeyListState('initial-loading');
+    keyRequest.current?.controller.abort();
+    const timer = window.setTimeout(() => void load(), search.trim() ? 250 : 0);
+    return () => { window.clearTimeout(timer); keyRequest.current?.controller.abort(); };
+  }, [token, tenant, writeTenant, search, serverStatus]);
   const loadMore = async () => {
     if (!canLoadMoreKeys(keyListState, Boolean(nextCursor), Boolean(keyRequest.current)) || !nextCursor || !token) return;
     const loadToken = token; const loadTenant = tenant; const cursor = nextCursor;
     const request = startKeyRequest('loading-more');
     setKeyError('');
     try {
-      const keyRows = await apiRead<KeyView[]>(keyListPath(loadTenant, cursor), loadToken, { signal: request.controller.signal });
+      const keyRows = await apiRead<KeyView[]>(keyListPath(loadTenant, cursor, { search, status: serverStatus }), loadToken, { signal: request.controller.signal });
       if (!ownsKeyRequest(request) || request.controller.signal.aborted) return;
       const page = applyKeyPage(values, keyRows, cursor);
       keyRequest.current = undefined;
@@ -1107,14 +1114,12 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
     }
   };
   const nonStatusFilteredValues = values.filter((value) => {
-    if (!matchesCredentialSearch(value, search, locale)) return false;
     if (groupFilter === 'all' || !writeTenant) return true;
     const memberships = credentialGroups.groups.filter((group) => group.member_ids.includes(value.key_id));
     return groupFilter === 'unassigned' ? memberships.length === 0 : memberships.some((group) => group.id === groupFilter);
   });
-  const statusFilter = useResourceListStatusFilter('credentials', tenant, nonStatusFilteredValues, (value) => (value.status ?? 'active') === 'active');
-  const filteredValues = statusFilter.values;
-  const filtersApplied = Boolean(search.trim()) || !statusFilter.showInactive || groupFilter !== 'all';
+  const filteredValues = nonStatusFilteredValues;
+  const filtersApplied = Boolean(search.trim()) || serverStatus !== 'all' || groupFilter !== 'all';
   const loadingKeys = keyListState === 'initial-loading' || keyListState === 'loading-more';
   const canLoadMore = canLoadMoreKeys(keyListState, Boolean(nextCursor), Boolean(keyRequest.current));
   const listPresentation = credentialListPresentation(keyListState, filtersApplied);
@@ -1262,11 +1267,11 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
     {workspace?.kind === 'routing' && !routingDraft && <p role="status">{t('common.loading')}</p>}
   </div>;
   return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} />{visibleSecret && <div ref={secretPriority} tabIndex={-1} className="credential-secret-priority"><OneTimeSecret key={visibleSecret.displayId} value={visibleSecret.value} recovered={visibleSecret.recovered} recoveryAvailable={!visibleSecret.recovered} filename="client-credential.txt" onDismiss={dismissSecret} message={t(visibleSecret.recovered ? 'credentials.recoveredSecret' : 'credentials.oneTimeSecret')} /></div>}<section className="management-layout">
-    <article className="panel"><div className="panel-title"><div><h2>{t('credentials.title')}</h2><p className="muted">{t('credentials.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>
-      <div className="credential-list-controls"><label>{t('credentials.search')}<input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t('credentials.searchPlaceholder')} /></label>{writeTenant && <label>{t('credentials.groupFilter')}<select value={groupFilter} onChange={(event) => setGroupFilter(event.target.value)}><option value="all">{t('common.all')}</option><option value="unassigned">{t('credentials.ungrouped')}</option>{credentialGroups.groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select></label>}</div>
+    <article className="panel"><div className="panel-title"><div><h2>{t('credentials.title')}</h2><p className="muted">{t('credentials.description')}</p></div><label>{t('request.status')}<Select aria-label={t('request.status')} value={serverStatus} onChange={event => setServerStatus(event.target.value)}><option value="active">{enumLabel(t, 'status', 'active')}</option><option value="all">{t('common.all')}</option><option value="suspended">{enumLabel(t, 'status', 'suspended')}</option><option value="revoked">{enumLabel(t, 'status', 'revoked')}</option></Select></label></div>
+      <div className="credential-list-controls"><label>{t('credentials.search')}<Input type="search" maxLength={200} value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t('credentials.searchPlaceholder')} /></label>{writeTenant && <label>{t('credentials.groupFilter')}<Select value={groupFilter} onChange={(event) => setGroupFilter(event.target.value)}><option value="all">{t('common.all')}</option><option value="unassigned">{t('credentials.ungrouped')}</option>{credentialGroups.groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</Select></label>}</div>
       <p className="credential-list-summary" role="status">{listPresentation === 'loading' ? t('credentials.loadingList') : listPresentation === 'loading-more' ? t('credentials.loadingMore', { count: formatNumber(values.length, locale) }) : listPresentation === 'failed' ? t('credentials.loadFailed', { count: formatNumber(values.length, locale) }) : listPresentation === 'filtered' ? t('credentials.filteredLoaded', { shown: formatNumber(filteredValues.length, locale), loaded: formatNumber(values.length, locale) }) : listPresentation === 'more' ? t('credentials.loadedMore', { count: formatNumber(values.length, locale) }) : t('credentials.loadedComplete', { count: formatNumber(values.length, locale) })}</p>
       {keyError && <div className="notice error" role="alert">{keyError}</div>}{routeError && <div className="notice error" role="alert">{routeError}</div>}{error && <div className="notice error" role="alert">{error}</div>}{credentialGroups.error && <div className="notice error" role="alert">{credentialGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{message && <div ref={credentialSuccess} tabIndex={-1} className="notice success" role="status">{message}</div>}
-      <div className="account-list credential-compact-list">{filteredValues.length === 0 && (loadingKeys ? <div className="empty">{t('common.loading')}</div> : keyListState === 'failed' ? <div className="empty">{t('credentials.loadFailed', { count: formatNumber(values.length, locale) })}</div> : <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('status.active')} empty={values.length === 0 ? t('credentials.empty') : t('credentials.noFilterResults')} />)}{filteredValues.map((value) => {
+      <div className="account-list credential-compact-list">{filteredValues.length === 0 && (loadingKeys ? <div className="empty">{t('common.loading')}</div> : keyListState === 'failed' ? <div className="empty">{t('credentials.loadFailed', { count: formatNumber(values.length, locale) })}</div> : <ResourceListStatusEmpty totalCount={values.length} normalLabel={t('status.active')} empty={values.length === 0 ? t('credentials.empty') : t('credentials.noFilterResults')} />)}{filteredValues.map((value) => {
         const memberships = credentialGroups.groups.filter((group) => group.member_ids.includes(value.key_id));
         const budget = credentialBudgetPresentation(value, locale, t);
         const technicalDetails = [
@@ -1278,8 +1283,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
           <div className="credential-recovery-control credential-row-actions">
             {value.credential_recovery_available && value.status === 'active'
               ? <Button appearance="secondary" type="button" disabled={!canManage(value) || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void recoverCredential(value)}>{busy === `recover-${value.key_id}` ? t('common.loading') : t('credentials.copy')}</Button>
-              : <><span className="credential-recovery-unavailable" title={t(value.status === 'revoked' ? 'credentials.copyRevoked' : value.status === 'suspended' ? 'credentials.copySuspended' : 'credentials.copyNotStored')}>{t(value.status === 'revoked' ? 'credentials.copyRevoked' : value.status === 'suspended' ? 'credentials.copySuspended' : 'credentials.copyNotStored')}</span>
-                <Button appearance="secondary" type="button" disabled>{t('credentials.copy')}</Button></>}
+              : value.status === 'active' ? <DetailTooltip content={t('credentials.copyUnavailable')}><span tabIndex={0}><Button appearance="secondary" type="button" disabled>{t('credentials.copy')}</Button></span></DetailTooltip> : null}
           </div>
           <CredentialActionMenu label={locale.startsWith('zh') ? '更多操作' : 'More actions'} disabled={Boolean(busy) || Boolean(visibleSecret)} actions={[
             { id: 'rename', label: t('credentials.rename'), disabled: !canWrite, onSelect: () => { setRenaming(value.key_id); setAliasDraft(value.alias); } },

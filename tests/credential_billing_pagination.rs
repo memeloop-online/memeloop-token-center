@@ -546,6 +546,106 @@ async fn exercise_credential_and_ledger_acceptance(state: AppState, label: &str)
     }
 }
 
+async fn exercise_filtered_credential_pages(state: &AppState) {
+    let tenant = format!("filtered-{}", Uuid::now_v7());
+    let unicode = create_credential(
+        state,
+        &tenant,
+        "ÉQUIPE-Ö-中文",
+        "ÉQUIPE Ö 中文",
+        "0",
+        &format!("{tenant}:unicode"),
+    )
+    .await;
+    // Preserve original non-ASCII spelling; never pre-fold the needle with a
+    // different Unicode implementation from the database's column function.
+    for search in ["%C3%89QUIPE", "%C3%96", "%E4%B8%AD%E6%96%87"] {
+        let (status, rows) = json_request(
+            state,
+            "GET",
+            &format!("/internal/v1/keys?tenant_external_id={tenant}&search={search}"),
+            BOOTSTRAP_TOKEN,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["key_id"], unicode["key_id"]);
+    }
+    let first = create_credential(
+        state,
+        &tenant,
+        "owner",
+        "Invoice 100%_Literal",
+        "0",
+        &format!("{tenant}:first"),
+    )
+    .await;
+    let second = create_credential(
+        state,
+        &tenant,
+        "owner",
+        "Invoice 100%_Literal",
+        "0",
+        &format!("{tenant}:second"),
+    )
+    .await;
+    let _decoy = create_credential(
+        state,
+        &tenant,
+        "owner",
+        "Invoice 100XLiteral",
+        "0",
+        &format!("{tenant}:decoy"),
+    )
+    .await;
+    let path = format!(
+        "/internal/v1/keys?tenant_external_id={tenant}&search=100%25_literal&status=active&limit=1"
+    );
+    let (status, page) = json_request(state, "GET", &path, BOOTSTRAP_TOKEN, None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page.as_array().unwrap().len(), 1);
+    assert_eq!(page[0]["key_id"], second["key_id"]);
+    let cursor = format!(
+        "{path}&before_created_at={}&before_id={}",
+        page[0]["created_at"],
+        page[0]["key_id"].as_str().unwrap()
+    );
+    let (_, page) = json_request(state, "GET", &cursor, BOOTSTRAP_TOKEN, None, None).await;
+    assert_eq!(page.as_array().unwrap().len(), 1);
+    assert_eq!(page[0]["key_id"], first["key_id"]);
+    state
+        .db
+        .set_key_status(
+            Uuid::parse_str(first["key_id"].as_str().unwrap()).unwrap(),
+            "revoked",
+        )
+        .await
+        .unwrap();
+    let (_, page) = json_request(
+        state,
+        "GET",
+        &path.replace("status=active", "status=revoked"),
+        BOOTSTRAP_TOKEN,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(page.as_array().unwrap().len(), 1);
+    assert_eq!(page[0]["key_id"], first["key_id"]);
+    let (status, _) = json_request(
+        state,
+        "GET",
+        &path.replace("status=active", "status=invalid"),
+        BOOTSTRAP_TOKEN,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn sqlite_create_reconciliation_and_paginated_tenant_billing_are_stable() {
     let directory = tempfile::tempdir().unwrap();
@@ -556,6 +656,7 @@ async fn sqlite_create_reconciliation_and_paginated_tenant_billing_are_stable() 
     let state = AppState::initialize(Config::for_test(database_url))
         .await
         .unwrap();
+    exercise_filtered_credential_pages(&state).await;
     exercise_credential_and_ledger_acceptance(state, "sqlite").await;
 }
 
@@ -576,5 +677,6 @@ async fn postgres_create_reconciliation_and_paginated_tenant_billing_are_stable(
     .await
     .unwrap();
     assert_eq!(cursor_indexes, 4);
+    exercise_filtered_credential_pages(&state).await;
     exercise_credential_and_ledger_acceptance(state, "postgres").await;
 }
