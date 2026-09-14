@@ -7,6 +7,8 @@ import type { GenerationAsset, GenerationJob, KeyView } from '../types';
 import { selfErrorMessage } from './errors';
 import { GenerationDrawer } from './SelfDrawers';
 import { GenerationActionRegistry, startCompletionPolling } from './generationConcurrency';
+import { Button } from '../design-system';
+import './generationPages.css';
 
 export function GenerationsPage({ credential, credentialView, onError }: {
   credential: string;
@@ -18,6 +20,7 @@ export function GenerationsPage({ credential, credentialView, onError }: {
   const [jobs, setJobs] = useState<GenerationJob[]>([]);
   const [selected, setSelected] = useState<GenerationJob>();
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
   const [message, setMessage] = useState('');
   const [cancellingIds, setCancellingIds] = useState<Set<string>>(() => new Set());
   const scopeGeneration = useRef(0);
@@ -33,13 +36,15 @@ export function GenerationsPage({ credential, credentialView, onError }: {
     const controller = new AbortController();
     refreshController.current = controller;
     refreshInFlight.current = true;
+    setLoading(true);
     try {
       const response = await api<GenerationJob[]>('/self/v1/generations?limit=100', credential, { signal: controller.signal });
       if (scope !== scopeGeneration.current || current !== refreshSequence.current || controller.signal.aborted) return;
       setJobs(response);
+      setLoadError('');
       setSelected((job) => job ? response.find((candidate) => candidate.job_id === job.job_id) : undefined);
     } catch (reason) {
-      if (scope === scopeGeneration.current && current === refreshSequence.current && !controller.signal.aborted) onError(selfErrorMessage(reason, t, t('common.requestFailed')));
+      if (scope === scopeGeneration.current && current === refreshSequence.current && !controller.signal.aborted) setLoadError(selfErrorMessage(reason, t, t('common.requestFailed')));
     } finally {
       if (scope === scopeGeneration.current && current === refreshSequence.current) setLoading(false);
       if (refreshController.current === controller) refreshInFlight.current = false;
@@ -53,6 +58,7 @@ export function GenerationsPage({ credential, credentialView, onError }: {
     actionControllers.current.abortAll();
     refreshInFlight.current = false;
     setJobs([]);
+    setLoadError('');
     setSelected(undefined);
     setMessage('');
     setCancellingIds(new Set());
@@ -131,8 +137,9 @@ export function GenerationsPage({ credential, credentialView, onError }: {
   return <div className="self-page self-generations-page" data-self-page="generations">{confirmationDialog}
     {message && <div className="notice success" role="status">{message}</div>}
     <article className="panel self-generations">
-      <div className="panel-title"><h2>{t('self.generations')}</h2><button type="button" className="secondary" disabled={loading} onClick={() => void refresh()}>{loading ? t('common.loading') : t('self.refreshGenerations')}</button></div>
-      {loading && jobs.length === 0 ? <div className="boot">{t('common.loading')}</div> : <div className="table-scroll"><table><thead><tr><th>{t('request.time')}</th><th>{t('request.model')}</th><th>{t('request.status')}</th><th>{t('self.units')}</th><th>{t('request.cost')}</th><th>{t('request.error')}</th><th>{t('routes.actions')}</th></tr></thead><tbody>{jobs.map((job) => <tr key={job.job_id}><td>{new Date(job.created_at).toLocaleString(locale)}</td><td><button type="button" className="table-link" onClick={() => setSelected(job)} aria-label={t('self.openGeneration', { model: job.model })}><code>{job.model}</code></button></td><td><span className={`status ${job.status === 'succeeded' ? 'ok' : job.status === 'failed' || job.status === 'cancelled' ? 'bad' : 'pending'}`}>{t(`generationStatus.${job.status}`)}</span></td><td>{job.billed_units === null ? `≤ ${formatNumber(job.estimated_units, locale)}` : formatNumber(job.billed_units, locale)}</td><td>{formatCurrency(job.cost, credentialView.currency, locale)}</td><td>{job.error_code ?? '—'}</td><td>{(job.status === 'queued' || job.status === 'running') && <button type="button" className="secondary" disabled={cancellingIds.has(job.job_id)} onClick={() => void cancel(job)}>{cancellingIds.has(job.job_id) ? t('common.loading') : t('self.cancelGeneration')}</button>}</td></tr>)}</tbody></table>{jobs.length === 0 && <div className="empty">{t('self.noGenerations')}</div>}</div>}
+      <div className="panel-title"><h2>{t('self.generations')}</h2><Button type="button" appearance="secondary" disabled={loading} onClick={() => void refresh()}>{loading ? t('common.loading') : t('self.refreshGenerations')}</Button></div>
+      {loadError && <div className="notice error" role="alert">{loadError}</div>}
+      {loading && jobs.length === 0 ? <div className="boot">{t('common.loading')}</div> : <div className="table-scroll"><table><thead><tr><th>{t('request.time')}</th><th>{t('request.model')}</th><th>{t('request.status')}</th><th>{t('self.units')}</th><th>{t('request.cost')}</th><th>{t('request.error')}</th><th>{t('routes.actions')}</th></tr></thead><tbody>{jobs.map((job) => <tr key={job.job_id}><td>{new Date(job.created_at).toLocaleString(locale)}</td><td><button type="button" className="table-link" onClick={() => setSelected(job)} aria-label={t('self.openGeneration', { model: job.model })}><code>{job.model}</code></button></td><td><span className={`status ${job.status === 'succeeded' ? 'ok' : job.status === 'failed' || job.status === 'cancelled' ? 'bad' : 'pending'}`}>{t(`generationStatus.${job.status}`)}</span></td><td>{job.billed_units === null ? `≤ ${formatNumber(job.estimated_units, locale)}` : formatNumber(job.billed_units, locale)}</td><td>{formatCurrency(job.cost, credentialView.currency, locale)}</td><td>{job.error_code ?? '—'}</td><td>{(job.status === 'queued' || job.status === 'running') && <button type="button" className="secondary" disabled={cancellingIds.has(job.job_id)} onClick={() => void cancel(job)}>{cancellingIds.has(job.job_id) ? t('common.loading') : t('self.cancelGeneration')}</button>}</td></tr>)}</tbody></table>{jobs.length === 0 && !loadError && <div className="empty">{t('self.noGenerations')}</div>}</div>}
     </article>
     {selected && <GenerationDrawer job={selected} currency={credentialView.currency} cancelling={cancellingIds.has(selected.job_id)} onDownload={(asset) => void download(selected, asset)} onCancel={() => void cancel(selected)} onClose={() => setSelected(undefined)} />}
   </div>;

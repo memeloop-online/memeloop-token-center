@@ -1,0 +1,15 @@
+.self-generations-page .self-generations,
+:root[data-theme] .self-generations-page .self-generations,
+.self-generate-page .generation-create,
+:root[data-theme] .self-generate-page .generation-create {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.self-generations-page .boot, .self-generate-page .boot {
+  height: auto;
+  min-height: 120px;
+}
+.self-generations-page .panel-title { margin-bottom: 16px; }
+.self-generate-page .generation-create { max-width: 920px; }

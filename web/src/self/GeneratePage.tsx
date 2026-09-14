@@ -9,6 +9,7 @@ import { safeValidator as validator } from '../safeValidator';
 import type { GenerationJob, ModelCatalogItem, ModelCatalogResponse } from '../types';
 import { selfErrorMessage } from './errors';
 import { buildGenerationInput, generationNeedsDuration } from './generationRequest';
+import './generationPages.css';
 
 export function GeneratePage({ credential, onError }: { credential: string; onError: (message: string) => void }) {
   const { locale, t } = useI18n();
