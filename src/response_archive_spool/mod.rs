@@ -4,6 +4,9 @@ mod cipher;
 mod producer;
 mod upload;
 
+#[cfg(test)]
+pub(crate) mod fence_probe;
+
 use std::{
     future::Future,
     sync::{
@@ -27,7 +30,7 @@ pub(crate) use producer::pause_next_begin_for_test;
 #[cfg(test)]
 pub(crate) use producer::pause_next_request_preseal_for_test;
 pub(crate) use producer::{BufferedArchive, PreparedArchiveBatch};
-pub(crate) use producer::{ResponseArchiveProducer, ResponseArchiveSettlement, mark_gap};
+pub(crate) use producer::{ResponseArchiveProducer, ResponseArchiveSettlement};
 pub(crate) use upload::run;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,7 +63,6 @@ pub(crate) const CAPTURE_INSERT_BATCH_CHUNKS: usize = 16;
 // reservation before the writer starts.
 const CAPTURE_QUEUE_CHUNKS: usize = 3;
 const CAPTURE_MEMORY_BYTES: usize = CHUNK_BYTES * 5;
-const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 struct OwnedTask<T: Send + 'static> {
     task: Option<tokio::task::JoinHandle<Result<T, AppError>>>,
