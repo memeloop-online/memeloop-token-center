@@ -8,6 +8,38 @@ pub(super) enum ExtractedUsage {
     Invalid,
 }
 
+/// Only Kimi's native buffered Chat uses its top-level cache spelling. Other
+/// providers and protocols retain their existing usage contracts unchanged.
+pub(super) fn extract_buffered_usage_checked(body: &[u8], driver: &str, protocol: Protocol) -> ExtractedUsage {
+    if driver != crate::oauth::managed::kimi::PROVIDER_DRIVER || !matches!(protocol, Protocol::OpenAiChat) {
+        return extract_usage_checked(body);
+    }
+    let Ok(mut value) = crate::api::sse::parse_unique_json(body) else {
+        return ExtractedUsage::Invalid;
+    };
+    let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) else {
+        return ExtractedUsage::Missing;
+    };
+    let Ok(usage) = crate::api::kimi_transport::usage::normalize(usage) else {
+        return ExtractedUsage::Invalid;
+    };
+    // A top-level cache count alone is not evidence of prompt/completion
+    // counts. Require the native complete counters, including their sum.
+    let count = |name| usage.get(name).and_then(Value::as_i64).filter(|n| (0..=MAX_REPORTED_TOKENS).contains(n));
+    let (Some(input), Some(output), Some(total)) = (count("prompt_tokens"), count("completion_tokens"), count("total_tokens")) else {
+        return ExtractedUsage::Invalid;
+    };
+    if input.checked_add(output) != Some(total) {
+        return ExtractedUsage::Invalid;
+    }
+    value["usage"] = usage;
+    match usage_from_value_checked(&value) {
+        Ok(Some(usage)) => ExtractedUsage::Valid(usage),
+        Ok(None) => ExtractedUsage::Missing,
+        Err(()) => ExtractedUsage::Invalid,
+    }
+}
+
 pub(super) fn merge_streaming_usage(current: &mut TokenUsage, next: TokenUsage) -> Result<(), ()> {
     current.input_tokens = current.input_tokens.max(next.input_tokens);
     current.cached_input_tokens = current.cached_input_tokens.max(next.cached_input_tokens);
@@ -299,6 +331,38 @@ pub(super) fn usage_from_value_checked(value: &Value) -> Result<Option<TokenUsag
 #[cfg(test)]
 pub(super) fn usage_from_value(value: &Value) -> Option<TokenUsage> {
     usage_from_value_checked(value).ok().flatten()
+}
+
+#[cfg(test)]
+mod kimi_buffered_tests {
+    use super::*;
+
+    fn parse(usage: Value, driver: &str, protocol: Protocol) -> ExtractedUsage {
+        extract_buffered_usage_checked(&serde_json::to_vec(&serde_json::json!({"usage":usage})).unwrap(), driver, protocol)
+    }
+
+    #[test]
+    fn kimi_cache_alias_is_driver_and_protocol_scoped_and_conflicts_fail() {
+        let kimi = crate::oauth::managed::kimi::PROVIDER_DRIVER;
+        let usage = serde_json::json!({"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"cached_tokens":6});
+        for (driver, protocol, counts) in [(kimi, Protocol::OpenAiChat, (4,6)), ("http-json", Protocol::OpenAiChat, (10,0)), (kimi, Protocol::OpenAiResponses, (10,0))] {
+            let ExtractedUsage::Valid(result) = parse(usage.clone(), driver, protocol) else { panic!("valid usage") };
+            assert_eq!((result.input_tokens, result.cached_input_tokens), counts);
+        }
+        for bad in [
+            serde_json::json!({"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"cached_tokens":6,"prompt_tokens_details":{"cached_tokens":5}}),
+            serde_json::json!({"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"cached_tokens":11}),
+            serde_json::json!({"prompt_tokens":10,"completion_tokens":2,"total_tokens":13,"cached_tokens":6}),
+            serde_json::json!({"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"cached_tokens":-1}),
+            serde_json::json!({"cached_tokens":6}),
+        ] {
+            assert!(matches!(parse(bad, kimi, Protocol::OpenAiChat), ExtractedUsage::Invalid));
+        }
+        assert!(matches!(parse(Value::Null, kimi, Protocol::OpenAiChat), ExtractedUsage::Missing));
+        let anthropic = serde_json::json!({"input_tokens":4,"output_tokens":2,"cache_read_input_tokens":6,"cache_creation_input_tokens":3});
+        let ExtractedUsage::Valid(result) = parse(anthropic, kimi, Protocol::AnthropicMessages) else { panic!("native Anthropic usage") };
+        assert_eq!((result.input_tokens,result.cached_input_tokens,result.cache_write_tokens), (4,6,3));
+    }
 }
 
 pub(super) fn is_supported_service_tier(tier: &str) -> bool {
