@@ -133,15 +133,22 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
       assert.deepEqual(await page.evaluate(() => [window.quotaReads, window.quotaWrites, window.quotaPrepares, window.quotaConfirms, window.quotaReconciles]), [1, 0, 0, 0, 0]);
     }
     for (const [locale, theme, width] of [['en', 'light', 1440], ['zh-CN', 'dark', 390]] as const) {
+      await page.clock.setFixedTime(new Date('2026-09-15T00:00:00Z'));
       await page.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
-      await page.goto(`${base}/e2e/fixtures/upstream-quota.html?mode=kimi`);
+      await page.goto(`${base}/e2e/fixtures/upstream-quota.html?mode=kimi&units=1`);
       await page.getByRole('button', { name: locale === 'en' ? 'View quota' : '查看额度', exact: true }).click();
       await page.getByText(locale === 'en' ? 'Remaining 100%' : '剩余 100%', { exact: true }).waitFor();
       await page.getByText(locale === 'en' ? 'Remaining 75%' : '剩余 75%', { exact: true }).waitFor();
       assert.equal(await page.getByText(/100 \/ 100/).count(), 0, 'unitless normalized values never look like an absolute allowance');
       assert.equal(await page.locator('.upstream-quota-reset').count(), 0, 'unsupported reset capability has no empty section or action');
-      assert.equal(await page.locator('.upstream-quota-window').count(), 2);
-      assert.equal(await page.locator('.upstream-quota-window meter').count(), 2);
+      await page.getByText(locale === 'en' ? 'Remaining 25 / 100 requests' : '剩余 25 / 100 请求', { exact: true }).waitFor();
+      await page.getByText(locale === 'en' ? 'Remaining 25 / 100 tokens' : '剩余 25 / 100 词元', { exact: true }).waitFor();
+      await page.getByText(`${locale === 'en' ? 'Remaining' : '剩余'} 25 / 100 Vendor Compute Units`, { exact: true }).waitFor();
+      await page.getByText(locale === 'en' ? 'Resets in 7d' : '距重置 7天', { exact: true }).waitFor();
+      const exactDate = await page.evaluate(locale => new Date('2026-09-22T00:00:00Z').toLocaleString(locale), locale);
+      await page.getByText(`${locale === 'en' ? 'Resets' : '重置于'} ${exactDate}`, { exact: true }).waitFor();
+      assert.equal(await page.locator('.upstream-quota-window').count(), 5);
+      assert.equal(await page.locator('.upstream-quota-window meter').count(), 5);
       assert.deepEqual(await page.evaluate(() => [window.quotaReads, window.quotaWrites, window.quotaPrepares, window.quotaConfirms]), [1, 0, 0, 0]);
       await page.setViewportSize({ width, height: 900 });
       await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);

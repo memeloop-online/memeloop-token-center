@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
-import { formatElapsedTime, formatNumber, formatPercent } from '../format';
+import { formatCountdown, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
-import { quotaObservationState, quotaReadErrorMessage, quotaRemaining, quotaResetCreditExpiry, quotaSourceLabel, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaPath, type UpstreamQuotaSnapshot } from './upstreamQuota';
+import { quotaObservationState, quotaReadErrorMessage, quotaRemaining, quotaResetCreditExpiry, quotaSourceLabel, quotaUnitMessage, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaPath, type UpstreamQuotaSnapshot } from './upstreamQuota';
 import type { QuotaReadState } from './useUpstreamQuotaReads';
 import './upstreamQuota.css';
 import { UpstreamQuotaReset } from './UpstreamQuotaReset';
@@ -35,6 +35,7 @@ export function UpstreamQuotaDetails({ snapshot, refreshError }: { snapshot: Ups
     {hasObservation && <div className="upstream-quota-windows">{snapshot.windows.map((window) => {
       const used = quotaUsedPercent(window);
       const remaining = quotaRemaining(window);
+      const unitMessage = remaining?.kind === 'amount' ? quotaUnitMessage(remaining.unit) : null;
       const presentation = quotaWindowPresentation(snapshot.provider, window);
       const baseScope = presentation.supplierLabel ?? t(presentation.scopeKey);
       const scope = presentation.qualifier ? t('quota.scopeWithQualifier', { scope: baseScope, qualifier: presentation.qualifier }) : baseScope;
@@ -47,9 +48,9 @@ export function UpstreamQuotaDetails({ snapshot, refreshError }: { snapshot: Ups
         {window.allowed === false && window.limit_reached !== true && <span className="status pending">{t('quota.notAllowed')}</span>}
         {remaining && <p>{remaining.kind === 'percent'
           ? t('quota.remainingPercent', { percent: formatPercent(remaining.percent / 100, locale) })
-          : t('quota.remainingWithUnit', { amount: formatNumber(remaining.amount, locale), limit: remaining.limit === null ? '—' : formatNumber(remaining.limit, locale), unit: remaining.unit })}</p>}
+          : t('quota.remainingWithUnit', { amount: formatNumber(remaining.amount, locale), limit: remaining.limit === null ? '—' : formatNumber(remaining.limit, locale), unit: unitMessage ? t(unitMessage) : remaining.unit })}</p>}
         <p>{window.reset_at === null ? t('quota.resetTimeUnknown') : t(window.reset_is_estimated ? 'quota.estimatedResetAt' : 'quota.resetAt', { time: new Date(window.reset_at).toLocaleString(locale) })}</p>
-        {window.reset_at !== null && <span>{window.reset_at <= now ? t('quota.resetElapsed') : t('quota.resetIn', { time: formatElapsedTime(window.reset_at - now, locale) })}</span>}
+        {window.reset_at !== null && <span>{window.reset_at <= now ? t('quota.resetElapsed') : t('quota.resetIn', { time: formatCountdown(window.reset_at - now, locale) })}</span>}
         <DetailTooltip content={t('quota.sourceEvidence', { source, id: window.id, rawSource: window.source })}><small tabIndex={0} data-quota-evidence={window.id}>{t('quota.sourceLabel')}</small></DetailTooltip>
       </section>;
     })}</div>}
