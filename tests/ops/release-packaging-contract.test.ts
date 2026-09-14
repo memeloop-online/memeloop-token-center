@@ -44,6 +44,15 @@ test('release contains only runtime images and no retired migration delivery sur
   const rust = parsed.jobs?.rust;
   const web = parsed.jobs?.web;
   const migration = parsed.jobs?.['migration-smoke'];
+  const runtimeFeature = '--features experimental-plugin-revisions';
+  const imageServiceBuilds = dockerfile.split('\n').filter((line) => line.includes('cargo build'));
+  assert.equal(imageServiceBuilds.length, 2);
+  for (const line of imageServiceBuilds) assert.ok(line.includes(runtimeFeature), 'service image must include the installed-revision runtime');
+  for (const [name, job] of [['memory-binary', memoryBinary], ['web', web]] as const) {
+    const serviceBuilds = job?.steps?.filter((step) => step.run?.includes('cargo build')) ?? [];
+    assert.equal(serviceBuilds.length, 1, `${name} must build the service binary once`);
+    assert.ok(serviceBuilds[0].run?.includes(runtimeFeature), `${name} must test the production service feature set`);
+  }
   assert.equal(memoryBinary?.if, "needs.changes.outputs.memory == 'true'");
   assert.equal(memoryAcceptance?.if, "needs.changes.outputs.memory == 'true'");
   assert.equal(rust?.if, "needs.changes.outputs.rust == 'true'");
