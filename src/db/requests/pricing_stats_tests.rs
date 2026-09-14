@@ -185,21 +185,33 @@ async fn parity(database: &Database) {
         // The production hot path is global and unfiltered. Keep a direct
         // semantic comparison here, where this database is test-local and no
         // concurrent fixture can alter the global total between reads.
-        let expected = database
-            .global_operator_stats_filtered(base.clone())
-            .await
-            .unwrap()
-            .by_model
-            .into_iter()
-            .map(|row| (row.name, row.requests, row.input_tokens, row.output_tokens))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            database
-                .pricing_model_usage(None, base.clone())
+        assert_global_unfiltered_parity(database, base.clone()).await;
+
+        // The original source's joins intentionally hide historical facts if
+        // their key or principal no longer exists. The core history tables do
+        // not have FKs for those links, so exercise both cases instead of
+        // relying on a permanence assumption for the optimized path.
+        let principal_id: String =
+            sqlx::query_scalar("SELECT principal_id FROM key_records WHERE id = $1")
+                .bind(key.to_string())
+                .fetch_one(&database.pool)
                 .await
-                .unwrap(),
-            expected
-        );
+                .unwrap();
+        sqlx::query("DELETE FROM principals WHERE id = $1")
+            .bind(principal_id)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        assert_global_unfiltered_parity(database, base.clone()).await;
+
+        let deleted_key_tenant = format!("pricing-deleted-key-{}", Uuid::now_v7());
+        let (deleted_key, _, _) = fixture(database, &deleted_key_tenant).await;
+        sqlx::query("DELETE FROM key_records WHERE id = $1")
+            .bind(deleted_key.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        assert_global_unfiltered_parity(database, base.clone()).await;
     }
     // CI-only EXPLAIN for the actual projection SQL. The fixtures contain no
     // secret/user input; every value below remains a driver-bound parameter.
@@ -265,6 +277,21 @@ async fn parity(database: &Database) {
     }
 }
 
+async fn assert_global_unfiltered_parity(database: &Database, filter: StatsFilter) {
+    let expected = database
+        .global_operator_stats_filtered(filter.clone())
+        .await
+        .unwrap()
+        .by_model
+        .into_iter()
+        .map(|row| (row.name, row.requests, row.input_tokens, row.output_tokens))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        database.pricing_model_usage(None, filter).await.unwrap(),
+        expected
+    );
+}
+
 #[tokio::test]
 async fn sqlite_pricing_model_projection_matches_existing_statistics() {
     let directory = tempfile::tempdir().unwrap();
@@ -292,11 +319,12 @@ async fn postgres_pricing_model_projection_matches_existing_statistics() {
 fn pricing_query_has_only_model_projection_and_disjoint_indexable_edges() {
     let query = pricing_stats_sql(None, &StatsFilter::default());
     assert!(!query.contains("GROUPING SETS"));
-    assert!(!query.contains("MATERIALIZED"));
+    assert!(!query.contains("filtered_activity AS MATERIALIZED"));
     assert!(!query.contains("DENSE_RANK"));
-    assert!(!query.contains("JOIN key_records"));
-    assert!(!query.contains("JOIN principals"));
-    assert!(!query.contains("JOIN tenants"));
+    assert_eq!(query.matches("JOIN key_records").count(), 1);
+    assert_eq!(query.matches("JOIN principals").count(), 1);
+    assert_eq!(query.matches("JOIN tenants").count(), 1);
+    assert_eq!(query.matches("JOIN pricing_visible_keys").count(), 6);
     assert_eq!(query.matches("AND f.created_at < $3").count(), 2);
     assert_eq!(
         query

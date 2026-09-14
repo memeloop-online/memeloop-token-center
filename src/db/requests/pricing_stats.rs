@@ -8,9 +8,10 @@ const DAY_MILLIS: i64 = 86_400_000;
 const EDGE_PREDICATE: &str = "  AND (f.created_at < $17 OR f.created_at >= $18)";
 
 // The pricing page normally asks for the global, unfiltered 30-day model
-// total.  That query does not need credential, principal, or tenant data:
-// the facts and rollups already carry the immutable model and usage fields.
-// Keeping it separate avoids six unnecessary relation joins on the hot path.
+// total. The facts and rollups already carry the immutable model and usage
+// fields. We still restrict them to an eligible key set so historic orphan
+// facts have the same visibility as the authoritative statistics query, but
+// compute that key/principal/tenant relation once instead of per UNION arm.
 // The four placeholders are deliberately consecutive so this statement has a
 // small bind set of its own; filtered and scoped requests retain the complete
 // operator-statistics source below.
@@ -20,6 +21,7 @@ SELECT a.model,
        a.output_tokens,
        a.requests
   FROM request_daily_aggregates a
+  JOIN pricing_visible_keys k ON k.id = a.key_id AND k.tenant_id = a.tenant_id
  WHERE a.day_bucket >= $3 / 86400000
    AND a.day_bucket < $4 / 86400000
 UNION ALL
@@ -28,6 +30,7 @@ SELECT f.model,
        f.output_tokens,
        CAST(1 AS BIGINT) AS requests
   FROM request_stats_facts f
+  JOIN pricing_visible_keys k ON k.id = f.key_id AND k.tenant_id = f.tenant_id
  WHERE f.created_at >= $1 AND f.created_at <= $2
    AND f.created_at < $3
 UNION ALL
@@ -36,6 +39,7 @@ SELECT f.model,
        f.output_tokens,
        CAST(1 AS BIGINT) AS requests
   FROM request_stats_facts f
+  JOIN pricing_visible_keys k ON k.id = f.key_id AND k.tenant_id = f.tenant_id
  WHERE f.created_at >= $1 AND f.created_at <= $2
    AND f.created_at >= $4 AND f.created_at >= $3
 UNION ALL
@@ -44,6 +48,7 @@ SELECT a.model,
        CAST(0 AS BIGINT) AS output_tokens,
        a.requests
   FROM generation_daily_aggregates a
+  JOIN pricing_visible_keys k ON k.id = a.key_id AND k.tenant_id = a.tenant_id
  WHERE a.day_bucket >= $3 / 86400000
    AND a.day_bucket < $4 / 86400000
 UNION ALL
@@ -52,6 +57,7 @@ SELECT f.model,
        CAST(0 AS BIGINT) AS output_tokens,
        CAST(1 AS BIGINT) AS requests
   FROM generation_stats_facts f
+  JOIN pricing_visible_keys k ON k.id = f.key_id AND k.tenant_id = f.tenant_id
  WHERE f.created_at >= $1 AND f.created_at <= $2
    AND f.created_at < $3
 UNION ALL
@@ -60,6 +66,7 @@ SELECT f.model,
        CAST(0 AS BIGINT) AS output_tokens,
        CAST(1 AS BIGINT) AS requests
   FROM generation_stats_facts f
+  JOIN pricing_visible_keys k ON k.id = f.key_id AND k.tenant_id = f.tenant_id
  WHERE f.created_at >= $1 AND f.created_at <= $2
    AND f.created_at >= $4 AND f.created_at >= $3
 "#;
@@ -116,7 +123,8 @@ fn pricing_activity_source(filter: &StatsFilter) -> String {
 }
 
 fn pricing_stats_sql(tenant_external_id: Option<&str>, filter: &StatsFilter) -> String {
-    let source = if is_global_unfiltered(tenant_external_id, filter) {
+    let global_unfiltered = is_global_unfiltered(tenant_external_id, filter);
+    let source = if global_unfiltered {
         GLOBAL_UNFILTERED_PRICING_ACTIVITY_SOURCE.to_owned()
     } else {
         pricing_activity_source(filter)
@@ -124,8 +132,19 @@ fn pricing_stats_sql(tenant_external_id: Option<&str>, filter: &StatsFilter) -> 
     // No MATERIALIZED fence: PostgreSQL can prune unused cost/status columns
     // and plan the individual rollup/edge arms. Unlike the operator snapshot,
     // this endpoint needs neither four projections nor currency/window ranks.
+    let eligibility = if global_unfiltered {
+        r#"pricing_visible_keys AS MATERIALIZED (
+    SELECT k.id, k.tenant_id
+      FROM key_records k
+      JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
+      JOIN tenants t ON t.id = k.tenant_id
+),
+"#
+    } else {
+        ""
+    };
     format!(
-        "WITH filtered_activity AS ({source})
+        "WITH {eligibility}filtered_activity AS ({source})
          SELECT model,
                 CAST(SUM(requests) AS BIGINT) AS calls,
                 CAST(SUM(input_tokens) AS BIGINT) AS input_tokens,
