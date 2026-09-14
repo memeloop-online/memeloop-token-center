@@ -94,7 +94,7 @@ async fn postgres_gc_holds_budget_only_for_one_bounded_batch_then_producer_progr
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let waiting: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND UPPER(query) LIKE 'SELECT CIPHER_BYTES FROM RESPONSE_ARCHIVE_SPOOL_BUDGET%' AND wait_event_type = 'Lock'",
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND UPPER(query) LIKE 'SELECT CIPHER_BYTES%FROM RESPONSE_ARCHIVE_SPOOL_BUDGET%FOR UPDATE%' AND wait_event_type = 'Lock'",
             )
             .bind(&fixture.schema)
             .fetch_one(&fixture.admin)
@@ -269,7 +269,7 @@ async fn postgres_gc_waits_for_budget_before_locking_spool_then_reclaims() {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let waiting: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND UPPER(query) LIKE 'SELECT CIPHER_BYTES FROM RESPONSE_ARCHIVE_SPOOL_BUDGET%' AND wait_event_type = 'Lock'",
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND UPPER(query) LIKE 'SELECT CIPHER_BYTES%FROM RESPONSE_ARCHIVE_SPOOL_BUDGET%FOR UPDATE%' AND wait_event_type = 'Lock'",
             )
             .bind(&fixture.schema)
             .fetch_one(&fixture.admin)
