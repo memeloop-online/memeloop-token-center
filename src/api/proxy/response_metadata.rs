@@ -387,6 +387,7 @@ mod kimi_buffered_tests {
                 panic!("valid usage")
             };
             assert_eq!((result.input_tokens, result.cached_input_tokens), counts);
+            assert_eq!(result.output_tokens, 2);
         }
         for bad in [
             serde_json::json!({"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"cached_tokens":6,"prompt_tokens_details":{"cached_tokens":5}}),

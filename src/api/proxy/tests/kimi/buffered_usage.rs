@@ -121,7 +121,8 @@ async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_origina
             rows[0].cached_input_tokens,
             rows[0].output_tokens
         ),
-        (4, 6, 2)
+        (10, 6, 2),
+        "request rows report inclusive input; cached input remains a subset"
     );
     assert_eq!(
         rows[0].usage_basis,
