@@ -51,7 +51,9 @@ fn translation_reasons_distinguish_usage_finish_and_limits_without_payload() {
         state.observe(b"data: {\"choices\":\"canary-secret\"}\n\n"),
         Err("kimi_choices_type")
     );
-    assert_eq!(state.translator.finish(), Err("finish_reason_missing"));
+    // Schema rejection now happens before any translator output is created.
+    assert!(state.pending.is_empty());
+    assert_eq!(state.translator.finish(), Err("empty_stream"));
     let mut translator =
         responses::Stream::new(responses::Context::new(&json!({"model":"kimi-k3"})));
     translator

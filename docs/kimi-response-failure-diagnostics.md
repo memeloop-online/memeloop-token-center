@@ -42,6 +42,11 @@ public example, not a customer response. Its 19 prompt tokens include 12 cached
 tokens: settlement must preserve 7 uncached + 12 cached + 13 output tokens.
 Both DONE and clean-EOF variants pass through actual translation, delivery,
 settlement and archive fixtures; cached tokens are not added twice.
+The test uses distinct uncached/cached/output prices of 2/1/3 USD per million
+and asserts 65 microdollars. Normalized TokenUsage stores 7 uncached inputs;
+request records intentionally expose 19 inclusive inputs with a cached subset
+of 12. The SSE fixture's final empty line is an intentional protocol delimiter,
+not removable trailing prose whitespace.
 
 The Kimi-only parser ignores additional envelope/choice metadata while keeping
 delta data and validating the existing core identity/choice/finish contract.

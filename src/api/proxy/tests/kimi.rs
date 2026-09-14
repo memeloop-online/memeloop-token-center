@@ -6,6 +6,21 @@ async fn translated_kimi_clean_eof_and_done_settle_and_archive_once() {
         let upstream = MockServer::start().await;
         let bridge = MockServer::start().await;
         let fixture = response_usage_fixture("kimi-terminal", &bridge, 0).await;
+        fixture
+            .state
+            .db
+            .upsert_model_price_tier(
+                &fixture.model,
+                "USD",
+                "default",
+                Decimal::from(2),
+                Decimal::ONE,
+                Decimal::from(2),
+                Decimal::from(3),
+                false,
+            )
+            .await
+            .unwrap();
         // Official Kimi Chat streaming example, including its top-level cache
         // count. See docs/kimi-response-failure-diagnostics.md for provenance.
         let documented = include_str!("../../kimi_transport/fixtures/documented-chat-stream.sse");
@@ -38,8 +53,17 @@ async fn translated_kimi_clean_eof_and_done_settle_and_archive_once() {
             .collect::<Vec<_>>();
         let mut capture = ResponsesSseCapture::for_responses();
         capture.push(&body);
-        let ResponsesSseOutcome::Completed { response_id } = capture.finish_summary().outcome
-        else {
+        let summary = capture.finish_summary();
+        let usage = summary.usage.as_ref().unwrap();
+        assert_eq!(
+            (
+                usage.input_tokens,
+                usage.cached_input_tokens,
+                usage.output_tokens
+            ),
+            (7, 12, 13)
+        );
+        let ResponsesSseOutcome::Completed { response_id } = summary.outcome else {
             panic!("Kimi clean terminal must complete");
         };
         // Feed actual adapter output through the ordinary gateway delivery and
@@ -72,17 +96,18 @@ async fn translated_kimi_clean_eof_and_done_settle_and_archive_once() {
             .await
             .unwrap();
         assert_eq!(rows[0].status_code, Some(200));
-        assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (7, 13));
+        // Request records expose inclusive input, unlike normalized TokenUsage.
+        assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (19, 13));
         assert_eq!(rows[0].cached_input_tokens, 12);
         assert_eq!(
             rows[0].usage_basis,
             Some(crate::model::RequestUsageBasis::ProviderReported)
         );
-        // Fixture prices use $1/M for both input and output, including cached
-        // input fallback: 7 uncached + 12 cached + 13 output, each exactly once.
+        // Distinct prices prove the cached subset is not charged as ordinary
+        // input or counted twice: 7*2 + 12*1 + 13*3 = 65 microdollars.
         assert_eq!(
             rows[0].cost.parse::<Decimal>().unwrap(),
-            Decimal::new(32, 6)
+            Decimal::new(65, 6)
         );
         assert_exactly_once_side_effects(&fixture, rows[0].request_id, response_id.as_deref())
             .await;
