@@ -362,6 +362,29 @@ pub(super) fn usage_from_value(value: &Value) -> Option<TokenUsage> {
     usage_from_value_checked(value).ok().flatten()
 }
 
+pub(super) fn is_supported_service_tier(tier: &str) -> bool {
+    matches!(
+        tier,
+        "default" | "auto" | "priority" | "flex" | "scale" | "batch" | "standard_only"
+    )
+}
+
+pub(super) fn append_bounded(capture: &mut Vec<u8>, chunk: &[u8], maximum: usize) {
+    if chunk.len() >= maximum {
+        capture.clear();
+        capture.extend_from_slice(&chunk[chunk.len() - maximum..]);
+        return;
+    }
+    let overflow = capture
+        .len()
+        .saturating_add(chunk.len())
+        .saturating_sub(maximum);
+    if overflow > 0 {
+        capture.drain(..overflow);
+    }
+    capture.extend_from_slice(chunk);
+}
+
 #[cfg(test)]
 mod kimi_buffered_tests {
     use super::*;
@@ -430,27 +453,4 @@ mod kimi_buffered_tests {
             (4, 6, 3)
         );
     }
-}
-
-pub(super) fn is_supported_service_tier(tier: &str) -> bool {
-    matches!(
-        tier,
-        "default" | "auto" | "priority" | "flex" | "scale" | "batch" | "standard_only"
-    )
-}
-
-pub(super) fn append_bounded(capture: &mut Vec<u8>, chunk: &[u8], maximum: usize) {
-    if chunk.len() >= maximum {
-        capture.clear();
-        capture.extend_from_slice(&chunk[chunk.len() - maximum..]);
-        return;
-    }
-    let overflow = capture
-        .len()
-        .saturating_add(chunk.len())
-        .saturating_sub(maximum);
-    if overflow > 0 {
-        capture.drain(..overflow);
-    }
-    capture.extend_from_slice(chunk);
 }
