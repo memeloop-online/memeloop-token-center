@@ -588,7 +588,11 @@ async fn finish_non_sse_proxy_response(
         return result;
     }
     let usage = if capture_json_usage {
-        match response_metadata::extract_buffered_usage_checked(&response_body, selected_driver, protocol) {
+        match response_metadata::extract_buffered_usage_checked(
+            &response_body,
+            selected_driver,
+            protocol,
+        ) {
             ExtractedUsage::Valid(usage) => {
                 (usage, crate::model::RequestUsageBasis::ProviderReported)
             }
