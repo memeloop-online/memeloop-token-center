@@ -158,12 +158,14 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
             documentScrollWidth: document.documentElement.scrollWidth,
             tableClientWidth: tableScroller.clientWidth,
             tableScrollWidth: tableScroller.scrollWidth,
+            summaryColumns: getComputedStyle(document.querySelector('.request-traffic-metrics')!).gridTemplateColumns.split(' ').length,
             compactIdClientWidth: compactId.clientWidth,
             compactIdScrollWidth: compactId.scrollWidth,
             diagnostics,
           };
         }), history, current);
         assert.ok(layout.documentScrollWidth <= layout.documentClientWidth, `${theme} ${width}px fixture must not create page overflow`);
+        if (width < 600) assert.equal(layout.summaryColumns, 2, `${theme} ${width}px summary keeps six metrics in three rows`);
         assert.ok(layout.tableScrollWidth >= layout.tableClientWidth, `${theme} ${width}px table remains in its own scroll container`);
         assert.ok(layout.compactIdScrollWidth >= layout.compactIdClientWidth, `${theme} ${width}px request ID remains safely clipped in its cell`);
         assert.equal(layout.diagnostics.length, 2, `${theme} ${width}px fixture must retain both recorded and historical diagnostic surfaces`);

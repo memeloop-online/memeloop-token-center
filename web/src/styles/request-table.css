@@ -321,6 +321,20 @@ table.request-table .request-model-cell code {
 }
 
 @media (max-width: 599px) {
+  .metrics.request-traffic-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .request-traffic-metrics .metric {
+    min-width: 0;
+    padding: 0.65rem 0.5rem;
+  }
+
+  .request-traffic-metrics .metric-value {
+    font-size: 1.5rem;
+  }
+
   .request-id-control > .copy-control button,
   .request-diagnostic-session,
   .request-session-metadata-trigger,
