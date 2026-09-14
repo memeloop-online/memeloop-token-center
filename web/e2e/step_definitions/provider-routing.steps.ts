@@ -506,10 +506,15 @@ Then('提供商组参与路由候选而路由组参与凭据授权', async funct
   assert.equal(openedRoutingResponse.status(), 200, `${openedRoutingResponse.request().method()} ${openedRoutingResponse.url()} ${await openedRoutingResponse.text()}`);
   const routing = page.locator('.credential-active-editor .routing-editor');
   await assertVisible(routing);
-  const routeGroupInput = routing.getByRole('combobox', { name: '路由组', exact: true });
-  const selectedRouteGroups = routing.locator('.multi-combobox').filter({ has: routeGroupInput }).locator('.selection-chip-label');
+  // `has` is evaluated relative to each field: do not embed the routing
+  // ancestor again, or an existing selected chip becomes unlocatable.
+  const routeGroupField = routing.locator('.multi-combobox').filter({ has: page.getByRole('combobox', { name: '路由组', exact: true }) });
+  const routeGroupInput = routeGroupField.getByRole('combobox', { name: '路由组', exact: true });
+  const selectedRouteGroups = routeGroupField.locator('.selection-chip-label');
   await routeGroupInput.fill('默认路由');
   await routeGroupInput.press('Enter');
+  await assertCount(selectedRouteGroups, 1);
+  await assertExactText(selectedRouteGroups, '默认路由');
   const routingSaved = page.waitForResponse((response) => response.url().endsWith(`/internal/v1/keys/${seed.clientKeyId}/routing`) && response.request().method() === 'PUT');
   await routing.getByRole('button', { name: '保存', exact: true }).click();
   const routingSavedResponse = await routingSaved;
@@ -525,7 +530,8 @@ Then('提供商组参与路由候选而路由组参与凭据授权', async funct
   await assertContains(routing, '当前共可使用');
 
   const credentialRoutingPath = `/internal/v1/keys/${seed.clientKeyId}/routing?tenant_external_id=${encodeURIComponent(tenant)}`;
-  const current = await requestJson<{ route_ids: string[]; grant_revision: number }>(credentialRoutingPath, { credential: seed.serviceCredential });
+  const current = await requestJson<{ route_ids: string[]; route_group_ids: string[]; grant_revision: number }>(credentialRoutingPath, { credential: seed.serviceCredential });
+  assert.deepEqual(current.route_group_ids, routingPayload.route_group_ids, 'the reopened selected chip corresponds to the authoritative persisted group grant');
   await requestJson(`/internal/v1/keys/${seed.clientKeyId}/routing`, {
     method: 'PUT',
     credential: seed.serviceCredential,
