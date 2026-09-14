@@ -98,6 +98,7 @@ pub(super) struct SyncImageRequest<'a> {
     pub(super) tenant_id: Uuid,
     pub(super) submission_armed: std::sync::atomic::AtomicBool,
     pub(super) invalid_response: std::sync::atomic::AtomicBool,
+    pub(super) confirmed_rejection: std::sync::atomic::AtomicBool,
 }
 
 fn uncertain_image_response(request_id: Uuid) -> Response {
@@ -259,6 +260,15 @@ pub(super) async fn execute_synchronous_image_request(
         }
     };
     let upstream_status = upstream.status();
+    // A complete explicit client rejection is non-execution evidence, except
+    // timeout/too-early/rate-limit responses whose semantics remain uncertain.
+    // Record it immediately from headers, before awaiting hooks/body/settlement.
+    // This only permits zero-cost settlement; it never permits another POST.
+    if upstream_status.is_client_error() && !matches!(upstream_status.as_u16(), 408 | 425 | 429) {
+        context
+            .confirmed_rejection
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
     if upstream_status == StatusCode::TOO_MANY_REQUESTS {
         let kind = crate::api::classify_media_rate_limit(upstream).await;
         attempt
@@ -329,7 +339,7 @@ pub(super) async fn execute_synchronous_image_request(
         .is_ok_and(|response| response.status().is_success())
     {
         attempt
-            .complete(crate::api::MediaAttemptTerminal::Succeeded)
+            .complete_committed(crate::api::MediaAttemptTerminal::Succeeded)
             .await;
     } else if context
         .invalid_response
@@ -465,6 +475,9 @@ async fn fail_image_request_with_staging(
     if context
         .submission_armed
         .load(std::sync::atomic::Ordering::Acquire)
+        && !context
+            .confirmed_rejection
+            .load(std::sync::atomic::Ordering::Acquire)
     {
         if matches!(
             error_code,

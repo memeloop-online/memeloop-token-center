@@ -122,9 +122,7 @@ pub(crate) async fn restore_selected(
         if let Some(authority) = restored.application_plugins.as_ref() {
             match authority.pin_historical(revision).await {
                 Ok(snapshot) => {
-                    restored.plugins = snapshot.runtime.runtime().clone();
-                    restored.providers = snapshot.providers.clone();
-                    restored.pinned_application_plugins = Some(snapshot);
+                    restored = restored.with_pinned_application_plugins(snapshot);
                 }
                 Err(_) => runtime_available = false,
             }

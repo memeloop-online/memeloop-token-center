@@ -252,6 +252,7 @@ async fn proxy_openai_image_generation(
         tenant_id: key.tenant_id,
         submission_armed: std::sync::atomic::AtomicBool::new(false),
         invalid_response: std::sync::atomic::AtomicBool::new(false),
+        confirmed_rejection: std::sync::atomic::AtomicBool::new(false),
     };
     match tokio::time::timeout(
         SYNCHRONOUS_IMAGE_DEADLINE,

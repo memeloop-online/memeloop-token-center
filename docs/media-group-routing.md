@@ -33,6 +33,16 @@ these requests. A confirmed successful response still commits the existing
 atomic usage/archive terminal transaction. An upstream idempotency header is
 not treated as proof that a provider can safely replay a request.
 
+Confirmed HTTP client rejection (excluding 408/425/429) retains the existing
+zero-charge failure settlement; authentication remains hard health evidence.
+Unknown outcomes are explicitly listed for manual reconciliation in the
+existing generation workspace. The operator must supply a tenant-scoped
+persistent service identity, current revision, evidence digest, idempotency
+key, and an explicit same-currency confirmed amount (zero for non-delivery).
+Resolution atomically audits and settles the original reservation, never
+resends the request and never fabricates a successful image. A ledger that
+cannot apply the exact confirmed amount rejects the whole resolution.
+
 Async jobs retain their existing pre-send quarantine and fixed upstream job
 identity: polling never reroutes or resubmits. Existing completed idempotency
 replays keep their original durable receipt. Async request normalization still

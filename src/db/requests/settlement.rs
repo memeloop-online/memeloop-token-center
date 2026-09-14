@@ -803,9 +803,51 @@ pub(crate) async fn settle_token_usage_in_transaction_with_charge(
     now: i64,
     forced_actual_micros: Option<i64>,
 ) -> Result<i64, AppError> {
+    if forced_actual_micros
+        .is_some_and(|forced| !(0..=reservation.reserved_micros).contains(&forced))
+    {
+        return Err(AppError::Internal);
+    }
+    settle_token_usage_with_explicit_charge(tx, reservation, usage, now, forced_actual_micros).await
+}
+
+pub(crate) async fn settle_confirmed_image_charge_in_transaction(
+    tx: &mut Transaction<'_, Any>,
+    reservation: &UsageReservation,
+    now: i64,
+    confirmed: i64,
+) -> Result<i64, AppError> {
+    if confirmed < 0 {
+        return Err(AppError::BadRequest(
+            "confirmed cost cannot be negative".into(),
+        ));
+    }
+    let charged = settle_token_usage_with_explicit_charge(
+        tx,
+        reservation,
+        &TokenUsage::default(),
+        now,
+        Some(confirmed),
+    )
+    .await?;
+    if charged != confirmed {
+        return Err(AppError::Conflict(
+            "confirmed charge exceeds the account's available balance or budget".into(),
+        ));
+    }
+    Ok(charged)
+}
+
+async fn settle_token_usage_with_explicit_charge(
+    tx: &mut Transaction<'_, Any>,
+    reservation: &UsageReservation,
+    usage: &TokenUsage,
+    now: i64,
+    forced_actual_micros: Option<i64>,
+) -> Result<i64, AppError> {
     validate_token_usage(usage)?;
     let calculated_micros = match forced_actual_micros {
-        Some(forced) if (0..=reservation.reserved_micros).contains(&forced) => forced,
+        Some(forced) if forced >= 0 => forced,
         Some(_) => return Err(AppError::Internal),
         None => price_token_usage(reservation, usage)?,
     };

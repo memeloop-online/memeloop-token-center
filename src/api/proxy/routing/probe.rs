@@ -320,6 +320,21 @@ impl UpstreamAttemptGuard {
         self.stop_heartbeat();
     }
 
+    /// A successful durable CAS has ended the caller's ownership lease. Keep
+    /// the already-proven terminal transition and its heartbeat alive even if
+    /// that caller's timeout/cancellation drops this waiting future. The owned
+    /// task performs only bounded observation and fenced health persistence;
+    /// it has no authority to send or replay an upstream request.
+    pub(crate) async fn complete_committed(mut self, terminal: UpstreamAttemptTerminal) {
+        let completion = tokio::spawn(async move { self.complete(terminal).await });
+        if completion.await.is_err() {
+            tracing::warn!(
+                stage = "committed_health_completion",
+                "committed upstream health completion task failed"
+            );
+        }
+    }
+
     /// A lost durable job fence grants no authority to publish an observation.
     /// Release only this exact owned lease; never heal or record a failure.
     pub(crate) async fn abandon_without_observe(&mut self) {

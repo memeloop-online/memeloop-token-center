@@ -1,6 +1,8 @@
 use super::*;
 use crate::api::{MediaAttemptGuard, MediaAttemptTerminal};
 use crate::{db::UpstreamFailureKind, metrics::UpstreamHealthReason};
+#[cfg(test)]
+mod committed_tests;
 
 /// Owns one HTTP attempt, with the generation job's durable ownership fence
 /// in addition to the existing account health lease.
@@ -116,11 +118,23 @@ impl<'a> Attempt<'a> {
                 } else {
                     self.terminal
                 };
-                guard.complete(terminal).await;
+                if result.is_ok() {
+                    complete_committed(guard, terminal).await;
+                } else {
+                    guard.complete(terminal).await;
+                }
             }
         }
         result
     }
+}
+
+/// A successful durable job CAS already ended the job lease. Its account
+/// observation owns its own heartbeat and must finish even if the outer job
+/// worker is cancelled during the bounded observation hook. This task cannot
+/// submit or poll: it only finalizes the already-completed HTTP attempt.
+async fn complete_committed(guard: MediaAttemptGuard, terminal: MediaAttemptTerminal) {
+    guard.complete_committed(terminal).await;
 }
 
 async fn classified_json(response: Response) -> (Result<Value, AppError>, MediaAttemptTerminal) {
