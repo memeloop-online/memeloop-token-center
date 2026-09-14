@@ -73,6 +73,27 @@ where
     .await
 }
 
+/// Scheduling shares the existing process-wide component capacity; it cannot
+/// create an independent unbounded blocking pool after request cancellation.
+pub(crate) async fn run_group<T, F>(metrics: Metrics, phase: Phase, work: F) -> Result<T, AppError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, AppError> + Send + 'static,
+{
+    run_with_limits(
+        phase,
+        work,
+        PERMITS.clone(),
+        Duration::from_millis(25),
+        Duration::from_millis(150),
+        move |event| {
+            metrics.observe_plugin_execution(event.phase, event.outcome);
+            emit_event(event);
+        },
+    )
+    .await
+}
+
 async fn run_with_limits<T, F, O>(
     phase: Phase,
     work: F,

@@ -55,6 +55,7 @@ const sessionRequests: Record<string, LogicalSessionDetail['requests']> = {
 };
 window.fetch = async (input) => {
   const url = String(input);
+  if (url.includes('/keys?')) return new Response(JSON.stringify([]));
   if (url.includes('/sessions?')) {
     window.sessionListReads += 1;
     return new Promise<Response>((resolve) => {

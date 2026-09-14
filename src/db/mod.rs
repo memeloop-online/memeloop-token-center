@@ -50,6 +50,7 @@ mod constants;
 mod credentials;
 mod filter_assistant;
 mod generation;
+mod group_routing;
 mod groups;
 mod migrations;
 mod monitoring_snapshot;
@@ -118,7 +119,8 @@ pub use generation::{
     StartSynchronousImageRequest, StartSynchronousImageResult, SynchronousImageIdempotencyClaim,
 };
 pub use groups::{
-    CreateGroupInput, GroupKind, GroupView, ReplaceGroupMembersInput, UpdateGroupInput,
+    CreateGroupInput, GroupKind, GroupRoutingStrategy, GroupView, ReplaceGroupMembersInput,
+    UpdateGroupInput, UpdateGroupRoutingStrategyInput,
 };
 pub use migrations::{BlockedPartition, PartitionMaintenanceReport};
 #[cfg(test)]

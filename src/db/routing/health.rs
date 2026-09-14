@@ -5,6 +5,7 @@ use super::super::{AppError, Database, unix_millis};
 use crate::config::UpstreamHealthConfig;
 
 mod delivery;
+mod strategy;
 
 #[cfg(test)]
 mod quota_tests;
@@ -20,6 +21,7 @@ pub(crate) enum UpstreamFailureKind {
     RateLimited,
     RateLimitedUntil { until: i64, exhausted: bool },
     Unavailable,
+    Authentication,
     InvalidResponse,
     Connection,
 }
@@ -68,6 +70,7 @@ impl UpstreamFailureKind {
                 exhausted: false, ..
             } => "rate_limited",
             Self::Unavailable => "unavailable",
+            Self::Authentication => "authentication",
             Self::InvalidResponse => "invalid_response",
             Self::Connection => "connection",
         }
@@ -78,7 +81,7 @@ impl UpstreamFailureKind {
             Self::RateLimited | Self::RateLimitedUntil { .. } => {
                 health.rate_limited_cooldown_millis
             }
-            Self::Unavailable => health.unavailable_cooldown_millis,
+            Self::Unavailable | Self::Authentication => health.unavailable_cooldown_millis,
             Self::InvalidResponse => health.invalid_response_cooldown_millis,
             Self::Connection => health.connection_cooldown_millis,
         }
@@ -433,7 +436,14 @@ impl Database {
                  probe_lease_until = 0,
                  probe_lease_token = '',
                  credential_generation = excluded.credential_generation,
-                 last_failure_kind = excluded.last_failure_kind,
+                 last_failure_kind = CASE
+                     WHEN upstream_account_health.credential_generation = excluded.credential_generation
+                          AND upstream_account_health.cooldown_until > excluded.updated_at
+                          AND upstream_account_health.last_failure_kind IN ('quota_exhausted', 'rate_limited', 'authentication')
+                          AND excluded.last_failure_kind IN ('connection', 'unavailable', 'invalid_response')
+                         THEN upstream_account_health.last_failure_kind
+                     ELSE excluded.last_failure_kind
+                 END,
                  updated_at = excluded.updated_at
              WHERE EXISTS (
                  SELECT 1 FROM upstream_accounts account

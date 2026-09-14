@@ -35,6 +35,8 @@ An absent hint is not proof that the call was not client-side compaction.
 | response_spool_gap_write / response_spool_failed_fence | Owned gap write and failed-writer fence, including late database completion |
 | stream_owner | Streaming owner through terminal reconciliation and archive EOF drain |
 | gateway_response_headers | Entry-to-handler response; **not** end-to-end streaming completion |
+| gateway_downstream_body | HTTP consumer polling through body EOS, error or drop; **not** a TCP/client acknowledgement |
+| delivery_prepare / delivery_confirm | First billable frame's durable delivery-state transitions, including existing retries |
 
 Phase events contain both phase `elapsed_ms` and `request_elapsed_ms` from the
 gateway entry. Overlapping phases are not additive. `started` allows an in-flight
@@ -43,6 +45,34 @@ proof of upstream delivery. `returned` means an owner returned after handling
 its own errors, not proof that persistence or network delivery succeeded.
 First-byte observations can be after bounded protocol sniffing/prefetching.
 None of these observations authorize retry, change billing, or set health.
+
+`gateway_downstream_body` emits one summary, not per-frame logs. `bytes` counts
+data returned by actual HTTP body polls; `frames` also counts forwarded trailers.
+`first_poll_ms` / `last_poll_ms` and `first_data_ms` / `last_data_ms` are measured
+from gateway ingress. `end_stream` means the consumer polled EOS or the final
+frame with `is_end_stream`; `body_error` preserves an error without logging its
+text; `dropped` means the consumer dropped an unfinished body. An already-empty
+body that is never polled reports `end_stream_unpolled`, not a disconnect.
+These observations preserve frame order, trailers, size hints, and the original
+EOF/permit owner. They prove neither socket flush nor client consumption. Join
+the request ID with validated ingress ID and ingress disconnect timing before
+attributing a `200 + downstream_remote_disconnect`.
+
+Delivery prepare/confirm phases retain safe SQLx classification in the
+`proxy_delivery_database` span and report cancellation as `not_completed`.
+Generic buffered reads preserve only the fixed `upstream_read_timeout` and
+`upstream_request_timeout` labels; other transport errors remain
+`upstream_stream`, never a provider error message.
+
+An automatic client compaction is not identifiable from duration alone. Obtain
+its client-side start/end and returned server request ID; otherwise an explicit
+compaction hint or independently matched request trace is needed. A normal
+`responses` request with no hint must not be relabeled by inspecting its body.
+Removing an ingress body cap does not remove application safeguards: Responses
+defaults to 16 MiB (configurable up to 64 MiB), request reads remain bounded to
+60 seconds, and responses/SSE products have independent caps. Inspect actual
+request byte counts, configured limits and 408/413 evidence before proposing
+limit changes; this diagnostics change adds or changes none.
 
 `archive_budget_acquire` separates `pool_wait_ms` (connection acquisition and
 transaction begin) from `budget_wait_ms` (the singleton budget row acquisition).

@@ -25,16 +25,25 @@ it is not necessarily the request ID. `preferred` proves ordering only, not
 health, dispatch, or successful delivery. This diagnostic event supplements,
 but does not replace, the request/attempt audit trail and failover metrics.
 
-## Deliberately absent extensions
+## Separate group scheduling contract
 
-The current hook does not receive an authorized candidate snapshot, a typed
+The opt-in [group-routing-v1 contract](plugin-group-routing-v1.md) now supplies
+authorized candidate snapshots and bounded plan/observe scheduling. It does not
+change the older traffic hook. Provider groups apply only when explicitly
+included by the route; route groups remain authorization collections and a
+strategy never creates a grant. The core still resolves and revalidates all
+candidate identities independently of the plugin.
+
+## Remaining boundaries
+
+The older traffic hook does not receive an authorized candidate snapshot, a typed
 health/quota view, or a multi-account ranking result. Provider `prepare` and
 `normalize` are bounded, buffered-only hooks, not arbitrary streaming data-flow
 hooks. Operator UI contributions select core-owned data renderers; they do not
 load arbitrary plugin JavaScript. Configuration cache freshness is not strict
 cross-replica revocation. None of these limitations is fixed by a sorting log.
 
-Safe future extensions need separate contracts and tests:
+Further extensions must preserve these contracts:
 
 | Extension | Host-owned invariant |
 | --- | --- |
@@ -44,8 +53,10 @@ Safe future extensions need separate contracts and tests:
 | Request/response hooks | Pin one runtime contract for the request, cap buffering and execution, retain host SSRF/header/metering validation, and define a one-way dispatch/delivery boundary before adding streaming hooks. |
 | Operator extension data | Use declared tenant-scoped, read-authorized feeds and core-owned renderers; expose freshness and partial failures without raw supplier payloads or secrets. |
 
-Plugin failure must not silently skip required policy or fall back to an older
-runtime. A plugin must never authorize replay: an HTTP 503 received after
+Required traffic-policy failure must not silently skip policy or fall back to
+an older runtime. Optional group scheduling uses an explicit, logged native
+fallback for the exact authorized candidates, never an older runtime.
+A plugin must never authorize replay: an HTTP 503 received after
 dispatch is not proof that execution did not occur. Cooling an account and
 authorizing a retry are separate decisions. Only host-proven pre-delivery
 failure can advance safely; ambiguous delivery, visible output, and uncertain
@@ -53,20 +64,11 @@ non-idempotent actions remain terminal without replay.
 
 ## Runtime revision stack and integration order
 
-The experimental stack is #55 (approved immutable inventory and lifecycle),
-then #59 (bounded-stale configuration snapshots), then #68 (database-authoritative
-application revision pinning). These drafts are not enabled by the production
-executable and do not supply the absent availability hooks above.
-
-For integration, first update #55 onto the current master and rerun its exact
-CI; replay #59 onto that updated head; then replay #68, resolving application
-entry-point and migration registry/chart/OpenAPI changes against current master.
-Reallocate #68's proposed migration number if already owned; do not renumber a
-published migration. Keep host inventory opt-in disabled until independent
-review, exact CI and admission performance acceptance. The candidate-ordering
-boundary here has no schema, WIT, or runtime-revision dependency and can merge
-independently. Future ABI work must version its contract and extend approved
-inventory compatibility checks rather than widening #68's fixed contract.
+Application pinning supplies one request-owned runtime to both group plan and
+terminal observation. Installing the new capability requires an approved
+baseline with that contribution; the hot-revision API cannot widen its fixed
+contract. Group configuration uses its own monotonic CAS version and does not
+modify the approved runtime inventory.
 
 ## Verification
 

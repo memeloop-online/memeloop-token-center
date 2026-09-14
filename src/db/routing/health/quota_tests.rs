@@ -182,6 +182,25 @@ async fn invariants(database: &Database, peer: &Database) {
             .unwrap(),
         "an observation that began before the current failure cannot clear it"
     );
+    // A transport failure during an active hard cooldown must retain the hard
+    // classification, otherwise a group transient override could bypass quota.
+    database
+        .record_upstream_account_failure(account, 1, UpstreamFailureKind::Connection)
+        .await
+        .unwrap();
+    assert!(
+        peer.upstream_quota_recovery_fence(account, 1)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    sqlx::query(
+        "UPDATE upstream_account_health SET cooldown_until = 0 WHERE upstream_account_id = $1",
+    )
+    .bind(account.to_string())
+    .execute(&database.pool)
+    .await
+    .unwrap();
     database
         .record_upstream_account_failure(account, 1, UpstreamFailureKind::Connection)
         .await
