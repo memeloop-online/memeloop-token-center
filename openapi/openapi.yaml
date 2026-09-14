@@ -3727,6 +3727,66 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /internal/v1/accounts/{account_id}/settlements/{settlement_id}/adjustments:
+    put:
+      tags: [Credits]
+      operationId: reconcileSettlementAdjustment
+      summary: Reconcile a forward-only attributed rebate for one immutable settlement
+      description: |
+        Reconciles one positive desired rebate in a stable namespace against the immutable
+        gross settlement identified by the path and request identity. This endpoint does
+        not alter the settlement feed record, gross usage charge, or settlement identity.
+        It can only increase the attributed rebate up to the original gross cost; a
+        reversal or a lower desired amount requires a separately authorized protocol.
+
+        Requires the dedicated `settlements:adjust` scope. `credits:write` alone does
+        not authorize this operation. Tenant-scoped service credentials may act only on
+        accounts in their own tenant; an unbound account or another tenant's account is
+        returned as 404. The idempotency namespace is the authenticated caller/tenant
+        and `Idempotency-Key`. An exact replay returns 200 with `replayed: true`; a new
+        reconciliation, including a higher desired version, returns 201. Reusing a key
+        with a different canonical request, stale version, or an amount above the gross
+        settlement returns 409.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: settlements:adjust
+      x-idempotency-contract:
+        namespace: authenticated-service-and-tenant
+        different-payload-status: 409
+        exact-replay-status: 200
+        new-or-higher-version-status: 201
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - name: settlement_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReconcileSettlementAdjustmentRequest' }
+      responses:
+        '200':
+          description: Exact idempotent replay of a previously reconciled adjustment.
+          headers:
+            Cache-Control: { schema: { const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SettlementAdjustmentResult' }
+        '201':
+          description: New attributed adjustment event or a higher desired reconciliation version.
+          headers:
+            Cache-Control: { schema: { const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SettlementAdjustmentResult' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
   /internal/v1/entitlements:
     get:
       tags: [Entitlements]
@@ -6323,6 +6383,7 @@ components:
         - generations:quarantine:read
         - generations:reconcile
         - requests:read
+        - settlements:adjust
         - providers:read
         - providers:write
         - plugins:read
@@ -7827,6 +7888,54 @@ components:
           oneOf:
             - $ref: '#/components/schemas/AccountSettlementCursor'
             - type: 'null'
+    SettlementAdjustmentNamespace:
+      type: string
+      minLength: 3
+      maxLength: 129
+      pattern: '^[a-z][a-z0-9-]{0,63}:[a-z][a-z0-9-]{0,63}$'
+      description: The initial Cloud namespace is `memeloop-cloud:usage-discount`; other restricted lower-case owner:name namespaces are reserved for independently versioned integrations.
+    SettlementAdjustmentDecisionDigest:
+      type: string
+      pattern: '^[a-f0-9]{64}$'
+      description: Lower-case SHA-256 digest of the external discount decision evidence. Raw decision evidence is not accepted or returned.
+    ReconcileSettlementAdjustmentRequest:
+      type: object
+      additionalProperties: false
+      required: [namespace, request_kind, request_id, currency, version, desired_rebate, decision_digest, source]
+      properties:
+        namespace: { $ref: '#/components/schemas/SettlementAdjustmentNamespace' }
+        request_kind: { $ref: '#/components/schemas/AccountSettlementKind' }
+        request_id: { type: string, format: uuid }
+        currency: { $ref: '#/components/schemas/Currency' }
+        version: { type: integer, format: int64, minimum: 1 }
+        desired_rebate:
+          allOf: [{ $ref: '#/components/schemas/NonNegativeMoney' }]
+          description: Must be strictly greater than zero. It is a forward-only desired total for this settlement and namespace, not a negative charge or reversal.
+        decision_digest: { $ref: '#/components/schemas/SettlementAdjustmentDecisionDigest' }
+        source: { type: string, minLength: 1, maxLength: 200, pattern: '^[^\x00-\x1F\x7F]+$' }
+    SettlementAdjustmentResult:
+      type: object
+      additionalProperties: false
+      required: [adjustment_entry_id, event_id, account_id, settlement_id, namespace, request_kind, request_id, currency, desired_rebate, applied_delta, cumulative_rebate, remaining_rebate, version, created_at, replayed]
+      properties:
+        adjustment_entry_id:
+          type: [string, 'null']
+          format: uuid
+          description: Ledger adjustment entry created for a positive delta; null when the desired total did not move.
+        event_id: { type: string, format: uuid }
+        account_id: { type: string, format: uuid }
+        settlement_id: { type: string, format: uuid }
+        namespace: { $ref: '#/components/schemas/SettlementAdjustmentNamespace' }
+        request_kind: { $ref: '#/components/schemas/AccountSettlementKind' }
+        request_id: { type: string, format: uuid }
+        currency: { $ref: '#/components/schemas/Currency' }
+        desired_rebate: { $ref: '#/components/schemas/NonNegativeMoney' }
+        applied_delta: { $ref: '#/components/schemas/NonNegativeMoney' }
+        cumulative_rebate: { $ref: '#/components/schemas/NonNegativeMoney' }
+        remaining_rebate: { $ref: '#/components/schemas/NonNegativeMoney' }
+        version: { type: integer, format: int64, minimum: 1 }
+        created_at: { type: integer, format: int64, description: Unix epoch milliseconds. }
+        replayed: { type: boolean }
     EntitlementIdentity:
       type: string
       minLength: 1
