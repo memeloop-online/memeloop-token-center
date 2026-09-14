@@ -26,7 +26,7 @@ export function SessionCredentialFilter({ value, sessions, token, tenant, onChan
     if (last && pageNumber > 0) { params.set('before_created_at', String(last.created_at)); params.set('before_id', last.key_id); }
     setLoading(true); setFailed(false);
     void api<KeyView[]>(`/internal/v1/keys?${params}`, token.trim(), { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]) })
-      .then(values => { if (!controller.signal.aborted) setPage(previous => ({ scope, values: last ? [...previous.values, ...values] : values, more: values.length === 100 })); })
+      .then(values => { if (!Array.isArray(values)) throw new Error('Invalid credential page'); if (!controller.signal.aborted) setPage(previous => ({ scope, values: last ? [...previous.values, ...values] : values, more: values.length === 100 })); })
       .catch(() => { if (!controller.signal.aborted) setFailed(true); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
@@ -45,8 +45,8 @@ export function SessionCredentialFilter({ value, sessions, token, tenant, onChan
   return <label htmlFor={id}>{t('sessions.credential')}
     <Combobox id={id} freeform value={query} selectedOptions={value ? [value] : []}
       placeholder={t('sessions.searchPlaceholder')}
-      onChange={event => { const next = event.target.value; setQuery(next); const valid = !next || /^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(next); event.target.setCustomValidity(valid ? '' : t('groups.noMatches')); if (valid) onChange(next); }}
-      onOptionSelect={(_, data) => { (document.getElementById(id) as HTMLInputElement | null)?.setCustomValidity(''); onChange(data.optionValue ?? ''); setQuery(data.optionText ?? ''); }}>
+      input={{ onChange: event => { const next = event.target.value; setQuery(next); const valid = !next || /^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(next); event.target.setCustomValidity(valid ? '' : t('groups.noMatches')); if (valid) onChange(next); } }}
+      onOptionSelect={(_, data) => { if (data.optionValue === undefined) return; (document.getElementById(id) as HTMLInputElement | null)?.setCustomValidity(''); onChange(data.optionValue); setQuery(data.optionText ?? ''); }}>
       <Option value="" text={t('common.all')}>{t('common.all')}</Option>
       {matches.map(option => <Option key={option.id} value={option.id} text={option.label}>{option.label}</Option>)}
     </Combobox>
