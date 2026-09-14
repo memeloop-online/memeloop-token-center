@@ -63,6 +63,36 @@ pub enum ReplaceModelCatalogResult {
 }
 
 impl Database {
+    /// Explicit account/model associations include disabled routes: discovery
+    /// must be able to repair their metadata before they can be enabled.
+    pub async fn configured_upstream_model_ids(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Vec<String>, AppError> {
+        Ok(sqlx::query_scalar(
+            "WITH candidates AS (\
+                SELECT direct.tenant_id, direct.model_route_id, direct.upstream_account_id, direct.upstream_model \
+                FROM model_route_upstream_accounts direct WHERE direct.upstream_account_id = $1 \
+                UNION \
+                SELECT included.tenant_id, included.model_route_id, member.upstream_account_id, route.upstream_model \
+                FROM model_route_included_provider_groups included \
+                JOIN upstream_account_provider_groups member ON member.tenant_id = included.tenant_id AND member.provider_group_id = included.provider_group_id \
+                JOIN model_routes route ON route.tenant_id = included.tenant_id AND route.id = included.model_route_id \
+                WHERE member.upstream_account_id = $1\
+            ) SELECT DISTINCT candidate.upstream_model FROM candidates candidate \
+            JOIN model_routes route ON route.id = candidate.model_route_id AND route.tenant_id = candidate.tenant_id \
+            JOIN upstream_accounts account ON account.id = candidate.upstream_account_id AND account.tenant_id = candidate.tenant_id AND account.status = 'active' \
+            WHERE route.archived_at IS NULL AND NOT EXISTS (\
+                SELECT 1 FROM model_route_excluded_provider_groups excluded \
+                JOIN upstream_account_provider_groups member ON member.tenant_id = excluded.tenant_id AND member.provider_group_id = excluded.provider_group_id \
+                WHERE excluded.tenant_id = candidate.tenant_id AND excluded.model_route_id = candidate.model_route_id AND member.upstream_account_id = candidate.upstream_account_id\
+            ) ORDER BY candidate.upstream_model",
+        )
+        .bind(account_id.to_string())
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     pub async fn upstream_account_tenant_external_id(
         &self,
         account_id: Uuid,

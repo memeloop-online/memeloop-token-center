@@ -524,14 +524,24 @@ async fn discover_codex_models(
     if values.len() > MAX_MODEL_COUNT {
         return Err("invalid_response");
     }
+    let configured_models: std::collections::HashSet<String> = state
+        .db
+        .configured_upstream_model_ids(account.id)
+        .await
+        .map_err(|_| "upstream_unavailable")?
+        .into_iter()
+        .collect();
     let normalized = values
         .iter()
         .filter(|value| {
-            value
-                .get("supported_in_api")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-                && value.get("visibility").and_then(Value::as_str) == Some("list")
+            // Codex's supported_in_api flag filters API-key mode, not
+            // ChatGPT OAuth. Visibility controls the picker, not whether
+            // authenticated metadata for an explicitly selected slug exists.
+            value.get("visibility").and_then(Value::as_str) == Some("list")
+                || value
+                    .get("slug")
+                    .and_then(Value::as_str)
+                    .is_some_and(|slug| configured_models.contains(slug))
         })
         .map(|value| {
             let id = value
