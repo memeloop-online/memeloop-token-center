@@ -154,6 +154,11 @@ async fn prepare_inner(
     deadline: tokio::time::Instant,
     candidates: &mut [AuthorizedUpstreamCandidate],
 ) -> Result<(), AppError> {
+    // This runs inside the whole-stage deadline, and avoids the larger
+    // candidate/group/health join for tenants retaining native scheduling.
+    if !state.db.has_group_routing_strategies(tenant_id).await? {
+        return Ok(());
+    }
     let started = tokio::time::Instant::now();
     // Many overlapping groups must not multiply per-component execution into
     // an unbounded request stall. Only one blocking hook is ever outstanding.
