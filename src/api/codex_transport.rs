@@ -11,8 +11,8 @@ use uuid::Uuid;
 use super::super::proxy_diagnostics;
 use super::super::sse::{
     BoundedSseEvent, BoundedSseFramer, ResponseIdentityGate, ResponsesStreamingSanitizer,
-    SseFramerRejection, is_response_metadata_event, is_sse_field_line, parse_sse_event,
-    parse_unique_json, trim_ascii,
+    SAFE_SSE_HEARTBEAT_COMMENT, SseFramerRejection, is_response_metadata_event,
+    is_sse_field_line, parse_sse_event, parse_unique_json, trim_ascii,
 };
 use super::{
     MAX_PROXY_LIFETIME, MAX_PROXY_RESPONSE_BODY, MAX_REPORTED_TOKENS,
@@ -96,6 +96,16 @@ const PASSTHROUGH_HEADERS: &[&str] = &[
 ];
 const MAX_PASSTHROUGH_HEADER_BYTES: usize = 4 * 1024;
 const IMAGE_GENERATION_TOOL_TYPE: &str = "image_generation";
+const CHAT_ALLOWED_FIELDS: &[&str] = &[
+    "model",
+    "messages",
+    "stream",
+    "stream_options",
+    "service_tier",
+    "n",
+    "max_tokens",
+    "max_completion_tokens",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CodexClientIdentity<'a> {
@@ -191,11 +201,11 @@ pub(super) struct PreparedCodexRequest {
 }
 
 pub(super) fn validate_protocol(protocol: Protocol) -> Result<(), AppError> {
-    if matches!(protocol, Protocol::OpenAiResponses) {
+    if matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses) {
         Ok(())
     } else {
         Err(AppError::BadRequest(
-            "OpenAI Codex supports the Responses protocol only".into(),
+            "OpenAI Codex supports the Responses and text Chat Completions protocols only".into(),
         ))
     }
 }
@@ -227,7 +237,13 @@ pub(super) fn prepare_request(
     upstream_model: &str,
     config: &Value,
 ) -> Result<PreparedCodexRequest, AppError> {
-    prepare_request_with_id(request, upstream_model, config, Uuid::nil())
+    prepare_request_with_id(
+        request,
+        upstream_model,
+        config,
+        Uuid::nil(),
+        Protocol::OpenAiResponses,
+    )
 }
 
 pub(super) fn prepare_request_with_id(
@@ -235,8 +251,12 @@ pub(super) fn prepare_request_with_id(
     upstream_model: &str,
     config: &Value,
     request_id: Uuid,
+    protocol: Protocol,
 ) -> Result<PreparedCodexRequest, AppError> {
     validate_route_config(config)?;
+    if matches!(protocol, Protocol::OpenAiChat) {
+        translate_chat_request(request)?;
+    }
     let object = request
         .as_object_mut()
         .ok_or_else(|| AppError::BadRequest("request body must be a JSON object".into()))?;
@@ -259,7 +279,9 @@ pub(super) fn prepare_request_with_id(
     object.insert("model".to_owned(), Value::String(upstream_model.to_owned()));
     object.insert("stream".to_owned(), Value::Bool(true));
     object.insert("store".to_owned(), Value::Bool(false));
-    ensure_image_generation_tool(object, upstream_model);
+    if matches!(protocol, Protocol::OpenAiResponses) {
+        ensure_image_generation_tool(object, upstream_model);
+    }
     if object
         .get("tools")
         .and_then(Value::as_array)
@@ -293,6 +315,125 @@ pub(super) fn prepare_request_with_id(
         output_token_ceiling,
         session_id,
     })
+}
+
+fn translate_chat_request(request: &mut Value) -> Result<(), AppError> {
+    let object = request
+        .as_object_mut()
+        .ok_or_else(|| AppError::BadRequest("request body must be a JSON object".into()))?;
+    if object
+        .keys()
+        .any(|field| !CHAT_ALLOWED_FIELDS.contains(&field.as_str()))
+    {
+        return Err(AppError::BadRequest(
+            "Codex text Chat Completions request contains an unsupported field".into(),
+        ));
+    }
+    match object.get("n") {
+        None => {}
+        Some(Value::Number(number)) if number.as_i64() == Some(1) => {}
+        Some(_) => {
+            return Err(AppError::BadRequest(
+                "Codex text Chat Completions requires n=1".into(),
+            ));
+        }
+    }
+    if let Some(options) = object.get("stream_options") {
+        let options = options
+            .as_object()
+            .ok_or_else(|| AppError::BadRequest("stream_options must be an object".into()))?;
+        if options
+            .iter()
+            .any(|(field, value)| field != "include_usage" || !value.is_boolean())
+        {
+            return Err(AppError::BadRequest(
+                "Codex text Chat Completions supports only stream_options.include_usage".into(),
+            ));
+        }
+    }
+    let messages = object
+        .remove("messages")
+        .and_then(|messages| messages.as_array().cloned())
+        .ok_or_else(|| AppError::BadRequest("messages must be an array".into()))?;
+    if messages.is_empty() {
+        return Err(AppError::BadRequest("messages cannot be empty".into()));
+    }
+    let mut instructions = Vec::new();
+    let mut input = Vec::new();
+    let mut conversation_started = false;
+    for message in messages {
+        let message = message
+            .as_object()
+            .ok_or_else(|| AppError::BadRequest("each message must be an object".into()))?;
+        if message.len() != 2 || !message.contains_key("role") || !message.contains_key("content") {
+            return Err(AppError::BadRequest(
+                "Codex text Chat messages support only role and text content".into(),
+            ));
+        }
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::BadRequest("message role must be a string".into()))?;
+        let content = chat_text_content(message.get("content").unwrap())?;
+        match role {
+            "system" | "developer" if !conversation_started => instructions.push(content),
+            "system" | "developer" => {
+                return Err(AppError::BadRequest(
+                    "Codex text Chat system messages must precede conversational messages".into(),
+                ));
+            }
+            "user" | "assistant" => {
+                conversation_started = true;
+                input.push(json!({"role": role, "content": content}));
+            }
+            _ => {
+                return Err(AppError::BadRequest(
+                    "Codex text Chat supports system, developer, user, and assistant roles only"
+                        .into(),
+                ));
+            }
+        }
+    }
+    if input.is_empty() {
+        return Err(AppError::BadRequest(
+            "Codex text Chat requires at least one user or assistant message".into(),
+        ));
+    }
+    object.remove("n");
+    object.remove("stream_options");
+    object.insert("input".into(), Value::Array(input));
+    object.insert(
+        "instructions".into(),
+        Value::String(instructions.join("\n\n")),
+    );
+    Ok(())
+}
+
+fn chat_text_content(content: &Value) -> Result<String, AppError> {
+    match content {
+        Value::String(text) => Ok(text.clone()),
+        Value::Array(parts) if !parts.is_empty() => {
+            let mut text = String::new();
+            for part in parts {
+                let part = part.as_object().ok_or_else(|| {
+                    AppError::BadRequest("Chat content parts must be objects".into())
+                })?;
+                if part.len() != 2
+                    || part.get("type").and_then(Value::as_str) != Some("text")
+                    || part.get("text").and_then(Value::as_str).is_none()
+                {
+                    return Err(AppError::BadRequest(
+                        "Codex text Chat supports text content parts only".into(),
+                    ));
+                }
+                text.push_str(part.get("text").and_then(Value::as_str).unwrap());
+            }
+            Ok(text)
+        }
+        _ => Err(AppError::BadRequest(
+            "Codex text Chat message content must be text".into(),
+        )),
+    }
 }
 
 fn ensure_image_generation_tool(object: &mut Map<String, Value>, upstream_model: &str) {
@@ -745,6 +886,310 @@ pub(super) fn http_version_class(response: &UpstreamResponse) -> &'static str {
 pub(super) struct BufferedCodexResponse {
     pub body: Bytes,
     pub usage: TokenUsage,
+}
+
+pub(super) fn translate_buffered_chat_response(
+    mut response: BufferedCodexResponse,
+    request_id: Uuid,
+    downstream_model: &str,
+) -> Result<BufferedCodexResponse, &'static str> {
+    let responses: Value =
+        serde_json::from_slice(&response.body).map_err(|_| "upstream_invalid_response")?;
+    let content = completed_response_text(&responses)?;
+    let mut chat = json!({
+        "id": chat_completion_id(request_id),
+        "object": "chat.completion",
+        "created": crate::db::unix_millis() / 1_000,
+        "model": downstream_model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop"
+        }],
+        "usage": chat_usage(&response.usage)
+    });
+    if let Some(tier) = response.usage.service_tier.as_deref() {
+        chat.as_object_mut()
+            .ok_or("upstream_invalid_response")?
+            .insert("service_tier".into(), Value::String(tier.into()));
+    }
+    let body = serde_json::to_vec(&chat).map_err(|_| "upstream_invalid_response")?;
+    if body.len() > MAX_PROXY_RESPONSE_BODY {
+        return Err("upstream_response_too_large");
+    }
+    response.body = Bytes::from(body);
+    Ok(response)
+}
+
+pub(super) struct CodexChatStreamTranslator {
+    id: String,
+    model: String,
+    created: i64,
+    saw_text_delta: bool,
+    started: bool,
+    terminal: bool,
+    include_usage: bool,
+}
+
+impl CodexChatStreamTranslator {
+    pub(super) fn new(request_id: Uuid, model: String, include_usage: bool) -> Self {
+        Self {
+            id: chat_completion_id(request_id),
+            model,
+            created: crate::db::unix_millis() / 1_000,
+            saw_text_delta: false,
+            started: false,
+            terminal: false,
+            include_usage,
+        }
+    }
+
+    pub(super) fn translate_frame(&mut self, frame: &[u8]) -> Result<Option<Bytes>, &'static str> {
+        let Some(data) = sse_data(frame) else {
+            return Ok(frame
+                .windows(SAFE_SSE_HEARTBEAT_COMMENT.len())
+                .any(|window| window == SAFE_SSE_HEARTBEAT_COMMENT)
+                .then(|| Bytes::copy_from_slice(frame)));
+        };
+        if data == b"[DONE]" {
+            return Ok(None);
+        }
+        let value: Value =
+            serde_json::from_slice(&data).map_err(|_| "upstream_invalid_response")?;
+        let kind = value
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or("upstream_invalid_response")?;
+        match kind {
+            "response.created" | "response.queued" | "response.in_progress" => Ok(None),
+            "response.output_text.delta" => {
+                if self.terminal {
+                    return Err("upstream_invalid_response");
+                }
+                let delta = value
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .ok_or("upstream_invalid_response")?;
+                self.saw_text_delta = true;
+                Ok(Some(self.delta_chunk(delta)?))
+            }
+            "response.output_item.added" | "response.output_item.done" => {
+                let item = value.get("item").ok_or("upstream_invalid_response")?;
+                match item.get("type").and_then(Value::as_str) {
+                    Some("message" | "reasoning") => Ok(None),
+                    _ => Err("upstream_unsupported_chat_output"),
+                }
+            }
+            "response.content_part.added"
+            | "response.content_part.done"
+            | "response.output_text.done" => Ok(None),
+            kind if kind.starts_with("response.reasoning") => Ok(None),
+            "response.completed" => self.complete(&value, "stop", false).map(Some),
+            "response.incomplete" => {
+                let response = value
+                    .get("response")
+                    .filter(|response| response.is_object())
+                    .ok_or("upstream_invalid_response")?;
+                if response.get("status").and_then(Value::as_str) != Some("incomplete")
+                    || !response.get("error").is_some_and(Value::is_null)
+                {
+                    return Err("upstream_invalid_response");
+                }
+                let reason = response
+                    .pointer("/incomplete_details/reason")
+                    .and_then(Value::as_str)
+                    .filter(|reason| !reason.is_empty())
+                    .ok_or("upstream_invalid_response")?;
+                let finish_reason = if reason == "content_filter" {
+                    "content_filter"
+                } else {
+                    "length"
+                };
+                self.complete(&value, finish_reason, true).map(Some)
+            }
+            "response.failed" | "response.error" | "error" => Err("upstream_failed_response"),
+            _ => Err("upstream_unsupported_chat_output"),
+        }
+    }
+
+    fn delta_chunk(&mut self, delta: &str) -> Result<Bytes, &'static str> {
+        let delta = if std::mem::replace(&mut self.started, true) {
+            json!({"content": delta})
+        } else {
+            json!({"role": "assistant", "content": delta})
+        };
+        chat_sse_chunk(
+            &self.id,
+            &self.model,
+            self.created,
+            json!([{"index": 0, "delta": delta, "finish_reason": null}]),
+            None,
+        )
+    }
+
+    fn complete(
+        &mut self,
+        event: &Value,
+        finish_reason: &'static str,
+        allow_empty_output: bool,
+    ) -> Result<Bytes, &'static str> {
+        if self.terminal {
+            return Err("upstream_invalid_response");
+        }
+        let response = event
+            .get("response")
+            .filter(|response| response.is_object())
+            .ok_or("upstream_invalid_response")?;
+        let completed = response_text(response, allow_empty_output)?;
+        let usage = canonical_responses_usage(response).map_err(|_| "upstream_invalid_usage")?;
+        let mut output = Vec::new();
+        if !self.saw_text_delta {
+            output.extend_from_slice(&self.delta_chunk(&completed)?);
+        }
+        output.extend_from_slice(&chat_sse_chunk(
+            &self.id,
+            &self.model,
+            self.created,
+            json!([{"index": 0, "delta": {}, "finish_reason": finish_reason}]),
+            None,
+        )?);
+        if self.include_usage {
+            output.extend_from_slice(&chat_sse_chunk(
+                &self.id,
+                &self.model,
+                self.created,
+                json!([]),
+                Some(chat_usage(&usage)),
+            )?);
+        }
+        output.extend_from_slice(b"data: [DONE]\n\n");
+        self.terminal = true;
+        Ok(Bytes::from(output))
+    }
+}
+
+fn chat_completion_id(request_id: Uuid) -> String {
+    format!("chatcmpl-{request_id}")
+}
+
+fn chat_usage(usage: &TokenUsage) -> Value {
+    json!({
+        "prompt_tokens": usage.total_input_tokens(),
+        "completion_tokens": usage.output_tokens,
+        "total_tokens": usage.total_tokens(),
+        "prompt_tokens_details": {"cached_tokens": usage.cached_input_tokens}
+    })
+}
+
+fn chat_sse_chunk(
+    id: &str,
+    model: &str,
+    created: i64,
+    choices: Value,
+    usage: Option<Value>,
+) -> Result<Bytes, &'static str> {
+    let mut chunk = json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": choices
+    });
+    if let Some(usage) = usage {
+        chunk
+            .as_object_mut()
+            .ok_or("upstream_invalid_response")?
+            .insert("usage".into(), usage);
+    }
+    let mut encoded = b"data: ".to_vec();
+    serde_json::to_writer(&mut encoded, &chunk).map_err(|_| "upstream_invalid_response")?;
+    encoded.extend_from_slice(b"\n\n");
+    Ok(Bytes::from(encoded))
+}
+
+fn sse_data(frame: &[u8]) -> Option<Vec<u8>> {
+    let mut data = Vec::new();
+    let mut found = false;
+    let mut start = 0_usize;
+    let mut index = 0_usize;
+    while index <= frame.len() {
+        let at_end = index == frame.len();
+        let is_ending = !at_end && matches!(frame[index], b'\r' | b'\n');
+        if !at_end && !is_ending {
+            index = index.saturating_add(1);
+            continue;
+        }
+        let line = &frame[start..index];
+        let Some(value) = line.strip_prefix(b"data:") else {
+            if at_end {
+                break;
+            }
+            if frame[index] == b'\r' && frame.get(index + 1) == Some(&b'\n') {
+                index = index.saturating_add(1);
+            }
+            index = index.saturating_add(1);
+            start = index;
+            continue;
+        };
+        if found {
+            data.push(b'\n');
+        }
+        data.extend_from_slice(value.strip_prefix(b" ").unwrap_or(value));
+        found = true;
+        if at_end {
+            break;
+        }
+        if frame[index] == b'\r' && frame.get(index + 1) == Some(&b'\n') {
+            index = index.saturating_add(1);
+        }
+        index = index.saturating_add(1);
+        start = index;
+    }
+    found.then_some(data)
+}
+
+fn completed_response_text(response: &Value) -> Result<String, &'static str> {
+    response_text(response, false)
+}
+
+fn response_text(response: &Value, allow_empty_output: bool) -> Result<String, &'static str> {
+    let output = response
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or("upstream_invalid_response")?;
+    let mut result = String::new();
+    let mut messages = 0_usize;
+    for item in output {
+        match item.get("type").and_then(Value::as_str) {
+            Some("reasoning") => continue,
+            Some("message") if item.get("role").and_then(Value::as_str) == Some("assistant") => {
+                messages = messages.saturating_add(1);
+                if messages != 1 {
+                    return Err("upstream_unsupported_chat_output");
+                }
+                let content = item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .ok_or("upstream_invalid_response")?;
+                for part in content {
+                    if part.get("type").and_then(Value::as_str) != Some("output_text") {
+                        return Err("upstream_unsupported_chat_output");
+                    }
+                    result.push_str(
+                        part.get("text")
+                            .and_then(Value::as_str)
+                            .ok_or("upstream_invalid_response")?,
+                    );
+                }
+            }
+            _ => return Err("upstream_unsupported_chat_output"),
+        }
+    }
+    if messages == 1 || (allow_empty_output && messages == 0) {
+        Ok(result)
+    } else {
+        Err("upstream_unsupported_chat_output")
+    }
 }
 
 pub(super) async fn buffer_response(
@@ -1809,9 +2254,9 @@ mod tests {
     }
 
     #[test]
-    fn only_responses_protocol_is_admitted() {
+    fn responses_and_text_chat_protocols_are_admitted() {
         assert!(validate_protocol(Protocol::OpenAiResponses).is_ok());
-        assert!(validate_protocol(Protocol::OpenAiChat).is_err());
+        assert!(validate_protocol(Protocol::OpenAiChat).is_ok());
         assert!(validate_protocol(Protocol::OpenAiEmbeddings).is_err());
     }
 }

@@ -2400,6 +2400,43 @@ fn completed_codex_sse(output: &str) -> String {
     )
 }
 
+fn streaming_codex_sse(output: &str, first_delta: &str, second_delta: &str) -> String {
+    [
+        json!({"type": "response.created", "response": {"id": "resp-codex"}}),
+        json!({"type": "response.output_text.delta", "delta": first_delta}),
+        json!({"type": "response.output_text.delta", "delta": second_delta}),
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "item-codex",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": output}]
+            }
+        }),
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-codex",
+                "object": "response",
+                "model": "upstream-returned-model",
+                "output": [{
+                    "id": "item-codex",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": output}]
+                }],
+                "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+            }
+        }),
+    ]
+    .into_iter()
+    .map(|event| format!("data: {event}\n\n"))
+    .chain(std::iter::once("data: [DONE]\n\n".to_owned()))
+    .collect()
+}
+
 fn assert_codex_wire(request: &wiremock::Request, upstream_model: &str) {
     assert_eq!(request.url.path(), codex_transport::RESPONSES_PATH);
     assert_eq!(request.headers[header::ACCEPT], "text/event-stream");
@@ -2460,8 +2497,49 @@ fn assert_codex_wire(request: &wiremock::Request, upstream_model: &str) {
     }
 }
 
+fn assert_codex_chat_wire(request: &wiremock::Request, upstream_model: &str) {
+    assert_eq!(request.url.path(), codex_transport::RESPONSES_PATH);
+    assert_eq!(request.headers[header::ACCEPT], "text/event-stream");
+    assert_eq!(request.headers[header::CONTENT_TYPE], "application/json");
+    assert_eq!(
+        request.headers[header::AUTHORIZATION],
+        "Bearer upstream-access-secret"
+    );
+    assert_eq!(request.headers["chatgpt-account-id"], "account-123");
+    let body: Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(body["model"], upstream_model);
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["store"], false);
+    assert_eq!(
+        body["instructions"],
+        "Translate faithfully.\n\nPreserve names."
+    );
+    assert_eq!(
+        body["input"],
+        json!([
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Bonjour"},
+            {"role": "user", "content": "Goodbye"}
+        ])
+    );
+    assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+    assert_eq!(
+        body["prompt_cache_key"],
+        request.headers["session-id"].to_str().unwrap()
+    );
+    for field in [
+        "messages",
+        "n",
+        "stream_options",
+        "tools",
+        "parallel_tool_calls",
+    ] {
+        assert!(body.get(field).is_none(), "{field}");
+    }
+}
+
 #[tokio::test]
-async fn codex_chat_and_embeddings_fail_before_reservation_archive_or_upstream() {
+async fn unsupported_codex_protocol_and_chat_shapes_fail_before_side_effects() {
     let fixture = codex_route_fixture("preadmission").await;
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
@@ -2472,7 +2550,29 @@ async fn codex_chat_and_embeddings_fail_before_reservation_archive_or_upstream()
     for (path, request) in [
         (
             "/v1/chat/completions",
-            json!({"model": fixture.model, "messages": [{"role": "user", "content": "hello"}]}),
+            json!({
+                "model": fixture.model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{"type": "function", "function": {"name": "lookup"}}]
+            }),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({
+                "model": fixture.model,
+                "messages": [{
+                    "role": "user",
+                    "content": [{"type": "image_url", "image_url": {"url": "https://example.invalid/a.png"}}]
+                }]
+            }),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({
+                "model": fixture.model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "n": 2
+            }),
         ),
         (
             "/v1/embeddings",
@@ -2483,7 +2583,7 @@ async fn codex_chat_and_embeddings_fail_before_reservation_archive_or_upstream()
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let body = String::from_utf8_lossy(&body);
-        assert!(body.contains("Responses protocol only"), "{body}");
+        assert!(body.contains("error"), "{body}");
     }
     assert!(
         fixture
@@ -2505,6 +2605,167 @@ async fn codex_chat_and_embeddings_fail_before_reservation_archive_or_upstream()
         0
     );
     pool.close().await;
+}
+
+#[tokio::test]
+async fn codex_buffered_chat_translates_request_and_response_and_settles_once() {
+    let fixture = codex_route_fixture("buffered-chat").await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            completed_codex_sse("Au revoir").into_bytes(),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let original = json!({
+        "model": fixture.model,
+        "messages": [
+            {"role": "system", "content": "Translate faithfully."},
+            {"role": "developer", "content": [{"type": "text", "text": "Preserve names."}]},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Bonjour"},
+            {"role": "user", "content": "Goodbye"}
+        ],
+        "stream": false,
+        "n": 1
+    });
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/chat/completions",
+        original.clone(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert!(body["id"].as_str().unwrap().starts_with("chatcmpl-"));
+    assert_eq!(body["object"], "chat.completion");
+    assert_eq!(body["model"], fixture.model);
+    assert_eq!(body["choices"][0]["message"]["role"], "assistant");
+    assert_eq!(body["choices"][0]["message"]["content"], "Au revoir");
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    assert_eq!(body["usage"]["prompt_tokens"], 3);
+    assert_eq!(body["usage"]["completion_tokens"], 2);
+    assert_eq!(body["usage"]["total_tokens"], 5);
+    assert!(body.get("output").is_none());
+
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    drain_completed_response_archive(&fixture).await;
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, rows[0].request_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(
+            &fixture
+                .state
+                .archive
+                .get(&refs.request_object)
+                .await
+                .unwrap()
+        )
+        .unwrap(),
+        original
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(
+            &fixture
+                .state
+                .archive
+                .get(refs.response_object.as_deref().unwrap())
+                .await
+                .unwrap()
+        )
+        .unwrap(),
+        body
+    );
+    let requests = upstream.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_codex_chat_wire(&requests[0], &fixture.upstream_model);
+}
+
+#[tokio::test]
+async fn codex_streaming_chat_emits_only_chat_chunks_with_terminal_usage() {
+    let fixture = codex_route_fixture("streaming-chat").await;
+    let upstream = MockServer::start().await;
+    let sse = streaming_codex_sse("Bonjour monde", "Bonjour ", "monde");
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/chat/completions",
+        json!({
+            "model": fixture.model,
+            "messages": [
+                {"role": "system", "content": "Translate faithfully."},
+                {"role": "developer", "content": "Preserve names."},
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Bonjour"},
+                {"role": "user", "content": "Goodbye"}
+            ],
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/event-stream"
+    );
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let rendered = String::from_utf8(body.to_vec()).unwrap();
+    assert!(rendered.contains("chat.completion.chunk"));
+    assert!(rendered.contains(&fixture.model));
+    assert!(rendered.contains("Bonjour "));
+    assert!(rendered.contains("monde"));
+    assert!(rendered.contains("\"finish_reason\":\"stop\""));
+    assert!(rendered.contains("\"choices\":[]"));
+    assert!(rendered.contains("\"prompt_tokens\":3"));
+    assert!(rendered.contains("data: [DONE]"));
+    assert!(!rendered.contains("response."));
+    assert!(!rendered.contains("output_text"));
+
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    let requests = upstream.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_codex_chat_wire(&requests[0], &fixture.upstream_model);
 }
 
 #[tokio::test]
