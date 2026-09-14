@@ -120,6 +120,19 @@ async fn verify_counts(url: &str) {
         .await
         .unwrap();
     assert_counts(&db, &tenant, &[(a, 1), (b, 0)]).await;
+    // Disabled configuration remains counted; archived configuration does not.
+    sqlx::query("UPDATE model_routes SET enabled = 0 WHERE id = $1")
+        .bind(routes[1].to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_counts(&db, &tenant, &[(a, 1), (b, 0)]).await;
+    sqlx::query("UPDATE model_routes SET archived_at = 2 WHERE id = $1")
+        .bind(routes[1].to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_counts(&db, &tenant, &[(a, 0), (b, 0)]).await;
 }
 
 async fn assert_counts(db: &Database, tenant: &str, expected: &[(Uuid, i64)]) {
