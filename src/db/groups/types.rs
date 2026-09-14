@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The three control-plane group families.
@@ -69,6 +69,25 @@ pub struct GroupView {
     pub member_count: i64,
     pub created_at: i64,
     pub updated_at: i64,
+    pub routing_strategy: Option<GroupRoutingStrategy>,
+    pub routing_priority: i32,
+    pub strategy_version: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupRoutingStrategy {
+    pub plugin_id: String,
+    pub config: serde_json::Value,
+}
+
+#[derive(Clone, Debug)]
+pub struct UpdateGroupRoutingStrategyInput {
+    pub tenant_external_id: String,
+    pub expected_updated_at: i64,
+    pub expected_strategy_version: i64,
+    pub routing_strategy: Option<GroupRoutingStrategy>,
+    pub routing_priority: i32,
 }
 
 #[derive(Clone, Debug)]

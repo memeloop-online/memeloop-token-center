@@ -267,14 +267,34 @@ async fn next_sendable_proxy_route(
         }
         let (next_input_token_ceiling, next_output_token_ceiling) =
             candidate_reservation_bounds(&planned, original_body_length, output_choice_count)?;
-        let admission = state
-            .db
-            .claim_upstream_account_attempt_with_health_config(
+        let admission = if let Some(snapshot) = state.group_routing.as_ref()
+            && let Some(policy) = snapshot.policy(
+                planned.route.route_id,
                 planned.route.account_id,
                 planned.route.credential_generation,
-                state.config.upstream_health,
-            )
-            .await?;
+            ) {
+            state
+                .db
+                .claim_upstream_account_attempt_with_strategy(
+                    snapshot.tenant_id,
+                    planned.route.account_id,
+                    planned.route.credential_generation,
+                    state.config.upstream_health,
+                    policy.allow_probe(),
+                    Some(policy.cooldown_ms()),
+                    false,
+                )
+                .await?
+        } else {
+            state
+                .db
+                .claim_upstream_account_attempt_with_health_config(
+                    planned.route.account_id,
+                    planned.route.credential_generation,
+                    state.config.upstream_health,
+                )
+                .await?
+        };
         if let UpstreamAttemptAdmission::Unavailable {
             cooldown_until,
             probe_lease_until,
@@ -624,6 +644,7 @@ async fn execute_component_primary(
     price: &crate::model::ModelPrice,
     mut primary: PlannedProxyRoute,
     original_body_length: usize,
+    recovery_wait_deadline: tokio::time::Instant,
 ) -> Result<Response, AppError> {
     let readiness = match refresh_route_snapshot(request.state, &mut primary.route).await {
         Ok(readiness) => readiness,
@@ -640,6 +661,70 @@ async fn execute_component_primary(
     if readiness != PreparedRouteReadiness::Ready {
         return finish_unavailable(&request, readiness.error_code(), None).await;
     }
+    // Every component request passes core health admission, including failed
+    // strategy execution/native fallback. A missing policy never disables the
+    // generation fence or revives hard quota. This path never replays a send.
+    let admission = if let Some(snapshot) = request.state.group_routing.as_ref()
+        && let Some(policy) = snapshot.policy(
+            primary.route.route_id,
+            primary.route.account_id,
+            primary.route.credential_generation,
+        ) {
+        request
+            .state
+            .db
+            .claim_upstream_account_attempt_with_strategy(
+                snapshot.tenant_id,
+                primary.route.account_id,
+                primary.route.credential_generation,
+                request.state.config.upstream_health,
+                policy.allow_probe(),
+                Some(policy.cooldown_ms()),
+                false,
+            )
+            .await?
+    } else {
+        request
+            .state
+            .db
+            .claim_upstream_account_attempt_with_health_config(
+                primary.route.account_id,
+                primary.route.credential_generation,
+                request.state.config.upstream_health,
+            )
+            .await?
+    };
+    let upstream_attempt = match admission {
+        UpstreamAttemptAdmission::Unavailable {
+            transient_wait_eligible: true,
+            ..
+        } => {
+            let Some((route, _, guard)) = routing::recovery_wait::wait(
+                request.state,
+                request.request_id,
+                primary.route.clone(),
+                recovery_wait_deadline,
+            )
+            .await?
+            else {
+                return finish_unavailable(&request, "upstream_unavailable", None).await;
+            };
+            primary.route = route;
+            Some(guard)
+        }
+        UpstreamAttemptAdmission::Unavailable { .. } => {
+            return finish_unavailable(&request, "upstream_unavailable", None).await;
+        }
+        admission => Some(UpstreamAttemptGuard::new(
+            request.state,
+            request.request_id,
+            primary.route.route_id,
+            primary.route.account_id,
+            primary.route.credential_generation,
+            admission,
+            None,
+        )),
+    };
     let mut active_route = match materialize_proxy_route(request.state, primary).await {
         Ok(prepared) => prepared,
         Err(_) => return finish_proxy_failure(&request, "provider_candidate_invalid").await,
@@ -685,6 +770,7 @@ async fn execute_component_primary(
         &active_route.route.credential,
         prepared,
         component_context,
+        upstream_attempt,
     )
     .await
 }
@@ -717,7 +803,7 @@ pub(in crate::api) async fn proxy_with_identity(
     let _request_buffer = state
         .metrics
         .memory_usage(crate::metrics::MemoryComponent::RequestBuffer, body.len());
-    let state = state.pin_application_plugins().await?;
+    let mut state = state.pin_application_plugins().await?;
     let proxy_lifecycle_permit = state
         .proxy_lifecycle_permits
         .clone()
@@ -773,6 +859,8 @@ pub(in crate::api) async fn proxy_with_identity(
         )
         .await?;
     retain_pinned_text_candidates(&state, pinned_route, &mut candidates)?;
+    let strategy_candidates =
+        crate::group_routing::candidate_snapshot_if_enabled(&state, &candidates);
     let request_context = ProxyRequestContext {
         state: &state,
         key: &key,
@@ -781,7 +869,7 @@ pub(in crate::api) async fn proxy_with_identity(
         request_id,
         request_json: &request_json,
     };
-    let route_plan = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
+    let mut route_plan = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
         request: request_context,
         original_body_length: body.len(),
         candidates,
@@ -793,6 +881,41 @@ pub(in crate::api) async fn proxy_with_identity(
     let attempt_budget = routing::RequestAttemptBudget::from_primary(primary, request_id)?;
     let recovery_wait_deadline =
         attempt_budget.recovery_wait_deadline(state.config.upstream_health);
+    if let Some(mut candidates) = strategy_candidates {
+        crate::group_routing::prepare(
+            &mut state,
+            key.tenant_id,
+            selection_seed,
+            request_id,
+            recovery_wait_deadline,
+            &mut candidates,
+        )
+        .await?;
+        if state.group_routing.is_some() {
+            route_plan = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
+                request: ProxyRequestContext {
+                    state: &state,
+                    key: &key,
+                    model: &model,
+                    protocol,
+                    request_id,
+                    request_json: &request_json,
+                },
+                original_body_length: body.len(),
+                candidates,
+            })
+            .await?;
+        }
+    }
+    let request_context = ProxyRequestContext {
+        state: &state,
+        key: &key,
+        model: &model,
+        protocol,
+        request_id,
+        request_json: &request_json,
+    };
+    let primary = route_plan.primary_route();
     let upstream_account_id = Some(primary.account_id);
     let model_route_id = Some(primary.route_id);
     let price = state.db.model_price(&model, &key.currency).await?;
@@ -919,6 +1042,7 @@ pub(in crate::api) async fn proxy_with_identity(
             &price,
             primary,
             request_body_length,
+            recovery_wait_deadline,
         )
         .await;
     }
@@ -1432,6 +1556,7 @@ async fn execute_component_provider(
     credential: &UpstreamCredential,
     prepared: PreparedProviderRequest,
     context: RequestContext,
+    mut upstream_attempt: Option<UpstreamAttemptGuard>,
 ) -> Result<Response, AppError> {
     let target = match component_provider_url(base_url, &prepared.path) {
         Ok(target) => target,
@@ -1504,12 +1629,50 @@ async fn execute_component_provider(
                 is_connect = error.is_connect(),
                 "component provider upstream request failed"
             );
+            if let Some(attempt) = upstream_attempt.as_mut() {
+                attempt
+                    .complete(UpstreamAttemptTerminal::Failed {
+                        kind: crate::db::UpstreamFailureKind::Connection,
+                        reason: UpstreamHealthReason::Connection,
+                    })
+                    .await;
+            }
             return finish_component_provider_failure(&request, "upstream_connection").await;
         }
     };
     let upstream_status = upstream.status();
     if !upstream_status.is_success() && !upstream_status.is_redirection() {
-        drop(upstream);
+        if let Some(attempt) = upstream_attempt.as_mut() {
+            let terminal = if upstream_status == StatusCode::TOO_MANY_REQUESTS {
+                let (response, kind) = routing::classify_rate_limit(upstream.into()).await;
+                drop(response);
+                UpstreamAttemptTerminal::Failed {
+                    kind,
+                    reason: UpstreamHealthReason::RateLimited,
+                }
+            } else {
+                drop(upstream);
+                if matches!(
+                    upstream_status,
+                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+                ) {
+                    UpstreamAttemptTerminal::Failed {
+                        kind: crate::db::UpstreamFailureKind::Authentication,
+                        reason: UpstreamHealthReason::Unavailable,
+                    }
+                } else if upstream_status.is_server_error() {
+                    UpstreamAttemptTerminal::Failed {
+                        kind: crate::db::UpstreamFailureKind::Unavailable,
+                        reason: UpstreamHealthReason::Unavailable,
+                    }
+                } else {
+                    UpstreamAttemptTerminal::Inconclusive
+                }
+            };
+            attempt.complete(terminal).await;
+        } else {
+            drop(upstream);
+        }
         return finish_buffered_request(
             &request,
             upstream_status,
@@ -1527,6 +1690,11 @@ async fn execute_component_provider(
         let value = match value.to_str() {
             Ok(value) => value,
             Err(_) => {
+                if let Some(attempt) = upstream_attempt.as_mut() {
+                    attempt
+                        .complete(UpstreamAttemptTerminal::invalid_response())
+                        .await;
+                }
                 return finish_component_provider_failure(&request, "upstream_invalid_headers")
                     .await;
             }
@@ -1554,6 +1722,15 @@ async fn execute_component_provider(
         Ok(body) => body,
         Err(error) => {
             tracing::warn!(request_id = %request.request_id, stage = "component_response", "component provider request failed");
+            if !matches!(
+                error,
+                buffered_upstream::BoundedUpstreamError::MemoryCapacity
+            ) && let Some(attempt) = upstream_attempt.as_mut()
+            {
+                attempt
+                    .complete(UpstreamAttemptTerminal::invalid_response())
+                    .await;
+            }
             return finish_component_provider_failure(&request, error.code()).await;
         }
     };
@@ -1568,8 +1745,19 @@ async fn execute_component_provider(
     .await
     {
         Ok(response) => response,
-        Err(_) => {
+        Err(error) => {
             tracing::warn!(request_id = %request.request_id, stage = "component_normalize", "component provider request failed");
+            // The adapter currently reports guest traps and invalid normalized
+            // envelopes through the same typed Upstream error. Both are a
+            // failed response-processing attempt, never a client cancellation.
+            // Local memory/storage/runtime setup errors remain inconclusive.
+            if matches!(error, AppError::Upstream(_))
+                && let Some(attempt) = upstream_attempt.as_mut()
+            {
+                attempt
+                    .complete(UpstreamAttemptTerminal::invalid_response())
+                    .await;
+            }
             return finish_component_provider_failure(&request, "provider_normalize").await;
         }
     };
@@ -1584,10 +1772,20 @@ async fn execute_component_provider(
     let status = match StatusCode::from_u16(normalized.status) {
         Ok(status) => status,
         Err(_) => {
+            if let Some(attempt) = upstream_attempt.as_mut() {
+                attempt
+                    .complete(UpstreamAttemptTerminal::invalid_response())
+                    .await;
+            }
             return finish_component_provider_failure(&request, "provider_invalid_response").await;
         }
     };
     if !status.is_success() {
+        if let Some(attempt) = upstream_attempt.as_mut() {
+            attempt
+                .complete(UpstreamAttemptTerminal::invalid_response())
+                .await;
+        }
         return finish_buffered_request(
             &request,
             status,
@@ -1608,6 +1806,11 @@ async fn execute_component_provider(
         (0..=MAX_REPORTED_TOKENS).contains(&tokens) && tokens <= request.output_token_ceiling
     });
     if !usage_is_valid {
+        if let Some(attempt) = upstream_attempt.as_mut() {
+            attempt
+                .complete(UpstreamAttemptTerminal::invalid_response())
+                .await;
+        }
         return finish_component_provider_failure(&request, "upstream_invalid_usage").await;
     }
     if normalized.estimated {
@@ -1628,7 +1831,7 @@ async fn execute_component_provider(
         .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
         .map(|(_, value)| value.as_str())
         .unwrap_or("application/json");
-    finish_buffered_request(
+    let result = finish_buffered_request(
         &request,
         status,
         Bytes::from(normalized.body),
@@ -1636,7 +1839,17 @@ async fn execute_component_provider(
         usage,
         None,
     )
-    .await
+    .await;
+    // A component's 2xx headers or normalized output do not prove recovery.
+    // Only a successful durable terminal settlement may heal the probe.
+    if let Some(attempt) = upstream_attempt.as_mut()
+        && result
+            .as_ref()
+            .is_ok_and(|response| response.status().is_success())
+    {
+        attempt.complete(UpstreamAttemptTerminal::Succeeded).await;
+    }
+    result
 }
 
 async fn finish_component_provider_failure(

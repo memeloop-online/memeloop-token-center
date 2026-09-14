@@ -23,6 +23,9 @@ use uuid::Uuid;
 #[path = "security_routing_groups/final_group_semantics.rs"]
 mod final_group_semantics;
 
+#[path = "security_routing_groups/group_strategy.rs"]
+mod group_strategy;
+
 async fn api_json(state: &AppState, method: &str, path: String, body: Value) -> StatusCode {
     api::router(state.clone())
         .oneshot(

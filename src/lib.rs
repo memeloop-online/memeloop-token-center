@@ -11,6 +11,7 @@ pub mod error;
 pub mod filter_ast;
 mod gateway_body;
 pub mod generation;
+mod group_routing;
 #[cfg(not(target_env = "msvc"))]
 mod jemalloc_control;
 pub mod metrics;
@@ -60,6 +61,8 @@ pub struct AppState {
     pub(crate) codex_clients: Arc<codex_clients::CodexClients>,
     pub providers: ProviderCatalog,
     pub plugins: PluginRuntime,
+    /// Request-owned policy snapshot; never shared back into the router state.
+    pub(crate) group_routing: Option<Arc<group_routing::RequestGroupRouting>>,
     #[cfg(feature = "experimental-plugin-revisions")]
     pub(crate) application_plugins: Option<Arc<plugin::application::ApplicationPlugins>>,
     #[cfg(feature = "experimental-plugin-revisions")]
@@ -162,6 +165,7 @@ impl AppState {
             archive,
             providers,
             plugins,
+            group_routing: None,
             #[cfg(feature = "experimental-plugin-revisions")]
             application_plugins,
             #[cfg(feature = "experimental-plugin-revisions")]

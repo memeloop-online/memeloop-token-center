@@ -10,7 +10,10 @@ use uuid::Uuid;
 use super::{require_service, require_service_tenant};
 use crate::{
     AppState,
-    db::{CreateGroupInput, GroupKind, ReplaceGroupMembersInput, UpdateGroupInput},
+    db::{
+        CreateGroupInput, GroupKind, GroupRoutingStrategy, ReplaceGroupMembersInput,
+        UpdateGroupInput, UpdateGroupRoutingStrategyInput,
+    },
     error::AppError,
 };
 
@@ -48,6 +51,66 @@ pub(super) struct ReplaceGroupMembersRequest {
     tenant_external_id: String,
     member_ids: Vec<Uuid>,
     expected_updated_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct UpdateGroupRoutingStrategyRequest {
+    tenant_external_id: String,
+    expected_updated_at: i64,
+    expected_strategy_version: i64,
+    routing_priority: i32,
+    routing_strategy: Option<GroupRoutingStrategy>,
+}
+
+async fn update_group_routing_strategy(
+    state: AppState,
+    headers: HeaderMap,
+    group_id: Uuid,
+    body: UpdateGroupRoutingStrategyRequest,
+    kind: GroupKind,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "routes:write").await?;
+    require_service_tenant(&service, &body.tenant_external_id)?;
+    if let Some(strategy) = &body.routing_strategy {
+        state
+            .plugins
+            .validate_group_routing_configuration(&strategy.plugin_id, &strategy.config)?;
+    }
+    Ok(Json(
+        state
+            .db
+            .update_group_routing_strategy(
+                kind,
+                group_id,
+                UpdateGroupRoutingStrategyInput {
+                    tenant_external_id: body.tenant_external_id,
+                    expected_updated_at: body.expected_updated_at,
+                    expected_strategy_version: body.expected_strategy_version,
+                    routing_priority: body.routing_priority,
+                    routing_strategy: body.routing_strategy,
+                },
+            )
+            .await?,
+    ))
+}
+
+pub(super) async fn update_provider_group_routing_strategy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(group_id): Path<Uuid>,
+    Json(body): Json<UpdateGroupRoutingStrategyRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    update_group_routing_strategy(state, headers, group_id, body, GroupKind::Provider).await
+}
+
+pub(super) async fn update_route_group_routing_strategy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(group_id): Path<Uuid>,
+    Json(body): Json<UpdateGroupRoutingStrategyRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    update_group_routing_strategy(state, headers, group_id, body, GroupKind::Route).await
 }
 
 macro_rules! group_handlers {

@@ -467,6 +467,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../../migrations/common/0087_generation_quarantine_resolutions.sql"),
     },
     Migration {
+        version: 88,
+        name: "group routing strategy",
+        sql: include_str!("../../../migrations/common/0088_group_routing_strategy.sql"),
+    },
+    Migration {
         version: 89,
         name: "request output timing",
         sql: include_str!("../../../migrations/common/0089_request_output_timing.sql"),
@@ -922,6 +927,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 87,
         name: "audited generation quarantine reconciliation",
         sql: include_str!("../../../migrations/common/0087_generation_quarantine_resolutions.sql"),
+    },
+    Migration {
+        version: 88,
+        name: "group routing strategy",
+        sql: include_str!("../../../migrations/common/0088_group_routing_strategy.sql"),
     },
     Migration {
         version: 89,

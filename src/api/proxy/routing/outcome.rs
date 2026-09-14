@@ -53,14 +53,7 @@ pub(in crate::api::proxy) fn classify_attempt_failure(
     rate_limit: Option<UpstreamFailureKind>,
 ) -> Option<(UpstreamFailureKind, UpstreamHealthReason)> {
     match result {
-        Ok(result) if result.response.status() == StatusCode::TOO_MANY_REQUESTS => Some((
-            rate_limit.unwrap_or(UpstreamFailureKind::RateLimited),
-            UpstreamHealthReason::RateLimited,
-        )),
-        Ok(result) if retryable_upstream_status(result.response.status()) => Some((
-            UpstreamFailureKind::Unavailable,
-            UpstreamHealthReason::Unavailable,
-        )),
+        Ok(result) => classify_response_failure(result.response.status(), rate_limit),
         // A complete rejected response may mark the account unavailable, but
         // it remains non-replayable across accounts.
         Err(ProxySendError::RetryableCodexBadRequest) => Some((
@@ -71,7 +64,6 @@ pub(in crate::api::proxy) fn classify_attempt_failure(
             UpstreamFailureKind::Connection,
             UpstreamHealthReason::Connection,
         )),
-        Ok(_) => None,
         Err(
             ProxySendError::CodexBadRequest
             | ProxySendError::AmbiguousResponse(_)
@@ -84,9 +76,49 @@ pub(in crate::api::proxy) fn classify_attempt_failure(
     }
 }
 
+fn classify_response_failure(
+    status: StatusCode,
+    rate_limit: Option<UpstreamFailureKind>,
+) -> Option<(UpstreamFailureKind, UpstreamHealthReason)> {
+    match status {
+        StatusCode::TOO_MANY_REQUESTS => Some((
+            rate_limit.unwrap_or(UpstreamFailureKind::RateLimited),
+            UpstreamHealthReason::RateLimited,
+        )),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Some((
+            UpstreamFailureKind::Authentication,
+            UpstreamHealthReason::Unavailable,
+        )),
+        status if retryable_upstream_status(status) => Some((
+            UpstreamFailureKind::Unavailable,
+            UpstreamHealthReason::Unavailable,
+        )),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authentication_is_hard_health_evidence_but_never_replay_permission() {
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+            assert!(matches!(
+                classify_response_failure(status, None),
+                Some((UpstreamFailureKind::Authentication, _))
+            ));
+            assert_eq!(
+                failover_disposition(Some(status), None),
+                FailoverDisposition::Stop
+            );
+        }
+        assert!(classify_response_failure(StatusCode::BAD_REQUEST, None).is_none());
+        assert!(matches!(
+            classify_response_failure(StatusCode::SERVICE_UNAVAILABLE, None),
+            Some((UpstreamFailureKind::Unavailable, _))
+        ));
+    }
 
     #[test]
     fn only_explicit_non_delivery_or_rate_limit_rejection_permits_failover() {
