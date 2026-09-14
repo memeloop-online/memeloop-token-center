@@ -2,50 +2,57 @@ import { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import { formatElapsedTime, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
-import { quotaReadErrorMessage, quotaUsedPercent, upstreamQuotaPath, type UpstreamQuotaSnapshot } from './upstreamQuota';
+import { quotaObservationState, quotaReadErrorMessage, quotaSourceLabel, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaPath, type UpstreamQuotaSnapshot } from './upstreamQuota';
 import './upstreamQuota.css';
 import { UpstreamQuotaReset } from './UpstreamQuotaReset';
 import { Disclosure, DetailTooltip } from '../design-system';
 
-export function UpstreamQuotaDetails({ snapshot }: { snapshot: UpstreamQuotaSnapshot }) {
+export function UpstreamQuotaDetails({ snapshot, refreshError }: { snapshot: UpstreamQuotaSnapshot; refreshError?: 'quota.readFailed' | 'quota.errorPermission' }) {
   const { locale, t } = useI18n();
   const [now, setNow] = useState(Date.now);
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 30_000);
     return () => window.clearInterval(timer);
   }, []);
-  const stale = snapshot.stale || (snapshot.stale_after !== null && now >= snapshot.stale_after);
+  const observation = quotaObservationState(snapshot, now, Boolean(refreshError));
+  const hasObservation = observation !== 'unobserved';
+  const readFailed = Boolean(refreshError) || snapshot.status === 'error' || Boolean(snapshot.error_code);
   const reset = snapshot.reset_capability;
   const resetMessage = reset.provider_supported === false ? 'quota.resetUnsupported'
     : reset.provider_supported === null ? 'quota.resetUnknown'
     : !reset.implementation_available ? 'quota.resetNotIntegrated' : 'quota.resetAvailable';
   return <div className="upstream-quota-details">
     <div className="upstream-quota-meta">
-      {snapshot.plan_type && <b>{snapshot.plan_type}</b>}
-      <span>{snapshot.observed_at === null ? t('quota.notObserved') : t('quota.observedAt', { time: new Date(snapshot.observed_at).toLocaleString(locale) })}</span>
-      {stale && <span className="status pending">{t('quota.stale')}</span>}
-      {snapshot.credits.balance !== null && <span>{t('quota.balance', { amount: snapshot.credits.balance })}</span>}
-      {snapshot.credits.unlimited === true && <span>{t('quota.unlimitedCredits')}</span>}
+      {hasObservation && snapshot.plan_type && <b>{snapshot.plan_type}</b>}
+      <span>{snapshot.observed_at === null ? t('quota.notObserved') : t(observation === 'historical' ? 'quota.lastObservedAt' : 'quota.observedAt', { time: new Date(snapshot.observed_at).toLocaleString(locale) })}</span>
+      {observation === 'historical' && <span className="status pending">{t('quota.historical')}</span>}
+      {hasObservation && snapshot.credits.balance !== null && <span>{t(observation === 'historical' ? 'quota.lastObservedBalance' : 'quota.balance', { amount: snapshot.credits.balance })}</span>}
+      {hasObservation && snapshot.credits.unlimited === true && <span>{t(observation === 'historical' ? 'quota.lastObservedUnlimitedCredits' : 'quota.unlimitedCredits')}</span>}
     </div>
     {snapshot.status === 'unsupported' && <p>{t('quota.readUnsupported')}</p>}
-    {snapshot.status !== 'unsupported' && (snapshot.status === 'error' || snapshot.error_code) && <div className="notice error" role="alert">
-      <p>{t(quotaReadErrorMessage(snapshot.error_code))}</p>
-      {snapshot.observed_at !== null && <p>{t('quota.refreshFailedRetained')}</p>}
+    {(snapshot.status !== 'unsupported' || refreshError) && readFailed && <div className="notice error" role="alert">
+      <p>{t(refreshError ?? quotaReadErrorMessage(snapshot.error_code))}</p>
+      <p>{snapshot.observed_at === null ? t('quota.refreshFailedNoObservation') : t('quota.refreshFailedRetainedAt', { time: new Date(snapshot.observed_at).toLocaleString(locale) })}</p>
     </div>}
-    {snapshot.status === 'ready' && snapshot.windows.length === 0 && <p>{t('quota.noWindows')}</p>}
-    <div className="upstream-quota-windows">{snapshot.windows.map((window) => {
+    {hasObservation && snapshot.status === 'ready' && snapshot.windows.length === 0 && <p>{t(observation === 'historical' ? 'quota.noWindowsHistorical' : 'quota.noWindows')}</p>}
+    {hasObservation && <div className="upstream-quota-windows">{snapshot.windows.map((window) => {
       const used = quotaUsedPercent(window);
+      const presentation = quotaWindowPresentation(snapshot.provider, window);
+      const baseScope = presentation.supplierLabel ?? t(presentation.scopeKey);
+      const scope = presentation.qualifier ? t('quota.scopeWithQualifier', { scope: baseScope, qualifier: presentation.qualifier }) : baseScope;
+      const name = t('quota.windowLabel', { scope, period: t(presentation.periodKey) });
+      const source = t(quotaSourceLabel(window.source));
       return <section className="upstream-quota-window" key={window.id}>
-        <div className="upstream-quota-window-heading"><b>{window.label}</b><strong>{formatPercent(used === null ? null : used / 100, locale)}</strong></div>
-        {used !== null && <meter min={0} max={100} value={Math.max(0, Math.min(100, used))} aria-label={t('quota.usedPercent', { name: window.label })} />}
+        <div className="upstream-quota-window-heading"><div><b>{name}</b>{observation === 'historical' && <small>{t('quota.lastObservedValue')}</small>}</div><strong>{formatPercent(used === null ? null : used / 100, locale)}</strong></div>
+        {used !== null && <meter min={0} max={100} value={Math.max(0, Math.min(100, used))} aria-label={t(observation === 'historical' ? 'quota.lastObservedUsedPercent' : 'quota.usedPercent', { name })} />}
         {window.limit_reached === true && <span className="status bad">{t('quota.limitReached')}</span>}
         {window.allowed === false && window.limit_reached !== true && <span className="status pending">{t('quota.notAllowed')}</span>}
         {window.remaining !== null && <p>{t('quota.remaining', { amount: formatNumber(window.remaining, locale), limit: window.limit === null ? '—' : formatNumber(window.limit, locale) })}</p>}
         <p>{window.reset_at === null ? t('quota.resetTimeUnknown') : t(window.reset_is_estimated ? 'quota.estimatedResetAt' : 'quota.resetAt', { time: new Date(window.reset_at).toLocaleString(locale) })}</p>
         {window.reset_at !== null && <span>{window.reset_at <= now ? t('quota.resetElapsed') : t('quota.resetIn', { time: formatElapsedTime(window.reset_at - now, locale) })}</span>}
-        <DetailTooltip content={t('quota.source', { source: window.source })}><small tabIndex={0}>{t('quota.sourceLabel')}</small></DetailTooltip>
+        <DetailTooltip content={t('quota.sourceEvidence', { source, id: window.id, rawSource: window.source })}><small tabIndex={0} data-quota-evidence={window.id}>{t('quota.sourceLabel')}</small></DetailTooltip>
       </section>;
-    })}</div>
+    })}</div>}
     <div className="upstream-quota-reset">
       <b>{t('quota.resetCapability')}</b>
       <p>{t(resetMessage)}</p>
@@ -77,7 +84,7 @@ export function UpstreamQuotaResetSection({ accountId, accountName, tenant, toke
 }
 
 /** User-triggered read: never starts one upstream request per card on page load. */
-export function UpstreamQuota({ accountId, accountName = accountId, credentialGeneration, tenant, token, onSnapshot, initialSnapshot }: { accountId: string; accountName?: string; credentialGeneration: number; tenant: string; token: string; onSnapshot?: (snapshot: UpstreamQuotaSnapshot) => void; initialSnapshot?: UpstreamQuotaSnapshot }) {
+export function UpstreamQuota({ accountId, accountName = accountId, credentialGeneration, tenant, token, onSnapshot, onRefreshFailed, initialSnapshot }: { accountId: string; accountName?: string; credentialGeneration: number; tenant: string; token: string; onSnapshot?: (snapshot: UpstreamQuotaSnapshot) => void; onRefreshFailed?: () => void; initialSnapshot?: UpstreamQuotaSnapshot }) {
   const { t } = useI18n();
   const [snapshot, setSnapshot] = useState<UpstreamQuotaSnapshot | undefined>(initialSnapshot);
   const [busy, setBusy] = useState(false);
@@ -103,17 +110,20 @@ export function UpstreamQuota({ accountId, accountName = accountId, credentialGe
       setSnapshot(value);
       onSnapshot?.(value);
     } catch (reason) {
-      if (scopeRef.current === scope && !controller.signal.aborted) setError(reason instanceof ApiError && [401, 403].includes(reason.status) ? 'quota.errorPermission' : 'quota.readFailed');
+      if (scopeRef.current === scope && !controller.signal.aborted) {
+        setError(reason instanceof ApiError && [401, 403].includes(reason.status) ? 'quota.errorPermission' : 'quota.readFailed');
+        onRefreshFailed?.();
+      }
     } finally {
       if (scopeRef.current === scope && !controller.signal.aborted) setBusy(false);
     }
   }
   return <section className="upstream-quota" aria-label={t('quota.title')} aria-busy={busy}>
     <div className="upstream-quota-heading"><h3>{t('quota.title')}</h3><button type="button" className="secondary" disabled={busy || !tenant} onClick={() => void load()}>{t(busy ? 'common.loading' : snapshot ? 'quota.refresh' : 'quota.view')}</button></div>
-    {error && <div className="notice error" role="alert"><p>{t(error)}</p>{snapshot && <p>{t('quota.refreshFailedRetained')}</p>}</div>}
+    {error && !snapshot && <div className="notice error" role="alert"><p>{t(error)}</p></div>}
     {!snapshot && busy && <div className="upstream-quota-loading" role="status"><span>{t('common.loading')}</span><div className="upstream-quota-skeleton" aria-hidden="true"><i /><i /></div></div>}
     {!snapshot && !busy && !error && <p>{t(tenant ? 'quota.notLoaded' : 'quota.selectTenant')}</p>}
-    {snapshot && <UpstreamQuotaDetails snapshot={snapshot} />}
+    {snapshot && <UpstreamQuotaDetails snapshot={snapshot} refreshError={error} />}
     <UpstreamQuotaResetSection key={scope} accountId={accountId} accountName={accountName} tenant={tenant} token={token} snapshot={snapshot} readFailed={Boolean(error)} />
   </section>;
 }

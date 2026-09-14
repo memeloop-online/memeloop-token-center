@@ -15,8 +15,8 @@ const snapshot: UpstreamQuotaSnapshot = {
   observed_at: now - 60_000, stale_after: now - 1, stale: true, plan_type: 'Pro',
   credits: { balance: '12.50', unlimited: false, has_credits: true },
   windows: mode === 'unsupported' ? [] : [
-    { id: 'primary', label: 'Primary window', used_percent: 75, remaining: 25, limit: 100, reset_at: now + 3600_000, period_seconds: 18000, source: 'provider_usage', reset_is_estimated: false, allowed: true, limit_reached: false },
-    { id: 'secondary', label: 'Weekly window', used_percent: null, remaining: null, limit: null, reset_at: null, period_seconds: 604800, source: 'provider_usage', reset_is_estimated: false, allowed: null, limit_reached: null },
+    { id: 'code:primary_window', label: 'code:primary_window', used_percent: 75, remaining: 25, limit: 100, reset_at: now + 3600_000, period_seconds: 18000, source: 'codex_usage', reset_is_estimated: false, allowed: true, limit_reached: false },
+    { id: 'code:secondary_window', label: 'code:secondary_window', used_percent: null, remaining: null, limit: null, reset_at: null, period_seconds: 604800, source: 'codex_usage', reset_is_estimated: false, allowed: null, limit_reached: null },
   ],
   reset_capability: { provider_supported: mode === 'unsupported' ? false : true, implementation_available: mode === 'reset' || mode === 'unknown', prepare_available: mode === 'reset' || mode === 'unknown', confirmation_required: mode === 'reset' || mode === 'unknown', retryable: false, available_credits: 2, applicable_credits: 1, reason: null, credit_error_code: null },
   error_code: mode === 'stale-error' ? 'quota_destination_invalid' : mode === 'rate-limited' ? 'quota_rate_limited' : null,

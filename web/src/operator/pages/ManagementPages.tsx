@@ -29,7 +29,7 @@ import {
 import { directCredentialSchema, supportsDirectConnection } from '../providerConnectionMethods';
 import { UpstreamAvailability, manualHealthLabel } from '../UpstreamAvailability';
 import { UpstreamQuota } from '../UpstreamQuota';
-import { quotaUsedPercent, type UpstreamQuotaSnapshot } from '../upstreamQuota';
+import { quotaSummaryPresentation, type UpstreamQuotaSnapshot } from '../upstreamQuota';
 import { connectionSchema, isPrivateProxyUrl, ProxyInput, UpstreamConnection } from '../UpstreamConnection';
 import { upstreamFormTemplates } from '../UpstreamFormTemplates';
 import { credentialFormTemplates } from '../CredentialFormTemplates';
@@ -90,7 +90,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   const [reauthorizing, setReauthorizing] = useState<UpstreamAccount>();
   const [providerWorkspaceOpen, setProviderWorkspaceOpen] = useState(false);
   const [providerDetail, setProviderDetail] = useState<string>();
-  const [quotaSummaries, setQuotaSummaries] = useState<Record<string, { generation: number; snapshot: UpstreamQuotaSnapshot }>>({});
+  const [quotaSummaries, setQuotaSummaries] = useState<Record<string, { generation: number; snapshot?: UpstreamQuotaSnapshot; refreshFailed: boolean }>>({});
   const quotaScope = useRef({ token, tenant, values });
   quotaScope.current = { token, tenant, values };
   const [providerCreateGeneration, setProviderCreateGeneration] = useState(0);
@@ -263,12 +263,9 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
         const cachedQuota = quotaSummaries[value.id];
         const generation = value.credential_generation;
         const quota = cachedQuota?.generation === generation ? cachedQuota.snapshot : undefined;
-        const quotaPercents = quota?.windows.map(quotaUsedPercent).filter((percent): percent is number => percent !== null) ?? [];
-        const quotaText = !quota ? t('providerDirectory.notChecked')
-          : quota.status === 'unsupported' ? t('providerDirectory.unsupported')
-          : quota.status === 'error' ? t('providerDirectory.readFailed')
-          : quotaPercents.length ? t('providerDirectory.used', { percent: formatPercent(Math.max(...quotaPercents) / 100, locale) })
-          : t('providerDirectory.usageUnavailable');
+        const quotaRefreshFailed = Boolean(cachedQuota?.generation === generation && cachedQuota.refreshFailed);
+        const quotaPresentation = quotaSummaryPresentation(quota, Date.now(), quotaRefreshFailed);
+        const quotaText = t(quotaPresentation.key, { percent: quotaPresentation.usedPercent === null ? '—' : formatPercent(quotaPresentation.usedPercent / 100, locale) });
         return <div className="account provider-account" data-upstream-id={value.id} key={value.id}>
           <div className="provider-directory-row">
             <div className="provider-directory-identity">
@@ -279,7 +276,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             </div>
             <div className="provider-directory-summary"><span className={`status ${value.status === 'active' ? 'ok' : 'pending'}`}>{enumLabel(t, 'status', value.status)}</span><span>{t('providers.routes', { count: formatNumber(value.route_count, locale) })}</span></div>
             <div className="provider-directory-summary"><small>{t('providers.recentAvailability')}</small><span>{availabilityLoading ? t('common.loading') : !facts ? t('providerDirectory.unavailable') : terminal > 0 ? t('providerDirectory.successful', { percent: formatPercent(facts.metrics.successful_requests / terminal, locale) }) : t('providerDirectory.noRequests')}</span></div>
-            <div className="provider-directory-summary"><small>{t('quota.title')}</small><span>{quotaText}</span>{quota && (quota.stale || (quota.stale_after !== null && quota.stale_after <= Date.now())) && <small>{t('quota.stale')}</small>}</div>
+            <div className="provider-directory-summary"><small>{t('quota.title')}</small><span>{quotaText}</span></div>
             <div className="provider-directory-actions">
               <Button appearance="secondary" type="button" aria-expanded={detailOpen} aria-controls={`provider-details-${value.id}`} disabled={Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} onClick={() => setProviderDetail(detailOpen ? undefined : value.id)}>{t(detailOpen ? 'providerDirectory.close' : 'providerDirectory.open')}</Button>
               {providerAvailable && <Button appearance="subtle" type="button" data-inline-edit-trigger={value.id} disabled={!manageable || Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} onClick={(event) => { rememberTrigger(value.id, event.currentTarget); setProviderDetail(undefined); setProviderEditDraft(undefined); setEditing(value); }}>{t('providers.edit')}</Button>}
@@ -295,7 +292,11 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
               // A late read owns the generation captured when it began, never
               // the current account's newer generation after a credential change.
               if (quotaScope.current.token !== token || quotaScope.current.tenant !== tenant || !quotaScope.current.values.some(account => account.id === value.id && account.credential_generation === generation)) return current;
-              return { ...current, [value.id]: { generation, snapshot } };
+              return { ...current, [value.id]: { generation, snapshot, refreshFailed: false } };
+            })} onRefreshFailed={() => setQuotaSummaries(current => {
+              if (quotaScope.current.token !== token || quotaScope.current.tenant !== tenant || !quotaScope.current.values.some(account => account.id === value.id && account.credential_generation === generation)) return current;
+              const previous = current[value.id];
+              return { ...current, [value.id]: { generation, snapshot: previous?.generation === generation ? previous.snapshot : undefined, refreshFailed: true } };
             })} />
             {currentReadiness && <small className={`status ${currentReadiness.can_delete ? 'ok' : 'pending'}`}>{deletionBlockers.join(' · ')}</small>}
           </div>
