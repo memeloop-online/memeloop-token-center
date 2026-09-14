@@ -56,6 +56,9 @@ impl exports::memeloop::token_center::upstream_provider::Guest for ModelGuard {
     }
 }
 
+// Component ABI symbols are valid Wasm exports, not native ELF symbol names.
+// Keep native algorithm tests linkable while exporting the actual component.
+#[cfg(target_arch = "wasm32")]
 export!(ModelGuard);
 
 #[cfg(test)]

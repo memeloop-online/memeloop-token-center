@@ -53,6 +53,14 @@ test('Model Guard default has no rewrite, provider, or host capability', () => {
   assert.equal(manifest.contributions.configuration.schema.additionalProperties, false);
 });
 
+test('Model Guard component exports do not enter the native test cdylib', () => {
+  const source = readFileSync(join(root, 'plugin-sources/model-guard/src/lib.rs'), 'utf8');
+  assert.match(source, /#\[cfg\(target_arch = "wasm32"\)\]\s*export!\(ModelGuard\);/);
+  const workflow = readFileSync(join(root, '.github/workflows/publish-first-party-plugin.yml'), 'utf8');
+  assert.match(workflow, /cargo test --locked --manifest-path plugin-sources\/model-guard\/Cargo.toml/);
+  assert.match(workflow, /cargo build --locked --release --target wasm32-unknown-unknown --manifest-path plugin-sources\/model-guard\/Cargo.toml/);
+});
+
 test('unbuilt plugin sources do not pollute the existing loadable plugin root', () => {
   assert(existsSync(join(root, 'plugin-sources/model-guard/Cargo.toml')));
   for (const entry of readdirSync(join(root, 'plugins'), { withFileTypes: true })) {
