@@ -18,8 +18,13 @@ import { apiRequest, MIB, processMemory, seed } from "./benchmark-memory.ts";
 // explicit pod/runtime headroom within the declared 512MiB deployment budget.
 const LIMIT_MIB = 448;
 const CHUNK = 64 * 1024;
+export const NATIVE_MMAP_THRESHOLD_BYTES = 64 * 1024;
 type Result = { status: number; bytes: number; sha256: string; retryAfter?: string; transportClosed?: boolean };
 type Plan = { prefix: Buffer; fillBytes: number; suffix: Buffer; bytes: number; path?: string };
+
+export function nativeAllocatorEnvironment(): NodeJS.ProcessEnv {
+  return { GLIBC_TUNABLES: `glibc.malloc.mmap_threshold=${NATIVE_MMAP_THRESHOLD_BYTES}` };
+}
 
 export function responsesInputPlan(bytes: number): Plan {
   const prefix = Buffer.from('{"model":"benchmark-text","input":"');
@@ -226,6 +231,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
     benchmark: "durable-archive-release-process-rss", binary,
     binary_sha256: createHash("sha256").update(readFileSync(binary)).digest("hex"),
     started_at: new Date().toISOString(), limit_mib: LIMIT_MIB,
+    native_allocator_environment: nativeAllocatorEnvironment(),
     pod_budget_mib: 512, reserved_runtime_headroom_mib: 64,
     isolation: "independent_process_not_cgroup",
     evidence_source: "independent service PID /proc/status RSS partition, /proc/smaps_rollup mapping attribution, kernel VmHWM, jemalloc, and glibc main-arena metrics; mock/client excluded",
@@ -274,7 +280,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
     for (const name of ["PATH", "HOME", "LANG", "TMPDIR", "SSL_CERT_DIR", "SSL_CERT_FILE"]) {
       if (process.env[name] !== undefined) env[name] = process.env[name];
     }
-    Object.assign(env, {
+    Object.assign(env, nativeAllocatorEnvironment(), {
       MTC_LISTEN: `127.0.0.1:${serviceAddress.port}`, MTC_DATABASE_URL: `sqlite://${database}?mode=rwc`,
       MTC_DATABASE_MAX_CONNECTIONS: "2", MTC_SERVICE_TOKEN: token,
       MTC_KEY_PEPPER: "durable-rss-pepper-has-at-least-thirty-two-bytes",
@@ -350,13 +356,17 @@ export async function run(binary: string, output: string): Promise<boolean> {
     const phase = async (name: string, operation: () => Promise<unknown>): Promise<void> => {
       const callsBefore = upstreamCalls;
       const from = report.samples.length;
+      const operationStarted = performance.now();
       const result = await deadline(operation(), 60_000, name);
+      const operationDurationMs = performance.now() - operationStarted;
       sample();
       const peak = Math.max(...report.samples.slice(from).map((s: any) => s.rss_mib));
-      const entry = { name, result, upstream_calls: upstreamCalls - callsBefore, peak_rss_mib: peak, drain: {} };
+      const entry = { name, result, upstream_calls: upstreamCalls - callsBefore, peak_rss_mib: peak, operation_duration_ms: operationDurationMs, drain_duration_ms: 0, drain: {} };
       report.phases.push(entry);
       assert(peak <= LIMIT_MIB, `${name}: service RSS exceeded 448 MiB (512 MiB pod minus 64 MiB headroom)`);
+      const drainStarted = performance.now();
       entry.drain = await drain();
+      entry.drain_duration_ms = performance.now() - drainStarted;
     };
 
     await phase("single-64MiB-buffered-response", async () => {
