@@ -175,9 +175,8 @@ impl Database {
         tx: &mut Transaction<'_, Any>,
         now: i64,
         archive: &crate::response_archive_spool::BufferedArchive<'_>,
+        prepared_first_batch: Option<crate::response_archive_spool::PreparedArchiveBatch>,
     ) -> Result<bool, AppError> {
-        const INSERT_BATCH_CHUNKS: usize = 16;
-
         let identity = archive.identity();
         let purpose = archive.purpose();
         let body = archive.body();
@@ -196,6 +195,31 @@ impl Database {
         }
         if accounted > CIPHER_LIMIT {
             return Ok(false);
+        }
+        let prepared_first_batch = prepared_first_batch
+            .map(|prepared| prepared.into_chunks_for(archive).ok_or(AppError::Internal))
+            .transpose()?;
+        let expected_prepared =
+            chunk_count.min(crate::response_archive_spool::CAPTURE_INSERT_BATCH_CHUNKS);
+        if let Some(chunks) = prepared_first_batch.as_deref() {
+            if chunks.len() != expected_prepared {
+                return Err(AppError::Internal);
+            }
+            for (seq, chunk) in chunks.iter().enumerate() {
+                let start = seq
+                    .checked_mul(crate::response_archive_spool::CHUNK_BYTES)
+                    .ok_or(AppError::Internal)?;
+                let expected_bytes = body
+                    .len()
+                    .saturating_sub(start)
+                    .min(crate::response_archive_spool::CHUNK_BYTES);
+                if chunk.seq != i64::try_from(seq).map_err(|_| AppError::Internal)?
+                    || chunk.byte_count
+                        != i64::try_from(expected_bytes).map_err(|_| AppError::Internal)?
+                {
+                    return Err(AppError::Internal);
+                }
+            }
         }
         let byte_count = i64::try_from(body.len()).map_err(|_| AppError::Internal)?;
         let valid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND completed_at IS NULL")
@@ -235,8 +259,14 @@ impl Database {
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.reservation_id.to_string())
             .bind(chunk_count as i64).bind(byte_count).bind(accounted).bind(now).bind(now + RETENTION).execute(&mut **tx).await?;
         let mut first_seq = 0;
+        if let Some(chunks) = prepared_first_batch {
+            insert_spool_chunks(tx, purpose, identity, &chunks).await?;
+            first_seq = chunks.len();
+            drop(chunks);
+        }
         while first_seq < chunk_count {
-            let end_seq = (first_seq + INSERT_BATCH_CHUNKS).min(chunk_count);
+            let end_seq = (first_seq + crate::response_archive_spool::CAPTURE_INSERT_BATCH_CHUNKS)
+                .min(chunk_count);
             let chunks = (first_seq..end_seq)
                 .map(|seq| {
                     let start = seq * crate::response_archive_spool::CHUNK_BYTES;
