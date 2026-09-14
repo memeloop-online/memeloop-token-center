@@ -270,7 +270,8 @@ async fn codex_catalog_uses_native_contract_and_persists_context_window_reservat
             "models": [
                 {"slug": "gpt-codex", "supported_in_api": true, "visibility": "list", "context_window": 272000},
                 {"slug": "hidden", "supported_in_api": true, "visibility": "hide", "context_window": 272000},
-                {"slug": "unsupported", "supported_in_api": false, "visibility": "list", "context_window": 272000}
+                {"slug": "subscription-only", "supported_in_api": false, "visibility": "list", "context_window": 272000},
+                {"slug": "gpt-5.3-codex-spark", "supported_in_api": false, "visibility": "hide", "context_window": 128000}
             ]
         })))
         .expect(1)
@@ -310,6 +311,23 @@ async fn codex_catalog_uses_native_contract_and_persists_context_window_reservat
         )
         .await
         .unwrap();
+    let route = state
+        .db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: "codex-tenant".into(),
+            public_model: "spark".into(),
+            upstream_account_id: account.id,
+            upstream_model: "gpt-5.3-codex-spark".into(),
+            protocol: "openai".into(),
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    state
+        .db
+        .set_model_route_enabled(route.id, "codex-tenant", false, route.updated_at)
+        .await
+        .unwrap();
     let (status, synced) = request(
         &state,
         "POST",
@@ -320,12 +338,22 @@ async fn codex_catalog_uses_native_contract_and_persists_context_window_reservat
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{synced}");
-    assert_eq!(synced["models"].as_array().unwrap().len(), 1);
-    assert_eq!(synced["models"][0]["id"], "gpt-codex");
-    assert_eq!(synced["models"][0]["context_window"], 272000);
-    assert_eq!(synced["models"][0]["reservation_token_bound"], 272000);
+    let models = synced["models"].as_array().unwrap();
+    assert_eq!(models.len(), 3);
+    let spark = models
+        .iter()
+        .find(|model| model["id"] == "gpt-5.3-codex-spark")
+        .unwrap();
+    assert_eq!(spark["context_window"], 128000);
+    assert_eq!(spark["reservation_token_bound"], 128000);
+    assert!(
+        models
+            .iter()
+            .any(|model| model["id"] == "subscription-only")
+    );
+    assert!(!models.iter().any(|model| model["id"] == "hidden"));
     assert_eq!(
-        synced["models"][0]["reservation_bound_source"],
+        spark["reservation_bound_source"],
         "mtc_context_window_bound"
     );
     let (updated, _) = state
@@ -336,6 +364,10 @@ async fn codex_catalog_uses_native_contract_and_persists_context_window_reservat
     assert_eq!(
         updated.config["reservation_token_bounds"]["gpt-codex"],
         272000
+    );
+    assert_eq!(
+        updated.config["reservation_token_bounds"]["gpt-5.3-codex-spark"],
+        128000
     );
 }
 
@@ -481,7 +513,7 @@ async fn codex_catalog_without_trusted_models_records_error_and_releases_sync_le
         .and(matches_header("chatgpt-account-id", "account-123"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "models": [
-                {"slug": "not-entitled", "supported_in_api": false, "visibility": "list", "context_window": 272000},
+                {"slug": "not-configured", "supported_in_api": false, "visibility": "hide", "context_window": 272000},
                 {"slug": "not-listed", "supported_in_api": true, "visibility": "hide", "context_window": 272000}
             ]
         })))

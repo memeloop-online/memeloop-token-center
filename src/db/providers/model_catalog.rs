@@ -63,6 +63,20 @@ pub enum ReplaceModelCatalogResult {
 }
 
 impl Database {
+    /// Explicit account/model associations include disabled routes: discovery
+    /// must be able to repair their metadata before they can be enabled.
+    pub async fn configured_upstream_model_ids(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Vec<String>, AppError> {
+        Ok(sqlx::query_scalar(
+            "SELECT DISTINCT upstream_model FROM model_route_upstream_accounts WHERE upstream_account_id = $1 ORDER BY upstream_model",
+        )
+        .bind(account_id.to_string())
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     pub async fn upstream_account_tenant_external_id(
         &self,
         account_id: Uuid,
