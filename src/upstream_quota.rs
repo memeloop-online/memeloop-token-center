@@ -23,12 +23,46 @@ const FRESH_MS: i64 = 30_000;
 const STALE_MS: i64 = 300_000;
 const MAX_ENTRIES: usize = 128;
 const BODY_LIMIT: usize = 1024 * 1024;
+const QUOTA_TIMEOUT: Duration = Duration::from_secs(8);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QuotaBudget {
+    total: Duration,
+    read: Duration,
+}
+
+fn codex_quota_budget(config: &Value) -> Result<QuotaBudget, &'static str> {
+    let value = config.get("transport_policy");
+    let policy = crate::provider::CodexTransportPolicy::parse(value)?;
+    // Retry-only account policies must not silently opt a control-plane read
+    // into the generation default (21 minutes). Explicit timeout fields do
+    // apply, using the same bounded account policy as generation and catalog.
+    let total = if value.is_some_and(|p| p.get("request_timeout_millis").is_some()) {
+        Duration::from_millis(policy.request_timeout_millis)
+    } else {
+        QUOTA_TIMEOUT
+    };
+    let read = if value.is_some_and(|p| p.get("read_timeout_millis").is_some()) {
+        Duration::from_millis(policy.read_timeout_millis).min(total)
+    } else {
+        total
+    };
+    Ok(QuotaBudget { total, read })
+}
 
 #[derive(Clone, Copy)]
 struct QuotaRequestContext {
     account_id: Uuid,
     credential_generation: i64,
     endpoint_kind: &'static str,
+}
+
+#[derive(Clone)]
+struct CodexQuotaAuth<'a> {
+    credential_header: http::HeaderName,
+    credential_value: http::HeaderValue,
+    account: http::HeaderValue,
+    proxy_url: Option<&'a str>,
 }
 
 impl QuotaRequestContext {
@@ -38,6 +72,30 @@ impl QuotaRequestContext {
             credential_generation: account.credential_generation,
             endpoint_kind,
         }
+    }
+}
+
+fn quota_transport_error_kind(
+    phase: &'static str,
+    is_timeout: bool,
+    is_connect: bool,
+) -> &'static str {
+    if is_timeout {
+        "timeout"
+    } else if is_connect {
+        "connect"
+    } else if phase == "body" {
+        "body"
+    } else {
+        "transport"
+    }
+}
+
+fn quota_transport_error_code(is_timeout: bool) -> &'static str {
+    if is_timeout {
+        "quota_timeout"
+    } else {
+        "quota_transport_failed"
     }
 }
 
@@ -89,6 +147,28 @@ fn log_quota_request_error(
             error.is_body(),
             error.is_request(),
         ),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "quota supplier request failed"
+    );
+}
+
+fn log_codex_quota_request_error(
+    context: QuotaRequestContext,
+    phase: &'static str,
+    is_timeout: bool,
+    is_connect: bool,
+    started: tokio::time::Instant,
+) {
+    // Do not log the transport error display/chain: it can include the complete
+    // URL, including proxy userinfo or request-derived credentials. These
+    // predicates are the deliberately allowlisted diagnostic surface.
+    tracing::warn!(
+        operation = "quota_supplier_read",
+        upstream_account_id = %context.account_id,
+        credential_generation = context.credential_generation,
+        endpoint_kind = context.endpoint_kind,
+        phase,
+        error_kind = quota_transport_error_kind(phase, is_timeout, is_connect),
         elapsed_ms = started.elapsed().as_millis() as u64,
         "quota supplier request failed"
     );
@@ -364,7 +444,14 @@ impl QuotaCache {
         };
         // Includes DNS/proxy setup, both GETs and bounded body decoding.
         let refresh_started = tokio::time::Instant::now();
-        let result = match tokio::time::timeout(Duration::from_secs(8), async {
+        let overall_timeout = if account.driver == "openai-codex" {
+            codex_quota_budget(&account.config)
+                .map(|budget| budget.total)
+                .unwrap_or(QUOTA_TIMEOUT)
+        } else {
+            QUOTA_TIMEOUT
+        };
+        let result = match tokio::time::timeout(overall_timeout, async {
             if account.driver == "kimi-oauth" {
                 kimi::read(state, account, credential, empty(None)).await
             } else {
@@ -467,9 +554,9 @@ async fn read_codex(
     let account_header = crate::oauth::managed::codex::account_header_value(credential)
         .map_err(|_| "credential_invalid")?;
     // Never use caller/account base_url or network_scope for these fixed
-    // supplier endpoints. Only the already-authorized encrypted proxy is reused.
-    let http = crate::network::client_for_codex_url(
-        &state.http,
+    // supplier endpoints. Validate the already-authorized encrypted proxy,
+    // then reuse the account generation's fingerprinted wreq client and policy.
+    crate::network::validate_codex_transport(
         USAGE_URL,
         &json!({"network_scope":"public"}),
         credential.proxy(),
@@ -488,20 +575,46 @@ async fn read_codex(
         );
         "quota_destination_invalid"
     })?;
+    let http = state
+        .codex_clients
+        .account_snapshot(account, credential)
+        .map_err(|_| {
+            tracing::warn!(
+                operation = "quota_supplier_read",
+                upstream_account_id = %account.id,
+                credential_generation = account.credential_generation,
+                endpoint_kind = "quota_client",
+                phase = "client",
+                error_kind = "transport_client_unavailable",
+                "quota supplier client setup failed"
+            );
+            "quota_transport_failed"
+        })?;
+    let budget = codex_quota_budget(&account.config).map_err(|_| "quota_destination_invalid")?;
+    let (credential_header, credential_value) = credential
+        .request_header(observation_started_at)
+        .map_err(|_| "credential_invalid")?
+        .ok_or("credential_invalid")?;
+    let auth = CodexQuotaAuth {
+        credential_header,
+        credential_value,
+        account: account_header,
+        proxy_url: credential.proxy().map(|(url, _)| url),
+    };
     let (usage, reset) = tokio::join!(
-        get_json(
+        get_codex_json(
             &http,
-            credential,
-            account_header.clone(),
+            auth.clone(),
             USAGE_URL,
             QuotaRequestContext::for_account(account, "usage"),
+            budget,
         ),
-        get_json(
+        get_codex_json(
             &http,
-            credential,
-            account_header,
+            auth,
             CREDITS_URL,
             QuotaRequestContext::for_account(account, "credits"),
+            budget,
         ),
     );
     let observed_at = unix_millis();
@@ -594,46 +707,6 @@ impl QuotaSnapshot {
     }
 }
 
-async fn get_json(
-    http: &reqwest::Client,
-    credential: &UpstreamCredential,
-    account: reqwest::header::HeaderValue,
-    url: &str,
-    context: QuotaRequestContext,
-) -> Result<Value, &'static str> {
-    let started = tokio::time::Instant::now();
-    let mut request = http
-        .get(url)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .header(
-            reqwest::header::USER_AGENT,
-            crate::oauth::managed::codex::USER_AGENT,
-        )
-        .header("chatgpt-account-id", account)
-        .header(
-            "originator",
-            if context.endpoint_kind == "credits" {
-                "Codex Desktop"
-            } else {
-                crate::oauth::managed::codex::ORIGINATOR
-            },
-        )
-        .timeout(Duration::from_secs(6));
-    if context.endpoint_kind == "credits" {
-        request = request.header("openai-beta", "codex-1");
-    }
-    let response = credential
-        .apply(request, unix_millis())
-        .map_err(|_| "credential_invalid")?
-        .send()
-        .await
-        .map_err(|error| {
-            log_quota_request_error(context, "send", &error, started);
-            quota_reqwest_error_code(error.is_timeout())
-        })?;
-    decode_response(response, context, started).await
-}
-
 async fn decode_response(
     response: reqwest::Response,
     context: QuotaRequestContext,
@@ -667,9 +740,115 @@ async fn decode_response(
     serde_json::from_slice(&bytes).map_err(|_| "quota_invalid_payload")
 }
 
+async fn get_codex_json(
+    http: &wreq::Client,
+    auth: CodexQuotaAuth<'_>,
+    url: &str,
+    context: QuotaRequestContext,
+    budget: QuotaBudget,
+) -> Result<Value, &'static str> {
+    let started = tokio::time::Instant::now();
+    let mut request = http
+        .get(url)
+        .default_headers(false)
+        .header(auth.credential_header, auth.credential_value)
+        .header(http::header::ACCEPT, "application/json")
+        .header(http::header::ACCEPT_ENCODING, "identity")
+        .header(
+            http::header::USER_AGENT,
+            crate::oauth::managed::codex::USER_AGENT,
+        )
+        .header("chatgpt-account-id", auth.account)
+        .header(
+            "originator",
+            if context.endpoint_kind == "credits" {
+                "Codex Desktop"
+            } else {
+                crate::oauth::managed::codex::ORIGINATOR
+            },
+        );
+    if context.endpoint_kind == "credits" {
+        request = request.header("openai-beta", "codex-1");
+    }
+    if let Some(proxy_url) = auth.proxy_url {
+        request =
+            request.proxy(wreq::Proxy::all(proxy_url).map_err(|_| "quota_destination_invalid")?);
+    }
+    let deadline = tokio::time::Instant::now() + budget.total;
+    let response = tokio::time::timeout_at(deadline, request.send())
+        .await
+        .map_err(|_| {
+            log_codex_quota_request_error(context, "send", true, false, started);
+            "quota_timeout"
+        })?
+        .map_err(|error| {
+            log_codex_quota_request_error(
+                context,
+                "send",
+                error.is_timeout(),
+                error.is_connect(),
+                started,
+            );
+            quota_transport_error_code(error.is_timeout())
+        })?;
+    decode_codex_response(response, context, started, deadline, budget.read).await
+}
+
+async fn decode_codex_response(
+    response: wreq::Response,
+    context: QuotaRequestContext,
+    started: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+    read_timeout: Duration,
+) -> Result<Value, &'static str> {
+    if !response.status().is_success() {
+        return Err(match response.status().as_u16() {
+            401 | 403 => "quota_not_authorized",
+            429 => "quota_rate_limited",
+            _ => "quota_upstream_error",
+        });
+    }
+    if response
+        .content_length()
+        .is_some_and(|len| len > BODY_LIMIT as u64)
+    {
+        return Err("quota_response_too_large");
+    }
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    loop {
+        let read_deadline = deadline.min(tokio::time::Instant::now() + read_timeout);
+        let chunk = tokio::time::timeout_at(read_deadline, stream.next())
+            .await
+            .map_err(|_| {
+                log_codex_quota_request_error(context, "body", true, false, started);
+                "quota_timeout"
+            })?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+        let chunk = chunk.map_err(|error| {
+            log_codex_quota_request_error(
+                context,
+                "body",
+                error.is_timeout(),
+                error.is_connect(),
+                started,
+            );
+            quota_transport_error_code(error.is_timeout())
+        })?;
+        if bytes.len().saturating_add(chunk.len()) > BODY_LIMIT {
+            return Err("quota_response_too_large");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "quota_invalid_payload")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{header, method, path},
@@ -753,7 +932,7 @@ mod tests {
     }
 
     #[test]
-    fn quota_reqwest_classification_keeps_timeouts_distinct_from_transport() {
+    fn quota_transport_classification_keeps_timeouts_distinct_from_transport() {
         assert_eq!(quota_reqwest_error_kind(true, true, true, true), "timeout");
         assert_eq!(quota_reqwest_error_kind(false, true, true, true), "connect");
         assert_eq!(quota_reqwest_error_kind(false, false, true, true), "body");
@@ -767,6 +946,107 @@ mod tests {
         );
         assert_eq!(quota_reqwest_error_code(true), "quota_timeout");
         assert_eq!(quota_reqwest_error_code(false), "quota_transport_failed");
+        assert_eq!(quota_transport_error_kind("send", true, true), "timeout");
+        assert_eq!(quota_transport_error_kind("send", false, true), "connect");
+        assert_eq!(quota_transport_error_kind("body", false, false), "body");
+        assert_eq!(
+            quota_transport_error_kind("send", false, false),
+            "transport"
+        );
+        assert_eq!(quota_transport_error_code(true), "quota_timeout");
+        assert_eq!(quota_transport_error_code(false), "quota_transport_failed");
+    }
+
+    #[test]
+    fn quota_budget_uses_only_explicit_account_timeouts() {
+        for config in [
+            json!({}),
+            json!({"transport_policy":{"connect_attempts":4}}),
+        ] {
+            assert_eq!(
+                codex_quota_budget(&config).unwrap(),
+                QuotaBudget {
+                    total: Duration::from_secs(8),
+                    read: Duration::from_secs(8),
+                }
+            );
+        }
+        assert_eq!(
+            codex_quota_budget(&json!({"transport_policy":{
+                "connect_timeout_millis":1000,
+                "read_timeout_millis":2000,
+                "request_timeout_millis":20000
+            }}))
+            .unwrap(),
+            QuotaBudget {
+                total: Duration::from_secs(20),
+                read: Duration::from_secs(2),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_quota_budget_is_not_cut_off_by_the_legacy_six_seconds() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = crate::build_codex_http_client_with_policy(
+            crate::provider::CodexTransportPolicy::default(),
+        )
+        .unwrap();
+        let context = QuotaRequestContext {
+            account_id: Uuid::from_u128(1),
+            credential_generation: 2,
+            endpoint_kind: "usage",
+        };
+        let url = format!("http://{}/usage", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            get_codex_json(
+                &client,
+                CodexQuotaAuth {
+                    credential_header: http::header::AUTHORIZATION,
+                    credential_value: http::HeaderValue::from_static("Bearer fixture-token"),
+                    account: http::HeaderValue::from_static("fixture-account"),
+                    proxy_url: None,
+                },
+                &url,
+                context,
+                QuotaBudget {
+                    total: Duration::from_secs(20),
+                    read: Duration::from_secs(20),
+                },
+            )
+            .await
+        });
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut headers = [0; 4096];
+        let mut received = 0;
+        loop {
+            assert!(
+                received < headers.len(),
+                "quota request headers exceed fixture bound"
+            );
+            let count = socket.read(&mut headers[received..]).await.unwrap();
+            assert_ne!(count, 0, "quota request ended before complete headers");
+            received += count;
+            if headers[..received]
+                .windows(4)
+                .any(|window| window == b"\r\n\r\n")
+            {
+                break;
+            }
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert!(!task.is_finished());
+        tokio::time::resume();
+        let body = br#"{"plan_type":"pro"}"#;
+        socket
+            .write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes(),
+            )
+            .await
+            .unwrap();
+        socket.write_all(body).await.unwrap();
+        assert_eq!(task.await.unwrap().unwrap()["plan_type"], "pro");
     }
 
     #[tokio::test]
@@ -797,8 +1077,17 @@ mod tests {
             proxy_url: None,
             proxy_network_scope: None,
         };
-        let http = crate::build_http_client().unwrap();
-        let account = reqwest::header::HeaderValue::from_static("fixture-account");
+        let http = crate::build_codex_http_client_with_policy(
+            crate::provider::CodexTransportPolicy::default(),
+        )
+        .unwrap();
+        let account = http::HeaderValue::from_static("fixture-account");
+        let (credential_header, credential_value) =
+            credential.request_header(unix_millis()).unwrap().unwrap();
+        let budget = QuotaBudget {
+            total: Duration::from_secs(8),
+            read: Duration::from_secs(8),
+        };
         let usage_context = QuotaRequestContext {
             account_id: Uuid::from_u128(1),
             credential_generation: 2,
@@ -809,24 +1098,34 @@ mod tests {
             ..usage_context
         };
         assert_eq!(
-            get_json(
+            get_codex_json(
                 &http,
-                &credential,
-                account.clone(),
+                CodexQuotaAuth {
+                    credential_header: credential_header.clone(),
+                    credential_value: credential_value.clone(),
+                    account: account.clone(),
+                    proxy_url: None,
+                },
                 &format!("{}/usage", server.uri()),
-                usage_context
+                usage_context,
+                budget,
             )
             .await
             .unwrap()["plan_type"],
             "pro"
         );
         assert_eq!(
-            get_json(
+            get_codex_json(
                 &http,
-                &credential,
-                account,
+                CodexQuotaAuth {
+                    credential_header,
+                    credential_value,
+                    account,
+                    proxy_url: None,
+                },
                 &format!("{}/credits", server.uri()),
-                credits_context
+                credits_context,
+                budget,
             )
             .await
             .unwrap_err(),
