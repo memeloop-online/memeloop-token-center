@@ -59,7 +59,7 @@ export function summarizeVisibleRequests(requests: readonly RequestView[]): Visi
   }
 
   const terminal = successful + failed;
-  return {
+  const request: RequestView = {
     requests: requests.length,
     successful,
     failed,
@@ -206,10 +206,12 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
     output_tokens: event.output_tokens,
     cost: event.cost,
     error_code: event.error_code,
-    credential_identity: event.credential_identity ?? previous?.credential_identity,
     archive_state: mergeArchiveState(previous?.archive_state, event),
     session_context: mergeSessionContext(previous?.session_context, event),
   };
+  const credentialIdentity = event.credential_identity ?? previous?.credential_identity;
+  if (credentialIdentity !== undefined) request.credential_identity = credentialIdentity;
+  return request;
 }
 
 export function mergeLiveRequestEvents(

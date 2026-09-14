@@ -109,7 +109,7 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     assert.match(historicalGapText, /Final route ID—/);
     assert.doesNotMatch(historicalGapText, /Cache read|Cache write/, 'missing historical cache fields must remain absent rather than becoming zero-valued rows');
     assert.match(historicalGapText, /Input tokens: 160.*Output tokens: 32/, 'known input/output must remain visible when historical cache telemetry is missing');
-    assert.match(await recordedRow.locator('.request-upstream-cell').textContent() ?? '', /Production Codex.*e82ea007/, 'operator rows retain both the readable account name and durable ID');
+    assert.match(await recordedRow.locator('.request-technical-info').getAttribute('title') ?? '', /Production Codex.*e82ea007/, 'operator rows retain both the readable account name and durable ID in request metadata');
     assert.match(await page.locator('tbody tr').nth(1).locator('.request-token-cell').textContent() ?? '', /Input tokens: 160.*Output tokens: 32/);
     assert.equal((await stage('read historical table currency', () => page!.locator('tbody tr').nth(1).locator('.request-cost-cell').textContent(), history, current))?.trim(), '—', 'an explicit historical null currency must not inherit the current credential currency');
 
