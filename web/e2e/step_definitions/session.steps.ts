@@ -449,8 +449,8 @@ Then('会话界面支持中英文亮暗主题、键盘和 320 与 375 像素视�
   const timeline = page.locator('.self-sessions .session-card').first().getByRole('button', { name: /^打开 / });
   await timeline.focus();
   await page.keyboard.press('Enter');
-  await visible(page.getByRole('dialog'));
-  await page.getByRole('dialog').getByRole('button', { name: '关闭', exact: true }).click();
+  await visible(page.locator('.self-sessions .session-detail'));
+  await page.locator('.self-sessions .session-detail').getByRole('button', { name: '关闭', exact: true }).click();
   await appPreferenceControls(page).getByRole('button', { name: 'English', exact: true }).click();
   await visible(page.getByRole('heading', { name: 'My sessions and requests', exact: true }));
   await appPreferenceControls(page).getByRole('button', { name: 'Switch to dark theme' }).click();
