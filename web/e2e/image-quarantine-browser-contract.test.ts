@@ -42,9 +42,15 @@ test('quarantine review requires facts, preserves conflict draft and retry ident
       await route.fulfill({ json: url.pathname.endsWith('/request-alpha') ? item : url.searchParams.get('tenant_external_id') === 'alpha' ? [item] : [] });
     });
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/image-quarantine.html`);
+    const selectDetails = async () => {
+      await page.getByRole('button', { name: 'Details', exact: true }).click();
+      // Busy and resolved forms are disabled. Do not edit the previous draft
+      // while the selected detail request is still replacing its state.
+      await page.locator('[aria-label="Manual review details"] fieldset:not([disabled])').waitFor();
+    };
     await page.getByText('Select an explicit tenant first;', { exact: false }).waitFor(); assert.equal(reads, 0);
     await page.getByLabel('Fixture tenant').selectOption('alpha');
-    await page.getByRole('button', { name: 'Details', exact: true }).click();
+    await selectDetails();
     await page.getByLabel('Verified resolution').selectOption('settle_confirmed');
     await page.getByLabel('Confirmed amount').fill('-1');
     await page.getByText('Enter a nonnegative decimal', { exact: false }).waitFor();
@@ -66,19 +72,22 @@ test('quarantine review requires facts, preserves conflict draft and retry ident
     await page.getByText('Acting service credential ID: service-alpha').waitFor();
     assert.equal(writes[2].body.expected_revision, 'b'.repeat(64)); assert.notEqual(writes[1].key, writes[2].key);
     await page.getByRole('button', { name: 'Refresh', exact: true }).click();
-    await page.getByRole('button', { name: 'Details', exact: true }).click();
+    await selectDetails();
+    // Details loads asynchronously. The previous resolved form also has a
+    // zero amount, but still has the old action; wait for the new form state.
+    await page.locator('input[inputmode="decimal"][readonly]').waitFor();
     assert.equal(await page.getByLabel('Confirmed amount').inputValue(), '0');
-    assert.equal(await page.getByLabel('Confirmed amount').getAttribute('readonly'), '');
+    assert.equal(await page.getByLabel('Confirmed amount').evaluate(node => (node as HTMLInputElement).readOnly), true);
     await page.getByLabel('Evidence digest', { exact: true }).fill('d'.repeat(64));
     await send(); await page.getByRole('status').waitFor();
     assert.equal(writes[3].body.action, 'not_delivered'); assert.equal(writes[3].body.confirmed_cost_micros, 0);
     await page.getByRole('button', { name: 'Refresh', exact: true }).click();
-    await page.getByRole('button', { name: 'Details', exact: true }).click();
+    await selectDetails();
     await page.getByLabel('Evidence digest', { exact: true }).fill('e'.repeat(64));
     await send(); await page.getByText('The record conflicted and refresh failed.', { exact: false }).waitFor();
     await verified.check(); assert.equal(await submit.isEnabled(), false);
     assert.equal(await page.getByLabel('Evidence digest', { exact: true }).inputValue(), 'e'.repeat(64));
-    await page.getByRole('button', { name: 'Details', exact: true }).click();
+    await selectDetails();
     await page.getByLabel('Evidence digest', { exact: true }).fill('f'.repeat(64));
     await verified.check(); await submit.click(); await page.getByRole('dialog').waitFor();
     // Programmatic scope change models the parent authority changing while a modal is open.
@@ -88,6 +97,8 @@ test('quarantine review requires facts, preserves conflict draft and retry ident
     await page.getByText('No image requests await review', { exact: false }).waitFor();
     assert.equal(await page.getByText('request-alpha', { exact: false }).count(), 0);
     assert.equal(await page.getByRole('dialog').count(), 0);
+    assert.equal(await page.getByLabel('Confirmed amount').count(), 0, 'old tenant form is unmounted, not merely empty');
+    assert.equal(await page.getByLabel('Evidence digest', { exact: true }).count(), 0, 'old tenant evidence input is absent');
     assert.equal(writes.length, 5);
   } finally { await browser.close(); await server.close(); }
 });

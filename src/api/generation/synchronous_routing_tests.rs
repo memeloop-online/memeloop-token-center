@@ -477,6 +477,7 @@ async fn durable_media_restore_pins_config_and_code_and_never_refreshes_deadline
     assert_eq!(retained["policies"][0]["directive"], original_directive);
     let observed = crate::group_routing::observe(
         &restored,
+        request_id,
         route.route_id,
         fixture.account,
         route.credential_generation,
@@ -509,6 +510,7 @@ async fn durable_media_restore_pins_config_and_code_and_never_refreshes_deadline
     assert!(
         crate::group_routing::observe(
             &fallback,
+            request_id,
             route.route_id,
             fixture.account,
             route.credential_generation,
