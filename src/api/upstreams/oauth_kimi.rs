@@ -153,10 +153,11 @@ pub(in crate::api) async fn poll_kimi_oauth(
             tenant_external_id,
         } => {
             require_service_tenant(&service, &tenant_external_id)?;
-            let account = state
+            let mut account = state
                 .db
                 .upstream_account_for_reauthorization(account_id, &tenant_external_id)
                 .await?;
+            super::restrict_transport_proxy_capability(&service, &mut account);
             Ok((
                 StatusCode::OK,
                 Json(super::config_secrets::public_account(&state, account)?),
@@ -190,7 +191,7 @@ async fn finish_kimi_login(
     )
     .await?;
     let reauthorizing = ready.reauthorize.is_some();
-    let account = match ready.reauthorize {
+    let mut account = match ready.reauthorize {
         Some(target) => {
             state
                 .db
@@ -240,7 +241,10 @@ async fn finish_kimi_login(
     tracing::info!(account_id = %account.id, operator_service_id = ?service.service_id,
         reauthorizing, identity_verification = "operator_selected_account",
         "Kimi native device authorization completed");
-    super::trigger_upstream_model_sync(state.clone(), account.id);
+    if account.status == "active" {
+        super::trigger_upstream_model_sync(state.clone(), account.id);
+    }
+    super::restrict_transport_proxy_capability(service, &mut account);
     Ok((
         if reauthorizing {
             StatusCode::OK

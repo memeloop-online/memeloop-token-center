@@ -106,6 +106,12 @@ fn failed() -> AppError {
     AppError::Upstream("Kimi OAuth request failed".into())
 }
 
+fn encode_form(form: &[(&str, &str)]) -> String {
+    url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(form.iter().copied())
+        .finish()
+}
+
 async fn post(
     http: &reqwest::Client,
     endpoint: &str,
@@ -126,11 +132,7 @@ async fn post(
     let response = kimi::apply_device_headers(client.post(endpoint), device)
         .header("Accept", "application/json")
         .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(
-            url::form_urlencoded::Serializer::new(String::new())
-                .extend_pairs(form.iter().copied())
-                .finish(),
-        )
+        .body(encode_form(form))
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
@@ -298,6 +300,31 @@ async fn poll_at(
     allow_test_loopback: bool,
     endpoint: &str,
 ) -> Result<KimiDevicePollResult, AppError> {
+    poll_at_with_clock(
+        db,
+        http,
+        token,
+        key,
+        now,
+        scope,
+        allow_test_loopback,
+        endpoint,
+        &crate::db::unix_millis,
+    )
+    .await
+}
+
+async fn poll_at_with_clock(
+    db: &Database,
+    http: &reqwest::Client,
+    token: &str,
+    key: &[u8],
+    now: i64,
+    scope: KimiDevicePollScope<'_>,
+    allow_test_loopback: bool,
+    endpoint: &str,
+    clock: &(dyn Fn() -> i64 + Sync),
+) -> Result<KimiDevicePollResult, AppError> {
     let session: Session = open_private_json(token, key, SESSION_AAD)
         .map_err(|_| AppError::BadRequest("invalid OAuth session token".into()))?;
     if scope
@@ -345,6 +372,14 @@ async fn poll_at(
         allow_test_loopback,
     )
     .await;
+    // The supplier call can outlive the remaining session lifetime. Use its
+    // completion time for expiry, token lifetime, lease updates and backoff.
+    let now = clock().max(now);
+    if now >= session.expires_at {
+        db.fail_oauth_login_poll(session.session_id, owner, now)
+            .await?;
+        return Err(AppError::BadRequest("Kimi authorization expired".into()));
+    }
     let response = match result {
         Ok(value) => value,
         Err(error) => {
@@ -477,6 +512,147 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{body_string_contains, header, method, path},
     };
+
+    #[test]
+    fn form_post_future_is_send_without_retaining_the_form_serializer() {
+        fn assert_send<T: Send>(_: T) {}
+        let http = crate::build_no_retry_http_client(None, &[]).unwrap();
+        assert_send(post(
+            &http,
+            DEVICE_ENDPOINT,
+            None,
+            "fixture-device",
+            &[("client_id", kimi::CLIENT_ID)],
+            false,
+        ));
+    }
+
+    #[tokio::test]
+    async fn slow_poll_uses_response_clock_and_cannot_stage_after_expiry() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("clock.db").display()
+        ))
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        let server = MockServer::start().await;
+        let http = crate::build_no_retry_http_client(None, &[]).unwrap();
+        let now = crate::db::unix_millis() + 3_600_000;
+        let key = b"kimi-device-clock-fixture-key";
+        Mock::given(method("POST"))
+            .and(path("/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "device_code":"clock-device-code", "user_code":"CLOCK-CODE",
+                "verification_uri":"https://auth.kimi.com/device", "expires_in":900, "interval":5
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let started = start_at(
+            &db,
+            &http,
+            StartKimiDeviceLogin {
+                tenant_external_id: "default".into(),
+                account_name: "Kimi clock".into(),
+                operator_service_id: None,
+                provider_config: kimi::native_import_config(),
+                proxy_url: None,
+                device_id: None,
+                previous_scope: None,
+                reauthorize: None,
+            },
+            key,
+            now,
+            true,
+            &format!("{}/device", server.uri()),
+        )
+        .await
+        .unwrap();
+        server.verify().await;
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"error":"authorization_pending"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let token_url = format!("{}/token", server.uri());
+        let scope = || KimiDevicePollScope {
+            required_tenant: None,
+            operator_service_id: None,
+        };
+        assert!(matches!(
+            poll_at_with_clock(
+                &db,
+                &http,
+                &started.session_token,
+                key,
+                now + 5000,
+                scope(),
+                true,
+                &token_url,
+                &|| now + 9000
+            )
+            .await
+            .unwrap(),
+            KimiDevicePollResult::Pending {
+                retry_after_seconds: 5
+            }
+        ));
+        // Backoff begins after the response, not from request admission.
+        assert!(matches!(
+            poll_at_with_clock(
+                &db,
+                &http,
+                &started.session_token,
+                key,
+                now + 10000,
+                scope(),
+                true,
+                &token_url,
+                &|| now + 10000
+            )
+            .await
+            .unwrap(),
+            KimiDevicePollResult::Pending {
+                retry_after_seconds: 4
+            }
+        ));
+        server.verify().await;
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token":"late-access", "refresh_token":"late-refresh",
+                "token_type":"bearer", "expires_in":3600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(
+            matches!(poll_at_with_clock(&db, &http, &started.session_token, key,
+            started.expires_at - 1, scope(), true, &token_url, &|| started.expires_at).await,
+            Err(AppError::BadRequest(message)) if message == "Kimi authorization expired")
+        );
+        let session: Session = open_private_json(&started.session_token, key, SESSION_AAD).unwrap();
+        let (status, ready): (String, Option<String>) = sqlx::query_as(
+            "SELECT status, ready_ciphertext FROM oauth_login_sessions WHERE id = $1",
+        )
+        .bind(session.session_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "failed");
+        assert!(
+            ready.is_none(),
+            "late credentials must never become a ready result"
+        );
+        server.verify().await;
+    }
 
     #[tokio::test]
     async fn device_flow_leases_pending_slowdown_and_consumes_one_credential() {
