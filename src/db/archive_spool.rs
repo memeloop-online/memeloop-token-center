@@ -1012,12 +1012,11 @@ impl Database {
         request_id: Option<Uuid>,
     ) -> Result<(Transaction<'_, Any>, i64, BudgetHold), AppError> {
         let pool_started = Instant::now();
-        let mut tx = self.begin_write_transaction().await.map_err(|error| {
+        let mut tx = self.begin_write_transaction().await.inspect_err(|_| {
             tracing::warn!(phase = "archive_budget_acquire", operation,
                 request_id = ?request_id, outcome = "transaction_acquire_failed",
                 pool_wait_ms = pool_started.elapsed().as_millis() as u64,
                 "archive transaction acquisition failed before budget ownership");
-            error
         })?;
         let pool_wait_ms = pool_started.elapsed().as_millis() as u64;
         // First for every accounting mutation, including GC. State-only
@@ -1035,12 +1034,11 @@ impl Database {
         let row = sqlx::query(lock)
             .fetch_one(&mut *tx)
             .await
-            .map_err(|error| {
+            .inspect_err(|_| {
                 tracing::warn!(phase = "archive_budget_acquire", operation,
                 request_id = ?request_id, outcome = "budget_lock_failed", pool_wait_ms,
                 budget_wait_ms = lock_started.elapsed().as_millis() as u64,
                 "archive budget acquisition failed without confirmed ownership");
-                error
             })?;
         let backend_pid: Option<i64> = row.try_get("backend_pid")?;
         let mut hold = BudgetHold::new(operation, request_id, backend_pid);
