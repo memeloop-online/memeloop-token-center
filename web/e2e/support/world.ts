@@ -10,6 +10,7 @@ export class DogfoodWorld extends World {
   readonly consoleErrors: string[] = [];
   readonly failedRequests: string[] = [];
   readonly serverErrorPaths: string[] = [];
+  readonly clientErrorPaths: string[] = [];
 
   constructor(options: IWorldOptions) {
     super(options);
@@ -35,6 +36,11 @@ export class DogfoodWorld extends World {
       this.failedRequests.push(`${request.method()} ${request.url()}: ${failure}`);
     });
     this.page.on('response', (response) => {
+      if (response.status() >= 400 && response.status() < 500) {
+        // Diagnostic only: preserve existing expected-auth-error assertions.
+        // No origin, query, credentials, request body or response body is logged.
+        this.clientErrorPaths.push(`${response.status()} ${new URL(response.url()).pathname}`);
+      }
       if (response.status() < 500) return;
       // Keep CI diagnostics safe: a pathname carries neither query values,
       // credentials, nor response content.
@@ -63,7 +69,7 @@ export class DogfoodWorld extends World {
 
   assertNoBrowserFailures(): void {
     assert.deepEqual(this.serverErrorPaths, [], 'browser HTTP 5xx responses were observed');
-    assert.deepEqual(this.consoleErrors, [], 'browser console or page errors were observed');
+    assert.deepEqual(this.consoleErrors, [], `browser console or page errors were observed; HTTP 4xx paths: ${JSON.stringify(this.clientErrorPaths)}`);
     assert.deepEqual(this.failedRequests, [], 'browser requests failed');
   }
 }

@@ -1,9 +1,14 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
 import { createIsolatedFixtureServer as createServer } from './support/isolated-vite-server.js';
+
+test('Cucumber cargo-run fallback preserves the feature set used by its preceding build', () => {
+  const server = readFileSync(new URL('./server.mjs', import.meta.url), 'utf8');
+  assert.match(server, /\['run', '--quiet', '--manifest-path', join\(repositoryRoot, 'Cargo.toml'\), '--features', 'experimental-plugin-revisions', '--bin', 'memeloop-token-center'/);
+});
 
 test('Operator plugin page installs, explicitly reviews, publishes and rolls back despite broken active catalog', { timeout: 60_000 }, async context => {
   if (!existsSync(chromium.executablePath())) {
