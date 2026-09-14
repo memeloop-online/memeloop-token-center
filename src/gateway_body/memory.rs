@@ -139,13 +139,15 @@ impl ProxyMemoryReservation {
     }
 
     pub(crate) async fn finalize_request(&self, deadline: tokio::time::Instant) -> bool {
-        let Ok(held) = self.held.lock() else {
-            return false;
+        let units = {
+            let Ok(held) = self.held.lock() else {
+                return false;
+            };
+            let Ok(units) = u32::try_from(held.0.div_ceil(UNIT_BYTES)) else {
+                return false;
+            };
+            units
         };
-        let Ok(units) = u32::try_from(held.0.div_ceil(UNIT_BYTES)) else {
-            return false;
-        };
-        drop(held);
         #[cfg(test)]
         self.retained_wait_started.notify_one();
         let Ok(permit) = tokio::time::timeout_at(
