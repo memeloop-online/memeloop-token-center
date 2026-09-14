@@ -97,7 +97,7 @@ async fn explicit_proxy_read_preserves_full_url_but_excludes_other_secrets_and_r
         );
     }
     let proxy_url = "socks5h://proxy-user:proxy-password@100.64.0.16:1080";
-    for credential in [
+    for (index, credential) in [
         UpstreamCredential::ProxiedApiKey {
             value: "API_KEY_CANARY".into(),
             header: "authorization".into(),
@@ -116,7 +116,10 @@ async fn explicit_proxy_read_preserves_full_url_but_excludes_other_secrets_and_r
             proxy_network_scope: Some(OutboundScope::Private),
         },
         UpstreamCredential::None,
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let configured = credential.proxy().is_some();
         let mut expected_credential = serde_json::to_value(&credential).unwrap();
         let account = state
@@ -124,7 +127,7 @@ async fn explicit_proxy_read_preserves_full_url_but_excludes_other_secrets_and_r
             .create_upstream_account(
                 CreateUpstreamAccountInput {
                     tenant_external_id: "proxy-tenant".into(),
-                    name: "Proxy settings fixture".into(),
+                    name: format!("Proxy settings fixture {index}"),
                     driver: "http-json".into(),
                     config: json!({"base_url": "https://93.184.216.34", "network_scope": "public"}),
                     credential,
@@ -224,13 +227,14 @@ async fn explicit_proxy_read_preserves_full_url_but_excludes_other_secrets_and_r
         let update = json!({"tenant_external_id": "proxy-tenant", "proxy_url": replacement,
             "expected_updated_at": account.updated_at, "expected_credential_generation": account.credential_generation});
         let edit_path = path.split('?').next().unwrap();
+        let edit_key = format!("edit-{}", account.id);
         assert_eq!(
             put(&state, edit_path, &tokens[2], "scoped-edit", &update)
                 .await
                 .0,
             StatusCode::FORBIDDEN
         );
-        let (status, edited) = put(&state, edit_path, &tokens[0], "edit-1", &update).await;
+        let (status, edited) = put(&state, edit_path, &tokens[0], &edit_key, &update).await;
         if !configured {
             assert_eq!(status, StatusCode::BAD_REQUEST);
             continue;
@@ -258,7 +262,7 @@ async fn explicit_proxy_read_preserves_full_url_but_excludes_other_secrets_and_r
             get(&state, &path, &tokens[0]).await.2["proxy_url"],
             replacement
         );
-        let replay = put(&state, edit_path, &tokens[0], "edit-1", &update).await;
+        let replay = put(&state, edit_path, &tokens[0], &edit_key, &update).await;
         assert_eq!(replay.0, StatusCode::OK);
         assert_eq!(
             replay.1["credential_generation"],
@@ -286,7 +290,7 @@ async fn explicit_proxy_read_preserves_full_url_but_excludes_other_secrets_and_r
             )
             .await
             .unwrap();
-        let replay = put(&state, edit_path, &tokens[0], "edit-1", &update).await;
+        let replay = put(&state, edit_path, &tokens[0], &edit_key, &update).await;
         assert_eq!(replay.0, StatusCode::OK);
         assert_eq!(replay.1, edited);
         assert_eq!(
@@ -296,7 +300,7 @@ async fn explicit_proxy_read_preserves_full_url_but_excludes_other_secrets_and_r
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            put(&state, edit_path, &tokens[2], "edit-1", &update)
+            put(&state, edit_path, &tokens[2], &edit_key, &update)
                 .await
                 .0,
             StatusCode::FORBIDDEN
