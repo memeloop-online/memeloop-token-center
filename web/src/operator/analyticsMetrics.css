@@ -1,5 +1,7 @@
 .operator-overview-dashboard .panel,
 .usage-page .panel { border: 0; box-shadow: none; background: transparent; }
+:root[data-theme] .operator-overview-dashboard .panel,
+:root[data-theme] .usage-page .panel { border: 0; box-shadow: none; background: transparent; }
 .operator-monitoring > .panel { padding: 0; margin-bottom: 8px; }
 .operator-monitoring .monitoring-heading { margin-bottom: 20px; }
 .operator-monitoring .monitoring-heading h2 { margin-bottom: 6px; }
