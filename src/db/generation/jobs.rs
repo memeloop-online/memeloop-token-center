@@ -952,7 +952,7 @@ impl Database {
         worker_id: &str,
     ) -> Result<Option<GenerationJobWork>, AppError> {
         let now = unix_millis();
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT id FROM generation_jobs WHERE status IN ('queued', 'running', 'submitting', 'cancelling') AND next_attempt_at <= $1 AND (lease_expires_at IS NULL OR lease_expires_at < $2) ORDER BY next_attempt_at, created_at, id FOR UPDATE SKIP LOCKED LIMIT 1"
