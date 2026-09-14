@@ -81,6 +81,11 @@ fn input_reservation_bound(
 
 #[derive(Default)]
 pub(in crate::api::proxy) struct CandidatePreparationSummary {
+    examined: usize,
+    retired_provider: usize,
+    unavailable_snapshot: usize,
+    protocol_mismatch: usize,
+    incompatible_usage: usize,
     skipped_incompatible_strict_route: bool,
     skipped_local_protocol_mismatch: bool,
     skipped_kimi_protocol_mismatch: bool,
@@ -93,7 +98,9 @@ pub(in crate::api::proxy) async fn next_planned_proxy_candidate(
     summary: &mut CandidatePreparationSummary,
 ) -> Result<Option<PlannedProxyRoute>, AppError> {
     for candidate in candidates.by_ref() {
+        summary.examined += 1;
         if !request.state.providers.is_public(&candidate.driver) {
+            summary.retired_provider += 1;
             tracing::warn!(
                 %request.request_id,
                 route_id = %candidate.route_id,
@@ -113,7 +120,10 @@ pub(in crate::api::proxy) async fn next_planned_proxy_candidate(
             .await
         {
             Ok(Some(route)) => route,
-            Ok(None) => continue,
+            Ok(None) => {
+                summary.unavailable_snapshot += 1;
+                continue;
+            }
             Err(error) => {
                 tracing::warn!(
                     %request.request_id,
@@ -131,6 +141,7 @@ pub(in crate::api::proxy) async fn next_planned_proxy_candidate(
         if candidate_compatibility(request.protocol, &route)
             == CandidateCompatibility::ProtocolMismatch
         {
+            summary.protocol_mismatch += 1;
             if route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER {
                 summary.skipped_kimi_protocol_mismatch = true;
             } else {
@@ -146,6 +157,7 @@ pub(in crate::api::proxy) async fn next_planned_proxy_candidate(
                 request.request_json,
             )
         {
+            summary.incompatible_usage += 1;
             summary.skipped_incompatible_strict_route = true;
             continue;
         }
@@ -168,6 +180,16 @@ pub(in crate::api::proxy) async fn next_planned_proxy_candidate(
             );
         });
     }
+    tracing::warn!(
+        request_id = %request.request_id,
+        phase = "candidate_preparation_exhausted",
+        examined = summary.examined,
+        retired_provider = summary.retired_provider,
+        unavailable_snapshot = summary.unavailable_snapshot,
+        protocol_mismatch = summary.protocol_mismatch,
+        incompatible_usage = summary.incompatible_usage,
+        "authorized candidate preparation exhausted without dispatch"
+    );
     Ok(None)
 }
 

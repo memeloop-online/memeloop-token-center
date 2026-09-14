@@ -8,6 +8,12 @@ async fn early_rejections_return_server_correlation_without_creating_request_rec
         ("/v1/responses", false, "{}", StatusCode::UNAUTHORIZED),
         ("/v1/responses", true, "not-json", StatusCode::BAD_REQUEST),
         ("/v1/responses/compact", true, "{}", StatusCode::NOT_FOUND),
+        (
+            "/v1/responses",
+            true,
+            r#"{"model":"unconfigured-diagnostic-model","input":"synthetic"}"#,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
     ] {
         let mut request = Request::post(path)
             .header(header::CONTENT_TYPE, "application/json")
@@ -44,6 +50,44 @@ async fn early_rejections_return_server_correlation_without_creating_request_rec
         count, 0,
         "pre-admission diagnostics must not add database writes"
     );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn control_early_failures_have_distinct_server_ids_without_proxy_records() {
+    let fixture = codex_route_fixture("phase-control-rejections").await;
+    let supplied = Uuid::new_v4();
+    let mut ids = std::collections::HashSet::new();
+    for (method, path) in [
+        ("POST", "/internal/v1/requests/query".to_owned()),
+        ("GET", format!("/internal/v1/requests/{}", Uuid::new_v4())),
+        ("GET", "/internal/v1/upstreams".to_owned()),
+        ("GET", "/internal/v1/request-events".to_owned()),
+    ] {
+        let response = router_for_role(fixture.state.clone(), RuntimeRole::Control)
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(REQUEST_ID_HEADER, supplied.to_string())
+                    .header("x-request-id", supplied.to_string())
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_client_error());
+        let id = Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
+        assert_ne!(id, supplied);
+        assert!(ids.insert(id));
+    }
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
     pool.close().await;
 }
 

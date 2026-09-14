@@ -1,5 +1,5 @@
 import { useEffect, useReducer, useRef } from 'react';
-import { streamSse } from '../../api';
+import { apiDiagnosticMessage, streamSse } from '../../api';
 import type { RequestEvent } from '../../types';
 import type { SessionStreamState } from '../SessionMonitor';
 
@@ -115,7 +115,7 @@ export function useRequestEventStream({
           if (!controller.signal.aborted) {
             dispatch({
               type: 'reconnecting',
-              message: reason instanceof Error ? reason.message : disconnectedMessage,
+              message: apiDiagnosticMessage(reason, disconnectedMessage),
             });
           }
         }

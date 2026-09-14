@@ -69,6 +69,17 @@ pub(super) fn ingress_request_id(value: Option<&str>) -> Option<Uuid> {
     value.and_then(|value| Uuid::parse_str(value).ok())
 }
 
+/// Match route templates, never concrete tenant/request identifiers or queries.
+pub(super) fn control_route_class(template: &str) -> Option<&'static str> {
+    match template {
+        "/internal/v1/requests/query" => Some("request_list"),
+        "/internal/v1/requests/{request_id}" => Some("request_detail"),
+        "/internal/v1/upstreams" => Some("upstream_directory"),
+        "/internal/v1/request-events" => Some("request_events"),
+        _ => None,
+    }
+}
+
 pub(super) struct Phase {
     context: Context,
     phase: &'static str,
@@ -141,6 +152,26 @@ impl Drop for Phase {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn control_labels_accept_only_the_reviewed_route_templates() {
+        assert_eq!(
+            control_route_class("/internal/v1/requests/{request_id}"),
+            Some("request_detail")
+        );
+        assert_eq!(
+            control_route_class("/internal/v1/request-events"),
+            Some("request_events")
+        );
+        for path in [
+            "/internal/v1/requests/secret-canary",
+            "/internal/v1/upstreams?tenant=secret-canary",
+            "/internal/v1/credentials",
+            "unmatched",
+        ] {
+            assert_eq!(control_route_class(path), None);
+        }
+    }
 
     #[test]
     fn first_output_clock_includes_preparation_and_admission_wait() {
