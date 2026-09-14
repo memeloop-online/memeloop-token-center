@@ -56,6 +56,8 @@ mod migrations;
 mod monitoring_snapshot;
 mod oauth_sessions;
 mod plugin_configurations;
+#[cfg(feature = "experimental-plugin-revisions")]
+mod plugin_installations;
 mod plugin_kv;
 #[cfg(feature = "experimental-plugin-revisions")]
 mod plugin_revisions;

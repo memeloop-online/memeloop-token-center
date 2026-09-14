@@ -363,6 +363,26 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             get(super::super::plugins::application_plugin_status),
         )
         .route(
+            "/internal/v1/plugin-runtime/history",
+            get(super::super::plugins::application_plugin_history),
+        )
+        .route(
+            "/internal/v1/plugin-runtime/installations",
+            post(super::super::plugins::install_application_plugin),
+        )
+        .route(
+            "/internal/v1/plugin-runtime/installations/{id}",
+            get(super::super::plugins::application_plugin_installation),
+        )
+        .route(
+            "/internal/v1/plugin-runtime/installations/{id}/approve",
+            post(super::super::plugins::approve_application_plugin_installation),
+        )
+        .route(
+            "/internal/v1/plugin-runtime/installations/{id}/retry",
+            post(super::super::plugins::retry_application_plugin_installation),
+        )
+        .route(
             "/internal/v1/plugin-runtime/candidates",
             get(super::super::plugins::application_plugin_status)
                 .post(super::super::plugins::stage_application_plugin),

@@ -445,6 +445,10 @@ jobs:
             "$RUNNER_TEMP/memory-binary/libgcc_s.so.1"
           install -m 0644 "$RUNNER_TEMP/release-service-input/libstdc++.so.6" \
             "$RUNNER_TEMP/memory-binary/libstdc++.so.6"
+          install -m 0555 "$RUNNER_TEMP/release-service-input/install-plugin-oci" \
+            "$RUNNER_TEMP/memory-binary/install-plugin-oci"
+          install -m 0555 "$RUNNER_TEMP/release-service-input/cosign" \
+            "$RUNNER_TEMP/memory-binary/cosign"
       - name: Seal the complete Docker-native service release input
         run: >-
           node ops/ci/create-release-service-input-manifest.ts

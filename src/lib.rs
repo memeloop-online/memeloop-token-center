@@ -149,13 +149,23 @@ impl AppState {
                         &plugins,
                     )
                     .await
+                    .map_err(|_| InitializationError::Plugin)?
+                    .with_installation_policy_file(
+                        config
+                            .plugin_install_policy_file
+                            .as_deref()
+                            .map(std::path::PathBuf::from),
+                    )
                     .map_err(|_| InitializationError::Plugin)?,
                 ))
             }
             None => None,
         };
         #[cfg(not(feature = "experimental-plugin-revisions"))]
-        if config.plugin_inventory_file.is_some() {
+        if config.plugin_inventory_file.is_some() || config.plugin_install_policy_file.is_some() {
+            return Err(InitializationError::Plugin);
+        }
+        if config.plugin_install_policy_file.is_some() && config.plugin_inventory_file.is_none() {
             return Err(InitializationError::Plugin);
         }
 

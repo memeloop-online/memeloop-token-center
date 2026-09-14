@@ -6,6 +6,7 @@ import { GenerationWorkspace } from '../GenerationWorkspace';
 import { MonitoringSnapshot } from '../MonitoringSnapshot';
 import { OverviewTrends, useOverviewTrendResource } from '../OverviewTrends';
 import { Plugins } from '../Plugins';
+import { PluginRuntimeManager } from '../PluginRuntimeManager';
 import { UsageAnalysis } from '../UsageAnalysis';
 import { useOperatorResource } from '../hooks/useOperatorResource';
 import type { ResourceState } from '../hooks/useOperatorResource';
@@ -99,7 +100,8 @@ export function GenerationsPage({ token, tenant, writeTenant }: OperatorPageProp
 
 export function PluginsPage({ token, tenant, writeTenant, catalog, reloadCatalog }: OperatorPageProps & { catalog: ResourceState<PluginManifest[]>; reloadCatalog: () => Promise<void> }) {
   const { t } = useI18n();
-  if (catalog.scopeKey !== token || catalog.kind === 'idle' || catalog.kind === 'loading') return <div className="empty">{t('common.loading')}</div>;
-  if (catalog.kind === 'failed') return <div className="notice error" role="alert">{catalog.message}<button type="button" onClick={() => void reloadCatalog()}>{t('common.retry')}</button></div>;
-  return <><button type="button" className="secondary" onClick={() => void reloadCatalog()}>{t('plugins.refreshCatalog')}</button>{catalog.refreshError && <div className="notice error" role="alert">{catalog.refreshError}</div>}<Plugins key={`${token}\0${tenant}\0${writeTenant}`} token={token} tenant={tenant} writeTenant={writeTenant} values={catalog.value} /></>;
+  const manager = <PluginRuntimeManager key={token} token={token} onPublished={reloadCatalog} />;
+  if (catalog.scopeKey !== token || catalog.kind === 'idle' || catalog.kind === 'loading') return <>{manager}<div className="empty">{t('common.loading')}</div></>;
+  if (catalog.kind === 'failed') return <>{manager}<div className="notice error" role="alert">{catalog.message}<button type="button" onClick={() => void reloadCatalog()}>{t('common.retry')}</button></div></>;
+  return <>{manager}<button type="button" className="secondary" onClick={() => void reloadCatalog()}>{t('plugins.refreshCatalog')}</button>{catalog.refreshError && <div className="notice error" role="alert">{catalog.refreshError}</div>}<Plugins key={`${token}\0${tenant}\0${writeTenant}`} token={token} tenant={tenant} writeTenant={writeTenant} values={catalog.value} /></>;
 }

@@ -1,5 +1,6 @@
 //! Application integration. Host-configured production activation. Inventory
-//! roots and grants are provisioned by the host, never by management requests.
+//! roots are host-controlled; grants are preconfigured or explicitly approved
+//! by a global administrator after signed installation and exact manifest review.
 use std::{
     collections::{BTreeMap, VecDeque},
     path::PathBuf,
@@ -17,6 +18,7 @@ use super::{
 use crate::{db::Database, error::AppError, provider::ProviderCatalog};
 
 const CACHED_REVISIONS: usize = 2;
+pub mod installation;
 const ADMISSION_WAIT: Duration = Duration::from_secs(5);
 const COMPILATION_DEADLINE: Duration = Duration::from_secs(35);
 const PIN_DEADLINE: Duration = Duration::from_secs(45);
@@ -84,6 +86,7 @@ pub struct ApplicationPlugins {
     db: Database,
     inventory: tokio::sync::RwLock<BTreeMap<String, PreinstalledInventory>>,
     inventory_file: Option<PathBuf>,
+    installation_policy_file: Option<PathBuf>,
     inventory_stamp: tokio::sync::Mutex<Option<InventoryStamp>>,
     #[cfg(test)]
     inventory_reads: std::sync::atomic::AtomicUsize,
@@ -213,6 +216,7 @@ impl ApplicationPlugins {
             db,
             inventory: tokio::sync::RwLock::new(inventory),
             inventory_file: None,
+            installation_policy_file: None,
             inventory_stamp: tokio::sync::Mutex::new(None),
             #[cfg(test)]
             inventory_reads: std::sync::atomic::AtomicUsize::new(0),
@@ -391,6 +395,15 @@ impl ApplicationPlugins {
         input: PublishApplicationPlugin,
         key: &str,
     ) -> Result<ApplicationRevision, AppError> {
+        self.publish_as(input, key, "host").await
+    }
+
+    pub async fn publish_as(
+        &self,
+        input: PublishApplicationPlugin,
+        key: &str,
+        actor: &str,
+    ) -> Result<ApplicationRevision, AppError> {
         validate_operation(input.expected_revision, key)?;
         let reason = if input.expected_revision == 0 {
             "initial"
@@ -415,6 +428,7 @@ impl ApplicationPlugins {
                 reason,
                 key,
                 &hash,
+                actor,
             )
             .await
     }
@@ -423,6 +437,15 @@ impl ApplicationPlugins {
         &self,
         input: RollbackApplicationPlugin,
         key: &str,
+    ) -> Result<ApplicationRevision, AppError> {
+        self.rollback_as(input, key, "host").await
+    }
+
+    pub async fn rollback_as(
+        &self,
+        input: RollbackApplicationPlugin,
+        key: &str,
+        actor: &str,
     ) -> Result<ApplicationRevision, AppError> {
         validate_operation(input.expected_revision, key)?;
         if input.target_revision <= 0 || input.target_revision >= input.expected_revision {
@@ -455,6 +478,7 @@ impl ApplicationPlugins {
                 "rollback",
                 key,
                 &hash,
+                actor,
             )
             .await
     }

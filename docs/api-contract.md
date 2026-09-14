@@ -34,7 +34,7 @@ canonical request is rejected. Secret values are never returned after issuance.
 ## Provider accounts and routes
 
 Installed plugin hot publication is documented separately in
-[the runtime contract](plugin-runtime-application-draft.md). Its three
+[the runtime contract](plugin-runtime-application-draft.md). Its activation
 `/internal/v1/plugin-runtime/*` POST operations are global `plugins:write`
 management only and require both the compile-time experimental feature and
 host-provisioned `MTC_PLUGIN_INVENTORY_FILE` opt-in. The service image includes
@@ -45,6 +45,13 @@ Candidate requests accept opaque preinstalled inventory IDs, never package URLs,
 paths, Wasm or grants. Publish and rollback use revision CAS and idempotency;
 rollback always creates a new revision. The feature remains disabled unless a
 host explicitly provisions and opts into the complete trusted inventory.
+The [Operator installation workflow](operator-plugin-installation.md) additionally
+uses `MTC_PLUGIN_INSTALL_POLICY_FILE` host trust to accept new digest-pinned OCI
+references at runtime. Global administrators inspect and approve an exact signed
+review before grants are registered. Task state, revision history and actor audit
+are available through `/internal/v1/plugin-runtime/history`; installation alone
+does not activate code. Paths, registry credentials and signing keys remain
+host-owned and are never accepted or returned by these installation routes.
 
 One provider account may use an API credential, native OAuth, plugin-provided
 authorization or no credential. Its authentication method is metadata, not a
