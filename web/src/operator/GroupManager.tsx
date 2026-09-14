@@ -56,6 +56,8 @@ export function GroupManager({ kind, token, tenant, groups, resources, onChanged
   const { locale, t } = useI18n();
   const { confirm, confirmationDialog } = useConfirmDialog([token, tenant, kind]);
   const [selectedId, setSelectedId] = useState('');
+  const [savedGroups, setSavedGroups] = useState<Record<string, GroupView>>({});
+  const drafts = useRef({ id: '', membersDirty: false, nameDirty: false });
   const [memberDraft, setMemberDraft] = useState<ComboboxOption[]>([]);
   const [newName, setNewName] = useState('');
   const [renameDraft, setRenameDraft] = useState('');
@@ -65,41 +67,61 @@ export function GroupManager({ kind, token, tenant, groups, resources, onChanged
   const operationSequence = useRef(0);
   const scope = useRef({ kind, token, tenant });
   scope.current = { kind, token, tenant };
-  const selected = groups.find((group) => group.id === selectedId);
+  // Mutation responses own the revision until a list read has caught up.
+  const visibleGroups = groups.map(group => savedGroups[group.id]?.updated_at > group.updated_at ? savedGroups[group.id] : group)
+    .concat(Object.values(savedGroups).filter(saved => !groups.some(group => group.id === saved.id)));
+  const rememberSaved = (group: GroupView) => setSavedGroups(current => current[group.id]?.updated_at > group.updated_at ? current : { ...current, [group.id]: group });
+  const selected = visibleGroups.find((group) => group.id === selectedId);
   const selectGroup = (id: string) => {
-    const group = groups.find((value) => value.id === id);
+    const group = visibleGroups.find((value) => value.id === id);
+    drafts.current = { id, membersDirty: false, nameDirty: false };
     setSelectedId(id);
     setRenameDraft(group?.name ?? '');
     setMemberDraft((group?.member_ids ?? []).map((memberId) => resources.find((item) => item.value === memberId)
       ?? { value: memberId, label: memberId }));
     setMessage(''); setError('');
   };
-  const groupVersion = groups.map((group) => `${group.id}:${group.updated_at}`).join('|');
+  const editorGroup = selected ?? visibleGroups[0];
+  const groupVersion = editorGroup ? `${editorGroup.id}:${editorGroup.updated_at}` : '';
   const resourceVersion = resources.map((resource) => `${resource.value}:${resource.label}`).join('|');
   useEffect(() => {
     operationSequence.current += 1;
-    setSelectedId(''); setMemberDraft([]); setNewName(''); setRenameDraft('');
+    drafts.current = { id: '', membersDirty: false, nameDirty: false };
+    setSavedGroups({}); setSelectedId(''); setMemberDraft([]); setNewName(''); setRenameDraft('');
     setBusy(false); setMessage(''); setError('');
   }, [kind, token, tenant]);
   useEffect(() => {
-    const group = groups.find((value) => value.id === selectedId) ?? groups[0];
+    const group = selected ?? visibleGroups[0];
     if (!group) {
       if (selectedId) { setSelectedId(''); setRenameDraft(''); setMemberDraft([]); }
       return;
     }
+    if (drafts.current.id !== group.id) drafts.current = { id: group.id, membersDirty: false, nameDirty: false };
     setSelectedId(group.id);
-    setRenameDraft(group.name);
-    setMemberDraft(group.member_ids.map((memberId) => resources.find((item) => item.value === memberId)
+    if (!drafts.current.nameDirty) setRenameDraft(group.name);
+    if (!drafts.current.membersDirty) setMemberDraft(group.member_ids.map((memberId) => resources.find((item) => item.value === memberId)
       ?? { value: memberId, label: memberId }));
-  }, [groupVersion, resourceVersion, selectedId]);
+  }, [groupVersion, selectedId]);
+  useEffect(() => {
+    setMemberDraft(draft => draft.map(member => resources.find(resource => resource.value === member.value) ?? member));
+  }, [resourceVersion]);
+  useEffect(() => {
+    setSavedGroups(current => {
+      const caughtUp = Object.keys(current).filter(id => groups.some(group => group.id === id && group.updated_at >= current[id].updated_at));
+      if (!caughtUp.length) return current;
+      const next = { ...current }; for (const id of caughtUp) delete next[id]; return next;
+    });
+  }, [groups]);
 
-  const perform = async (action: () => Promise<void>, success: string) => {
+  const perform = async (action: () => Promise<void | (() => void)>, success: string) => {
+    if (busy) return;
     const sequence = ++operationSequence.current;
     const operationScope = { kind, token, tenant };
     setBusy(true); setMessage(''); setError('');
     try {
-      await action();
+      const applyResult = await action();
       if (sequence !== operationSequence.current || scope.current.kind !== operationScope.kind || scope.current.token !== operationScope.token || scope.current.tenant !== operationScope.tenant) return;
+      applyResult?.();
       setMessage(success); await onChanged();
     }
     catch (reason) {
@@ -120,27 +142,29 @@ export function GroupManager({ kind, token, tenant, groups, resources, onChanged
       if (!name) return;
       void perform(async () => {
         const created = await api<GroupView>(`/internal/v1/${paths[kind]}`, token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, name }) });
-        setNewName(''); setSelectedId(created.id); setRenameDraft(created.name); setMemberDraft([]);
+        return () => { drafts.current = { id: created.id, membersDirty: false, nameDirty: false }; rememberSaved(created); setNewName(''); setSelectedId(created.id); setRenameDraft(created.name); setMemberDraft([]); };
       }, t('groups.created', { name }));
     }}><label>{t('groups.name')}<input maxLength={100} value={newName} onChange={(event) => setNewName(event.target.value)} /></label><button type="submit" disabled={!tenant || busy || !newName.trim()}>{t('groups.create')}</button></form>
-    {groups.length === 0 ? <div className="empty">{t(`groups.${kind}.empty`)}</div> : <div className="group-editor-layout">
-      <div className="group-list" role="list" aria-label={t(`groups.${kind}.title`)}>{groups.map((group) => <button type="button" role="listitem" className={group.id === selectedId ? 'active' : ''} key={group.id} onClick={() => selectGroup(group.id)}><span>{group.name}</span><small>{t('groups.memberCount', { count: formatNumber(group.member_count, locale) })}</small></button>)}</div>
+    {visibleGroups.length === 0 ? <div className="empty">{t(`groups.${kind}.empty`)}</div> : <div className="group-editor-layout">
+      <div className="group-list" role="list" aria-label={t(`groups.${kind}.title`)}>{visibleGroups.map((group) => <button type="button" role="listitem" disabled={busy} className={group.id === selectedId ? 'active' : ''} key={group.id} onClick={() => selectGroup(group.id)}><span>{group.name}</span><small>{t('groups.memberCount', { count: formatNumber(group.member_count, locale) })}</small></button>)}</div>
       {selected && <div className="group-editor">
-        {kind !== 'credential' && <GroupStrategyEditor key={`${token}\0${tenant}\0${kind}\0${selected.id}`} kind={kind} token={token} tenant={tenant} group={selected} onChanged={onChanged} />}
-        <div className="group-rename"><label>{t('groups.name')}<input maxLength={100} value={renameDraft} onChange={(event) => setRenameDraft(event.target.value)} /></label><button type="button" className="secondary" disabled={busy || !renameDraft.trim() || renameDraft.trim() === selected.name} onClick={() => void perform(async () => {
-          await api(`/internal/v1/${paths[kind]}/${selected.id}`, token, { method: 'PUT', body: JSON.stringify({ tenant_external_id: tenant, name: renameDraft.trim(), expected_updated_at: selected.updated_at }) });
+        <div className="group-rename"><label>{t('groups.name')}<input maxLength={100} disabled={busy} value={renameDraft} onChange={(event) => { drafts.current.nameDirty = true; setRenameDraft(event.target.value); }} /></label><button type="button" className="secondary" disabled={busy || !renameDraft.trim() || renameDraft.trim() === selected.name} onClick={() => void perform(async () => {
+          const saved = await api<GroupView>(`/internal/v1/${paths[kind]}/${selected.id}`, token, { method: 'PUT', body: JSON.stringify({ tenant_external_id: tenant, name: renameDraft.trim(), expected_updated_at: selected.updated_at }) });
+          return () => { drafts.current.nameDirty = false; rememberSaved(saved); };
         }, t('groups.renamed', { name: renameDraft.trim() }))}>{t('common.save')}</button></div>
-        <MultiCombobox label={t(`groups.${kind}.members`)} options={resources} value={memberDraft} onChange={setMemberDraft} placeholder={t('groups.searchMembers')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} />
+        <MultiCombobox disabled={busy} label={t(`groups.${kind}.members`)} options={resources} value={memberDraft} onChange={value => { drafts.current.membersDirty = true; setMemberDraft(value); }} placeholder={t('groups.searchMembers')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} />
         <div className="group-editor-actions"><button type="button" disabled={busy} onClick={() => void perform(async () => {
-          await api(`/internal/v1/${paths[kind]}/${selected.id}/members`, token, { method: 'PUT', body: JSON.stringify({ tenant_external_id: tenant, member_ids: memberDraft.map((item) => item.value), expected_updated_at: selected.updated_at }) });
+          const saved = await api<GroupView>(`/internal/v1/${paths[kind]}/${selected.id}/members`, token, { method: 'PUT', body: JSON.stringify({ tenant_external_id: tenant, member_ids: memberDraft.map((item) => item.value), expected_updated_at: selected.updated_at }) });
+          return () => { drafts.current.membersDirty = false; rememberSaved(saved); };
         }, t('groups.membersSaved'))}>{t('groups.saveMembers')}</button><button type="button" className="danger" disabled={busy} onClick={async () => {
           if (!await confirm(t('groups.confirmDelete', { name: selected.name }))) return;
           void perform(async () => {
             const query = new URLSearchParams({ tenant_external_id: tenant, expected_updated_at: String(selected.updated_at) });
             await api(`/internal/v1/${paths[kind]}/${selected.id}?${query}`, token, { method: 'DELETE' });
-            setSelectedId('');
+            return () => { setSavedGroups(current => { const next = { ...current }; delete next[selected.id]; return next; }); setSelectedId(''); };
           }, t('groups.deleted', { name: selected.name }));
         }}>{t('common.remove')}</button></div>
+        {kind !== 'credential' && <GroupStrategyEditor key={`${token}\0${tenant}\0${kind}\0${selected.id}`} kind={kind} token={token} tenant={tenant} group={selected} onChanged={onChanged} onSaved={rememberSaved} />}
       </div>}
     </div>}
   </article>;

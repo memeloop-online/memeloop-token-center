@@ -15,8 +15,8 @@ export interface GroupRoutingStrategyOption {
 }
 
 /** Parent keys by tenant, token, kind and group. Refresh never discards edits. */
-export function GroupStrategyEditor({ kind, token, tenant, group, onChanged }: {
-  kind: 'provider' | 'route'; token: string; tenant: string; group: GroupView; onChanged: () => Promise<void>;
+export function GroupStrategyEditor({ kind, token, tenant, group, onChanged, onSaved }: {
+  kind: 'provider' | 'route'; token: string; tenant: string; group: GroupView; onChanged: () => Promise<void>; onSaved?: (group: GroupView) => void;
 }) {
   const { locale, t } = useI18n();
   const [catalog, setCatalog] = useState<GroupRoutingStrategyOption[]>([]);
@@ -32,6 +32,11 @@ export function GroupStrategyEditor({ kind, token, tenant, group, onChanged }: {
   const [message, setMessage] = useState('');
   const [needsRefresh, setNeedsRefresh] = useState(false);
   const mounted = useRef(true);
+  useEffect(() => {
+    // Rename/member writes share updated_at but do not change strategy content.
+    // A different strategy version must still conflict with our retained draft.
+    setSnapshot(current => group.updated_at > current.updated_at && (group.strategy_version ?? 0) === (current.strategy_version ?? 0) ? group : current);
+  }, [group]);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   useEffect(() => {
     const controller = new AbortController();
@@ -51,7 +56,7 @@ export function GroupStrategyEditor({ kind, token, tenant, group, onChanged }: {
     const current = groups.find(value => value.id === group.id);
     if (!current) throw new Error(t('groups.strategyMissingGroup'));
     if (!mounted.current) return;
-    setSnapshot(current); setNeedsRefresh(false);
+    setSnapshot(current); onSaved?.(current); setNeedsRefresh(false);
     await onChanged();
   }
   async function save(formData: Record<string, unknown>) {
@@ -64,7 +69,7 @@ export function GroupStrategyEditor({ kind, token, tenant, group, onChanged }: {
           routing_strategy: pluginId ? { plugin_id: pluginId, config: formData } : null }),
       });
       if (!mounted.current) return;
-      setSnapshot(saved); setMessage(t('groups.strategySaved'));
+      setSnapshot(saved); onSaved?.(saved); setMessage(t('groups.strategySaved'));
       await onChanged();
     } catch (reason) {
       if (!mounted.current) return;
@@ -96,10 +101,10 @@ export function GroupStrategyEditor({ kind, token, tenant, group, onChanged }: {
     {pluginId && !option && !loading && <p role="alert">{t('groups.strategyUnavailable')}</p>}
     <label>{t('groups.strategyPriority')}<input type="number" step="1" min={-2147483648} max={2147483647} value={priority} disabled={saving} onChange={event => setPriority(event.target.value)} /></label>
     <p className="muted">{t('groups.strategyPriorityHelp')}</p>
-    <RjsfForm key={pluginId} idPrefix={`group-strategy-${group.id}`} schema={localizeSchema(option?.schema ?? { type: 'object', properties: {} }, locale)}
+    {pluginId ? <RjsfForm key={pluginId} idPrefix={`group-strategy-${group.id}`} schema={localizeSchema(option?.schema ?? { type: 'object', properties: {} }, locale)}
       formData={config} validator={safeValidator} templates={schemaFormTemplates} disabled={saving}
       noHtml5Validate onChange={({ formData }) => setConfig(formData ?? {})} onSubmit={({ formData }) => void save(formData ?? {})}>
       <button type="submit" disabled={saving || !token || !tenant || !validPriority || needsRefresh || Boolean(pluginId && (!option || loading || catalogError))}>{t('groups.strategySave')}</button>
-    </RjsfForm>
+    </RjsfForm> : <button type="button" disabled={saving || !token || !tenant || !validPriority || needsRefresh} onClick={() => void save({})}>{t('groups.strategySave')}</button>}
   </section>;
 }
