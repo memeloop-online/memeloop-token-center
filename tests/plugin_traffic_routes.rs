@@ -55,6 +55,15 @@ impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for LogCapture {
 }
 
 impl LogCapture {
+    fn dispatch(&self) -> tracing::Dispatch {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(self.clone())
+            .finish();
+        tracing::Dispatch::new(subscriber)
+    }
+
     fn contents(&self) -> String {
         String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
     }
@@ -1031,14 +1040,14 @@ async fn log_capability_emits_only_bounded_host_owned_fields() {
     )
     .await;
     let capture = LogCapture::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .without_time()
-        .with_writer(capture.clone())
-        .finish();
-    let dispatch = tracing::Dispatch::new(subscriber);
+    // Keep both registry dispatchers alive before either invocation. A parallel
+    // test with no subscriber can otherwise cache an execution-only callsite
+    // as disabled; the direct guest log alone would not re-register the host
+    // span and observation callsites used by the gateway invocation.
+    let direct_dispatch = capture.dispatch();
+    let gateway_dispatch = capture.dispatch();
 
-    let decision = tracing::dispatcher::with_default(&dispatch, || {
+    let decision = tracing::dispatcher::with_default(&direct_dispatch, || {
         state.plugins.apply_traffic(
             memeloop_token_center::plugin::memeloop::token_center::types::RequestContext {
                 tenant_id: "tenant".into(),
@@ -1060,7 +1069,7 @@ async fn log_capability_emits_only_bounded_host_owned_fields() {
         "/v1/chat/completions",
         json!({"model": "requested-model", "messages": []}),
     )
-    .with_subscriber(dispatch)
+    .with_subscriber(gateway_dispatch)
     .await;
 
     assert_eq!(response.0, StatusCode::FORBIDDEN);

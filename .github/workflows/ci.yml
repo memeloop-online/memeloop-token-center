@@ -431,8 +431,8 @@ jobs:
             MTC_BUILD_GIT_SHA_INPUT=${{ github.sha }}
             MTC_BUILD_TIMESTAMP_INPUT=${{ steps.release-input.outputs.timestamp }}
             MTC_BUILD_TARGET_INPUT=${{ steps.release-input.outputs.target }}
-          cache-from: type=gha,scope=service
-          cache-to: type=gha,mode=max,scope=service
+          cache-from: type=gha,scope=service-release-input
+          cache-to: type=gha,mode=max,scope=service-release-input
       - name: Seal the binary identity for same-run acceptance
         run: >-
           node ops/ci/create-memory-binary-manifest.ts

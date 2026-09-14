@@ -73,8 +73,8 @@ test('release contains only runtime images and no retired migration delivery sur
   assert.equal(memoryDockerBuild?.with?.target, 'release-input-export');
   assert.equal(memoryDockerBuild?.with?.platforms, 'linux/amd64');
   assert.equal(memoryDockerBuild?.with?.outputs, 'type=local,dest=${{ runner.temp }}/release-service-input');
-  assert.equal(memoryDockerBuild?.with?.['cache-from'], 'type=gha,scope=service');
-  assert.equal(memoryDockerBuild?.with?.['cache-to'], 'type=gha,mode=max,scope=service');
+  assert.equal(memoryDockerBuild?.with?.['cache-from'], 'type=gha,scope=service-release-input');
+  assert.equal(memoryDockerBuild?.with?.['cache-to'], 'type=gha,mode=max,scope=service-release-input');
   assert.match(String(memoryDockerBuild?.with?.['build-args']), /MTC_BUILD_GIT_SHA_INPUT=\$\{\{ github\.sha \}\}/);
   assert.match(String(memoryDockerBuild?.with?.['build-args']), /MTC_BUILD_TARGET_INPUT=\$\{\{ steps\.release-input\.outputs\.target \}\}/);
   contains('Dockerfile', 'FROM scratch AS release-input-export');
