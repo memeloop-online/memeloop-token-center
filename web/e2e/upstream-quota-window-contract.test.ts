@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { quotaObservationState, quotaResetCreditExpiry, quotaSummaryPresentation, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaPath, type UpstreamQuotaSnapshot } from '../src/operator/upstreamQuota.js';
+import { quotaObservationState, quotaRemaining, quotaResetCreditExpiry, quotaSummaryPresentation, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaPath, type UpstreamQuotaSnapshot } from '../src/operator/upstreamQuota.js';
 
 test('quota URL requires and preserves explicit account and tenant identity', () => {
   const url = new URL(upstreamQuotaPath('account/one', 'tenant & one'), 'https://example.test');
@@ -15,6 +15,12 @@ test('unknown windows stay unknown and exact usage is not rounded or capped by t
   assert.equal(quotaUsedPercent({ ...window, remaining: 25, limit: 100 }), 75);
   assert.equal(quotaUsedPercent({ ...window, remaining: 0, limit: 0 }), null);
   assert.equal(quotaUsedPercent({ ...window, used_percent: 120.25 }), 120.25);
+  assert.deepEqual(quotaRemaining({ ...window, unit: null, used_percent: 0, remaining: 100, limit: 100 }), { kind: 'percent', percent: 100 });
+  assert.deepEqual(quotaRemaining({ ...window, used_percent: 25.5, remaining: 100, limit: 100 }), { kind: 'percent', percent: 74.5 });
+  assert.equal(quotaRemaining({ ...window, remaining: 100, limit: 100 }), null, 'unknown unit and unknown used percentage cannot imply 100 absolute credits');
+  assert.equal(quotaRemaining({ ...window, used_percent: Number.NaN }), null);
+  assert.equal(quotaRemaining({ ...window, used_percent: 120.25 }), null, 'out-of-range usage is not clamped into invented remaining quota');
+  assert.deepEqual(quotaRemaining({ ...window, unit: 'requests', remaining: 25, limit: 100 }), { kind: 'amount', amount: 25, limit: 100, unit: 'requests' });
 });
 
 test('Codex window cadence follows supplier duration before internal primary or secondary role', () => {

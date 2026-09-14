@@ -15,6 +15,7 @@ export interface UpstreamQuotaSnapshot {
     used_percent: number | null;
     remaining: number | null;
     limit: number | null;
+    unit?: string | null;
     reset_at: number | null;
     period_seconds: number | null;
     source: string;
@@ -57,6 +58,18 @@ export function upstreamQuotaPath(accountId: string, tenant: string) {
 export function quotaUsedPercent(window: UpstreamQuotaSnapshot['windows'][number]): number | null {
   if (window.used_percent !== null && Number.isFinite(window.used_percent)) return window.used_percent;
   if (window.remaining !== null && window.limit !== null && window.limit > 0) return (1 - window.remaining / window.limit) * 100;
+  return null;
+}
+
+/** Unitless normalized amounts are not evidence of absolute quota units. */
+export function quotaRemaining(window: UpstreamQuotaSnapshot['windows'][number]):
+  { kind: 'percent'; percent: number } | { kind: 'amount'; amount: number; limit: number | null; unit: string } | null {
+  const unit = window.unit?.trim();
+  if (unit && window.remaining !== null && Number.isFinite(window.remaining)) {
+    return { kind: 'amount', amount: window.remaining, limit: window.limit !== null && Number.isFinite(window.limit) ? window.limit : null, unit };
+  }
+  const used = window.used_percent;
+  if (!unit && used !== null && Number.isFinite(used) && used >= 0 && used <= 100) return { kind: 'percent', percent: 100 - used };
   return null;
 }
 

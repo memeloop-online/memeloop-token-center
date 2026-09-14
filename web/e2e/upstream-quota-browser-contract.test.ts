@@ -132,6 +132,21 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
       assert.equal(await page.getByText('fixture-sensitive-message-must-not-render').count(), 0);
       assert.deepEqual(await page.evaluate(() => [window.quotaReads, window.quotaWrites, window.quotaPrepares, window.quotaConfirms, window.quotaReconciles]), [1, 0, 0, 0, 0]);
     }
+    for (const [locale, theme, width] of [['en', 'light', 1440], ['zh-CN', 'dark', 390]] as const) {
+      await page.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
+      await page.goto(`${base}/e2e/fixtures/upstream-quota.html?mode=kimi`);
+      await page.getByRole('button', { name: locale === 'en' ? 'View quota' : '查看额度', exact: true }).click();
+      await page.getByText(locale === 'en' ? 'Remaining 100%' : '剩余 100%', { exact: true }).waitFor();
+      await page.getByText(locale === 'en' ? 'Remaining 75%' : '剩余 75%', { exact: true }).waitFor();
+      assert.equal(await page.getByText(/100 \/ 100/).count(), 0, 'unitless normalized values never look like an absolute allowance');
+      assert.equal(await page.locator('.upstream-quota-reset').count(), 0, 'unsupported reset capability has no empty section or action');
+      assert.equal(await page.locator('.upstream-quota-window').count(), 2);
+      assert.equal(await page.locator('.upstream-quota-window meter').count(), 2);
+      assert.deepEqual(await page.evaluate(() => [window.quotaReads, window.quotaWrites, window.quotaPrepares, window.quotaConfirms]), [1, 0, 0, 0]);
+      await page.setViewportSize({ width, height: 900 });
+      await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
+      await page.screenshot({ path: join(artifacts, `kimi-percent-${locale}-${width}.png`), fullPage: true });
+    }
     assert.deepEqual(errors, []);
   } finally {
     await browser.close();

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import { formatElapsedTime, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
-import { quotaObservationState, quotaReadErrorMessage, quotaResetCreditExpiry, quotaSourceLabel, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaPath, type UpstreamQuotaSnapshot } from './upstreamQuota';
+import { quotaObservationState, quotaReadErrorMessage, quotaRemaining, quotaResetCreditExpiry, quotaSourceLabel, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaPath, type UpstreamQuotaSnapshot } from './upstreamQuota';
 import type { QuotaReadState } from './useUpstreamQuotaReads';
 import './upstreamQuota.css';
 import { UpstreamQuotaReset } from './UpstreamQuotaReset';
@@ -34,6 +34,7 @@ export function UpstreamQuotaDetails({ snapshot, refreshError }: { snapshot: Ups
     {hasObservation && snapshot.status === 'ready' && snapshot.windows.length === 0 && <p>{t(observation === 'historical' ? 'quota.noWindowsHistorical' : 'quota.noWindows')}</p>}
     {hasObservation && <div className="upstream-quota-windows">{snapshot.windows.map((window) => {
       const used = quotaUsedPercent(window);
+      const remaining = quotaRemaining(window);
       const presentation = quotaWindowPresentation(snapshot.provider, window);
       const baseScope = presentation.supplierLabel ?? t(presentation.scopeKey);
       const scope = presentation.qualifier ? t('quota.scopeWithQualifier', { scope: baseScope, qualifier: presentation.qualifier }) : baseScope;
@@ -44,7 +45,9 @@ export function UpstreamQuotaDetails({ snapshot, refreshError }: { snapshot: Ups
         {used !== null && <meter min={0} max={100} value={Math.max(0, Math.min(100, used))} aria-label={t(observation === 'historical' ? 'quota.lastObservedUsedPercent' : 'quota.usedPercent', { name })} />}
         {window.limit_reached === true && <span className="status bad">{t('quota.limitReached')}</span>}
         {window.allowed === false && window.limit_reached !== true && <span className="status pending">{t('quota.notAllowed')}</span>}
-        {window.remaining !== null && <p>{t('quota.remaining', { amount: formatNumber(window.remaining, locale), limit: window.limit === null ? '—' : formatNumber(window.limit, locale) })}</p>}
+        {remaining && <p>{remaining.kind === 'percent'
+          ? t('quota.remainingPercent', { percent: formatPercent(remaining.percent / 100, locale) })
+          : t('quota.remainingWithUnit', { amount: formatNumber(remaining.amount, locale), limit: remaining.limit === null ? '—' : formatNumber(remaining.limit, locale), unit: remaining.unit })}</p>}
         <p>{window.reset_at === null ? t('quota.resetTimeUnknown') : t(window.reset_is_estimated ? 'quota.estimatedResetAt' : 'quota.resetAt', { time: new Date(window.reset_at).toLocaleString(locale) })}</p>
         {window.reset_at !== null && <span>{window.reset_at <= now ? t('quota.resetElapsed') : t('quota.resetIn', { time: formatElapsedTime(window.reset_at - now, locale) })}</span>}
         <DetailTooltip content={t('quota.sourceEvidence', { source, id: window.id, rawSource: window.source })}><small tabIndex={0} data-quota-evidence={window.id}>{t('quota.sourceLabel')}</small></DetailTooltip>
@@ -75,8 +78,8 @@ export function UpstreamQuotaResetSection({ accountId, accountName, tenant, toke
 }) {
   const { t, locale } = useI18n();
   const capability = snapshot?.reset_capability;
-  const resetMessage = capability?.provider_supported === false ? 'quota.resetUnsupported'
-    : capability?.provider_supported == null ? 'quota.resetUnknown'
+  if (capability?.provider_supported === false) return null;
+  const resetMessage = capability?.provider_supported == null ? 'quota.resetUnknown'
     : !capability.implementation_available ? 'quota.resetNotIntegrated' : 'quota.resetAvailable';
   const actionable = capability?.provider_supported === true && capability.implementation_available;
   return <section className="upstream-quota-reset" aria-label={t('quota.resetCapability')}>
