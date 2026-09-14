@@ -258,6 +258,7 @@ table.request-table .request-model-cell code {
 }
 
 .request-id-control.compact code {
+  display: none;
   color: var(--muted, #82979e);
   font-size: 0.7rem;
   overflow: hidden;

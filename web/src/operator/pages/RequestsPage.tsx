@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../../api';
 import { DrawerFrame, Metric, NumberMetric, RequestDiagnostics, RequestTable } from '../../components';
-import { formatMilliseconds, formatPercent } from '../../format';
+import { formatDurationDisplay, formatPercent } from '../../format';
 import { useI18n } from '../../i18n';
 import type { RequestDetail, RequestEvent, RequestListResponse, RequestView, TypedFilterAst, UpstreamAccount } from '../../types';
 import type { SessionStreamState } from '../SessionMonitor';
@@ -299,6 +299,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
 }) {
   const { locale, t } = useI18n();
   const summary = summarizeVisibleRequests(requests);
+  const averageDuration = formatDurationDisplay(summary.averageDurationMs, locale);
   return <article className="panel"><div className="panel-title traffic-heading"><div><h2>{typedFiltersActive(filters) ? t('traffic.filtered') : t('traffic.live')}</h2><span>{typedFiltersActive(filters) ? t('traffic.filteredHint') : t('traffic.liveHint')}</span></div><div className="traffic-heading-actions"><div className={`request-live-state session-live-state ${streamState}`} role="status">{t(`sessions.live.${streamState}`)}</div><div className="segmented" role="group" aria-label={t('sessions.monitorMode')}><button type="button" className="active" aria-pressed="true">{t('sessions.requestsMode')}</button><button type="button" aria-pressed="false" onClick={onOpenSessions}>{t('sessions.sessionsMode')}</button></div></div></div>
     <TypedFilterBuilder ast={filters} disabled={loading} onApply={onApply} onClear={onClear} scope="requests" token={token} tenant={tenant} upstreams={upstreams} />
     {olderFilteredResultsStale && <div className="notice warning" role="status">{t('traffic.olderFilteredResultsStale')}<button type="button" className="secondary" disabled={loading} onClick={onRefreshFilteredResults}>{t('traffic.refreshFilteredResults')}</button></div>}
@@ -308,7 +309,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
       <NumberMetric label={t('traffic.failure')} value={summary.failed} tone="negative" />
       <NumberMetric label={t('common.running')} value={summary.running} tone={summary.running > 0 ? 'pending' : undefined} />
       <Metric label={t('usage.successRate')} value={formatPercent(summary.successRate, locale)} tone="positive" />
-      <Metric label={t('usage.average')} value={formatMilliseconds(summary.averageDurationMs, locale)} />
+      <Metric label={t('usage.average')} value={<span title={averageDuration.title}>{averageDuration.text}</span>} />
     </section>}
     <RequestTable requests={requests} upstreamNames={new Map(upstreams.map((account) => [account.id, account.name]))} onSelect={(request) => void onSelect(request)} onOpenSession={onOpenSession} />
     {hasOlder && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('traffic.loadOlder')}</button></div>}
