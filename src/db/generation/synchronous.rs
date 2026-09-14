@@ -3,6 +3,26 @@ use crate::archive_staging::{
     ArchiveStagingOwner, ArchiveStagingPurpose, ArchiveStagingWriteLease,
 };
 
+mod submission;
+
+pub(super) fn serialize_media_routing_snapshot(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<String>, AppError> {
+    let encoded = value
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|_| AppError::Internal)?;
+    if encoded
+        .as_ref()
+        .is_some_and(|text| text.len() > 1024 * 1024)
+    {
+        return Err(AppError::BadRequest(
+            "media routing snapshot exceeds 1 MiB".into(),
+        ));
+    }
+    Ok(encoded)
+}
+
 #[derive(Clone, Debug)]
 pub struct GenerationJobIdempotency {
     pub key: String,
@@ -12,6 +32,9 @@ pub struct GenerationJobIdempotency {
 #[derive(Clone, Debug)]
 pub enum SynchronousImageIdempotencyClaim {
     Claimed,
+    Uncertain {
+        request_id: Uuid,
+    },
     Pending {
         request_id: Uuid,
     },
@@ -27,6 +50,7 @@ pub enum SynchronousImageIdempotencyClaim {
 }
 
 pub struct StartSynchronousImageRequest<'a> {
+    pub routing_snapshot: Option<&'a serde_json::Value>,
     pub request_id: Uuid,
     pub key: &'a AuthenticatedKey,
     pub price: &'a ModelPrice,
@@ -121,6 +145,15 @@ impl Database {
         if row.try_get::<String, _>("status")? == "pending"
             && row.try_get::<i64, _>("lease_expires_at")? <= unix_millis()
         {
+            let request_id = parse_uuid(row.try_get("request_id")?)?;
+            if self
+                .synchronous_image_submission_started(key_id, request_id)
+                .await?
+            {
+                return Ok(Some(SynchronousImageIdempotencyClaim::Uncertain {
+                    request_id,
+                }));
+            }
             return Ok(Some(SynchronousImageIdempotencyClaim::Claimed));
         }
         synchronous_image_claim_from_row(row).map(Some)
@@ -173,35 +206,26 @@ impl Database {
             // start transaction may refund/recover the old request and CAS the
             // new owner into place.
             transaction.commit().await?;
+            let existing_request_id = parse_uuid(row.try_get("request_id")?)?;
+            if self
+                .synchronous_image_submission_started(key_id, existing_request_id)
+                .await?
+            {
+                return Ok(SynchronousImageIdempotencyClaim::Uncertain {
+                    request_id: existing_request_id,
+                });
+            }
             return Ok(SynchronousImageIdempotencyClaim::Claimed);
         }
         transaction.commit().await?;
-        let request_id = parse_uuid(row.try_get("request_id")?)?;
-        match row.try_get::<String, _>("status")?.as_str() {
-            "pending" => Ok(SynchronousImageIdempotencyClaim::Pending { request_id }),
-            "completed" => Ok(SynchronousImageIdempotencyClaim::Completed {
-                request_id,
-                response_status: row
-                    .try_get::<Option<i64>, _>("response_status")?
-                    .ok_or(AppError::Internal)?,
-                response_object: row
-                    .try_get::<Option<String>, _>("response_object")?
-                    .ok_or(AppError::Internal)?,
-            }),
-            "failed" => Ok(SynchronousImageIdempotencyClaim::Failed {
-                request_id,
-                error_code: row
-                    .try_get::<Option<String>, _>("error_code")?
-                    .unwrap_or_else(|| "image_generation_failed".to_owned()),
-            }),
-            _ => Err(AppError::Internal),
-        }
+        synchronous_image_claim_from_row(row)
     }
 
     pub async fn start_synchronous_image_request(
         &self,
         input: StartSynchronousImageRequest<'_>,
     ) -> Result<StartSynchronousImageResult, AppError> {
+        let routing_snapshot = serialize_media_routing_snapshot(input.routing_snapshot)?;
         let now = unix_millis();
         let Some(idempotency) = input.idempotency else {
             let mut transaction = self.begin_write_transaction().await?;
@@ -229,6 +253,14 @@ impl Database {
                 },
                 now,
             )
+            .await?;
+            sqlx::query(
+                "UPDATE request_records SET routing_snapshot = $1 WHERE id = $2 AND key_id = $3",
+            )
+            .bind(&routing_snapshot)
+            .bind(input.request_id.to_string())
+            .bind(input.key.key_id.to_string())
+            .execute(&mut *transaction)
             .await?;
             transaction.commit().await?;
             return Ok(StartSynchronousImageResult::Started(reservation));
@@ -275,7 +307,10 @@ impl Database {
             }
             let status: String = row.try_get("status")?;
             let existing_request_id = parse_uuid(row.try_get("request_id")?)?;
-            if status != "pending" {
+            if status != "pending"
+                || row.try_get::<Option<String>, _>("error_code")?.as_deref()
+                    == Some("image_submission_uncertain")
+            {
                 let replay = synchronous_image_claim_from_row(row)?;
                 transaction.commit().await?;
                 return Ok(StartSynchronousImageResult::Replay(replay));
@@ -411,6 +446,14 @@ impl Database {
                 "synchronous image idempotency owner changed before request start".into(),
             ));
         }
+        sqlx::query(
+            "UPDATE request_records SET routing_snapshot = $1 WHERE id = $2 AND key_id = $3",
+        )
+        .bind(&routing_snapshot)
+        .bind(&request_id)
+        .bind(&key_id)
+        .execute(&mut *transaction)
+        .await?;
         transaction.commit().await?;
         Ok(StartSynchronousImageResult::Started(reservation))
     }
@@ -933,6 +976,12 @@ fn synchronous_image_claim_from_row(
     row: AnyRow,
 ) -> Result<SynchronousImageIdempotencyClaim, AppError> {
     let request_id = parse_uuid(row.try_get("request_id")?)?;
+    if row.try_get::<String, _>("status")? == "pending"
+        && row.try_get::<Option<String>, _>("error_code")?.as_deref()
+            == Some("image_submission_uncertain")
+    {
+        return Ok(SynchronousImageIdempotencyClaim::Uncertain { request_id });
+    }
     match row.try_get::<String, _>("status")?.as_str() {
         "pending" => Ok(SynchronousImageIdempotencyClaim::Pending { request_id }),
         "completed" => Ok(SynchronousImageIdempotencyClaim::Completed {
@@ -1000,7 +1049,7 @@ async fn recover_expired_synchronous_image_owner(
     now: i64,
 ) -> Result<Option<SynchronousImageIdempotencyClaim>, AppError> {
     let row = sqlx::query(
-        "SELECT q.created_at, q.completed_at, q.status_code, q.cost_micros, q.error_code, q.response_object, q.reservation_id, r.account_id, r.key_id AS reservation_key_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id WHERE q.id = $1 AND q.key_id = $2",
+        "SELECT q.created_at, q.completed_at, q.submission_started_at, q.status_code, q.cost_micros, q.error_code, q.response_object, q.reservation_id, r.account_id, r.key_id AS reservation_key_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id WHERE q.id = $1 AND q.key_id = $2",
     )
     .bind(request_id.to_string())
     .bind(key_id.to_string())
@@ -1011,6 +1060,16 @@ async fn recover_expired_synchronous_image_owner(
     };
     let created_at: i64 = row.try_get("created_at")?;
     let completed_at: Option<i64> = row.try_get("completed_at")?;
+    if completed_at.is_none()
+        && row
+            .try_get::<Option<i64>, _>("submission_started_at")?
+            .is_some()
+    {
+        submission::mark_uncertain(tx, key_id, Some(idempotency_key), request_id, now).await?;
+        return Ok(Some(SynchronousImageIdempotencyClaim::Uncertain {
+            request_id,
+        }));
+    }
     let status_code: Option<i64> = row.try_get("status_code")?;
     let error_code: Option<String> = row.try_get("error_code")?;
     let response_object: Option<String> = row.try_get("response_object")?;

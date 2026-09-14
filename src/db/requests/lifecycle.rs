@@ -805,6 +805,10 @@ impl Database {
         .bind(&reservation_id)
         .execute(&mut *transaction)
         .await?;
+            if claimed.rows_affected() == 1 && sqlx::query("SELECT 1 FROM request_records WHERE id = $1 AND key_id = $2 AND submission_started_at IS NOT NULL")
+                .bind(&request_id).bind(&key_id).fetch_optional(&mut *transaction).await?.is_some() {
+                return Err(AppError::Conflict("submitted image requires authoritative image settlement or quarantine".into()));
+            }
             let locator = sqlx::query(
                 "SELECT created_at, tenant_id, key_id FROM request_record_locators WHERE id = $1",
             )

@@ -1,14 +1,14 @@
 //! Request-local policy snapshot. Standbys cannot increase the original budget.
 use super::*;
 
-pub(in crate::api::proxy) struct RequestAttemptBudget {
+pub(crate) struct RequestAttemptBudget {
     max_attempts: usize,
     deadline: Option<tokio::time::Instant>,
     pub(in crate::api::proxy) version: u32,
 }
 
 impl RequestAttemptBudget {
-    pub(in crate::api::proxy) fn recovery_wait_deadline(
+    pub(crate) fn recovery_wait_deadline(
         &self,
         health: crate::config::UpstreamHealthConfig,
     ) -> tokio::time::Instant {
@@ -21,7 +21,7 @@ impl RequestAttemptBudget {
         let cap = tokio::time::Instant::now() + std::time::Duration::from_millis(millis);
         self.deadline.map_or(cap, |deadline| deadline.min(cap))
     }
-    pub(in crate::api::proxy) fn from_primary(
+    pub(crate) fn from_primary(
         route: &ResolvedUpstream,
         request_id: Uuid,
     ) -> Result<Self, AppError> {

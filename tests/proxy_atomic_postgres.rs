@@ -1877,6 +1877,7 @@ async fn postgres_synchronous_image_terminal_ack_recovery_is_exactly_once_withou
     let request_id = Uuid::now_v7();
     let reservation = match database
         .start_synchronous_image_request(StartSynchronousImageRequest {
+            routing_snapshot: None,
             request_id,
             key: &key,
             price: &price,

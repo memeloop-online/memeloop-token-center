@@ -5,6 +5,10 @@ use super::synchronous_image::{
     scoped_upstream_image_idempotency,
 };
 
+#[cfg(test)]
+#[path = "synchronous_routing_tests.rs"]
+mod routing_tests;
+
 #[derive(Debug, Deserialize)]
 pub(in crate::api) struct CreateGenerationRequest {
     pub(in crate::api) model: String,
@@ -34,7 +38,7 @@ async fn proxy_openai_image_generation(
     request_json: Value,
 ) -> Result<Response, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
-    let state = state.pin_application_plugins().await?;
+    let mut state = state.pin_application_plugins().await?;
     let downstream_idempotency_key = image_idempotency_key(&headers)?;
     let existing_idempotency = match downstream_idempotency_key.as_deref() {
         Some(idempotency_key) => {
@@ -96,21 +100,15 @@ async fn proxy_openai_image_generation(
         }
     }
     let preparation = async {
-        let route = state
-            .db
-            .resolve_authorized_upstream_with_hint(
-                key.key_id,
-                key.tenant_id,
-                &model,
-                "generation",
-                RouteSelectionOptions {
-                    upstream_account_hint,
-                    selection_seed: request_id,
-                },
-                state.config.key_pepper.as_bytes(),
-            )
-            .await?
-            .ok_or_else(|| AppError::Upstream("image generation route is not configured".into()))?;
+        let route = crate::generation::group_routing::prepare_route(
+            &mut state,
+            &key,
+            &model,
+            upstream_account_hint,
+            request_id,
+            request_id,
+        )
+        .await?;
         if !crate::provider::is_openai_compatible_http_driver(&route.driver) {
             return Err(AppError::Upstream(format!(
                 "generation driver {} does not implement the OpenAI Images API",
@@ -204,6 +202,7 @@ async fn proxy_openai_image_generation(
     // admission transaction is deliberately completed before the first object
     // store write, so rejected/replayed requests cannot consume archive space.
     let staged_request_object = format!("pending://synchronous/{request_id}/request");
+    let routing_snapshot = crate::generation::group_routing::snapshot(&state)?;
     let started = state
         .db
         .start_synchronous_image_request(StartSynchronousImageRequest {
@@ -218,6 +217,7 @@ async fn proxy_openai_image_generation(
             request_object: &staged_request_object,
             upstream_account_id: Some(route.account_id),
             model_route_id: Some(route.route_id),
+            routing_snapshot: routing_snapshot.as_ref(),
         })
         .await;
     let reservation = match started {
@@ -249,6 +249,9 @@ async fn proxy_openai_image_generation(
         expected_image_count: image_count,
         key_id: key.key_id,
         idempotency_key: image_idempotency.as_ref().map(|value| value.key.as_str()),
+        tenant_id: key.tenant_id,
+        submission_armed: std::sync::atomic::AtomicBool::new(false),
+        invalid_response: std::sync::atomic::AtomicBool::new(false),
     };
     match tokio::time::timeout(
         SYNCHRONOUS_IMAGE_DEADLINE,
@@ -263,6 +266,13 @@ async fn proxy_openai_image_generation(
     )
     .await
     {
+        Ok(Err(_))
+            if context
+                .submission_armed
+                .load(std::sync::atomic::Ordering::Acquire) =>
+        {
+            fail_image_request(&context, "image_submission_uncertain").await
+        }
         Ok(result) => result,
         Err(_) => fail_image_request(&context, "image_deadline_exceeded").await,
     }
