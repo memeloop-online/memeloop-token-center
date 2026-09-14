@@ -65,11 +65,6 @@ pub(in crate::api) async fn reconcile_settlement_adjustment(
         return Err(AppError::BadRequest("version must be positive".into()));
     }
     let desired_rebate_micros = parse_money_micros(&body.desired_rebate, "desired_rebate")?;
-    if desired_rebate_micros == 0 {
-        return Err(AppError::BadRequest(
-            "desired_rebate must be positive; reversals use a separate protocol".into(),
-        ));
-    }
 
     let result = state
         .db
@@ -213,5 +208,10 @@ mod tests {
         assert!(validate_decision_digest(&"a".repeat(64)).is_ok());
         assert!(validate_decision_digest(&"A".repeat(64)).is_err());
         assert!(validate_decision_digest("abc").is_err());
+    }
+
+    #[test]
+    fn desired_rebate_decimal_parser_allows_a_zero_no_op() {
+        assert_eq!(parse_money_micros("0", "desired_rebate").unwrap(), 0);
     }
 }

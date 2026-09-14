@@ -3733,10 +3733,10 @@ paths:
       operationId: reconcileSettlementAdjustment
       summary: Reconcile a forward-only attributed rebate for one immutable settlement
       description: |
-        Reconciles one positive desired rebate in a stable namespace against the immutable
+        Reconciles one non-negative desired rebate in a stable namespace against the immutable
         gross settlement identified by the path and request identity. This endpoint does
         not alter the settlement feed record, gross usage charge, or settlement identity.
-        It can only increase the attributed rebate up to the original gross cost; a
+        It can only move the attributed rebate forward up to the original gross cost; a
         reversal or a lower desired amount requires a separately authorized protocol.
 
         Requires the dedicated `settlements:adjust` scope. `credits:write` alone does
@@ -7910,7 +7910,7 @@ components:
         version: { type: integer, format: int64, minimum: 1 }
         desired_rebate:
           allOf: [{ $ref: '#/components/schemas/NonNegativeMoney' }]
-          description: Must be strictly greater than zero. It is a forward-only desired total for this settlement and namespace, not a negative charge or reversal.
+          description: A non-negative, forward-only desired total for this settlement and namespace, not a negative charge or reversal. Zero permits an initial no-op decision event; after a non-zero value, lowering it requires the separate reversal protocol.
         decision_digest: { $ref: '#/components/schemas/SettlementAdjustmentDecisionDigest' }
         source: { type: string, minLength: 1, maxLength: 200, pattern: '^[^\x00-\x1F\x7F]+$' }
     SettlementAdjustmentResult:

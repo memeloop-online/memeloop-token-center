@@ -41,7 +41,7 @@ as not found so the endpoint cannot become a tenant-discovery oracle.
 
 The request names the original `request_kind` and `request_id`, its immutable
 `currency`, a discount `namespace`, monotonically increasing `version`, and a
-positive `desired_rebate`. It also includes an opaque `decision_digest` and
+non-negative `desired_rebate`. It also includes an opaque `decision_digest` and
 operator-safe `source`. `Idempotency-Key` is mandatory. The key is scoped to
 the authenticated service/tenant and canonical request: repeating the same
 request returns the original event, while changing a request under an existing
@@ -50,7 +50,9 @@ key, supplying a stale version, or exceeding the original settled cost returns
 
 An adjustment never changes the gross settlement feed row, original usage
 amount, or settlement identity. It can only move the attributed rebate forward
-from zero up to that row's gross cost; it cannot make the usage charge negative.
+from zero up to that row's gross cost; an initial zero desired amount creates a
+durable no-op decision event, but a value cannot subsequently be lowered. It
+cannot make the usage charge negative.
 The response reports desired, delta, cumulative and remaining money amounts,
 plus opaque adjustment/event identifiers. A new reconciliation (including a
 higher desired version) returns 201; an exact idempotent replay returns 200.
