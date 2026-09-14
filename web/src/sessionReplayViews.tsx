@@ -129,7 +129,12 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
   const sourceRequests = useMemo(() => orderedRequests, [requestKey]);
 
   useEffect(() => {
-    if (!loadArchiveDetail) return undefined;
+    if (!loadArchiveDetail) {
+      archiveCache.current.clear();
+      setArchivePage({ sessionId: detail.session_id, scopeKey, values: [] });
+      setArchiveLoading(false);
+      return undefined;
+    }
     const current = ++sequence.current;
     const controller = new AbortController();
     if (archiveOwner.current.sessionId !== detail.session_id || archiveOwner.current.scopeKey !== scopeKey || archiveOwner.current.loader !== loadArchiveDetail) {
