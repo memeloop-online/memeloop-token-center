@@ -102,7 +102,8 @@ test('group strategy schema validation, CAS refresh preservation, native reset a
     assert.equal(await page.locator('.selection-chip-label').count(), 0, 'the new group must never borrow the first group members while list reload is pending');
     releaseList();
     await page.waitForFunction(() => !document.querySelector<HTMLButtonElement>('.group-editor-actions button')?.disabled);
-    assert.equal(await page.locator('.group-list .active').innerText(), 'Kimi models\n0 members');
+    assert.equal(await page.locator('.group-list .active > span').textContent(), 'Kimi models');
+    assert.equal(await page.locator('.group-list .active > small').textContent(), '0 members');
     const members = page.getByRole('combobox', { name: 'Provider members' });
     await members.fill('kimi'); await members.press('Enter'); await members.press('Escape');
     await page.locator('.group-rename input').fill('Kimi renamed');
