@@ -1,6 +1,7 @@
 mod aggregation;
 mod jobs;
 mod operator;
+mod reconcile;
 mod synchronous;
 mod terminal;
 
@@ -15,6 +16,9 @@ use super::unix_millis;
 pub use jobs::{
     AttachGenerationJobResult, CreateGenerationJobInput, CreateGenerationJobResult,
     FinishGenerationJobInput, StartGenerationJobInput,
+};
+pub use reconcile::{
+    GenerationQuarantineResolution, GenerationQuarantineView, ResolveGenerationQuarantine,
 };
 pub use synchronous::{
     AttachSynchronousImageRequestObject, FinishSynchronousImageRequest,

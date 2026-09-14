@@ -12,6 +12,8 @@ const SUPPORTED_SERVICE_SCOPES: &[&str] = &[
     "credits:write",
     "entitlements:read",
     "entitlements:write",
+    "generations:quarantine:read",
+    "generations:reconcile",
     "generations:write",
     "keys:read",
     "keys:write",

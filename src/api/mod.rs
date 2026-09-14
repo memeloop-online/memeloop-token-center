@@ -38,6 +38,7 @@ mod control_requests;
 mod credentials;
 mod diagnostics;
 mod generation;
+mod generation_quarantine;
 mod groups;
 mod health;
 mod kimi_transport;
