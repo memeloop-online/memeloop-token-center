@@ -39,7 +39,7 @@ RUN mkdir -p src/bin tests \
     && printf 'pub fn dependency_cache_marker() {}\n' > src/lib.rs \
     && printf 'fn main() {}\n' > src/bin/install-plugin-oci.rs \
     && printf 'fn main() {}\n' > tests/cucumber.rs \
-    && cargo build --locked --release --features plugin-distribution --bin install-plugin-oci \
+    && cargo build --locked --release --features plugin-distribution,experimental-plugin-revisions --bin install-plugin-oci \
     && cargo clean --release --package memeloop-token-center \
     && rm -rf src tests
 COPY src ./src
@@ -50,7 +50,7 @@ COPY wit ./wit
 # binary is built. Keep the production image context small while satisfying the
 # manifest contract; this placeholder is never compiled by the command below.
 RUN mkdir -p tests && printf 'fn main() {}\n' > tests/cucumber.rs
-RUN cargo build --locked --release --features plugin-distribution --bin install-plugin-oci \
+RUN cargo build --locked --release --features plugin-distribution,experimental-plugin-revisions --bin install-plugin-oci \
     && install -m 0755 target/release/install-plugin-oci /tmp/install-plugin-oci \
     && cp "$(gcc -print-file-name=libgcc_s.so.1)" /tmp/libgcc_s.so.1
 

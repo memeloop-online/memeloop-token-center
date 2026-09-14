@@ -20,6 +20,10 @@ test('release contains only runtime images and no retired migration delivery sur
   contains('Dockerfile.plugin-installer', 'FROM ${RUNTIME_IMAGE}');
 
   const workflow = read('.github/workflows/ci.yml');
+  const browserSteps = (parse(workflow) as Workflow).jobs?.web?.steps ?? [];
+  const cucumber = browserSteps.find((step) => step.run === 'npm run test:e2e');
+  assert.equal(cucumber?.env?.MTC_E2E_BINARY, '${{ github.workspace }}/target/debug/memeloop-token-center');
+  contains('web/e2e/server.mjs', "'--features', 'experimental-plugin-revisions'");
   assert.ok(!workflow.includes('Dockerfile.importer'));
   assert.ok(!workflow.includes('memeloop-token-center-importer'));
   assert.ok(!workflow.includes('prepare-cpamp-acceptance-bundle'));

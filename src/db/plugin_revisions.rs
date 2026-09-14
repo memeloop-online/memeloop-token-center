@@ -2,6 +2,16 @@ use super::*;
 use crate::plugin::application::ApplicationRevision;
 
 impl Database {
+    pub(crate) async fn application_plugin_history(
+        &self,
+        before: Option<i64>,
+    ) -> Result<Vec<serde_json::Value>, AppError> {
+        sqlx::query("SELECT revision,inventory_id,reason,created_at FROM application_plugin_revisions WHERE ($1 IS NULL OR revision < $1) ORDER BY revision DESC LIMIT 100")
+            .bind(before).fetch_all(&self.pool).await?.into_iter().map(|row| Ok(serde_json::json!({
+                "revision":row.try_get::<i64,_>("revision")?,"inventory_id":row.try_get::<String,_>("inventory_id")?,
+                "reason":row.try_get::<String,_>("reason")?,"created_at":row.try_get::<i64,_>("created_at")?,
+            }))).collect()
+    }
     pub(crate) async fn replay_application_plugin_operation(
         &self,
         key: &str,
@@ -80,6 +90,7 @@ impl Database {
         reason: &str,
         idempotency_key: &str,
         request_hash: &str,
+        actor: &str,
     ) -> Result<ApplicationRevision, AppError> {
         let next = expected_revision
             .checked_add(1)
@@ -124,6 +135,10 @@ impl Database {
         }
         sqlx::query("UPDATE application_plugin_operations SET result_revision = $1 WHERE idempotency_key = $2")
             .bind(next).bind(idempotency_key).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO application_plugin_audit (id,event_key,actor,action,inventory_id,revision,outcome,created_at) VALUES ($1,$2,$3,$4,$5,$6,'published',$7) ON CONFLICT(event_key) DO NOTHING")
+            .bind(Uuid::now_v7().to_string()).bind(format!("revision:{next}")).bind(actor)
+            .bind(if reason=="rollback" {"rollback"}else{"publish"}).bind(inventory_id).bind(next).bind(unix_millis())
+            .execute(&mut *tx).await?;
         tx.commit().await?;
         self.application_plugin_revision(next).await
     }

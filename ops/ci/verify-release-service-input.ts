@@ -9,14 +9,15 @@ if (directoryValue === '' || revisionValue === '') fail(SCOPE, 'directory and re
 const directory = requireCanonicalDirectory(resolve(directoryValue), SCOPE, 'release input directory');
 const revision = requireRevision(revisionValue, SCOPE);
 const manifest = parseObject(readFileSync(join(directory, 'release-service-input.json'), 'utf8'), SCOPE, 'release input manifest');
-const files = ['memeloop-token-center', 'libgcc_s.so.1', 'libstdc++.so.6'] as const;
+const files = ['memeloop-token-center', 'install-plugin-oci', 'cosign', 'libgcc_s.so.1', 'libstdc++.so.6'] as const;
 if (
   manifest.schema_version !== 1
   || manifest.revision !== revision
   || manifest.platform !== 'linux/amd64'
   || !Array.isArray(manifest.features)
-  || manifest.features.length !== 1
+  || manifest.features.length !== 2
   || manifest.features[0] !== 'experimental-plugin-revisions'
+  || manifest.features[1] !== 'plugin-distribution'
   || manifest.files === null
   || Array.isArray(manifest.files)
   || typeof manifest.files !== 'object'
