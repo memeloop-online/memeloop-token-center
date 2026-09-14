@@ -41,9 +41,11 @@
 .management-layout:has(> .create-journey) .managed-resource .credential-recovery-unavailable,
 .management-layout:has(> .create-journey) .managed-resource .account-meta .pill { border: 0; background: transparent; padding: 0; color: var(--picker-muted); font-size: 14px; }
 .credential-group-workspace .fui-AccordionHeader__button { justify-content: flex-start; }
-@media (min-width: 850px) { .create-journey .credential-form-journey { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; } }
+/* Keep identity, authorization and budget in reading order at every width. */
+.create-journey .credential-form-journey { grid-template-columns: minmax(0, 1fr); }
+.credential-authorization-fields, .credential-policy-fields { display: grid; gap: 16px; min-width: 0; }
 @media (min-width: 850px) {
-  .create-journey .route-form-sections { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+  .create-journey .route-form-sections { grid-template-columns: minmax(0, 1fr); }
   .create-journey .route-form-sections > .mtc-form-section:first-child, .create-journey .form-journey-preview { grid-column: 1 / -1; }
 }
 .managed-resource .fui-AccordionHeader__button { justify-content: flex-start; min-height: 44px; }

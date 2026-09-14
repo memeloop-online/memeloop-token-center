@@ -237,6 +237,9 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
       await create.locator(':scope > .journey-heading [data-workspace-toggle]').click();
       const routes = create.getByRole('combobox', { name: english ? 'Specific routes' : '具体路由', exact: true });
       const groups = create.getByRole('combobox', { name: english ? 'Route groups' : '路由组', exact: true });
+      await groups.waitFor();
+      assert.equal(await routes.isVisible(), false, 'route groups are the primary authorization choice; direct model grants remain available on demand');
+      await create.getByRole('button', { name: english ? 'Individual model grants (0)' : '单独授权模型（0）', exact: true }).click();
       await routes.fill('Research model');
       await routes.press('ArrowDown');
       await routes.press('Enter');

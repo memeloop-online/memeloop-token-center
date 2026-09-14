@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { createRoot } from 'react-dom/client';
 
-import { I18nProvider } from '../../src/i18n';
+import { I18nProvider, useI18n } from '../../src/i18n';
 import { MtcFluentProvider } from '../../src/design-system';
 import { CredentialsPage, ServiceCredentialsPage } from '../../src/operator/pages/ManagementPages';
 import keyCreateSchema from '../../../schemas/key-create.schema.json';
@@ -249,7 +249,8 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
 
 function Fixture() {
   const [tenant, setTenant] = useState(initialTenant);
-  if (scenario === 'client-form') return <main style={{ maxWidth: 760, margin: '0 auto', padding: 12 }}><CredentialsPage token="mts_fixture" tenant={tenant} /></main>;
+  const { locale, setLocale } = useI18n();
+  if (scenario === 'client-form') return <main style={{ maxWidth: 960, margin: '0 auto', padding: 12 }}><button data-change-locale type="button" onClick={() => setLocale(locale === 'en' ? 'zh-CN' : 'en')}>Switch language</button><CredentialsPage token="mts_fixture" tenant={tenant} /></main>;
   if (scenario === 'service-plaintext' || scenario === 'service-scope-aba' || scenario === 'service-copy') {
     return <>
       {scenario === 'service-scope-aba' && <button type="button" onClick={() => setTenant((current) => current === 'tenant-a' ? 'tenant-b' : 'tenant-a')}>Switch tenant</button>}

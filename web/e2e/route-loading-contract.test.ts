@@ -58,6 +58,7 @@ test('route credentials stay off the list critical path and load inside an opene
     assert.equal(openedCalls.filter((call) => new URL(call, 'http://fixture').pathname === '/internal/v1/keys').length, 1,
       'opening create performs one authoritative credential inventory read');
 
+    await page.getByRole('button', { name: 'Individual credential grants (0)', exact: true }).click();
     const credentialField = page.locator('.create-journey .multi-combobox').filter({
       has: page.getByRole('combobox', { name: 'Grant to specific credentials', exact: true }),
     });
