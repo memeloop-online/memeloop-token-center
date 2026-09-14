@@ -61,9 +61,9 @@ impl Database {
     }
 
     /// Projects one claimed settlement and acknowledges its outbox row in the
-    /// same transaction. It intentionally writes only append-style usage
-    /// read models; balances, prepaid budget state, and admission windows are
-    /// never touched by this path.
+    /// same transaction. It advances the account lifetime-usage state and the
+    /// append-style usage read models; balances, prepaid key-budget state, and
+    /// admission windows are never touched by this path.
     pub async fn project_claimed_metered_usage_projection_task(
         &self,
         lease_owner: Uuid,
@@ -112,6 +112,13 @@ impl Database {
                 "metered usage projection source no longer matches its settlement".into(),
             ));
         }
+        super::super::billing::project_account_usage_in_transaction(
+            &mut transaction,
+            &account_id,
+            actual_micros,
+            now,
+        )
+        .await?;
 
         // Token requests have exactly one request fact. Asynchronous generation
         // jobs have no request row and already own their generation projections,

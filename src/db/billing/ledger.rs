@@ -1,31 +1,72 @@
 use super::super::*;
 
+async fn ensure_account_usage_state(
+    transaction: &mut Transaction<'_, Any>,
+    account_id: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    // Migration-era and external importers may have created a legitimate
+    // credit account without the rollup row introduced in schema v22. Repair
+    // that invariant while the account is locked. Deriving the initial value
+    // from already-projected and prepaid ledger entries avoids double-counting
+    // metered settlements that still await their exactly-once outbox update.
+    sqlx::query(
+        "INSERT INTO account_usage_state (account_id, settled_lifetime_micros, updated_at) SELECT a.id, COALESCE((SELECT SUM(CASE WHEN l.amount_micros < 0 THEN -l.amount_micros ELSE 0 END) FROM ledger_entries l WHERE l.account_id = a.id AND l.kind = 'usage' AND NOT EXISTS (SELECT 1 FROM metered_usage_projection_outbox o WHERE o.reservation_id = l.source AND o.account_id = a.id AND o.projected_at IS NULL)), 0), $2 FROM credit_accounts a WHERE a.id = $1 ON CONFLICT(account_id) DO NOTHING",
+    )
+    .bind(account_id)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
 async fn account_usage_snapshot(
     transaction: &mut Transaction<'_, Any>,
     account_id: Uuid,
     now: i64,
 ) -> Result<i64, AppError> {
-    // Migration-era and external importers may have created a legitimate
-    // credit account without the rollup row introduced in schema v22. Repair
-    // that invariant while the account is locked. Deriving the initial value
-    // from the durable ledger, instead of blindly assuming zero, preserves the
-    // rule that a grant cannot be reversed after settled usage.
-    sqlx::query(
-        "INSERT INTO account_usage_state (account_id, settled_lifetime_micros, updated_at) SELECT a.id, COALESCE((SELECT SUM(CASE WHEN l.amount_micros < 0 THEN -l.amount_micros ELSE 0 END) FROM ledger_entries l WHERE l.account_id = a.id AND l.kind = 'usage'), 0), $2 FROM credit_accounts a WHERE a.id = $1 ON CONFLICT(account_id) DO NOTHING",
-    )
-    .bind(account_id.to_string())
-    .bind(now)
-    .execute(&mut **transaction)
-    .await?;
+    let account_id = account_id.to_string();
+    ensure_account_usage_state(transaction, &account_id, now).await?;
 
     let state = sqlx::query(
-        "SELECT settled_lifetime_micros FROM account_usage_state WHERE account_id = $1",
+        "SELECT settled_lifetime_micros + CAST(COALESCE((SELECT SUM(actual_micros) FROM metered_usage_projection_outbox WHERE account_id = $1 AND projected_at IS NULL), 0) AS BIGINT) AS settled_lifetime_micros FROM account_usage_state WHERE account_id = $1",
     )
-    .bind(account_id.to_string())
+    .bind(&account_id)
     .fetch_optional(&mut **transaction)
     .await?
     .ok_or(AppError::NotFound)?;
     Ok(state.try_get("settled_lifetime_micros")?)
+}
+
+pub(crate) async fn project_account_usage_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    account_id: &str,
+    actual_micros: i64,
+    now: i64,
+) -> Result<(), AppError> {
+    let account_lock =
+        sqlx::query("UPDATE credit_accounts SET updated_at = updated_at WHERE id = $1")
+            .bind(account_id)
+            .execute(&mut **transaction)
+            .await?;
+    if account_lock.rows_affected() != 1 {
+        return Err(AppError::Conflict(
+            "metered usage projection account no longer exists".into(),
+        ));
+    }
+    ensure_account_usage_state(transaction, account_id, now).await?;
+    let updated = sqlx::query(
+        "UPDATE account_usage_state SET settled_lifetime_micros = settled_lifetime_micros + $1, updated_at = $2 WHERE account_id = $3",
+    )
+    .bind(actual_micros)
+    .bind(now)
+    .bind(account_id)
+    .execute(&mut **transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(AppError::Internal);
+    }
+    Ok(())
 }
 
 impl Database {

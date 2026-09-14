@@ -345,7 +345,7 @@ async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_wi
     // The key-scoped assertions below prove that all of this test's rows were
     // projected exactly once.
     assert!(projected >= REQUESTS);
-    let projection_state: (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+    let projection_state: (i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
             (SELECT COUNT(*) FROM metered_usage_projection_outbox WHERE key_id = $1 AND projected_at IS NOT NULL),
             (SELECT COALESCE(SUM(requests), 0)::BIGINT FROM usage_daily_aggregates WHERE key_id = $2),
@@ -353,7 +353,8 @@ async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_wi
             (SELECT COALESCE(SUM(requests), 0)::BIGINT FROM usage_analysis_hourly WHERE key_id = $4 AND source_kind = 'request'),
             (SELECT COALESCE(SUM(requests), 0)::BIGINT FROM usage_analysis_daily WHERE key_id = $5 AND source_kind = 'request'),
             (SELECT COALESCE(SUM(requests), 0)::BIGINT FROM session_usage_totals WHERE key_id = $6),
-            (SELECT COALESCE(settled_lifetime_micros, 0) FROM key_budget_state WHERE key_id = $7)",
+            (SELECT COALESCE(settled_lifetime_micros, 0) FROM key_budget_state WHERE key_id = $7),
+            (SELECT settled_lifetime_micros FROM account_usage_state WHERE account_id = $8)",
     )
     .bind(key.key_id.to_string())
     .bind(key.key_id.to_string())
@@ -362,6 +363,7 @@ async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_wi
     .bind(key.key_id.to_string())
     .bind(key.key_id.to_string())
     .bind(key.key_id.to_string())
+    .bind(issued.account_id.to_string())
     .fetch_one(&inspection)
     .await
     .unwrap();
@@ -375,6 +377,7 @@ async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_wi
             REQUESTS as i64,
             REQUESTS as i64,
             0,
+            REQUESTS as i64 * 2,
         )
     );
 }

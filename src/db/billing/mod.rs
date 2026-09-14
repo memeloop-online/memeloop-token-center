@@ -11,6 +11,7 @@ pub use entitlements::{
     CloudRoutingGrantSnapshot, EntitlementOperation, ReconcileEntitlementInput,
     ReplaceEntitlementInput,
 };
+pub(crate) use ledger::project_account_usage_in_transaction;
 pub(crate) use settlements::{
     publish_generation_settlement_in_transaction, publish_text_settlement_in_transaction,
 };
