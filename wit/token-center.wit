@@ -68,3 +68,14 @@ world plugin {
   export traffic-policy;
   export upstream-provider;
 }
+
+/// Independent ABI: existing traffic/provider components need no new exports.
+interface group-routing-v1 {
+  plan: func(input-json: string) -> result<string, string>;
+  observe: func(input-json: string) -> result<string, string>;
+}
+
+world group-routing-plugin {
+  import host;
+  export group-routing-v1;
+}

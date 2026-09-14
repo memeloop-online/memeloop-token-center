@@ -65,6 +65,20 @@
       "additionalProperties": false,
       "properties": {
         "traffic_policy": { "type": "boolean", "default": false },
+        "group_routing": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["version", "schema", "default"],
+          "properties": {
+            "version": { "const": "group-routing-v1" },
+            "schema": {
+              "type": "object",
+              "description": "Object-root credential-free group strategy configuration schema; writeOnly fields are forbidden."
+            },
+            "default": { "type": "object" }
+          },
+          "description": "Independent group-routing-plugin WIT world. Requires a component; host validates this contribution's configuration schema and default."
+        },
         "request_rewrite": {
           "type": "boolean",
           "default": false,

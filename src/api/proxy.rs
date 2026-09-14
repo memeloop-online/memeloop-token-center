@@ -267,14 +267,34 @@ async fn next_sendable_proxy_route(
         }
         let (next_input_token_ceiling, next_output_token_ceiling) =
             candidate_reservation_bounds(&planned, original_body_length, output_choice_count)?;
-        let admission = state
-            .db
-            .claim_upstream_account_attempt_with_health_config(
+        let admission = if let Some(snapshot) = state.group_routing.as_ref()
+            && let Some(policy) = snapshot.policy(
+                planned.route.route_id,
                 planned.route.account_id,
                 planned.route.credential_generation,
-                state.config.upstream_health,
-            )
-            .await?;
+            ) {
+            state
+                .db
+                .claim_upstream_account_attempt_with_strategy(
+                    snapshot.tenant_id,
+                    planned.route.account_id,
+                    planned.route.credential_generation,
+                    state.config.upstream_health,
+                    policy.allow_probe(),
+                    Some(policy.cooldown_ms()),
+                    false,
+                )
+                .await?
+        } else {
+            state
+                .db
+                .claim_upstream_account_attempt_with_health_config(
+                    planned.route.account_id,
+                    planned.route.credential_generation,
+                    state.config.upstream_health,
+                )
+                .await?
+        };
         if let UpstreamAttemptAdmission::Unavailable {
             cooldown_until,
             probe_lease_until,
@@ -703,7 +723,7 @@ pub(super) async fn proxy(
         .metrics
         .memory_usage(crate::metrics::MemoryComponent::RequestBuffer, body.len());
     let key = authenticate_downstream(&headers, &state).await?;
-    let state = state.pin_application_plugins().await?;
+    let mut state = state.pin_application_plugins().await?;
     let proxy_lifecycle_permit = state
         .proxy_lifecycle_permits
         .clone()
@@ -745,6 +765,9 @@ pub(super) async fn proxy(
             },
         )
         .await?;
+    let strategy_candidates = (state.plugins.has_group_routing_hooks()
+        || state.db.has_group_routing_strategies(key.tenant_id).await?)
+        .then(|| candidates.clone());
     let request_context = ProxyRequestContext {
         state: &state,
         key: &key,
@@ -753,7 +776,7 @@ pub(super) async fn proxy(
         request_id,
         request_json: &request_json,
     };
-    let route_plan = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
+    let mut route_plan = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
         request: request_context,
         original_body_length: body.len(),
         candidates,
@@ -765,6 +788,41 @@ pub(super) async fn proxy(
     let attempt_budget = routing::RequestAttemptBudget::from_primary(primary, request_id)?;
     let recovery_wait_deadline =
         attempt_budget.recovery_wait_deadline(state.config.upstream_health);
+    if let Some(mut candidates) = strategy_candidates {
+        crate::group_routing::prepare(
+            &mut state,
+            key.tenant_id,
+            selection_seed,
+            request_id,
+            recovery_wait_deadline,
+            &mut candidates,
+        )
+        .await?;
+        if state.group_routing.is_some() {
+            route_plan = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
+                request: ProxyRequestContext {
+                    state: &state,
+                    key: &key,
+                    model: &model,
+                    protocol,
+                    request_id,
+                    request_json: &request_json,
+                },
+                original_body_length: body.len(),
+                candidates,
+            })
+            .await?;
+        }
+    }
+    let request_context = ProxyRequestContext {
+        state: &state,
+        key: &key,
+        model: &model,
+        protocol,
+        request_id,
+        request_json: &request_json,
+    };
+    let primary = route_plan.primary_route();
     let upstream_account_id = Some(primary.account_id);
     let model_route_id = Some(primary.route_id);
     let price = state.db.model_price(&model, &key.currency).await?;

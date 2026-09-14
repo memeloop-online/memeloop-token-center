@@ -36,8 +36,23 @@ enum Check<T> {
     Stop,
 }
 
+#[cfg(test)]
 async fn bounded_wait<T, F, Fut>(
     deadline: Instant,
+    permits: Arc<Semaphore>,
+    metrics: Option<&crate::metrics::Metrics>,
+    check: F,
+) -> Result<Option<T>, AppError>
+where
+    F: FnMut(Arc<OwnedSemaphorePermit>) -> Fut,
+    Fut: Future<Output = Result<Check<T>, AppError>>,
+{
+    bounded_wait_with_recheck(deadline, RECHECK, permits, metrics, check).await
+}
+
+async fn bounded_wait_with_recheck<T, F, Fut>(
+    deadline: Instant,
+    recheck: Duration,
     permits: Arc<Semaphore>,
     metrics: Option<&crate::metrics::Metrics>,
     mut check: F,
@@ -70,7 +85,7 @@ where
             Check::Ready(value) => return Ok(Some(value)),
             Check::Stop => return Ok(None),
             Check::Retry => {
-                tokio::time::sleep_until((Instant::now() + RECHECK).min(deadline)).await
+                tokio::time::sleep_until((Instant::now() + recheck).min(deadline)).await
             }
         }
     }
@@ -89,55 +104,95 @@ pub(in crate::api::proxy) async fn wait(
     )>,
     AppError,
 > {
-    bounded_wait(deadline, WAITERS.clone(), Some(&state.metrics), |permit| {
-        let mut route = route.clone();
-        let state = state.clone();
-        // Owned checks finish lease publication/cleanup after caller cancellation;
-        // the permit remains charged until that database work actually ends.
-        let task = tokio::spawn(async move {
-            let _permit = permit;
-            if refresh_route_snapshot(&state, &mut route).await? != PreparedRouteReadiness::Ready
-                || route
-                    .credential
-                    .expires_at()
-                    .is_some_and(|expiry| expiry <= unix_millis())
-            {
-                return Ok(Check::Stop);
-            }
-            let admission = state
-                .db
-                .claim_transient_recovery_attempt(
-                    route.account_id,
-                    route.credential_generation,
-                    state.config.upstream_health,
-                )
-                .await?;
-            match admission {
-                UpstreamAttemptAdmission::Unavailable {
-                    transient_wait_eligible: true,
-                    ..
-                } => {
-                    #[cfg(test)]
-                    test_checkpoint(route.account_id).notify_one();
-                    Ok(Check::Retry)
+    let policy = state.group_routing.as_ref().and_then(|snapshot| {
+        snapshot
+            .policy(
+                route.route_id,
+                route.account_id,
+                route.credential_generation,
+            )
+            .map(|policy| (snapshot, policy))
+    });
+    let (deadline, recheck) = policy.map_or((deadline, RECHECK), |(snapshot, policy)| {
+        (policy.wait_deadline(snapshot, deadline), policy.recheck())
+    });
+    bounded_wait_with_recheck(
+        deadline,
+        recheck,
+        WAITERS.clone(),
+        Some(&state.metrics),
+        |permit| {
+            let mut route = route.clone();
+            let state = state.clone();
+            // Owned checks finish lease publication/cleanup after caller cancellation;
+            // the permit remains charged until that database work actually ends.
+            let task = tokio::spawn(async move {
+                let _permit = permit;
+                if refresh_route_snapshot(&state, &mut route).await?
+                    != PreparedRouteReadiness::Ready
+                    || route
+                        .credential
+                        .expires_at()
+                        .is_some_and(|expiry| expiry <= unix_millis())
+                {
+                    return Ok(Check::Stop);
                 }
-                UpstreamAttemptAdmission::Unavailable { .. } => Ok(Check::Stop),
-                UpstreamAttemptAdmission::Healthy | UpstreamAttemptAdmission::Probe { .. } => {
-                    let guard = UpstreamAttemptGuard::new(
-                        &state,
-                        request_id,
+                let admission = if let Some(snapshot) = state.group_routing.as_ref()
+                    && let Some(policy) = snapshot.policy(
+                        route.route_id,
                         route.account_id,
                         route.credential_generation,
-                        admission,
-                        None,
-                    );
-                    Ok(Check::Ready((route, admission, guard)))
+                    ) {
+                    state
+                        .db
+                        .claim_upstream_account_attempt_with_strategy(
+                            snapshot.tenant_id,
+                            route.account_id,
+                            route.credential_generation,
+                            state.config.upstream_health,
+                            policy.allow_probe(),
+                            Some(policy.cooldown_ms()),
+                            true,
+                        )
+                        .await?
+                } else {
+                    state
+                        .db
+                        .claim_transient_recovery_attempt(
+                            route.account_id,
+                            route.credential_generation,
+                            state.config.upstream_health,
+                        )
+                        .await?
+                };
+                match admission {
+                    UpstreamAttemptAdmission::Unavailable {
+                        transient_wait_eligible: true,
+                        ..
+                    } => {
+                        #[cfg(test)]
+                        test_checkpoint(route.account_id).notify_one();
+                        Ok(Check::Retry)
+                    }
+                    UpstreamAttemptAdmission::Unavailable { .. } => Ok(Check::Stop),
+                    UpstreamAttemptAdmission::Healthy | UpstreamAttemptAdmission::Probe { .. } => {
+                        let guard = UpstreamAttemptGuard::new(
+                            &state,
+                            request_id,
+                            route.route_id,
+                            route.account_id,
+                            route.credential_generation,
+                            admission,
+                            None,
+                        );
+                        Ok(Check::Ready((route, admission, guard)))
+                    }
+                    UpstreamAttemptAdmission::SharedProbe { .. } => Ok(Check::Stop),
                 }
-                UpstreamAttemptAdmission::SharedProbe { .. } => Ok(Check::Stop),
-            }
-        });
-        async move { task.await.map_err(|_| AppError::Internal)? }
-    })
+            });
+            async move { task.await.map_err(|_| AppError::Internal)? }
+        },
+    )
     .await
 }
 

@@ -302,6 +302,7 @@ mod tests {
                 manifest,
                 component: None,
                 configuration_validator: Some(validator),
+                routing_validator: None,
                 identity: super::super::PluginPackageIdentity {
                     component_sha256: None,
                     provenance: None,

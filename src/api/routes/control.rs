@@ -73,6 +73,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         )
         .route("/internal/v1/plugins", get(plugin_manifests))
         .route(
+            "/internal/v1/plugins/group-routing-strategies",
+            get(super::super::plugins::group_routing_strategies),
+        )
+        .route(
             "/internal/v1/plugins/{plugin_id}/configuration",
             get(get_plugin_configuration).put(put_plugin_configuration),
         )
@@ -269,6 +273,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             put(replace_provider_group_members),
         )
         .route(
+            "/internal/v1/provider-groups/{group_id}/routing-strategy",
+            put(update_provider_group_routing_strategy),
+        )
+        .route(
             "/internal/v1/route-groups",
             get(list_route_groups).post(create_route_group),
         )
@@ -279,6 +287,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route(
             "/internal/v1/route-groups/{group_id}/members",
             put(replace_route_group_members),
+        )
+        .route(
+            "/internal/v1/route-groups/{group_id}/routing-strategy",
+            put(update_route_group_routing_strategy),
         )
         .route(
             "/internal/v1/credential-groups",

@@ -29,6 +29,7 @@ mod configuration;
 /// host-opted-in through `application` and never enabled by the production binary.
 #[cfg(feature = "experimental-plugin-revisions")]
 pub mod lifecycle;
+pub mod routing;
 mod ui_projection;
 pub use configuration::{
     ConfigurationSource, ResolvedConfigurationRevision, ResolvedTrafficSnapshot,
@@ -116,6 +117,8 @@ pub struct PluginManifest {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginContributions {
+    #[serde(default)]
+    pub group_routing: Option<routing::GroupRoutingContribution>,
     #[serde(default)]
     pub traffic_policy: bool,
     /// Runs the same post-auth component hook but explicitly declares that the
@@ -297,6 +300,7 @@ struct LoadedPlugin {
     manifest: PluginManifest,
     component: Option<Component>,
     configuration_validator: Option<crate::schema::CompiledSchema>,
+    routing_validator: Option<crate::schema::CompiledSchema>,
     #[cfg(feature = "experimental-plugin-revisions")]
     identity: PluginPackageIdentity,
 }
@@ -628,10 +632,17 @@ impl PluginRuntime {
                 .as_ref()
                 .map(|configuration| crate::schema::compile(&configuration.schema))
                 .transpose()?;
+            let routing_validator = manifest
+                .contributions
+                .group_routing
+                .as_ref()
+                .map(|routing| crate::schema::compile(&routing.schema))
+                .transpose()?;
             plugins.push(LoadedPlugin {
                 manifest,
                 component,
                 configuration_validator,
+                routing_validator,
                 #[cfg(feature = "experimental-plugin-revisions")]
                 identity,
             });
@@ -1880,6 +1891,7 @@ pub fn validate_plugin_package(directory: &Path) -> Result<PluginManifest, AppEr
 }
 
 fn validate_manifest(manifest: &PluginManifest) -> Result<(), AppError> {
+    routing::validate_contribution(manifest)?;
     if manifest.id.is_empty()
         || manifest.id.len() > MAX_PLUGIN_ID_BYTES
         || !manifest

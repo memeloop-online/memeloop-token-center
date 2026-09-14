@@ -17,6 +17,15 @@ use crate::{
     },
 };
 
+pub(super) async fn group_routing_strategies(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    require_service(&headers, &state, "routes:read").await?;
+    let state = state.pin_application_plugins().await?;
+    Ok(Json(state.plugins.group_routing_strategies()))
+}
+
 #[cfg(feature = "experimental-plugin-revisions")]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

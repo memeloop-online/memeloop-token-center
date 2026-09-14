@@ -73,6 +73,7 @@ pub(in crate::api::proxy) async fn prepare_admitted_proxy_route(
         UpstreamAttemptGuard::new(
             state,
             request_id,
+            planned.route.route_id,
             planned.route.account_id,
             planned.route.credential_generation,
             admission,
