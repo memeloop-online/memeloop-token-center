@@ -133,7 +133,11 @@ mod tests {
                 json!("canary-secret"),
                 "kimi_cached_tokens_type",
             ),
-            ("/usage/cached_tokens", json!(20), "chat_usage_invalid"),
+            (
+                "/usage/cached_tokens",
+                json!(20),
+                "usage_detail_exceeds_total",
+            ),
             (
                 "/usage/prompt_tokens_details",
                 json!({"cached_tokens":11}),
@@ -144,7 +148,7 @@ mod tests {
                 json!(123),
                 "kimi_usage_unknown_field",
             ),
-            ("/usage/total_tokens", json!(31), "chat_usage_invalid"),
+            ("/usage/total_tokens", json!(31), "usage_total_mismatch"),
             ("/choices/0/index", json!(1), "chat_choice_index"),
             (
                 "/choices/0/finish_reason",

@@ -50,6 +50,11 @@ both spellings are present they must agree. Unknown accounting fields remain
 rejected rather than assumed to be zero or assigned invented pricing semantics.
 The default OpenAI strict parser is unchanged. The same cache mapping is used
 by the Kimi Responses translator, preventing acceptance with a lost cache count.
+The shared Kimi normalizer validates required integer totals, equality and token
+limits as well as every supported detail's type/range before returning. Thus
+buffered Responses cannot bypass streaming's accounting checks. Unsupported
+accounting dimensions (including cache-write counters without a Kimi billing
+contract) are rejected, not silently omitted from a completed response.
 Native streaming Chat selects the same parser only for the authenticated route's
 `kimi-oauth` driver; it still requires its existing DONE terminal contract and
 does not synthesize a wire terminal. Kimi buffered Responses also maps the cache
