@@ -96,10 +96,10 @@ export function GroupStrategyEditor({ kind, token, tenant, group, onChanged }: {
     {pluginId && !option && !loading && <p role="alert">{t('groups.strategyUnavailable')}</p>}
     <label>{t('groups.strategyPriority')}<input type="number" step="1" min={-2147483648} max={2147483647} value={priority} disabled={saving} onChange={event => setPriority(event.target.value)} /></label>
     <p className="muted">{t('groups.strategyPriorityHelp')}</p>
-    <RjsfForm key={pluginId} idPrefix={`group-strategy-${group.id}`} schema={localizeSchema(option?.schema ?? { type: 'object', properties: {} }, locale)}
+    {pluginId ? <RjsfForm key={pluginId} idPrefix={`group-strategy-${group.id}`} schema={localizeSchema(option?.schema ?? { type: 'object', properties: {} }, locale)}
       formData={config} validator={safeValidator} templates={schemaFormTemplates} disabled={saving}
       noHtml5Validate onChange={({ formData }) => setConfig(formData ?? {})} onSubmit={({ formData }) => void save(formData ?? {})}>
       <button type="submit" disabled={saving || !token || !tenant || !validPriority || needsRefresh || Boolean(pluginId && (!option || loading || catalogError))}>{t('groups.strategySave')}</button>
-    </RjsfForm>
+    </RjsfForm> : <button type="button" disabled={saving || !token || !tenant || !validPriority || needsRefresh} onClick={() => void save({})}>{t('groups.strategySave')}</button>}
   </section>;
 }
