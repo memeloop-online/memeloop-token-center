@@ -1541,7 +1541,6 @@ struct BufferedRequest<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn execute_component_provider(
     request: BufferedRequest<'_>,
     driver: &str,

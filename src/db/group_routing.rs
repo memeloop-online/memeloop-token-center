@@ -9,6 +9,7 @@ pub(crate) struct CandidateGroupStrategy {
     pub priority: i32,
     pub version: i64,
     pub strategy: GroupRoutingStrategy,
+    pub health: String,
 }
 
 impl Database {
@@ -29,7 +30,7 @@ impl Database {
         account_id: Uuid,
     ) -> Result<Option<CandidateGroupStrategy>, AppError> {
         Ok(self
-            .candidate_group_strategies(tenant_id, &[(route_id, account_id)])
+            .candidate_group_strategies(tenant_id, &[(route_id, account_id, 1)])
             .await?
             .pop()
             .map(|(_, _, binding)| binding))
@@ -40,7 +41,7 @@ impl Database {
     pub(crate) async fn candidate_group_strategies(
         &self,
         tenant_id: Uuid,
-        candidates: &[(Uuid, Uuid)],
+        candidates: &[(Uuid, Uuid, i64)],
     ) -> Result<Vec<(Uuid, Uuid, CandidateGroupStrategy)>, AppError> {
         if candidates.is_empty() {
             return Ok(Vec::new());
@@ -51,34 +52,49 @@ impl Database {
             ));
         }
         let values = (0..candidates.len())
-            .map(|index| format!("(${},${})", index * 2 + 2, index * 2 + 3))
+            .map(|index| {
+                format!(
+                    "(${},${},CAST(${} AS BIGINT))",
+                    index * 3 + 2,
+                    index * 3 + 3,
+                    index * 3 + 4
+                )
+            })
             .collect::<Vec<_>>()
             .join(",");
-        let statement = format!("WITH input(route_id,account_id) AS (VALUES {values}), candidate_scope AS (
-            SELECT DISTINCT input.route_id, input.account_id FROM input
+        let statement = format!("WITH input(route_id,account_id,generation) AS (VALUES {values}), candidate_scope AS (
+            SELECT DISTINCT input.route_id, input.account_id,
+                CASE WHEN a.status <> 'active' OR a.credential_generation <> input.generation THEN 'authentication'
+                     WHEN COALESCE(h.consecutive_failures,0) = 0 THEN 'healthy'
+                     ELSE h.last_failure_kind END AS health
+            FROM input
             JOIN model_routes r ON r.id = input.route_id AND r.tenant_id = $1
             JOIN upstream_accounts a ON a.id = input.account_id AND a.tenant_id = $1
+            LEFT JOIN upstream_account_health h ON h.upstream_account_id = a.id AND h.credential_generation = input.generation
         ), bindings AS (
-            SELECT c.route_id, c.account_id, g.id, g.routing_priority, g.strategy_version, g.routing_strategy, 'provider' AS kind
+            SELECT c.route_id, c.account_id, g.id, g.routing_priority, g.strategy_version, g.routing_strategy, 'provider' AS kind, c.health
             FROM candidate_scope c
             JOIN model_route_included_provider_groups inclusion ON inclusion.model_route_id = c.route_id AND inclusion.tenant_id = $1
             JOIN provider_groups g ON g.id = inclusion.provider_group_id AND g.tenant_id = $1
             JOIN upstream_account_provider_groups m ON m.tenant_id = $1 AND m.provider_group_id = g.id AND m.upstream_account_id = c.account_id
             WHERE g.routing_strategy IS NOT NULL
             UNION ALL
-            SELECT c.route_id, c.account_id, g.id, g.routing_priority, g.strategy_version, g.routing_strategy, 'route' AS kind
+            SELECT c.route_id, c.account_id, g.id, g.routing_priority, g.strategy_version, g.routing_strategy, 'route' AS kind, c.health
             FROM candidate_scope c
             JOIN model_route_group_memberships m ON m.model_route_id = c.route_id AND m.tenant_id = $1
             JOIN route_groups g ON g.id = m.route_group_id AND g.tenant_id = $1
             WHERE g.routing_strategy IS NOT NULL
         ), ranked AS (
             SELECT bindings.*, ROW_NUMBER() OVER (PARTITION BY route_id, account_id ORDER BY routing_priority DESC, id ASC, kind ASC) AS position FROM bindings
-        ) SELECT route_id, account_id, id, routing_priority, strategy_version, routing_strategy, kind FROM ranked WHERE position = 1");
+        ) SELECT route_id, account_id, id, routing_priority, strategy_version, routing_strategy, kind, health FROM ranked WHERE position = 1");
         // Interpolation contains only host-generated placeholder positions;
         // every identifier value remains a bound parameter.
         let mut query = sqlx::query(sqlx::AssertSqlSafe(statement)).bind(tenant_id.to_string());
-        for (route, account) in candidates {
-            query = query.bind(route.to_string()).bind(account.to_string());
+        for (route, account, generation) in candidates {
+            query = query
+                .bind(route.to_string())
+                .bind(account.to_string())
+                .bind(*generation);
         }
         query
             .fetch_all(&self.pool)
@@ -98,6 +114,7 @@ impl Database {
                         ),
                         priority: row.try_get("routing_priority")?,
                         version: row.try_get("strategy_version")?,
+                        health: row.try_get("health")?,
                         strategy: serde_json::from_str(
                             &row.try_get::<String, _>("routing_strategy")?,
                         )

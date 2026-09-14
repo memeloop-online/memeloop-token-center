@@ -91,9 +91,36 @@ pub(crate) async fn prepare(
     deadline: tokio::time::Instant,
     candidates: &mut [AuthorizedUpstreamCandidate],
 ) -> Result<(), AppError> {
-    if !state.db.has_group_routing_strategies(tenant_id).await? {
-        return Ok(());
+    let stage_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_millis(250));
+    match tokio::time::timeout_at(
+        stage_deadline,
+        prepare_inner(
+            state,
+            tenant_id,
+            selection_seed,
+            request_id,
+            deadline,
+            candidates,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(%request_id, stage="group_routing_native_fallback", "group snapshot or execution exceeded request scheduling budget");
+            Ok(())
+        }
     }
+}
+
+async fn prepare_inner(
+    state: &mut AppState,
+    tenant_id: Uuid,
+    selection_seed: Uuid,
+    request_id: Uuid,
+    deadline: tokio::time::Instant,
+    candidates: &mut [AuthorizedUpstreamCandidate],
+) -> Result<(), AppError> {
     let started = tokio::time::Instant::now();
     // Many overlapping groups must not multiply per-component execution into
     // an unbounded request stall. Only one blocking hook is ever outstanding.
@@ -107,7 +134,13 @@ pub(crate) async fn prepare(
     }
     let candidate_ids = candidates
         .iter()
-        .map(|candidate| (candidate.route_id, candidate.account_id))
+        .map(|candidate| {
+            (
+                candidate.route_id,
+                candidate.account_id,
+                candidate.credential_generation,
+            )
+        })
         .collect::<Vec<_>>();
     let bindings = state
         .db
@@ -116,6 +149,9 @@ pub(crate) async fn prepare(
         .into_iter()
         .map(|(route, account, binding)| ((route, account), binding))
         .collect::<BTreeMap<_, _>>();
+    if bindings.is_empty() {
+        return Ok(());
+    }
     for (index, candidate) in candidates.iter().enumerate() {
         if let Some(binding) = bindings.get(&(candidate.route_id, candidate.account_id)) {
             buckets
@@ -145,26 +181,13 @@ pub(crate) async fn prepare(
         let plugin_id = members[0].2.plugin_id.clone();
         let mut inputs = Vec::new();
         for (_, candidate, _, _) in &members {
-            let health = match state
-                .db
-                .group_routing_health(
-                    tenant_id,
-                    candidate.account_id,
-                    candidate.credential_generation,
-                )
-                .await?
+            let health = match bindings
+                .get(&(candidate.route_id, candidate.account_id))
+                .map(|binding| binding.health.as_str())
             {
-                None => GroupRoutingHealth::Authentication,
-                Some(health) if health.consecutive_failures == 0 => GroupRoutingHealth::Healthy,
-                Some(health) if health.last_failure_kind == "authentication" => {
-                    GroupRoutingHealth::Authentication
-                }
-                Some(health)
-                    if matches!(
-                        health.last_failure_kind.as_str(),
-                        "connection" | "unavailable" | "invalid_response"
-                    ) =>
-                {
+                Some("healthy") => GroupRoutingHealth::Healthy,
+                Some("authentication") | None => GroupRoutingHealth::Authentication,
+                Some("connection" | "unavailable" | "invalid_response") => {
                     GroupRoutingHealth::Transient
                 }
                 Some(_) => GroupRoutingHealth::HardQuota,

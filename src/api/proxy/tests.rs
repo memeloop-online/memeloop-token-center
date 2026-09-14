@@ -25,6 +25,7 @@ mod archive_terminal;
 mod chat_sse_usage;
 mod codex_quota;
 mod filter_assistant;
+mod group_routing;
 mod ha_policy;
 mod kimi;
 mod memory_admission;
