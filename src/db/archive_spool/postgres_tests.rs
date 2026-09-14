@@ -8,7 +8,7 @@ use tokio::task::JoinHandle;
 use super::*;
 
 #[tokio::test]
-async fn postgres_request_preseal_finishes_before_the_budget_transaction() {
+async fn postgres_request_preseal_and_capture_do_not_hold_the_event_cursor() {
     use crate::{
         db::{CreateKeyInput, StartProxyRequest},
         response_archive_spool::pause_next_request_preseal_for_test,
@@ -103,6 +103,21 @@ async fn postgres_request_preseal_finishes_before_the_budget_transaction() {
         "pre-sealing before the transaction cannot expose admission facts"
     );
 
+    // Pause a real insert, not a scheduler delay. An unrelated tenant must
+    // publish an event while this admission still holds the archive budget.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION pause_request_chunk() RETURNS trigger LANGUAGE plpgsql AS $body$ BEGIN PERFORM pg_advisory_xact_lock({}); RETURN NEW; END $body$;
+         CREATE TRIGGER pause_request_chunk BEFORE INSERT ON request_archive_spool_chunks FOR EACH ROW EXECUTE FUNCTION pause_request_chunk();",
+        fixture.gate
+    )))
+    .execute(&fixture.db.pool).await.unwrap();
+    let mut chunk_gate = fixture.db.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(fixture.gate)
+        .execute(&mut *chunk_gate)
+        .await
+        .unwrap();
+
     release.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -122,11 +137,56 @@ async fn postgres_request_preseal_finishes_before_the_budget_transaction() {
     .await
     .expect("admission must wait at the original budget-first boundary");
     budget_holder.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock' AND wait_event = 'advisory' AND query LIKE 'INSERT INTO request_archive_spool_chunks%'",
+            )
+            .bind(&fixture.schema).fetch_one(&fixture.admin).await.unwrap();
+            if waiting == 1 { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("admission must reach the real chunk insert barrier");
+    let mut other_tenant = fixture.db.pool.begin().await.unwrap();
+    let other_request = Uuid::new_v4().to_string();
+    let other_tenant_id = Uuid::new_v4().to_string();
+    let other_key_id = Uuid::new_v4().to_string();
+    let cursor = tokio::time::timeout(
+        Duration::from_secs(2),
+        allocate_request_event_cursor(
+            &mut other_tenant,
+            4_000_000_000_000,
+            &other_tenant_id,
+            &other_key_id,
+            &other_request,
+        ),
+    )
+    .await
+    .expect("archive insertion must not hold the cross-tenant event cursor")
+    .unwrap();
+    sqlx::query("INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, 'started', 'openai', 'cursor-contract', 0, 0, 0)")
+        .bind(&cursor.event_id).bind(other_tenant_id).bind(other_key_id).bind(other_request).bind(cursor.event_at)
+        .execute(&mut *other_tenant).await.unwrap();
+    other_tenant.commit().await.unwrap();
+    chunk_gate.commit().await.unwrap();
     let reservation = tokio::time::timeout(Duration::from_secs(5), producer)
         .await
         .expect("admission must finish after the budget is released")
         .unwrap()
         .unwrap();
+    let admission_cursor =
+        sqlx::query("SELECT event_at, event_id FROM request_events WHERE request_id = $1")
+            .bind(request_id.to_string())
+            .fetch_one(&fixture.db.pool)
+            .await
+            .unwrap();
+    assert!(
+        (
+            admission_cursor.get::<i64, _>("event_at"),
+            admission_cursor.get::<String, _>("event_id")
+        ) > (cursor.event_at, cursor.event_id),
+        "cursor order must follow the unrelated tenant's earlier commit"
+    );
     let row = sqlx::query(
         "SELECT s.chunk_count, s.reservation_id, b.cipher_bytes, b.request_cipher_bytes FROM request_archive_spools s CROSS JOIN response_archive_spool_budget b WHERE s.request_id = $1 AND b.singleton = 1",
     )

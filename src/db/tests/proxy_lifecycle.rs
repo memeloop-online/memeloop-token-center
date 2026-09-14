@@ -71,6 +71,8 @@ async fn buffered_conversation_content_wait_does_not_hold_archive_budget() {
     .execute(&mut *blocker)
     .await
     .unwrap();
+    let (response_presealed, release_response_preseal) =
+        crate::response_archive_spool::pause_next_request_preseal_for_test(request_id);
     let finish_database = database.clone();
     let mut finish = tokio::spawn(async move {
         use crate::response_archive_spool::{BufferedArchive, BufferedArchivePurpose};
@@ -119,6 +121,19 @@ async fn buffered_conversation_content_wait_does_not_hold_archive_budget() {
             )
             .await
     });
+    tokio::time::timeout(std::time::Duration::from_secs(5), response_presealed)
+        .await
+        .expect("response ciphertext must be prepared before the terminal transaction")
+        .unwrap();
+    let (preseal_budget, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        database.spool_transaction(),
+    )
+    .await
+    .expect("response pre-sealing must not hold the archive budget")
+    .unwrap();
+    preseal_budget.rollback().await.unwrap();
+    release_response_preseal.send(()).unwrap();
     let waiting = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             let waiting: i64 = sqlx::query_scalar(
