@@ -82,6 +82,18 @@ alive; losing ownership cancels its subprocess. Each package has a three-hour
 hard ceiling, covering 64 layers/config/manifest (each network operation is
 bounded at 120 seconds), eight signing-key attempts and local validation. The
 complete set has no shorter aggregate deadline that would starve later packages.
+The three-hour bound covers the entire package, including checkpoint reuse,
+subprocess verification, shared-volume hashing and database progress writes.
+Preparation and final review each have a 60-second bound, as do individual
+checkpoint reads. An outer attempt ceiling is the package count times three
+hours plus two minutes. Any deadline ends renewal; a bounded terminal database
+write releases the claim, or its last lease expires if the database is unavailable.
+Blocking filesystem I/O cannot necessarily be canceled by Rust. Such work retains
+one separate installation-storage/validation permit until the OS call returns;
+it does not retain the installation database lease or the request/staging
+compilation permit. Further installation I/O may return overload until storage
+recovers. This explicitly bounds retained work instead of detaching unlimited
+threads or pretending a timed-out join handle stopped an OS read.
 Restart/lease expiry produces an `interrupted` state; operators can retry
 the existing task without retaining a browser-generated idempotency key. Retry
 uses database checkpoints for completed packages: unchanged current signing

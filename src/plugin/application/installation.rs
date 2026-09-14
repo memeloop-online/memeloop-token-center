@@ -9,8 +9,13 @@ const INSTALLER: &str = "/usr/local/bin/install-plugin-oci";
 // 64 layers plus config/manifest and up to eight signature-key attempts. Bound
 // each package, not the aggregate; committed packages survive interrupted work.
 const PACKAGE_DEADLINE: Duration = Duration::from_secs(3 * 60 * 60);
+const STORAGE_DEADLINE: Duration = Duration::from_secs(60);
 const LEASE_RENEWAL: Duration = Duration::from_secs(30);
 static INSTALL_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+// An uninterruptible filesystem read retains this permit until it actually
+// returns. Never share it with request pinning/staging compilation admission.
+static INSTALL_STORAGE_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
 
 #[derive(Deserialize)]
@@ -274,21 +279,27 @@ impl ApplicationPlugins {
             let attempt_id = record.attempt_id.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let work = authority.perform_install(&id, &attempt_id, &input, &policy);
+                let attempt_deadline =
+                    PACKAGE_DEADLINE * input.packages.len() as u32 + STORAGE_DEADLINE * 2;
+                let work = bounded_install_phase(
+                    attempt_deadline,
+                    authority.perform_install(&id, &attempt_id, &input, &policy),
+                );
                 let result = authority
                     .with_installation_lease(&id, &attempt_id, work)
                     .await;
                 let review = result.ok();
-                let _ = authority
-                    .db
-                    .finish_plugin_installation(
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    authority.db.finish_plugin_installation(
                         &id,
                         &attempt_id,
                         review
                             .as_ref()
                             .map(|(digest, value)| (digest.as_str(), value)),
-                    )
-                    .await;
+                    ),
+                )
+                .await;
             });
         }
         Ok(record)
@@ -301,81 +312,102 @@ impl ApplicationPlugins {
         input: &InstallPluginRequest,
         policy: &InstallPolicy,
     ) -> Result<(String, serde_json::Value), AppError> {
-        let trust = trust_digest(policy).await?;
         let inventory_root = policy.plugin_root.join(&input.inventory_id);
-        tokio::fs::create_dir_all(&policy.plugin_root)
+        let (trust, mut checkpoints) = bounded_install_phase(STORAGE_DEADLINE, async {
+            let trust = trust_digest(policy).await?;
+            tokio::fs::create_dir_all(&policy.plugin_root)
+                .await
+                .map_err(|_| AppError::Internal)?;
+            let parent = tokio::fs::symlink_metadata(&policy.plugin_root)
+                .await
+                .map_err(|_| AppError::Internal)?;
+            if !parent.is_dir() || parent.file_type().is_symlink() {
+                return Err(AppError::Forbidden);
+            }
+            let claim_root = inventory_root.clone();
+            let owner = operation_id.to_owned();
+            let permit = tokio::time::timeout(
+                ADMISSION_WAIT,
+                INSTALL_STORAGE_PERMITS.clone().acquire_owned(),
+            )
             .await
+            .map_err(|_| AppError::Overloaded)?
             .map_err(|_| AppError::Internal)?;
-        let parent = tokio::fs::symlink_metadata(&policy.plugin_root)
-            .await
-            .map_err(|_| AppError::Internal)?;
-        if !parent.is_dir() || parent.file_type().is_symlink() {
-            return Err(AppError::Forbidden);
-        }
-        let claim_root = inventory_root.clone();
-        let owner = operation_id.to_owned();
-        tokio::task::spawn_blocking(move || claim_inventory_root(&claim_root, &owner))
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                claim_inventory_root(&claim_root, &owner)
+            })
             .await
             .map_err(|_| AppError::Internal)??;
-        let mut checkpoints = self.db.plugin_installation(operation_id).await?.checkpoints;
+            let checkpoints = self.db.plugin_installation(operation_id).await?.checkpoints;
+            Ok((trust, checkpoints))
+        })
+        .await?;
         for reference in &input.packages {
-            if let Some(checkpoint) = checkpoints.get(reference) {
-                if checkpoint_matches(&inventory_root, reference, &trust, checkpoint).await? {
-                    continue;
+            bounded_install_phase(PACKAGE_DEADLINE, async {
+                if let Some(checkpoint) = checkpoints.get(reference) {
+                    if checkpoint_matches(&inventory_root, reference, &trust, checkpoint).await? {
+                        return Ok(());
+                    }
                 }
-            }
-            let mut command = tokio::process::Command::new(INSTALLER);
-            command
-                .arg(reference)
-                .arg("--plugin-dir")
-                .arg(&policy.plugin_root)
-                .arg("--inventory-id")
-                .arg(&input.inventory_id)
-                .env_clear()
-                // Only fixed runtime loader/search paths cross the process
-                // boundary; service tokens and unrelated host settings do not.
-                .env("LD_LIBRARY_PATH", "/usr/local/lib")
-                .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .kill_on_drop(true);
-            for source in &policy.allowed_sources {
-                command.arg("--allowed-source").arg(source);
-            }
-            for key in &policy.cosign_public_keys {
-                command.arg("--cosign-public-key").arg(key);
-            }
-            if let Some(credentials) = policy.credentials_for(reference) {
-                credentials.apply(&mut command);
-            }
-            if !tokio::time::timeout(PACKAGE_DEADLINE, command.status())
-                .await
-                .map_err(|_| AppError::Overloaded)?
-                .map_err(|_| AppError::Internal)?
-                .success()
-            {
-                return Err(AppError::Internal);
-            }
-            let checkpoint = package_checkpoint(&inventory_root, reference, &trust).await?;
-            checkpoints.insert(reference.clone(), checkpoint);
-            self.db
-                .checkpoint_plugin_installation(operation_id, attempt_id, &checkpoints)
-                .await?;
-        }
-        let runtime = self
-            .review_runtime(policy.plugin_root.join(&input.inventory_id))
+                let mut command = tokio::process::Command::new(INSTALLER);
+                command
+                    .arg(reference)
+                    .arg("--plugin-dir")
+                    .arg(&policy.plugin_root)
+                    .arg("--inventory-id")
+                    .arg(&input.inventory_id)
+                    .env_clear()
+                    // Only fixed runtime loader/search paths cross the process
+                    // boundary; service tokens and unrelated host settings do not.
+                    .env("LD_LIBRARY_PATH", "/usr/local/lib")
+                    .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .kill_on_drop(true);
+                for source in &policy.allowed_sources {
+                    command.arg("--allowed-source").arg(source);
+                }
+                for key in &policy.cosign_public_keys {
+                    command.arg("--cosign-public-key").arg(key);
+                }
+                if let Some(credentials) = policy.credentials_for(reference) {
+                    credentials.apply(&mut command);
+                }
+                if !command
+                    .status()
+                    .await
+                    .map_err(|_| AppError::Internal)?
+                    .success()
+                {
+                    return Err(AppError::Internal);
+                }
+                let checkpoint = package_checkpoint(&inventory_root, reference, &trust).await?;
+                checkpoints.insert(reference.clone(), checkpoint);
+                self.db
+                    .checkpoint_plugin_installation(operation_id, attempt_id, &checkpoints)
+                    .await?;
+                Ok(())
+            })
             .await?;
-        let digest = review_digest(&runtime, &trust)?;
-        let review = json!({"plugins":runtime.manifests()});
-        if serde_json::to_vec(&review)
-            .map_err(|_| AppError::Internal)?
-            .len()
-            > 4 * 1024 * 1024
-        {
-            return Err(AppError::Forbidden);
         }
-        Ok((digest, review))
+        bounded_install_phase(STORAGE_DEADLINE, async {
+            let runtime = self
+                .review_runtime(policy.plugin_root.join(&input.inventory_id))
+                .await?;
+            let digest = review_digest(&runtime, &trust)?;
+            let review = json!({"plugins":runtime.manifests()});
+            if serde_json::to_vec(&review)
+                .map_err(|_| AppError::Internal)?
+                .len()
+                > 4 * 1024 * 1024
+            {
+                return Err(AppError::Forbidden);
+            }
+            Ok((digest, review))
+        })
+        .await
     }
 
     async fn with_installation_lease<T>(
@@ -389,11 +421,13 @@ impl ApplicationPlugins {
 
     async fn review_runtime(&self, root: PathBuf) -> Result<PluginRuntime, AppError> {
         let db = self.db.clone();
-        let permit =
-            tokio::time::timeout(ADMISSION_WAIT, COMPILATION_PERMITS.clone().acquire_owned())
-                .await
-                .map_err(|_| AppError::Overloaded)?
-                .map_err(|_| AppError::Internal)?;
+        let permit = tokio::time::timeout(
+            ADMISSION_WAIT,
+            INSTALL_STORAGE_PERMITS.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| AppError::Overloaded)?
+        .map_err(|_| AppError::Internal)?;
         let task = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let metadata = std::fs::symlink_metadata(&root).map_err(|_| AppError::Internal)?;
@@ -478,6 +512,15 @@ impl ApplicationPlugins {
             .register_plugin_installation(id, digest, actor)
             .await
     }
+}
+
+async fn bounded_install_phase<T>(
+    deadline: Duration,
+    work: impl std::future::Future<Output = Result<T, AppError>>,
+) -> Result<T, AppError> {
+    tokio::time::timeout(deadline, work)
+        .await
+        .map_err(|_| AppError::Overloaded)?
 }
 
 async fn run_with_lease<T, R: std::future::Future<Output = Result<(), AppError>>>(
@@ -621,11 +664,14 @@ async fn package_checkpoint(
     let root = root.to_owned();
     let reference = reference.to_owned();
     let trust = trust.to_owned();
-    let permit = tokio::time::timeout(ADMISSION_WAIT, COMPILATION_PERMITS.clone().acquire_owned())
-        .await
-        .map_err(|_| AppError::Overloaded)?
-        .map_err(|_| AppError::Internal)?;
-    tokio::task::spawn_blocking(move || {
+    let permit = tokio::time::timeout(
+        ADMISSION_WAIT,
+        INSTALL_STORAGE_PERMITS.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| AppError::Overloaded)?
+    .map_err(|_| AppError::Internal)?;
+    let task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         use std::io::Read;
         let (source, digest) = reference.rsplit_once('@').ok_or(AppError::Forbidden)?;
@@ -673,9 +719,11 @@ async fn package_checkpoint(
             });
         }
         found.ok_or(AppError::Forbidden)
-    })
-    .await
-    .map_err(|_| AppError::Internal)?
+    });
+    tokio::time::timeout(STORAGE_DEADLINE, task)
+        .await
+        .map_err(|_| AppError::Overloaded)?
+        .map_err(|_| AppError::Internal)?
 }
 
 async fn checkpoint_matches(
@@ -1439,5 +1487,89 @@ mod tests {
             checkpoints[reference].tree_digest
         );
         assert_ne!(active.attempt_id, retry.attempt_id);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_checkpoint_is_bounded_and_stops_lease_renewal() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let renewals = AtomicUsize::new(0);
+        // This represents a successful installer followed by a checkpoint
+        // read/DB write that never resolves, not a pending subprocess.
+        let package = bounded_install_phase(PACKAGE_DEADLINE, async {
+            std::future::ready(Ok::<(), AppError>(())).await?;
+            std::future::pending::<Result<(), AppError>>().await
+        });
+        let result = run_with_lease(package, || {
+            renewals.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(()))
+        })
+        .await;
+        assert!(result.is_err());
+        let stopped = renewals.load(Ordering::SeqCst);
+        assert!(stopped > 1);
+        tokio::time::advance(Duration::from_secs(540)).await;
+        assert_eq!(renewals.load(Ordering::SeqCst), stopped);
+        assert!(
+            bounded_install_phase(
+                STORAGE_DEADLINE,
+                std::future::pending::<Result<(), AppError>>()
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_storage_work_releases_database_installation_claim() {
+        let (_directory, state, _, _) = fixture().await;
+        let packages = json!([format!("ghcr.io/example/new@sha256:{}", "c".repeat(64))]);
+        let (old, _) = state
+            .db
+            .begin_plugin_installation(
+                "hung",
+                &packages,
+                "hash",
+                "hung-key",
+                "bootstrap",
+                crate::db::unix_millis() + 270000,
+            )
+            .await
+            .unwrap();
+        let authority = state.application_plugins.as_ref().unwrap();
+        let result = authority
+            .with_installation_lease(
+                &old.id,
+                &old.attempt_id,
+                bounded_install_phase(
+                    Duration::from_millis(1),
+                    std::future::pending::<Result<(), AppError>>(),
+                ),
+            )
+            .await;
+        assert!(result.is_err());
+        // The production task uses this same terminal operation after the
+        // bounded work returns, without any renewal running alongside it.
+        state
+            .db
+            .finish_plugin_installation(&old.id, &old.attempt_id, None)
+            .await
+            .unwrap();
+        let (_, run) = state
+            .db
+            .begin_plugin_installation(
+                "next",
+                &packages,
+                "next-hash",
+                "next-key",
+                "bootstrap",
+                crate::db::unix_millis() + 270000,
+            )
+            .await
+            .unwrap();
+        assert!(
+            run,
+            "another installation must be able to acquire the global lock"
+        );
+        assert!(!Arc::ptr_eq(&INSTALL_STORAGE_PERMITS, &COMPILATION_PERMITS));
     }
 }
