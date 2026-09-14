@@ -9,7 +9,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Pull requests share a group by PR number so a new head cancels only its
+  # obsolete run. Every push receives its own group: master validation can
+  # therefore overlap, while the publisher still emits only immutable SHA tags.
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('push-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -442,9 +445,10 @@ jobs:
 
   memory-acceptance:
     if: needs.changes.outputs.memory == 'true'
-    # Do not spend the long-running harness budget on a revision that already
-    # failed a source, browser, migration, or security gate.
-    needs: [changes, memory-binary, rust, web, migration-smoke, api-contract, dependency-security, repository-security]
+    # The harness consumes only the sealed same-run binary. Keep its critical
+    # path independent from unrelated Rust, browser, migration, and security
+    # gates; publish still waits for every existing release check below.
+    needs: [changes, memory-binary]
     permissions:
       contents: read
     uses: ./.github/workflows/memory-acceptance.yml

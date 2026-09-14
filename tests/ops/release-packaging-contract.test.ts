@@ -6,6 +6,10 @@ import { contains, occurrences, read, repository, run } from './contract-helpers
 
 type WorkflowStep = { id?: string; if?: string; name?: string; uses?: string; run?: string; with?: Record<string, unknown>; env?: Record<string, unknown> };
 type WorkflowJob = { if?: string; needs?: string | string[]; steps?: WorkflowStep[]; uses?: string; with?: Record<string, unknown> };
+type Workflow = {
+  concurrency?: { group?: string; 'cancel-in-progress'?: boolean | string };
+  jobs?: Record<string, WorkflowJob>;
+};
 
 test('release contains only runtime images and no retired migration delivery surface', () => {
   const dockerfile = read('Dockerfile');
@@ -38,7 +42,12 @@ test('release contains only runtime images and no retired migration delivery sur
   for (const line of uses) assert.match(line, /uses:\s+(?:\.\/\S+|\S+@[0-9a-fA-F]{40}\s+#\s+\S+)/, `unpinned action: ${line}`);
   assert.equal(occurrences(workflows, 'actions/checkout@'), occurrences(workflows, 'persist-credentials: false'));
 
-  const parsed = parse(workflow) as { jobs?: Record<string, WorkflowJob> };
+  const parsed = parse(workflow) as Workflow;
+  assert.match(parsed.concurrency?.group ?? '', /^ci-\$\{\{ github\.workflow \}\}-/);
+  assert.match(parsed.concurrency?.group ?? '', /github\.event_name == 'pull_request'/);
+  assert.match(parsed.concurrency?.group ?? '', /github\.event\.pull_request\.number/);
+  assert.match(parsed.concurrency?.group ?? '', /github\.run_id/);
+  assert.equal(parsed.concurrency?.['cancel-in-progress'], "${{ github.event_name == 'pull_request' }}");
   const memoryBinary = parsed.jobs?.['memory-binary'];
   const memoryAcceptance = parsed.jobs?.['memory-acceptance'];
   const rust = parsed.jobs?.rust;
@@ -54,6 +63,10 @@ test('release contains only runtime images and no retired migration delivery sur
   assert.ok(migration?.needs?.includes('changes'));
   assert.ok(memoryBinary?.needs?.includes('changes'));
   assert.ok(memoryAcceptance?.needs?.includes('memory-binary'));
+  const memoryAcceptanceNeeds = Array.isArray(memoryAcceptance?.needs)
+    ? memoryAcceptance.needs
+    : memoryAcceptance?.needs === undefined ? [] : [memoryAcceptance.needs];
+  assert.deepEqual(new Set(memoryAcceptanceNeeds), new Set(['changes', 'memory-binary']));
   assert.equal(memoryAcceptance?.uses, './.github/workflows/memory-acceptance.yml');
   assert.equal(memoryAcceptance?.with?.binary_artifact, 'memory-binary-${{ github.sha }}');
   for (const jobName of ['repository-security', 'dependency-security', 'api-contract', 'packaging']) {
