@@ -2053,7 +2053,7 @@ mod tests {
             flow_now + 3_000,
             true,
             &endpoints,
-            &TEST_OAUTH_REFRESH_REQUEST_GUARD,
+            &crate::oauth::TEST_OAUTH_REFRESH_REQUEST_GUARD,
         )
         .await
         .unwrap();
