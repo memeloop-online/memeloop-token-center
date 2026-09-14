@@ -298,6 +298,7 @@ fn take_append_failure_for_test(state: &AppState) -> bool {
 }
 
 pub(crate) struct ResponseArchiveProducer {
+    #[cfg(test)]
     state: AppState,
     sender: Option<tokio::sync::mpsc::Sender<Bytes>>,
     terminal: Option<tokio::sync::oneshot::Sender<Bytes>>,
@@ -408,6 +409,7 @@ impl ResponseArchiveProducer {
             Some(active.clone()),
         );
         Some(Self {
+            #[cfg(test)]
             state: state.clone(),
             sender: Some(sender),
             terminal: Some(terminal),
