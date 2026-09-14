@@ -6,6 +6,146 @@ use sqlx::{AnyPool, any::AnyPoolOptions};
 use tokio::task::JoinHandle;
 
 use super::*;
+
+#[tokio::test]
+async fn postgres_request_preseal_finishes_before_the_budget_transaction() {
+    use crate::{
+        db::{CreateKeyInput, StartProxyRequest},
+        response_archive_spool::pause_next_request_preseal_for_test,
+    };
+
+    let Some(fixture) = PgFixture::new_with_schema(true).await else {
+        return;
+    };
+    let pepper = b"durable-admission-test-pepper-over-32-bytes";
+    let issued = fixture
+        .db
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "request-preseal".into(),
+                principal_external_id: "member".into(),
+                alias: "request-preseal".into(),
+                currency: "USD".into(),
+                policy: crate::model::KeyPolicy::default(),
+                initial_balance: rust_decimal::Decimal::ONE,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = fixture
+        .db
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let price = fixture
+        .db
+        .upsert_model_price(
+            "request-preseal",
+            "USD",
+            rust_decimal::Decimal::ONE,
+            rust_decimal::Decimal::ONE,
+        )
+        .await
+        .unwrap();
+    let request_id = Uuid::new_v4();
+    let locator = format!("gap://{request_id}/request");
+    let body = bytes::Bytes::from(vec![b'x'; 16 * crate::response_archive_spool::CHUNK_BYTES]);
+    let (presealed, release) = pause_next_request_preseal_for_test(request_id);
+    let task_db = fixture.db.clone();
+    let producer = tokio::spawn(async move {
+        task_db
+            .start_proxy_request_with_archive(
+                StartProxyRequest {
+                    request_id,
+                    key: &key,
+                    price: &price,
+                    input_token_ceiling: 7,
+                    output_token_ceiling: 11,
+                    protocol: "openai",
+                    model: "request-preseal",
+                    request_object: &locator,
+                    upstream_account_id: None,
+                    model_route_id: None,
+                },
+                &body,
+                pepper,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), presealed)
+        .await
+        .expect("the first ciphertext batch must finish before database admission")
+        .unwrap();
+
+    // If pre-sealing regresses below spool_transaction(), this independent
+    // budget acquisition blocks and the bounded assertion fails.
+    let mut budget_holder = fixture.db.pool.begin().await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        sqlx::query(
+            "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1 FOR UPDATE",
+        )
+        .execute(&mut *budget_holder),
+    )
+    .await
+    .expect("pre-sealing must not hold the global archive budget")
+    .unwrap();
+    let admission_facts: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM usage_reservations) + (SELECT COUNT(*) FROM request_records) + (SELECT COUNT(*) FROM request_archive_spools)",
+    )
+    .fetch_one(&fixture.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        admission_facts, 0,
+        "pre-sealing before the transaction cannot expose admission facts"
+    );
+
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock' AND query LIKE 'SELECT cipher_bytes FROM response_archive_spool_budget%FOR UPDATE%'",
+            )
+            .bind(&fixture.schema)
+            .fetch_one(&fixture.admin)
+            .await
+            .unwrap();
+            if waiting == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("admission must wait at the original budget-first boundary");
+    budget_holder.commit().await.unwrap();
+    let reservation = tokio::time::timeout(Duration::from_secs(5), producer)
+        .await
+        .expect("admission must finish after the budget is released")
+        .unwrap()
+        .unwrap();
+    let row = sqlx::query(
+        "SELECT s.chunk_count, s.reservation_id, b.cipher_bytes, b.request_cipher_bytes FROM request_archive_spools s CROSS JOIN response_archive_spool_budget b WHERE s.request_id = $1 AND b.singleton = 1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&fixture.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<i64, _>("chunk_count"), 16);
+    assert_eq!(
+        row.get::<String, _>("reservation_id"),
+        reservation.id.to_string()
+    );
+    assert_eq!(
+        row.get::<i64, _>("cipher_bytes"),
+        row.get::<i64, _>("request_cipher_bytes")
+    );
+    fixture.finish().await;
+}
+
 #[tokio::test]
 async fn postgres_request_admission_lost_commit_ack_never_dispatches_and_orphan_settles_once() {
     use crate::db::{CreateKeyInput, StartProxyRequest};

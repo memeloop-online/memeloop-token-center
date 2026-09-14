@@ -175,6 +175,13 @@ impl Database {
                     .map_err(|_| AppError::Overloaded)
             })
             .transpose()?;
+        // Prepare the existing bounded first insert batch before opening the
+        // budget-first transaction. Cancellation here leaves no admission
+        // facts, and the ciphertext is dropped with this future.
+        let prepared_request_batch = match buffered_archive.as_ref() {
+            Some(archive) => Some(archive.prepare_first_batch().await?),
+            None => None,
+        };
         // Always acquire the spool budget before request/account locks, matching
         // the archive worker's budget -> request lock order.
         let (mut transaction, now) = if archive.is_some() {
@@ -215,9 +222,15 @@ impl Database {
             return Err(error);
         }
         if let Some(archive) = buffered_archive {
+            let prepared_request_batch = prepared_request_batch.ok_or(AppError::Internal)?;
             let capture_started = std::time::Instant::now();
             if !self
-                .capture_buffered_archive_body_in_transaction(&mut transaction, now, &archive)
+                .capture_buffered_archive_body_in_transaction(
+                    &mut transaction,
+                    now,
+                    &archive,
+                    Some(prepared_request_batch),
+                )
                 .await
                 .map_err(|_| AppError::Overloaded)?
             {
@@ -229,6 +242,8 @@ impl Database {
                 );
                 return Err(AppError::Overloaded);
             }
+        } else if prepared_request_batch.is_some() {
+            return Err(AppError::Internal);
         }
         // No cancellation deadline: only a positively observed COMMIT permits
         // dispatch. Unknown COMMIT returns unavailable, leaving orphan recovery
@@ -984,7 +999,7 @@ impl Database {
         if let Some(archive) = buffered_archive {
             let capture_started = std::time::Instant::now();
             if !self
-                .capture_buffered_archive_body_in_transaction(&mut transaction, now, archive)
+                .capture_buffered_archive_body_in_transaction(&mut transaction, now, archive, None)
                 .await?
             {
                 tracing::warn!(

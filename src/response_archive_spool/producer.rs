@@ -7,6 +7,23 @@ use std::sync::{
 
 use crate::{AppState, db::ArchiveSpoolIdentity, error::AppError};
 
+// Deliberately no Debug: prepared ciphertext must not enter logs.
+pub(crate) struct PreparedArchiveBatch {
+    identity: ArchiveSpoolIdentity,
+    purpose: super::BufferedArchivePurpose,
+    chunks: Vec<crate::db::ArchiveSpoolChunk>,
+}
+
+impl PreparedArchiveBatch {
+    pub(crate) fn into_chunks_for(
+        self,
+        archive: &BufferedArchive<'_>,
+    ) -> Option<Vec<crate::db::ArchiveSpoolChunk>> {
+        (self.identity == archive.identity && self.purpose == archive.purpose)
+            .then_some(self.chunks)
+    }
+}
+
 /// A replayable buffered capture. Only the response bytes and 12-byte random
 /// nonces are retained; ciphertext is generated in bounded database batches.
 pub(crate) struct BufferedArchive<'a> {
@@ -76,6 +93,72 @@ impl<'a> BufferedArchive<'a> {
         )?;
         debug_assert_eq!(Some(sealed.len()), self.sealed_len(bytes.len()));
         Ok(sealed)
+    }
+
+    /// Prepare only the existing bounded first database batch before any
+    /// archive/account transaction is opened. This keeps peak ciphertext
+    /// memory unchanged while removing encryption and bind construction from
+    /// the global budget lock for the common one-batch request.
+    pub(crate) async fn prepare_first_batch(&self) -> Result<PreparedArchiveBatch, AppError> {
+        let chunks = (0..self.nonces.len().min(super::CAPTURE_INSERT_BATCH_CHUNKS))
+            .map(|seq| {
+                let start = seq
+                    .checked_mul(super::CHUNK_BYTES)
+                    .ok_or(AppError::Internal)?;
+                let end = (start + super::CHUNK_BYTES).min(self.body.len());
+                Ok(crate::db::ArchiveSpoolChunk {
+                    seq: i64::try_from(seq).map_err(|_| AppError::Internal)?,
+                    ciphertext: self.seal(seq)?,
+                    byte_count: i64::try_from(end - start).map_err(|_| AppError::Internal)?,
+                })
+            })
+            .collect::<Result<Vec<_>, AppError>>()?;
+        #[cfg(test)]
+        pause_request_preseal_for_test(self.identity.request_id).await;
+        Ok(PreparedArchiveBatch {
+            identity: self.identity,
+            purpose: self.purpose,
+            chunks,
+        })
+    }
+}
+
+#[cfg(test)]
+type RequestPresealPause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(test)]
+static PAUSE_REQUEST_PRESEAL: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<uuid::Uuid, RequestPresealPause>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn pause_next_request_preseal_for_test(
+    request_id: uuid::Uuid,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered, entering) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let mut pauses = PAUSE_REQUEST_PRESEAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(pauses.insert(request_id, (entered, released)).is_none());
+    (entering, release)
+}
+
+#[cfg(test)]
+async fn pause_request_preseal_for_test(request_id: uuid::Uuid) {
+    let pause = PAUSE_REQUEST_PRESEAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&request_id);
+    if let Some((entered, released)) = pause {
+        let _ = entered.send(());
+        let _ = released.await;
     }
 }
 
