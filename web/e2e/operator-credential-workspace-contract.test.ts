@@ -155,6 +155,9 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     await filters.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await filters.goto(fixture('client-filter'));
     await filters.getByText('Recent client', { exact: true }).waitFor();
+    const initialKeyQuery = (await calls(filters)).find(call => new URL(call, 'http://fixture.invalid').pathname === '/internal/v1/keys');
+    assert.ok(initialKeyQuery);
+    assert.equal(new URL(initialKeyQuery, 'http://fixture.invalid').searchParams.get('status'), 'active', 'the initial request filters active credentials before pagination');
     await filters.getByRole('searchbox').fill('100%_literal');
     await filters.getByText('Matching older client', { exact: true }).waitFor();
     assert.equal(await filters.getByText('Recent client', { exact: true }).count(), 0, 'search replaces the page with a server-filtered result, not a local match');
