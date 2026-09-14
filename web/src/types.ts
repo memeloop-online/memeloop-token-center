@@ -436,6 +436,9 @@ export interface GroupView {
   member_ids: string[];
   created_at: number;
   updated_at: number;
+  routing_strategy?: { plugin_id: string; config: Record<string, unknown> } | null;
+  routing_priority?: number;
+  strategy_version?: number;
 }
 
 export interface CredentialRoutingView {

@@ -5,6 +5,7 @@ import { formatNumber } from '../format';
 import { useI18n } from '../i18n';
 import type { GroupKind, GroupView } from '../types';
 import { MultiCombobox, type ComboboxOption } from './MultiCombobox';
+import { GroupStrategyEditor } from './GroupStrategyEditor';
 
 const paths: Record<GroupKind, string> = {
   provider: 'provider-groups',
@@ -76,6 +77,11 @@ export function GroupManager({ kind, token, tenant, groups, resources, onChanged
   const groupVersion = groups.map((group) => `${group.id}:${group.updated_at}`).join('|');
   const resourceVersion = resources.map((resource) => `${resource.value}:${resource.label}`).join('|');
   useEffect(() => {
+    operationSequence.current += 1;
+    setSelectedId(''); setMemberDraft([]); setNewName(''); setRenameDraft('');
+    setBusy(false); setMessage(''); setError('');
+  }, [kind, token, tenant]);
+  useEffect(() => {
     const group = groups.find((value) => value.id === selectedId) ?? groups[0];
     if (!group) {
       if (selectedId) { setSelectedId(''); setRenameDraft(''); setMemberDraft([]); }
@@ -86,12 +92,6 @@ export function GroupManager({ kind, token, tenant, groups, resources, onChanged
     setMemberDraft(group.member_ids.map((memberId) => resources.find((item) => item.value === memberId)
       ?? { value: memberId, label: memberId }));
   }, [groupVersion, resourceVersion, selectedId]);
-
-  useEffect(() => {
-    operationSequence.current += 1;
-    setSelectedId(''); setMemberDraft([]); setNewName(''); setRenameDraft('');
-    setBusy(false); setMessage(''); setError('');
-  }, [kind, token, tenant]);
 
   const perform = async (action: () => Promise<void>, success: string) => {
     const sequence = ++operationSequence.current;
@@ -126,6 +126,7 @@ export function GroupManager({ kind, token, tenant, groups, resources, onChanged
     {groups.length === 0 ? <div className="empty">{t(`groups.${kind}.empty`)}</div> : <div className="group-editor-layout">
       <div className="group-list" role="list" aria-label={t(`groups.${kind}.title`)}>{groups.map((group) => <button type="button" role="listitem" className={group.id === selectedId ? 'active' : ''} key={group.id} onClick={() => selectGroup(group.id)}><span>{group.name}</span><small>{t('groups.memberCount', { count: formatNumber(group.member_count, locale) })}</small></button>)}</div>
       {selected && <div className="group-editor">
+        {kind !== 'credential' && <GroupStrategyEditor key={`${token}\0${tenant}\0${kind}\0${selected.id}`} kind={kind} token={token} tenant={tenant} group={selected} onChanged={onChanged} />}
         <div className="group-rename"><label>{t('groups.name')}<input maxLength={100} value={renameDraft} onChange={(event) => setRenameDraft(event.target.value)} /></label><button type="button" className="secondary" disabled={busy || !renameDraft.trim() || renameDraft.trim() === selected.name} onClick={() => void perform(async () => {
           await api(`/internal/v1/${paths[kind]}/${selected.id}`, token, { method: 'PUT', body: JSON.stringify({ tenant_external_id: tenant, name: renameDraft.trim(), expected_updated_at: selected.updated_at }) });
         }, t('groups.renamed', { name: renameDraft.trim() }))}>{t('common.save')}</button></div>

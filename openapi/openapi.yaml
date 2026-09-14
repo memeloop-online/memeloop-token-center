@@ -827,6 +827,24 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '500': { $ref: '#/components/responses/InternalError' }
 
+  /internal/v1/plugins/group-routing-strategies:
+    get:
+      tags: [Groups]
+      operationId: listGroupRoutingStrategies
+      summary: List installed group-routing-v1 strategy plugins and their configuration schemas
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:read
+      responses:
+        '200':
+          description: Installed strategy catalog from the pinned plugin revision.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/GroupRoutingStrategyCatalogEntry' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
   /internal/v1/plugins:
     get:
       tags: [System]
@@ -2758,6 +2776,28 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
+  /internal/v1/provider-groups/{group_id}/routing-strategy:
+    put:
+      tags: [Groups]
+      operationId: updateProviderGroupRoutingStrategy
+      summary: Replace or clear a provider group routing strategy using dual optimistic concurrency
+      description: Applies only to routes explicitly including this provider group. The installed group-routing-v1 plugin validates configuration. Both group timestamp and strategy version must match; strategy updates increment the version and timestamp without changing members or grants.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:write
+      parameters: [{ $ref: '#/components/parameters/GroupId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateGroupRoutingStrategyRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/GroupUpdated' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
   /internal/v1/provider-groups/{group_id}/members:
     put:
       tags: [Groups]
@@ -2843,6 +2883,28 @@ paths:
         - $ref: '#/components/parameters/ExpectedUpdatedAt'
       responses:
         '204': { description: Group deleted. }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/route-groups/{group_id}/routing-strategy:
+    put:
+      tags: [Groups]
+      operationId: updateRouteGroupRoutingStrategy
+      summary: Replace or clear a route group routing strategy using dual optimistic concurrency
+      description: Strategy selection occurs after authorization and never grants access. The installed group-routing-v1 plugin validates configuration. Both group timestamp and strategy version must match; stale writes return 409.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:write
+      parameters: [{ $ref: '#/components/parameters/GroupId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateGroupRoutingStrategyRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/GroupUpdated' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -6671,7 +6733,7 @@ components:
     Group:
       type: object
       additionalProperties: false
-      required: [id, tenant_id, tenant_external_id, name, member_ids, member_count, created_at, updated_at]
+      required: [id, tenant_id, tenant_external_id, name, member_ids, member_count, created_at, updated_at, routing_strategy, routing_priority, strategy_version]
       properties:
         id: { type: string, format: uuid }
         tenant_id: { type: string, format: uuid }
@@ -6685,6 +6747,53 @@ components:
         member_count: { type: integer, format: int64, minimum: 0, maximum: 10000 }
         created_at: { type: integer, format: int64 }
         updated_at: { type: integer, format: int64 }
+        routing_strategy: { $ref: '#/components/schemas/NullableGroupRoutingStrategy' }
+        routing_priority:
+          type: integer
+          format: int32
+          default: 0
+          description: Higher values win; ties use ascending group UUID. Credential groups always return zero.
+        strategy_version:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Monotonically increasing strategy revision; credential groups always return zero.
+    GroupRoutingStrategy:
+      type: object
+      additionalProperties: false
+      required: [plugin_id, config]
+      properties:
+        plugin_id: { type: string, minLength: 1 }
+        config:
+          description: JSON configuration validated against the installed plugin's configuration schema.
+    NullableGroupRoutingStrategy:
+      description: Null selects the host default behavior. Credential groups always return null.
+      oneOf:
+        - $ref: '#/components/schemas/GroupRoutingStrategy'
+        - type: 'null'
+    GroupRoutingStrategyCatalogEntry:
+      type: object
+      additionalProperties: false
+      required: [id, version, schema, default]
+      properties:
+        id: { type: string }
+        version: { type: string }
+        schema:
+          description: JSON Schema for this strategy's configuration.
+        default:
+          description: Default JSON configuration supplied by the plugin.
+    UpdateGroupRoutingStrategyRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_external_id, expected_updated_at, expected_strategy_version, routing_priority]
+      properties:
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+        expected_updated_at: { type: integer, format: int64 }
+        expected_strategy_version: { type: integer, format: int64, minimum: 0 }
+        routing_priority: { type: integer, format: int32 }
+        routing_strategy:
+          $ref: '#/components/schemas/NullableGroupRoutingStrategy'
+          description: Null or omitted clears the strategy. Serialized strategy configuration is limited to 64 KiB.
     CreateGroupRequest:
       type: object
       additionalProperties: false

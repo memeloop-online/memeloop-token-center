@@ -618,6 +618,7 @@ mod tests {
                 manifest,
                 component: None,
                 configuration_validator: None,
+                routing_validator: None,
                 identity: identity(),
             }]),
             ..PluginRuntime::default()
@@ -658,6 +659,7 @@ mod tests {
                 manifest,
                 component: None,
                 configuration_validator: None,
+                routing_validator: None,
                 identity: identity(),
             }]),
             ..PluginRuntime::default()

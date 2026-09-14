@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+mod observe_heartbeat_tests;
 use crate::metrics::{UpstreamHealthEvent, UpstreamHealthReason};
 use std::{
     collections::HashMap,
@@ -142,6 +144,7 @@ impl UpstreamAttemptTerminal {
 pub(in crate::api::proxy) struct UpstreamAttemptGuard {
     state: Option<AppState>,
     request_id: Uuid,
+    route_id: Uuid,
     upstream_account_id: Uuid,
     credential_generation: i64,
     lease_token: Option<Uuid>,
@@ -155,6 +158,7 @@ pub(in crate::api::proxy) struct UpstreamAttemptGuard {
 struct UpstreamAttemptRecord {
     state: AppState,
     request_id: Uuid,
+    route_id: Uuid,
     upstream_account_id: Uuid,
     credential_generation: i64,
     lease_token: Option<Uuid>,
@@ -163,9 +167,11 @@ struct UpstreamAttemptRecord {
 }
 
 impl UpstreamAttemptGuard {
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::api::proxy) fn new(
         state: &AppState,
         request_id: Uuid,
+        route_id: Uuid,
         upstream_account_id: Uuid,
         credential_generation: i64,
         admission: UpstreamAttemptAdmission,
@@ -223,6 +229,7 @@ impl UpstreamAttemptGuard {
         Self {
             state: Some(state.clone()),
             request_id,
+            route_id,
             upstream_account_id,
             credential_generation,
             lease_token,
@@ -290,14 +297,17 @@ impl UpstreamAttemptGuard {
     }
 
     pub(in crate::api::proxy) async fn complete(&mut self, terminal: UpstreamAttemptTerminal) {
-        self.stop_heartbeat();
         let Some(state) = self.state.take() else {
             return;
         };
+        // Observe may wait for bounded component capacity. Keep renewing the
+        // owner fence until its conclusive database transition has finished;
+        // short probe leases must not expire during plugin observation.
         record_terminal(
             UpstreamAttemptRecord {
                 state,
                 request_id: self.request_id,
+                route_id: self.route_id,
                 upstream_account_id: self.upstream_account_id,
                 credential_generation: self.credential_generation,
                 lease_token: self.lease_token,
@@ -307,6 +317,7 @@ impl UpstreamAttemptGuard {
             terminal,
         )
         .await;
+        self.stop_heartbeat();
     }
 
     fn stop_heartbeat(&mut self) {
@@ -323,6 +334,7 @@ impl Drop for UpstreamAttemptGuard {
             return;
         };
         let request_id = self.request_id;
+        let route_id = self.route_id;
         let upstream_account_id = self.upstream_account_id;
         let credential_generation = self.credential_generation;
         let lease_token = self.lease_token;
@@ -337,6 +349,7 @@ impl Drop for UpstreamAttemptGuard {
                 UpstreamAttemptRecord {
                     state,
                     request_id,
+                    route_id,
                     upstream_account_id,
                     credential_generation,
                     lease_token,
@@ -354,12 +367,55 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
     let UpstreamAttemptRecord {
         state,
         request_id,
+        route_id,
         upstream_account_id,
         credential_generation,
         lease_token,
         owns_probe_lease,
         recovered_on_delivery,
     } = record;
+    use crate::plugin::routing::GroupRoutingOutcome;
+    let outcome = match terminal {
+        UpstreamAttemptTerminal::Succeeded => GroupRoutingOutcome::Success,
+        UpstreamAttemptTerminal::Inconclusive => GroupRoutingOutcome::Cancelled,
+        UpstreamAttemptTerminal::Failed {
+            kind: UpstreamFailureKind::RateLimited | UpstreamFailureKind::RateLimitedUntil { .. },
+            ..
+        } => GroupRoutingOutcome::HardQuota,
+        UpstreamAttemptTerminal::Failed {
+            kind: UpstreamFailureKind::Authentication,
+            ..
+        } => GroupRoutingOutcome::Authentication,
+        UpstreamAttemptTerminal::Failed { .. } => GroupRoutingOutcome::TransientFailure,
+    };
+    let directive = crate::group_routing::observe(
+        &state,
+        request_id,
+        route_id,
+        upstream_account_id,
+        credential_generation,
+        outcome,
+    )
+    .await;
+    let mut health = state.config.upstream_health;
+    if let Some(directive) = directive
+        && matches!(
+            terminal,
+            UpstreamAttemptTerminal::Failed {
+                kind: UpstreamFailureKind::Connection
+                    | UpstreamFailureKind::Unavailable
+                    | UpstreamFailureKind::InvalidResponse,
+                ..
+            }
+        )
+    {
+        // Only transient failures consume plugin cooldown. Typed 429/reset
+        // evidence, lease ownership and uncertain POST handling remain core.
+        let cooldown = directive.cooldown_ms.min(60_000) as i64;
+        health.connection_cooldown_millis = cooldown;
+        health.unavailable_cooldown_millis = cooldown;
+        health.invalid_response_cooldown_millis = cooldown;
+    }
     match terminal {
         UpstreamAttemptTerminal::Succeeded => {
             let Some(lease_token) = lease_token else {
@@ -431,7 +487,7 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                             credential_generation,
                             lease_token,
                             kind,
-                            state.config.upstream_health,
+                            health,
                         )
                         .await
                 }
@@ -442,7 +498,7 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                             upstream_account_id,
                             credential_generation,
                             kind,
-                            state.config.upstream_health,
+                            health,
                         )
                         .await
                 }
