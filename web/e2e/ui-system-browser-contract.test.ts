@@ -192,7 +192,25 @@ test('shared surfaces contain long content and retain keyboard actions across lo
           assert.equal(await scrollRegion.evaluate(element => getComputedStyle(element).outlineStyle !== 'none'), true, `${label}: table focus visible`);
           if (width <= 390) assert.ok(await metadataToggle.evaluate(element => element.getBoundingClientRect().height >= 44), `${label}: metadata touch target`);
           if (theme === 'light') assert.equal(await action.evaluate(element => getComputedStyle(element).color), 'rgb(8, 121, 110)', `${label}: accessible light-theme link token`);
-          if (width <= 390) assert.ok(await page.locator('.request-diagnostics .copy-control button').first().evaluate(element => element.getBoundingClientRect().height >= 44), `${label}: copy target`);
+          const requestIdentifiers = page.locator('[data-fixture-request="recorded"] .request-diagnostics').getByRole('button', { name: locale === 'en' ? 'Record identifiers · Details' : '记录标识 · 详细信息', exact: true });
+          assert.equal(await page.locator('.request-metadata-surface').count(), 0, `${label}: request identifiers are supplemental, not permanent rows`);
+          await requestIdentifiers.focus();
+          await page.keyboard.press('Enter');
+          const requestMetadata = page.locator('.request-metadata-surface');
+          await requestMetadata.waitFor({ state: 'visible' });
+          const requestId = '5a3bc0cc-8d47-4cee-9b5e-2581f8d99d13';
+          assert.equal(await requestMetadata.locator('code').textContent(), requestId, `${label}: complete request ID remains available`);
+          const requestCopy = requestMetadata.getByRole('button', { name: locale === 'en' ? 'Copy Request ID' : '复制 请求 ID', exact: true });
+          if (width <= 390) {
+            assert.ok(await requestIdentifiers.evaluate(element => element.getBoundingClientRect().height >= 44), `${label}: request metadata touch target`);
+            assert.ok(await requestCopy.evaluate(element => element.getBoundingClientRect().height >= 44), `${label}: request ID copy target`);
+          }
+          await requestCopy.focus();
+          await page.keyboard.press('Enter');
+          assert.equal(await page.evaluate(() => navigator.clipboard.readText()), requestId, `${label}: keyboard copies the complete request ID`);
+          await page.keyboard.press('Escape');
+          await requestMetadata.waitFor({ state: 'detached' });
+          assert.equal(await requestIdentifiers.evaluate(element => document.activeElement === element), true, `${label}: request metadata restores keyboard focus`);
         }
         if (width === 390 || width === 1440) await page.screenshot({ path: `${artifacts}/${route.name}-${locale}-${theme}-${width}.png`, fullPage: true });
       }
