@@ -2,6 +2,6 @@
   "format_version": 1,
   "status": "ready",
   "repository": "ghcr.io/memeloop-online/memeloop-token-center-plugin-installer",
-  "digest": "sha256:5d01c0a753358c241fa01ae3c94afe1dd71ec4c1708711dd64f774f49488a980",
-  "source_revision": "69b03ff0f37f76458bd6b49a05faa9aa43383493"
+  "digest": "sha256:3762012f35acf9151b4aa49a52565be882d016da64d6b368bf901adb8985121e",
+  "source_revision": "c8b68028a21e80a610b74ee3c41b442a69b84f97"
 }
