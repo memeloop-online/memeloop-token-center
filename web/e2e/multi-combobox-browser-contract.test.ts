@@ -7,18 +7,24 @@ import { chromium } from 'playwright';
 import { createServer } from 'vite';
 
 test('multi-select escapes clipping and supports keyboard selection, dismissal and retry', { timeout: 30_000 }, async (context) => {
+  const started = Date.now();
+  const stage = (name: string) => context.diagnostic(`${Date.now() - started}ms: ${name}`);
   if (!existsSync(chromium.executablePath())) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for the multi-select contract');
     context.skip('Chromium is not installed'); return;
   }
+  stage('starting fixture server');
   const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen();
   const address = server.httpServer?.address();
   assert.ok(address && typeof address !== 'string');
   const browser = await chromium.launch({ headless: true });
   try {
+    stage('browser launched');
     const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+    page.setDefaultTimeout(5_000);
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/multi-combobox.html`);
+    stage('checking selection, dismissal and retry');
     const input = page.getByRole('combobox', { name: 'Workspaces' });
     const menu = page.locator('.multi-combobox-popover');
     for (let click = 0; click < 3; click += 1) {
@@ -60,6 +66,7 @@ test('multi-select escapes clipping and supports keyboard selection, dismissal a
     const artifacts = fileURLToPath(new URL('../e2e-artifacts/ui-system/multi-combobox/', import.meta.url));
     await mkdir(artifacts, { recursive: true });
     for (const theme of ['dark', 'light']) for (const width of [320, 390, 768, 1440]) {
+      stage(`checking ${theme}/${width}`);
       await page.setViewportSize({ width, height: 900 });
       // Every capture starts from identical component state, without the
       // deliberately clipped host used by the earlier top-layer regression.
@@ -114,11 +121,18 @@ test('multi-select escapes clipping and supports keyboard selection, dismissal a
       }
       assert.equal(await menu.getAttribute('aria-modal'), null);
       await page.screenshot({ path: `${artifacts}/${theme}-${width}.png`, fullPage: true });
+      stage(`closing ${theme}/${width} popup after capture`);
       await input.press('Escape');
       await menu.waitFor({ state: 'hidden' });
       assert.equal(await input.getAttribute('aria-expanded'), 'false');
       assert.equal(await input.getAttribute('aria-controls'), null);
       assert.equal(await input.getAttribute('aria-activedescendant'), null, 'closing clears the previously active option reference');
     }
-  } finally { await browser.close(); await server.close(); }
+  } finally {
+    stage('closing browser');
+    await browser.close();
+    stage('closing fixture server');
+    await server.close();
+    stage('cleanup complete');
+  }
 });
