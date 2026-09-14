@@ -13,7 +13,7 @@ const [surface, replayView, replayStyles, operatorSessions, selfSessions, i18n] 
 
 test('sessions surface supplies a scoped archive reader without moving credentials into the replay component', () => {
   assert.match(surface, /loadReplayArchive\?: SessionReplayArchiveLoader/);
-  assert.match(surface, /<SessionReplayPanel detail=\{detail\} loadArchiveDetail=\{loadReplayArchive\}/);
+  assert.match(surface, /<SessionReplayPanel detail=\{detail\} scopeKey=\{summary\?\.key_id \?\? detail\.session_id\} loadArchiveDetail=\{loadReplayArchive\}/);
   assert.match(operatorSessions, /requestArchivePath\(tenant, request\.request_id\)/);
   assert.match(operatorSessions, /tenant_external_id/);
   assert.match(operatorSessions, /loadReplayArchive=\{loadReplayArchive\}/);
@@ -26,7 +26,7 @@ test('replay reads are bounded, abortable, and accept only an exact request and 
   assert.match(replayView, /SESSION_REPLAY_MAX_REQUESTS/);
   assert.match(replayView, /REPLAY_ARCHIVE_CONCURRENCY = 4/);
   assert.match(replayView, /const controller = new AbortController\(\)/);
-  assert.match(replayView, /candidate\.request_id !== request\.request_id \|\| candidate\.session_context\?\.session_id !== detail\.session_id/);
+  assert.match(replayView, /candidate\.request_id !== request\.request_id \|\| candidate\.session_context\?\.session_id !== scope\.sessionId/);
   assert.match(replayView, /controller\.abort\(\)/);
   assert.match(replayView, /projectSessionReplay\(detail\.session_id, archiveDetails\)/);
   assert.match(replayView, /outside_session/);

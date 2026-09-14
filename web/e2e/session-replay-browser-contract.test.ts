@@ -8,6 +8,8 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
 
+declare global { interface Window { sessionReplayReads: Record<string, number>; sessionReplayAborts: number } }
+
 const webRoot = fileURLToPath(new URL('..', import.meta.url));
 const artifactRoot = join(webRoot, 'e2e-artifacts', 'session-replay');
 const screenshotWidths = [320, 768, 1440] as const;
@@ -29,6 +31,60 @@ async function localChromiumExecutable() {
 async function nextPaint(page: import('playwright').Page) {
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
 }
+
+test('slow replay reads survive live metadata refresh, publish incrementally and isolate scopes', { timeout: 30_000 }, async () => {
+  const executablePath = await localChromiumExecutable();
+  if (!executablePath) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
+    return test.skip('Chromium required');
+  }
+  const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ executablePath, headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-replay.html?live=1`);
+    await page.locator('.session-replay-entry.message.user').waitFor();
+    assert.equal(await page.locator('.session-replay-entry.tool-result').count(), 0, 'fast content appears before the deliberately slow tool archive');
+    for (let index = 4; index < 7; index += 1) {
+      await page.getByRole('button', { name: 'Append live request', exact: true }).click();
+      await page.waitForFunction(id => window.sessionReplayReads[id] === 1, `additional-${index}`);
+    }
+    assert.equal(await page.evaluate(() => window.sessionReplayReads['replay-r2']), 1, 'new live requests never abort or restart an unchanged slow read');
+    assert.equal(await page.evaluate(() => window.sessionReplayAborts), 0);
+    await page.getByRole('button', { name: 'Switch replay scope', exact: true }).click();
+    assert.equal(await page.locator('.session-replay-entry.message').count(), 0, 'the previous scope is hidden immediately, before the new read completes');
+    await page.getByRole('button', { name: 'Resume scope reads', exact: true }).click();
+    await page.locator('.session-replay-entry.message.user').waitFor();
+    await page.getByRole('button', { name: 'Release slow archive', exact: true }).click();
+    await page.locator('.session-replay-entry.tool-result').waitFor();
+    assert.equal(await page.evaluate(() => window.sessionReplayReads['replay-r1']), 2, 'metadata-only refreshes never restart completed or in-flight reads');
+    assert.equal(await page.evaluate(() => window.sessionReplayReads['replay-r2']), 2);
+    assert.ok(await page.evaluate(() => window.sessionReplayAborts) > 0, 'scope transition cancels obsolete reads');
+    const originalTurn = page.locator('.session-replay-turns button').filter({ hasText: 'Find the forecast for Oslo' });
+    await originalTurn.click();
+    const originalEntry = page.locator('.session-replay-feed > li').filter({ has: page.locator('.session-replay-entry.message.user') });
+    await originalEntry.evaluate(element => element.setAttribute('data-retained-test', 'true'));
+    await page.getByRole('button', { name: 'Append earlier archive', exact: true }).click();
+    await page.waitForFunction(() => window.sessionReplayReads['earlier-late'] === 1);
+    assert.equal(await originalTurn.getAttribute('aria-pressed'), 'true', 'new unrelated requests retain the selected user turn');
+    await page.getByRole('button', { name: 'Release earlier archive', exact: true }).click();
+    await page.locator('.session-replay-feed').getByText('Earlier restored user turn', { exact: true }).waitFor();
+    assert.equal(await originalTurn.getAttribute('aria-pressed'), 'true', 'earlier archives do not move the selected identity to another message');
+    assert.equal(await page.locator('.session-replay-feed > li[data-retained-test="true"].selected').count(), 1, 'late insertion preserves the original message DOM and reading state');
+    await page.getByRole('button', { name: 'Finish late archive', exact: true }).click();
+    await page.getByText('Late archive arrived', { exact: true }).waitFor();
+    assert.equal(await page.evaluate(() => window.sessionReplayReads['replay-r1']), 2, 'complete archives are reused inside the same bounded scope');
+    assert.equal(await page.evaluate(() => window.sessionReplayReads['replay-r3']), 3, 'late availability refreshes an incomplete archive');
+    await page.getByRole('button', { name: 'Invalidate complete archive', exact: true }).click();
+    await page.waitForFunction(() => window.sessionReplayReads['replay-r1'] === 3);
+    assert.equal(await page.locator('.session-replay-entry.message.user').filter({ hasText: 'Find the forecast for Oslo' }).count(), 0, 'a changed archive revision invalidates even previously complete cached content');
+    assert.equal(await page.locator('.session-replay-turns button[aria-pressed="true"]').count(), 0, 'revoking the selected archive clears its selection');
+    assert.equal(await page.locator('.session-replay-entry.message.user').filter({ hasText: 'Earlier restored user turn' }).count(), 1, 'revocation does not discard unrelated archived messages');
+  } finally { await browser.close(); await server.close(); }
+});
 
 test('SessionReplayPanel renders archived content, keeps missing data explicit, and saves responsive theme screenshots', { timeout: 45_000 }, async () => {
   const executablePath = await localChromiumExecutable();

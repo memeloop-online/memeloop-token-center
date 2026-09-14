@@ -422,16 +422,21 @@ impl Drop for CaptureQueueMemory {
     }
 }
 
-async fn fence_failed_capture(state: &AppState, identity: ArchiveSpoolIdentity) {
-    if let Err(error) = observe_writer_database(identity, "response_spool_failed_fence", 0, async {
+async fn fence_failed_capture(
+    state: &AppState,
+    identity: ArchiveSpoolIdentity,
+) -> Result<(), AppError> {
+    #[cfg(test)]
+    super::fence_probe::observe(state).await;
+    let result = observe_writer_database(identity, "response_spool_failed_fence", 0, async {
         state
             .db
             .fail_response_archive_spool(identity, "capture_failed")
             .await
             .map(|()| true)
     })
-    .await
-    {
+    .await;
+    if let Err(error) = &result {
         tracing::warn!(
             request_id = %identity.request_id,
             stage = "response_spool_failed_ack_fence",
@@ -439,6 +444,7 @@ async fn fence_failed_capture(state: &AppState, identity: ArchiveSpoolIdentity) 
             "failed response archive acknowledgement could not be fenced"
         );
     }
+    result.map(|_| ())
 }
 
 impl ResponseArchiveProducer {
@@ -480,10 +486,16 @@ impl ResponseArchiveProducer {
                 )
                 .await
                 {
-                    Ok(()) => Ok(()),
+                    Ok(WriterOutcome::Sealed) => Ok(()),
+                    // The writer owns cancellation even when begin commits
+                    // after its producer disappears. A successful gap fence
+                    // is not a failed database operation.
+                    Ok(WriterOutcome::Abandoned) => {
+                        fence_failed_capture(&writer_state, identity).await
+                    }
                     Err(error) => {
                         failure_active.store(false, Ordering::Release);
-                        fence_failed_capture(&writer_state, identity).await;
+                        let _ = fence_failed_capture(&writer_state, identity).await;
                         Err(error)
                     }
                 }
@@ -562,6 +574,12 @@ impl ResponseArchiveProducer {
     #[cfg(test)]
     pub(super) fn queue_memory_owners_for_test(&self) -> usize {
         Arc::strong_count(&self._queue_memory)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn cancel_and_wait_for_test(mut self) -> Option<Result<(), AppError>> {
+        self.abandon("test_cancel");
+        self.writer.wait().await
     }
 
     /// Hand the terminal tail to the owned writer. Database completion is
@@ -696,13 +714,19 @@ impl ResponseArchiveWriter {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum WriterOutcome {
+    Sealed,
+    Abandoned,
+}
+
 async fn run_response_archive_writer(
     state: AppState,
     identity: ArchiveSpoolIdentity,
     mut receiver: tokio::sync::mpsc::Receiver<Bytes>,
     terminal: tokio::sync::oneshot::Receiver<Bytes>,
     active: Arc<AtomicBool>,
-) -> Result<(), AppError> {
+) -> Result<WriterOutcome, AppError> {
     #[cfg(test)]
     pause_begin_for_test(&state).await;
     let mut writer = ResponseArchiveWriter::begin_inner(state.clone(), identity).await?;
@@ -710,50 +734,33 @@ async fn run_response_archive_writer(
     pause_begin_ack_for_test(&state).await;
     while let Some(bytes) = receiver.recv().await {
         if !active.load(Ordering::Acquire) {
-            return Err(writer_interrupted(identity, "abandoned_before_append"));
+            return Ok(writer_interrupted(identity, "abandoned_before_append"));
         }
         writer.append_chunk(&bytes).await?;
     }
-    let tail = terminal
-        .await
-        .map_err(|_| writer_interrupted(identity, "terminal_sender_dropped"))?;
+    let Ok(tail) = terminal.await else {
+        return Ok(writer_interrupted(identity, "terminal_sender_dropped"));
+    };
     if !active.load(Ordering::Acquire) {
-        return Err(writer_interrupted(identity, "abandoned_before_tail"));
+        return Ok(writer_interrupted(identity, "abandoned_before_tail"));
     }
     if !tail.is_empty() {
         writer.append_chunk(&tail).await?;
     }
     if !active.load(Ordering::Acquire) {
-        return Err(writer_interrupted(identity, "abandoned_before_seal"));
+        return Ok(writer_interrupted(identity, "abandoned_before_seal"));
     }
-    writer.seal_inner().await
+    writer.seal_inner().await?;
+    Ok(WriterOutcome::Sealed)
 }
 
-pub(crate) async fn mark_gap(
-    state: &AppState,
-    identity: ArchiveSpoolIdentity,
-    reason: &'static str,
-) {
-    // Lost database ACKs are not retried by resending upstream or recharging.
-    // Stale unsealed captures are independently fenced and expired by worker.
-    let state = state.clone();
-    let result = super::await_owned(
-        super::ACK_TIMEOUT,
-        async move { mark_gap_inner(state, identity, reason).await },
-        "response_spool_gap_ack",
-    )
-    .await
-    .and_then(Result::ok);
-    if result.is_none() {
-        tracing::warn!(request_id = %identity.request_id, stage = "response_spool_gap_ack", "proxy archive gap");
-    }
-}
-
+#[cfg(test)]
 async fn mark_gap_inner(
     state: AppState,
     identity: ArchiveSpoolIdentity,
     reason: &'static str,
 ) -> Result<(), AppError> {
+    super::fence_probe::observe(&state).await;
     observe_writer_database(identity, "response_spool_gap_write", 0, async {
         state
             .db
@@ -765,9 +772,9 @@ async fn mark_gap_inner(
     .map(|_| ())
 }
 
-fn writer_interrupted(identity: ArchiveSpoolIdentity, reason: &'static str) -> AppError {
+fn writer_interrupted(identity: ArchiveSpoolIdentity, reason: &'static str) -> WriterOutcome {
     tracing::warn!(request_id = %identity.request_id, phase = "response_spool_writer", outcome = reason, "response writer was abandoned before durable completion");
-    AppError::Internal
+    WriterOutcome::Abandoned
 }
 
 async fn observe_writer_database(

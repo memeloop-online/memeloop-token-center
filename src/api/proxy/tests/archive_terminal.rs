@@ -242,6 +242,8 @@ async fn terminal_delivery_transfers_capture_to_the_owned_writer_or_records_a_ga
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
         let begin_pause = (!fail_append)
             .then(|| crate::response_archive_spool::pause_next_begin_for_test(&fixture.state));
+        let fence_probe = fail_append
+            .then(|| crate::response_archive_spool::fence_probe::install(&fixture.state));
         if fail_append {
             // A SQLite RAISE(ABORT) queues transaction rollback when SQLx drops
             // the failed append. Under executor load that rollback can delay
@@ -280,7 +282,28 @@ async fn terminal_delivery_transfers_capture_to_the_owned_writer_or_records_a_ga
             .expect("short stream must finalize before the paused writer begins");
             release.send(()).unwrap();
         }
-        let body = body.await.unwrap();
+        let fence_owner = if let Some((probe, entered, release)) = fence_probe {
+            tokio::time::timeout(Duration::from_secs(5), entered)
+                .await
+                .expect("abandoned capture must reach its owned fence")
+                .unwrap();
+            Some((probe, release))
+        } else {
+            None
+        };
+        let body = tokio::time::timeout(Duration::from_secs(5), body)
+            .await
+            .expect("terminal delivery and EOF must not await a cancelled writer fence")
+            .unwrap();
+        let fence_probe = fence_owner.map(|(probe, release)| {
+            assert_eq!(
+                probe.calls(),
+                1,
+                "terminal path must not start a duplicate gap write"
+            );
+            release.send(()).unwrap();
+            probe
+        });
         assert_eq!(body.as_ref(), payload.as_bytes());
         let (state, gap_reason): (String, Option<String>) =
             tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -306,6 +329,9 @@ async fn terminal_delivery_transfers_capture_to_the_owned_writer_or_records_a_ga
             gap_reason.as_deref(),
             fail_append.then_some("capture_failed")
         );
+        if let Some(probe) = fence_probe {
+            assert_eq!(probe.calls(), 1);
+        }
         upstream.verify().await;
         pool.close().await;
     }

@@ -60,6 +60,20 @@ test('session initial spinner, retry failure and background retry preserve the r
     await retry.waitFor();
     assert.ok(await page.getByText('Retained session', { exact: true }).count() > 0, 'failed retry does not blank the page');
     assert.equal(await page.locator('.session-browser').getByText('Loading…', { exact: true }).count(), 0);
+    const credential = page.locator('.session-controls input[role="combobox"]');
+    const credentialId = '019f4b00-1111-7111-8111-111111111111';
+    await credential.fill(credentialId);
+    assert.equal(await credential.inputValue(), credentialId, 'a pasted real-shaped credential ID stays editable');
+    await page.getByRole('button', { name: 'Apply filters', exact: true }).click();
+    await page.waitForFunction(() => window.sessionListReads === 5);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await page.getByText('Retained session', { exact: true }).first().waitFor();
+    await credential.fill('alias-that-has-not-been-selected');
+    assert.equal(await credential.inputValue(), 'alias-that-has-not-been-selected', 'editing must not silently restore the selected alias');
+    assert.equal(await credential.evaluate(input => (input as HTMLInputElement).checkValidity()), false);
+    await page.keyboard.press('Escape');
+    await page.getByRole('button', { name: 'Clear filters', exact: true }).click();
+    assert.equal(await credential.evaluate(input => (input as HTMLInputElement).checkValidity()), true, 'authoritative clearing removes stale custom validity');
   } finally { await browser.close(); await server.close(); }
 });
 

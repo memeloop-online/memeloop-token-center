@@ -4,6 +4,7 @@ import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestIn
 import { requestViewFromEvent } from '../src/operator/traffic/requestTraffic.js';
 import type { RequestEvent } from '../src/types.js';
 import type { RequestView } from '../src/types.js';
+import { requestOutcome, requestStatusCopy } from '../src/requestStatusPresentation.js';
 
 const request: RequestView = {
   request_id: 'fixture', created_at: 1, protocol: 'openai', model: 'fixture', status_code: 200,
@@ -56,6 +57,12 @@ test('terminal imported history need not have completion timestamps; live starte
   assert.equal(requestIsPending({ ...request, status_code: null, completed_at: null }), true);
   assert.equal(requestIsPending({ ...request, completed_at: null }), false);
   assert.equal(averageRequestOutputTps({ ...request, completed_at: null }), 16);
+  assert.equal(requestOutcome(request), 'unknown', 'a historical status alone does not prove completed delivery');
+  assert.equal(requestOutcome({ ...request, completed_at: 3000 }), 'completed');
+  assert.equal(requestOutcome({ ...request, completed_at: 3000, error_code: 'upstream_incomplete_response' }), 'interrupted', 'even 200 must not hide a recorded terminal error');
+  assert.equal(requestOutcome({ ...request, status_code: 499, error_code: 'client_cancelled' }), 'cancelled');
+  assert.equal(requestOutcome({ ...request, status_code: null, error_code: 'delivery_started' }), 'delivering');
+  assert.match(requestStatusCopy({ ...request, completed_at: 3000 }, 'en').hint, /not client acknowledgement/);
 });
 
 test('Anthropic uses persisted normalized total input, not raw provider input', () => {

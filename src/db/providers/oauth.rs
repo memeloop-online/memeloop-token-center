@@ -21,6 +21,41 @@ pub struct ReauthorizeUpstreamAccountInput {
     pub credential: UpstreamCredential,
 }
 
+/// Generation-bound lifecycle metadata returned by an acquired refresh claim.
+#[derive(Debug)]
+pub struct ClaimedUpstreamOAuthRefresh {
+    pub credential_generation: i64,
+    pub driver: String,
+    pub refresh_url: String,
+}
+
+/// Exact replay or a newly acquired generation-bound refresh claim.
+#[derive(Debug)]
+pub enum ClaimUpstreamOAuthRefreshResult {
+    Replay(Box<UpstreamAccountView>),
+    Claimed(ClaimedUpstreamOAuthRefresh),
+}
+
+fn oauth_refresh_lifecycle_from_row(row: &sqlx::any::AnyRow) -> Result<(String, String), AppError> {
+    if let (Some(driver), Some(refresh_url)) = (
+        row.try_get::<Option<String>, _>("oauth_driver")?,
+        row.try_get::<Option<String>, _>("oauth_refresh_url")?,
+    ) {
+        return Ok((driver, refresh_url));
+    }
+    let config: Value = serde_json::from_str(&row.try_get::<String, _>("config_json")?)
+        .map_err(|_| AppError::Internal)?;
+    let driver = config
+        .pointer("/oauth/driver")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::BadRequest("upstream OAuth driver is missing".into()))?;
+    let refresh_url = config
+        .pointer("/oauth/refresh_url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::BadRequest("upstream OAuth refresh URL is missing".into()))?;
+    Ok((driver.to_owned(), refresh_url.to_owned()))
+}
+
 impl Database {
     /// Read a completed, exact replay before transport validation performs DNS work.
     /// A concurrent miss is still serialized by the transactional rotation claim.
@@ -124,7 +159,7 @@ impl Database {
             key_material,
         );
         let replay_expires_at = now.saturating_add(CREDENTIAL_ROTATION_REPLAY_TTL_MILLIS);
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write_transaction().await?;
         if let Some(replay) = claim_credential_rotation(
             &mut tx,
             UPSTREAM_TRANSPORT_PROXY_ROTATION_RESOURCE,
@@ -177,6 +212,32 @@ impl Database {
         if generation != expected_credential_generation || updated_at != expected_updated_at {
             return Err(AppError::Conflict(
                 "reload the upstream provider before changing its transport proxy".into(),
+            ));
+        }
+        let refresh_select = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT request_started_at, pending_credential_ciphertext FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND credential_generation = $2 FOR UPDATE"
+            }
+            DatabaseBackend::Sqlite => {
+                "SELECT request_started_at, pending_credential_ciphertext FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND credential_generation = $2"
+            }
+        };
+        let refresh = sqlx::query(refresh_select)
+            .bind(account_id.to_string())
+            .bind(generation)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if let Some(refresh) = refresh
+            && (refresh
+                .try_get::<Option<i64>, _>("request_started_at")?
+                .is_some()
+                || refresh
+                    .try_get::<Option<String>, _>("pending_credential_ciphertext")?
+                    .is_some())
+        {
+            return Err(AppError::Conflict(
+                "OAuth refresh for this credential generation was already dispatched; recover that refresh or authorize again before changing its transport proxy"
+                    .into(),
             ));
         }
         let ciphertext: String = row.try_get("credential_ciphertext")?;
@@ -613,6 +674,23 @@ impl Database {
         idempotency_key: &str,
         key_material: &[u8],
     ) -> Result<Option<UpstreamAccountView>, AppError> {
+        match self
+            .claim_upstream_oauth_refresh(account_id, idempotency_key, key_material)
+            .await?
+        {
+            ClaimUpstreamOAuthRefreshResult::Replay(view) => Ok(Some(*view)),
+            ClaimUpstreamOAuthRefreshResult::Claimed(_) => Ok(None),
+        }
+    }
+
+    /// Claim an OAuth refresh and return lifecycle metadata from the same
+    /// locked credential generation as the lease.
+    pub async fn claim_upstream_oauth_refresh(
+        &self,
+        account_id: Uuid,
+        idempotency_key: &str,
+        key_material: &[u8],
+    ) -> Result<ClaimUpstreamOAuthRefreshResult, AppError> {
         validate_idempotency_key(idempotency_key, "Idempotency-Key")?;
         let idempotency_key = idempotency_key.trim();
         let now = unix_millis();
@@ -647,7 +725,7 @@ impl Database {
                     now,
                 )?;
                 tx.commit().await?;
-                return Ok(Some(view));
+                return Ok(ClaimUpstreamOAuthRefreshResult::Replay(Box::new(view)));
             }
             let pending = sqlx::query(
                 "SELECT credential_generation, pending_credential_ciphertext, request_started_at FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND idempotency_key = $2",
@@ -699,14 +777,14 @@ impl Database {
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
-            return Ok(Some(view));
+            return Ok(ClaimUpstreamOAuthRefreshResult::Replay(Box::new(view)));
         }
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "SELECT auth_kind, status, credential_generation, oauth_session_id FROM upstream_accounts WHERE id = $1 FOR UPDATE"
+                "SELECT auth_kind, status, credential_generation, oauth_session_id, oauth_driver, oauth_refresh_url, config_json FROM upstream_accounts WHERE id = $1 FOR UPDATE"
             }
             DatabaseBackend::Sqlite => {
-                "SELECT auth_kind, status, credential_generation, oauth_session_id FROM upstream_accounts WHERE id = $1"
+                "SELECT auth_kind, status, credential_generation, oauth_session_id, oauth_driver, oauth_refresh_url, config_json FROM upstream_accounts WHERE id = $1"
             }
         };
         let account = sqlx::query(select)
@@ -728,6 +806,7 @@ impl Database {
             ));
         }
         let generation: i64 = account.try_get("credential_generation")?;
+        let (driver, refresh_url) = oauth_refresh_lifecycle_from_row(&account)?;
         let lease_expires_at = now.saturating_add(UPSTREAM_OAUTH_REFRESH_LEASE_MILLIS);
         let leased = sqlx::query(
             "INSERT INTO upstream_oauth_refresh_leases (account_id, credential_generation, idempotency_key, lease_expires_at, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(account_id) DO UPDATE SET credential_generation = excluded.credential_generation, idempotency_key = excluded.idempotency_key, pending_credential_ciphertext = NULL, pending_expires_at = NULL, request_started_at = NULL, lease_expires_at = excluded.lease_expires_at, created_at = excluded.created_at WHERE (upstream_oauth_refresh_leases.pending_credential_ciphertext IS NULL AND upstream_oauth_refresh_leases.request_started_at IS NULL AND upstream_oauth_refresh_leases.lease_expires_at <= $5) OR upstream_oauth_refresh_leases.credential_generation <> excluded.credential_generation",
@@ -761,7 +840,13 @@ impl Database {
             ));
         }
         tx.commit().await?;
-        Ok(None)
+        Ok(ClaimUpstreamOAuthRefreshResult::Claimed(
+            ClaimedUpstreamOAuthRefresh {
+                credential_generation: generation,
+                driver,
+                refresh_url,
+            },
+        ))
     }
     /// Persist the one-way boundary immediately before a refresh-token request
     /// is dispatched. Once set, neither abort nor lease expiry may make the
@@ -1052,23 +1137,7 @@ impl Database {
                 "upstream account has no managed OAuth lifecycle".into(),
             ));
         }
-        if let (Some(driver), Some(refresh_url)) = (
-            row.try_get::<Option<String>, _>("oauth_driver")?,
-            row.try_get::<Option<String>, _>("oauth_refresh_url")?,
-        ) {
-            return Ok((driver, refresh_url));
-        }
-        let config: Value = serde_json::from_str(&row.try_get::<String, _>("config_json")?)
-            .map_err(|_| AppError::Internal)?;
-        let driver = config
-            .pointer("/oauth/driver")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AppError::BadRequest("upstream OAuth driver is missing".into()))?;
-        let refresh_url = config
-            .pointer("/oauth/refresh_url")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AppError::BadRequest("upstream OAuth refresh URL is missing".into()))?;
-        Ok((driver.to_owned(), refresh_url.to_owned()))
+        oauth_refresh_lifecycle_from_row(&row)
     }
     pub async fn list_managed_oauth_refresh_candidates(
         &self,
