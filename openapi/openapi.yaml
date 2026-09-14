@@ -2589,6 +2589,45 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
+  /internal/v1/native-oauth-imports/cursor:
+    post:
+      tags: [Upstream providers]
+      operationId: importNativeCursorOAuthSource
+      summary: Import a source-bound native Cursor OAuth account
+      description: |
+        Global operator-only auth projection; no provider calls. The source document's
+        accessToken JWT subject and expiry are source-declared, not signature-verified
+        by this endpoint. Only accessToken and refreshToken are projected; legacy file
+        layout and unrelated settings do not alter the native account identity.
+        A same-document replay returns the current account and generation without
+        restoring old tokens. Changed documents require exact account/document/generation
+        CAS and cannot replace a generation owned by a refresh lease. Existing name,
+        status, config and omitted proxy are preserved. An expired imported token stays
+        expired until the native managed refresh lifecycle succeeds; no grants are added.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: upstreams:import:write
+      x-global-service-only: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NativeCursorOAuthSourceRequest' }
+      responses:
+        '200':
+          description: Replayed current account or CAS-rotated native credential.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NativeCursorOAuthSourceResponse' }
+        '201':
+          description: Native account and provenance created in one transaction.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NativeCursorOAuthSourceResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
   /internal/v1/native-oauth-imports/kimi-cohort:
     post:
       tags: [Upstream providers]
@@ -6631,9 +6670,15 @@ components:
         contract_version: { type: integer, const: 2 }
         source_types:
           type: array
-          prefixItems: [{ const: kimi }]
-          minItems: 1
-          maxItems: 1
+          prefixItems: [{ const: kimi }, { const: cursor }]
+          minItems: 2
+          maxItems: 2
+        single_account_contracts:
+          type: object
+          additionalProperties: false
+          required: [cursor]
+          properties:
+            cursor: { const: source-bound-native-cursor-v1 }
         source_identity_contract: { const: operator-hmac-sha256-v1 }
         account_name_policies:
           type: object
@@ -6647,6 +6692,36 @@ components:
           minItems: 1
           maxItems: 1
         credential_envelope_contract: { const: chacha20poly1305-hkdf-sha256-v2-aad-v1 }
+    NativeCursorOAuthSourceRequest:
+      type: object
+      additionalProperties: false
+      required: [contract, tenant_external_id, account_name, source_identity_hash, source_document_sha256, source_layout, source_relative_path, document]
+      properties:
+        contract: { const: source-bound-native-cursor-v1 }
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+        account_name: { type: string, minLength: 1 }
+        source_identity_hash: { type: string, pattern: '^[0-9a-f]{64}$' }
+        source_document_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+        source_layout: { type: string, minLength: 1, maxLength: 200 }
+        source_relative_path: { type: string, minLength: 1, maxLength: 512 }
+        expected_current_account_id: { type: [string, 'null'], format: uuid }
+        expected_current_document_sha256: { type: [string, 'null'], pattern: '^[0-9a-f]{64}$' }
+        expected_current_credential_generation: { type: [integer, 'null'], minimum: 1 }
+        proxy_url: { type: [string, 'null'], writeOnly: true }
+        document:
+          type: object
+          writeOnly: true
+          required: [accessToken, refreshToken]
+          properties:
+            accessToken: { type: string, minLength: 1, writeOnly: true }
+            refreshToken: { type: string, minLength: 1, writeOnly: true }
+    NativeCursorOAuthSourceResponse:
+      type: object
+      additionalProperties: false
+      required: [disposition, account]
+      properties:
+        disposition: { type: string, enum: [created, replayed, rotated] }
+        account: { $ref: '#/components/schemas/UpstreamProvider' }
     NativeOAuthImportSource:
       type: object
       additionalProperties: false

@@ -459,7 +459,7 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         let deleted = sqlx::query(
-            "DELETE FROM upstream_accounts WHERE id = $1 AND tenant_id = $2 AND status = 'disabled' AND updated_at = $3 AND NOT EXISTS (SELECT 1 FROM model_routes r WHERE r.tenant_id = $2 AND (r.upstream_account_id = $1 OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = $1))) AND NOT EXISTS (SELECT 1 FROM upstream_account_imports imported WHERE imported.tenant_id = $2 AND imported.upstream_account_id = $1) AND NOT EXISTS (SELECT 1 FROM native_oauth_import_receipts imported WHERE imported.tenant_id = $2 AND imported.upstream_account_id = $1)",
+            "DELETE FROM upstream_accounts WHERE id = $1 AND tenant_id = $2 AND status = 'disabled' AND updated_at = $3 AND NOT EXISTS (SELECT 1 FROM model_routes r WHERE r.tenant_id = $2 AND (r.upstream_account_id = $1 OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = $1))) AND NOT EXISTS (SELECT 1 FROM upstream_account_imports imported WHERE imported.tenant_id = $2 AND imported.upstream_account_id = $1) AND NOT EXISTS (SELECT 1 FROM native_oauth_import_receipts imported WHERE imported.tenant_id = $2 AND imported.upstream_account_id = $1) AND NOT EXISTS (SELECT 1 FROM native_oauth_source_bindings imported WHERE imported.tenant_id = $2 AND imported.upstream_account_id = $1)",
         )
         .bind(account_id.to_string())
         .bind(tenant_id)
@@ -547,8 +547,8 @@ impl Database {
                    a.name, a.driver, a.auth_kind, a.config_json, a.status,
                    a.credential_generation, a.oauth_session_id, a.oauth_driver,
                    a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at,
-                   receipt.source_identity_hash AS import_source_identity_hash,
-                   receipt.source_document_sha256 AS import_source_document_sha256,
+                   COALESCE(receipt.source_identity_hash, source_binding.source_identity_hash) AS import_source_identity_hash,
+                   COALESCE(receipt.source_document_sha256, source_binding.source_document_sha256) AS import_source_document_sha256,
                    COALESCE(route_counts.route_count, 0) AS route_count
             FROM page a
             JOIN tenants t ON t.id = a.tenant_id
@@ -562,6 +562,9 @@ impl Database {
             LEFT JOIN page_route_counts route_counts
               ON route_counts.tenant_id = a.tenant_id
              AND route_counts.upstream_account_id = a.id
+            LEFT JOIN native_oauth_source_bindings source_binding
+              ON source_binding.tenant_id = a.tenant_id
+             AND source_binding.upstream_account_id = a.id
             ORDER BY a.created_at DESC, a.id DESC
             "#,
         )
@@ -619,8 +622,8 @@ impl Database {
                    a.credential_generation, a.oauth_session_id, a.oauth_driver,
                    a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at,
                    c.credential_ciphertext,
-                   receipt.source_identity_hash AS import_source_identity_hash,
-                   receipt.source_document_sha256 AS import_source_document_sha256,
+                   COALESCE(receipt.source_identity_hash, source_binding.source_identity_hash) AS import_source_identity_hash,
+                   COALESCE(receipt.source_document_sha256, source_binding.source_document_sha256) AS import_source_document_sha256,
                    COALESCE(route_counts.route_count, 0) AS route_count
             FROM page a
             JOIN tenants t ON t.id = a.tenant_id
@@ -634,6 +637,9 @@ impl Database {
             LEFT JOIN page_route_counts route_counts
               ON route_counts.tenant_id = a.tenant_id
              AND route_counts.upstream_account_id = a.id
+            LEFT JOIN native_oauth_source_bindings source_binding
+              ON source_binding.tenant_id = a.tenant_id
+             AND source_binding.upstream_account_id = a.id
             ORDER BY a.created_at DESC, a.id DESC
             "#,
         )
@@ -704,7 +710,7 @@ where
     E: Executor<'e, Database = Any>,
 {
     let row = sqlx::query(
-        "SELECT (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = $1 AND (r.upstream_account_id = $2 OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = $2))) AS model_route_count, (SELECT COUNT(*) FROM request_records history WHERE history.tenant_id = $1 AND history.upstream_account_id = $2) AS request_history_count, (SELECT COUNT(*) FROM generation_jobs history WHERE history.tenant_id = $1 AND history.upstream_account_id = $2) AS generation_history_count, ((SELECT COUNT(*) FROM upstream_account_imports imported WHERE imported.tenant_id = $1 AND imported.upstream_account_id = $2) + (SELECT COUNT(*) FROM native_oauth_import_receipts imported WHERE imported.tenant_id = $1 AND imported.upstream_account_id = $2)) AS import_count",
+        "SELECT (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = $1 AND (r.upstream_account_id = $2 OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = $2))) AS model_route_count, (SELECT COUNT(*) FROM request_records history WHERE history.tenant_id = $1 AND history.upstream_account_id = $2) AS request_history_count, (SELECT COUNT(*) FROM generation_jobs history WHERE history.tenant_id = $1 AND history.upstream_account_id = $2) AS generation_history_count, ((SELECT COUNT(*) FROM upstream_account_imports imported WHERE imported.tenant_id = $1 AND imported.upstream_account_id = $2) + (SELECT COUNT(*) FROM native_oauth_import_receipts imported WHERE imported.tenant_id = $1 AND imported.upstream_account_id = $2) + (SELECT COUNT(*) FROM native_oauth_source_bindings imported WHERE imported.tenant_id = $1 AND imported.upstream_account_id = $2)) AS import_count",
     )
     .bind(tenant_id)
     .bind(account_id.to_string())

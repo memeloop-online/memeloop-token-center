@@ -2,6 +2,7 @@ use super::super::*;
 use super::accounts::{upstream_account_view_with_transport, validate_upstream_account_name};
 use super::native_oauth_imports::lock_native_oauth_import_tenant;
 
+#[derive(Clone)]
 pub struct NativeCursorImportInput {
     pub tenant_external_id: String,
     pub source_identity_hash: String,
@@ -208,4 +209,169 @@ async fn cursor_source_row(
         .bind(source_identity)
         .fetch_optional(&mut **tx)
         .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input(tenant: &str) -> NativeCursorImportInput {
+        NativeCursorImportInput {
+            tenant_external_id: tenant.into(),
+            source_identity_hash: "1".repeat(64),
+            provider_subject_hash: "2".repeat(64),
+            source_document_sha256: "3".repeat(64),
+            payload_digest: "4".repeat(64),
+            source_layout: "cursor-auth-legacy-v1".into(),
+            account_name: "Cursor Imported".into(),
+            expected_account_id: None,
+            expected_document_sha256: None,
+            expected_credential_generation: None,
+            credential: UpstreamCredential::OAuth {
+                access_token: "synthetic-native-cursor-access".into(),
+                refresh_token: Some("synthetic-native-cursor-refresh".into()),
+                expires_at: Some(1000),
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                adapter_state: Some(
+                    serde_json::json!({"schema":"cursor-oauth-v1","account_id":"cursor-source-fixture"}),
+                ),
+                proxy_url: Some("socks5h://192.168.1.20:1080".into()),
+                proxy_network_scope: Some(crate::network::OutboundScope::Private),
+            },
+        }
+    }
+
+    async fn contract(db: &Database, tenant: &str) {
+        let key = b"cursor-native-source-test-encryption";
+        let original = input(tenant);
+        let created = db
+            .import_native_cursor_source(original.clone(), key)
+            .await
+            .unwrap();
+        assert_eq!(created.disposition, "created");
+        assert_eq!(created.account.credential_generation, 1);
+        assert_eq!(created.account.credential_expires_at, Some(1000));
+        assert!(created.account.can_refresh && created.account.can_reauthorize);
+        assert_eq!(created.account.route_count, 0);
+        let id = created.account.id;
+        let mut changed = original.clone();
+        changed.source_document_sha256 = "5".repeat(64);
+        changed.payload_digest = "6".repeat(64);
+        // Changed sources cannot be installed without exact account/document/generation.
+        assert!(matches!(
+            db.import_native_cursor_source(changed.clone(), key).await,
+            Err(AppError::Conflict(_))
+        ));
+        changed.expected_account_id = Some(id);
+        changed.expected_document_sha256 = Some(original.source_document_sha256.clone());
+        changed.expected_credential_generation = Some(1);
+        sqlx::query("INSERT INTO upstream_oauth_refresh_leases (account_id, credential_generation, idempotency_key, lease_expires_at, created_at, request_started_at) VALUES ($1, 1, $2, 1, 0, 0)")
+            .bind(id.to_string()).bind(Uuid::now_v7().to_string()).execute(&db.pool).await.unwrap();
+        assert!(
+            matches!(
+                db.import_native_cursor_source(changed.clone(), key).await,
+                Err(AppError::Conflict(_))
+            ),
+            "even an expired lease with an uncertain refresh outcome owns its generation"
+        );
+        let unchanged = db.list_upstream_accounts(tenant).await.unwrap();
+        assert_eq!(unchanged[0].credential_generation, 1);
+        assert_eq!(
+            unchanged[0].import_source_document_sha256.as_deref(),
+            Some(original.source_document_sha256.as_str())
+        );
+        sqlx::query("DELETE FROM upstream_oauth_refresh_leases WHERE account_id = $1")
+            .bind(id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        if let UpstreamCredential::OAuth {
+            proxy_url,
+            proxy_network_scope,
+            ..
+        } = &mut changed.credential
+        {
+            *proxy_url = None;
+            *proxy_network_scope = None;
+        }
+        let rotated = db
+            .import_native_cursor_source(changed.clone(), key)
+            .await
+            .unwrap();
+        assert_eq!(rotated.disposition, "rotated");
+        assert_eq!(rotated.account.id, id);
+        assert_eq!(rotated.account.credential_generation, 2);
+        assert!(
+            rotated.account.has_proxy,
+            "missing source proxy retains runtime proxy"
+        );
+        // A repeated rotate request carrying generation 1 must not rotate again.
+        let replay = db
+            .import_native_cursor_source(changed.clone(), key)
+            .await
+            .unwrap();
+        assert_eq!(replay.disposition, "replayed");
+        assert_eq!(replay.account.credential_generation, 2);
+        // A source path rename must not create another upstream identity.
+        let mut duplicate = original.clone();
+        duplicate.source_identity_hash = "7".repeat(64);
+        duplicate.account_name = "Cursor Duplicate".into();
+        assert!(matches!(
+            db.import_native_cursor_source(duplicate, key).await,
+            Err(AppError::Conflict(_))
+        ));
+        // Simulate the existing managed lifecycle installing a later generation;
+        // replay must report that live generation, not restore the source token.
+        let credential = seal_credential(&changed.credential, key).unwrap();
+        let mut tx = db.begin_write_transaction().await.unwrap();
+        sqlx::query("UPDATE upstream_credentials SET revoked_at = 2000 WHERE upstream_account_id = $1 AND generation = 2").bind(id.to_string()).execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO upstream_credentials (id, upstream_account_id, generation, credential_ciphertext, expires_at, created_at) VALUES ($1, $2, 3, $3, 1000, 2000)")
+            .bind(Uuid::now_v7().to_string()).bind(id.to_string()).bind(credential).execute(&mut *tx).await.unwrap();
+        sqlx::query("UPDATE upstream_accounts SET credential_generation = 3 WHERE id = $1")
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let replay = db
+            .import_native_cursor_source(changed.clone(), key)
+            .await
+            .unwrap();
+        assert_eq!(replay.account.credential_generation, 3);
+        assert_eq!(replay.disposition, "replayed");
+        // A stale source update must fail without changing receipt or generation.
+        changed.source_document_sha256 = "8".repeat(64);
+        changed.payload_digest = "9".repeat(64);
+        assert!(matches!(
+            db.import_native_cursor_source(changed, key).await,
+            Err(AppError::Conflict(_))
+        ));
+        let account = db.list_upstream_accounts(tenant).await.unwrap();
+        assert_eq!(account.len(), 1);
+        assert_eq!(account[0].credential_generation, 3);
+    }
+
+    #[tokio::test]
+    async fn sqlite_native_cursor_source_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("native-cursor.db").display()
+        ))
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        contract(&db, "cursor-source-sqlite").await;
+    }
+
+    #[tokio::test]
+    async fn postgres_native_cursor_source_contract() {
+        let Ok(url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let db = Database::connect(&url).await.unwrap();
+        db.migrate().await.unwrap();
+        contract(&db, &format!("cursor-source-pg-{}", Uuid::now_v7())).await;
+    }
 }
