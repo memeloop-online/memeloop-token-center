@@ -1063,6 +1063,10 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
             );
             Ok(ConversationRequestView {
                 request: RequestView {
+                    compaction: row
+                        .try_get::<Option<i64>, _>("compaction")?
+                        .filter(|value| *value == 1)
+                        .map(|_| true),
                     first_output_ms: row.try_get("first_output_ms")?,
                     generation_duration_ms: row.try_get("generation_duration_ms")?,
                     request_id: parse_uuid(row.try_get("id")?)?,

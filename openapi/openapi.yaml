@@ -7568,6 +7568,10 @@ components:
       type: object
       required: [request_id, created_at, completed_at, source_completed_at, lifecycle_state, protocol, model, upstream_account_id, route_id, status_code, duration_ms, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, cost, currency, usage, billing, error_code, archive_state, credential_identity, session_context]
       properties:
+        compaction:
+          type: [boolean, 'null']
+          enum: [true, null]
+          description: Explicit persisted client context-compaction evidence. True only for a declared compaction marker; null or absence means unknown, including legacy default-false observations. Never inferred from duration, model, archive compression or request contents while serving history.
         request_id: { type: string, format: uuid }
         created_at: { type: integer, format: int64 }
         completed_at:
