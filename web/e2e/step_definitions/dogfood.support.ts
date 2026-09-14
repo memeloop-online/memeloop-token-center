@@ -106,9 +106,11 @@ export async function connectOperator(
       const url = new URL(response.url());
       return response.request().method() === 'GET'
         // The helper opens the settings route, whose tenant-scoped resource
-        // load is model routes rather than the traffic page's request list.
-        && url.pathname === '/internal/v1/model-routes'
-        && url.searchParams.get('tenant_external_id') === tenant;
+        // load is the bounded route projection rather than the traffic page's
+        // request list.
+        && url.pathname === '/internal/v1/model-picker-options'
+        && url.searchParams.get('tenant_external_id') === tenant
+        && url.searchParams.get('selection_kind') === 'route';
     });
     await tenantPicker.selectOption(tenant);
     assert.equal((await scopedReload).status(), 200);
