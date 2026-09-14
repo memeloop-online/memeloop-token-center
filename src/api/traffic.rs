@@ -373,33 +373,34 @@ async fn apply_traffic_plugin(
         config_json: "{}".to_owned(),
     };
     let metrics = state.metrics.clone();
-    let plugin_decision = plugin_execution::run(Phase::PostAuth, move || {
-        let _temporary_memory = temporary_memory;
-        let result = (|| {
-            #[cfg(feature = "experimental-plugin-revisions")]
-            if let Some(snapshot) = application_snapshot {
-                return snapshot.runtime.apply_traffic_with_config_and_memory(
+    let plugin_decision =
+        plugin_execution::run(state.metrics.clone(), Phase::PostAuth, move || {
+            let _temporary_memory = temporary_memory;
+            let result = (|| {
+                #[cfg(feature = "experimental-plugin-revisions")]
+                if let Some(snapshot) = application_snapshot {
+                    return snapshot.runtime.apply_traffic_with_config_and_memory(
+                        plugin_context,
+                        &plugin_request,
+                        &plugin_configurations,
+                        memory.as_deref(),
+                    );
+                }
+                plugins.apply_traffic_with_config_and_memory(
                     plugin_context,
                     &plugin_request,
                     &plugin_configurations,
                     memory.as_deref(),
-                );
-            }
-            plugins.apply_traffic_with_config_and_memory(
-                plugin_context,
-                &plugin_request,
-                &plugin_configurations,
-                memory.as_deref(),
-            )
-        })();
-        result.map_err(|error| {
-            metrics.observe_proxy_memory_error(
-                crate::metrics::ProxyMemoryRejectionStage::Plugin,
-                error,
-            )
+                )
+            })();
+            result.map_err(|error| {
+                metrics.observe_proxy_memory_error(
+                    crate::metrics::ProxyMemoryRejectionStage::Plugin,
+                    error,
+                )
+            })
         })
-    })
-    .await?;
+        .await?;
     if !plugin_decision.allow {
         plugin_decision.log_denial();
         return Err(AppError::Forbidden);
@@ -462,7 +463,7 @@ pub(super) async fn prepare_component_provider(
     });
     let plugins = state.plugins.clone();
     let provider_id = provider_id.to_owned();
-    plugin_execution::run(Phase::Prepare, move || {
+    plugin_execution::run(state.metrics.clone(), Phase::Prepare, move || {
         let _memory = memory;
         plugins.prepare_provider_request(&provider_id, context, &config, &request_json)
     })
@@ -491,7 +492,7 @@ pub(super) async fn normalize_component_provider(
         })?;
     let plugins = state.plugins.clone();
     let provider_id = provider_id.to_owned();
-    plugin_execution::run(Phase::Normalize, move || {
+    plugin_execution::run(state.metrics.clone(), Phase::Normalize, move || {
         let _temporary_memory = temporary_memory;
         plugins.normalize_provider_response(&provider_id, context, status, &headers, &body)
     })

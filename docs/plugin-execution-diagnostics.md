@@ -28,6 +28,12 @@ component span and wrapper observation, not an entire failover chain. Events
 contain no model, account preference, configuration, bodies, headers, raw plugin
 reason, supplier response, or credentials. Filtering the existing tracing
 target controls diagnostic visibility; this change adds no remote logging API.
+The existing metrics endpoint exposes
+`memeloop_token_center_plugin_execution_observations_total` with exactly 21
+preallocated phase/outcome series. The same once-only observation records the
+counter even when the caller is cancelled; no invocation, tenant, plugin, model,
+or payload label is accepted. Both pinned application snapshots and the default
+runtime enter this wrapper. This does not activate application revisions.
 Process termination may prevent any final event; these logs are not a durable
 audit store. Configuration lookup and post-hook validation occur outside the
 wrapper and are not misreported as invocation success or failure.

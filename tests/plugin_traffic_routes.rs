@@ -1086,6 +1086,27 @@ async fn log_capability_emits_only_bounded_host_owned_fields() {
         .unwrap();
     assert!(guest.contains(id), "{logs}");
     assert!(logs.len() < 4_096, "guest message amplified log output");
+    let metrics = state.metrics.render(&Default::default());
+    let observations: Vec<_> = metrics
+        .lines()
+        .filter(|line| {
+            line.starts_with("memeloop_token_center_plugin_execution_observations_total{")
+        })
+        .collect();
+    assert_eq!(observations.len(), 21, "fixed phase/outcome cardinality");
+    assert!(observations.contains(&"memeloop_token_center_plugin_execution_observations_total{phase=\"post_auth\",outcome=\"returned\"} 1"));
+    assert_eq!(
+        observations
+            .iter()
+            .filter(|line| !line.ends_with(" 0"))
+            .count(),
+        1
+    );
+    for line in observations {
+        assert!(!line.contains(CANARY));
+        assert!(!line.contains(id));
+        assert!(!line.contains("gateway-policy"));
+    }
 }
 
 #[tokio::test]

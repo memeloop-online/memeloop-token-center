@@ -7,51 +7,13 @@ use std::{
 use tokio::{sync::Semaphore, time::Instant};
 use uuid::Uuid;
 
-use crate::error::AppError;
+pub(super) use crate::metrics::plugin_execution::Phase;
+use crate::{
+    error::AppError,
+    metrics::{Metrics, plugin_execution::Outcome},
+};
 
 static PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(8)));
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Phase {
-    PostAuth,
-    Prepare,
-    Normalize,
-}
-
-impl Phase {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::PostAuth => "post_auth",
-            Self::Prepare => "prepare",
-            Self::Normalize => "normalize",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Outcome {
-    Returned,
-    HookError,
-    CapacityTimeout,
-    CapacityClosed,
-    ExecutionTimeout,
-    TaskFailed,
-    CallerCancelled,
-}
-
-impl Outcome {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Returned => "returned",
-            Self::HookError => "hook_error",
-            Self::CapacityTimeout => "capacity_timeout",
-            Self::CapacityClosed => "capacity_closed",
-            Self::ExecutionTimeout => "execution_timeout",
-            Self::TaskFailed => "task_failed",
-            Self::CallerCancelled => "caller_cancelled",
-        }
-    }
-}
 
 struct Event {
     invocation_id: Uuid,
@@ -92,7 +54,7 @@ fn emit_event(event: Event) {
     );
 }
 
-pub(super) async fn run<T, F>(phase: Phase, work: F) -> Result<T, AppError>
+pub(super) async fn run<T, F>(metrics: Metrics, phase: Phase, work: F) -> Result<T, AppError>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, AppError> + Send + 'static,
@@ -103,7 +65,10 @@ where
         PERMITS.clone(),
         Duration::from_secs(1),
         Duration::from_secs(35),
-        emit_event,
+        move |event| {
+            metrics.observe_plugin_execution(event.phase, event.outcome);
+            emit_event(event);
+        },
     )
     .await
 }
