@@ -508,7 +508,12 @@ async fn token_request(
     let request = http
         .post(endpoint)
         .timeout(std::time::Duration::from_secs(20))
-        .form(form);
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .header(reqwest::header::ACCEPT, "application/json")
+        .body(encode_token_form(form));
     if let Some(guard) = guard {
         guard.mark_request_started().await?;
     }
@@ -526,6 +531,12 @@ async fn token_request(
     }
     serde_json::from_slice(&body)
         .map_err(|_| AppError::Upstream("invalid OAuth token response".into()))
+}
+
+fn encode_token_form(form: &[(&str, String)]) -> String {
+    url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(form.iter().map(|(name, value)| (*name, value.as_str())))
+        .finish()
 }
 
 fn add_client(form: &mut Vec<(&'static str, String)>, client: &ClientConfig) {
@@ -600,6 +611,24 @@ fn callback_code(callback: &str, redirect: &str, state: &str) -> Result<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn token_form_escapes_reserved_characters_without_changing_credentials() {
+        let fields = [
+            ("code", "fixture+code&scope=other /?".to_owned()),
+            ("client_secret", "fixture=secret+%".to_owned()),
+        ];
+        let encoded = encode_token_form(&fields);
+        let decoded = url::form_urlencoded::parse(encoded.as_bytes())
+            .into_owned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decoded,
+            fields
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), value))
+                .collect::<Vec<_>>()
+        );
+    }
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{body_string_contains, method, path},
