@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { providerEditSchema } from '../src/operator/providerEditSchema';
+import { providerEditSchema } from '../src/operator/providerEditSchema.js';
 
 test('provider presentation changes only copy, preserving unknown schemas and constraints', () => {
   const schema = { type: 'object' as const, properties: { config: { type: 'object' as const,

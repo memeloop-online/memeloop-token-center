@@ -42,6 +42,11 @@ test('real Codex config shapes keep proxy primary and preserve advanced edits an
       await bound.fill('72000');
       assert.equal(await workspace.getByRole('button', { name: `删除字段：${model}`, exact: true }).count(), 1);
       assert.equal(await workspace.getByRole('textbox', { name: `字段名称：${model}`, exact: true }).count(), 1);
+      const key = workspace.getByRole('textbox', { name: `字段名称：${model}`, exact: true });
+      await key.fill(`${model}-renamed`); await key.press('Tab');
+      assert.equal(await workspace.getByRole('textbox', { name: `${model}-renamed`, exact: true }).inputValue(), '72000', 'renaming a model key retains its reservation');
+      const renamed = workspace.getByRole('textbox', { name: `字段名称：${model}-renamed`, exact: true });
+      await renamed.fill(model); await renamed.press('Tab');
       assert.equal(await workspace.locator('button').evaluateAll(buttons => buttons.filter(button => !button.textContent?.trim() && !button.getAttribute('aria-label') && !button.getAttribute('aria-labelledby')).length), 0);
       for (const width of [390, 1440]) for (const theme of ['light', 'dark']) {
         await page.setViewportSize({ width, height: 1000 });
