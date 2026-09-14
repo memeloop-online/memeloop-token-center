@@ -22,6 +22,59 @@ pub struct ReauthorizeUpstreamAccountInput {
 }
 
 impl Database {
+    /// Read a completed, exact replay before transport validation performs DNS work.
+    /// A concurrent miss is still serialized by the transactional rotation claim.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upstream_transport_proxy_rotation_replay(
+        &self,
+        account_id: Uuid,
+        tenant_external_id: &str,
+        proxy_url: &str,
+        expected_updated_at: i64,
+        expected_credential_generation: i64,
+        idempotency_key: &str,
+        key_material: &[u8],
+    ) -> Result<Option<UpstreamAccountView>, AppError> {
+        validate_idempotency_key(idempotency_key, "Idempotency-Key")?;
+        let idempotency_key = idempotency_key.trim();
+        let request_hash = upstream_transport_proxy_request_hash(
+            account_id,
+            tenant_external_id,
+            proxy_url,
+            expected_updated_at,
+            expected_credential_generation,
+            key_material,
+        );
+        let row = sqlx::query(
+            "SELECT resource_kind, resource_id, request_hash, response_ciphertext, expires_at FROM credential_rotation_replays WHERE idempotency_key = $1",
+        )
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        if row.try_get::<String, _>("resource_kind")? != UPSTREAM_TRANSPORT_PROXY_ROTATION_RESOURCE
+            || row.try_get::<String, _>("resource_id")? != account_id.to_string()
+            || row.try_get::<String, _>("request_hash")? != request_hash
+        {
+            return Err(AppError::BadRequest(
+                "Idempotency-Key was already used for a different credential rotation".into(),
+            ));
+        }
+        open_rotation_replay(
+            super::super::rotation::RotationReplay {
+                response_ciphertext: row.try_get("response_ciphertext")?,
+                expires_at: row.try_get("expires_at")?,
+            },
+            UPSTREAM_TRANSPORT_PROXY_ROTATION_RESOURCE,
+            account_id,
+            idempotency_key,
+            &request_hash,
+            key_material,
+            unix_millis(),
+        )
+        .map(Some)
+    }
+
     async fn begin_upstream_oauth_refresh_write_transaction(
         &self,
         account_id: Uuid,
@@ -59,7 +112,6 @@ impl Database {
         actor_service_id: Option<Uuid>,
         key_material: &[u8],
     ) -> Result<(UpstreamAccountView, bool), AppError> {
-        crate::provider::validate_codex_proxy_url(&proxy_url)?;
         validate_idempotency_key(idempotency_key, "Idempotency-Key")?;
         let idempotency_key = idempotency_key.trim();
         let now = unix_millis();
@@ -112,11 +164,13 @@ impl Database {
             .await?
             .ok_or(AppError::NotFound)?;
         let driver: String = row.try_get("driver")?;
-        let auth_kind: String = row.try_get("auth_kind")?;
-        if driver != crate::oauth::codex_device::PROVIDER_DRIVER || auth_kind != "oauth" {
-            return Err(AppError::BadRequest(
-                "transport proxy updates are only available for OpenAI Codex OAuth accounts".into(),
-            ));
+        if driver == crate::oauth::codex_device::PROVIDER_DRIVER {
+            if row.try_get::<String, _>("auth_kind")? != "oauth" {
+                return Err(AppError::BadRequest(
+                    "Codex transport proxy updates require an OAuth credential".into(),
+                ));
+            }
+            crate::provider::validate_codex_proxy_url(&proxy_url)?;
         }
         let generation: i64 = row.try_get("credential_generation")?;
         let updated_at: i64 = row.try_get("updated_at")?;
@@ -136,9 +190,19 @@ impl Database {
             != Some((proxy_url.as_str(), crate::network::OutboundScope::Private));
         let replacement = current_credential
             .clone()
-            .with_oauth_proxy(proxy_url.clone())?;
-        let old_metadata = current_credential.codex_proxy_metadata(key_material)?;
-        let new_metadata = replacement.codex_proxy_metadata(key_material)?;
+            .with_transport_proxy(proxy_url.clone())?;
+        let (old_metadata, new_metadata) = if driver == crate::oauth::codex_device::PROVIDER_DRIVER
+        {
+            (
+                current_credential.codex_proxy_metadata(key_material)?,
+                replacement.codex_proxy_metadata(key_material)?,
+            )
+        } else {
+            (
+                current_credential.proxy_metadata(key_material)?,
+                replacement.proxy_metadata(key_material)?,
+            )
+        };
         let mut view = upstream_account_view(row)?;
 
         if proxy_changed {
@@ -1101,9 +1165,7 @@ impl Database {
         .await?;
 
         let config_json: String = row.try_get("config_json")?;
-        let can_update_transport_proxy = row.try_get::<String, _>("driver")?
-            == crate::oauth::codex_device::PROVIDER_DRIVER
-            && auth_kind == "oauth";
+        let can_update_transport_proxy = credential.supports_transport_proxy();
         let mut view = UpstreamAccountView {
             id: account_id,
             tenant_id: parse_uuid(row.try_get("tenant_id")?)?,

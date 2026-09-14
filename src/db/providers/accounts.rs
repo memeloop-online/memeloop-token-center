@@ -144,8 +144,7 @@ impl Database {
             proxy_remote_dns: false,
             proxy_label: None,
             proxy_fingerprint: None,
-            can_update_transport_proxy: input.driver == crate::oauth::codex_device::PROVIDER_DRIVER
-                && auth_kind == "oauth",
+            can_update_transport_proxy: input.credential.supports_transport_proxy(),
             import_source_identity_hash: None,
             import_source_document_sha256: None,
             can_refresh: auth_kind == "oauth"
@@ -206,7 +205,7 @@ impl Database {
         let oauth_driver = row.try_get::<Option<String>, _>("oauth_driver")?;
         let credential = open_credential(&ciphertext, key_material)?;
         let mut view = upstream_account_view(row)?;
-        view.can_update_transport_proxy &= active;
+        view.can_update_transport_proxy = active && credential.supports_transport_proxy();
         Ok((view, credential, active, oauth_driver))
     }
 
@@ -755,8 +754,7 @@ pub(super) fn upstream_account_view(
         oauth_session_id.as_deref(),
         oauth_driver.as_deref(),
     );
-    let can_update_transport_proxy =
-        driver == crate::oauth::codex_device::PROVIDER_DRIVER && auth_kind == "oauth";
+    let can_update_transport_proxy = auth_kind == "oauth";
     Ok(UpstreamAccountView {
         id: parse_uuid(row.try_get("id")?)?,
         tenant_id: parse_uuid(row.try_get("tenant_id")?)?,
