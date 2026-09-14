@@ -1056,6 +1056,10 @@ async fn pending_image_arm_uses_durable_truth_and_preserves_unknown_query_failur
 
 #[tokio::test]
 async fn non_connect_image_send_timeout_keeps_health_unchanged_and_reservation_uncertain() {
+    use super::super::synchronous_image::{
+        ARM_NOT_STARTED, SyncImageRequest, execute_synchronous_image_request,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicU8};
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/images/generations"))
@@ -1064,17 +1068,97 @@ async fn non_connect_image_send_timeout_keeps_health_unchanged_and_reservation_u
         .mount(&upstream)
         .await;
     let mut fixture = fixture(&upstream).await;
-    fixture.state.http = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_millis(100))
-        .build()
+    let key = fixture
+        .state
+        .db
+        .authenticate_key(
+            &fixture.credential,
+            fixture.state.config.key_pepper.as_bytes(),
+        )
+        .await
         .unwrap();
-    let response = post(
-        fixture.state.clone(),
-        &fixture.credential,
-        "non-connect-timeout",
+    let request_id = Uuid::now_v7();
+    let route = crate::generation::group_routing::prepare_route(
+        &mut fixture.state,
+        &key,
+        "image-replay-model",
+        None,
+        request_id,
+        request_id,
     )
-    .await;
+    .await
+    .unwrap();
+    let snapshot = crate::generation::group_routing::snapshot(&fixture.state).unwrap();
+    let price = fixture
+        .state
+        .db
+        .generation_price("image-replay-model", &key.currency)
+        .await
+        .unwrap()
+        .reservation_price()
+        .unwrap();
+    let placeholder = format!("pending://synchronous/{request_id}/request");
+    let reservation = match fixture
+        .state
+        .db
+        .start_synchronous_image_request(StartSynchronousImageRequest {
+            routing_snapshot: snapshot.as_ref(),
+            request_id,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 0,
+            output_token_ceiling: 1,
+            idempotency: None,
+            protocol: "openai-image",
+            model: "image-replay-model",
+            request_object: &placeholder,
+            upstream_account_id: Some(route.account_id),
+            model_route_id: Some(route.route_id),
+        })
+        .await
+        .unwrap()
+    {
+        StartSynchronousImageResult::Started(value) => value,
+        _ => panic!("fresh timeout request"),
+    };
+    let context = SyncImageRequest {
+        state: &fixture.state,
+        reservation: &reservation,
+        request_id,
+        started: Instant::now(),
+        billed_units: 1,
+        expected_image_count: 1,
+        key_id: key.key_id,
+        idempotency_key: None,
+        tenant_id: key.tenant_id,
+        arm_state: AtomicU8::new(ARM_NOT_STARTED),
+        invalid_response: AtomicBool::new(false),
+        confirmed_rejection: AtomicBool::new(false),
+    };
+    // Per-request timeout is intentional: network policy may construct a fresh
+    // no-retry client, so changing AppState.http does not control its deadline.
+    // Keep real staging, durable arm, health admission and the single POST.
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let request = route
+        .credential
+        .apply(
+            client
+                .post(format!("{}/v1/images/generations", upstream.uri()))
+                .json(&request_json())
+                .timeout(Duration::from_millis(100)),
+            unix_millis(),
+        )
+        .unwrap();
+    let response = execute_synchronous_image_request(
+        &context,
+        Bytes::from(serde_json::to_vec(&request_json()).unwrap()),
+        &placeholder,
+        &route,
+        request,
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(response.status(), StatusCode::CONFLICT);
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
     let health = fixture
@@ -1088,8 +1172,14 @@ async fn non_connect_image_send_timeout_keeps_health_unchanged_and_reservation_u
     assert_eq!(health.last_failure_kind, "");
     assert_eq!(health.probe_lease_until, 0);
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let status:String=sqlx::query_scalar("SELECT r.status FROM usage_reservations r JOIN request_records q ON q.reservation_id=r.id WHERE q.key_id=$1")
+    let row=sqlx::query("SELECT r.status, q.submission_started_at, q.submission_uncertain_at, q.completed_at FROM usage_reservations r JOIN request_records q ON q.reservation_id=r.id WHERE q.key_id=$1")
         .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();
-    assert_eq!(status, "reserved");
+    assert_eq!(row.get::<String, _>("status"), "reserved");
+    assert!(row.get::<Option<i64>, _>("submission_started_at").is_some());
+    assert!(
+        row.get::<Option<i64>, _>("submission_uncertain_at")
+            .is_some()
+    );
+    assert!(row.get::<Option<i64>, _>("completed_at").is_none());
     pool.close().await;
 }
