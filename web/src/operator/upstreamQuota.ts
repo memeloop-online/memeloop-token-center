@@ -73,6 +73,14 @@ export function quotaRemaining(window: UpstreamQuotaSnapshot['windows'][number])
   return null;
 }
 
+export function quotaUnitMessage(unit: string): 'quota.unitRequests' | 'quota.unitTokens' | null {
+  switch (unit.trim().toLowerCase()) {
+    case 'request': case 'requests': return 'quota.unitRequests';
+    case 'token': case 'tokens': return 'quota.unitTokens';
+    default: return null;
+  }
+}
+
 export type QuotaObservationState = 'unobserved' | 'current' | 'historical';
 
 /** A retained snapshot is evidence from its observation time, never a current successful read. */

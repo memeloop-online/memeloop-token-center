@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { quotaObservationState, quotaRemaining, quotaResetCreditExpiry, quotaSummaryPresentation, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaPath, type UpstreamQuotaSnapshot } from '../src/operator/upstreamQuota.js';
+import { formatCountdown } from '../src/format.js';
+import { quotaObservationState, quotaRemaining, quotaResetCreditExpiry, quotaSummaryPresentation, quotaUnitMessage, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaPath, type UpstreamQuotaSnapshot } from '../src/operator/upstreamQuota.js';
 
 test('quota URL requires and preserves explicit account and tenant identity', () => {
   const url = new URL(upstreamQuotaPath('account/one', 'tenant & one'), 'https://example.test');
@@ -21,6 +22,24 @@ test('unknown windows stay unknown and exact usage is not rounded or capped by t
   assert.equal(quotaRemaining({ ...window, used_percent: Number.NaN }), null);
   assert.equal(quotaRemaining({ ...window, used_percent: 120.25 }), null, 'out-of-range usage is not clamped into invented remaining quota');
   assert.deepEqual(quotaRemaining({ ...window, unit: 'requests', remaining: 25, limit: 100 }), { kind: 'amount', amount: 25, limit: 100, unit: 'requests' });
+  assert.equal(quotaUnitMessage('requests'), 'quota.unitRequests');
+  assert.equal(quotaUnitMessage('Tokens'), 'quota.unitTokens');
+  assert.equal(quotaUnitMessage('Vendor Compute Units'), null, 'unrecognized supplier units stay verbatim');
+});
+
+test('quota countdown keeps minute, hour and day boundaries without sleeping or changing exact deadlines', () => {
+  const now = Date.UTC(2026, 8, 15);
+  for (const [milliseconds, zh, en] of [
+    [0, '0分钟', '0m'], [59_999, '不到1分钟', 'less than 1 min'], [60_000, '1分钟', '1m'],
+    [3_599_999, '59分钟', '59m'], [3_600_000, '1小时', '1h'],
+    [86_399_999, '23小时59分钟', '23h 59m'], [86_400_000, '1天', '1d'],
+    [167 * 3_600_000, '6天23小时', '6d 23h'], [90_180_000, '1天1小时3分钟', '1d 1h 3m'],
+  ] as const) {
+    const resetAt = now + milliseconds;
+    assert.equal(formatCountdown(resetAt - now, 'zh-CN'), zh);
+    assert.equal(formatCountdown(resetAt - now, 'en'), en);
+  }
+  for (const value of [null, undefined, Number.NaN, Infinity, -1]) assert.equal(formatCountdown(value, 'zh-CN'), '—');
 });
 
 test('Codex window cadence follows supplier duration before internal primary or secondary role', () => {

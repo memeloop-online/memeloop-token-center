@@ -184,3 +184,16 @@ export function formatElapsedTime(value: number | null | undefined, locale: Loca
   if (locale === 'zh-CN') return `${formatNumber(hours, locale)}小时${formatNumber(minutes, locale)}分${formatNumber(seconds, locale)}秒`;
   return `${formatNumber(hours, locale)}h ${formatNumber(minutes, locale)}m ${formatNumber(seconds, locale)}s`;
 }
+
+/** Minute-level countdown; callers keep the exact deadline alongside it. */
+export function formatCountdown(value: number | null | undefined, locale: Locale) {
+  if (value === null || value === undefined || !Number.isFinite(value) || value < 0) return '—';
+  if (value > 0 && value < 60_000) return locale === 'zh-CN' ? '不到1分钟' : 'less than 1 min';
+  const totalMinutes = Math.floor(value / 60_000);
+  const days = Math.floor(totalMinutes / 1_440);
+  const hours = Math.floor(totalMinutes % 1_440 / 60);
+  const minutes = totalMinutes % 60;
+  const values = [[days, locale === 'zh-CN' ? '天' : 'd'], [hours, locale === 'zh-CN' ? '小时' : 'h'], [minutes, locale === 'zh-CN' ? '分钟' : 'm']] as const;
+  const parts = values.filter(([amount]) => amount > 0).map(([amount, unit]) => `${formatNumber(amount, locale)}${unit}`);
+  return parts.length ? parts.join(locale === 'zh-CN' ? '' : ' ') : locale === 'zh-CN' ? '0分钟' : '0m';
+}
