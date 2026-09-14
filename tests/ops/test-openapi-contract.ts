@@ -56,6 +56,13 @@ test("lifetime apostrophe is not parsed as a character literal", () => assert.eq
 test("unknown merged router fails closed", () => assert.throws(() => sourceRoutes(sourceWith(".merge(helper_router())")), /unparsed Router/u));
 
 test("asset and image semantics are complete", () => validateProductContracts(cloneDocument()));
+test("filter assistant execution uses a dedicated billable capability", () => {
+  const document = cloneDocument(); const operation = document.paths["/internal/v1/filter-assistant/plan"].post;
+  assert.deepEqual(operation.security, [{ serviceBearer: [] }]);
+  assert.equal(operation["x-required-scope"], "filter_assistant:execute");
+  assert.ok(document.components.schemas.ServiceScope.enum.includes("filter_assistant:execute"));
+  assert.deepEqual(operation.responses["429"], { $ref: "#/components/responses/UsageRejected" });
+});
 test("model picker projection fails closed on network side effects", () => {
   const document = cloneDocument(); const operation = document.paths["/internal/v1/model-picker-options"].get;
   operation["x-projection-contract"]["provider-network-io"] = "allowed";
