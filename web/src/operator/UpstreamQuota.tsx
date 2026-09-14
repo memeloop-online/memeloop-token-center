@@ -86,7 +86,7 @@ export function UpstreamQuotaResetSection({ accountId, accountName, tenant, toke
       {capability?.available_credits !== null && capability?.available_credits !== undefined && <span>{t('quota.resetCredits', { available: formatNumber(capability.available_credits, locale), applicable: capability.applicable_credits === null ? '—' : formatNumber(capability.applicable_credits, locale) })}</span>}
       {snapshot.provider === 'openai-codex' && <QuotaResetCreditExpiry snapshot={snapshot} />}
       {capability?.credit_error_code && <p>{t('quota.resetCreditsUnavailable')} {t(quotaReadErrorMessage(capability.credit_error_code))}</p>}
-      {actionable && <><p>{t('quota.resetWarning')}</p><UpstreamQuotaReset accountId={accountId} accountName={accountName} tenant={tenant} token={token} snapshot={snapshot} /></>}
+      {actionable && <UpstreamQuotaReset accountId={accountId} accountName={accountName} tenant={tenant} token={token} snapshot={snapshot} />}
     </> : <>
       <p role="status">{t(readFailed ? 'quota.resetDiscoveryFailed' : 'quota.resetDiscoveryPending')}</p>
       <button type="button" className="danger" disabled>{t('quota.resetAction')}</button>
