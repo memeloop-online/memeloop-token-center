@@ -49,6 +49,21 @@ async fn assistant_invokes_selected_route_and_bills_explicit_key_then_rejects_di
             "usage":{"input_tokens":100,"output_tokens":30,"total_tokens":130}
         }))).expect(1).mount(&upstream).await;
     let mut fixture = response_usage_fixture("filter-assistant", &upstream, 0).await;
+    // The same provider advertises text and non-text capabilities. Pure-text
+    // assistant execution must still succeed through ordinary key/route grants.
+    let provider = fixture.state.providers.get("http-json").unwrap();
+    assert!(
+        provider
+            .modalities
+            .iter()
+            .any(|modality| modality == "text")
+    );
+    assert!(
+        provider
+            .modalities
+            .iter()
+            .any(|modality| modality != "text")
+    );
     let tenant = "compatibility-route-filter-assistant";
     // Both routes are authorized for the same public model. Ordinary priority
     // selection would choose the decoy; the configured route must win instead.

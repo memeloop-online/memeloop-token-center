@@ -271,6 +271,7 @@ async fn image_invalid_body_observes_once_and_same_key_remains_uncertain_after_e
     let body: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body["error"]["code"], "image_submission_uncertain");
     assert_eq!(body["error"]["retryable"], false);
+    assert_eq!(body["error"]["reconciliation_available"], true);
     let health = fixture
         .state
         .db
@@ -301,6 +302,12 @@ async fn image_invalid_body_observes_once_and_same_key_remains_uncertain_after_e
     pool.close().await;
     let repeated = post(fixture.state.clone(), &fixture.credential, "invalid-image").await;
     assert_eq!(repeated.status(), StatusCode::CONFLICT);
+    let replay: Value =
+        serde_json::from_slice(&to_bytes(repeated.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert!(
+        replay["error"]["reconciliation_available"].is_null(),
+        "read-only replay must not claim publication readiness"
+    );
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
 }
 
@@ -393,4 +400,553 @@ async fn cancelling_after_image_send_keeps_durable_no_replay_fence() {
     .await;
     assert_eq!(repeated.status(), StatusCode::CONFLICT);
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn durable_media_restore_pins_config_and_code_and_never_refreshes_deadline() {
+    use crate::generation::group_routing::{prepare_route, snapshot};
+    use crate::group_routing::durable::{deadline, restore_selected};
+    use crate::plugin::routing::GroupRoutingOutcome;
+    let upstream = MockServer::start().await;
+    let mut fixture = fixture(&upstream).await;
+    let key = fixture
+        .state
+        .db
+        .authenticate_key(
+            &fixture.credential,
+            fixture.state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let request_id = Uuid::now_v7();
+    let route = prepare_route(
+        &mut fixture.state,
+        &key,
+        "image-replay-model",
+        None,
+        request_id,
+        request_id,
+    )
+    .await
+    .unwrap();
+    let persisted = snapshot(&fixture.state)
+        .unwrap()
+        .expect("group inclusion must create a durable strategy snapshot");
+    assert_eq!(persisted["policies"].as_array().unwrap().len(), 1);
+    assert_eq!(persisted["policies"][0]["config"], json!({}));
+    let original_directive = persisted["policies"][0]["directive"].clone();
+
+    // A later group update must not retroactively become this job's config.
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query("UPDATE provider_groups SET routing_strategy = $1, strategy_version = strategy_version + 1 WHERE tenant_id = $2")
+        .bind(json!({"plugin_id":"image-routing","config":{"tag":"new"}}).to_string())
+        .bind(fixture.tenant.to_string()).execute(&pool).await.unwrap();
+    pool.close().await;
+
+    // Change the actual component bytes and reload a separate runtime, keeping
+    // the original runtime alive like a retained historical application pin.
+    let root = fixture._directory.path().join("plugins");
+    let mut replacement = original_directive.clone();
+    replacement["cooldown_ms"] = json!(24680);
+    fs::write(
+        root.join("image-routing/plugin.wasm"),
+        component(&json!({"candidates":[replacement.clone()]}), &replacement),
+    )
+    .unwrap();
+    let mut current = fixture.state.clone();
+    current.plugins = PluginRuntime::load(root.to_str(), current.db.clone()).unwrap();
+    prepare_route(
+        &mut current,
+        &key,
+        "image-replay-model",
+        None,
+        request_id,
+        request_id,
+    )
+    .await
+    .unwrap();
+    let new_plan = snapshot(&current).unwrap().unwrap();
+    assert_eq!(new_plan["policies"][0]["config"], json!({"tag":"new"}));
+    assert_eq!(new_plan["policies"][0]["directive"]["cooldown_ms"], 24680);
+
+    let restored = restore_selected(
+        &fixture.state,
+        Some(&persisted),
+        fixture.tenant,
+        Some(route.route_id),
+        fixture.account,
+        request_id,
+    )
+    .await
+    .unwrap();
+    let retained = snapshot(&restored).unwrap().unwrap();
+    assert_eq!(retained["policies"][0]["config"], json!({}));
+    assert_eq!(retained["policies"][0]["directive"], original_directive);
+    let observed = crate::group_routing::observe(
+        &restored,
+        request_id,
+        route.route_id,
+        fixture.account,
+        route.credential_generation,
+        GroupRoutingOutcome::TransientFailure,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        observed.cooldown_ms, 12345,
+        "real old Wasm observe must remain pinned"
+    );
+
+    let fallback = restore_selected(
+        &current,
+        Some(&persisted),
+        fixture.tenant,
+        Some(route.route_id),
+        fixture.account,
+        request_id,
+    )
+    .await
+    .unwrap();
+    assert!(
+        snapshot(&fallback).unwrap().unwrap()["policies"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "different component fingerprint must not substitute replacement code"
+    );
+    assert!(
+        crate::group_routing::observe(
+            &fallback,
+            request_id,
+            route.route_id,
+            fixture.account,
+            route.credential_generation,
+            GroupRoutingOutcome::TransientFailure
+        )
+        .await
+        .is_none()
+    );
+    assert!(
+        restore_selected(
+            &fixture.state,
+            Some(&persisted),
+            Uuid::now_v7(),
+            Some(route.route_id),
+            fixture.account,
+            request_id
+        )
+        .await
+        .is_err()
+    );
+
+    // Use a definitely expired persisted wall-clock budget rather than sleeps
+    // or a fresh Tokio deadline; every worker restore must keep it expired.
+    let mut expired = persisted.clone();
+    expired["deadline_at"] = json!(unix_millis() - 100);
+    expired["started_at"] = json!(unix_millis() - 1100);
+    for _ in 0..2 {
+        let restored = restore_selected(
+            &fixture.state,
+            Some(&expired),
+            fixture.tenant,
+            Some(route.route_id),
+            fixture.account,
+            request_id,
+        )
+        .await
+        .unwrap();
+        assert!(deadline(&restored).unwrap() <= tokio::time::Instant::now());
+    }
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn explicit_image_auth_rejection_settles_zero_and_never_replays() {
+    for status in [401, 403] {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/generations"))
+            // Malformed body does not erase the definite rejection in headers.
+            .respond_with(
+                ResponseTemplate::new(status).set_body_raw("invalid JSON", "application/json"),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let fixture = fixture(&upstream).await;
+        let response = post(
+            fixture.state.clone(),
+            &fixture.credential,
+            "definite-auth-rejection",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+        let row = sqlx::query("SELECT r.status, r.actual_micros, q.cost_micros, q.submission_uncertain_at, i.status AS idempotency_status FROM usage_reservations r JOIN request_records q ON q.reservation_id = r.id JOIN synchronous_image_idempotency i ON i.request_id = q.id WHERE q.key_id = $1")
+            .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();
+        assert_eq!(row.get::<String, _>("status"), "settled");
+        assert_eq!(row.get::<i64, _>("actual_micros"), 0);
+        assert_eq!(row.get::<i64, _>("cost_micros"), 0);
+        assert_eq!(row.get::<String, _>("idempotency_status"), "failed");
+        assert!(
+            row.get::<Option<i64>, _>("submission_uncertain_at")
+                .is_none()
+        );
+        pool.close().await;
+        let health = fixture
+            .state
+            .db
+            .group_routing_health(fixture.tenant, fixture.account, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(health.last_failure_kind, "authentication");
+        assert_eq!(health.consecutive_failures, 1);
+        assert_eq!(health.probe_lease_until, 0);
+        let replay = post(
+            fixture.state.clone(),
+            &fixture.credential,
+            "definite-auth-rejection",
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn truncated_successful_image_body_keeps_reservation_and_never_replays() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let upstream = MockServer::start().await;
+    let fixture = fixture(&upstream).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 8192];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{").await.unwrap();
+        socket.shutdown().await.unwrap();
+        listener
+    });
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query("UPDATE upstream_accounts SET config_json = $1 WHERE id = $2")
+        .bind(
+            json!({"base_url":format!("http://{address}/v1"),"network_scope":"private"})
+                .to_string(),
+        )
+        .bind(fixture.account.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let response = post(
+        fixture.state.clone(),
+        &fixture.credential,
+        "truncated-image",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let listener = server.await.unwrap();
+    let status: String = sqlx::query_scalar("SELECT r.status FROM usage_reservations r JOIN request_records q ON q.reservation_id = r.id WHERE q.key_id = $1")
+        .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!(status, "reserved");
+    pool.close().await;
+    let replay = post(
+        fixture.state.clone(),
+        &fixture.credential,
+        "truncated-image",
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::CONFLICT);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "same-key replay must not establish another upstream connection"
+    );
+    let body = to_bytes(replay.into_body(), 64 * 1024).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["code"], "image_submission_uncertain");
+}
+
+#[tokio::test]
+async fn rejected_image_arm_cas_never_sends_and_settles_zero_without_uncertainty() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    let fixture = fixture(&upstream).await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query("CREATE TRIGGER reject_image_arm BEFORE UPDATE OF submission_started_at ON request_records WHEN NEW.submission_started_at IS NOT NULL BEGIN SELECT RAISE(IGNORE); END")
+        .execute(&pool).await.unwrap();
+    let response = post(
+        fixture.state.clone(),
+        &fixture.credential,
+        "arm-cas-rejected",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_ne!(body["error"]["code"], "image_submission_uncertain");
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+    let row = sqlx::query("SELECT r.status, r.actual_micros, q.submission_started_at, q.submission_uncertain_at FROM usage_reservations r JOIN request_records q ON q.reservation_id=r.id WHERE q.key_id=$1")
+        .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!(row.get::<String, _>("status"), "settled");
+    assert_eq!(row.get::<i64, _>("actual_micros"), 0);
+    assert!(row.get::<Option<i64>, _>("submission_started_at").is_none());
+    assert!(
+        row.get::<Option<i64>, _>("submission_uncertain_at")
+            .is_none()
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn pending_image_arm_uses_durable_truth_and_preserves_unknown_query_failures() {
+    use super::super::synchronous_image::{
+        ARM_CONFIRMED, ARM_NOT_STARTED, ARM_PENDING, SyncImageRequest, submission_may_have_started,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+    for scenario in [
+        "not_started",
+        "committed_ack_lost",
+        "query_failed",
+        "query_failed_after_commit",
+    ] {
+        let upstream = MockServer::start().await;
+        let fixture = fixture(&upstream).await;
+        let key = fixture
+            .state
+            .db
+            .authenticate_key(
+                &fixture.credential,
+                fixture.state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let price = fixture
+            .state
+            .db
+            .generation_price("image-replay-model", &key.currency)
+            .await
+            .unwrap()
+            .reservation_price()
+            .unwrap();
+        let request_id = Uuid::now_v7();
+        let reservation = match fixture
+            .state
+            .db
+            .start_synchronous_image_request(StartSynchronousImageRequest {
+                routing_snapshot: None,
+                request_id,
+                key: &key,
+                price: &price,
+                input_token_ceiling: 0,
+                output_token_ceiling: 1,
+                idempotency: None,
+                protocol: "openai-image",
+                model: "image-replay-model",
+                request_object: "objects/blake3/test-arm-proof",
+                upstream_account_id: Some(fixture.account),
+                model_route_id: None,
+            })
+            .await
+            .unwrap()
+        {
+            StartSynchronousImageResult::Started(value) => value,
+            _ => panic!("fresh request"),
+        };
+        if matches!(scenario, "committed_ack_lost" | "query_failed_after_commit") {
+            // Leave local state Pending, simulating loss of the successful
+            // transaction acknowledgement after the durable marker committed.
+            fixture
+                .state
+                .db
+                .arm_synchronous_image_submission(fixture.key_id, None, request_id, reservation.id)
+                .await
+                .unwrap();
+        }
+        let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+        if scenario.starts_with("query_failed") {
+            sqlx::query("CREATE TRIGGER fail_arm_confirmation BEFORE UPDATE OF completed_at ON request_records BEGIN SELECT RAISE(FAIL, 'confirmation unavailable'); END")
+                .execute(&pool).await.unwrap();
+        }
+        let context = SyncImageRequest {
+            state: &fixture.state,
+            reservation: &reservation,
+            request_id,
+            started: Instant::now(),
+            billed_units: 1,
+            expected_image_count: 1,
+            key_id: fixture.key_id,
+            idempotency_key: None,
+            tenant_id: fixture.tenant,
+            arm_state: AtomicU8::new(ARM_PENDING),
+            invalid_response: AtomicBool::new(false),
+            confirmed_rejection: AtomicBool::new(false),
+        };
+        assert_eq!(
+            submission_may_have_started(&context).await.unwrap(),
+            scenario != "not_started"
+        );
+        let expected_state = match scenario {
+            "not_started" => ARM_NOT_STARTED,
+            "committed_ack_lost" => ARM_CONFIRMED,
+            _ => ARM_PENDING,
+        };
+        assert_eq!(context.arm_state.load(Ordering::Acquire), expected_state);
+        let response = fail_image_request(&context, "image_submission_failed")
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if scenario == "not_started" {
+                StatusCode::BAD_GATEWAY
+            } else {
+                StatusCode::CONFLICT
+            }
+        );
+        let response: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        if scenario.starts_with("query_failed") {
+            assert_eq!(
+                response["error"]["code"],
+                "image_submission_state_unavailable"
+            );
+            assert_eq!(response["error"]["reconciliation_available"], false);
+            assert_eq!(response["error"]["retryable"], false);
+            assert!(
+                fixture
+                    .state
+                    .db
+                    .list_image_generation_quarantine("synchronous-strategy", 20, None)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        } else if scenario == "committed_ack_lost" {
+            assert_eq!(response["error"]["code"], "image_submission_uncertain");
+            assert_eq!(response["error"]["reconciliation_available"], true);
+        }
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM usage_reservations WHERE id=$1")
+                .bind(reservation.id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status,
+            if scenario == "not_started" {
+                "settled"
+            } else {
+                "reserved"
+            }
+        );
+        if scenario.starts_with("query_failed") {
+            // Restore storage, then run the real maintenance recovery. No new
+            // submission, fake receipt or status-only rewrite is involved.
+            sqlx::query("DROP TRIGGER fail_arm_confirmation")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let stale = unix_millis() - 31 * 60 * 1000;
+            sqlx::query("UPDATE request_records SET created_at=$1 WHERE id=$2")
+                .bind(stale)
+                .bind(request_id.to_string())
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE usage_reservations SET created_at=$1 WHERE id=$2")
+                .bind(stale)
+                .bind(reservation.id.to_string())
+                .execute(&pool)
+                .await
+                .unwrap();
+            fixture
+                .state
+                .db
+                .release_orphaned_reservations(20)
+                .await
+                .unwrap();
+            let row = sqlx::query("SELECT r.status, r.actual_micros, q.completed_at, q.submission_uncertain_at FROM usage_reservations r JOIN request_records q ON q.reservation_id=r.id WHERE q.id=$1")
+                .bind(request_id.to_string()).fetch_one(&pool).await.unwrap();
+            let listed = fixture
+                .state
+                .db
+                .list_image_generation_quarantine("synchronous-strategy", 20, None)
+                .await
+                .unwrap();
+            if scenario == "query_failed_after_commit" {
+                assert_eq!(row.get::<String, _>("status"), "reserved");
+                assert!(row.get::<Option<i64>, _>("completed_at").is_none());
+                assert!(
+                    row.get::<Option<i64>, _>("submission_uncertain_at")
+                        .is_some()
+                );
+                assert_eq!(
+                    listed.len(),
+                    1,
+                    "committed fence must become actionable after recovery"
+                );
+            } else {
+                assert_eq!(row.get::<String, _>("status"), "settled");
+                assert_eq!(row.get::<i64, _>("actual_micros"), 0);
+                assert!(row.get::<Option<i64>, _>("completed_at").is_some());
+                assert!(
+                    row.get::<Option<i64>, _>("submission_uncertain_at")
+                        .is_none()
+                );
+                assert!(
+                    listed.is_empty(),
+                    "proven unsent request is safely closed, not quarantined"
+                );
+            }
+        }
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+        pool.close().await;
+    }
+}
+
+#[tokio::test]
+async fn non_connect_image_send_timeout_keeps_health_unchanged_and_reservation_uncertain() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let mut fixture = fixture(&upstream).await;
+    fixture.state.http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_millis(100))
+        .build()
+        .unwrap();
+    let response = post(
+        fixture.state.clone(),
+        &fixture.credential,
+        "non-connect-timeout",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    let health = fixture
+        .state
+        .db
+        .group_routing_health(fixture.tenant, fixture.account, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(health.consecutive_failures, 0);
+    assert_eq!(health.last_failure_kind, "");
+    assert_eq!(health.probe_lease_until, 0);
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let status:String=sqlx::query_scalar("SELECT r.status FROM usage_reservations r JOIN request_records q ON q.reservation_id=r.id WHERE q.key_id=$1")
+        .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!(status, "reserved");
+    pool.close().await;
 }

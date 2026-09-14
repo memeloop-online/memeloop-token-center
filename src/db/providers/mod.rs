@@ -20,7 +20,9 @@ pub use model_picker::{
 pub use native_oauth_imports::{
     NativeOAuthImportAccountInput, NativeOAuthImportApproval, NativeOAuthImportCohortResult,
 };
-pub use oauth::ReauthorizeUpstreamAccountInput;
+pub use oauth::{
+    ClaimUpstreamOAuthRefreshResult, ClaimedUpstreamOAuthRefresh, ReauthorizeUpstreamAccountInput,
+};
 pub use routes::{CreateModelRouteInput, UpdateModelRouteInput};
 
 const UPSTREAM_CREDENTIAL_ROTATION_RESOURCE: &str = "upstream_credential";

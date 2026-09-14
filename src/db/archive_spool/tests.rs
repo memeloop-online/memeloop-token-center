@@ -1314,6 +1314,48 @@ async fn competing_replays_charge_one_admission_and_one_chunk() {
 }
 
 #[tokio::test]
+async fn lost_process_capturing_spool_expires_without_publishing_a_prefix() {
+    let (_dir, db, id) = fixture().await;
+    assert!(db.begin_response_archive_spool(id).await.unwrap());
+    assert!(
+        db.append_response_archive_spool(id, 0, 1, "opaque")
+            .await
+            .unwrap()
+    );
+    assert!(budget(&db).await > 0);
+    // Persisted state left by a killed process: no producer or writer exists
+    // to fence it, so the unchanged worker expiry path is the recovery owner.
+    sqlx::query("UPDATE response_archive_spools SET expires_at = 0 WHERE request_id = $1")
+        .bind(id.request_id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        db.claim_response_archive_spool(Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 1);
+    assert_eq!(budget(&db).await, 0);
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM response_archive_spools WHERE request_id = $1")
+            .bind(id.request_id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "gap");
+    let chunks: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM response_archive_spool_chunks WHERE request_id = $1",
+    )
+    .bind(id.request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(chunks, 0);
+}
+
+#[tokio::test]
 async fn exhausted_crash_lease_and_pending_retention_release_budget() {
     let (_dir, db, id) = fixture().await;
     assert!(db.begin_response_archive_spool(id).await.unwrap());

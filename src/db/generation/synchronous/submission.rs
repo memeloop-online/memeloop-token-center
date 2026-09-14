@@ -1,6 +1,38 @@
 use super::*;
 
 impl Database {
+    /// After cancelling/dropping the arm future, serialize behind its submitted
+    /// SQL before deciding that no durable send authority exists. Missing owner
+    /// evidence is unknown, never proof that cleanup/refund is safe.
+    pub(crate) async fn confirm_synchronous_image_submission_started(
+        &self,
+        key_id: Uuid,
+        request_id: Uuid,
+        reservation_id: Uuid,
+    ) -> Result<bool, AppError> {
+        let mut tx = self.begin_write_transaction().await?;
+        sqlx::query("UPDATE synchronous_image_idempotency SET lease_expires_at = lease_expires_at WHERE request_id = $1 AND key_id = $2")
+            .bind(request_id.to_string()).bind(key_id.to_string()).execute(&mut *tx).await?;
+        let locked = sqlx::query("UPDATE request_records SET completed_at = completed_at WHERE id = $1 AND key_id = $2 AND reservation_id = $3")
+            .bind(request_id.to_string()).bind(key_id.to_string()).bind(reservation_id.to_string()).execute(&mut *tx).await?;
+        if locked.rows_affected() != 1 {
+            return Err(AppError::NotFound);
+        }
+        let row = sqlx::query("SELECT q.submission_started_at, q.completed_at, r.status AS reservation_status FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id AND r.key_id = q.key_id WHERE q.id = $1 AND q.key_id = $2 AND q.reservation_id = $3")
+            .bind(request_id.to_string()).bind(key_id.to_string()).bind(reservation_id.to_string()).fetch_optional(&mut *tx).await?.ok_or(AppError::NotFound)?;
+        let marker: Option<i64> = row.try_get("submission_started_at")?;
+        if marker.is_none()
+            && (row.try_get::<Option<i64>, _>("completed_at")?.is_some()
+                || row.try_get::<String, _>("reservation_status")? != "reserved")
+        {
+            return Err(AppError::Conflict(
+                "synchronous image request is no longer an unsubmitted live owner".into(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(marker.is_some())
+    }
+
     pub(super) async fn synchronous_image_submission_started(
         &self,
         key_id: Uuid,

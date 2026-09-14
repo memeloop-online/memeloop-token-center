@@ -21,6 +21,7 @@ use crate::{
 
 pub const FLOW: &str = "generic_authorization_code";
 pub const CLIENT_DEFAULTS_ENV: &str = "MTC_PROVIDER_OAUTH_CLIENT_DEFAULTS_JSON";
+const READY_RECOVERY_MILLIS: i64 = 24 * 60 * 60 * 1000;
 
 /// Deployment-owned Secret injection. Values never appear in config debug or
 /// public catalog JSON; the chosen client is snapshotted into the AEAD session.
@@ -58,6 +59,46 @@ pub struct ClientConfig {
     pub client_secret: Option<String>,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefreshState {
+    client_id: String,
+    client_secret: Option<String>,
+    refresh_url: String,
+    network_scope: OutboundScope,
+}
+
+fn refresh_state(input: &StartInput) -> Result<Value, AppError> {
+    let state = json!({"authorization_code": RefreshState {
+        client_id: input.client.client_id.clone(),
+        client_secret: input.client.client_secret.clone(),
+        refresh_url: input.adapter.refresh_url.clone(),
+        network_scope: network::scope_from_config(&input.provider_config),
+    }});
+    crate::provider::validate_adapter_state(&state)?;
+    Ok(state)
+}
+
+fn validate_start_proxy(input: &StartInput) -> Result<(), AppError> {
+    match (input.proxy_url.as_deref(), input.proxy_network_scope) {
+        (None, None) => Ok(()),
+        (Some(proxy), Some(OutboundScope::Private)) => {
+            crate::provider::validate_proxy_url(proxy)?;
+            let parsed = Url::parse(proxy)
+                .map_err(|_| AppError::BadRequest("invalid OAuth proxy".into()))?;
+            if parsed.scheme() == "socks5h" && !network::has_safe_private_ip_literal_host(&parsed) {
+                return Err(AppError::BadRequest(
+                    "remote-DNS OAuth proxy must use a private IP endpoint".into(),
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(AppError::BadRequest(
+            "OAuth proxy must use private network scope".into(),
+        )),
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StartInput {
     #[serde(default)]
@@ -79,6 +120,7 @@ pub struct LoginStart {
     pub login_url: String,
     pub session_token: String,
     pub expires_at: i64,
+    pub recovery_expires_at: i64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -142,7 +184,7 @@ pub fn session_application_revision(
     {
         return Err(AppError::Forbidden);
     }
-    if session.expires_at <= now {
+    if session.expires_at.saturating_add(READY_RECOVERY_MILLIS) <= now {
         return Err(AppError::BadRequest("OAuth session expired".into()));
     }
     Ok(session.application_plugin_revision)
@@ -177,11 +219,19 @@ struct TokenResponse {
 
 pub async fn start(
     db: &Database,
-    input: StartInput,
+    mut input: StartInput,
     key: &[u8],
     now: i64,
 ) -> Result<LoginStart, AppError> {
     validate_client(&input.client)?;
+    input.client.redirect_uri = Url::parse(&input.client.redirect_uri)
+        .map_err(|_| AppError::BadRequest("invalid OAuth redirect URI".into()))?
+        .to_string();
+    validate_start_proxy(&input)?;
+    let _ = refresh_state(&input)?;
+    if input.provider_driver == crate::provider::antigravity::DRIVER {
+        let _ = crate::provider::antigravity::Config::from_account(&input.provider_config)?;
+    }
     if input.adapter.flow_kind != OAuthFlowKind::AuthorizationCodePkce
         || input.adapter.api_version != "oauth-adapter-v1"
     {
@@ -248,6 +298,7 @@ pub async fn start(
         login_url: url.into(),
         session_token: seal_private_json(&session, key, TOKEN_AAD)?,
         expires_at: session.expires_at,
+        recovery_expires_at: session.expires_at.saturating_add(READY_RECOVERY_MILLIS),
     })
 }
 
@@ -270,7 +321,7 @@ pub async fn complete(
     {
         return Err(AppError::Forbidden);
     }
-    if session.expires_at <= now {
+    if session.expires_at.saturating_add(READY_RECOVERY_MILLIS) <= now {
         return Err(AppError::BadRequest("OAuth session expired".into()));
     }
     let reference = OAuthLoginSessionReference {
@@ -280,38 +331,48 @@ pub async fn complete(
         operator_service_id,
         expires_at: session.expires_at,
     };
-    let (lease_owner, ciphertext) = match db.claim_oauth_login_poll(&reference, now, 1).await? {
-        OAuthLoginClaim::Pending {
-            retry_after_seconds,
-        } => {
-            return Ok(CompleteResult::Pending {
+    let (lease_owner, ciphertext) =
+        match db.claim_oauth_code_ready_recovery(&reference, now).await? {
+            OAuthLoginClaim::Pending {
                 retry_after_seconds,
-            });
-        }
-        OAuthLoginClaim::Consumed { account_id } => {
-            return Ok(CompleteResult::Consumed {
-                account_id,
-                tenant_external_id: session.tenant_external_id,
-            });
-        }
-        OAuthLoginClaim::Ready {
-            lease_owner,
-            ready_ciphertext,
-        } => {
-            return Ok(CompleteResult::Ready {
+            } => {
+                return Ok(CompleteResult::Pending {
+                    retry_after_seconds,
+                });
+            }
+            OAuthLoginClaim::Consumed { account_id } => {
+                return Ok(CompleteResult::Consumed {
+                    account_id,
+                    tenant_external_id: session.tenant_external_id,
+                });
+            }
+            OAuthLoginClaim::Ready {
                 lease_owner,
-                login: open_ready(&ready_ciphertext, key, &session)?,
-            });
-        }
-        OAuthLoginClaim::Claimed {
-            lease_owner,
-            state_ciphertext,
-        } => (lease_owner, state_ciphertext),
-    };
+                ready_ciphertext,
+            } => {
+                return Ok(CompleteResult::Ready {
+                    lease_owner,
+                    login: open_ready(&ready_ciphertext, key, &session)?,
+                });
+            }
+            OAuthLoginClaim::Claimed {
+                lease_owner,
+                state_ciphertext,
+            } => (lease_owner, state_ciphertext),
+        };
     let mut login: LoginState = open_private_json(&ciphertext, key, STATE_AAD)?;
     if login.input.application_plugin_revision != session.application_plugin_revision {
         return Err(AppError::Conflict(
             "OAuth application revision binding changed".into(),
+        ));
+    }
+    // Empty callbacks are explicit status/finalization checks from the UI.
+    // They may claim a Ready result, but may never arm, exchange or fail a code.
+    if callback_url.is_empty() {
+        db.release_oauth_login_poll(session.session_id, lease_owner, now)
+            .await?;
+        return Err(AppError::Conflict(
+            "OAuth credentials are not ready for finalization".into(),
         ));
     }
     if login.exchange_started {
@@ -336,17 +397,7 @@ pub async fn complete(
         ("code_verifier", login.verifier.clone()),
     ];
     add_client(&mut form, &login.input.client);
-    // A reclaimed lease may not replay an authorization code after a crash.
-    // This one-way marker is encrypted with the existing session state and
-    // becomes durable before any token request can be dispatched.
-    login.exchange_started = true;
-    db.replace_oauth_login_poll_state(
-        session.session_id,
-        lease_owner,
-        seal_private_json(&login, key, STATE_AAD)?,
-    )
-    .await?;
-    let tokens = token_request(
+    let prepared = match prepare_token_request(
         http,
         &login.input.adapter.poll_url,
         &login.input.provider_config,
@@ -357,10 +408,35 @@ pub async fn complete(
             .zip(login.input.proxy_network_scope),
         &form,
         allow_test_loopback,
-        None,
     )
     .await
-    .and_then(|tokens| credential(tokens, &login.input, now, None));
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            db.release_oauth_login_poll(session.session_id, lease_owner, now)
+                .await?;
+            return Err(error);
+        }
+    };
+    // Validate the final encrypted refresh envelope before crossing the send fence.
+    if let Err(error) = refresh_state(&login.input) {
+        db.release_oauth_login_poll(session.session_id, lease_owner, now)
+            .await?;
+        return Err(error);
+    }
+    // A reclaimed lease may not replay an authorization code after a crash.
+    // This one-way marker is encrypted with the existing session state and
+    // becomes durable before any token request can be dispatched.
+    login.exchange_started = true;
+    db.replace_oauth_login_poll_state(
+        session.session_id,
+        lease_owner,
+        seal_private_json(&login, key, STATE_AAD)?,
+    )
+    .await?;
+    let tokens = dispatch_token_request(prepared)
+        .await
+        .and_then(|tokens| credential(tokens, &login.input, now, None));
     let credential = match tokens {
         Ok(credential) => credential,
         Err(error) => {
@@ -386,7 +462,7 @@ pub async fn complete(
         now,
     )
     .await?;
-    match db.claim_oauth_login_poll(&reference, now, 1).await? {
+    match db.claim_oauth_code_ready_recovery(&reference, now).await? {
         OAuthLoginClaim::Ready {
             lease_owner,
             ready_ciphertext,
@@ -425,7 +501,7 @@ pub async fn refresh(
             "OAuth refresh state is missing".into(),
         ));
     };
-    let input: StartInput = serde_json::from_value(
+    let input: RefreshState = serde_json::from_value(
         state
             .get("authorization_code")
             .cloned()
@@ -433,7 +509,7 @@ pub async fn refresh(
     )
     .map_err(|_| AppError::BadRequest("invalid OAuth refresh state".into()))?;
     if active_adapter.flow_kind != OAuthFlowKind::AuthorizationCodePkce
-        || active_adapter.refresh_url != input.adapter.refresh_url
+        || active_adapter.refresh_url != input.refresh_url
     {
         return Err(AppError::Conflict(
             "OAuth contribution changed; reconnect this account".into(),
@@ -443,18 +519,24 @@ pub async fn refresh(
         ("grant_type", "refresh_token".to_owned()),
         ("refresh_token", refresh.clone()),
     ];
-    add_client(&mut form, &input.client);
+    form.push(("client_id", input.client_id.clone()));
+    if let Some(secret) = &input.client_secret {
+        form.push(("client_secret", secret.clone()));
+    }
     let tokens = token_request(
         http,
         &active_adapter.refresh_url,
-        &input.provider_config,
+        &json!({"network_scope": input.network_scope}),
         current.proxy(),
         &form,
         allow_test_loopback,
         Some(guard),
     )
     .await?;
-    Ok(credential(tokens, &input, now, Some(refresh))?.preserve_proxy_from(current))
+    Ok(
+        credential_with_state(tokens, state.clone(), now, Some(refresh))?
+            .preserve_proxy_from(current),
+    )
 }
 
 fn credential(
@@ -463,6 +545,26 @@ fn credential(
     now: i64,
     old_refresh: Option<&String>,
 ) -> Result<UpstreamCredential, AppError> {
+    let mut credential = credential_with_state(tokens, refresh_state(input)?, now, old_refresh)?;
+    if let UpstreamCredential::OAuth {
+        proxy_url,
+        proxy_network_scope,
+        ..
+    } = &mut credential
+    {
+        *proxy_url = input.proxy_url.clone();
+        *proxy_network_scope = input.proxy_network_scope;
+    }
+    Ok(credential)
+}
+
+fn credential_with_state(
+    tokens: TokenResponse,
+    state: Value,
+    now: i64,
+    old_refresh: Option<&String>,
+) -> Result<UpstreamCredential, AppError> {
+    crate::provider::validate_adapter_state(&state)?;
     if tokens.access_token.is_empty()
         || tokens.access_token.len() > 128 * 1024
         || tokens.expires_in <= 0
@@ -486,9 +588,9 @@ fn credential(
         ),
         header: "authorization".into(),
         prefix: "Bearer ".into(),
-        adapter_state: Some(json!({"authorization_code": input})),
-        proxy_url: input.proxy_url.clone(),
-        proxy_network_scope: input.proxy_network_scope,
+        adapter_state: Some(state),
+        proxy_url: None,
+        proxy_network_scope: None,
     })
 }
 
@@ -502,6 +604,22 @@ async fn token_request(
     allow_test_loopback: bool,
     guard: Option<&dyn OAuthRefreshRequestGuard>,
 ) -> Result<TokenResponse, AppError> {
+    let prepared =
+        prepare_token_request(http, endpoint, config, proxy, form, allow_test_loopback).await?;
+    if let Some(guard) = guard {
+        guard.mark_request_started().await?;
+    }
+    dispatch_token_request(prepared).await
+}
+
+async fn prepare_token_request(
+    http: &reqwest::Client,
+    endpoint: &str,
+    config: &Value,
+    proxy: Option<(&str, OutboundScope)>,
+    form: &[(&str, String)],
+    allow_test_loopback: bool,
+) -> Result<(reqwest::Client, reqwest::Request), AppError> {
     let http =
         network::client_for_config_url_no_retry(http, endpoint, config, proxy, allow_test_loopback)
             .await?;
@@ -513,12 +631,17 @@ async fn token_request(
             "application/x-www-form-urlencoded",
         )
         .header(reqwest::header::ACCEPT, "application/json")
-        .body(encode_token_form(form));
-    if let Some(guard) = guard {
-        guard.mark_request_started().await?;
-    }
-    let response = request
-        .send()
+        .body(encode_token_form(form))
+        .build()
+        .map_err(|_| AppError::BadRequest("OAuth token request is invalid".into()))?;
+    Ok((http, request))
+}
+
+async fn dispatch_token_request(
+    (http, request): (reqwest::Client, reqwest::Request),
+) -> Result<TokenResponse, AppError> {
+    let response = http
+        .execute(request)
         .await
         .map_err(|_| AppError::Upstream("OAuth token request failed".into()))?;
     let status = response.status();
@@ -580,7 +703,9 @@ fn callback_code(callback: &str, redirect: &str, state: &str) -> Result<String, 
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .collect();
     callback.set_query(None);
-    if callback.as_str() != redirect || callback.fragment().is_some() {
+    let expected = Url::parse(redirect)
+        .map_err(|_| AppError::BadRequest("invalid OAuth redirect URI".into()))?;
+    if callback != expected || callback.fragment().is_some() {
         return Err(AppError::BadRequest(
             "OAuth callback destination did not match".into(),
         ));
@@ -611,6 +736,277 @@ fn callback_code(callback: &str, redirect: &str, state: &str) -> Result<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn issued_ready_result_recovers_after_authorization_expiry_without_reexchange() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("ready-recovery.db").display()
+        ))
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        let key = b"fixture encryption key at least 32 bytes long";
+        let input = input("https://tokens.example.com/token".into());
+        let started = start(&db, input.clone(), key, 1000).await.unwrap();
+        let session: Session = open_private_json(&started.session_token, key, TOKEN_AAD).unwrap();
+        let reference = OAuthLoginSessionReference {
+            session_id: session.session_id,
+            flow_kind: FLOW.into(),
+            tenant_external_id: session.tenant_external_id.clone(),
+            operator_service_id: None,
+            expires_at: session.expires_at,
+        };
+        let OAuthLoginClaim::Claimed { lease_owner, .. } = db
+            .claim_oauth_login_poll(&reference, started.expires_at - 1000, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("initial lease")
+        };
+        let issued = credential(
+            TokenResponse {
+                access_token: "fixture-access".into(),
+                refresh_token: Some("fixture-refresh".into()),
+                expires_in: 3600,
+                token_type: None,
+            },
+            &input,
+            started.expires_at - 500,
+            None,
+        )
+        .unwrap();
+        let ready = ReadyLogin {
+            application_plugin_revision: session.application_plugin_revision,
+            session_id: session.session_id,
+            tenant_external_id: session.tenant_external_id,
+            account_name: input.account_name,
+            provider_driver: input.provider_driver,
+            provider_config: input.provider_config,
+            refresh_url: input.adapter.refresh_url,
+            credential: issued,
+        };
+        db.stage_oauth_login_ready(
+            session.session_id,
+            lease_owner,
+            seal_private_json(&ready, key, READY_AAD).unwrap(),
+            started.expires_at - 500,
+        )
+        .await
+        .unwrap();
+        let now = started.expires_at + 1000;
+        let result = complete(
+            &db,
+            &reqwest::Client::new(),
+            &started.session_token,
+            "unused-for-ready-recovery",
+            None,
+            None,
+            key,
+            now,
+            false,
+        )
+        .await
+        .unwrap();
+        let CompleteResult::Ready { lease_owner, login } = result else {
+            panic!("issued credentials remain recoverable")
+        };
+        let ready = *login;
+        let account = db
+            .create_upstream_account(
+                crate::db::CreateUpstreamAccountInput {
+                    tenant_external_id: ready.tenant_external_id,
+                    name: ready.account_name,
+                    driver: ready.provider_driver,
+                    config: ready.provider_config,
+                    credential: ready.credential,
+                    oauth_session_id: Some(ready.session_id),
+                    oauth_driver: Some(FLOW.into()),
+                    oauth_refresh_url: Some(ready.refresh_url),
+                },
+                key,
+            )
+            .await
+            .unwrap();
+        db.finish_oauth_login_session(ready.session_id, lease_owner, account.id, now)
+            .await
+            .unwrap();
+        assert!(matches!(
+            complete(
+                &db,
+                &reqwest::Client::new(),
+                &started.session_token,
+                "unused-for-consumed-replay",
+                None,
+                None,
+                key,
+                now + 1,
+                false
+            )
+            .await
+            .unwrap(),
+            CompleteResult::Consumed { .. }
+        ));
+        assert!(
+            complete(
+                &db,
+                &reqwest::Client::new(),
+                &started.session_token,
+                "unused",
+                None,
+                None,
+                key,
+                started.recovery_expires_at,
+                false
+            )
+            .await
+            .is_err()
+        );
+    }
+    #[test]
+    fn compact_refresh_state_excludes_provider_headers_and_normalizes_redirect_comparison() {
+        let mut input = input("https://tokens.example.com/token".into());
+        input.provider_config["request_headers"] = json!({"x-one": "a".repeat(6000), "x-two": "b".repeat(6000), "x-three": "c".repeat(6000)});
+        let state = refresh_state(&input).unwrap();
+        assert!(serde_json::to_vec(&state).unwrap().len() < 1024);
+        assert!(state["authorization_code"].get("provider_config").is_none());
+        input.client.client_secret = Some("x".repeat(17000));
+        assert!(refresh_state(&input).is_err());
+        assert_eq!(
+            callback_code(
+                "https://client.example/?code=fixture&state=fixture",
+                "https://client.example:443",
+                "fixture"
+            )
+            .unwrap(),
+            "fixture"
+        );
+        assert_eq!(
+            callback_code(
+                "https://client.example/?code=fixture&state=fixture",
+                "https://client.example",
+                "fixture"
+            )
+            .unwrap(),
+            "fixture"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_proxy_or_native_config_precedes_login_and_transport_preflight_does_not_arm() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("preflight.db").display()
+        ))
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        let key = b"fixture encryption key at least 32 bytes long";
+        let mut invalid = input("https://tokens.example.com/token".into());
+        invalid.proxy_url = Some("socks5://192.168.1.10:1080".into());
+        invalid.proxy_network_scope = Some(OutboundScope::Public);
+        assert!(matches!(
+            start(&db, invalid, key, 1000).await,
+            Err(AppError::BadRequest(_))
+        ));
+        for configuration in [
+            json!({"base_url": "https://api.example.com", "control_url": "ftp://api.example.com"}),
+            json!({"base_url": "https://api.example.com", "request_headers": {"bad header": "fixture"}}),
+        ] {
+            let mut invalid = input("https://tokens.example.com/token".into());
+            invalid.provider_driver = crate::provider::antigravity::DRIVER.into();
+            invalid.provider_config = configuration;
+            assert!(matches!(
+                start(&db, invalid, key, 1000).await,
+                Err(AppError::BadRequest(_))
+            ));
+        }
+        let mut input = input("https://tokens.example.com/token".into());
+        input.client.redirect_uri = "https://client.example:443".into();
+        input.provider_config["request_headers"] = json!({"x-one": "a".repeat(6000), "x-two": "b".repeat(6000), "x-three": "c".repeat(6000)});
+        let started = start(&db, input, key, 1000).await.unwrap();
+        let login_url = Url::parse(&started.login_url).unwrap();
+        assert!(
+            login_url
+                .query_pairs()
+                .any(|(name, value)| name == "redirect_uri" && value == "https://client.example/")
+        );
+        let session: Session = open_private_json(&started.session_token, key, TOKEN_AAD).unwrap();
+        let reference = OAuthLoginSessionReference {
+            session_id: session.session_id,
+            flow_kind: FLOW.into(),
+            tenant_external_id: session.tenant_external_id,
+            operator_service_id: None,
+            expires_at: session.expires_at,
+        };
+        let OAuthLoginClaim::Claimed {
+            lease_owner,
+            state_ciphertext,
+        } = db
+            .claim_oauth_login_poll(&reference, 1001, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("initial lease")
+        };
+        let mut login: LoginState = open_private_json(&state_ciphertext, key, STATE_AAD).unwrap();
+        let mock = MockServer::start().await;
+        login.input.adapter.poll_url = format!("{}/token", mock.uri());
+        let callback = format!(
+            "{}?code=fixture&state={}",
+            login.input.client.redirect_uri, login.state
+        );
+        db.replace_oauth_login_poll_state(
+            session.session_id,
+            lease_owner,
+            seal_private_json(&login, key, STATE_AAD).unwrap(),
+        )
+        .await
+        .unwrap();
+        db.release_oauth_login_poll(session.session_id, lease_owner, 1001)
+            .await
+            .unwrap();
+        // Production transport rejects the loopback destination before any dispatch.
+        let result = complete(
+            &db,
+            &reqwest::Client::new(),
+            &started.session_token,
+            &callback,
+            None,
+            None,
+            key,
+            2002,
+            false,
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
+        assert!(mock.received_requests().await.unwrap().is_empty());
+        let OAuthLoginClaim::Claimed {
+            state_ciphertext, ..
+        } = db
+            .claim_oauth_login_poll(&reference, 3003, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("preflight remains retryable")
+        };
+        let login: LoginState = open_private_json(&state_ciphertext, key, STATE_AAD).unwrap();
+        assert!(!login.exchange_started);
+        let issued = credential(
+            TokenResponse {
+                access_token: "fixture-access".into(),
+                refresh_token: Some("fixture-refresh".into()),
+                expires_in: 3600,
+                token_type: None,
+            },
+            &login.input,
+            1000,
+            None,
+        )
+        .unwrap();
+        crate::provider::seal_credential(&issued, key).unwrap();
+    }
     #[test]
     fn token_form_escapes_reserved_characters_without_changing_credentials() {
         let fields = [
@@ -719,7 +1115,7 @@ mod tests {
                 key,
                 None,
                 None,
-                started.expires_at
+                started.recovery_expires_at
             )
             .is_err()
         );
@@ -768,6 +1164,35 @@ mod tests {
         )
         .await
         .unwrap();
+        let check_only = complete(
+            &db,
+            &reqwest::Client::new(),
+            &started.session_token,
+            "",
+            Some("fixture-tenant"),
+            None,
+            key,
+            31_002,
+            false,
+        )
+        .await;
+        assert!(matches!(check_only, Err(AppError::Conflict(_))));
+        let OAuthLoginClaim::Claimed {
+            lease_owner: check_owner,
+            state_ciphertext,
+        } = db
+            .claim_oauth_login_poll(&reference, 32_003, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("empty callback must not fail the session")
+        };
+        let state_after_check: LoginState =
+            open_private_json(&state_ciphertext, key, STATE_AAD).unwrap();
+        assert!(state_after_check.exchange_started);
+        db.release_oauth_login_poll(session.session_id, check_owner, 32_003)
+            .await
+            .unwrap();
         let reclaimed = complete(
             &db,
             &reqwest::Client::new(),
@@ -776,7 +1201,7 @@ mod tests {
             Some("fixture-tenant"),
             None,
             key,
-            31_002,
+            33_004,
             false,
         )
         .await;

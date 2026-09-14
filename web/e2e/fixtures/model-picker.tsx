@@ -1,6 +1,7 @@
 import { createRoot } from 'react-dom/client';
 import { useState } from 'react';
-import { I18nProvider } from '../../src/i18n';
+import { I18nProvider, useI18n } from '../../src/i18n';
+import { MtcFluentProvider } from '../../src/design-system/MtcFluentProvider';
 import { TypedFilterBuilder } from '../../src/operator/TypedFilterBuilder';
 import { SystemSettingsPage } from '../../src/operator/pages/SystemSettingsPage';
 import type { ModelRouteView, TypedFilterAst, UpstreamAccount } from '../../src/types';
@@ -50,33 +51,52 @@ const projection = {
     { selection: { kind: 'route', route_id: 'route-c' }, value: 'route-c', label: 'retired-model', sources: [source({ routeId: 'route-c', accountId: 'c', accountLabel: 'Retired account', providerId: 'provider-c', providerLabel: 'provider-c', available: false, upstreamModel: 'native-c' })] },
     { selection: { kind: 'route', route_id: 'route-image' }, value: 'route-image', label: 'image-only', sources: [source({ routeId: 'route-image', accountId: 'a', accountLabel: 'Research account', providerId: 'provider-a', providerLabel: 'provider-a', protocol: 'openai-image', modalities: ['image'], upstreamModel: 'native-image' })] },
     { selection: { kind: 'route', route_id: 'route-video' }, value: 'route-video', label: 'video-only', sources: [source({ routeId: 'route-video', accountId: 'a', accountLabel: 'Research account', providerId: 'provider-a', providerLabel: 'provider-a', protocol: 'generation', modalities: ['video'], upstreamModel: 'native-video' })] },
-    { selection: { kind: 'route', route_id: 'route-embedding' }, value: 'route-embedding', label: 'embedding-model', sources: [source({ routeId: 'route-embedding', accountId: 'a', accountLabel: 'Research account', providerId: 'generic-http', providerLabel: 'Generic HTTP', modalities: ['text', 'embedding', 'image'], upstreamModel: 'embeddinggemma-300m' })] },
-    { selection: { kind: 'route', route_id: 'route-moderation' }, value: 'route-moderation', label: 'moderation-model', sources: [source({ routeId: 'route-moderation', accountId: 'a', accountLabel: 'Research account', providerId: 'generic-http', providerLabel: 'Generic HTTP', modalities: ['text', 'embedding', 'image'], upstreamModel: 'omni-moderation-latest' })] },
+    { selection: { kind: 'route', route_id: 'route-embedding' }, value: 'route-embedding', label: 'embedding-only', sources: [source({ routeId: 'route-embedding', accountId: 'a', accountLabel: 'Research account', providerId: 'embedding-provider', providerLabel: 'Embedding provider', modalities: ['embedding'], upstreamModel: 'opaque-embedding-id' })] },
+    { selection: { kind: 'route', route_id: 'route-mixed-text' }, value: 'route-mixed-text', label: 'multimodal-assistant', sources: [source({ routeId: 'route-mixed-text', accountId: 'a', accountLabel: 'Research account', providerId: 'generic-http', providerLabel: 'Generic HTTP', modalities: ['image', 'text', 'embedding'], upstreamModel: 'opaque-conversation-id' })] },
     { selection: { kind: 'route', route_id: 'route-legal-alias' }, value: 'route-legal-alias', label: 'image-analysis-assistant', sources: [source({ routeId: 'route-legal-alias', accountId: 'a', accountLabel: 'Research account', providerId: 'provider-a', providerLabel: 'provider-a', upstreamModel: 'legal-text-alias' })] },
     { selection: { kind: 'route', route_id: 'route-custom' }, value: 'route-custom', label: 'friendly-custom-chat', sources: [source({ routeId: 'route-custom', accountId: 'a', accountLabel: 'Research account', providerId: 'provider-a', providerLabel: 'provider-a', status: 'never_observed', listed: false, upstreamModel: 'friendly-custom-chat' })] },
   ],
 };
+const control = { delaySave: false, delayBilling: false, pendingBilling: '', failBilling: false, writes: 0, settingsReads: 0, billingReads: 0, releaseSave: () => {}, releaseBilling: () => {} };
+Object.assign(window, { settingsFixture: control });
 globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url, location.origin);
   if (init?.method && init.method !== 'GET') await (window as unknown as { recordModelPickerWrite?: (path: string) => Promise<void> }).recordModelPickerWrite?.(url.pathname);
+  if (url.pathname.endsWith('/filter-assistant/settings') && init?.method === 'PUT') {
+    control.writes += 1;
+    if (control.delaySave) await new Promise<void>((resolve) => { control.releaseSave = resolve; });
+    return Response.json({ ...JSON.parse(String(init.body)), updated_at: 99 });
+  }
+  if (url.pathname.endsWith('/billing-choices')) {
+    control.billingReads += 1;
+    const route = url.searchParams.get('model_route_id');
+    if (control.delayBilling) await new Promise<void>((resolve) => { control.pendingBilling = route ?? ''; control.releaseBilling = resolve; });
+    if (control.failBilling) return Response.json({ error: { message: 'Billing unavailable' } }, { status: 503 });
+    return Response.json({ data: [{ key_id: `key-${route}`, alias: `Budget ${route}`, principal: 'Research team' }], next_cursor: null });
+  }
+  if (url.pathname.endsWith('/filter-assistant/settings')) control.settingsReads += 1;
   const values: Record<string, unknown> = {
     '/internal/v1/upstreams': accounts,
     '/internal/v1/model-routes': routes,
     '/internal/v1/model-picker-options': projection,
     '/internal/v1/provider-groups': groups,
     '/internal/v1/filter-presets': { named: [], recent: [] },
-    '/internal/v1/filter-assistant/settings': { model_route_id: 'route-custom', updated_at: Date.now() },
+    '/internal/v1/filter-assistant/settings': { model_route_id: url.searchParams.get('tenant_external_id') === 'other' ? 'route-b' : 'route-custom', updated_at: 1 },
   };
   return new Response(JSON.stringify(values[url.pathname] ?? {}), { status: Object.hasOwn(values, url.pathname) ? 200 : 404, headers: { 'Content-Type': 'application/json' } });
 };
 function Fixture() {
+  const { locale, setLocale } = useI18n();
   const [ast, setAst] = useState<TypedFilterAst>({ logical_operator: 'and', conditions: [] });
   const [outside, setOutside] = useState(0);
+  const [tenant, setTenant] = useState('tenant');
   return <main style={{ padding: 12 }}>
     <button type="button" data-outside onClick={() => setOutside((value) => value + 1)}>Outside {outside}</button>
     <TypedFilterBuilder ast={ast} onApply={setAst} onClear={() => setAst({ logical_operator: 'and', conditions: [] })} token="fixture" tenant="tenant" scope="requests" upstreams={accounts} />
     <output data-filter-model>{ast.conditions.find((condition) => condition.field === 'model')?.value.value}</output>
-    <SystemSettingsPage token="fixture" tenant="tenant" />
+    <button data-switch-scope type="button" onClick={() => setTenant('other')}>Switch scope</button>
+    <button data-switch-locale type="button" onClick={() => setLocale(locale === 'en' ? 'zh-CN' : 'en')}>Switch language</button>
+    <SystemSettingsPage token="fixture" tenant={tenant} />
   </main>;
 }
-createRoot(document.getElementById('root')!).render(<I18nProvider><Fixture /></I18nProvider>);
+createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><Fixture /></MtcFluentProvider></I18nProvider>);

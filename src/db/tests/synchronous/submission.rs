@@ -44,6 +44,26 @@ async fn durable_send_blocks_duplicate_owner_takeover_and_generic_refund() {
             snapshot
         );
         assert!(
+            !database
+                .confirm_synchronous_image_submission_started(
+                    key.key_id,
+                    request_id,
+                    reservation.id
+                )
+                .await
+                .unwrap()
+        );
+        assert!(matches!(
+            database
+                .confirm_synchronous_image_submission_started(
+                    key.key_id,
+                    request_id,
+                    Uuid::now_v7()
+                )
+                .await,
+            Err(AppError::NotFound)
+        ));
+        assert!(
             database
                 .arm_synchronous_image_submission(
                     Uuid::now_v7(),
@@ -101,6 +121,16 @@ async fn durable_send_blocks_duplicate_owner_takeover_and_generic_refund() {
                 conversation: None,
             })
             .await;
+        assert!(
+            database
+                .confirm_synchronous_image_submission_started(
+                    key.key_id,
+                    request_id,
+                    reservation.id
+                )
+                .await
+                .unwrap()
+        );
         assert!(
             matches!(generic_expiry, Err(AppError::Conflict(_))),
             "a reaper selected before arm must still be fenced at settlement"

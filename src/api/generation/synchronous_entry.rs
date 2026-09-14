@@ -272,8 +272,9 @@ async fn proxy_openai_image_generation(
         key_id: key.key_id,
         idempotency_key: image_idempotency.as_ref().map(|value| value.key.as_str()),
         tenant_id: key.tenant_id,
-        submission_armed: std::sync::atomic::AtomicBool::new(false),
+        arm_state: std::sync::atomic::AtomicU8::new(super::synchronous_image::ARM_NOT_STARTED),
         invalid_response: std::sync::atomic::AtomicBool::new(false),
+        confirmed_rejection: std::sync::atomic::AtomicBool::new(false),
     };
     match tokio::time::timeout(
         SYNCHRONOUS_IMAGE_DEADLINE,
@@ -289,11 +290,10 @@ async fn proxy_openai_image_generation(
     .await
     {
         Ok(Err(_))
-            if context
-                .submission_armed
-                .load(std::sync::atomic::Ordering::Acquire) =>
+            if context.arm_state.load(std::sync::atomic::Ordering::Acquire)
+                != super::synchronous_image::ARM_NOT_STARTED =>
         {
-            fail_image_request(&context, "image_submission_uncertain").await
+            fail_image_request(&context, "image_submission_failed").await
         }
         Ok(result) => result,
         Err(_) => fail_image_request(&context, "image_deadline_exceeded").await,

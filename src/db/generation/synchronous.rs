@@ -3,7 +3,12 @@ use crate::archive_staging::{
     ArchiveStagingOwner, ArchiveStagingPurpose, ArchiveStagingWriteLease,
 };
 
+mod reconcile;
 mod submission;
+pub use reconcile::{
+    ImageGenerationQuarantineResolution, ImageGenerationQuarantineView,
+    ResolveImageGenerationQuarantine,
+};
 
 pub(super) fn serialize_media_routing_snapshot(
     value: Option<&serde_json::Value>,
@@ -836,7 +841,7 @@ impl Database {
         request_id: Uuid,
     ) -> Result<(), AppError> {
         sqlx::query(
-            "DELETE FROM synchronous_image_idempotency WHERE key_id = $1 AND idempotency_key = $2 AND request_id = $3 AND status = 'pending'",
+            "DELETE FROM synchronous_image_idempotency WHERE key_id = $1 AND idempotency_key = $2 AND request_id = $3 AND status = 'pending' AND NOT EXISTS (SELECT 1 FROM request_records q WHERE q.id = $3 AND q.key_id = $1 AND q.submission_started_at IS NOT NULL)",
         )
         .bind(key_id.to_string())
         .bind(idempotency_key)

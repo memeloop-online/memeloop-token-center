@@ -36,6 +36,9 @@ After completion, the existing project is discovered through `loadCodeAssist`.
 This does not automatically onboard a project, accept terms, reset quota, or
 switch service tiers. A project discovery error leaves issued tokens in the
 encrypted ready session for retry instead of repeating code exchange.
+The initial code-exchange window is ten minutes. Already-issued Ready/Consumed
+results can be finalized or replayed for the following 24 hours, matching session
+cleanup retention; this does not extend the authorization-code exchange window.
 
 Use the account's live model catalog and a generation route priced per image or
 job. `POST /v1/images/generations` accepts `n=1`; image output enters the same

@@ -66,7 +66,6 @@ export function ModelPicker({ label, value, onChange, options, disabled = false,
     [option.label, option.providerGroup, option.provider, option.upstream, option.description, ...(option.capabilities ?? [])]
       .some((text) => text?.toLocaleLowerCase().includes(query)))
     .sort((a, b) => (a.providerGroup ?? '').localeCompare(b.providerGroup ?? '') || a.provider.localeCompare(b.provider) || a.upstream.localeCompare(b.upstream) || a.label.localeCompare(b.label)), [options, query]);
-  const groups = groupOptions(matching, 'provider');
   const selected = options.find((option) => option.value === value);
   const close = (restore = false) => { setOpen(false); setActive(-1); if (restore) anchor.current?.focus(); };
   const show = () => { if (!open) { setSearch(''); setActive(-1); onOpen?.(); setOpen(true); } };
@@ -102,6 +101,7 @@ export function ModelPicker({ label, value, onChange, options, disabled = false,
       : <button ref={anchor} id={`${id}-input`} type="button" className="secondary model-picker-trigger" aria-labelledby={`${id}-label ${id}-value`} aria-describedby={describedBy} aria-haspopup="dialog" aria-expanded={open} aria-controls={`${id}-popover`} disabled={disabled} onClick={() => open ? close() : show()} onKeyDown={keyboard}><span id={`${id}-value`}>{selected?.label || value || t('common.select')}</span><span aria-hidden="true">⌄</span></button>}
     {open && <section ref={panel} id={`${id}-popover`} className="shared-model-popover" popover="auto" style={position} role="dialog" aria-modal="false" aria-label={popupLabel || t('filter.catalogModels')} onToggle={(event) => { if (event.target === event.currentTarget && event.newState === 'closed') close(); }}>
       {!editable && <input ref={searchInput} autoFocus role="combobox" aria-label={t('filter.searchCatalog')} aria-autocomplete="list" aria-expanded="true" aria-controls={`${id}-list`} aria-activedescendant={activeId} placeholder={t('filter.searchCatalog')} value={search} onKeyDown={keyboard} onChange={(event) => { setSearch(event.target.value); onQueryChange?.(event.target.value); setActive(-1); }} />}
+      <small className="model-picker-keyboard-hint">{t('modelPicker.keyboardHint')}</small>
       {loading && <small role="status">{t('common.loading')}</small>}
       {error && <small role="alert" className="error-text">{error}</small>}
       <div id={`${id}-list`} role="listbox" aria-label={label} aria-busy={loading}>

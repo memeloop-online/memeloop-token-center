@@ -43,6 +43,10 @@ impl Config {
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::RequestBuilder, AppError> {
+        Ok(request.headers(self.validated_headers()?))
+    }
+
+    fn validated_headers(&self) -> Result<reqwest::header::HeaderMap, AppError> {
         if self.request_headers.len() > 64 {
             return Err(AppError::BadRequest("too many request headers".into()));
         }
@@ -68,7 +72,28 @@ impl Config {
                 .map_err(|_| AppError::BadRequest("invalid request header".into()))?;
             headers.insert(name, value);
         }
-        Ok(request.headers(headers))
+        Ok(headers)
+    }
+
+    pub fn validate(&self) -> Result<(), AppError> {
+        for endpoint in [&self.base_url, &self.control_url] {
+            let url = url::Url::parse(endpoint)
+                .map_err(|_| AppError::BadRequest("invalid Antigravity API URL".into()))?;
+            if !matches!(url.scheme(), "http" | "https")
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                return Err(AppError::BadRequest("invalid Antigravity API URL".into()));
+            }
+        }
+        if self.project_id.len() > 256 || self.project_id.chars().any(char::is_control) {
+            return Err(AppError::BadRequest("invalid Antigravity project".into()));
+        }
+        let _ = self.validated_headers()?;
+        Ok(())
     }
     pub fn from_account(value: &Value) -> Result<Self, AppError> {
         let mut config = Self::default();
@@ -85,6 +110,7 @@ impl Config {
             config.request_headers = serde_json::from_value(headers.clone())
                 .map_err(|_| AppError::BadRequest("invalid request headers".into()))?;
         }
+        config.validate()?;
         Ok(config)
     }
 }
@@ -98,6 +124,40 @@ pub fn model_display_name(id: &str) -> &str {
         "gemini-3.1-flash-image" | "gemini-3.1-flash-image-preview" => "Nano Banana 2",
         _ => id,
     }
+}
+
+/// Tenant-scoped writers may rename a managed account, not rebind its OAuth
+/// credential or inherit operator-only headers into a new destination.
+pub fn authorize_config_update(
+    current: &Value,
+    incoming: &Value,
+    global_operator: bool,
+) -> Result<(), AppError> {
+    let mut effective = incoming.clone();
+    if incoming.get("request_headers").is_none()
+        && let Some(headers) = current.get("request_headers")
+    {
+        effective["request_headers"] = headers.clone();
+    }
+    if !global_operator && effective != *current {
+        return Err(AppError::Forbidden);
+    }
+    let before = Config::from_account(current)?;
+    let after = Config::from_account(incoming)?;
+    let origin = |url: &str| {
+        url::Url::parse(url)
+            .map(|url| url.origin())
+            .map_err(|_| AppError::BadRequest("invalid Antigravity API URL".into()))
+    };
+    let destination_changed = origin(&before.base_url)? != origin(&after.base_url)?
+        || origin(&before.control_url)? != origin(&after.control_url)?;
+    if destination_changed
+        && !before.request_headers.is_empty()
+        && incoming.get("request_headers").is_none()
+    {
+        return Err(AppError::BadRequest("changing Antigravity API origin requires explicit request header replacement or clearing".into()));
+    }
+    Ok(())
 }
 
 pub struct NativeClient<'a> {
@@ -424,6 +484,31 @@ async fn bounded_body(response: reqwest::Response, limit: usize) -> Result<Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tenant_cannot_rebind_hidden_oauth_headers_and_global_requires_explicit_origin_replacement() {
+        let original = json!({"base_url": "https://api.example.com", "project_id": "fixture-project", "request_headers": {"authorization": "fixture-override"}});
+        let unchanged_public =
+            json!({"base_url": "https://api.example.com", "project_id": "fixture-project"});
+        authorize_config_update(&original, &unchanged_public, false).unwrap();
+        let mut other = unchanged_public;
+        other["base_url"] = json!("https://other.example.com");
+        assert!(matches!(
+            authorize_config_update(&original, &other, false),
+            Err(AppError::Forbidden)
+        ));
+        assert!(matches!(
+            authorize_config_update(&original, &other, true),
+            Err(AppError::BadRequest(_))
+        ));
+        other["request_headers"] = json!({});
+        authorize_config_update(&original, &other, true).unwrap();
+        assert!(matches!(
+            authorize_config_update(&original, &other, false),
+            Err(AppError::Forbidden)
+        ));
+        other["request_headers"] = json!({"authorization": "fixture-new-override"});
+        authorize_config_update(&original, &other, true).unwrap();
+    }
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{header, method, path},

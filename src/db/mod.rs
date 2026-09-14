@@ -115,7 +115,8 @@ pub use generation::{
     AttachGenerationJobResult, AttachSynchronousImageRequestObject, CreateGenerationJobInput,
     CreateGenerationJobResult, FinishGenerationJobInput, FinishSynchronousImageRequest,
     FinishSynchronousImageResult, GenerationJobIdempotency, GenerationQuarantineResolution,
-    GenerationQuarantineView, ResolveGenerationQuarantine, StartGenerationJobInput,
+    GenerationQuarantineView, ImageGenerationQuarantineResolution, ImageGenerationQuarantineView,
+    ResolveGenerationQuarantine, ResolveImageGenerationQuarantine, StartGenerationJobInput,
     StartSynchronousImageRequest, StartSynchronousImageResult, SynchronousImageIdempotencyClaim,
 };
 pub use groups::{
@@ -130,7 +131,8 @@ use migrations::{apply_migration_range, maintain_postgres_partitions};
 pub use monitoring_snapshot::{MonitoringScope, MonitoringSnapshotFilter};
 pub use oauth_sessions::{BeginOAuthLoginSession, OAuthLoginClaim, OAuthLoginSessionReference};
 pub use providers::{
-    AggregatedUpstreamModelCatalogView, AggregatedUpstreamModelView, CreateModelRouteInput,
+    AggregatedUpstreamModelCatalogView, AggregatedUpstreamModelView,
+    ClaimUpstreamOAuthRefreshResult, ClaimedUpstreamOAuthRefresh, CreateModelRouteInput,
     CreateUpstreamAccountInput, DiscoveredUpstreamModel, MODEL_PICKER_GROUP_LIMIT,
     MODEL_PICKER_ITEM_LIMIT, MODEL_PICKER_SOURCE_LIMIT, ModelPickerCatalogEvidence,
     ModelPickerConfigurationAvailability, ModelPickerHealthEvidence, ModelPickerItem,
