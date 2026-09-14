@@ -63,7 +63,6 @@ pub(crate) const CAPTURE_INSERT_BATCH_CHUNKS: usize = 16;
 // reservation before the writer starts.
 const CAPTURE_QUEUE_CHUNKS: usize = 3;
 const CAPTURE_MEMORY_BYTES: usize = CHUNK_BYTES * 5;
-const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 struct OwnedTask<T: Send + 'static> {
     task: Option<tokio::task::JoinHandle<Result<T, AppError>>>,
