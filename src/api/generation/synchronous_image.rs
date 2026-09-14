@@ -281,10 +281,11 @@ pub(super) async fn execute_synchronous_image_request(
         };
     // Archival/admission may have waited since preparation. Recheck expiry
     // before arming, while a local credential failure is still non-dispatched.
-    let request = match route.credential.apply(request, unix_millis()) {
-        Ok(request) => request,
-        Err(_) => return fail_image_request(context, "upstream_credential_invalid").await,
-    };
+    // Preparation already attached the credential. Revalidate its lifetime,
+    // without appending a second Authorization (or custom API-key) header.
+    if route.credential.validate(unix_millis()).is_err() {
+        return fail_image_request(context, "upstream_credential_invalid").await;
+    }
     // Pending is not proof of dispatch. After an error/cancelled wait, resolve
     // this state through the serialized authoritative DB query before deciding
     // whether zero-cost cleanup is safe. Only an acknowledged arm permits send.
@@ -560,6 +561,19 @@ async fn fail_image_request_with_staging(
             context
                 .invalid_response
                 .store(true, std::sync::atomic::Ordering::Release);
+        }
+        // An unusable result never becomes a published asset. Hand its owned
+        // staging attempt to durable cleanup without deleting bytes here or
+        // interpreting this local cleanup as permission to refund/resubmit.
+        if let Some(lease) = result_lease
+            && let Err(error) = context
+                .state
+                .db
+                .abandon_archive_staging_attempt(lease)
+                .await
+        {
+            tracing::warn!(request_id=%context.request_id, error_category=error.diagnostic_category(),
+                "uncertain image result cleanup publication failed; lease expiry retains recovery");
         }
         return Ok(quarantine_image_request(context).await);
     }
