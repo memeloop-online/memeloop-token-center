@@ -7,6 +7,7 @@ import type { RequestView } from '../src/types.js';
 import { requestOutcome, requestStatusCopy } from '../src/requestStatusPresentation.js';
 
 const request: RequestView = {
+  usage_basis: 'provider_reported',
   request_id: 'fixture', created_at: 1, protocol: 'openai', model: 'fixture', status_code: 200,
   duration_ms: 2000, input_tokens: 160, cached_input_tokens: 40, cache_write_tokens: 20,
   output_tokens: 32, cost: '0', error_code: null,
@@ -18,7 +19,12 @@ test('generation TPS requires observed output interval and does not relabel tota
   assert.equal(averageRequestOutputTps(timed), 16);
   assert.equal(generationRequestOutputTps(request), null);
   for (const generation_duration_ms of [null, 0, -1, Number.NaN, Infinity]) assert.equal(generationRequestOutputTps({ ...timed, generation_duration_ms }), null);
-  assert.equal(generationRequestOutputTps({ ...timed, status_code: 502 }), null);
+  assert.equal(generationRequestOutputTps({ ...timed, status_code: 499 }), 64, 'a later disconnect does not erase reported usage and a complete recorded interval');
+  for (const usage_basis of [undefined, null, 'contract_ceiling', 'provider_estimated', 'not_observed'] as const) {
+    assert.equal(generationRequestOutputTps({ ...timed, usage_basis }), null);
+    assert.equal(averageRequestOutputTps({ ...timed, usage_basis }), null);
+  }
+  assert.equal(averageRequestOutputTps({ ...timed, usage_basis: 'contract_ceiling', output_tokens: 100000, duration_ms: 11681 }), null, 'the reported 8560.91 reservation-ceiling ratio must not appear as actual throughput');
   assert.equal(generationRequestOutputTps({ ...timed, first_output_ms: undefined }), null);
 });
 
@@ -28,6 +34,9 @@ test('legacy and archive SSE patches retain recorded timing', () => {
   assert.equal(requestViewFromEvent(event, timed)?.generation_duration_ms, 500);
   assert.equal(requestViewFromEvent({ ...event, first_output_ms: null }, timed)?.first_output_ms, 1000);
   assert.equal(requestViewFromEvent({ ...event, first_output_ms: 1200, generation_duration_ms: 400 }, timed)?.generation_duration_ms, 400);
+  assert.equal(requestViewFromEvent({ ...event, usage_basis: undefined }, timed)?.usage_basis, 'provider_reported');
+  assert.equal(requestViewFromEvent({ ...event, usage_basis: null }, timed)?.usage_basis, null, 'explicit unknown clears old provenance; absence only preserves it');
+  assert.equal(requestViewFromEvent({ ...event, usage_basis: 'contract_ceiling' }, timed)?.usage_basis, 'contract_ceiling');
 });
 
 test('uncached input uses both recorded cache components and does not fabricate missing counts', () => {

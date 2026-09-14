@@ -244,6 +244,15 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
         }
       }
     }
+    await page.goto(`${origin}/e2e/fixtures/request-diagnostics.html?usage-basis=contract_ceiling`);
+    const ceiling = page.locator('[data-fixture-request="recorded"] .request-diagnostics');
+    await ceiling.waitFor();
+    assert.match(await ceiling.innerText(), /Settlement ceiling/);
+    assert.match(await ceiling.locator('.request-token-primary').innerText(), /≤/);
+    assert.match(await ceiling.locator('[data-rate="average"]').innerText(), /Average TPS\s+—/);
+    assert.match(await ceiling.locator('[data-rate="generation"]').innerText(), /Generation TPS\s+—/);
+    assert.doesNotMatch(await ceiling.innerText(), /8,?560\.91/);
+    assert.match(await ceiling.innerText(), /US\$<0\.01|\$<0\.01/, 'a ceiling settlement is not changed to free');
   } catch (reason) {
     const diagnostics = await fixtureDiagnostics(page, current.value, history, pageErrors, consoleErrors);
     process.stderr.write(`request-diagnostics browser contract failed: ${JSON.stringify(diagnostics)}\n`);

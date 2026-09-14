@@ -10,6 +10,7 @@ import '../../src/theme.css';
 import '../../src/styles/request-table.css';
 
 const request: RequestView = {
+  usage_basis: 'provider_reported',
   request_id: '5a3bc0cc-8d47-4cee-9b5e-2581f8d99d13',
   created_at: Date.UTC(2026, 8, 8, 12, 34, 56),
   completed_at: Date.UTC(2026, 8, 8, 12, 34, 57, 234),
@@ -36,6 +37,10 @@ const request: RequestView = {
     semantics_source: 'declared',
   },
 };
+
+if (new URLSearchParams(location.search).get('usage-basis') === 'contract_ceiling') {
+  Object.assign(request, { usage_basis: 'contract_ceiling', status_code: 499, output_tokens: 100000, duration_ms: 11681, first_output_ms: 1000, generation_duration_ms: 10681 });
+}
 
 const historicalGap: RequestView = {
   request_id: '3d9f7abc-b767-4668-a8d1-baa042ea1df2',
