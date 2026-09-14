@@ -211,6 +211,20 @@ impl AppState {
         Ok(self)
     }
 
+    /// Install one authoritative historical or current snapshot as an indivisible
+    /// request pin. Nested entry points must not replace it with today's head.
+    #[cfg(feature = "experimental-plugin-revisions")]
+    pub(crate) fn with_pinned_application_plugins(
+        mut self,
+        snapshot: Arc<plugin::application::ApplicationPluginSnapshot>,
+    ) -> Self {
+        self.plugins = snapshot.runtime.runtime().clone();
+        self.providers = snapshot.providers.clone();
+        self.pinned_application_plugins = Some(snapshot);
+        self.application_plugins_pinned = true;
+        self
+    }
+
     /// Called once at a request entry point. A cloned request state retains the
     /// atomic runtime/catalog pair through policy, prepare, retries and normalize.
     pub(crate) async fn pin_application_plugins(self) -> Result<Self, error::AppError> {
@@ -221,9 +235,7 @@ impl AppState {
                 && let Some(authority) = &state.application_plugins
             {
                 if let Some(snapshot) = authority.pin_if_published().await? {
-                    state.plugins = snapshot.runtime.runtime().clone();
-                    state.providers = snapshot.providers.clone();
-                    state.pinned_application_plugins = Some(snapshot);
+                    state = state.with_pinned_application_plugins(snapshot);
                 }
                 state.application_plugins_pinned = true;
             }

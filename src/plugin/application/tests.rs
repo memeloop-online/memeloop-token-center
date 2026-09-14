@@ -595,6 +595,21 @@ async fn running_authority_admits_new_contract_and_pins_history_without_restart(
     );
     assert_provider_phases(&current, false).await;
     assert!(previous.providers.get(PROVIDER).is_none());
+    let resumed = state
+        .clone()
+        .with_pinned_application_plugins(authority.pin_historical(1).await.unwrap());
+    let nested = resumed.pin_application_plugins().await.unwrap();
+    assert_eq!(
+        nested
+            .pinned_application_plugins
+            .as_ref()
+            .unwrap()
+            .receipt
+            .revision,
+        1
+    );
+    assert!(nested.providers.get(PROVIDER).is_none());
+    assert!(nested.plugins.manifests().is_empty());
     assert!(
         authority
             .pin_historical(1)
