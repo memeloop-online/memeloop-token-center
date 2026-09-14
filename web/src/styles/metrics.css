@@ -1,9 +1,20 @@
 .metrics {
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr));
+  background: transparent;
+  border: 0;
+  gap: 12px;
+}
+
+/* Keep the grid itself transparent in the light theme so empty track space
+   does not read as an extra, unlabeled metric card. */
+:root[data-theme='light'] .metrics {
+  background: transparent;
+  border-color: transparent;
 }
 
 .metric {
   container-type: inline-size;
+  border: 1px solid #27373c;
   padding: clamp(1rem, 0.875rem + 0.45vw, 1.375rem);
 }
 

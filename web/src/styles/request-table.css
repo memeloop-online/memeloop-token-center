@@ -99,6 +99,28 @@
   white-space: normal;
 }
 
+.request-credential-cell {
+  min-width: 12rem;
+  max-width: 18rem;
+  white-space: normal;
+}
+
+.request-credential-cell strong {
+  color: #f1fbfc;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.request-technical-info {
+  color: #79dfcf;
+  background: transparent;
+  border: 0;
+  margin-left: 0.35rem;
+  padding: 0.1rem 0.25rem;
+}
+
+.request-technical-info:hover { color: #d9fff9; }
+
 table.request-table .request-model-cell code {
   color: #f1fbfc;
   font-size: 0.88rem;
@@ -196,9 +218,13 @@ table.request-table .request-model-cell code {
   white-space: nowrap;
 }
 
+.request-cost-cell { color: #f2d18b; }
+
 :root[data-theme='light'] .request-cost-cell {
   color: #17343a;
 }
+
+:root[data-theme='light'] .request-credential-cell strong { color: #17343a; }
 
 .request-token-cell small {
   color: var(--muted, #82979e);

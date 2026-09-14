@@ -206,6 +206,7 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
     output_tokens: event.output_tokens,
     cost: event.cost,
     error_code: event.error_code,
+    credential_identity: event.credential_identity ?? previous?.credential_identity,
     archive_state: mergeArchiveState(previous?.archive_state, event),
     session_context: mergeSessionContext(previous?.session_context, event),
   };

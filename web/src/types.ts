@@ -19,10 +19,18 @@ export interface RequestView {
   /** Stable final model-route assignment, not a routing-attempt history. */
   route_id?: string | null;
   currency?: string | null;
+  credential_identity?: RequestCredentialIdentity | null;
   error_code: string | null;
   /** Durable request/response archive convergence state. */
   archive_state?: RequestArchiveState;
   session_context?: RequestSessionContext | null;
+}
+
+export interface RequestCredentialIdentity {
+  tenant_external_id: string;
+  key_id: string;
+  key_alias: string;
+  principal_external_id: string;
 }
 
 /** Exclusive descending keyset cursor returned by the operator request API. */
@@ -113,6 +121,7 @@ export interface RequestEvent {
   cost: string;
   error_code: string | null;
   archive_state: RequestArchiveState;
+  credential_identity?: RequestCredentialIdentity | null;
 }
 
 export interface StatsBucket {
