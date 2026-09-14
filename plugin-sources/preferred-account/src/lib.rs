@@ -125,6 +125,9 @@ impl exports::memeloop::token_center::group_routing_v1::Guest for PreferredAccou
     }
 }
 
+// Canonical ABI export names contain ':'/'#' and are not ELF symbols. Native
+// tests exercise the same policy without emitting a Wasm export table.
+#[cfg(target_arch = "wasm32")]
 export!(PreferredAccount);
 
 #[cfg(test)]
