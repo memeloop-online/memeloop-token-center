@@ -20,14 +20,14 @@ export function PricingTable({ rows, currency, loading, usageLoading, usageFaile
   const usageReady = !usageLoading && !usageFailed;
   const query = search.trim().toLocaleLowerCase(locale);
   const filtered = rows.filter(row => (!query || `${row.model} ${row.tier?.source ?? ''}`.toLocaleLowerCase(locale).includes(query))
-    && (filter === 'all' || filter === 'missing' && !loading && !row.tier || filter === 'used' && usageReady && (row.usage?.calls ?? 0) > 0));
-  const unavailableFilter = filter === 'used' && !usageReady;
+    && (filter === 'all' || filter === 'missing' && usageReady && !loading && !row.tier || filter === 'used' && usageReady && (row.usage?.calls ?? 0) > 0));
+  const unavailableFilter = filter !== 'all' && !usageReady;
   const tierLabel = (tier: string) => tier === 'default' ? t('pricing.tierDefault') : tier === 'priority' ? t('pricing.tierPriority') : tier === 'flex' ? t('pricing.tierFlex') : tier;
   return <section className="pricing-catalog">
     <div className="pricing-list-controls">
       <label>{t('pricing.search')}<Input aria-label={t('pricing.search')} type="search" value={search} onChange={event => setSearch(event.target.value)} placeholder={t('pricing.searchHint')} /></label>
       <label>{t('pricing.filter')}<Select aria-label={t('pricing.filter')} value={filter} onChange={event => setFilter(event.target.value)}>
-        <option value="all">{t('common.all')}</option><option value="used" disabled={!usageReady}>{t('pricing.filterUsed')}</option><option value="missing">{t('pricing.filterMissing')}</option>
+        <option value="all">{t('common.all')}</option><option value="used" disabled={!usageReady}>{t('pricing.filterUsed')}</option><option value="missing" disabled={!usageReady}>{t('pricing.filterMissing')}</option>
       </Select></label>
       {(search || filter !== 'all') && <Button appearance="subtle" onClick={() => { setSearch(''); setFilter('all'); }}>{t('pricing.clearFilters')}</Button>}
     </div>
@@ -41,7 +41,7 @@ export function PricingTable({ rows, currency, loading, usageLoading, usageFaile
           <td>{row.tier ? <><PriceSource source={row.tier.source} /><DetailTooltip content={`${t('pricing.updated')}: ${new Date(row.tier.updated_at).toLocaleString(locale)}`}><time tabIndex={0} dateTime={new Date(row.tier.updated_at).toISOString()}>{new Date(row.tier.updated_at).toLocaleDateString(locale)}</time></DetailTooltip></> : <span>{loading ? t('pricing.loadingPrices') : t('pricing.missing')}</span>}</td>
         </tr>)}</tbody>
       </table>
-      {!filtered.length && <div className="empty" role="status">{unavailableFilter ? t(usageLoading ? 'pricing.usageLoading' : 'pricing.usedFilterUnavailable') : loading ? t('pricing.loadingPrices') : search || filter !== 'all' ? t('pricing.noMatches') : t('pricing.noPricesForCurrency', { currency })}</div>}
+      {!filtered.length && <div className="empty" role="status">{unavailableFilter ? t(usageLoading ? 'pricing.usageLoading' : filter === 'used' ? 'pricing.usedFilterUnavailable' : 'pricing.missingFilterUnavailable') : loading ? t('pricing.loadingPrices') : search || filter !== 'all' ? t('pricing.noMatches') : t('pricing.noPricesForCurrency', { currency })}</div>}
     </div>
   </section>;
 }
