@@ -45,7 +45,7 @@ const copy = {
   },
 };
 
-export function PluginRuntimeManager({ token, onPublished }: { token: string; onPublished: () => Promise<void> }) {
+export function PluginRuntimeManager({ token, canManage, onPublished }: { token: string; canManage: boolean; onPublished: () => Promise<void> }) {
   const { locale } = useI18n();
   const text = locale.startsWith('zh') ? copy.zh : copy.en;
   const [status, setStatus] = useState<RuntimeStatus>();
@@ -88,7 +88,7 @@ export function PluginRuntimeManager({ token, onPublished }: { token: string; on
   }, [installing, load]);
 
   async function mutate(path: string, body: unknown, activates = false) {
-    if (busy) return;
+    if (busy || !canManage) return;
     setBusy(true); setError(''); setMessage('');
     const encoded = JSON.stringify(body);
     const identity = `${path}\0${encoded}`;
@@ -141,7 +141,7 @@ export function PluginRuntimeManager({ token, onPublished }: { token: string; on
     {unavailable ? <p className="muted">{text.unavailable}</p> : !status || !history ? <p>{text.loading}</p> : <>
       <p>{text.current}: {history.runtime_enabled === false ? text.unavailable : status.current ? `${status.current.revision} · ${status.current.inventory_id}` : text.baseline}</p>
       <p className="muted">{text.scope}</p>
-      {!history.installation_enabled ? <p className="notice">{text.disabled}</p> : <form onSubmit={(event) => { event.preventDefault(); void mutate('/internal/v1/plugin-runtime/installations', { inventory_id: inventory.trim(), packages: packages.split('\n').map((line) => line.trim()).filter(Boolean) }); }}>
+      {!history.installation_enabled ? <p className="notice">{text.disabled}</p> : canManage && <form onSubmit={(event) => { event.preventDefault(); void mutate('/internal/v1/plugin-runtime/installations', { inventory_id: inventory.trim(), packages: packages.split('\n').map((line) => line.trim()).filter(Boolean) }); }}>
         <label>{text.inventory}<input required pattern="[A-Za-z0-9_-]{1,64}" value={inventory} onChange={(event) => setInventory(event.target.value)} disabled={busy} /></label>
         <label>{text.packages}<textarea required rows={3} value={packages} onChange={(event) => setPackages(event.target.value)} disabled={busy} placeholder="ghcr.io/example/plugin@sha256:…" /></label>
         <button disabled={busy} type="submit">{busy ? text.pending : text.install}</button>
@@ -153,22 +153,22 @@ export function PluginRuntimeManager({ token, onPublished }: { token: string; on
         {job.failure_category && <p role="alert">{job.failure_category}</p>}
         {job.review_digest && <button type="button" className="secondary" onClick={() => void review(job)}>{text.review}</button>}
         {reviews[job.id]?.review && <details open><summary>{text.review}</summary><pre style={{ maxHeight: '24rem', overflow: 'auto', whiteSpace: 'pre-wrap' }}>{JSON.stringify(reviews[job.id].review, null, 2)}</pre></details>}
-        {job.status === 'review' && job.review_digest && <><p>{text.warning}</p><label><input type="checkbox" disabled={!reviews[job.id]?.review || reviews[job.id].review_digest !== job.review_digest} checked={approvals[job.id] === true} onChange={(event) => setApprovals((old) => ({ ...old, [job.id]: event.target.checked }))} />{text.approve}</label><button type="button" disabled={busy || !approvals[job.id] || reviews[job.id]?.review_digest !== job.review_digest} onClick={() => void mutate(`/internal/v1/plugin-runtime/installations/${encodeURIComponent(job.id)}/approve`, { review_digest: reviews[job.id].review_digest })}>{text.approve}</button></>}
-        {['failed', 'interrupted'].includes(job.status) && <button type="button" disabled={busy} onClick={() => void mutate(`/internal/v1/plugin-runtime/installations/${encodeURIComponent(job.id)}/retry`, {})}>{text.retry}</button>}
+        {canManage && job.status === 'review' && job.review_digest && <><p>{text.warning}</p><label><input type="checkbox" disabled={!reviews[job.id]?.review || reviews[job.id].review_digest !== job.review_digest} checked={approvals[job.id] === true} onChange={(event) => setApprovals((old) => ({ ...old, [job.id]: event.target.checked }))} />{text.approve}</label><button type="button" disabled={busy || !approvals[job.id] || reviews[job.id]?.review_digest !== job.review_digest} onClick={() => void mutate(`/internal/v1/plugin-runtime/installations/${encodeURIComponent(job.id)}/approve`, { review_digest: reviews[job.id].review_digest })}>{text.approve}</button></>}
+        {canManage && ['failed', 'interrupted'].includes(job.status) && <button type="button" disabled={busy} onClick={() => void mutate(`/internal/v1/plugin-runtime/installations/${encodeURIComponent(job.id)}/retry`, {})}>{text.retry}</button>}
       </section>)}
       <h3>{text.candidates}</h3>
-      <label><input type="checkbox" checked={confirmation} onChange={(event) => setConfirmation(event.target.checked)} />{text.confirm}</label>
+      {canManage && <label><input type="checkbox" checked={confirmation} onChange={(event) => setConfirmation(event.target.checked)} />{text.confirm}</label>}
       {status.candidates.map((candidate) => <div className="managed-resource" key={candidate.inventory_id}>
         <b>{candidate.inventory_id}</b><span className="pill">{candidate.staged ? text.staged : text.unstaged}</span>
         <p>{Object.entries(candidate.plugins).map(([id, versions]) => `${id}: ${versions.join(', ')}`).join(' · ')}</p>
-        <button type="button" className="secondary" disabled={busy} onClick={() => void mutate('/internal/v1/plugin-runtime/candidates', { inventory_id: candidate.inventory_id })}>{text.stage}</button>
-        <button type="button" disabled={busy || !confirmation || candidate.inventory_id === status.current?.inventory_id} onClick={() => void mutate('/internal/v1/plugin-runtime/publish', { inventory_id: candidate.inventory_id, expected_revision: status.current?.revision ?? 0 }, true)}>{text.publish}</button>
+        <button type="button" className="secondary" disabled={busy || !canManage} onClick={() => void mutate('/internal/v1/plugin-runtime/candidates', { inventory_id: candidate.inventory_id })}>{text.stage}</button>
+        <button type="button" disabled={busy || !canManage || !confirmation || candidate.inventory_id === status.current?.inventory_id} onClick={() => void mutate('/internal/v1/plugin-runtime/publish', { inventory_id: candidate.inventory_id, expected_revision: status.current?.revision ?? 0 }, true)}>{text.publish}</button>
       </div>)}
       <h3>{text.history}</h3>
       {history.revisions.length === 0 && <p className="muted">{text.empty}</p>}
       {history.revisions.map((revision) => <div className="managed-resource" key={revision.revision}>
         <b>{revision.revision} · {revision.inventory_id}</b> <span>{revision.reason}</span>
-        <button type="button" className="secondary" disabled={busy || !confirmation || !status.current || revision.revision >= status.current.revision || revision.inventory_id === status.current.inventory_id} onClick={() => void mutate('/internal/v1/plugin-runtime/rollback', { target_revision: revision.revision, expected_revision: status.current?.revision }, true)}>{text.rollback}</button>
+        <button type="button" className="secondary" disabled={busy || !canManage || !confirmation || !status.current || revision.revision >= status.current.revision || revision.inventory_id === status.current.inventory_id} onClick={() => void mutate('/internal/v1/plugin-runtime/rollback', { target_revision: revision.revision, expected_revision: status.current?.revision }, true)}>{text.rollback}</button>
       </div>)}
       {history.revisions.length > 0 && <button type="button" className="secondary" disabled={busy} onClick={() => void older()}>{text.older}</button>}
       <h3>{text.audit}</h3>

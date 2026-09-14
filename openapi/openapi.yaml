@@ -863,6 +863,29 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
+  /internal/v1/plugins/runtime-access:
+    get:
+      tags: [System]
+      operationId: getPluginRuntimeAccess
+      summary: Read the current plugin reader's runtime-management capability
+      description: Available without experimental features or inventory configuration. Tenant-bound plugin readers receive false for both capabilities. Global plugin readers can view runtime data when compiled in; management additionally requires plugins:write. Does not read global runtime data. The Operator mounts runtime reads only with view capability and enables mutations only with manage capability; endpoints still independently enforce authorization.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:read
+      responses:
+        '200':
+          description: Current principal capability only; no tenant or inventory information.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [can_view_runtime, can_manage_runtime]
+                properties:
+                  can_manage_runtime: { type: boolean }
+                  can_view_runtime: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
   /internal/v1/plugin-runtime:
     get:
       tags: [System]

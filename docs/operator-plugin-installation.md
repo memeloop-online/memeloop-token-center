@@ -23,7 +23,13 @@ status and history reports `runtime_enabled: false`, allowing the Plugins page t
 show disabled management without failed capability-probe requests. Write endpoints
 still reject requests when runtime authority is absent.
 
-A policy is:
+The Plugins page first reads `/internal/v1/plugins/runtime-access`, a self-scope
+capability lookup available to plugin readers. Tenant-bound credentials receive
+false view/manage flags and never mount global runtime reads. Global readers can
+inspect history; only global writers get enabled installation/publication actions.
+Every backend operation still checks its own scope independently.
+
+Host policy example:
 
 ```json
 {

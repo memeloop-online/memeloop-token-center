@@ -77,6 +77,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         )
         .route("/internal/v1/plugins", get(plugin_manifests))
         .route(
+            "/internal/v1/plugins/runtime-access",
+            get(super::super::plugins::application_plugin_access),
+        )
+        .route(
             "/internal/v1/plugins/group-routing-strategies",
             get(super::super::plugins::group_routing_strategies),
         )

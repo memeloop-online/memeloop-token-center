@@ -26,6 +26,22 @@ pub(super) async fn group_routing_strategies(
     Ok(Json(state.plugins.group_routing_strategies()))
 }
 
+pub(super) async fn application_plugin_access(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "plugins:read").await?;
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "private, no-store")],
+        Json(serde_json::json!({
+            "can_view_runtime": cfg!(feature = "experimental-plugin-revisions")
+                && service.tenant_external_id.is_none(),
+            "can_manage_runtime": cfg!(feature = "experimental-plugin-revisions")
+                && service.tenant_external_id.is_none() && service.allows("plugins:write"),
+        })),
+    ))
+}
+
 #[cfg(feature = "experimental-plugin-revisions")]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

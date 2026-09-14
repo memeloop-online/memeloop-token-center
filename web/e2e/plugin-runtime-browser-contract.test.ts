@@ -20,6 +20,10 @@ test('Operator plugin page installs, explicitly reviews, publishes and rolls bac
   // so establish the locale before I18nProvider reads persisted preferences.
   await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
   try {
+    await page.route('**/internal/v1/plugins/runtime-access', async route => {
+      assert.equal(route.request().headers().authorization, 'Bearer operator-test');
+      await route.fulfill({ json: { can_view_runtime: true, can_manage_runtime: true } });
+    });
     let current = { revision: 1, inventory_id: 'baseline', reason: 'initial' };
     const revisions = [current];
     const candidates = [{ inventory_id: 'baseline', staged: true, plugins: {} as Record<string, string[]> }];
@@ -80,5 +84,26 @@ test('Operator plugin page installs, explicitly reviews, publishes and rolls bac
     assert.deepEqual(writes[0].body, { inventory_id: 'new-inventory', packages: [reference] });
     assert.ok(writes.every((write) => typeof write.key === 'string' && write.key.length > 0));
     assert.deepEqual(writes.map((write) => write.path), ['/internal/v1/plugin-runtime/installations', '/internal/v1/plugin-runtime/installations/job/approve', '/internal/v1/plugin-runtime/publish', '/internal/v1/plugin-runtime/rollback']);
+    // A global reader can inspect history but cannot publish or roll back.
+    await page.route('**/internal/v1/plugins/runtime-access', route => route.fulfill({ json: { can_view_runtime: true, can_manage_runtime: false } }));
+    await page.reload();
+    await page.getByRole('heading', { name: 'Version history', exact: true }).waitFor();
+    assert.equal(await page.getByRole('button', { name: 'Install for review' }).count(), 0);
+    assert.equal(await page.getByRole('button', { name: 'Publish inventory', exact: true }).first().isDisabled(), true);
+    assert.equal(await page.getByRole('button', { name: 'Roll back to this version', exact: true }).first().isDisabled(), true);
+    // Tenant principals must never issue a global-runtime request, not merely
+    // accept its 403. Capability lookup remains a successful self-scope read.
+    let tenantRuntimeReads = 0;
+    page.on('request', request => {
+      if (new URL(request.url()).pathname.startsWith('/internal/v1/plugin-runtime')) tenantRuntimeReads++;
+    });
+    await page.route('**/internal/v1/plugins/runtime-access', route => route.fulfill({ json: { can_view_runtime: false, can_manage_runtime: false } }));
+    const accessResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/internal/v1/plugins/runtime-access');
+    await page.reload();
+    await accessResponse;
+    await page.getByText('broken current catalog', { exact: false }).waitFor();
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    assert.equal(await page.getByRole('heading', { name: 'Plugin installation and versions' }).count(), 0);
+    assert.equal(tenantRuntimeReads, 0);
   } finally { await browser.close(); await server.close(); }
 });

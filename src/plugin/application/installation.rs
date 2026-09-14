@@ -1220,6 +1220,59 @@ mod tests {
             )
             .await
             .unwrap();
+        let access_path = "/internal/v1/plugins/runtime-access";
+        let (status, access) = call(
+            &state,
+            "GET",
+            access_path,
+            &scoped.token,
+            json!({}),
+            "access",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            access,
+            json!({"can_view_runtime":false,"can_manage_runtime":false})
+        );
+        let readonly = state
+            .db
+            .create_service_token(
+                crate::db::CreateServiceTokenInput {
+                    name: "global-plugin-reader".into(),
+                    scopes: vec!["plugins:read".into()],
+                    tenant_external_id: None,
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            call(
+                &state,
+                "GET",
+                access_path,
+                &readonly.token,
+                json!({}),
+                "access"
+            )
+            .await
+            .1,
+            json!({"can_view_runtime":true,"can_manage_runtime":false})
+        );
+        assert_eq!(
+            call(
+                &state,
+                "GET",
+                access_path,
+                &state.config.service_token,
+                json!({}),
+                "access"
+            )
+            .await
+            .1,
+            json!({"can_view_runtime":true,"can_manage_runtime":true})
+        );
         assert_eq!(
             call(
                 &state,
