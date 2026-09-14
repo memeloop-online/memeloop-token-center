@@ -91,6 +91,18 @@ test('multi-tenant scope exposes tenant CRUD, dependency refusal, authorization 
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(fixture(address.port, 'multiple'));
     await page.getByRole('heading', { name: 'Tenant management', exact: true }).waitFor();
+    await page.evaluate(() => localStorage.setItem('mtc-locale', 'zh-CN'));
+    await page.reload();
+    const chineseScope = page.getByRole('combobox', { name: '租户范围', exact: true });
+    await chineseScope.waitFor();
+    assert.equal(await chineseScope.locator('option[value="default"]').innerText(), '默认');
+    await tenantRow(page, '默认').waitFor();
+    await chineseScope.selectOption('default');
+    assert.equal(await chineseScope.inputValue(), 'default', 'localized display never changes the selected external ID');
+    assert.equal(await page.locator('.app-brand').innerText().then(text => text.includes('Token Center')), true, 'the product brand remains unchanged');
+    await page.evaluate(() => localStorage.setItem('mtc-locale', 'en'));
+    await page.reload();
+    await page.getByRole('heading', { name: 'Tenant management', exact: true }).waitFor();
     const scope = page.getByRole('combobox', { name: 'Tenant scope', exact: true });
     await scope.selectOption('north');
     assert.equal(await scope.inputValue(), 'north');

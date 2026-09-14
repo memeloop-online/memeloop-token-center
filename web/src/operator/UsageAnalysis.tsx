@@ -26,7 +26,7 @@ const localCopy = {
   'zh-CN': {
     dimensions: '维度分析', filters: '筛选条件', charts: '图表数据', throughput: '请求吞吐', latency: '响应延迟', costTrend: '费用趋势',
     averageLatency: '平均延迟', p95Latency: 'P95 延迟（近似）', heatMetric: '热力指标', requests: '请求数', success: '成功', failures: '失败',
-    tokens: 'Token', cost: '费用', failureRate: '失败率', selectedCell: '已选择', chartEmpty: '当前范围没有可绘制的数据', filtersActive: '项筛选已生效', category: '分类',
+    tokens: '词元', cost: '费用', failureRate: '失败率', selectedCell: '已选择', chartEmpty: '当前范围没有可绘制的数据', filtersActive: '项筛选已生效', category: '分类',
   },
   en: {
     dimensions: 'Dimensions', filters: 'Filters', charts: 'Chart data', throughput: 'Request throughput', latency: 'Response latency', costTrend: 'Cost trend',

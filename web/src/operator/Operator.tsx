@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
 import { Shell } from '../components';
 import { useI18n } from '../i18n';
+import { tenantDisplayName } from '../tenantDisplayName';
 import type { PluginManifest, TypedFilterAst, UsageAnalysisSessionBucket } from '../types';
 import { api } from '../api';
 import './operator.css';
@@ -57,7 +58,7 @@ function pageId(route: OperatorApplicationRoute) {
 }
 
 export function Operator({ route, onRouteChange, onPluginNavigation, embedded = false, showNavigation = true }: OperatorProps = {}) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const scope = useOperatorScope();
   const [internalRoute, setInternalRoute] = useState<OperatorRouteKey>('requests');
   const [sessionFocus, setSessionFocus] = useState<SessionFocus>();
@@ -187,7 +188,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
   const content = <>
     {scope.authenticating && <div className="console-context"><div><b>{t('common.loading')}</b></div></div>}
     {scope.activeCredential && scope.tenants.length === 0 && <div className="console-context"><div><b>{t('operator.noTenants')}</b></div></div>}
-    {scope.activeCredential && scope.tenants.length > 1 && <div className="tenant-scope-switcher"><label className="tenant-picker"><span>{t('operator.tenant')}</span><select value={scope.tenant} onChange={(event) => scope.setTenant(event.target.value)}>{scope.tenants.map((value) => <option key={value.external_id} value={value.external_id}>{value.external_id}</option>)}</select></label></div>}
+    {scope.activeCredential && scope.tenants.length > 1 && <div className="tenant-scope-switcher"><label className="tenant-picker"><span>{t('operator.tenant')}</span><select value={scope.tenant} onChange={(event) => scope.setTenant(event.target.value)}>{scope.tenants.map((value) => <option key={value.external_id} value={value.external_id}>{tenantDisplayName(value.external_id, locale)}</option>)}</select></label></div>}
     {showNavigation && <nav className="tabs" role="tablist" aria-label={t('operator.sections')}>{navigation.map((item) => <button id={`operator-tab-${item.domId}`} role="tab" aria-selected={activeRoute === item.route} aria-controls={`operator-panel-${item.domId}`} tabIndex={activeRoute === item.route ? 0 : -1} key={item.route} className={activeRoute === item.route ? 'active' : ''} onClick={() => navigate(item.route)} onKeyDown={(event) => changeRouteByKeyboard(event, item.route)}>{t(item.label)}</button>)}</nav>}
     {scope.error && <div className="notice error" role="alert">{scope.error}</div>}
     <section id={`operator-panel-${pageId(activeRoute)}`} role="tabpanel" aria-labelledby={showNavigation ? `operator-tab-${pageId(activeRoute)}` : undefined} tabIndex={0}>
