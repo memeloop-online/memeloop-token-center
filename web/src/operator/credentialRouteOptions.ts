@@ -52,7 +52,9 @@ export function credentialRouteOptions(routes: ModelRouteView[], accounts: Upstr
       disabled: !route.enabled || candidates?.length === 0,
     };
   });
-  return options.map(option => options.some(other => other.value !== option.value && other.label === option.label && (option.disabled || !other.disabled))
+  // Account/scope descriptions already distinguish ordinary same-model routes.
+  // Reserve technical suffixes for genuinely identical human-visible choices.
+  return options.map(option => options.some(other => other.value !== option.value && other.label === option.label && other.description === option.description && (option.disabled || !other.disabled))
     ? { ...option, label: `${option.label} (${shortIdentity(option.value, options.map(value => value.value))})` }
     : option);
 }

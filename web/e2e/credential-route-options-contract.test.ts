@@ -10,7 +10,10 @@ test('route grant identity, candidate count and unavailable reasons are independ
   const input = [route('one', { candidate_upstream_account_ids: ['a'] }), route('two', { candidate_upstream_account_ids: ['b'] }), route('many', { candidate_upstream_account_ids: ['a', 'b'] }), route('off', { enabled: false, candidate_upstream_account_ids: [] }), route('empty', { candidate_upstream_account_ids: [] }), route('unknown')];
   const options = credentialRouteOptions([...input, input[0]], accounts, providers, 'zh-CN');
   assert.deepEqual(options.map(option => option.value), input.map(value => value.id));
-  assert.notEqual(options[0].label, options[1].label);
+  assert.equal(options[0].label, 'Sol');
+  assert.equal(options[1].label, 'Sol');
+  assert.equal(options[2].label, 'Sol', 'single and shared scope descriptions do not need route ID suffixes');
+  assert.notEqual(options[0].description, options[1].description, 'distinct accounts stay identifiable in secondary text');
   assert.match(options[2].description!, /共享候选 · 2 个账号/);
   assert.match(options[0].chipDescription, /单账号/);
   assert.match(options[0].label, /^Sol/);
