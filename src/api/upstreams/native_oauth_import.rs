@@ -85,6 +85,9 @@ pub(in crate::api) async fn native_oauth_import_capabilities(
         "account_name_policies": {"kimi": ACCOUNT_NAME_POLICY},
         "atomic_cohort_contracts": [KIMI_COHORT_CONTRACT],
         "credential_envelope_contract": CREDENTIAL_ENVELOPE_CONTRACT,
+        "credential_lifecycle_policies": {
+            "kimi": {"expired_access_token": "managed_refresh_required"}
+        },
     })))
 }
 
