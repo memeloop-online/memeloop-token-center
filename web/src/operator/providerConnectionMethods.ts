@@ -6,7 +6,8 @@ type JsonSchema = Record<string, unknown>;
 export function oauthCreationProxyMode(provider?: ProviderType): 'required' | 'optional' | 'none' {
   if (provider?.oauth_adapter?.flow_kind === 'openai_device') return 'required';
   if (provider?.source === 'builtin' && ((provider.id === 'cursor' && provider.oauth_adapter?.flow_kind === 'cursor_pkce')
-    || (provider.id === 'github-copilot' && provider.oauth_adapter?.flow_kind === 'github_device_copilot'))) return 'optional';
+    || (provider.id === 'github-copilot' && provider.oauth_adapter?.flow_kind === 'github_device_copilot')
+    || (provider.id === 'kimi-oauth' && provider.oauth_adapter?.flow_kind === 'kimi_device'))) return 'optional';
   return 'none';
 }
 
