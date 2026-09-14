@@ -239,8 +239,10 @@ export function RequestTable({
               `${t('request.protocol')}: ${request.protocol}`,
               request.upstream_account_id ? `${t('request.upstreamId')}: ${upstreamNames?.get(request.upstream_account_id) ?? request.upstream_account_id}` : '',
               request.route_id ? `${t('request.routeId')}: ${request.route_id}` : '',
-              request.completed_at != null ? `${t('request.completedAt')}: ${new Date(request.completed_at).toLocaleString(locale)}` : '',
             ].filter(Boolean).join(' · ');
+            const durationSummary = request.completed_at != null
+              ? `${t('request.completedAt')}: ${new Date(request.completed_at).toLocaleString(locale)}`
+              : '';
             const cost = currencyForRequest ? formatCurrencyDisplay(request.cost, currencyForRequest, locale) : { text: '—' };
             return <tr key={request.request_id}>
               <td className="request-time-cell"><time>{new Date(request.created_at).toLocaleString(locale)}</time><RequestIdentifier requestId={request.request_id} compact /></td>
@@ -259,7 +261,7 @@ export function RequestTable({
                 {sessionMeta && <RequestSessionMetadata value={sessionMeta} />}
               </td>}
               <td><span className={`status ${request.status_code && request.status_code < 400 ? 'ok' : request.status_code ? 'bad' : 'pending'}`}>{request.status_code ?? t('common.running')}</span></td>
-              <td>{request.duration_ms === null ? '—' : `${formatNumber(request.duration_ms, locale, 2)} ms`}</td>
+              <td title={durationSummary || undefined}>{request.duration_ms === null ? '—' : `${formatNumber(request.duration_ms, locale, 2)} ms`}</td>
               <td>{request.error_code ? <code className="error-code">{request.error_code}</code> : '—'}</td>
               {onSelect && <td><button className="secondary table-action" type="button" onClick={() => onSelect(request)} aria-label={t('request.openDetail', { model: request.model })}>{t('request.inspect')}</button></td>}
             </tr>

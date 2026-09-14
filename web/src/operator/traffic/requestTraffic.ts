@@ -59,7 +59,7 @@ export function summarizeVisibleRequests(requests: readonly RequestView[]): Visi
   }
 
   const terminal = successful + failed;
-  const request: RequestView = {
+  return {
     requests: requests.length,
     successful,
     failed,
@@ -188,7 +188,7 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
   if (createdAt === undefined) return previous;
   // Replayed starts must not regress an authoritative terminal history row.
   if (event.event_kind === 'started' && previous?.status_code != null) return previous;
-  return {
+  const request: RequestView = {
     ...previous,
     request_id: event.request_id,
     created_at: createdAt,
