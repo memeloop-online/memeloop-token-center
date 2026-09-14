@@ -5,6 +5,7 @@ import type { Locator, Page } from 'playwright';
 import { baseURL, eventually, model, requestJson, runtime, tenant } from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
 import { appPreferenceControls, openAppRoute } from './app-route.support.js';
+import { openIndividualAuthorization } from './form-disclosure.support.js';
 
 import { addTypedFilterCondition, assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertVisible, catalogModelSearch, connectOperator, credentialGroupObservations, groupedModel, metric, openCatalogModelPicker, openTypedFilterDialog, operatorTrafficPanel, uuidPattern } from './dogfood.support.js';
 When('上游授权方式包含 Codex、Claude、Copilot 和 Cursor 且仅显示产品接入方式', async function (this: DogfoodWorld) {
@@ -392,7 +393,7 @@ When('管理员用键盘创建提供商组和路由组', { timeout: 120_000 }, a
   const existingRoute = page.locator('tbody tr').filter({ hasText: model });
   await existingRoute.getByRole('button', { name: '编辑', exact: true }).click();
   const staleEditor = page.locator('.create-journey');
-  await staleEditor.getByRole('button', { name: /单独授权凭据/ }).click();
+  await openIndividualAuthorization(staleEditor, 'credential');
   const staleCredentialField = staleEditor.locator('.multi-combobox').filter({
     has: page.getByRole('combobox', { name: '授权给具体凭据', exact: true }),
   });
@@ -442,6 +443,7 @@ When('管理员用键盘创建提供商组和路由组', { timeout: 120_000 }, a
   assert.ok(routeGroupListId);
   await assertContains(routeEditor.locator(`#${routeGroupListId}`).getByRole('option'), '创建路由组“默认路由”');
   await routeGroupInput.press('Enter');
+  await openIndividualAuthorization(routeEditor, 'credential');
   const exactCredentialField = routeEditor.locator('.multi-combobox').filter({
     has: page.getByRole('combobox', { name: '授权给具体凭据', exact: true }),
   });
