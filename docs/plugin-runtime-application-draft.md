@@ -1,0 +1,108 @@
+# Draft application plugin revision integration
+
+Stacked on **#59** (configuration snapshots and refill fences),
+which is stacked on **#94** (atomic runtime revision foundation).
+**Not production enabled.** These are distinct dependency layers, not alternative
+implementations. #87 adds execution diagnostics; #54 adds UI projection primitives
+but still requires authenticated backend and real product-slot integration.
+
+The `experimental-plugin-revisions` feature exposes a host-only
+`AppState::with_application_plugin_inventory` opt-in. The production executable
+does not call it. There is deliberately no new environment variable, UI toggle,
+remote installer API, or plugin-provided activation mechanism.
+
+## Authority and request ownership
+
+Migration 83 creates global candidate, immutable revision, singleton head, and
+idempotency operation tables. A successful operation claims its idempotency key,
+inserts the next revision, performs `expected_revision` CAS, and records its result
+in one transaction. A failed CAS rolls back the operation and revision. Exact
+replay returns the original revision receipt; a different request with the same
+key conflicts. Rollback selects a historical inventory and publishes a strictly
+new revision, never rewinding head. Identity and contract digests are internal
+metadata and are not included in the API receipt.
+
+Migration 81 is reserved for OAuth authority (#103), and 82 for conversation
+query indexes. This stack must retain both migrations when integrated with master;
+it must not reuse either version or replace their schema contracts.
+
+Each authenticated proxy, synchronous image, or asynchronous generation request
+pins the primary database head once at entry. The resulting request-owned
+`ApplicationPluginSnapshot` contains both runtime and provider catalog; the
+request's AppState clone carries that pair through traffic policy, provider
+prepare, candidate retries, and provider normalize. A second pin on the same
+request state retains the first snapshot. There is no notification dependency:
+another AppState/replica reads the database on its next request, even if it has
+missed every notification. Database failures, missing local inventory, identity
+mismatches, schema/provider-contract changes, and package/configuration validation
+failures stop admission; no startup-runtime fallback is permitted.
+
+## Trusted inventory and management boundary
+
+Inventory is an independently provisioned host map from a bounded opaque ID to
+an absolute, read-only revision root and exact approved grants. Grants bind the
+manifest, capabilities, component digest, and signed-install provenance. The
+complete plugin set and all contribution contracts must match the original
+application baseline. Database publication additionally compares the candidate
+contract with the expected historical revision, preventing an incompatible
+replica baseline from widening the contract. Versions and approved executable
+identities may change; configuration schema, provider contract, capabilities,
+policy set, and other contributions may not.
+
+With the feature and host opt-in, the following control endpoints require a
+**global** service credential with `plugins:write`:
+
+| POST endpoint | Exact JSON body |
+| --- | --- |
+| `/internal/v1/plugin-runtime/candidates` | `{"inventory_id":"approved-a"}` |
+| `/internal/v1/plugin-runtime/publish` | `{"inventory_id":"approved-a","expected_revision":0}` |
+| `/internal/v1/plugin-runtime/rollback` | `{"target_revision":1,"expected_revision":2}` |
+
+Publish and rollback require `Idempotency-Key`. Unknown fields are rejected,
+including URL, path, Wasm, grant and tenant overrides. Candidate IDs cannot encode
+paths or URLs. Candidate staging validates local bytes before persisting an
+immutable identity; publication also validates, so a direct publish is safe.
+Unknown inventory is forbidden. Tenant-scoped credentials cannot publish even
+with `plugins:write`. No remote package source, key material, or local root is
+returned in receipts. The gateway role does not expose these control endpoints.
+
+The installer accepts `--inventory-id ID` to install under `--plugin-dir/ID`.
+Each new approved package set gets a new root. Existing package IDs are never
+overwritten; signed OCI verification and atomic no-replace install remain in
+force. Provision the complete inventory before mounting its root read-only on
+every replica. Do not modify that root after publication. Keep historical roots
+available for in-flight requests, restart, and rollback.
+
+## Verification and remaining deployment gate
+
+All heavy builds/tests run in the existing GitHub `cargo test --all-targets
+--all-features` job, including its PostgreSQL service. Local work is limited to
+formatting and diff checks. Tests use oneshot channels and barriers, not sleeps
+or randomized scheduling, to check A-policy / switch-B / A-prepare-normalize and
+new-request B; two independent AppStates cover CAS winners, concurrent exact
+replay, lost-notification behavior, restart, monotonic rollback, migration replay,
+missing packages, database failure, tampered input, and management authorization.
+PostgreSQL schema UUIDs only isolate test data; they do not drive scheduling.
+
+Each authority retains at most two compiled revision snapshots. Every request
+still reads the primary database head, checks the local inventory root and validates
+the exact cached receipt; database/identity/missing-root failures never fall back
+to a cached older revision. Concurrent cold pins join one manager-owned loading
+task and publication through a shared completion channel. The first caller owns
+neither the task nor its result: cancellation cannot discard the compiled revision
+or force followers to restart it. A short-held mutex bounds in-flight bookkeeping
+to one load per authority. A process-wide owned permit admits one compilation at a time,
+including staging; an abandoned blocking task retains its permit until it finishes.
+Permit waits are capped at five seconds, compilation waits at 35 seconds and
+shared pin/loading waits at 45 seconds. Immutable
+compiled bytes remain valid if the package files later change; staging and fresh
+loads still revalidate those bytes. Inventory roots must remain read-only.
+
+Eviction drops only cache ownership, never an in-flight request pin. The retained
+runtime also retains its revision circuit state across requests. CI extends the
+existing SQLite/PostgreSQL authority exercise with concurrent Arc identity,
+single-compilation after leader cancellation and bounded-history checks; warm DB/missing-root failures remain
+covered. This has **not** passed a production performance or rollout gate. The
+feature remains off by default and host opt-in is not wired into the executable.
+It does not implement arbitrary schema/provider-contract changes, strict
+configuration revocation, UI changes, or health/archive changes.

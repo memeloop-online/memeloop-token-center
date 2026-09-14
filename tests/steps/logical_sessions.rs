@@ -48,12 +48,7 @@ async fn logical_sessions_on_sqlite(world: &mut TokenCenterWorld) {
     // Logical-session contracts write deterministic request and projection fixtures
     // directly through the database. They do not exercise generation processing, so
     // let the worker finish cancellation before any fixture write can contend with it.
-    let worker = world
-        .worker_task
-        .take()
-        .expect("SQLite logical-session fixture starts a generation worker");
-    worker.abort();
-    assert!(worker.await.is_err(), "generation worker must be cancelled");
+    stop_test_worker(world).await;
 }
 
 #[given("a logical session token center backed by PostgreSQL")]

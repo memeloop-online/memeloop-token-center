@@ -7,6 +7,141 @@ use crate::{AppState, config::Config, db::ArchiveSpoolIdentity};
 
 const PEPPER: &[u8] = b"existing-test-pepper-over-thirty-two-bytes";
 
+#[tokio::test]
+async fn both_buffered_purposes_recover_exact_bytes_only_after_terminal() {
+    let (_dir, state, pool, identity) = fixture().await;
+    let request = Bytes::from_static(b"{\"messages\":[{\"content\":\"private request\"}]}");
+    let response = Bytes::from_static(b"{\"output\":\"complete private response\"}");
+    assert!(
+        capture_buffered(
+            &state,
+            identity,
+            BufferedArchivePurpose::Request,
+            request.clone()
+        )
+        .await
+    );
+    assert!(
+        capture_buffered(
+            &state,
+            identity,
+            BufferedArchivePurpose::Response,
+            response.clone()
+        )
+        .await
+    );
+    assert!(!process_one_for_test(&state).await);
+    sqlx::query("UPDATE request_records SET request_object = $1 WHERE id = $2")
+        .bind(format!("gap://{}/request", identity.request_id))
+        .bind(identity.request_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    finish(&pool, identity).await;
+    let permits = state.proxy_archive_stream_permits.clone();
+    let held = permits
+        .clone()
+        .acquire_many_owned(permits.available_permits() as u32)
+        .await
+        .unwrap();
+    assert!(!process_one_for_test(&state).await);
+    for table in ["request_archive_spools", "response_archive_spools"] {
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT state, attempts FROM {table} WHERE request_id = $1"
+        )))
+        .bind(identity.request_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("state"), "pending");
+        assert_eq!(row.get::<i64, _>("attempts"), 0);
+    }
+    drop(held);
+    assert!(process_one_for_test(&state).await);
+    assert!(process_one_for_test(&state).await);
+    let row =
+        sqlx::query("SELECT request_object, response_object FROM request_records WHERE id = $1")
+            .bind(identity.request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let request_locator: String = row.get("request_object");
+    let response_locator: String = row.get("response_object");
+    assert_ne!(request_locator, response_locator);
+    assert_eq!(state.archive.get(&request_locator).await.unwrap(), request);
+    assert_eq!(
+        state.archive.get(&response_locator).await.unwrap(),
+        response
+    );
+}
+
+#[test]
+fn request_cipher_domain_is_distinct_and_schema71_response_aad_is_unchanged() {
+    let identity = ArchiveSpoolIdentity {
+        request_id: Uuid::new_v4(),
+        tenant_id: Uuid::new_v4(),
+        reservation_id: Uuid::new_v4(),
+    };
+    let payload = Bytes::from_static(b"private archive");
+    let request =
+        encrypt_buffered(identity, BufferedArchivePurpose::Request, &payload, PEPPER).unwrap();
+    assert!(
+        cipher::open(
+            identity,
+            0,
+            &request[0].ciphertext,
+            payload.len() as i64,
+            PEPPER
+        )
+        .is_err()
+    );
+    assert_eq!(
+        cipher::open_for_purpose(
+            identity,
+            0,
+            &request[0].ciphertext,
+            payload.len() as i64,
+            PEPPER,
+            BufferedArchivePurpose::Request
+        )
+        .unwrap(),
+        payload
+    );
+    let legacy_aad = format!(
+        "memeloop-token-center/response-archive-spool/v1/{}/{}/{}/0",
+        identity.tenant_id, identity.request_id, identity.reservation_id
+    );
+    let legacy = crate::provider::seal_private_json(
+        &serde_json::json!({"bytes":"cHJpdmF0ZSBhcmNoaXZl"}),
+        PEPPER,
+        legacy_aad.as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        cipher::open_for_purpose(
+            identity,
+            0,
+            &legacy,
+            payload.len() as i64,
+            PEPPER,
+            BufferedArchivePurpose::Response
+        )
+        .unwrap(),
+        payload
+    );
+    assert!(
+        cipher::open_for_purpose(
+            identity,
+            0,
+            &legacy,
+            payload.len() as i64,
+            PEPPER,
+            BufferedArchivePurpose::Request
+        )
+        .is_err()
+    );
+}
+
 #[test]
 fn encrypted_chunks_bind_every_owner_and_sequence_without_plaintext() {
     let id = ArchiveSpoolIdentity {
@@ -83,6 +218,67 @@ async fn finish(pool: &sqlx::AnyPool, identity: ArchiveSpoolIdentity) {
     sqlx::query("UPDATE request_records SET completed_at=2, status_code=200, response_object=$1 WHERE id=$2")
         .bind(format!("gap://{}/response", identity.request_id))
         .bind(identity.request_id.to_string()).execute(pool).await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_at_claim_admission_preserves_attempts_and_never_starts_a_writer() {
+    let (_dir, state, pool, identity) = fixture().await;
+    let mut producer = ResponseArchiveProducer::begin_for_test(&state, identity)
+        .await
+        .unwrap();
+    producer
+        .append_for_test(vec![Bytes::from_static(b"data: [DONE]\n\n")])
+        .await
+        .unwrap();
+    producer.seal_for_test().await.unwrap();
+    finish(&pool, identity).await;
+
+    for _ in 0..10 {
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        // The seam executes after the real SELECT, while the transaction owns
+        // the budget lock, immediately before UPDATE would consume an attempt.
+        assert!(
+            !upload::process_one_with_admission(&state, Uuid::new_v4(), Some(&receiver), || {
+                sender.send(true).unwrap();
+                !*receiver.borrow()
+            })
+            .await
+        );
+        let row = sqlx::query("SELECT state, attempts, lease_token FROM response_archive_spools WHERE request_id = $1")
+            .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
+        assert_eq!(row.get::<String, _>("state"), "pending");
+        assert_eq!(row.get::<i64, _>("attempts"), 0);
+        assert!(row.get::<Option<String>, _>("lease_token").is_none());
+        let writers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archive_staging_attempts WHERE owner_id = $1 AND purpose = 'response'")
+            .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            writers, 0,
+            "no staging attempt means no object writer was opened"
+        );
+    }
+
+    // Once the admission decision is true, shutdown arriving before COMMIT
+    // must drain exactly that one upload, never strand a paid retry attempt.
+    let (sender, receiver) = tokio::sync::watch::channel(false);
+    assert!(
+        upload::process_one_with_admission(&state, Uuid::new_v4(), Some(&receiver), || {
+            sender.send(true).unwrap();
+            true
+        })
+        .await
+    );
+    assert!(!upload::process_one(&state, Uuid::new_v4()).await);
+    let row =
+        sqlx::query("SELECT state, attempts FROM response_archive_spools WHERE request_id = $1")
+            .bind(identity.request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row.get::<String, _>("state"), "bound");
+    assert_eq!(row.get::<i64, _>("attempts"), 1);
+    let writers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archive_staging_attempts WHERE owner_id = $1 AND purpose = 'response'")
+        .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!(writers, 1);
 }
 
 #[tokio::test]
@@ -188,4 +384,50 @@ async fn rejected_capture_never_publishes_a_complete_prefix() {
             .await
             .unwrap();
     assert_eq!(locator, format!("gap://{}/response", identity.request_id));
+}
+
+#[tokio::test]
+async fn late_begin_ack_is_fenced_as_gap_and_cannot_leave_a_capturing_spool() {
+    let (_dir, state, pool, identity) = fixture().await;
+    let clock = capture_ack_clock_for_test(&state);
+    let (entering, release) = pause_next_begin_ack_for_test(&state);
+    let begin_state = state.clone();
+    let begin =
+        tokio::spawn(async move { ResponseArchiveProducer::begin(&begin_state, identity).await });
+    tokio::time::timeout(std::time::Duration::from_secs(1), entering)
+        .await
+        .expect("begin transaction must commit before its ACK is paused")
+        .unwrap();
+    let state_before_timeout: String =
+        sqlx::query_scalar("SELECT state FROM response_archive_spools WHERE request_id = $1")
+            .bind(identity.request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state_before_timeout, "capturing");
+
+    // Expire this fixture's ACK timer only after the transaction committed.
+    // The same controlled clock keeps unrelated byte-redaction tests independent
+    // of CI scheduler latency without relaxing production's 250 ms deadline.
+    clock.expire();
+    assert!(begin.await.unwrap().is_none());
+    release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let row = sqlx::query(
+                "SELECT state, expires_at, updated_at FROM response_archive_spools WHERE request_id = $1",
+            )
+            .bind(identity.request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if row.get::<String, _>("state") == "gap" {
+                assert!(row.get::<i64, _>("expires_at") <= row.get::<i64, _>("updated_at"));
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("unobserved successful begin must be made immediately GC-eligible");
 }

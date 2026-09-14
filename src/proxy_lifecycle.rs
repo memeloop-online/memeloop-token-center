@@ -9,7 +9,7 @@ use crate::{
         ArchiveStagingOwner, ArchiveStagingPurpose, ArchiveStagingWriteLease,
         BeginArchiveStagingInput, BeginArchiveStagingResult,
     },
-    db::{AttachProxyArchiveResult, Database, FinishProxyRequest, FinishProxyRequestResult},
+    db::{Database, FinishProxyRequest, FinishProxyRequestResult, ProxyRequestUpstreamAttribution},
     error::AppError,
     model::UsageReservation,
 };
@@ -121,12 +121,14 @@ pub(crate) async fn finish_proxy_request_with_retry(
     database: &Database,
     input: FinishProxyRequest<'_>,
     archive_attempt: Option<&ProxyArchiveAttempt>,
+    upstream_attribution: ProxyRequestUpstreamAttribution,
 ) -> Result<FinishProxyRequestResult, AppError> {
     for delay in RETRY_DELAYS {
         match database
-            .finish_proxy_request_with_archive_staging(
+            .finish_proxy_request_with_archive_staging_and_upstream_attribution(
                 input.clone(),
                 archive_attempt.map(|attempt| &attempt.lease),
+                upstream_attribution,
             )
             .await
         {
@@ -136,9 +138,10 @@ pub(crate) async fn finish_proxy_request_with_retry(
         }
     }
     database
-        .finish_proxy_request_with_archive_staging(
+        .finish_proxy_request_with_archive_staging_and_upstream_attribution(
             input,
             archive_attempt.map(|attempt| &attempt.lease),
+            upstream_attribution,
         )
         .await
 }
@@ -216,43 +219,6 @@ pub(crate) async fn confirm_proxy_delivery_with_retry(
     }
     database
         .mark_proxy_delivery_started(request_id, tenant_id, reservation)
-        .await
-}
-
-pub(crate) async fn attach_proxy_archive_with_retry(
-    database: &Database,
-    request_id: Uuid,
-    tenant_id: Uuid,
-    reservation_id: Uuid,
-    expected_request_object: &str,
-    attempt: &ProxyArchiveAttempt,
-) -> Result<AttachProxyArchiveResult, AppError> {
-    for delay in RETRY_DELAYS {
-        match database
-            .attach_proxy_request_archive_staged(
-                request_id,
-                tenant_id,
-                reservation_id,
-                expected_request_object,
-                &attempt.lease,
-                &attempt.object_locator,
-            )
-            .await
-        {
-            Ok(result) => return Ok(result),
-            Err(AppError::Internal) => tokio::time::sleep(delay).await,
-            Err(error) => return Err(error),
-        }
-    }
-    database
-        .attach_proxy_request_archive_staged(
-            request_id,
-            tenant_id,
-            reservation_id,
-            expected_request_object,
-            &attempt.lease,
-            &attempt.object_locator,
-        )
         .await
 }
 

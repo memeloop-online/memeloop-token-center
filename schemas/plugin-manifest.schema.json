@@ -182,7 +182,7 @@
               "icon": { "enum": ["activity", "chart", "database", "heart", "plug", "shield"] },
               "renderer": { "const": "typed_data_v1" },
               "presentation": {
-                "enum": ["health_intelligence_v1"],
+                "enum": ["health_intelligence_v1", "projection_v1"],
                 "description": "Optional closed, core-owned typed-data presentation. This never names plugin browser code."
               },
               "data_endpoint": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$" }

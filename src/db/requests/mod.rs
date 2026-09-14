@@ -3,8 +3,6 @@ mod lifecycle;
 mod metered_projection;
 mod pricing_stats;
 mod queries;
-mod session_archive;
-mod session_archive_quarantine;
 mod settlement;
 mod stats;
 
@@ -17,21 +15,17 @@ pub use lifecycle::{
     AttachProxyArchiveResult, FinishProxyRequest, FinishProxyRequestResult, FinishRequest,
     NewRequest, ProxyConversationInput, StartProxyRequest,
 };
+pub(crate) use lifecycle::{
+    ProxyRequestUpstreamAttribution, SwitchProxyCandidateInput, allocate_request_event_cursor,
+    record_request_finished_in_transaction, record_request_started_in_transaction,
+};
 #[cfg(test)]
 pub(crate) use lifecycle::{
     RequestEventCursor, claim_request_event_locator, claim_request_record_locator,
 };
-pub(crate) use lifecycle::{
-    SwitchProxyCandidateInput, allocate_request_event_cursor,
-    record_request_finished_in_transaction, record_request_started_in_transaction,
-};
 pub use metered_projection::MeteredUsageProjectionTask;
 pub use queries::RequestListFilter;
 pub(crate) use queries::{request_detail_accounting_projection, search_prefix};
-pub use session_archive_quarantine::{
-    SessionArchiveQuarantineFilter, SessionArchiveQuarantineRecordView,
-    SessionArchiveQuarantineResolutionInput, SessionArchiveQuarantineResolutionView,
-};
 pub use settlement::normalize_proxy_usage;
 pub(crate) use settlement::{
     price_token_usage, proxy_contract_ceiling_micros, reserve_usage_in_transaction,

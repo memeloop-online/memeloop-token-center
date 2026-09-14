@@ -30,7 +30,6 @@ use tower_http::{
 };
 use uuid::Uuid;
 
-mod archive_quarantine;
 mod auth;
 mod billing;
 mod cloud_entitlements;
@@ -46,6 +45,7 @@ mod limits;
 mod model_picker;
 mod model_routes;
 mod monitoring_snapshot;
+mod plugin_execution;
 mod plugins;
 mod proxy;
 mod request_detail;
@@ -61,9 +61,6 @@ mod upstreams;
 mod usage_analysis;
 mod web;
 
-use archive_quarantine::{
-    get_archive_quarantine, list_archive_quarantine, resolve_archive_quarantine,
-};
 use auth::{
     admit_cloud_webhook_before_body, authenticate_control_before_body, authenticate_downstream,
     authenticate_gateway_before_body, authenticated_service, management_tenant,
@@ -98,8 +95,8 @@ use health::{
 use limits::*;
 use model_picker::list_model_picker_options;
 use model_routes::{
-    create_model_route, delete_model_route, list_model_routes, retire_model_route_upstreams,
-    set_model_route_enabled, update_model_route,
+    archive_model_route, create_model_route, delete_model_route, get_archived_model_route,
+    list_model_routes, retire_model_route_upstreams, set_model_route_enabled, update_model_route,
 };
 use plugins::{get_plugin_configuration, get_plugin_service_data, put_plugin_configuration};
 use request_detail::*;
@@ -130,7 +127,6 @@ pub(crate) use upstreams::{
 
 use crate::{
     AppState,
-    archive_staging::ArchiveStagingPurpose,
     config::RuntimeRole,
     db::{
         ApplyCloudEntitlementInput, AttachGenerationJobResult, AttachSynchronousImageRequestObject,
@@ -161,8 +157,7 @@ use crate::{
     provider::{ResolvedUpstream, UpstreamCredential, validate_config},
     proxy_lifecycle::{
         MAX_DOWNSTREAM_SEND_WAIT, MAX_PROXY_LIFETIME, MAX_PROXY_STREAM_LIFETIME,
-        abandon_proxy_archive_attempt, attach_proxy_archive_with_retry,
-        begin_proxy_archive_attempt, confirm_proxy_delivery_with_retry,
+        abandon_proxy_archive_attempt, confirm_proxy_delivery_with_retry,
         finish_proxy_request_with_retry, prepare_proxy_delivery_with_retry,
         response_archive_requires_cleanup,
     },

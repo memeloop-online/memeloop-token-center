@@ -12,6 +12,7 @@ pub const DEFAULT_RESPONSES_BODY_MAX_BYTES: u32 = 16 * 1024 * 1024;
 pub const MIN_RESPONSES_BODY_MAX_BYTES: u32 = 4 * 1024 * 1024;
 pub const MAX_RESPONSES_BODY_MAX_BYTES: u32 = 64 * 1024 * 1024;
 pub const DEFAULT_RESPONSES_BODY_READ_CONCURRENCY: u32 = 4;
+pub const DEFAULT_PROXY_MEMORY_BUDGET_BYTES: u32 = 256 * 1024 * 1024;
 pub const MAX_RESPONSES_BODY_READ_CONCURRENCY: u32 = 8;
 pub const DEFAULT_UPSTREAM_SHARED_PROBE_ATTEMPTS: u32 = 1;
 pub const MAX_UPSTREAM_SHARED_PROBE_ATTEMPTS: u32 = 4;
@@ -135,6 +136,8 @@ pub struct Config {
     /// Service saturation is distinct from a credential policy limit and is
     /// reported as HTTP 503, never as a per-key 429.
     pub proxy_lifecycle_concurrency: u32,
+    /// Weighted raw body/JSON/ciphertext memory admission, shared by all text routes.
+    pub proxy_memory_budget_bytes: u32,
     /// Maximum gateway request bodies buffered concurrently. The permit covers
     /// only the bounded body read, not the complete proxy lifecycle.
     pub gateway_body_read_concurrency: u32,
@@ -159,6 +162,8 @@ pub struct Config {
     pub s3_access_key: Option<String>,
     pub s3_secret_key: Option<String>,
     pub s3_allow_http: bool,
+    #[serde(default)]
+    pub s3_timeouts: S3Timeouts,
     pub upstream_openai_url: Option<String>,
     pub upstream_openai_key: Option<String>,
     pub upstream_anthropic_url: Option<String>,
@@ -184,6 +189,7 @@ impl std::fmt::Debug for Config {
             .field("listen", &self.listen)
             .field("database_url", &"[redacted]")
             .field("database_max_connections", &self.database_max_connections)
+            .field("proxy_memory_budget_bytes", &self.proxy_memory_budget_bytes)
             .field(
                 "proxy_lifecycle_concurrency",
                 &self.proxy_lifecycle_concurrency,
@@ -260,6 +266,52 @@ pub enum ArchiveBackend {
     Memory,
 }
 
+/// Role-independent settings, applied by rolling restart without rebuilding.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct S3Timeouts {
+    pub connect_millis: u32,
+    pub request_millis: u32,
+    pub readiness_millis: u32,
+}
+
+impl Default for S3Timeouts {
+    fn default() -> Self {
+        Self {
+            connect_millis: 5_000,
+            request_millis: 30_000,
+            readiness_millis: 5_000,
+        }
+    }
+}
+
+impl S3Timeouts {
+    fn from_env() -> Result<Self, ConfigError> {
+        let defaults = Self::default();
+        let value = Self {
+            connect_millis: env_u32("MTC_S3_CONNECT_TIMEOUT_MILLIS", defaults.connect_millis)?,
+            request_millis: env_u32("MTC_S3_REQUEST_TIMEOUT_MILLIS", defaults.request_millis)?,
+            readiness_millis: env_u32(
+                "MTC_S3_READINESS_DEADLINE_MILLIS",
+                defaults.readiness_millis,
+            )?,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(self) -> Result<(), ConfigError> {
+        if !(100..=30_000).contains(&self.connect_millis)
+            || !(100..=120_000).contains(&self.request_millis)
+            || !(100..=30_000).contains(&self.readiness_millis)
+            || self.connect_millis > self.request_millis
+        {
+            return Err(ConfigError::InvalidS3Timeouts);
+        }
+        Ok(())
+    }
+}
+
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         let archive_backend = production_archive_backend(&env_string("MTC_ARCHIVE_BACKEND", "s3"))?;
@@ -293,7 +345,7 @@ impl Config {
         )?;
         let upstream_health = UpstreamHealthConfig::from_env()?;
 
-        Ok(Self {
+        let config = Self {
             listen: env_string("MTC_LISTEN", "0.0.0.0:8080"),
             database_url: env_string(
                 "MTC_DATABASE_URL",
@@ -302,6 +354,10 @@ impl Config {
             database_max_connections: env_u32("MTC_DATABASE_MAX_CONNECTIONS", 4)?.clamp(1, 32),
             proxy_lifecycle_concurrency: env_u32("MTC_PROXY_LIFECYCLE_CONCURRENCY", 64)?
                 .clamp(1, 4_096),
+            proxy_memory_budget_bytes: env_u32(
+                "MTC_PROXY_MEMORY_BUDGET_BYTES",
+                DEFAULT_PROXY_MEMORY_BUDGET_BYTES,
+            )?,
             gateway_body_read_concurrency: gateway_body_read_concurrency(env_u32(
                 "MTC_GATEWAY_BODY_READ_CONCURRENCY",
                 DEFAULT_GATEWAY_BODY_READ_CONCURRENCY,
@@ -327,6 +383,7 @@ impl Config {
             s3_access_key: env::var("MTC_S3_ACCESS_KEY").ok(),
             s3_secret_key: env::var("MTC_S3_SECRET_KEY").ok(),
             s3_allow_http: env_bool("MTC_S3_ALLOW_HTTP", false),
+            s3_timeouts: S3Timeouts::from_env()?,
             upstream_openai_url: env::var("MTC_UPSTREAM_OPENAI_URL").ok(),
             upstream_openai_key: env::var("MTC_UPSTREAM_OPENAI_KEY").ok(),
             upstream_anthropic_url: env::var("MTC_UPSTREAM_ANTHROPIC_URL").ok(),
@@ -338,7 +395,20 @@ impl Config {
             allow_oauth_loopback,
             codex_test_loopback: false,
             runtime_profiling_enabled: env_bool("MTC_RUNTIME_PROFILING_ENABLED", false),
-        })
+        };
+        config.validate_proxy_memory_budget()?;
+        Ok(config)
+    }
+
+    pub(crate) fn validate_proxy_memory_budget(&self) -> Result<(), ConfigError> {
+        if self.proxy_memory_budget_bytes < DEFAULT_PROXY_MEMORY_BUDGET_BYTES
+            || self.proxy_memory_budget_bytes > 2 * 1024 * 1024 * 1024
+            || u64::from(self.proxy_memory_budget_bytes)
+                < u64::from(self.responses_body_max_bytes) * 12 + 1024 * 1024
+        {
+            return Err(ConfigError::InvalidProxyMemoryBudget);
+        }
+        Ok(())
     }
 
     pub fn for_test(database_url: String) -> Self {
@@ -347,6 +417,7 @@ impl Config {
             database_url,
             database_max_connections: 8,
             proxy_lifecycle_concurrency: 64,
+            proxy_memory_budget_bytes: DEFAULT_PROXY_MEMORY_BUDGET_BYTES,
             gateway_body_read_concurrency: DEFAULT_GATEWAY_BODY_READ_CONCURRENCY,
             responses_body_max_bytes: DEFAULT_RESPONSES_BODY_MAX_BYTES,
             responses_body_read_concurrency: DEFAULT_RESPONSES_BODY_READ_CONCURRENCY,
@@ -365,6 +436,7 @@ impl Config {
             s3_access_key: None,
             s3_secret_key: None,
             s3_allow_http: true,
+            s3_timeouts: S3Timeouts::default(),
             upstream_openai_url: None,
             upstream_openai_key: None,
             upstream_anthropic_url: None,
@@ -504,6 +576,14 @@ fn responses_body_read_concurrency(value: u32) -> u32 {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    #[error(
+        "MTC_PROXY_MEMORY_BUDGET_BYTES must be 256 MiB..2 GiB and at least twelve times MTC_RESPONSES_BODY_MAX_BYTES plus 1 MiB; pod memory must cover this budget plus 256 MiB"
+    )]
+    InvalidProxyMemoryBudget,
+    #[error(
+        "S3 timeouts must be bounded: connect/readiness 100..30000 ms, request 100..120000 ms, connect <= request"
+    )]
+    InvalidS3Timeouts,
     #[error("missing required environment variable {0}")]
     Missing(&'static str),
     #[error("MTC_KEY_PEPPER must contain at least 32 bytes")]
@@ -529,6 +609,69 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_memory_budget_reserves_progress_headroom_and_request_capture() {
+        let mut config = Config::for_test("sqlite::memory:".to_owned());
+        assert!(config.validate_proxy_memory_budget().is_ok());
+        config.proxy_memory_budget_bytes = 192 * 1024 * 1024;
+        assert!(config.validate_proxy_memory_budget().is_err());
+        config.proxy_memory_budget_bytes = DEFAULT_PROXY_MEMORY_BUDGET_BYTES;
+        config.responses_body_max_bytes = MAX_RESPONSES_BODY_MAX_BYTES;
+        assert!(config.validate_proxy_memory_budget().is_err());
+        config.proxy_memory_budget_bytes = MAX_RESPONSES_BODY_MAX_BYTES * 12 + 1024 * 1024;
+        assert!(config.validate_proxy_memory_budget().is_ok());
+    }
+
+    #[test]
+    fn s3_timeout_defaults_and_bounds_are_role_independent() {
+        let defaults = S3Timeouts::default();
+        assert_eq!(
+            (
+                defaults.connect_millis,
+                defaults.request_millis,
+                defaults.readiness_millis
+            ),
+            (5000, 30000, 5000)
+        );
+        assert!(defaults.validate().is_ok());
+        for value in [0, 99, 30_001, u32::MAX] {
+            assert!(
+                S3Timeouts {
+                    connect_millis: value,
+                    ..defaults
+                }
+                .validate()
+                .is_err()
+            );
+            assert!(
+                S3Timeouts {
+                    readiness_millis: value,
+                    ..defaults
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        for value in [0, 99, 120_001, u32::MAX] {
+            assert!(
+                S3Timeouts {
+                    request_millis: value,
+                    ..defaults
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            S3Timeouts {
+                request_millis: 100,
+                ..defaults
+            }
+            .validate()
+            .is_err()
+        );
+    }
 
     #[test]
     fn debug_output_never_contains_runtime_credentials_or_credential_bearing_urls() {

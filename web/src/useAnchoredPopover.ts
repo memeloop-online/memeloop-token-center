@@ -13,11 +13,23 @@ export function useAnchoredPopover<T extends HTMLElement = HTMLButtonElement & H
       const rect = anchor.current?.getBoundingClientRect();
       if (!rect) return;
       const viewport = window.visualViewport;
-      const bounds = element.getBoundingClientRect();
-      const next = popoverPlacement(rect, { width: bounds.width, height: Math.max(bounds.height, element.scrollHeight) }, {
+      const viewportBounds = {
         left: viewport?.offsetLeft ?? 0, top: viewport?.offsetTop ?? 0,
         width: viewport?.width ?? window.innerWidth, height: viewport?.height ?? window.innerHeight,
-      }, matchWidth);
+      };
+      // A reopened panel retains the previous viewport's inline maxWidth.
+      // Normalize constraints before reading its actual width: measuring the
+      // old narrow panel and then widening it places its right edge offscreen.
+      const availableWidth = Math.max(0, viewportBounds.width - 16);
+      element.style.maxWidth = `${availableWidth}px`;
+      if (matchWidth) element.style.width = `${Math.min(rect.width, availableWidth)}px`;
+      const bounds = element.getBoundingClientRect();
+      const next = popoverPlacement(rect, { width: bounds.width, height: Math.max(bounds.height, element.scrollHeight) }, viewportBounds, matchWidth);
+      // ResizeObserver and viewport callbacks must commit coordinates in this
+      // layout phase, not expose new dimensions with stale React coordinates.
+      element.style.left = `${next.left}px`;
+      element.style.top = `${next.top}px`;
+      element.style.maxHeight = `${next.maxHeight}px`;
       setPosition((previous) => JSON.stringify(previous) === JSON.stringify(next) ? previous : next);
     };
     element.showPopover();

@@ -50,10 +50,11 @@ impl Database {
         if !key_exists {
             return Err(AppError::NotFound);
         }
+        // Serialize existence checks with archival, not just the inserts.
+        lock_routing_relation_writes(&mut tx, &tenant_id).await?;
         require_members_tenant(&mut tx, "model_routes", &route_ids, &tenant_id).await?;
         require_members_tenant(&mut tx, "route_groups", &route_group_ids, &tenant_id).await?;
 
-        lock_routing_relation_writes(&mut tx, &tenant_id).await?;
         let old_route_ids =
             select_key_grant_ids_in_transaction(&mut tx, &tenant_id, key_id, true).await?;
         let old_route_group_ids =
@@ -149,7 +150,9 @@ async fn require_members_tenant(
 ) -> Result<(), AppError> {
     let sql = match table {
         "route_groups" => "SELECT 1 FROM route_groups WHERE tenant_id = $1 AND id = $2",
-        "model_routes" => "SELECT 1 FROM model_routes WHERE tenant_id = $1 AND id = $2",
+        "model_routes" => {
+            "SELECT 1 FROM model_routes WHERE archived_at IS NULL AND tenant_id = $1 AND id = $2"
+        }
         _ => return Err(AppError::Internal),
     };
     for id in ids {

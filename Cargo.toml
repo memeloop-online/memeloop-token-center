@@ -27,6 +27,7 @@ name = "cucumber"
 harness = false
 
 [features]
+experimental-plugin-revisions = []
 default = []
 plugin-distribution = ["dep:oci-client", "dep:tempfile"]
 

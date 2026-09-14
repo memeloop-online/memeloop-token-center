@@ -60,6 +60,18 @@
   white-space: nowrap;
 }
 
+/* Dense analytics surfaces lead with the localized compact value while the
+   exact grouped value remains in the DOM for copy, accessibility, and tests. */
+.metric-number.has-compact {
+  align-items: baseline;
+}
+
+.metric-number.has-compact .metric-exact {
+  color: inherit;
+  font: inherit;
+  font-variant-numeric: inherit;
+}
+
 /* Operator monitoring and traffic summaries use the same metric primitive as
    the rest of the product, while reserving enough inline width for precise
    locale-formatted numbers. */

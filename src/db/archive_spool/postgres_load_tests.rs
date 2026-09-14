@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn postgres_gc_retries_contention_without_blocking_live_capture() {
+async fn postgres_gc_holds_budget_only_for_one_bounded_batch_then_producer_progresses() {
     let Some(fixture) = PgFixture::new().await else {
         return;
     };
@@ -37,36 +37,102 @@ async fn postgres_gc_retries_contention_without_blocking_live_capture() {
         .await
         .unwrap();
     assert!(fixture.db.begin_response_archive_spool(live).await.unwrap());
+
+    // Freeze GC while it owns the budget and updates the selected spool. This
+    // makes the canonical budget -> spool order observable without relying on
+    // timing from a shared CI PostgreSQL server.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION pause_expired_spool_gc() RETURNS trigger LANGUAGE plpgsql AS $body$ BEGIN
+             IF OLD.request_id = '{}' AND NEW.cipher_bytes < OLD.cipher_bytes THEN
+                 PERFORM pg_advisory_xact_lock({});
+             END IF;
+             RETURN NEW;
+         END $body$;
+         CREATE TRIGGER pause_expired_spool_gc BEFORE UPDATE ON response_archive_spools
+         FOR EACH ROW EXECUTE FUNCTION pause_expired_spool_gc();",
+        fixture.id.request_id, fixture.gate
+    )))
+    .execute(&fixture.db.pool)
+    .await
+    .unwrap();
+    let mut blocker = fixture.admin.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(fixture.gate)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let gc_db = fixture.db.clone();
+    let gc = tokio::spawn(async move { gc_db.cleanup_response_archive_spools(1).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND UPPER(query) LIKE 'UPDATE RESPONSE_ARCHIVE_SPOOLS%' AND wait_event_type = 'Lock' AND wait_event = 'advisory'",
+            )
+            .bind(&fixture.schema)
+            .fetch_one(&fixture.admin)
+            .await
+            .unwrap();
+            if waiting == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("GC must reach the deliberate bounded-update gate");
+
     let db = fixture.db.clone();
     let producer = tokio::spawn(async move {
         for seq in 0..32 {
             assert!(
-                tokio::time::timeout(
-                    Duration::from_millis(250),
-                    db.append_response_archive_spool(live, seq, 1, "x")
-                )
-                .await
-                .expect("producer ACK must stay bounded during small GC batches")
-                .unwrap()
+                db.append_response_archive_spool(live, seq, 1, "x")
+                    .await
+                    .unwrap()
             );
-            tokio::task::yield_now().await;
         }
     });
-    for _ in 0..8 {
-        // NOWAIT contention errors are allowed; blocking behind a producer
-        // while holding a spool lock is not. Retry only bounded GC batches.
-        let _ = tokio::time::timeout(
-            Duration::from_secs(1),
-            fixture.db.cleanup_response_archive_spools(1),
-        )
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND UPPER(query) LIKE 'SELECT CIPHER_BYTES FROM RESPONSE_ARCHIVE_SPOOL_BUDGET%' AND wait_event_type = 'Lock'",
+            )
+            .bind(&fixture.schema)
+            .fetch_one(&fixture.admin)
+            .await
+            .unwrap();
+            if waiting == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("producer must queue behind the bounded GC budget owner");
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(fixture.gate)
+        .execute(&mut *blocker)
         .await
-        .expect("GC must complete or fail NOWAIT within bounded time");
-        tokio::task::yield_now().await;
-    }
-    producer.await.unwrap();
-    for _ in 0..3 {
-        fixture.db.cleanup_response_archive_spools(1).await.unwrap();
-    }
+        .unwrap();
+    drop(blocker);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), gc)
+            .await
+            .expect("bounded GC batch must release the budget")
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    tokio::time::timeout(Duration::from_secs(5), producer)
+        .await
+        .expect("producer must progress after one bounded GC batch")
+        .unwrap();
+
+    // The first bounded batch left one old chunk. One later batch must finish
+    // it without touching the concurrently captured live spool.
+    assert_eq!(
+        fixture.db.cleanup_response_archive_spools(1).await.unwrap(),
+        1
+    );
     let old_chunks: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM response_archive_spool_chunks WHERE request_id = $1",
     )
@@ -166,7 +232,7 @@ async fn postgres_large_tiny_chunk_and_audit_inventory_has_bounded_indexed_gc() 
 }
 
 #[tokio::test]
-async fn postgres_gc_nowait_rolls_back_deletes_when_producer_holds_budget() {
+async fn postgres_gc_waits_for_budget_before_locking_spool_then_reclaims() {
     let Some(fixture) = PgFixture::new().await else {
         return;
     };
@@ -198,17 +264,45 @@ async fn postgres_gc_nowait_rolls_back_deletes_when_producer_holds_budget() {
     .fetch_one(&mut *producer)
     .await
     .unwrap();
-    let result = tokio::time::timeout(
-        Duration::from_secs(1),
-        fixture.db.cleanup_response_archive_spools(1),
-    )
+    let gc_db = fixture.db.clone();
+    let gc = tokio::spawn(async move { gc_db.cleanup_response_archive_spools(1).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND UPPER(query) LIKE 'SELECT CIPHER_BYTES FROM RESPONSE_ARCHIVE_SPOOL_BUDGET%' AND wait_event_type = 'Lock'",
+            )
+            .bind(&fixture.schema)
+            .fetch_one(&fixture.admin)
+            .await
+            .unwrap();
+            if waiting == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
     .await
-    .expect("GC must fail NOWAIT, never wait behind producer while holding spool");
-    assert!(result.is_err());
-    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spool_chunks")
-        .fetch_one(&fixture.db.pool)
-        .await
-        .unwrap();
+    .expect("GC must queue on the canonical budget-first lock");
+    let mut spool_probe = fixture.db.pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT request_id FROM response_archive_spools WHERE request_id = $1 FOR UPDATE NOWAIT",
+    )
+    .bind(fixture.id.request_id.to_string())
+    .fetch_one(&mut *spool_probe)
+    .await
+    .expect("GC waiting for budget must not lock or delete from the spool first");
+    spool_probe.rollback().await.unwrap();
+    assert!(
+        !gc.is_finished(),
+        "GC must wait instead of failing NOWAIT and retrying useless work"
+    );
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM response_archive_spool_chunks WHERE request_id = $1",
+    )
+    .bind(fixture.id.request_id.to_string())
+    .fetch_one(&fixture.db.pool)
+    .await
+    .unwrap();
     assert_eq!(remaining, 65);
     assert_eq!(budget(&fixture.db).await, before);
     let accounted: i64 = sqlx::query_scalar("SELECT cipher_bytes FROM response_archive_spools")
@@ -218,7 +312,11 @@ async fn postgres_gc_nowait_rolls_back_deletes_when_producer_holds_budget() {
     assert_eq!(accounted, before);
     producer.rollback().await.unwrap();
     assert_eq!(
-        fixture.db.cleanup_response_archive_spools(1).await.unwrap(),
+        tokio::time::timeout(Duration::from_secs(5), gc)
+            .await
+            .expect("queued GC must acquire budget and reclaim after producer commit")
+            .unwrap()
+            .unwrap(),
         0
     );
     let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spool_chunks")

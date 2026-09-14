@@ -43,6 +43,8 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
   value: {{ .Values.config.databaseMaxConnections | quote }}
 - name: MTC_PROXY_LIFECYCLE_CONCURRENCY
   value: {{ .Values.config.proxyLifecycleConcurrency | quote }}
+- name: MTC_PROXY_MEMORY_BUDGET_BYTES
+  value: {{ printf "%d" (int64 .Values.config.proxyMemoryBudgetBytes) | quote }}
 - name: MTC_GATEWAY_BODY_READ_CONCURRENCY
   value: {{ .Values.config.gatewayBodyReadConcurrency | quote }}
 - name: MTC_RESPONSES_BODY_MAX_BYTES
@@ -70,6 +72,12 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
   value: {{ .Values.config.archiveBackend | quote }}
 - name: MTC_S3_BUCKET
   value: {{ .Values.config.s3.bucket | quote }}
+- name: MTC_S3_CONNECT_TIMEOUT_MILLIS
+  value: {{ .Values.config.s3.connectTimeoutMillis | quote }}
+- name: MTC_S3_REQUEST_TIMEOUT_MILLIS
+  value: {{ .Values.config.s3.requestTimeoutMillis | quote }}
+- name: MTC_S3_READINESS_DEADLINE_MILLIS
+  value: {{ .Values.config.s3.readinessDeadlineMillis | quote }}
 - name: MTC_S3_ENDPOINT
   value: {{ .Values.config.s3.endpoint | quote }}
 - name: MTC_S3_REGION
@@ -113,4 +121,15 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
   value: {{ .noProxy | quote }}
 {{- end }}
 {{- end }}
+{{- end -}}
+{{/* Parse supported Kubernetes memory quantities for the hard workload budget gate. */}}
+{{- define "memeloop-token-center.memoryBytes" -}}
+{{- $value := toString . -}}
+{{- if not (regexMatch "^[0-9]+(\\.[0-9]+)?(Ki|Mi|Gi|Ti|k|M|G|T)?$" $value) -}}
+{{- fail "memory limit must be numeric bytes or a Ki/Mi/Gi/Ti/k/M/G/T quantity" -}}
+{{- end -}}
+{{- $suffix := regexFind "[A-Za-z]+$" $value -}}
+{{- $amount := float64 (trimSuffix $suffix $value) -}}
+{{- $scale := dict "" 1 "Ki" 1024 "Mi" 1048576 "Gi" 1073741824 "Ti" 1099511627776 "k" 1000 "M" 1000000 "G" 1000000000 "T" 1000000000000 -}}
+{{- printf "%d" (int64 (mulf $amount (index $scale $suffix))) -}}
 {{- end -}}

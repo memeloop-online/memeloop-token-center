@@ -1,6 +1,6 @@
 {{- if .Values.serviceMonitor.enabled }}
-{{- if not (or (and .Values.roles.control.enabled .Values.roles.control.service.enabled) (and .Values.roles.all.enabled .Values.roles.all.service.enabled)) }}
-{{- fail "serviceMonitor.enabled requires a Service for the control or all role because gateway does not expose /metrics" }}
+{{- if not (or (and .Values.roles.gateway.enabled .Values.roles.gateway.service.enabled) (and .Values.roles.control.enabled .Values.roles.control.service.enabled) (and .Values.roles.all.enabled .Values.roles.all.service.enabled)) }}
+{{- fail "serviceMonitor.enabled requires a Service for the gateway, control, or all role" }}
 {{- end }}
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
@@ -26,7 +26,10 @@ spec:
     matchLabels:
       app.kubernetes.io/name: {{ include "memeloop-token-center.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
-      app.kubernetes.io/component: {{ ternary "control" "all" (and .Values.roles.control.enabled .Values.roles.control.service.enabled) | quote }}
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values: [gateway, control, all]
   namespaceSelector:
     {{- if .Values.serviceMonitor.namespaceSelector }}
     {{- toYaml .Values.serviceMonitor.namespaceSelector | nindent 4 }}

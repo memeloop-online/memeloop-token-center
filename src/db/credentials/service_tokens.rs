@@ -13,8 +13,6 @@ const SUPPORTED_SERVICE_SCOPES: &[&str] = &[
     "entitlements:read",
     "entitlements:write",
     "generations:write",
-    "imports:session_archive:quarantine:read",
-    "imports:session_archive:quarantine:resolve",
     "keys:read",
     "keys:write",
     "metrics:read",
@@ -102,7 +100,7 @@ impl Database {
         // reads stay bounded by the public page limit even while a pool is
         // serving concurrent list requests.
         let rows = sqlx::query(
-            "WITH page AS MATERIALIZED (SELECT p.id, p.name, p.status, p.credential_generation, p.created_at, p.updated_at FROM service_principals p WHERE (p.created_at < $1 OR (p.created_at = $1 AND p.id < $2)) AND EXISTS (SELECT 1 FROM service_credentials c WHERE c.service_principal_id = p.id AND c.generation = p.credential_generation) ORDER BY p.created_at DESC, p.id DESC LIMIT $3) SELECT p.id, p.name, p.status, p.credential_generation, p.created_at, p.updated_at, c.fingerprint, c.scopes_json, c.tenant_external_id FROM page p JOIN service_credentials c ON c.service_principal_id = p.id AND c.generation = p.credential_generation ORDER BY p.created_at DESC, p.id DESC",
+            "WITH page AS MATERIALIZED (SELECT p.id, p.name, p.status, p.credential_generation, p.created_at, p.updated_at FROM service_principals p WHERE (p.created_at < $1 OR (p.created_at = $1 AND p.id < $2)) AND EXISTS (SELECT 1 FROM service_credentials c WHERE c.service_principal_id = p.id AND c.generation = p.credential_generation) ORDER BY p.created_at DESC, p.id DESC LIMIT $3) SELECT p.id, p.name, p.status, p.credential_generation, p.created_at, p.updated_at, c.fingerprint, CASE WHEN c.secret_plaintext IS NOT NULL THEN 1 ELSE 0 END AS credential_copy_available, c.scopes_json, c.tenant_external_id FROM page p JOIN service_credentials c ON c.service_principal_id = p.id AND c.generation = p.credential_generation ORDER BY p.created_at DESC, p.id DESC",
         )
         .bind(before_created_at)
         .bind(before_id)
@@ -179,12 +177,13 @@ impl Database {
         .execute(&mut *transaction)
         .await?;
         sqlx::query(
-            "INSERT INTO service_credentials (id, service_principal_id, generation, secret_hash, fingerprint, scopes_json, tenant_external_id, created_at) VALUES ($1, $2, 1, $3, $4, $5, $6, $7)",
+            "INSERT INTO service_credentials (id, service_principal_id, generation, secret_hash, fingerprint, secret_plaintext, scopes_json, tenant_external_id, created_at) VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8)",
         )
         .bind(issued.credential_id.to_string())
         .bind(service_id.to_string())
         .bind(&issued.secret_hash)
         .bind(&issued.fingerprint)
+        .bind(&issued.secret)
         .bind(scopes_json)
         .bind(&input.tenant_external_id)
         .bind(now)
@@ -271,13 +270,14 @@ impl Database {
         .execute(&mut *transaction)
         .await?;
         sqlx::query(
-            "INSERT INTO service_credentials (id, service_principal_id, generation, secret_hash, fingerprint, scopes_json, tenant_external_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            "INSERT INTO service_credentials (id, service_principal_id, generation, secret_hash, fingerprint, secret_plaintext, scopes_json, tenant_external_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(issued.credential_id.to_string())
         .bind(service_id.to_string())
         .bind(generation)
         .bind(&issued.secret_hash)
         .bind(&issued.fingerprint)
+        .bind(&issued.secret)
         .bind(scopes_json)
         .bind(&tenant_external_id)
         .bind(now)
@@ -313,6 +313,32 @@ impl Database {
         .await?;
         transaction.commit().await?;
         Ok(response)
+    }
+
+    /// Returns a current service credential only to the global control-plane
+    /// authorization enforced by the API handler. Hash-only historical tokens
+    /// are intentionally unavailable rather than replaced or fabricated.
+    pub async fn copy_service_token(
+        &self,
+        service_id: Uuid,
+    ) -> Result<RecoveredServiceCredential, AppError> {
+        let row = sqlx::query(
+            "SELECT p.status, p.credential_generation, c.secret_plaintext FROM service_principals p JOIN service_credentials c ON c.service_principal_id = p.id AND c.generation = p.credential_generation AND c.revoked_at IS NULL WHERE p.id = $1",
+        )
+        .bind(service_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
+        if row.try_get::<String, _>("status")? != "active" {
+            return Err(AppError::Forbidden);
+        }
+        let token: Option<String> = row.try_get("secret_plaintext")?;
+        let token = token.ok_or(AppError::NotFound)?;
+        Ok(RecoveredServiceCredential {
+            service_id,
+            credential_generation: row.try_get("credential_generation")?,
+            token,
+        })
     }
 
     pub async fn authenticate_service_token(
@@ -358,6 +384,8 @@ fn service_token_view(row: AnyRow) -> Result<ServiceTokenView, AppError> {
         status: row.try_get("status")?,
         credential_generation: row.try_get("credential_generation")?,
         fingerprint: row.try_get("fingerprint")?,
+        credential_copy_available: row.try_get::<i64, _>("credential_copy_available")? != 0
+            && row.try_get::<String, _>("status")? == "active",
         scopes: serde_json::from_str(&scopes_json).map_err(|_| AppError::Internal)?,
         tenant_external_id: row.try_get("tenant_external_id")?,
         created_at: row.try_get("created_at")?,
@@ -516,11 +544,8 @@ mod tests {
         let supported = database
             .create_service_token(
                 CreateServiceTokenInput {
-                    name: "quarantine-operator".to_owned(),
-                    scopes: vec![
-                        "imports:session_archive:quarantine:read".to_owned(),
-                        "imports:session_archive:quarantine:resolve".to_owned(),
-                    ],
+                    name: "bounded-operator".to_owned(),
+                    scopes: vec!["keys:read".to_owned(), "routes:read".to_owned()],
                     tenant_external_id: None,
                 },
                 pepper,

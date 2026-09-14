@@ -70,7 +70,7 @@
       ],
       "properties": {
         "enabled": { "type": "boolean" },
-        "schemaVersion": { "type": "integer", "const": 81 },
+        "schemaVersion": { "type": "integer", "const": 86 },
         "backoffLimit": { "type": "integer", "minimum": 0, "maximum": 20 },
         "activeDeadlineSeconds": { "type": "integer", "minimum": 30 },
         "ttlSecondsAfterFinished": { "type": "integer", "minimum": 0 },
@@ -125,6 +125,7 @@
       "required": [
         "databaseMaxConnections",
         "proxyLifecycleConcurrency",
+        "proxyMemoryBudgetBytes",
         "gatewayBodyReadConcurrency",
         "responsesBodyMaxBytes",
         "responsesBodyReadConcurrency",
@@ -142,6 +143,7 @@
       "properties": {
         "databaseMaxConnections": { "type": "integer", "minimum": 1, "maximum": 64 },
         "proxyLifecycleConcurrency": { "type": "integer", "minimum": 1, "maximum": 4096 },
+        "proxyMemoryBudgetBytes": { "type": "integer", "minimum": 268435456, "maximum": 2147483648 },
         "gatewayBodyReadConcurrency": { "type": "integer", "minimum": 1, "maximum": 8192 },
         "responsesBodyMaxBytes": { "type": "integer", "minimum": 4194304, "maximum": 67108864 },
         "responsesBodyReadConcurrency": { "type": "integer", "minimum": 1, "maximum": 8 },
@@ -201,6 +203,9 @@
             "endpoint": { "type": "string" },
             "region": { "type": "string", "minLength": 1 },
             "allowHttp": { "type": "boolean" },
+            "connectTimeoutMillis": { "type": "integer", "minimum": 100, "maximum": 30000 },
+            "requestTimeoutMillis": { "type": "integer", "minimum": 100, "maximum": 120000 },
+            "readinessDeadlineMillis": { "type": "integer", "minimum": 100, "maximum": 30000 },
             "credentialsSecret": {
               "type": "object",
               "additionalProperties": false,
@@ -512,6 +517,7 @@
       "properties": {
         "startup": { "$ref": "#/definitions/probe" },
         "readiness": {
+          "description": "For /readyz, Helm also enforces timeoutSeconds >= ceil(config.s3.readinessDeadlineMillis / 1000) + 2. /livez does not depend on archive deadlines.",
           "allOf": [
             { "$ref": "#/definitions/probe" },
             {

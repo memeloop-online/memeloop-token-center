@@ -6,20 +6,25 @@ import '../../src/theme.css';
 import '../../src/operator/operator.css';
 
 const options = Array.from({ length: 20 }, (_, index) => ({ value: String(index), label: `Workspace ${index + 1}`, description: 'A reusable selection field with a descriptive secondary line' }));
+const matrixLayout = new URLSearchParams(location.search).has('matrix');
 function Fixture() {
   const [selected, setSelected] = useState<ComboboxOption[]>([]);
   const [query, setQuery] = useState('');
   const [error, setError] = useState(false);
+  const [submissions, setSubmissions] = useState(0);
   return <main style={{ padding: 24, maxWidth: 600, margin: '0 auto' }}>
     <h1 onMouseDown={(event) => event.preventDefault()}>Resource selection</h1>
     <button onClick={() => setError(true)}>Simulate unavailable search</button>
-    <div style={{ overflow: 'hidden', height: 160, padding: 8, marginTop: 40 }}>
+    <form onSubmit={(event) => { event.preventDefault(); setSubmissions(value => value + 1); }}>
+    <div style={{ overflow: matrixLayout ? undefined : 'hidden', height: matrixLayout ? undefined : 160, padding: 8, marginTop: 40 }}>
       <MultiCombobox label="Workspaces" options={options} value={selected} onChange={setSelected}
         placeholder="Search workspaces" emptyText="No matching workspaces" removeLabel={label => `Remove ${label}`}
         hint="Choose one or more workspaces. Existing permissions are unchanged until you save."
         onQueryChange={setQuery} error={error ? 'Search unavailable. Try again.' : ''} retryLabel="Retry search" onRetry={() => setError(false)} />
     </div>
     <button>Continue</button>
+    </form>
+    <output aria-label="Submission count">{submissions}</output>
     <output aria-label="Selected count">{selected.length}</output>
     <output aria-label="Search query">{query || 'empty'}</output>
   </main>;

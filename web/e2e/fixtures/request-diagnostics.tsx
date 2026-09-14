@@ -53,6 +53,12 @@ const historicalGap: RequestView = {
   session_context: null,
 };
 
+// Exercise unbroken provider/session metadata without altering ordinary fixtures.
+if (new URLSearchParams(location.search).has('long-tokens') && request.session_context) {
+  request.session_context.session_name = 'session_'.repeat(40);
+  request.session_context.agent_id = 'agent_'.repeat(40);
+}
+
 function Fixture() {
   const [openedSession, setOpenedSession] = useState('');
   // The production shell places main in grid column two after its rail. Keep

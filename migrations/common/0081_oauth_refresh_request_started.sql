@@ -1,0 +1,1 @@
+ALTER TABLE upstream_oauth_refresh_leases ADD COLUMN request_started_at BIGINT;

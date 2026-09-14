@@ -20,6 +20,8 @@ export interface RequestView {
   route_id?: string | null;
   currency?: string | null;
   error_code: string | null;
+  /** Durable request/response archive convergence state. */
+  archive_state?: RequestArchiveState;
   session_context?: RequestSessionContext | null;
 }
 
@@ -85,11 +87,14 @@ export interface RequestDetail extends RequestView {
   };
 }
 
+export type RequestEventKind = 'started' | 'finished' | 'projected' | 'archive_bound' | 'archive_gap';
+export type RequestArchiveState = 'capturing' | 'pending' | 'uploading' | 'bound' | 'gap';
+
 export interface RequestEvent {
   event_id: string;
   request_id: string;
   event_at: number;
-  event_kind: 'started' | 'finished' | 'projected';
+  event_kind: RequestEventKind;
   created_at?: number | null;
   completed_at?: number | null;
   upstream_account_id?: string | null;
@@ -107,6 +112,7 @@ export interface RequestEvent {
   output_tokens: number;
   cost: string;
   error_code: string | null;
+  archive_state: RequestArchiveState;
 }
 
 export interface StatsBucket {
@@ -268,6 +274,17 @@ export interface OperatorUsageAnalysis {
   by_status: UsageAnalysisBucket[];
   errors: UsageAnalysisBucket[];
   heatmap: UsageAnalysisHeatmapBucket[];
+}
+
+export interface OperatorUsageAnalysisTrends {
+  from_created_at: number;
+  to_created_at: number;
+  granularity: 'hour' | 'day';
+  time_zone: 'UTC';
+  p95_is_approximate: true;
+  p95_method: 'fixed_histogram_upper_bound_capped_60000ms';
+  summary: UsageAnalysisMetrics;
+  time_series: UsageAnalysisTimeBucket[];
 }
 
 export interface SelfUsageAnalysis {
@@ -440,6 +457,7 @@ export interface ServiceTokenView {
   service_id: string;
   name: string;
   credential_generation: number;
+  credential_copy_available?: boolean;
   fingerprint: string;
   scopes: string[];
   tenant_external_id: string | null;
@@ -661,7 +679,7 @@ export interface PluginManifest {
 export type PluginOperatorUiSlot = 'operator.sidebar.tab' | 'operator.overview.card';
 export type PluginOperatorUiIcon = 'activity' | 'chart' | 'database' | 'heart' | 'plug' | 'shield';
 /** Closed core-owned data presentation; this is never a plugin browser-code entrypoint. */
-export type PluginOperatorUiPresentation = 'health_intelligence_v1';
+export type PluginOperatorUiPresentation = 'health_intelligence_v1' | 'projection_v1';
 
 export interface PluginOperatorUiContribution {
   id: string;

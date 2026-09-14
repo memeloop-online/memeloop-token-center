@@ -46,8 +46,6 @@ tags:
     description: Exact, versioned subscription credit reconciliation for memeloop web.
   - name: Operator traffic
     description: Tenant/global traffic statistics, request detail, and live events.
-  - name: Session archive quarantine
-    description: Global persistent-operator review and immutable resolution of uncorrelated archive records.
   - name: Self service
     description: Credential-scoped, read-only usage and logical-conversation views.
   - name: OpenAI compatible
@@ -123,7 +121,7 @@ paths:
       operationId: getPrometheusMetrics
       summary: Export bounded-cardinality operational metrics
       description: |
-        Registered only by the control/all role. Labels are restricted to controlled
+        Registered by gateway, control and all roles. Labels are restricted to controlled
         methods, matched route templates, status classes, providers, operations,
         dependencies, pool states, and generation states. Tenant, credential, model,
         URL, resource ID, and error-text labels are deliberately excluded.
@@ -265,12 +263,11 @@ paths:
     put:
       tags: [Client credentials]
       operationId: storeClientCredentialRecovery
-      summary: Store an already-active client credential for future authorized copying
+      summary: Store an already-active client credential for direct authorized copying
       description: |
-        Verifies the supplied credential against the active stable key and stores only a
-        key- and generation-bound encrypted envelope. It does not rotate, replace, or
-        otherwise change the credential. This supports an authorized importer that still
-        has source access; existing credentials without an envelope cannot be reconstructed.
+        Verifies the supplied credential against the active stable key and stores its original
+        value for direct copying. It does not rotate, replace, or otherwise change the
+        credential. Existing hash-only credentials cannot be reconstructed.
       security: [{ serviceBearer: [] }]
       x-required-scope: keys:write
       parameters: [{ $ref: '#/components/parameters/KeyId' }]
@@ -280,7 +277,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/StoreClientCredentialRecoveryRequest' }
       responses:
-        '204': { description: Encrypted recovery envelope stored; no secret is returned. }
+        '204': { description: Original credential stored; no secret is returned. }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -295,13 +292,9 @@ paths:
         Returns plaintext only for an explicit, authorized copy action and only while the
         matching key generation remains active. Credential lists and self-service APIs never
         contain the secret. This operation never rotates or replaces the credential; repeated
-        authorized calls return the same current-generation credential while its envelope
-        remains available and rate limits permit. A key created before recovery envelopes were
-        enabled returns 404 and is explicitly unrecoverable through this endpoint unless an
-        authorized importer still has the source credential and stores its envelope. Retrieval
-        attempts are durably audited without credential material and limited in a short window
-        by target tenant, authenticated actor, and key; the actor also has a tenant-wide cap to
-        prevent bulk plaintext recovery across keys.
+        authorized calls return the same current-generation credential. A hash-only historical
+        key returns 404 unless an authorized importer still has and stores its original value.
+        Legacy encrypted values are verified against the active generation before copying.
       security: [{ serviceBearer: [] }]
       x-required-scope: keys:write
       parameters: [{ $ref: '#/components/parameters/KeyId' }]
@@ -316,11 +309,6 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
-        '429':
-          description: The authenticated actor exceeded a credential-recovery access limit.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/ErrorResponse' }
 
   /internal/v1/keys/{key_id}/alias:
     patch:
@@ -560,6 +548,30 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/IssuedServiceCredential' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/service-tokens/{service_id}/copy:
+    post:
+      tags: [Service credentials]
+      operationId: copyServiceCredential
+      summary: Copy a durable active service credential
+      description: |
+        Global service-token management only. Returns the current original credential through
+        an explicit no-store copy action without rotating it. Hash-only historical tokens
+        return 404 and are never replaced or fabricated.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: service_tokens:write
+      parameters: [{ $ref: '#/components/parameters/ServiceId' }]
+      responses:
+        '200':
+          description: The active service credential for immediate copying.
+          headers:
+            Cache-Control: { schema: { const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecoveredServiceCredential' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -830,6 +842,105 @@ paths:
                 items: { $ref: '#/components/schemas/PluginManifest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/plugin-runtime/candidates:
+    post:
+      tags: [System]
+      operationId: stageApplicationPluginInventory
+      summary: Validate a preinstalled application plugin inventory (experimental)
+      description: Requires experimental-plugin-revisions and explicit host-only inventory opt-in, neither enabled in production. Global operators only; no URL, path, Wasm, grant, or tenant override is accepted. Only already-approved unchanged contracts can be staged.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:write
+      x-global-operator-only: true
+      x-experimental-feature: experimental-plugin-revisions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [inventory_id]
+              properties:
+                inventory_id: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
+      responses:
+        '204': { description: Verified immutable inventory identity staged. }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /internal/v1/plugin-runtime/publish:
+    post:
+      tags: [System]
+      operationId: publishApplicationPluginInventory
+      summary: Publish a global application snapshot using revision CAS (experimental)
+      description: Requires experimental-plugin-revisions and explicit host-only inventory opt-in, neither enabled in production. Validates a preinstalled inventory and atomically publishes expected_revision plus one. Zero bootstraps an absent head. Exact idempotency replay returns its original receipt, not the latest head. Global operators only; unknown fields and remote installation inputs are rejected.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:write
+      x-global-operator-only: true
+      x-experimental-feature: experimental-plugin-revisions
+      parameters: [{ $ref: '#/components/parameters/RequiredIdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [inventory_id, expected_revision]
+              properties:
+                inventory_id: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
+                expected_revision: { type: integer, format: int64, minimum: 0 }
+      responses:
+        '200':
+          description: Original publication receipt, including exact replay.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApplicationPluginRevision' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /internal/v1/plugin-runtime/rollback:
+    post:
+      tags: [System]
+      operationId: rollbackApplicationPluginInventory
+      summary: Publish an earlier inventory as a new monotonic revision (experimental)
+      description: Requires experimental-plugin-revisions and explicit host-only inventory opt-in, neither enabled in production. Global operators only. Target must be earlier than expected_revision and locally available with the original approved identity. Rollback publishes expected_revision plus one and never rewinds head.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:write
+      x-global-operator-only: true
+      x-experimental-feature: experimental-plugin-revisions
+      parameters: [{ $ref: '#/components/parameters/RequiredIdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [target_revision, expected_revision]
+              properties:
+                target_revision: { type: integer, format: int64, minimum: 1 }
+                expected_revision: { type: integer, format: int64, minimum: 2 }
+      responses:
+        '200':
+          description: Original rollback receipt with a strictly new revision.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApplicationPluginRevision' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /internal/v1/plugins/{plugin_id}/configuration:
     parameters:
@@ -1164,7 +1275,8 @@ paths:
       x-required-scope: providers:read
       description: |
         Requires an explicit authorized tenant. Performs only bounded native
-        Codex usage and reset-credit GETs with server-held encrypted credentials.
+        Codex/Kimi usage GETs and the Codex reset-credit GET with server-held
+        encrypted credentials.
         Never consumes a reset credit or exposes supplier bodies or secrets.
         Snapshots are cached for 30 seconds with bounded singleflight/concurrency;
         stale observations may be retained for five minutes after a read error.
@@ -1187,7 +1299,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [contract_version, upstream_account_id, tenant_external_id, provider, status, observed_at, stale_after, stale, plan_type, windows, credits, reset_capability, error_code]
+                required: [contract_version, upstream_account_id, tenant_external_id, provider, status, observed_at, stale_after, stale, freshness, plan_type, workspace, capabilities, subscription_active_until, reset_credits, windows, credits, reset_capability, error_code]
                 properties:
                   contract_version: { const: upstream_quota_v1 }
                   upstream_account_id: { type: string, format: uuid }
@@ -1197,18 +1309,48 @@ paths:
                   observed_at: { type: [integer, 'null'], format: int64, description: Unix epoch milliseconds of supplier observation. }
                   stale_after: { type: [integer, 'null'], format: int64, description: Unix epoch milliseconds freshness deadline. }
                   stale: { type: boolean }
+                  freshness: { type: string, enum: [unobserved, fresh, stale] }
                   plan_type: { type: [string, 'null'] }
+                  workspace: { type: [string, 'null'], description: Verified supplier workspace label; null when the native adapter has no source contract. }
+                  subscription_active_until: { type: [integer, 'null'], format: int64, description: Verified subscription expiry, never OAuth access-token expiry. }
+                  capabilities:
+                    type: object
+                    required: [read, plan, workspace, window_amounts, window_amount_unit, window_percent, reset_credit_expiry, subscription_expiry, supplier_read_only, refreshes_credentials, consumes_reset_credit]
+                    properties:
+                      read: { type: boolean }
+                      plan: { type: boolean }
+                      workspace: { type: boolean }
+                      window_amounts: { type: boolean }
+                      window_amount_unit: { type: boolean }
+                      window_percent: { type: boolean }
+                      reset_credit_expiry: { type: boolean }
+                      subscription_expiry: { type: boolean }
+                      supplier_read_only: { type: boolean, description: The quota inspection itself does not mutate the supplier. }
+                      refreshes_credentials: { type: boolean }
+                      consumes_reset_credit: { type: boolean }
+                  reset_credits:
+                    type: array
+                    maxItems: 1024
+                    items:
+                      type: object
+                      required: [status, granted_at, expires_at, source]
+                      properties:
+                        status: { type: [string, 'null'] }
+                        granted_at: { type: [integer, 'null'], format: int64 }
+                        expires_at: { type: [integer, 'null'], format: int64 }
+                        source: { type: string, enum: [codex_reset_credits] }
                   error_code: { type: [string, 'null'], description: Sanitized product error code; never upstream text. }
                   credits:
                     type: object
-                    required: [balance, unlimited, has_credits]
+                    required: [balance, unlimited, has_credits, source]
                     properties:
                       balance: { type: [string, 'null'], description: Supplier decimal balance, not customer key balance. }
                       unlimited: { type: [boolean, 'null'] }
                       has_credits: { type: [boolean, 'null'] }
+                      source: { type: [string, 'null'], enum: [codex_usage, null] }
                   reset_capability:
                     type: object
-                    required: [provider_supported, implementation_available, prepare_available, confirmation_required, retryable, available_credits, applicable_credits, reason, credit_error_code]
+                    required: [provider_supported, implementation_available, prepare_available, confirmation_required, retryable, available_credits, applicable_credits, reason, credit_error_code, evidence]
                     properties:
                       provider_supported: { type: [boolean, 'null'] }
                       implementation_available: { type: boolean }
@@ -1219,18 +1361,21 @@ paths:
                       applicable_credits: { type: [integer, 'null'], format: int64 }
                       reason: { type: string }
                       credit_error_code: { type: [string, 'null'] }
+                      evidence: { type: string, enum: [server_driver_contract, unknown_provider], description: Server-held driver capability; dispatch still requires fresh credit evidence. }
                   windows:
                     type: array
                     maxItems: 68
                     items:
                       type: object
-                      required: [id, label, used_percent, remaining, limit, reset_at, period_seconds, source, reset_is_estimated, allowed, limit_reached]
+                      required: [id, label, used_percent, used, remaining, limit, unit, reset_at, period_seconds, source, reset_is_estimated, allowed, limit_reached]
                       properties:
                         id: { type: string }
                         label: { type: string }
                         used_percent: { type: [number, 'null'] }
+                        used: { type: [number, 'null'] }
                         remaining: { type: [number, 'null'] }
                         limit: { type: [number, 'null'] }
+                        unit: { type: [string, 'null'], description: Supplier-declared unit; null when amounts are unitless or the contract is unknown. }
                         reset_at: { type: [integer, 'null'], format: int64, description: Unix epoch milliseconds. }
                         period_seconds: { type: [integer, 'null'], format: int64 }
                         source: { type: string }
@@ -1988,70 +2133,6 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '502': { $ref: '#/components/responses/UpstreamError' }
 
-  /internal/v1/migrations/openai-codex/prepare:
-    post:
-      tags: [Upstream providers]
-      operationId: prepareNativeOpenAICodexUpgrade
-      summary: Prepare an exact native OpenAI Codex account migration
-      description: |
-        Global operator-only review stage for a finite explicit account-id
-        allowlist. It returns only ids, compare-and-swap versions, and proxy
-        attestations; OAuth tokens, account configuration, and proxy URLs are
-        never returned. Every selected account must already carry a private
-        SOCKS transport, otherwise preparation fails closed.
-      security: [{ serviceBearer: [] }]
-      x-required-scope: providers:write
-      x-global-service-only: true
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/NativeCodexUpgradePrepareRequest' }
-      responses:
-        '200':
-          description: Immutable CAS plan for the explicitly selected account ids.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/NativeCodexUpgradePlan' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-
-  /internal/v1/migrations/openai-codex/apply:
-    post:
-      tags: [Upstream providers]
-      operationId: applyNativeOpenAICodexUpgrade
-      summary: Apply a reviewed native OpenAI Codex account migration
-      description: |
-        Transactional native-only upgrade or repair for the exact targets
-        returned by prepare. It preserves each stable account id, encrypted
-        refresh state, proxy endpoint and proxy authentication while restoring
-        the required `socks5h` remote-DNS scheme for safe IP-literal proxies.
-        Imported accounts atomically change provider driver and adapter-state
-        ABI; already-native accounts with a collapsed `socks5` scheme are
-        repaired in place. Repeating a completed request returns ids as already
-        native; an unreviewed or changed row fails with 409.
-      security: [{ serviceBearer: [] }]
-      x-required-scope: providers:write
-      x-global-service-only: true
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/NativeCodexUpgradeApplyRequest' }
-      responses:
-        '200':
-          description: Upgrade outcome containing only stable account ids and counts.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/NativeCodexUpgradeResult' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
-
   /internal/v1/native-oauth-imports/capabilities:
     get:
       tags: [Upstream providers]
@@ -2104,110 +2185,6 @@ paths:
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
-        '409': { $ref: '#/components/responses/Conflict' }
-
-  /internal/v1/imports/session-archive/quarantine:
-    get:
-      tags: [Session archive quarantine]
-      operationId: listSessionArchiveQuarantine
-      summary: List quarantined session archive records for one tenant
-      description: |
-        Requires a global persistent service credential. The bootstrap secret,
-        tenant-scoped service credentials, and downstream client credentials are
-        rejected. Records are ordered by `(source_started_at, id)` descending;
-        continue with the final row's paired cursor values.
-      security: [{ serviceBearer: [] }]
-      x-required-scope: imports:session_archive:quarantine:read
-      x-global-service-only: true
-      x-persistent-service-only: true
-      parameters:
-        - $ref: '#/components/parameters/RequiredTenant'
-        - name: state
-          in: query
-          required: false
-          schema:
-            type: string
-            enum: [pending, resolved, dismissed]
-        - name: limit
-          in: query
-          required: false
-          schema: { type: integer, format: int64, minimum: 1, maximum: 100, default: 100 }
-        - name: before_started_at
-          in: query
-          required: false
-          description: Exclusive source-start timestamp cursor; must be paired with `before_id`.
-          schema: { type: integer, format: int64 }
-        - $ref: '#/components/parameters/BeforeId'
-      responses:
-        '200':
-          description: Bounded tenant quarantine page without credential material or identity-claim proofs.
-          content:
-            application/json:
-              schema:
-                type: array
-                maxItems: 100
-                items: { $ref: '#/components/schemas/SessionArchiveQuarantineRecord' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-
-  /internal/v1/imports/session-archive/quarantine/{quarantine_id}:
-    get:
-      tags: [Session archive quarantine]
-      operationId: getSessionArchiveQuarantineRecord
-      summary: Get one tenant-bound quarantine record
-      description: Requires a global persistent service credential; cross-tenant IDs are returned as not found.
-      security: [{ serviceBearer: [] }]
-      x-required-scope: imports:session_archive:quarantine:read
-      x-global-service-only: true
-      x-persistent-service-only: true
-      parameters:
-        - $ref: '#/components/parameters/QuarantineId'
-        - $ref: '#/components/parameters/RequiredTenant'
-      responses:
-        '200':
-          description: Quarantine metadata safe for operator review.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/SessionArchiveQuarantineRecord' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-
-  /internal/v1/imports/session-archive/quarantine/{quarantine_id}/resolutions:
-    post:
-      tags: [Session archive quarantine]
-      operationId: resolveSessionArchiveQuarantineRecord
-      summary: Permanently associate or dismiss one quarantined archive record
-      description: |
-        Requires a global persistent service credential so the immutable audit
-        record always contains a stable service principal. `expected_record_digest`
-        provides optimistic concurrency; `evidence_digest` is a SHA-256 digest of
-        independently retained operator evidence. An exact Idempotency-Key replay
-        returns the original resolution, while changed proof or action returns 409.
-      security: [{ serviceBearer: [] }]
-      x-required-scope: imports:session_archive:quarantine:resolve
-      x-global-service-only: true
-      x-persistent-service-only: true
-      parameters:
-        - $ref: '#/components/parameters/QuarantineId'
-        - $ref: '#/components/parameters/RequiredIdempotencyKey'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/ResolveSessionArchiveQuarantineRequest' }
-      responses:
-        '200':
-          description: Newly committed or exactly replayed immutable resolution.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/SessionArchiveQuarantineResolution' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
   /internal/v1/model-routes:
@@ -2348,6 +2325,67 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/model-routes/{route_id}/archive:
+    post:
+      tags: [Routes and pricing]
+      operationId: archiveModelRoute
+      summary: Archive a disabled route while retaining request history
+      description: Removes live grants and memberships and hides the route from management and selection. Archived routes cannot be edited or reactivated. Repeating an archive is idempotent.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:write
+      parameters: [{ $ref: '#/components/parameters/RouteId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [tenant_external_id, expected_updated_at]
+              properties:
+                tenant_external_id: { type: string }
+                expected_updated_at: { type: integer, format: int64 }
+      responses:
+        '204': { description: Route archived or already archived. }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/archived-model-routes/{route_id}:
+    get:
+      tags: [Routes and pricing]
+      operationId: getArchivedModelRoute
+      summary: Look up a retained route identity for historical audit
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:read
+      parameters:
+        - $ref: '#/components/parameters/RouteId'
+        - $ref: '#/components/parameters/RequiredTenant'
+      responses:
+        '200':
+          description: Archived identity; no active configuration edges or credentials.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, tenant_external_id, public_model, upstream_model, protocol, priority, enabled, created_at, archived_at]
+                properties:
+                  id: { type: string, format: uuid }
+                  tenant_external_id: { type: string }
+                  public_model: { type: string }
+                  upstream_model: { type: string }
+                  protocol: { type: string }
+                  priority: { type: integer, format: int64 }
+                  enabled: { type: boolean, const: false }
+                  created_at: { type: integer, format: int64 }
+                  archived_at: { type: integer, format: int64 }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /internal/v1/model-routes/{route_id}/retire-upstreams:
     post:
@@ -3019,7 +3057,7 @@ paths:
         page remains bound to the path account, and a tenant-scoped service credential
         may inspect only an account in its own tenant. The cursor pair must identify
         an existing settlement in that account. Unknown query parameters are rejected.
-        Covers prepaid terminal snapshots published after migration 79; historical
+        Covers prepaid terminal snapshots published after migration 86; historical
         records are not bulk-backfilled and metered-unlimited usage is excluded.
         An empty exact lookup is not evidence of zero cost. Polling consumers retain
         the final item's cursor even when next_cursor is null.
@@ -3885,6 +3923,60 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/UsageAnalysis' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/usage-analysis/trends:
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorUsageAnalysisTrends
+      summary: Read the bounded summary and time-series usage projection
+      description: |
+        Uses the same tenant scope, filters, inclusive range, bucket selection, and metric
+        aggregation as the complete usage-analysis resource. The response is restricted to
+        summary and time-series data and executes one business aggregation statement; it does
+        not load dimension, session, generation-breakdown, or heatmap projections.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/FromCreatedAt'
+        - $ref: '#/components/parameters/ToCreatedAt'
+        - name: granularity
+          in: query
+          required: false
+          schema: { type: string, enum: [auto, hour, day], default: auto }
+        - $ref: '#/components/parameters/KeyFilter'
+        - $ref: '#/components/parameters/ModelFilter'
+        - name: protocol
+          in: query
+          required: false
+          description: Exact canonical protocol family.
+          schema: { type: string, enum: [openai, anthropic, openai-image, generation] }
+        - name: status
+          in: query
+          required: false
+          description: Terminal logical status; pending traffic is intentionally absent from usage rollups.
+          schema: { type: string, enum: [success, error] }
+        - $ref: '#/components/parameters/ErrorCodeFilter'
+        - name: upstream_account_id
+          in: query
+          required: false
+          description: One stable upstream UUID, or `unassigned` for terminal activity recorded without an upstream.
+          schema:
+            oneOf:
+              - { type: string, format: uuid }
+              - { type: string, const: unassigned }
+        - $ref: '#/components/parameters/RouteFilter'
+        - $ref: '#/components/parameters/KeyAliasFilter'
+        - $ref: '#/components/parameters/PrincipalFilter'
+      responses:
+        '200':
+          description: Currency-safe summary and UTC time buckets.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UsageAnalysisTrends' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -4802,11 +4894,6 @@ components:
       required: false
       description: When true, return a cursor envelope instead of the compatibility array response. The page size remains limited by `limit`.
       schema: { type: boolean, default: false }
-    QuarantineId:
-      name: quarantine_id
-      in: path
-      required: true
-      schema: { type: string, format: uuid }
     KeyFilter:
       name: key_id
       in: query
@@ -5135,6 +5222,14 @@ components:
           schema: { type: object, additionalProperties: true }
 
   schemas:
+    ApplicationPluginRevision:
+      type: object
+      additionalProperties: false
+      required: [revision, inventory_id, reason]
+      properties:
+        revision: { type: integer, format: int64, minimum: 1 }
+        inventory_id: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
+        reason: { type: string, enum: [initial, reload, rollback] }
     UpstreamQuotaResetOperation:
       type: object
       required: [id, upstream_account_id, state, credential_generation, available_credits, applicable_credits, observed_at, expires_at, prepared_by_service_id, confirmed_by_service_id, confirmed_at, created_at, updated_at, last_reconciled_at, reconciled_available_credits, reconciled_applicable_credits, error_code, audit, effect, consumes_credits]
@@ -5449,8 +5544,6 @@ components:
         - plugins:write
         - oauth:write
         - upstreams:import:write
-        - imports:session_archive:quarantine:read
-        - imports:session_archive:quarantine:resolve
         - routes:read
         - routes:write
         - prices:read
@@ -5495,19 +5588,28 @@ components:
     ServiceCredential:
       type: object
       additionalProperties: false
-      required: [service_id, name, status, credential_generation, fingerprint, scopes, tenant_external_id, created_at, updated_at]
+      required: [service_id, name, status, credential_generation, fingerprint, credential_copy_available, scopes, tenant_external_id, created_at, updated_at]
       properties:
         service_id: { type: string, format: uuid }
         name: { type: string }
         status: { $ref: '#/components/schemas/CredentialStatus' }
         credential_generation: { type: integer, format: int64 }
         fingerprint: { type: string }
+        credential_copy_available: { type: boolean, description: Whether the current active credential has an original value available for copying. }
         scopes:
           type: array
           items: { $ref: '#/components/schemas/ServiceScope' }
         tenant_external_id: { type: [string, 'null'] }
         created_at: { type: integer, format: int64 }
         updated_at: { type: integer, format: int64 }
+    RecoveredServiceCredential:
+      type: object
+      additionalProperties: false
+      required: [service_id, credential_generation, token]
+      properties:
+        service_id: { type: string, format: uuid }
+        credential_generation: { type: integer, format: int64, minimum: 1 }
+        token: { type: string, writeOnly: true, description: Active service credential returned only by an explicit no-store copy action. }
     JsonSchema:
       oneOf:
         - type: object
@@ -5977,125 +6079,6 @@ components:
         status: { const: pending }
         retry_after_seconds: { type: integer, format: int64, minimum: 0 }
         message: { type: [string, 'null'] }
-    NativeCodexUpgradeTarget:
-      type: object
-      additionalProperties: false
-      required: [account_id, expected_updated_at, expected_credential_generation, has_proxy, proxy_network_scope]
-      properties:
-        account_id: { type: string, format: uuid }
-        expected_updated_at: { type: integer, format: int64 }
-        expected_credential_generation: { type: integer, format: int64, minimum: 1 }
-        has_proxy: { const: true, description: The encrypted credential has an operator-approved proxy; no URL is returned. }
-        proxy_network_scope: { const: private }
-    NativeCodexUpgradePrepareRequest:
-      type: object
-      additionalProperties: false
-      required: [account_ids]
-      properties:
-        account_ids:
-          type: array
-          minItems: 1
-          maxItems: 64
-          uniqueItems: true
-          items: { type: string, format: uuid }
-    NativeCodexUpgradePlan:
-      type: object
-      additionalProperties: false
-      required: [target_count, targets]
-      properties:
-        target_count: { type: integer, minimum: 1, maximum: 64 }
-        targets:
-          type: array
-          minItems: 1
-          maxItems: 64
-          items: { $ref: '#/components/schemas/NativeCodexUpgradeTarget' }
-    NativeCodexUpgradeApplyRequest:
-      type: object
-      additionalProperties: false
-      required: [targets]
-      properties:
-        targets:
-          type: array
-          minItems: 1
-          maxItems: 64
-          items: { $ref: '#/components/schemas/NativeCodexUpgradeTarget' }
-    NativeCodexUpgradeResult:
-      type: object
-      additionalProperties: false
-      required: [upgraded_count, upgraded_account_ids, already_native_count, already_native_account_ids]
-      properties:
-        upgraded_count: { type: integer, minimum: 0, maximum: 64 }
-        upgraded_account_ids:
-          type: array
-          maxItems: 64
-          items: { type: string, format: uuid }
-        already_native_count: { type: integer, minimum: 0, maximum: 64 }
-        already_native_account_ids:
-          type: array
-          maxItems: 64
-          items: { type: string, format: uuid }
-    SessionArchiveQuarantineRecord:
-      type: object
-      additionalProperties: false
-      required: [id, tenant_external_id, source, external_request_id, record_digest, reason_code, source_started_at, source_completed_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, error_code, state]
-      properties:
-        id: { type: string, format: uuid }
-        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
-        source: { type: string, minLength: 1, maxLength: 256 }
-        external_request_id: { type: string, minLength: 1, maxLength: 512 }
-        record_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
-        reason_code: { type: string, enum: [missing_credential_hash, unproven_identity] }
-        source_started_at: { type: integer, format: int64 }
-        source_completed_at: { type: [integer, 'null'], format: int64 }
-        protocol: { type: string, minLength: 1, maxLength: 64 }
-        model: { type: string, minLength: 1, maxLength: 512 }
-        status_code: { type: [integer, 'null'], format: int64, minimum: 100, maximum: 599 }
-        duration_ms: { type: [integer, 'null'], format: int64, minimum: 0 }
-        input_tokens: { type: integer, format: int64, minimum: 0 }
-        output_tokens: { type: integer, format: int64, minimum: 0 }
-        error_code: { type: [string, 'null'], maxLength: 256 }
-        state: { type: string, enum: [pending, resolved, dismissed] }
-    ResolveSessionArchiveQuarantineRequest:
-      type: object
-      additionalProperties: false
-      required: [tenant_external_id, action, expected_record_digest, evidence_digest]
-      properties:
-        tenant_external_id: { type: string, minLength: 1, maxLength: 200, pattern: '^[^\x00-\x1F\x7F]+$' }
-        action:
-          type: string
-          enum: [associate, dismiss]
-          description: Associate requires `key_id`; dismiss requires it to be absent or null.
-        key_id: { type: [string, 'null'], format: uuid }
-        expected_record_digest:
-          type: string
-          pattern: '^[0-9a-f]{64}$'
-          description: Optimistic-concurrency digest copied from the reviewed quarantine record.
-        evidence_digest:
-          type: string
-          pattern: '^[0-9a-f]{64}$'
-          description: SHA-256 digest of independently retained operator evidence; raw evidence is never accepted.
-        note: { type: [string, 'null'], maxLength: 2000, pattern: '^[^\x00-\x1F\x7F]*$' }
-      allOf:
-        - if:
-            properties: { action: { const: associate } }
-          then:
-            required: [key_id]
-            properties: { key_id: { type: string, format: uuid } }
-        - if:
-            properties: { action: { const: dismiss } }
-          then:
-            properties: { key_id: { type: 'null' } }
-    SessionArchiveQuarantineResolution:
-      type: object
-      additionalProperties: false
-      required: [id, quarantine_id, action, key_id, evidence_digest, created_at]
-      properties:
-        id: { type: string, format: uuid }
-        quarantine_id: { type: string, format: uuid }
-        action: { type: string, enum: [associate, dismiss] }
-        key_id: { type: [string, 'null'], format: uuid }
-        evidence_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
-        created_at: { type: integer, format: int64 }
     PluginManifest:
       type: object
       required: [id, version, wit_version, capabilities, contributions]
@@ -6385,7 +6368,7 @@ components:
     AggregatedUpstreamModelCatalog:
       type: object
       additionalProperties: false
-      required: [data, eligible_account_count, unknown_account_count, stale_account_count]
+      required: [data, eligible_account_count, unknown_account_count, unsupported_account_count, stale_account_count]
       properties:
         data:
           type: array
@@ -6393,6 +6376,11 @@ components:
           items: { $ref: '#/components/schemas/AggregatedUpstreamModel' }
         eligible_account_count: { type: integer, format: int64, minimum: 0 }
         unknown_account_count: { type: integer, format: int64, minimum: 0 }
+        unsupported_account_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Subset of unknown accounts with a current-generation terminal server-owned unsupported discovery verdict. Never includes pending, network, authentication or permission failures. Counts satisfy unsupported_account_count <= unknown_account_count <= eligible_account_count.
         stale_account_count: { type: integer, format: int64, minimum: 0 }
     Group:
       type: object
@@ -7888,6 +7876,21 @@ components:
             sentinel. Missing coordinates mean zero activity and are filled by
             the client.
           items: { $ref: '#/components/schemas/UsageAnalysisHeatmapBucket' }
+    UsageAnalysisTrends:
+      type: object
+      additionalProperties: false
+      required: [from_created_at, to_created_at, granularity, time_zone, p95_is_approximate, p95_method, summary, time_series]
+      properties:
+        from_created_at: { type: integer, format: int64, minimum: 0 }
+        to_created_at: { type: integer, format: int64, minimum: 0 }
+        granularity: { type: string, enum: [hour, day] }
+        time_zone: { type: string, const: UTC }
+        p95_is_approximate: { type: boolean, const: true }
+        p95_method: { type: string, const: fixed_histogram_upper_bound_capped_60000ms }
+        summary: { $ref: '#/components/schemas/UsageAnalysisMetrics' }
+        time_series:
+          type: array
+          items: { $ref: '#/components/schemas/UsageAnalysisTimeBucket' }
     SelfUsageAnalysis:
       type: object
       additionalProperties: false

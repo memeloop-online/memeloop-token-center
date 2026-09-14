@@ -8,7 +8,8 @@ This guide records endpoint invariants that need prose as well as schemas.
 | Role | Routes | Credential |
 | --- | --- | --- |
 | gateway | `/v1/*`, `/self/v1/*`, `/portal` | Active `mtc_…` client credential |
-| control | `/internal/v1/*`, `/operator`, `/metrics`, `/version` | Bootstrap or persisted `mts_…` service credential |
+| control | `/internal/v1/*`, `/operator`, `/version` | Bootstrap or persisted `mts_…` service credential |
+| gateway, control, all | `/metrics` | Service credential with `metrics:read` |
 | every HTTP role | `/livez`, `/readyz`, deprecated `/healthz`, `/ui-assets/*` | none |
 
 Control is not exposed through public client ingress. `/livez` covers process
@@ -31,6 +32,16 @@ a resource. Exact replay returns the original result; reuse with a distinct
 canonical request is rejected. Secret values are never returned after issuance.
 
 ## Provider accounts and routes
+
+Experimental application plugin publication is documented separately in
+[the draft runtime contract](plugin-runtime-application-draft.md). Its three
+`/internal/v1/plugin-runtime/*` POST operations are global `plugins:write`
+management only and require both the compile-time experimental feature and
+host-provisioned inventory opt-in. They are not enabled in the production binary.
+Candidate requests accept opaque preinstalled inventory IDs, never package URLs,
+paths, Wasm or grants. Publish and rollback use revision CAS and idempotency;
+rollback always creates a new revision. The feature remains disabled unless a
+host explicitly provisions and opts into the complete trusted inventory.
 
 One provider account may use an API credential, native OAuth, plugin-provided
 authorization or no credential. Its authentication method is metadata, not a
@@ -66,6 +77,19 @@ upstream update CAS. Its bounded `connect_attempts`,
 `connect_retry_delay_millis`, and `shared_probe_attempts` fields apply to newly
 prepared inference requests without a service release; changing them never
 changes the fixed destination or encrypted per-account proxy binding.
+The same policy accepts `connect_timeout_millis` (100–60000; default 5000),
+`read_timeout_millis` (1000–1260000; default 600000, maximum inactivity from
+response headers to the first body read and between later body reads), and
+`request_timeout_millis` (1000–1260000; default 1260000, one absolute budget
+from the first send through the complete response body, including the sole
+permitted classified HTTP 400 replay). Connect timeout must be lower than the
+request timeout; read timeout cannot exceed the request timeout. Connect and
+read timeouts apply to independent phases and otherwise do not constrain one
+another.
+Clients are bounded and keyed by account transport revision, proxy fingerprint,
+and timeout values. Each prepared send keeps its client snapshot across its
+permitted connection retries. Updates do not extend the request's original
+candidate/failover budget or permit replay after ambiguous delivery or HTTP 503.
 
 `GET /internal/v1/upstreams/{account_id}/deletion-readiness` reports the exact
 lifecycle, direct-or-multi-candidate route, immutable history, and import
@@ -129,11 +153,15 @@ stored in that audit projection or returned.
 `GET /internal/v1/upstreams/{account_id}/quota?tenant_external_id=...` requires
 `providers:read` and an explicit authorized tenant. It returns the sanitized
 `upstream_quota_v1` contract: provider/status, nullable observation and freshness
-deadlines (epoch milliseconds), stale marker, plan, all applicable windows,
-supplier credits, reset capability and closed product error codes. Window reset
-times are epoch milliseconds; relative supplier offsets are marked estimated.
-Unknown values stay null, never zero/unlimited. Supplier reset support is
-distinct from MTC implementation availability and available/applicable credits.
+deadlines (epoch milliseconds), explicit unobserved/fresh/stale state, plan and
+workspace, all applicable windows, supplier credits, reset-credit provenance,
+reset capability and closed product error codes. Window reset times are epoch
+milliseconds; relative supplier offsets are marked estimated. Amount units stay
+null unless the supplier contract declares one. Unknown values stay null, never
+zero/unlimited. Capabilities declare which metadata is implemented and that a
+quota read neither refreshes credentials nor consumes a reset credit. Supplier
+reset support is distinct from MTC implementation availability and fresh
+available/applicable-credit evidence.
 This GET performs no reset, token refresh, probe or model invocation. Only
 server-held credentials reach fixed native supplier GET endpoints; no upstream
 body, email, account header, token or proxy secret is returned. The 30-second
@@ -207,7 +235,7 @@ to its request/job, account, key, model, decimal cost, currency, settlement time
 completion time and token dimensions. Bodies and reservation IDs are omitted.
 Async generation token dimensions are null.
 
-The feed covers prepaid terminal transactions published after migration 79.
+The feed covers prepaid terminal transactions published after migration 86.
 Historical terminal records are not bulk-backfilled. Metered-unlimited usage is
 not included: that path uses its separate asynchronous accounting projection.
 Consumers must not interpret an empty exact lookup as a zero-cost settlement.

@@ -2,9 +2,15 @@ import { useState } from 'react';
 import { createRoot } from 'react-dom/client';
 
 import { I18nProvider } from '../../src/i18n';
+import { MtcFluentProvider } from '../../src/design-system';
 import { CredentialsPage, ServiceCredentialsPage } from '../../src/operator/pages/ManagementPages';
+import keyCreateSchema from '../../../schemas/key-create.schema.json';
+import keyPolicySchema from '../../../schemas/key-policy.schema.json';
+import '../../src/styles.css';
+import '../../src/theme.css';
+import '../../src/operator/operator.css';
 
-type Scenario = 'all-tenants' | 'route-failure' | 'scope-race' | 'scope-lock' | 'client-recovery' | 'service-plaintext' | 'service-scope-aba';
+type Scenario = 'all-tenants' | 'route-failure' | 'scope-race' | 'scope-lock' | 'client-recovery' | 'service-copy' | 'service-plaintext' | 'service-scope-aba' | 'client-form';
 
 interface RecordedRequest {
   method: string;
@@ -13,12 +19,14 @@ interface RecordedRequest {
   credentials?: RequestCredentials;
   referrerPolicy?: ReferrerPolicy;
   hasSignal: boolean;
+  body?: string;
 }
 
 interface FixtureState {
   calls: string[];
   requests: RecordedRequest[];
   releaseIssue: (token: string) => void;
+  releaseRoutingResponse: (status: number) => void;
   releaseCredentialScopeA: () => void;
   releaseCredentialCursor: () => void;
   createdObjectUrls: string[];
@@ -34,6 +42,8 @@ const scenario = (parameters.get('scenario') ?? 'all-tenants') as Scenario;
 const initialTenant = scenario === 'all-tenants' ? '' : 'tenant-a';
 
 const pendingIssues: Array<(response: Response) => void> = [];
+const pendingRouting: Array<(response: Response) => void> = [];
+const routingResponse = { key_id: 'key-form', route_ids: [], route_group_ids: [], effective_route_ids: [], grant_revision: 1, updated_at: 1 };
 const pendingCredentialScopeA: Array<(response: Response) => void> = [];
 const pendingCredentialCursor: Array<(response: Response) => void> = [];
 window.credentialFixture = {
@@ -41,6 +51,11 @@ window.credentialFixture = {
   requests: [],
   createdObjectUrls: [],
   revokedObjectUrls: [],
+  releaseRoutingResponse(status) {
+    const resolve = pendingRouting.shift();
+    if (!resolve) throw new Error('no pending routing fixture response');
+    resolve(json(status === 200 ? routingResponse : { error: { message: 'late routing conflict must stay hidden' } }, status));
+  },
   releaseIssue(token) {
     const resolve = pendingIssues.shift();
     if (!resolve) throw new Error('no pending service credential issuance');
@@ -57,6 +72,23 @@ window.credentialFixture = {
     resolve(json([credential('Scope B older client', 'tenant-b', 'scope-b-001')]));
   },
 };
+
+if (scenario === 'client-recovery') {
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+    writeText: async (value: string) => {
+      if (parameters.has('clipboard-failure')) throw new Error('fixture clipboard denied');
+      document.documentElement.dataset.copiedFixtureCredential = String(value === 'mts_client_recovered');
+    },
+  } });
+}
+if (scenario === 'service-copy') {
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+    writeText: async (value: string) => {
+      if (parameters.has('clipboard-failure')) throw new Error('fixture clipboard denied');
+      document.documentElement.dataset.copiedServiceFixture = String(value === 'mts_service_original');
+    },
+  } });
+}
 
 if (scenario === 'service-plaintext') {
   Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
@@ -137,13 +169,21 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     credentials: init?.credentials,
     referrerPolicy: init?.referrerPolicy,
     hasSignal: Boolean(init?.signal),
+    ...(scenario === 'client-form' && typeof init?.body === 'string' ? { body: init.body } : {}),
   });
   if (url.pathname === '/internal/v1/schemas') {
     return json({
-      key_create: { type: 'object', properties: {} },
-      key_policy: { type: 'object', properties: {} },
+      key_create: scenario === 'client-form' ? keyCreateSchema : { type: 'object', properties: {} },
+      key_policy: scenario === 'client-form' ? keyPolicySchema : { type: 'object', properties: {} },
       service_token: { type: 'object', properties: {} },
     });
+  }
+  if (parameters.has('routing-lifecycle') && url.pathname === '/internal/v1/keys/key-form/routing') {
+    return new Promise<Response>(resolve => pendingRouting.push(resolve));
+  }
+  if (url.pathname === '/internal/v1/service-tokens/service-existing/copy' && method === 'POST' && scenario === 'service-copy') {
+    if (parameters.has('forbidden')) return json({ error: { message: 'fixture permission denied' } }, 403);
+    return json({ service_id: 'service-existing', credential_generation: 1, token: 'mts_service_original' });
   }
   if (url.pathname === '/internal/v1/service-tokens' && method === 'POST') {
     // Deliberately ignore AbortSignal so the component, rather than the mock,
@@ -154,6 +194,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     service_id: 'service-existing',
     name: 'Existing service credential',
     credential_generation: 1,
+    credential_copy_available: scenario === 'service-copy' && !parameters.has('unavailable'),
     fingerprint: 'fixture-fingerprint',
     scopes: ['keys:read'],
     tenant_external_id: initialTenant || 'tenant-a',
@@ -162,6 +203,13 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   }]);
   if (url.pathname === '/internal/v1/keys/key-recovery/credential-recovery/copy' && method === 'POST') {
     return json({ key_id: 'key-recovery', credential_generation: 1, key: 'mts_client_recovered' });
+  }
+  if (scenario === 'client-form') {
+    if (url.pathname === '/internal/v1/route-groups') return json([{ id: '00000000-0000-4000-8000-000000000002', name: 'Research group', member_ids: [], member_count: 0, created_at: 1, updated_at: 1 }]);
+    if (url.pathname === '/internal/v1/model-routes') return json([{ id: '00000000-0000-4000-8000-000000000001', public_model: 'Research model', enabled: true, tenant_external_id: 'tenant-a' }]);
+    if (url.pathname === '/internal/v1/keys' && method === 'POST') return json({ key_id: 'key-created', key: 'mts_fixture_created' });
+    if (url.pathname === '/internal/v1/keys/key-form/policy' && method === 'PUT') return json({});
+    if (url.pathname === '/internal/v1/keys') return json([credential(localStorage.getItem('mtc-locale')?.startsWith('zh') ? '研发工作区' : 'Research workspace', 'tenant-a', 'key-form')]);
   }
   if (url.pathname.endsWith('credential-groups') || url.pathname.endsWith('route-groups')) return json([]);
   if (url.pathname === '/internal/v1/model-routes') {
@@ -172,9 +220,13 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     const tenant = url.searchParams.get('tenant_external_id');
     if (scenario === 'client-recovery') return json([{
       ...credential('Recoverable client', 'tenant-a', 'key-recovery'),
+      policy: { ...credential('unused', 'tenant-a', 'unused').policy, enforcement_mode: 'metered_unlimited' },
       credential_recovery_available: true,
     }]);
-    if (scenario === 'all-tenants') return json([credential('All tenant client', 'tenant-visible', 'key-all')]);
+    if (scenario === 'all-tenants') return json([{
+      ...credential('All tenant client', 'tenant-visible', 'key-all'),
+      available_balance: '9223372036854.775807',
+    }]);
     if ((scenario === 'scope-race' || scenario === 'scope-lock') && tenant === 'tenant-a') {
       // Deliberately ignore the aborted signal.  The component must reject this
       // stale result instead of releasing the active tenant-b request.
@@ -197,7 +249,8 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
 
 function Fixture() {
   const [tenant, setTenant] = useState(initialTenant);
-  if (scenario === 'service-plaintext' || scenario === 'service-scope-aba') {
+  if (scenario === 'client-form') return <main style={{ maxWidth: 760, margin: '0 auto', padding: 12 }}><CredentialsPage token="mts_fixture" tenant={tenant} /></main>;
+  if (scenario === 'service-plaintext' || scenario === 'service-scope-aba' || scenario === 'service-copy') {
     return <>
       {scenario === 'service-scope-aba' && <button type="button" onClick={() => setTenant((current) => current === 'tenant-a' ? 'tenant-b' : 'tenant-a')}>Switch tenant</button>}
       <span>Tenant {tenant}</span>
@@ -210,4 +263,4 @@ function Fixture() {
   </>;
 }
 
-createRoot(document.getElementById('root')!).render(<I18nProvider><Fixture /></I18nProvider>);
+createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><Fixture /></MtcFluentProvider></I18nProvider>);
