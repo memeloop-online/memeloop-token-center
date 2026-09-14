@@ -19,6 +19,7 @@ use crate::{db::Database, error::AppError, provider::ProviderCatalog};
 const CACHED_REVISIONS: usize = 2;
 const ADMISSION_WAIT: Duration = Duration::from_secs(5);
 const COMPILATION_DEADLINE: Duration = Duration::from_secs(35);
+const PIN_DEADLINE: Duration = Duration::from_secs(45);
 // Shared by request pinning and administrative staging across all AppStates.
 // An abandoned blocking compilation retains its permit until it really ends.
 static COMPILATION_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
@@ -68,9 +69,55 @@ pub struct ApplicationPlugins {
     db: Database,
     inventory: BTreeMap<String, PreinstalledInventory>,
     contract_digest: String,
-    snapshots: tokio::sync::Mutex<VecDeque<Arc<ApplicationPluginSnapshot>>>,
+    snapshots: tokio::sync::Mutex<RevisionCache>,
     #[cfg(test)]
     compilations: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    compile_gate: std::sync::Mutex<Option<CompileGate>>,
+}
+
+#[cfg(test)]
+type CompileGate = (
+    tokio::sync::oneshot::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
+#[derive(Default)]
+struct RevisionCache {
+    snapshots: VecDeque<Arc<ApplicationPluginSnapshot>>,
+    in_flight: Option<Arc<RevisionLoad>>,
+}
+
+struct RevisionLoad {
+    revision: i64,
+    result: tokio::sync::watch::Receiver<Option<LoadResult>>,
+}
+
+type LoadResult = Result<Arc<ApplicationPluginSnapshot>, LoadFailure>;
+
+#[derive(Clone, Copy)]
+enum LoadFailure {
+    Forbidden,
+    Overloaded,
+    Internal,
+}
+
+impl LoadFailure {
+    fn from_error(error: AppError) -> Self {
+        match error {
+            AppError::Forbidden => Self::Forbidden,
+            AppError::Overloaded => Self::Overloaded,
+            _ => Self::Internal,
+        }
+    }
+
+    fn into_error(self) -> AppError {
+        match self {
+            Self::Forbidden => AppError::Forbidden,
+            Self::Overloaded => AppError::Overloaded,
+            Self::Internal => AppError::Internal,
+        }
+    }
 }
 
 impl ApplicationPlugins {
@@ -89,9 +136,11 @@ impl ApplicationPlugins {
             db,
             inventory,
             contract_digest: contract_digest(baseline)?,
-            snapshots: tokio::sync::Mutex::new(VecDeque::new()),
+            snapshots: tokio::sync::Mutex::new(RevisionCache::default()),
             #[cfg(test)]
             compilations: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            compile_gate: std::sync::Mutex::new(None),
         })
     }
 
@@ -112,10 +161,17 @@ impl ApplicationPlugins {
         #[cfg(test)]
         self.compilations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        let gate = self.compile_gate.lock().unwrap().take();
         // Build only on cache miss/staging. Neither timeout nor caller cancellation
         // releases capacity while Wasmtime compilation still occupies a thread.
         let task = tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            #[cfg(test)]
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                release.recv().map_err(|_| AppError::Internal)?;
+            }
             let metadata =
                 std::fs::symlink_metadata(&entry.root).map_err(|_| AppError::Internal)?;
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -233,7 +289,7 @@ impl ApplicationPlugins {
             .await
     }
 
-    pub async fn pin(&self) -> Result<Arc<ApplicationPluginSnapshot>, AppError> {
+    pub async fn pin(self: &Arc<Self>) -> Result<Arc<ApplicationPluginSnapshot>, AppError> {
         // The cache never supplies authority. Even a warm hit must read the
         // primary head and validate the exact immutable receipt on this request.
         let head = self.db.application_plugin_head().await?;
@@ -247,33 +303,96 @@ impl ApplicationPlugins {
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err(AppError::Forbidden);
         }
-        // Hold the lock through loading/publication: concurrent cold pins join
-        // one compilation instead of each producing a new engine and epoch task.
-        let mut snapshots = tokio::time::timeout(ADMISSION_WAIT, self.snapshots.lock())
+        tokio::time::timeout(PIN_DEADLINE, self.pin_head(head))
             .await
-            .map_err(|_| AppError::Overloaded)?;
-        if let Some(snapshot) = snapshots
-            .iter()
-            .find(|snapshot| snapshot.receipt.revision == head.revision)
-        {
-            if snapshot.receipt.inventory_id != head.inventory_id
-                || snapshot.receipt.reason != head.reason
-            {
-                return Err(AppError::Forbidden);
+            .map_err(|_| AppError::Overloaded)?
+    }
+
+    async fn pin_head(
+        self: &Arc<Self>,
+        head: ApplicationRevision,
+    ) -> Result<Arc<ApplicationPluginSnapshot>, AppError> {
+        loop {
+            let flight = {
+                let mut cache = self.snapshots.lock().await;
+                if let Some(snapshot) = cache
+                    .snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.receipt.revision == head.revision)
+                {
+                    if snapshot.receipt.inventory_id != head.inventory_id
+                        || snapshot.receipt.reason != head.reason
+                    {
+                        return Err(AppError::Forbidden);
+                    }
+                    validate_receipt(&snapshot.receipt, &head)?;
+                    return Ok(snapshot.clone());
+                }
+                if let Some(flight) = &cache.in_flight {
+                    flight.clone()
+                } else {
+                    let (result, receive) = tokio::sync::watch::channel(None);
+                    let flight = Arc::new(RevisionLoad {
+                        revision: head.revision,
+                        result: receive,
+                    });
+                    cache.in_flight = Some(flight.clone());
+                    let authority = self.clone();
+                    let receipt = head.clone();
+                    // The manager owns the operation and cache publication, not
+                    // the first request. Dropping any/all waiters loses no result.
+                    tokio::spawn(async move {
+                        let loaded = tokio::time::timeout(PIN_DEADLINE, async {
+                            let snapshot = authority
+                                .load(&receipt.inventory_id, receipt.revision, &receipt.reason)
+                                .await?;
+                            validate_receipt(&snapshot.receipt, &receipt)?;
+                            Ok::<_, AppError>(Arc::new(snapshot))
+                        })
+                        .await
+                        .unwrap_or(Err(AppError::Overloaded))
+                        .map_err(LoadFailure::from_error);
+                        let mut cache = authority.snapshots.lock().await;
+                        if let Ok(snapshot) = &loaded {
+                            if cache.snapshots.len() == CACHED_REVISIONS {
+                                cache.snapshots.pop_front();
+                            }
+                            cache.snapshots.push_back(snapshot.clone());
+                        }
+                        cache.in_flight = None;
+                        result.send_replace(Some(loaded));
+                    });
+                    flight
+                }
+            };
+            let mut receive = flight.result.clone();
+            let result = loop {
+                if let Some(result) = receive.borrow().clone() {
+                    break result;
+                }
+                if receive.changed().await.is_err() {
+                    let mut cache = self.snapshots.lock().await;
+                    if cache
+                        .in_flight
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &flight))
+                    {
+                        cache.in_flight = None;
+                    }
+                    return Err(AppError::Internal);
+                }
+            };
+            if flight.revision == head.revision {
+                let snapshot = result.map_err(LoadFailure::into_error)?;
+                if snapshot.receipt.inventory_id != head.inventory_id
+                    || snapshot.receipt.reason != head.reason
+                {
+                    return Err(AppError::Forbidden);
+                }
+                validate_receipt(&snapshot.receipt, &head)?;
+                return Ok(snapshot);
             }
-            validate_receipt(&snapshot.receipt, &head)?;
-            return Ok(snapshot.clone());
         }
-        let snapshot = self
-            .load(&head.inventory_id, head.revision, &head.reason)
-            .await?;
-        validate_receipt(&snapshot.receipt, &head)?;
-        let snapshot = Arc::new(snapshot);
-        if snapshots.len() == CACHED_REVISIONS {
-            snapshots.pop_front();
-        }
-        snapshots.push_back(snapshot.clone());
-        Ok(snapshot)
     }
 }
 

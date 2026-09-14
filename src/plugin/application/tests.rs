@@ -193,6 +193,14 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
     let before = authority_a
         .compilations
         .load(std::sync::atomic::Ordering::Relaxed);
+    let (entered, entering) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    *authority_a.compile_gate.lock().unwrap() = Some((entered, released));
+    let leader_authority = authority_a.clone();
+    let leader = tokio::spawn(async move { leader_authority.pin().await });
+    entering.await.unwrap();
+    leader.abort();
+    assert!(matches!(leader.await, Err(error) if error.is_cancelled()));
     let barrier = Arc::new(tokio::sync::Barrier::new(8));
     let mut pins = tokio::task::JoinSet::new();
     for _ in 0..8 {
@@ -203,6 +211,7 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
             authority.pin().await.unwrap()
         });
     }
+    release.send(()).unwrap();
     let initial = pins.join_next().await.unwrap().unwrap();
     while let Some(pin) = pins.join_next().await {
         assert!(Arc::ptr_eq(&initial, &pin.unwrap()));
@@ -378,10 +387,13 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
             .unwrap();
         let newest = authority_a.pin().await.unwrap();
         assert_eq!(newest.receipt.revision, current.revision + 1);
-        assert!(authority_a.snapshots.lock().await.len() <= CACHED_REVISIONS);
+        assert!(authority_a.snapshots.lock().await.snapshots.len() <= CACHED_REVISIONS);
     }
     assert_eq!(initial.receipt.revision, 1);
-    assert_eq!(authority_a.snapshots.lock().await.len(), CACHED_REVISIONS);
+    assert_eq!(
+        authority_a.snapshots.lock().await.snapshots.len(),
+        CACHED_REVISIONS
+    );
 
     // Tampering cannot change a persisted inventory identity, and an absent
     // local package cannot fall back to the old AppState startup runtime.
