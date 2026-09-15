@@ -11,6 +11,7 @@ const PluginConfigurationForm = lazy(() => import('./PluginConfigurationForm').t
 function PluginConfigurationEditor({ token, tenant, writeTenant, plugin }: { token: string; tenant: string; writeTenant: string; plugin: PluginManifest }) {
   const { locale, t } = useI18n();
   const [opened, setOpened] = useState(false);
+  const [activated, setActivated] = useState(false);
   const [configuration, setConfiguration] = useState<PluginConfiguration>();
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -65,8 +66,8 @@ function PluginConfigurationEditor({ token, tenant, writeTenant, plugin }: { tok
   }
 
   if (!contribution) return null;
-  return <div className="plugin-configuration-editor form-panel"><Disclosure title={t('plugins.editConfiguration')} open={opened} onOpenChange={(open) => { setOpened(open); if (open) void load(); }}>
-    {opened && <>
+  return <div className="plugin-configuration-editor form-panel"><Disclosure title={t('plugins.editConfiguration')} open={opened} onOpenChange={(open) => { setOpened(open); if (open) { setActivated(true); void load(); } }}>
+    {activated && <>
       {loading && <div role="status">{t('common.loading')}</div>}
       {error && <div className="notice error" role="alert">{error}{!configuration && <button type="button" onClick={() => void load()}>{t('common.retry')}</button>}</div>}
       {message && <div className="notice success" role="status">{message}</div>}

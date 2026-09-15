@@ -120,10 +120,12 @@ test('plugin catalog is usable without unrelated route code or unopened configur
     await plugin.getByLabel('Mode').waitFor();
     assert.equal(await plugin.getByLabel('Mode').inputValue(), 'ready');
     assert.equal(configurationReads, 1);
+    await plugin.getByLabel('Mode').fill('unsaved draft');
     await configurationButton.press('Space');
     assert.equal(await plugin.getByLabel('Mode').isHidden(), true);
     await configurationButton.press('Space');
     await plugin.getByLabel('Mode').waitFor();
+    assert.equal(await plugin.getByLabel('Mode').inputValue(), 'unsaved draft', 'collapsing configuration must not discard an unsaved draft');
     assert.equal(configurationModuleRequests, 1, 'reopening the configuration surface reuses loaded form code');
     assert.equal(configurationReads, 1, 'reopening a loaded configuration does not duplicate the read');
   } finally {
