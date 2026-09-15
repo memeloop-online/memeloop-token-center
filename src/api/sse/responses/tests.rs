@@ -99,6 +99,42 @@ fn sanitizer_redacts_failures_and_rejects_terminal_conflicts() {
 }
 
 #[test]
+fn sanitizer_mints_progress_heartbeats_only_for_an_active_response() {
+    let mut sanitizer = ResponsesStreamingSanitizer::default();
+    assert!(sanitizer.progress_heartbeat().is_none());
+
+    sanitizer
+        .push(
+            b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-heartbeat\",\"model\":\"upstream-secret\",\"metadata\":{\"secret\":\"do-not-copy\"}}}\n\n",
+        )
+        .unwrap();
+    let heartbeat = sanitizer.progress_heartbeat().unwrap();
+    let mut heartbeat_framer = BoundedSseFramer::default();
+    let event = heartbeat_framer
+        .push(&heartbeat)
+        .events
+        .into_iter()
+        .next()
+        .unwrap();
+    let (event_name, data) = parse_sse_event(&event).unwrap();
+    assert_eq!(event_name.as_deref(), Some("response.in_progress"));
+    let payload: Value = serde_json::from_slice(&data.unwrap()).unwrap();
+    assert_eq!(payload["type"], "response.in_progress");
+    assert_eq!(payload["response"]["id"], "resp-heartbeat");
+    assert_eq!(payload["response"]["status"], "in_progress");
+    assert_eq!(payload["response"]["output"], json!([]));
+    assert!(payload.pointer("/response/model").is_none());
+    assert!(payload.pointer("/response/metadata").is_none());
+
+    sanitizer
+        .push(
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-heartbeat\"}}\n\n",
+        )
+        .unwrap();
+    assert!(sanitizer.progress_heartbeat().is_none());
+}
+
+#[test]
 fn failed_terminal_drops_a_bare_secret_event_before_done() {
     let stream = concat!(
         "event: response.failed\n",

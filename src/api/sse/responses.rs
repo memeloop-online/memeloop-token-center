@@ -1,5 +1,5 @@
 use axum::body::Bytes;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::{
     BoundedSseEvent, BoundedSseFramer, SAFE_SSE_HEARTBEAT_COMMENT, SseIdleControl,
@@ -137,6 +137,11 @@ pub(in crate::api) struct ResponsesStreamingSanitizer {
     forward_crlf_continuation: bool,
     identity: ResponseIdentityGate,
     terminal_hold: ResponseTerminalHold,
+    // This is derived only from the validated lifecycle identity. It is used
+    // by the Codex Responses proxy to make an otherwise quiet, long-running
+    // response observable to the downstream client without replaying an
+    // upstream payload.
+    progress_heartbeat: Option<Bytes>,
     // A fixed, low-cardinality operator diagnosis. It is deliberately never
     // derived from an upstream event, identifier, or payload.
     last_rejection_stage: Option<&'static str>,
@@ -189,6 +194,13 @@ impl ResponsesStreamingSanitizer {
     /// second terminal error.
     pub(in crate::api) fn has_failed_terminal(&self) -> bool {
         self.terminal == Some(StreamTerminal::Failed)
+    }
+
+    /// A canonical, non-terminal Responses lifecycle event for an active
+    /// response. The caller sends this directly to the downstream body: it is
+    /// intentionally excluded from capture, archival, usage, and billing.
+    pub(in crate::api) fn progress_heartbeat(&self) -> Option<Bytes> {
+        self.progress_heartbeat.clone()
     }
 
     /// A static parser boundary suitable for operator logs and metric labels.
@@ -336,6 +348,15 @@ impl ResponsesStreamingSanitizer {
             None => {}
         }
         self.terminal = terminal;
+        if matches!(payload_name, "response.created" | "response.in_progress")
+            && self.terminal.is_none()
+            && let Some(response_id) = self.identity.response_id.as_deref()
+        {
+            self.progress_heartbeat = Some(progress_heartbeat_event(response_id));
+        }
+        if self.terminal.is_some() {
+            self.progress_heartbeat = None;
+        }
         if matches!(
             terminal,
             Some(StreamTerminal::Completed | StreamTerminal::Incomplete)
@@ -370,6 +391,27 @@ impl ResponsesStreamingSanitizer {
         }
         Ok(())
     }
+}
+
+fn progress_heartbeat_event(response_id: &str) -> Bytes {
+    // Serialize the identifier rather than interpolating it into SSE. The
+    // identity gate already bounds and validates it, and JSON serialization
+    // preserves that guarantee if the accepted character set changes.
+    let data = serde_json::to_vec(&json!({
+        "type": "response.in_progress",
+        "response": {
+            "id": response_id,
+            "object": "response",
+            "status": "in_progress",
+            "output": [],
+        },
+    }))
+    .expect("a fixed Responses progress heartbeat is serializable");
+    let mut event = Vec::with_capacity(b"event: response.in_progress\ndata: \n\n".len() + data.len());
+    event.extend_from_slice(b"event: response.in_progress\ndata: ");
+    event.extend_from_slice(&data);
+    event.extend_from_slice(b"\n\n");
+    Bytes::from(event)
 }
 
 fn safe_sse_fields(event: &BoundedSseEvent) -> Vec<u8> {

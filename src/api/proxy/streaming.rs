@@ -16,6 +16,17 @@ enum DownstreamAwarePoll<T> {
     DownstreamClosed,
 }
 
+enum StreamPoll<T> {
+    Upstream(DownstreamAwarePoll<T>),
+    ProgressHeartbeat,
+    TimedOut,
+}
+
+// Codex treats an SSE connection with no Responses protocol event for about
+// five minutes as stalled. Keep a generous margin below that client limit
+// while avoiding a material per-request event rate.
+const CODEX_RESPONSES_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
 async fn poll_upstream_or_downstream_closed<T>(
     body_sender: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
     upstream: impl std::future::Future<Output = T>,
@@ -32,6 +43,34 @@ async fn poll_upstream_or_downstream_closed<T>(
             downstream_closed: body_sender.is_closed(),
         },
         _ = body_sender.closed() => DownstreamAwarePoll::DownstreamClosed,
+    }
+}
+
+async fn poll_upstream_downstream_or_progress_heartbeat<T>(
+    body_sender: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    upstream: impl std::future::Future<Output = T>,
+    stream_deadline: tokio::time::Instant,
+    progress_heartbeat_deadline: Option<tokio::time::Instant>,
+) -> StreamPoll<T> {
+    let upstream_poll = tokio::time::timeout_at(
+        stream_deadline,
+        poll_upstream_or_downstream_closed(body_sender, upstream),
+    );
+    tokio::pin!(upstream_poll);
+    if let Some(progress_heartbeat_deadline) = progress_heartbeat_deadline {
+        tokio::select! {
+            biased;
+            result = &mut upstream_poll => match result {
+                Ok(poll) => StreamPoll::Upstream(poll),
+                Err(_) => StreamPoll::TimedOut,
+            },
+            _ = tokio::time::sleep_until(progress_heartbeat_deadline) => StreamPoll::ProgressHeartbeat,
+        }
+    } else {
+        match upstream_poll.await {
+            Ok(poll) => StreamPoll::Upstream(poll),
+            Err(_) => StreamPoll::TimedOut,
+        }
     }
 }
 
@@ -220,6 +259,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let mut responses_streaming_sanitizer = (is_sse
                 && (is_codex_route || matches!(protocol, Protocol::OpenAiResponses)))
             .then(crate::api::sse::ResponsesStreamingSanitizer::default);
+            let codex_responses_progress_heartbeat =
+                is_sse && is_codex_route && matches!(protocol, Protocol::OpenAiResponses);
             let mut transport_error: Option<&'static str> = None;
             let mut response_bytes = 0_usize;
             let mut delivery_confirmed = false;
@@ -232,6 +273,11 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 .memory_usage(crate::metrics::MemoryComponent::StreamCapture, 0);
             let mut downstream_closed_observed = false;
             let mut downstream_ready_bytes = 0_usize;
+            // This stays `None` until a validated `response.created` or
+            // `response.in_progress` was delivered. The synthetic event is
+            // downstream-only, so it cannot alter archive contents, usage,
+            // settlement, or the delivery transition.
+            let mut progress_heartbeat_deadline = None;
             loop {
                 let mut flushing_terminal = false;
                 let next = if let Some(chunk) = terminal_delivery.take_pending() {
@@ -240,13 +286,15 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 } else if !terminal_delivery.upstream_poll_allowed() {
                     break;
                 } else {
-                    match tokio::time::timeout_at(
+                    match poll_upstream_downstream_or_progress_heartbeat(
+                        &body_sender,
+                        upstream_stream.next(),
                         stream_deadline,
-                        poll_upstream_or_downstream_closed(&body_sender, upstream_stream.next()),
+                        progress_heartbeat_deadline,
                     )
                     .await
                     {
-                        Ok(DownstreamAwarePoll::Upstream {
+                        StreamPoll::Upstream(DownstreamAwarePoll::Upstream {
                             value: next,
                             downstream_closed,
                         }) => {
@@ -256,12 +304,41 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             }
                             next
                         }
-                        Ok(DownstreamAwarePoll::DownstreamClosed) => {
+                        StreamPoll::Upstream(DownstreamAwarePoll::DownstreamClosed) => {
                             transport_error = Some("downstream_disconnected");
                             drop(archive_sender.take());
                             break;
                         }
-                        Err(_) => {
+                        StreamPoll::ProgressHeartbeat => {
+                            let Some(heartbeat) = responses_streaming_sanitizer
+                                .as_ref()
+                                .and_then(
+                                    crate::api::sse::ResponsesStreamingSanitizer::progress_heartbeat,
+                                )
+                            else {
+                                progress_heartbeat_deadline = None;
+                                continue;
+                            };
+                            match tokio::time::timeout(
+                                MAX_DOWNSTREAM_SEND_WAIT,
+                                body_sender.send(Ok(heartbeat)),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {
+                                    progress_heartbeat_deadline = Some(
+                                        tokio::time::Instant::now()
+                                            + CODEX_RESPONSES_PROGRESS_HEARTBEAT_INTERVAL,
+                                    );
+                                    continue;
+                                }
+                                Ok(Err(_)) => transport_error = Some("downstream_disconnected"),
+                                Err(_) => transport_error = Some("downstream_backpressure"),
+                            }
+                            drop(archive_sender.take());
+                            break;
+                        }
+                        StreamPoll::TimedOut => {
                             transport_error = Some(transport_error_with_downstream_precedence(
                                 downstream_closed_observed || body_sender.is_closed(),
                                 "upstream_timeout",
@@ -599,6 +676,16 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             transport_error = Some("downstream_disconnected");
                             drop(archive_sender.take());
                             break;
+                        }
+                        if codex_responses_progress_heartbeat
+                            && progress_heartbeat_deadline.is_none()
+                            && let Some(sanitizer) = responses_streaming_sanitizer.as_ref()
+                            && sanitizer.progress_heartbeat().is_some()
+                        {
+                            progress_heartbeat_deadline = Some(
+                                tokio::time::Instant::now()
+                                    + CODEX_RESPONSES_PROGRESS_HEARTBEAT_INTERVAL,
+                            );
                         }
                         if strict_chat_terminal_ready {
                             break;
