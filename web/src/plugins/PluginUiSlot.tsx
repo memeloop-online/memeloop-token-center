@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { parsePluginUiProjection, type PluginUiPolicy, type PluginUiProjection } from './uiProjection.js';
-import { AnalyticsMetric } from '../operator/AnalyticsMetric';
+import { AnalyticsMetric } from '../operator/AnalyticsMetric.js';
 
 export interface PluginUiSlotProps extends PluginUiPolicy {
   /** Changes on tenant, principal, credential/authorization revision, or plugin revision. */
