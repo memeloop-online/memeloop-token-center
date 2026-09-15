@@ -138,7 +138,7 @@ Then('插件配置由 Schema 渲染并可保存租户覆盖', async function (th
   const page = this.requirePage();
   await openAppRoute(page, 'operator', 'plugins');
   const plugin = page.locator('.managed-resource').filter({ hasText: 'browser-configuration' });
-  await plugin.locator('summary').click();
+  await plugin.getByRole('button', { name: '查看与编辑配置', exact: true }).click();
   await assertContains(plugin, '插件默认值');
   await plugin.getByLabel('Mode').selectOption('configured');
   const saveResponse = page.waitForResponse((response) =>

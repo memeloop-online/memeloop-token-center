@@ -80,6 +80,7 @@ test('Operator plugin page installs, explicitly reviews, publishes and rolls bac
     const reference = `ghcr.io/example/new@sha256:${'a'.repeat(64)}`;
     await page.getByLabel('Digest-pinned OCI references (one per line)').fill(reference);
     await page.getByRole('button', { name: 'Install for review' }).click();
+    await page.getByRole('button', { name: 'Tasks and version records' }).click();
     const approve = page.getByRole('button', { name: 'Approve this exact inventory', exact: true });
     await approve.waitFor();
     assert.equal(await approve.isDisabled(), true);
@@ -97,9 +98,24 @@ test('Operator plugin page installs, explicitly reviews, publishes and rolls bac
     assert.deepEqual(writes[0].body, { inventory_id: 'new-inventory', packages: [reference] });
     assert.ok(writes.every((write) => typeof write.key === 'string' && write.key.length > 0));
     assert.deepEqual(writes.map((write) => write.path), ['/internal/v1/plugin-runtime/installations', '/internal/v1/plugin-runtime/installations/job/approve', '/internal/v1/plugin-runtime/publish', '/internal/v1/plugin-runtime/rollback']);
+    // Status and history are independent reads. A status failure must not hide
+    // installation, review or durable history that loaded successfully.
+    job!.status = 'review';
+    const failStatus = (route: import('playwright').Route) => route.fulfill({ status: 503, json: { error: { message: 'runtime status unavailable' } } });
+    await page.route('**/internal/v1/plugin-runtime', failStatus);
+    await page.reload();
+    await page.getByText('runtime status unavailable', { exact: false }).waitFor();
+    await page.getByLabel('New inventory ID').waitFor();
+    await page.getByRole('button', { name: 'Tasks and version records' }).click();
+    await page.getByRole('heading', { name: 'Version history', exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Review manifest and requested capabilities' }).waitFor();
+    assert.equal(await page.getByRole('checkbox', { name: 'Approve this exact inventory' }).count(), 1);
+    await page.getByText('baseline', { exact: false }).first().waitFor();
+    await page.unroute('**/internal/v1/plugin-runtime', failStatus);
     // A global reader can inspect history but cannot publish or roll back.
     await page.route('**/internal/v1/plugins/runtime-access', route => route.fulfill({ json: { can_view_runtime: true, can_manage_runtime: false } }));
     await page.reload();
+    await page.getByRole('button', { name: 'Tasks and version records' }).click();
     await page.getByRole('heading', { name: 'Version history', exact: true }).waitFor();
     assert.equal(await page.getByRole('button', { name: 'Install for review' }).count(), 0);
     assert.equal(await page.getByRole('button', { name: 'Publish inventory', exact: true }).first().isDisabled(), true);

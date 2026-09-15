@@ -5,6 +5,7 @@ import { PluginRuntimeManager } from '../PluginRuntimeManager';
 import { Plugins } from '../Plugins';
 import { useOperatorResource } from '../hooks/useOperatorResource';
 import type { ResourceState } from '../hooks/useOperatorResource';
+import '../pluginManagement.css';
 
 interface PluginsPageProps {
   token: string;
@@ -29,7 +30,7 @@ export function PluginsPage({ token, tenant, writeTenant, catalog, reloadCatalog
     ? <p className="notice error" role="alert">{access.state.message}</p>
     : access.state.kind === 'ready' && access.state.value.can_view_runtime
       ? <PluginRuntimeManager key={token} token={token} canManage={access.state.value.can_manage_runtime} onPublished={reloadCatalog} /> : null;
-  if (catalog.scopeKey !== token || catalog.kind === 'idle' || catalog.kind === 'loading') return <>{manager}<div className="empty">{t('common.loading')}</div></>;
-  if (catalog.kind === 'failed') return <>{manager}<div className="notice error" role="alert">{catalog.message}<button type="button" onClick={() => void reloadCatalog()}>{t('common.retry')}</button></div></>;
-  return <>{manager}<button type="button" className="secondary" onClick={() => void reloadCatalog()}>{t('plugins.refreshCatalog')}</button>{catalog.refreshError && <div className="notice error" role="alert">{catalog.refreshError}</div>}<Plugins key={`${token}\0${tenant}\0${writeTenant}`} token={token} tenant={tenant} writeTenant={writeTenant} values={catalog.value} /></>;
+  if (catalog.scopeKey !== token || catalog.kind === 'idle' || catalog.kind === 'loading') return <div className="plugin-management-flow">{manager}<div className="empty">{t('common.loading')}</div></div>;
+  if (catalog.kind === 'failed') return <div className="plugin-management-flow">{manager}<div className="notice error" role="alert">{catalog.message}<button type="button" onClick={() => void reloadCatalog()}>{t('common.retry')}</button></div></div>;
+  return <div className="plugin-management-flow">{manager}<Plugins key={`${token}\0${tenant}\0${writeTenant}`} token={token} tenant={tenant} writeTenant={writeTenant} values={catalog.value} onRefresh={reloadCatalog} refreshError={catalog.refreshError} /></div>;
 }

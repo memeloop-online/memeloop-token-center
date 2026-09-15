@@ -1,0 +1,91 @@
+.plugin-management-flow {
+  display: grid;
+  gap: var(--spacingVerticalXL);
+}
+
+.plugin-management-flow > .panel {
+  margin-bottom: 0;
+}
+
+.plugin-runtime-disclosures {
+  margin-top: var(--spacingVerticalL);
+}
+
+.plugin-runtime-disclosures .fui-AccordionHeader__button,
+.plugin-configuration-editor .fui-AccordionHeader__button {
+  justify-content: flex-start;
+  min-height: 44px;
+  padding-inline: 0;
+}
+
+.plugin-runtime-section {
+  display: grid;
+  gap: var(--spacingVerticalM);
+  padding: 0 0 var(--spacingVerticalL) var(--spacingHorizontalXXL);
+}
+
+.plugin-runtime-section > section + section {
+  border-top: 1px solid var(--colorNeutralStroke2);
+  padding-top: var(--spacingVerticalL);
+}
+
+.plugin-runtime-section h3 {
+  font-size: 15px;
+  margin: 0;
+}
+
+.plugin-runtime-list {
+  display: grid;
+}
+
+.plugin-runtime-resource-heading,
+.plugin-runtime-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacingHorizontalS);
+}
+
+.plugin-runtime-actions button,
+.plugin-runtime-section > section > button {
+  margin-right: var(--spacingHorizontalS);
+}
+
+.plugin-runtime-install-form {
+  display: grid;
+  gap: var(--spacingVerticalS);
+  max-width: 52rem;
+}
+
+.plugin-runtime-install-form label {
+  color: var(--colorNeutralForeground2);
+  display: grid;
+  font-size: 12px;
+  gap: var(--spacingVerticalXS);
+}
+
+.plugin-runtime-install-form button {
+  justify-self: start;
+}
+
+.plugin-configuration-editor {
+  border-top: 1px solid var(--colorNeutralStroke2);
+  margin-top: var(--spacingVerticalM);
+}
+
+.plugin-configuration-editor .fui-AccordionPanel {
+  padding-inline: var(--spacingHorizontalXXL) 0;
+}
+
+@media (width <= 480px) {
+  .plugin-runtime-section,
+  .plugin-configuration-editor .fui-AccordionPanel {
+    padding-left: var(--spacingHorizontalL);
+  }
+
+  .plugin-runtime-actions button,
+  .plugin-runtime-install-form button {
+    flex: 1 1 auto;
+    width: 100%;
+  }
+}
