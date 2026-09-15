@@ -3,6 +3,7 @@ import { Disclosure } from './design-system';
 import {
   projectSessionReplay,
   SESSION_REPLAY_MAX_REQUESTS,
+  SESSION_REPLAY_MAX_ITEMS,
   type ReplayUnknownReason,
   type SessionReplayItem,
 } from './sessionReplayProjection.js';
@@ -11,6 +12,7 @@ import type { LogicalSessionDetail, RequestDetail, RequestView } from './types.j
 import './sessionReplay.css';
 
 const REPLAY_ARCHIVE_CONCURRENCY = 4;
+const REPLAY_ARCHIVE_PAGE_SIZE = 12;
 const REPLAY_EXPAND_TEXT_LENGTH = 1_600;
 
 export type SessionReplayArchiveLoader = (request: RequestView, signal: AbortSignal) => Promise<RequestDetail>;
@@ -56,7 +58,7 @@ function unknownLabel(t: Translate, reason: ReplayUnknownReason | null, requestA
   }
 }
 
-function messageLabel(t: Translate, role: 'user' | 'assistant') {
+function messageLabel(t: Translate, role: 'user' | 'assistant' | 'agent') {
   return role === 'user' ? t('sessionReplay.user') : t('sessionReplay.agent');
 }
 
@@ -123,13 +125,28 @@ function EntryContent({ entry, t }: { entry: ReplayEntry; t: Translate }) {
  * by the owning surface so this component never handles authentication material or broadens
  * archive authorization.
  */
-export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadArchiveDetail }: {
+export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadArchiveDetail, onLoadEarlierRequests, loadingEarlier = false }: {
   detail: LogicalSessionDetail;
   scopeKey?: string;
   loadArchiveDetail?: SessionReplayArchiveLoader;
+  onLoadEarlierRequests?: () => void;
+  loadingEarlier?: boolean;
 }) {
   const { t } = useI18n();
-  const orderedRequests = [...detail.requests].sort(requestOrder).slice(0, SESSION_REPLAY_MAX_REQUESTS);
+  const [archiveWindow, setArchiveWindow] = useState({ scopeKey, sessionId: detail.session_id, limit: REPLAY_ARCHIVE_PAGE_SIZE, offset: 0 });
+  const sameWindow = archiveWindow.scopeKey === scopeKey && archiveWindow.sessionId === detail.session_id;
+  const archiveLimit = sameWindow ? archiveWindow.limit : REPLAY_ARCHIVE_PAGE_SIZE;
+  const archiveOffset = sameWindow ? archiveWindow.offset : 0;
+  const orderedRequests = [...detail.requests].sort(requestOrder).slice(-archiveOffset - archiveLimit, archiveOffset ? -archiveOffset : undefined);
+  const pendingEarlier = useRef<{ sessionId: string; scopeKey: string; count: number; offset: number } | undefined>(undefined);
+  useEffect(() => {
+    const pending = pendingEarlier.current;
+    if (!pending) return;
+    if (pending.sessionId !== detail.session_id || pending.scopeKey !== scopeKey) { pendingEarlier.current = undefined; return; }
+    if (detail.requests.length <= pending.count) return;
+    setArchiveWindow({ scopeKey, sessionId: detail.session_id, offset: pending.offset, limit: REPLAY_ARCHIVE_PAGE_SIZE });
+    pendingEarlier.current = undefined;
+  }, [detail.session_id, scopeKey, detail.requests.length]);
   const visibleRevisions = new Map(orderedRequests.map(request => [request.request_id, archiveRevision(request)]));
   const [archivePage, setArchivePage] = useState<{ sessionId: string; scopeKey: string; loader?: SessionReplayArchiveLoader; values: RequestDetail[]; revisions: Map<string, string> }>({ sessionId: '', scopeKey: '', values: [], revisions: new Map() });
   // Scope and per-request freshness are checked during render, before effect cleanup.
@@ -140,8 +157,11 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
   const [archiveLoading, setArchiveLoading] = useState(Boolean(loadArchiveDetail));
   const entryRefs = useRef(new Map<string, HTMLElement>());
   const [selectedTurn, setSelectedTurn] = useState<string>();
+  const [retryRevision, setRetryRevision] = useState(0);
 
   const requestKey = JSON.stringify(orderedRequests.map(archiveRevision));
+  const [itemWindow, setItemWindow] = useState({ requestKey, scopeKey, offset: 0 });
+  const itemOffset = itemWindow.requestKey === requestKey && itemWindow.scopeKey === scopeKey ? itemWindow.offset : 0;
   // Live list refreshes create fresh objects even when archive inputs are unchanged.
   // Keep the bounded read batch stable so a busy session cannot starve its replay.
   const sourceRequests = useMemo(() => orderedRequests, [requestKey]);
@@ -219,9 +239,9 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
     scope.wanted = wanted;
     pump(scope);
     publish(scope);
-  }, [detail.session_id, scopeKey, loadArchiveDetail, requestKey, sourceRequests]);
+  }, [detail.session_id, scopeKey, loadArchiveDetail, requestKey, sourceRequests, retryRevision]);
 
-  const projection = projectSessionReplay(detail.session_id, archiveDetails);
+  const projection = useMemo(() => projectSessionReplay(detail.session_id, archiveDetails, itemOffset), [detail.session_id, archivePage, scopeKey, loadArchiveDetail, requestKey, itemOffset]);
   const loadedIds = new Set(archiveDetails.map((request) => request.request_id));
   const missingEntries: SessionReplayItem[] = archiveLoading ? [] : sourceRequests
     .filter((request) => !loadedIds.has(request.request_id))
@@ -241,7 +261,7 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
       const source = JSON.stringify([item.requestId, item.body]);
       const ordinal = sourceOrdinals.get(source) ?? 0;
       sourceOrdinals.set(source, ordinal + 1);
-      return { item, index, identity: JSON.stringify([item.requestId, item.body, ordinal]) };
+      return { item, index, identity: JSON.stringify([item.requestId, item.body, ordinal, itemOffset]) };
     })
     .sort((left, right) => (requestPositions.get(left.item.requestId) ?? Number.MAX_SAFE_INTEGER) - (requestPositions.get(right.item.requestId) ?? Number.MAX_SAFE_INTEGER)
       || bodyOrder(left.item) - bodyOrder(right.item)
@@ -262,11 +282,20 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
     return merged;
   }, []);
   const turns = entries.filter((entry) => entry.item.kind === 'message' && entry.item.role === 'user');
-  const turnIdentities = JSON.stringify(turns.map(entry => entry.identity));
+  const turnIdentities = JSON.stringify(entries.map(entry => entry.identity));
   useEffect(() => {
-    if (selectedTurn && !turns.some(entry => entry.identity === selectedTurn)) setSelectedTurn(undefined);
+    if (selectedTurn && !entries.some(entry => entry.identity === selectedTurn)) setSelectedTurn(undefined);
   }, [selectedTurn, turnIdentities]);
   const incompleteCount = archiveDetails.filter((request) => !request.archive_complete).length;
+  const activity = entries.filter((entry) => entry.item.kind !== 'unknown' && !(entry.item.kind === 'message' && entry.item.role === 'user'));
+  const unreadCount = sourceRequests.length - archiveDetails.length;
+
+  function retryUnread() {
+    const scope = readScope.current;
+    if (!scope || !current(scope)) return;
+    for (const id of scope.wanted.keys()) if (!scope.cache.has(id)) scope.finished.delete(id);
+    setRetryRevision((value) => value + 1);
+  }
 
   function selectTurn(turn: ReplayEntry) {
     setSelectedTurn(turn.identity);
@@ -279,14 +308,24 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
     <header className="session-replay-heading">
       <div><span className="eyebrow">{t('sessionReplay.title')}</span><h3>{t('sessionReplay.content')}</h3></div>
       <div className="session-replay-status" role="status" aria-live="polite">
-        {archiveLoading && <span>{t('sessionReplay.loading')}</span>}
+        {archiveLoading && <span>{t('sessionReplay.loadingProgress', { loaded: archiveDetails.length, total: sourceRequests.length })}</span>}
+        {!archiveLoading && unreadCount > 0 && <button type="button" className="secondary" onClick={retryUnread}>{t('sessionReplay.retryArchives')}</button>}
         {incompleteCount > 0 && <span>{t('sessionReplay.incomplete', { count: incompleteCount })}</span>}
-        {(projection.truncated || detail.requests.length > sourceRequests.length) && <span>{t('sessionReplay.truncated')}</span>}
+        {projection.truncated && <span>{t('sessionReplay.truncated')}</span>}
+        <span>{t('sessionReplay.archiveRange', { start: Math.max(1, detail.requests.length - archiveOffset - sourceRequests.length + 1), end: detail.requests.length - archiveOffset, total: detail.requests.length })}</span>
+        {archiveOffset > 0 && <button type="button" className="secondary" onClick={() => setArchiveWindow({ scopeKey, sessionId: detail.session_id, offset: Math.max(0, archiveOffset - SESSION_REPLAY_MAX_REQUESTS), limit: SESSION_REPLAY_MAX_REQUESTS })}>{t('sessionReplay.newerArchives')}</button>}
+        {detail.requests.length > archiveOffset + sourceRequests.length && <button type="button" className="secondary" onClick={() => setArchiveWindow({ scopeKey, sessionId: detail.session_id, offset: archiveLimit >= SESSION_REPLAY_MAX_REQUESTS ? archiveOffset + archiveLimit : archiveOffset, limit: archiveLimit >= SESSION_REPLAY_MAX_REQUESTS ? REPLAY_ARCHIVE_PAGE_SIZE : Math.min(archiveLimit + REPLAY_ARCHIVE_PAGE_SIZE, SESSION_REPLAY_MAX_REQUESTS) })}>{t('sessionReplay.loadEarlierArchives')}</button>}
+        {detail.requests.length <= archiveOffset + sourceRequests.length && detail.has_more && onLoadEarlierRequests && <button type="button" className="secondary" disabled={loadingEarlier} onClick={() => { pendingEarlier.current = { sessionId: detail.session_id, scopeKey, count: detail.requests.length, offset: archiveOffset + sourceRequests.length }; onLoadEarlierRequests(); }}>{loadingEarlier ? t('common.loading') : t('sessionReplay.loadEarlierArchives')}</button>}
       </div>
     </header>
+    {(itemOffset > 0 || projection.nextItemOffset !== null) && <nav className="session-refresh-controls" aria-label={t('sessionReplay.content')}>
+      <button type="button" className="secondary" disabled={archiveLoading || itemOffset === 0} onClick={() => setItemWindow({ requestKey, scopeKey, offset: Math.max(0, itemOffset - SESSION_REPLAY_MAX_ITEMS) })}>{t('sessionReplay.previousContent')}</button>
+      <span>{t('sessionReplay.itemRange', { start: itemOffset + 1, end: itemOffset + projection.items.length, total: projection.totalItems })}</span>
+      <button type="button" className="secondary" disabled={archiveLoading || projection.nextItemOffset === null} onClick={() => setItemWindow({ requestKey, scopeKey, offset: projection.nextItemOffset ?? itemOffset })}>{t('sessionReplay.nextContent')}</button>
+    </nav>}
     <div className="session-replay-layout">
       <aside className="session-replay-turns" aria-label={t('sessionReplay.userTurns')}>
-        <div className="session-replay-turn-heading"><span>{t('sessionReplay.userTurns')}</span><b>{turns.length}</b></div>
+        <div className="session-replay-turn-heading"><span>{t('sessionReplay.userTurns')}</span><b>{archiveLoading && !turns.length ? '—' : turns.length}</b></div>
         {turns.length > 0 ? <ol>{turns.map((turn, index) => {
           const message = turn.item.kind === 'message' ? turn.item : undefined;
           const fullText = message?.text ?? unknownLabel(t, message?.unknown ?? null);
@@ -297,7 +336,9 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
             aria-pressed={selectedTurn === turn.identity}
             onClick={() => selectTurn(turn)}
           ><span>{index + 1}</span><b>{fullText}</b></button></li>;
-        })}</ol> : <p>{t('sessionReplay.noUserTurns')}</p>}
+        })}</ol> : <p role="status">{archiveLoading ? t('sessionReplay.loading') : t('sessionReplay.noUserTurns')}</p>}
+        <div className="session-replay-turn-heading"><span>{t('sessionReplay.activity')}</span><b>{archiveLoading && !activity.length ? '—' : activity.length}</b></div>
+        <ol>{activity.map((entry, index) => <li key={entry.identity}><button type="button" aria-pressed={selectedTurn === entry.identity} onClick={() => selectTurn(entry)}><span>{index + 1}</span><b>{entry.item.kind === 'message' ? entry.item.text || t('sessionReplay.agent') : entry.item.kind === 'tool_call' ? entry.item.name || t('sessionReplay.toolCall') : entry.item.kind === 'tool_result' ? entry.item.name || t('sessionReplay.toolResult') : ''}</b></button></li>)}</ol>
       </aside>
       <ol className="session-replay-feed" aria-label={t('sessionReplay.archiveSequence')}>
         {entries.map((entry) => <li

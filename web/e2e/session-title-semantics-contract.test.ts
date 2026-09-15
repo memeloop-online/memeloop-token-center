@@ -4,19 +4,19 @@ import test from 'node:test';
 
 const sessions = await readFile(new URL('../src/SessionViews.tsx', import.meta.url), 'utf8');
 
-test('session titles use only explicitly reported names', () => {
-  assert.match(sessions, /session\.session_name \|\| t\('sessions\.reportedNameMissing'\)/);
-  assert.match(sessions, /declaredSessionName \|\| summary\?\.session_name \|\| t\('sessions\.reportedNameMissing'\)/);
+test('session titles prefer reported names and use a labelled short identity when absent', () => {
+  assert.match(sessions, /session\.session_name \|\| t\('sessions\.displayNameFallback', \{ id: session\.session_id\.slice\(-8\) \}\)/);
+  assert.match(sessions, /declaredSessionName \|\| summary\?\.session_name \|\| t\('sessions\.displayNameFallback'/);
   assert.doesNotMatch(sessions, /sessions\.sessionTitle/);
   assert.doesNotMatch(sessions, /declaredSessionName \|\| summary\?\.model/);
 });
 
-test('session identifiers remain inside diagnostic disclosures', () => {
+test('full session identifiers remain inside diagnostic disclosures', () => {
   assert.match(sessions, /<details><summary>\{t\('sessions\.diagnostics'\)\}<\/summary><code>\{session\.session_id\}<\/code>/);
   assert.match(sessions, /showDiagnosticIds && <div className="session-diagnostics"><Disclosure/);
   assert.match(sessions, /reportedSessionId && <>/);
   assert.doesNotMatch(sessions, /reportedSession && <span>/);
-  assert.doesNotMatch(sessions, /const title[^;]*session_id/);
+  assert.doesNotMatch(sessions, /const title[^;]*session_id\s*;/);
 });
 
 test('semantic warnings and duration chart use localized product copy', () => {

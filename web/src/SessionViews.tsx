@@ -168,7 +168,7 @@ export function SessionList({ values, loading, showCredential, onSelect, selecte
   if (!values.length) return <div className="empty">{loading ? t('common.loading') : t('sessions.empty')}</div>;
   if (layout === 'sidebar') return <div className="session-list session-list-sidebar" aria-label={t('sessions.recent')}>
     {values.map((session) => {
-      const title = session.unlinked ? t('sessions.unlinkedRequests') : session.session_name || t('sessions.reportedNameMissing');
+      const title = session.unlinked ? t('sessions.unlinkedRequests') : session.session_name || t('sessions.displayNameFallback', { id: session.session_id.slice(-8) });
       const isSelected = selected?.session_id === session.session_id && selected?.key_id === session.key_id;
       return <article className="session-card session-sidebar-card" key={`${session.key_id}:${session.session_id}`}>
         <button type="button" className={`session-sidebar-item${isSelected ? ' selected' : ''}`} onClick={() => onSelect(session)} aria-pressed={isSelected} aria-label={t('sessions.open', { name: title })}>
@@ -182,7 +182,7 @@ export function SessionList({ values, loading, showCredential, onSelect, selecte
   return <div className="session-list">{values.map((session) => {
     const title = session.unlinked
       ? t('sessions.unlinkedRequests')
-      : session.session_name || t('sessions.reportedNameMissing');
+      : session.session_name || t('sessions.displayNameFallback', { id: session.session_id.slice(-8) });
     return <article className="session-card" key={`${session.key_id}:${session.session_id}`}>
       <div className="session-card-heading"><b>{title}</b><span>{session.task_kind && <span className="pill">{session.task_kind}</span>}<span className={`status ${statusTone(session.last_status)}`}>{t(`sessions.status.${session.last_status}`)}</span></span></div>
       {session.unlinked && <span className="session-unlinked-label">{t('sessions.unlinkedReason')}</span>}
@@ -292,7 +292,7 @@ export function SessionDetailSurface({ detail, summary, currency, showDiagnostic
   const reportedSessionId = [...detail.requests].reverse().find((request) => request.structure?.session_id)?.structure?.session_id;
   const title = detail.unlinked
     ? t('sessions.unlinkedRequests')
-    : declaredSessionName || summary?.session_name || t('sessions.reportedNameMissing');
+    : declaredSessionName || summary?.session_name || t('sessions.displayNameFallback', { id: detail.session_id.slice(-8) });
   const confirmedEdges = detail.edges.filter((edge) => edge.relation !== 'candidate');
   const candidateEdges = detail.edges.filter((edge) => edge.relation === 'candidate');
   const requestPositions = new Map(detail.requests.map((request, index) => [request.request_id, { index: index + 1, createdAt: request.created_at }]));
@@ -304,8 +304,8 @@ export function SessionDetailSurface({ detail, summary, currency, showDiagnostic
   return <section className="session-detail" aria-label={title}>
     <header className="session-detail-heading"><div><span className="eyebrow">{t('sessions.logicalSession')}</span><h2>{title}</h2>{detail.unlinked && <p className="mtc-secondary-text">{t('sessions.unlinkedDetail')}</p>}</div>{onClose && <button type="button" className="secondary" onClick={onClose} aria-label={t('common.close')}>×</button>}</header>
     {showDiagnosticIds && <div className="session-diagnostics"><Disclosure title={t('sessions.diagnostics')}><code className="break-anywhere">{detail.session_id}</code><CopyDiagnostic value={detail.session_id} kind="session" />{reportedSessionId && <><small>{t('sessions.reportedSession')}</small><code className="break-anywhere">{reportedSessionId}</code><CopyDiagnostic value={reportedSessionId} kind="session" /></>}</Disclosure></div>}
-    <SessionReplayPanel detail={detail} scopeKey={summary?.key_id ?? detail.session_id} loadArchiveDetail={loadReplayArchive} />
-    <Disclosure title={t('sessions.executionTimeline')}><SessionActivity detail={detail} summary={summary} currency={currency} loading={loading} onSelect={onSelect} /></Disclosure>
+    {!(detail.unlinked && detail.session_id.startsWith('unlinked:')) && <SessionReplayPanel detail={detail} scopeKey={summary?.key_id ?? detail.session_id} loadArchiveDetail={loadReplayArchive} onLoadEarlierRequests={onLoadOlder} loadingEarlier={loading} />}
+    <Disclosure title={t('sessions.executionTimeline')} defaultOpen={detail.unlinked}><SessionActivity detail={detail} summary={summary} currency={currency} loading={loading} onSelect={onSelect} /></Disclosure>
     {detail.has_more && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('sessions.loadEarlier')}</button></div>}
     {!detail.unlinked && <Disclosure title={t('sessions.semantic')}><SemanticExecutionPanel detail={detail} /></Disclosure>}
     <details className="session-relationships"><summary>{t('sessions.relationships')}</summary>{detail.edges_truncated && <div className="notice warning">{t('sessions.edgesTruncated')}</div>}<div className="edge-list">{confirmedEdges.map((edge) => <div className="edge" key={`${edge.from_request_id ?? 'root'}-${edge.to_request_id}-${edge.relation}`}>
@@ -332,7 +332,7 @@ export function SessionDrawer({ detail, summary, currency, showDiagnosticIds = f
   const declaredSessionName = [...detail.requests].reverse().find((request) => request.execution?.session_name)?.execution?.session_name;
   const title = detail.unlinked
     ? t('sessions.unlinkedRequests')
-    : declaredSessionName || summary?.session_name || t('sessions.reportedNameMissing');
+    : declaredSessionName || summary?.session_name || t('sessions.displayNameFallback', { id: detail.session_id.slice(-8) });
   return <DrawerFrame title={title} eyebrow={t('sessions.logicalSession')} onClose={onClose}>
     <SessionDetailSurface detail={detail} summary={summary} currency={currency} showDiagnosticIds={showDiagnosticIds} loading={loading} onLoadOlder={onLoadOlder} onSelect={onSelect} />
   </DrawerFrame>;

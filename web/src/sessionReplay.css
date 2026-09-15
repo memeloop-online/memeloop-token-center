@@ -19,6 +19,22 @@
   background: linear-gradient(135deg, var(--replay-surface), var(--replay-surface-deep));
 }
 
+.mtc-fluent-root .session-replay {
+  --replay-surface: var(--colorNeutralBackground1);
+  --replay-surface-deep: var(--colorNeutralBackground2);
+  --replay-entry: var(--colorNeutralBackground1);
+  --replay-code: var(--colorNeutralBackground2);
+  --replay-border: var(--colorNeutralStroke2);
+  --replay-border-subtle: var(--colorNeutralStroke2);
+  --replay-text: var(--colorNeutralForeground1);
+  --replay-muted: var(--colorNeutralForeground2);
+  --replay-accent: var(--colorBrandForeground1);
+}
+.mtc-fluent-root .session-replay-turns { border: 0; border-radius: var(--borderRadiusMedium); }
+.mtc-fluent-root .session-replay-turns button { border: 0; border-radius: var(--borderRadiusMedium); }
+.mtc-fluent-root .session-replay-status span { border: 0; border-radius: 0; font-family: inherit; letter-spacing: normal; }
+.mtc-fluent-root .session-replay-entry { border-radius: var(--borderRadiusMedium); }
+
 .session-replay-heading,
 .session-replay-heading > div,
 .session-replay-status,

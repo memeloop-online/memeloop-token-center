@@ -75,7 +75,7 @@ test('slow replay reads survive live metadata refresh, publish incrementally and
     assert.equal(await originalTurn.getAttribute('aria-pressed'), 'true', 'earlier archives do not move the selected identity to another message');
     assert.equal(await page.locator('.session-replay-feed > li[data-retained-test="true"].selected').count(), 1, 'late insertion preserves the original message DOM and reading state');
     await page.getByRole('button', { name: 'Finish late archive', exact: true }).click();
-    await page.getByText('Late archive arrived', { exact: true }).waitFor();
+    await page.locator('.session-replay-feed').getByText('Late archive arrived', { exact: true }).waitFor();
     assert.equal(await page.evaluate(() => window.sessionReplayReads['replay-r1']), 2, 'complete archives are reused inside the same bounded scope');
     assert.equal(await page.evaluate(() => window.sessionReplayReads['replay-r3']), 3, 'late availability refreshes an incomplete archive');
     await page.getByRole('button', { name: 'Invalidate complete archive', exact: true }).click();
