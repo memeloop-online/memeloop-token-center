@@ -18,6 +18,7 @@ test('failed quota refresh labels retained zeroes as historical and hides unobse
   const browser = await chromium.launch({ headless: true });
   try {
     const page = await browser.newPage();
+    page.setDefaultTimeout(5_000);
     await page.clock.install();
     const forbiddenRequests: string[] = [];
     const pageErrors: string[] = [];
@@ -79,7 +80,7 @@ test('failed quota refresh labels retained zeroes as historical and hides unobse
     await mkdir(artifacts, { recursive: true });
     for (const theme of ['light', 'dark']) {
       await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
-      await summary.locator('[tabindex="0"]').focus();
+      await summary.locator('[tabindex="0"]').click();
       await windows.waitFor();
       await page.screenshot({ path: `${artifacts}/quota-summary-${theme}.png` });
       assert.equal(await summary.locator('meter').count(), 0, 'themed Fluent component, not a browser-colored native meter');
