@@ -3,6 +3,7 @@
 wit_bindgen::generate!({ path: "../../wit/token-center.wit", world: "group-routing-plugin" });
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -93,7 +94,11 @@ fn bounded(value: &str, max: usize) -> bool {
     value.len() <= max && !value.chars().any(char::is_control)
 }
 
-fn rank(candidate: &Candidate, input: &Input) -> Option<i64> {
+fn rank(
+    candidate: &Candidate,
+    input: &Input,
+    accounts: &BTreeMap<(&str, u64), &Account>,
+) -> Option<i64> {
     if candidate.health != Health::Healthy
         || input.config.target_provider.is_empty()
         || input.config.target_window_id.is_empty()
@@ -101,9 +106,7 @@ fn rank(candidate: &Candidate, input: &Input) -> Option<i64> {
         return None;
     }
     let context = &input.quota_context;
-    let account = context.accounts.iter().find(|account| {
-        account.account_id == candidate.account_id && account.generation == candidate.generation
-    })?;
+    let account = accounts.get(&(candidate.account_id.as_str(), candidate.generation))?;
     if account.provider != input.config.target_provider
         || account.observed_at < 0
         || account.observed_at > context.now_ms
@@ -140,8 +143,15 @@ fn plan(input: &str) -> Result<String, String> {
     }
     let mut input: Input = serde_json::from_str(input).map_err(|_| "invalid routing input")?;
     let context = &input.quota_context;
+    // Avoid quadratic account scans at the host's 1024-candidate bound.
+    let accounts: BTreeMap<_, _> = context
+        .accounts
+        .iter()
+        .map(|account| ((account.account_id.as_str(), account.generation), account))
+        .collect();
     if input.candidates.len() > 1024
         || context.accounts.len() > 1024
+        || accounts.len() != context.accounts.len()
         || context.version != "account-windows-v1"
         || context.now_ms < 0
         || input.remaining_deadline_ms == 0
@@ -151,11 +161,8 @@ fn plan(input: &str) -> Result<String, String> {
             .candidates
             .iter()
             .any(|candidate| candidate.tenant_id != input.tenant_id)
-        || context.accounts.iter().enumerate().any(|(index, account)| {
+        || context.accounts.iter().any(|account| {
             account.windows.len() > 64
-                || context.accounts[..index].iter().any(|other| {
-                    other.account_id == account.account_id && other.generation == account.generation
-                })
                 || account.windows.iter().enumerate().any(|(index, window)| {
                     !bounded(&window.id, 512)
                         || window.id.is_empty()
@@ -179,7 +186,7 @@ fn plan(input: &str) -> Result<String, String> {
         .iter()
         .enumerate()
         .filter_map(|(index, candidate)| {
-            rank(candidate, &input).map(|reset| (index, reset, candidate.clone()))
+            rank(candidate, &input, &accounts).map(|reset| (index, reset, candidate.clone()))
         })
         .collect();
     let slots: Vec<_> = eligible.iter().map(|(index, _, _)| *index).collect();
