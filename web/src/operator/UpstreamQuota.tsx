@@ -79,7 +79,8 @@ export function UpstreamQuotaResetSection({ accountId, accountName, tenant, toke
 }) {
   const { t, locale } = useI18n();
   const capability = snapshot?.reset_capability;
-  if (capability?.provider_supported === false) return null;
+  if (capability?.provider_supported === false
+    || (snapshot?.status === 'unsupported' && !capability?.implementation_available)) return null;
   const resetMessage = capability?.provider_supported == null ? 'quota.resetUnknown'
     : !capability.implementation_available ? 'quota.resetNotIntegrated' : 'quota.resetAvailable';
   const actionable = capability?.provider_supported === true && capability.implementation_available;

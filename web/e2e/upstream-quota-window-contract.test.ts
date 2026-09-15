@@ -11,7 +11,7 @@ test('quota URL requires and preserves explicit account and tenant identity', ()
 });
 
 test('unknown windows stay unknown and exact usage is not rounded or capped by the projection', () => {
-  const window: UpstreamQuotaSnapshot['windows'][number] = { id: 'primary', label: 'Primary', used_percent: null, remaining: null, limit: null, reset_at: null, period_seconds: null, source: 'provider', reset_is_estimated: false, allowed: null, limit_reached: null };
+  const window: UpstreamQuotaSnapshot['windows'][number] = { id: 'primary', label: 'Primary', used_percent: null, used: null, remaining: null, limit: null, unit: null, reset_at: null, period_seconds: null, source: 'provider', reset_is_estimated: false, allowed: null, limit_reached: null };
   assert.equal(quotaUsedPercent(window), null);
   assert.equal(quotaUsedPercent({ ...window, remaining: 25, limit: 100 }), 75);
   assert.equal(quotaUsedPercent({ ...window, remaining: 0, limit: 0 }), null);
@@ -43,7 +43,7 @@ test('quota countdown keeps minute, hour and day boundaries without sleeping or 
 });
 
 test('Codex window cadence follows supplier duration before internal primary or secondary role', () => {
-  const window: UpstreamQuotaSnapshot['windows'][number] = { id: 'code:primary_window', label: 'code:primary_window', used_percent: 0, remaining: null, limit: null, reset_at: null, period_seconds: 18_000, source: 'codex_usage', reset_is_estimated: false, allowed: true, limit_reached: false };
+  const window: UpstreamQuotaSnapshot['windows'][number] = { id: 'code:primary_window', label: 'code:primary_window', used_percent: 0, used: null, remaining: null, limit: null, unit: null, reset_at: null, period_seconds: 18_000, source: 'codex_usage', reset_is_estimated: false, allowed: true, limit_reached: false };
   assert.deepEqual(quotaWindowPresentation('openai-codex', window), {
     scopeKey: 'quota.scopeCodex', periodKey: 'quota.periodFiveHour', supplierLabel: null, qualifier: null,
   });
@@ -56,7 +56,7 @@ test('Codex window cadence follows supplier duration before internal primary or 
 });
 
 test('Kimi weekly usage is named semantically while unknown limit cadence is not guessed from reset dates', () => {
-  const window: UpstreamQuotaSnapshot['windows'][number] = { id: 'limit-0', label: 'limit-0', used_percent: 0, remaining: 100, limit: null, reset_at: 1789428406870, period_seconds: null, source: 'kimi_usage', reset_is_estimated: false, allowed: null, limit_reached: null };
+  const window: UpstreamQuotaSnapshot['windows'][number] = { id: 'limit-0', label: 'limit-0', used_percent: 0, used: null, remaining: 100, limit: null, unit: null, reset_at: 1789428406870, period_seconds: null, source: 'kimi_usage', reset_is_estimated: false, allowed: null, limit_reached: null };
   assert.deepEqual(quotaWindowPresentation('kimi-oauth', window), {
     scopeKey: 'quota.scopeKimi', periodKey: 'quota.periodSupplier', supplierLabel: null, qualifier: null,
   });
@@ -72,9 +72,10 @@ test('Kimi weekly usage is named semantically while unknown limit cadence is not
 test('quota observation state does not confuse a failed refresh or expired snapshot with current data', () => {
   const snapshot: UpstreamQuotaSnapshot = {
     contract_version: 'upstream_quota_v1', upstream_account_id: 'account', tenant_external_id: 'tenant', provider: 'openai-codex',
-    status: 'ready', observed_at: 1_000, stale_after: 2_000, stale: false, plan_type: null,
-    credits: { balance: null, unlimited: null, has_credits: null }, windows: [],
-    reset_capability: { provider_supported: true, implementation_available: false, prepare_available: false, confirmation_required: false, retryable: false, available_credits: null, applicable_credits: null, reason: null, credit_error_code: null },
+    status: 'ready', observed_at: 1_000, stale_after: 2_000, stale: false, freshness: 'fresh', plan_type: null, workspace: null,
+    capabilities: { read: true, plan: true, workspace: false, window_amounts: false, window_amount_unit: false, window_percent: true, reset_credit_expiry: true, subscription_expiry: false, supplier_read_only: true, refreshes_credentials: false, consumes_reset_credit: false },
+    subscription_active_until: null, credits: { balance: null, unlimited: null, has_credits: null, source: null }, windows: [], reset_credits: [],
+    reset_capability: { provider_supported: true, implementation_available: false, prepare_available: false, confirmation_required: false, retryable: false, available_credits: null, applicable_credits: null, reason: 'quota_reset_not_supported', credit_error_code: null, evidence: 'server_driver_contract' },
     error_code: null,
   };
   assert.equal(quotaObservationState(snapshot, 1_500), 'current');
@@ -82,10 +83,10 @@ test('quota observation state does not confuse a failed refresh or expired snaps
   assert.equal(quotaObservationState({ ...snapshot, error_code: 'quota_transport_failed' }, 1_500), 'historical');
   assert.equal(quotaObservationState(snapshot, 2_000), 'historical');
   assert.equal(quotaObservationState({ ...snapshot, observed_at: null }, 1_500), 'unobserved');
-  const zeroWindow = { id: 'code:primary_window', label: 'code:primary_window', used_percent: 0, remaining: null, limit: null, reset_at: null, period_seconds: 18_000, source: 'codex_usage', reset_is_estimated: false, allowed: true, limit_reached: false };
+  const zeroWindow = { id: 'code:primary_window', label: 'code:primary_window', used_percent: 0, used: null, remaining: null, limit: null, unit: null, reset_at: null, period_seconds: 18_000, source: 'codex_usage', reset_is_estimated: false, allowed: true, limit_reached: false };
   assert.deepEqual(quotaSummaryPresentation({ ...snapshot, windows: [zeroWindow], error_code: 'quota_transport_failed' }, 1_500), { key: 'providerDirectory.refreshFailedUsed', usedPercent: 0 });
   assert.deepEqual(quotaSummaryPresentation({ ...snapshot, status: 'error', observed_at: null, windows: [zeroWindow] }, 1_500), { key: 'providerDirectory.readFailed', usedPercent: null });
-  const credit = { status: 'available', granted_at: 1000, expires_at: 9000, source: 'codex_reset_credits' };
+  const credit: UpstreamQuotaSnapshot['reset_credits'][number] = { status: 'available', granted_at: 1000, expires_at: 9000, source: 'codex_reset_credits' };
   assert.deepEqual(quotaResetCreditExpiry({ ...snapshot, reset_credits: [credit, { ...credit, expires_at: 5000 }, { ...credit, status: 'used', expires_at: 2000 }] }, 1500), { state: 'known', at: 5000 });
   assert.deepEqual(quotaResetCreditExpiry({ ...snapshot, reset_credits: [credit, { ...credit, expires_at: null }] }, 1500), { state: 'unknown' }, 'incomplete evidence cannot establish the earliest expiry');
   assert.deepEqual(quotaResetCreditExpiry(snapshot, 1500), { state: 'unknown' }, 'window reset dates cannot substitute for absent credit expiry');
