@@ -97,11 +97,16 @@ test('verified merge scope ignores a stale event base and fails closed for an un
   }
 });
 
-test('scope matrix skips expensive service gates only for web or static-contract pull requests', () => {
+test('scope matrix skips expensive service gates only for presentation or static-contract pull requests', () => {
   const matrix: readonly [label: string, changes: readonly Change[], expected: Record<string, string>][] = [
     ['PR 66-shaped web source and browser contract', [['M', 'web/src/useAnchoredPopover.ts'], ['A', 'web/e2e/popover-width-browser-contract.test.ts']], webOnly],
     ['web deletion', [['D', 'web/e2e/obsolete-browser-contract.test.ts']], webOnly],
     ['web-only rename', [['R100', 'web/src/old.tsx', 'web/src/new.tsx']], webOnly],
+    ['PR 251-shaped browser source, fixture, and design documentation', [
+      ['M', 'docs/fluent-design-system.md'],
+      ['M', 'web/e2e/fixtures/operator-overview.tsx'],
+      ['M', 'web/src/operator/pages/RequestsPage.tsx'],
+    ], webOnly],
     ['PR 115-shaped source module static contract', [['M', 'tests/ops/source-module-size-contract.test.ts']], staticContractsOnly],
     ['static contract helper', [['M', 'tests/ops/contract-helpers.ts']], staticContractsOnly],
     ['static contract plus runtime source', [['M', 'tests/ops/source-module-size-contract.test.ts'], ['M', 'src/api/routes/control.rs']], fullPlugin],
@@ -109,6 +114,7 @@ test('scope matrix skips expensive service gates only for web or static-contract
     ['CI scope script', [['M', 'ops/ci/detect-expensive-ci-scopes.ts']], full],
     ['production renamed into web', [['R100', 'src/api/routes.rs', 'web/src/routes.ts']], fullPlugin],
     ['web renamed into production', [['R100', 'web/src/routes.ts', 'src/api/routes.rs']], fullPlugin],
+    ['documentation renamed into production', [['R100', 'docs/operator.md', 'src/operator.rs']], fullPlugin],
     ['shared manifest', [['M', 'package-lock.json']], full],
     ['Rust manifest', [['M', 'Cargo.lock']], fullPlugin],
     ['migration', [['D', 'migrations/0099_retired.sql']], fullPlugin],
@@ -123,6 +129,23 @@ test('known documentation and ordinary test paths preserve existing memory polic
     scopes('pull_request', [['M', 'docs/performance.md'], ['M', 'tests/route_management.rs']]),
     { rust: 'true', web: 'true', migration: 'true', memory: 'false', memory_acceptance: 'false', plugin_installer: 'false' },
   );
+});
+
+test('the focused plugin UI workflow is manual because mandatory web CI already covers its browser contracts', () => {
+  const pluginWorkflow = readFileSync(join(repository, '.github/workflows/plugin-ui-projection.yml'), 'utf8');
+  const ciWorkflow = readFileSync(join(repository, '.github/workflows/ci.yml'), 'utf8');
+  const webPackage = JSON.parse(readFileSync(join(repository, 'web/package.json'), 'utf8')) as { scripts?: Record<string, string> };
+
+  assert.match(pluginWorkflow, /^  workflow_dispatch:/m);
+  assert.doesNotMatch(pluginWorkflow, /^  pull_request:/m);
+  assert.match(ciWorkflow, /MTC_REQUIRE_BROWSER=1 npm run test:localization/);
+  const mandatoryContracts = webPackage.scripts?.['test:localization'] ?? '';
+  assert.match(mandatoryContracts, /e2e\/\*-contract\.test\.ts/);
+  for (const contract of [
+    'e2e/plugin-ui-projection-contract.test.ts',
+    'e2e/plugin-ui-slot-browser-contract.test.ts',
+    'e2e/operator-plugin-projection-browser-contract.test.ts',
+  ]) assert.match(contract, /^e2e\/[^/]+-contract\.test\.ts$/);
 });
 
 test('pushes and malformed or empty pull-request diffs fail closed', () => {
