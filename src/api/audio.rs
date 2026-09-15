@@ -901,7 +901,7 @@ mod tests {
                     tenant_external_id: tenant.to_owned(),
                     name: "local-asr".to_owned(),
                     driver: "http-json".to_owned(),
-                    config: json!({"base_url":upstream.uri(),"network_scope":"public"}),
+                    config: json!({"base_url":upstream.uri(),"network_scope":"private"}),
                     credential: UpstreamCredential::None,
                     oauth_session_id: None,
                     oauth_driver: None,
