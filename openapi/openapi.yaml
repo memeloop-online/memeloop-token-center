@@ -2305,6 +2305,7 @@ paths:
       tags: [Upstream providers]
       operationId: completeProviderAuthorizationCode
       summary: Complete a revision-bound standard OAuth session
+      description: HTTP 409 with error.code oauth_identity_mismatch means the newly authorized Google account or original client binding did not match and this session has been terminated without changing the existing upstream. Other conflict codes do not imply this terminal state.
       security: [{ serviceBearer: [] }]
       x-required-scope: oauth:write
       requestBody:
@@ -2337,6 +2338,7 @@ paths:
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
         '502': { $ref: '#/components/responses/UpstreamError' }
 
   /internal/v1/oauth/claude/start:

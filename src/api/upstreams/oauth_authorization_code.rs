@@ -245,7 +245,7 @@ pub(in crate::api) async fn complete_authorization_code_oauth(
                         .db
                         .reject_generic_oauth_ready(ready.session_id, lease_owner, unix_millis())
                         .await?;
-                    return Err(AppError::Conflict("authorization belongs to a different upstream account; the existing account was not changed".into()));
+                    return Ok(identity_mismatch_response());
                 }
             }
             // Tokens are already durably staged before this recoverable read.
@@ -338,5 +338,26 @@ pub(in crate::api) async fn complete_authorization_code_oauth(
             )
                 .into_response())
         }
+    }
+}
+
+fn identity_mismatch_response() -> Response {
+    (StatusCode::CONFLICT, Json(json!({"error": {
+        "code": "oauth_identity_mismatch",
+        "message": "authorization belongs to a different upstream account; the existing account was not changed"
+    }}))).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn terminated_identity_session_has_a_distinct_machine_code() {
+        let response = super::identity_mismatch_response();
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["code"], "oauth_identity_mismatch");
     }
 }
