@@ -78,6 +78,8 @@ test('AppShell workspaces retain failed drafts, return after success, and priori
     await page.goto(`${origin}/e2e/fixtures/operator-credential-workspace.html?scenario=client-form`);
     const credential = page.locator('.credential-compact-row').first();
     await credential.waitFor();
+    const credentialArtifacts = `${root}/e2e-artifacts/ui-system/credentials`;
+    await mkdir(credentialArtifacts, { recursive: true });
     for (const theme of ['light', 'dark']) for (const width of [390, 1440]) {
       await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
       await page.setViewportSize({ width, height: 1000 });
@@ -90,7 +92,7 @@ test('AppShell workspaces retain failed drafts, return after success, and priori
       assert.ok(identityGap >= 0 && identityGap <= 24, 'identity remains beside its selection, not centered across the page');
       assert.equal(await credential.locator('.credential-row-actions').getByRole('button', { name: '更多操作', exact: true }).count(), 1, 'copy and secondary actions form one action group');
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
-      await page.screenshot({ path: `${artifacts}/credential-list-${theme}-${width}.png`, fullPage: true });
+      await page.screenshot({ path: `${credentialArtifacts}/credential-list-${theme}-${width}.png`, fullPage: true });
     }
     await page.locator('[data-workspace-toggle]').click();
     await page.locator('#root_principal_external_id').fill('fixture-principal');

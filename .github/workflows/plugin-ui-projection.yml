@@ -49,6 +49,6 @@ jobs:
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
         with:
           name: plugin-ui-slots-${{ github.sha }}
-          path: web/e2e-artifacts/plugin-ui-slots/
+          path: web/e2e-artifacts/ui-system/plugin-ui-slots/
           if-no-files-found: warn
           retention-days: 14
