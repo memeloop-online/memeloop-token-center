@@ -341,7 +341,7 @@ async fn discover_models(
         let body = crate::cursor_native::unary(
             state,
             credential,
-            crate::cursor_native::Method::GetUsableModels,
+            crate::cursor_native::Method::UsableModels,
         )
         .await?;
         return crate::cursor_native::models::decode(&body).map(|models| ("cursor_native", models));
