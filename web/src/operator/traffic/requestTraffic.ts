@@ -179,7 +179,7 @@ function mergeArchiveState(previous: RequestView['archive_state'], event: Reques
   // Archive terminal states are monotonic, and gap dominates bound when the
   // two terminal facts cannot be ordered by a shared cursor.
   if (previous === 'gap' || incoming === 'gap') return 'gap';
-  if (previous === 'bound') return 'bound';
+  if (previous === 'bound' || previous === 'metadata_only') return previous;
   return incoming;
 }
 

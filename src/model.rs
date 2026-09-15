@@ -647,6 +647,7 @@ pub enum RequestArchiveState {
     Capturing,
     Pending,
     Uploading,
+    MetadataOnly,
     Bound,
     Gap,
 }
@@ -657,6 +658,7 @@ impl RequestArchiveState {
             "capturing" => Some(Self::Capturing),
             "pending" => Some(Self::Pending),
             "uploading" => Some(Self::Uploading),
+            "metadata_only" => Some(Self::MetadataOnly),
             "bound" => Some(Self::Bound),
             "gap" => Some(Self::Gap),
             _ => None,

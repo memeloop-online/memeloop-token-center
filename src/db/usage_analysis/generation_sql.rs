@@ -30,25 +30,48 @@ pub(super) fn generation_usage_dimension_sql(
     let fact_filters = filters("f");
     format!(
         r#"WITH generation_activity AS (
-               SELECT a.tenant_id, a.key_id, a.model, a.status_class, a.error_code,
+               SELECT a.tenant_id, a.key_id, a.model,
+                      CASE WHEN a.modality = 'audio' AND a.billing_unit = 'second'
+                           THEN 'audio-transcription' ELSE 'generation' END AS protocol,
+                      a.status_class, a.error_code,
                       a.upstream_account_id, a.model_route_id, a.modality,
                       a.billing_unit, a.currency, a.units
                  FROM {table} a
                 WHERE a.{bucket_column} >= $3 AND a.{bucket_column} < $4
                   {rollup_filters}
                UNION ALL
-               SELECT f.tenant_id, f.key_id, f.model, f.status_class, f.error_code,
+               SELECT f.tenant_id, f.key_id, f.model, 'generation' AS protocol,
+                      f.status_class, f.error_code,
                       f.upstream_account_id, f.model_route_id, f.modality,
                       f.billing_unit, f.currency, f.billed_units
                  FROM generation_stats_facts f
                 WHERE $13 <= $14 AND f.created_at >= $13 AND f.created_at <= $14
                   {fact_filters}
                UNION ALL
-               SELECT f.tenant_id, f.key_id, f.model, f.status_class, f.error_code,
+               SELECT f.tenant_id, f.key_id, f.model, 'generation' AS protocol,
+                      f.status_class, f.error_code,
                       f.upstream_account_id, f.model_route_id, f.modality,
                       f.billing_unit, f.currency, f.billed_units
                  FROM generation_stats_facts f
                 WHERE $15 <= $16 AND f.created_at >= $15 AND f.created_at <= $16
+                  {fact_filters}
+               UNION ALL
+               SELECT f.tenant_id, f.key_id, f.model, 'audio-transcription' AS protocol,
+                      f.status_class, f.error_code, f.upstream_account_id,
+                      f.model_route_id, 'audio' AS modality, 'second' AS billing_unit,
+                      f.currency, f.generation_units
+                 FROM request_stats_facts f
+                WHERE $13 <= $14 AND f.created_at >= $13 AND f.created_at <= $14
+                  AND f.protocol = 'audio-transcription'
+                  {fact_filters}
+               UNION ALL
+               SELECT f.tenant_id, f.key_id, f.model, 'audio-transcription' AS protocol,
+                      f.status_class, f.error_code, f.upstream_account_id,
+                      f.model_route_id, 'audio' AS modality, 'second' AS billing_unit,
+                      f.currency, f.generation_units
+                 FROM request_stats_facts f
+                WHERE $15 <= $16 AND f.created_at >= $15 AND f.created_at <= $16
+                  AND f.protocol = 'audio-transcription'
                   {fact_filters}
            ),
            filtered_generation AS (
@@ -59,7 +82,7 @@ pub(super) fn generation_usage_dimension_sql(
                  JOIN principals principal
                    ON principal.id = k.principal_id
                   AND principal.tenant_id = k.tenant_id
-                WHERE ($6 = '' OR $6 = 'generation')
+                WHERE ($6 = '' OR activity.protocol = $6)
                   AND ($7 = ''
                        OR ($7 = 'success' AND activity.status_class = 'success')
                        OR ($7 = 'error' AND activity.status_class = 'failure'))

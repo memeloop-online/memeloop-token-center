@@ -521,6 +521,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "shared account quota observations",
         sql: include_str!("../../../migrations/common/0098_shared_quota_observations.sql"),
     },
+    Migration {
+        version: 99,
+        name: "request generation usage units",
+        sql: include_str!("../../../migrations/common/0099_request_generation_units.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1027,6 +1032,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 98,
         name: "shared account quota observations",
         sql: include_str!("../../../migrations/common/0098_shared_quota_observations.sql"),
+    },
+    Migration {
+        version: 99,
+        name: "request generation usage units",
+        sql: include_str!("../../../migrations/common/0099_request_generation_units.sql"),
     },
 ];
 

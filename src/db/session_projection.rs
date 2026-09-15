@@ -21,6 +21,7 @@ struct RequestSessionDelta {
     output_tokens: i64,
     cached_input_tokens: i64,
     cache_write_tokens: i64,
+    generation_units: i64,
     cost_micros: i64,
 }
 
@@ -38,7 +39,7 @@ pub(crate) async fn add_request_fact_to_session_projection_in_transaction(
                   CASE WHEN status_class = 'failure' THEN 1 ELSE 0 END,
                   CASE WHEN input_tokens >= cached_input_tokens + cache_write_tokens
                        THEN input_tokens - cached_input_tokens - cache_write_tokens ELSE 0 END,
-                  output_tokens, cached_input_tokens, cache_write_tokens, 0,
+                  output_tokens, cached_input_tokens, cache_write_tokens, generation_units,
                   1, duration_ms, cost_micros
              FROM request_stats_facts WHERE request_id = $1
            ON CONFLICT (tenant_id, key_id, session_id, currency) DO UPDATE SET
@@ -51,6 +52,7 @@ pub(crate) async fn add_request_fact_to_session_projection_in_transaction(
                output_tokens = session_usage_totals.output_tokens + excluded.output_tokens,
                cached_input_tokens = session_usage_totals.cached_input_tokens + excluded.cached_input_tokens,
                cache_write_tokens = session_usage_totals.cache_write_tokens + excluded.cache_write_tokens,
+               generation_units = session_usage_totals.generation_units + excluded.generation_units,
                duration_count = session_usage_totals.duration_count + 1,
                duration_sum_ms = session_usage_totals.duration_sum_ms + excluded.duration_sum_ms,
                cost_micros = session_usage_totals.cost_micros + excluded.cost_micros"#,
@@ -73,12 +75,13 @@ pub(crate) async fn add_request_fact_to_session_projection_in_transaction(
                SELECT tenant_id, key_id, session_id, created_at / {divisor}, model,
                       CASE WHEN protocol = 'anthropic' OR protocol LIKE 'anthropic-%'
                            THEN 'anthropic' WHEN protocol = 'openai-image' THEN 'openai-image'
+                           WHEN protocol = 'audio-transcription' THEN 'audio-transcription'
                            ELSE 'openai' END,
                       status_class, error_code, upstream_account_id, model_route_id,
                       currency, 1,
                       CASE WHEN input_tokens >= cached_input_tokens + cache_write_tokens
                            THEN input_tokens - cached_input_tokens - cache_write_tokens ELSE 0 END,
-                      output_tokens, cached_input_tokens, cache_write_tokens, 0,
+                      output_tokens, cached_input_tokens, cache_write_tokens, generation_units,
                       1, duration_ms, cost_micros
                  FROM request_stats_facts WHERE request_id = $1
                ON CONFLICT (
@@ -90,6 +93,7 @@ pub(crate) async fn add_request_fact_to_session_projection_in_transaction(
                    output_tokens = {table}.output_tokens + excluded.output_tokens,
                    cached_input_tokens = {table}.cached_input_tokens + excluded.cached_input_tokens,
                    cache_write_tokens = {table}.cache_write_tokens + excluded.cache_write_tokens,
+                   generation_units = {table}.generation_units + excluded.generation_units,
                    duration_count = {table}.duration_count + 1,
                    duration_sum_ms = {table}.duration_sum_ms + excluded.duration_sum_ms,
                    cost_micros = {table}.cost_micros + excluded.cost_micros"#,
@@ -112,7 +116,7 @@ pub(crate) async fn reclassify_request_session_in_transaction(
                   fact.model, fact.protocol, fact.status_class, fact.error_code,
                   fact.upstream_account_id, fact.model_route_id, fact.currency,
                   fact.duration_ms, fact.input_tokens, fact.output_tokens,
-                  fact.cached_input_tokens, fact.cache_write_tokens,
+                  fact.cached_input_tokens, fact.cache_write_tokens, fact.generation_units,
                   fact.cost_micros,
                   COALESCE(record.conversation_cluster_id,
                            'unlinked:' || fact.key_id) AS authoritative_session_id
@@ -152,6 +156,7 @@ pub(crate) async fn reclassify_request_session_in_transaction(
         output_tokens: row.try_get("output_tokens")?,
         cached_input_tokens: row.try_get("cached_input_tokens")?,
         cache_write_tokens: row.try_get("cache_write_tokens")?,
+        generation_units: row.try_get("generation_units")?,
         cost_micros: row.try_get("cost_micros")?,
     };
     if delta.previous_session_id == delta.authoritative_session_id {
@@ -201,20 +206,22 @@ async fn remove_request_fact_from_session_projection_in_transaction(
                output_tokens = output_tokens - $3,
                cached_input_tokens = cached_input_tokens - $4,
                cache_write_tokens = cache_write_tokens - $5,
+               generation_units = generation_units - $6,
                duration_count = duration_count - 1,
-               duration_sum_ms = duration_sum_ms - $6,
-               cost_micros = cost_micros - $7
-           WHERE tenant_id = $8 AND key_id = $9 AND session_id = $10 AND currency = $11
+               duration_sum_ms = duration_sum_ms - $7,
+               cost_micros = cost_micros - $8
+           WHERE tenant_id = $9 AND key_id = $10 AND session_id = $11 AND currency = $12
              AND requests >= 1 AND errors >= $1 AND input_tokens >= $2
              AND output_tokens >= $3 AND cached_input_tokens >= $4
-             AND cache_write_tokens >= $5 AND duration_count >= 1
-             AND duration_sum_ms >= $6 AND cost_micros >= $7"#,
+             AND cache_write_tokens >= $5 AND generation_units >= $6
+             AND duration_count >= 1 AND duration_sum_ms >= $7 AND cost_micros >= $8"#,
     )
     .bind(error_delta)
     .bind(delta.input_tokens)
     .bind(delta.output_tokens)
     .bind(delta.cached_input_tokens)
     .bind(delta.cache_write_tokens)
+    .bind(delta.generation_units)
     .bind(delta.duration_ms)
     .bind(delta.cost_micros)
     .bind(&delta.tenant_id)
@@ -289,23 +296,25 @@ async fn remove_request_fact_from_session_projection_in_transaction(
                    output_tokens = output_tokens - $2,
                    cached_input_tokens = cached_input_tokens - $3,
                    cache_write_tokens = cache_write_tokens - $4,
+                   generation_units = generation_units - $5,
                    duration_count = duration_count - 1,
-                   duration_sum_ms = duration_sum_ms - $5,
-                   cost_micros = cost_micros - $6
-               WHERE tenant_id = $7 AND key_id = $8 AND session_id = $9
-                 AND {bucket_column} = $10 AND model = $11 AND protocol = $12
-                 AND status_class = $13 AND error_code = $14
-                 AND upstream_account_id = $15 AND model_route_id = $16
-                 AND currency = $17 AND requests >= 1 AND input_tokens >= $1
+                   duration_sum_ms = duration_sum_ms - $6,
+                   cost_micros = cost_micros - $7
+               WHERE tenant_id = $8 AND key_id = $9 AND session_id = $10
+                 AND {bucket_column} = $11 AND model = $12 AND protocol = $13
+                 AND status_class = $14 AND error_code = $15
+                 AND upstream_account_id = $16 AND model_route_id = $17
+                 AND currency = $18 AND requests >= 1 AND input_tokens >= $1
                  AND output_tokens >= $2 AND cached_input_tokens >= $3
-                 AND cache_write_tokens >= $4 AND duration_count >= 1
-                 AND duration_sum_ms >= $5 AND cost_micros >= $6"#,
+                 AND cache_write_tokens >= $4 AND generation_units >= $5
+                 AND duration_count >= 1 AND duration_sum_ms >= $6 AND cost_micros >= $7"#,
         );
         let updated = sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(delta.input_tokens)
             .bind(delta.output_tokens)
             .bind(delta.cached_input_tokens)
             .bind(delta.cache_write_tokens)
+            .bind(delta.generation_units)
             .bind(delta.duration_ms)
             .bind(delta.cost_micros)
             .bind(&delta.tenant_id)
@@ -360,6 +369,8 @@ fn canonical_session_protocol(protocol: &str) -> &str {
         "anthropic"
     } else if protocol == "openai-image" {
         "openai-image"
+    } else if protocol == "audio-transcription" {
+        "audio-transcription"
     } else {
         "openai"
     }
@@ -398,7 +409,7 @@ async fn rebuild_request_session_projection_in_transaction(
                           WHEN input_tokens >= cached_input_tokens + cache_write_tokens
                           THEN input_tokens - cached_input_tokens - cache_write_tokens ELSE 0 END),
                   SUM(output_tokens), SUM(cached_input_tokens), SUM(cache_write_tokens),
-                  0, COUNT(*), SUM(duration_ms), SUM(cost_micros)
+                  SUM(generation_units), COUNT(*), SUM(duration_ms), SUM(cost_micros)
              FROM request_stats_facts
             WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3
             GROUP BY tenant_id, key_id, session_id, currency"#,
@@ -454,6 +465,7 @@ async fn rebuild_request_session_projection_in_transaction(
                       CASE WHEN protocol = 'anthropic' OR protocol LIKE 'anthropic-%'
                            THEN 'anthropic'
                            WHEN protocol = 'openai-image' THEN 'openai-image'
+                           WHEN protocol = 'audio-transcription' THEN 'audio-transcription'
                            ELSE 'openai' END,
                       status_class, error_code, upstream_account_id, model_route_id,
                       currency, COUNT(*),
@@ -461,13 +473,14 @@ async fn rebuild_request_session_projection_in_transaction(
                               WHEN input_tokens >= cached_input_tokens + cache_write_tokens
                               THEN input_tokens - cached_input_tokens - cache_write_tokens ELSE 0 END),
                       SUM(output_tokens), SUM(cached_input_tokens), SUM(cache_write_tokens),
-                      0, COUNT(*), SUM(duration_ms), SUM(cost_micros)
+                      SUM(generation_units), COUNT(*), SUM(duration_ms), SUM(cost_micros)
                  FROM request_stats_facts
                 WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3
                 GROUP BY tenant_id, key_id, session_id, created_at / {divisor}, model,
                       CASE WHEN protocol = 'anthropic' OR protocol LIKE 'anthropic-%'
                            THEN 'anthropic'
                            WHEN protocol = 'openai-image' THEN 'openai-image'
+                           WHEN protocol = 'audio-transcription' THEN 'audio-transcription'
                            ELSE 'openai' END,
                       status_class, error_code, upstream_account_id, model_route_id,
                       currency"#

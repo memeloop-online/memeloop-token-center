@@ -149,6 +149,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     count('default', 'name: MTC_ARCHIVE_BACKEND', 3); count('default', 'value: "s3"', 3); lacks('default', 'name: MTC_MEMELOOP_CLOUD_WEBHOOK_SECRET'); has('webhook', 'name: memeloop-cloud-integration'); has('webhook', 'key: webhook-secret');
     count('default', 'name: MTC_GATEWAY_BODY_READ_CONCURRENCY', 3); count('default', 'value: "1024"', 3);
     count('default', 'name: MTC_RESPONSES_BODY_MAX_BYTES', 3); count('default', 'value: "16777216"', 3); count('default', 'name: MTC_RESPONSES_BODY_READ_CONCURRENCY', 3);
+    count('default', 'name: MTC_AUDIO_BODY_MAX_BYTES', 3); count('default', 'value: "26214400"', 3);
     count('default', /name: MTC_RUNTIME_PROFILING_ENABLED\n\s+value: "false"/, 1);
     count('profiling', /name: MTC_RUNTIME_PROFILING_ENABLED\n\s+value: "true"/, 1);
     count('default', /name: MTC_ARCHIVE_SPOOL_COMPRESSION_ENABLED\n\s+value: "false"/, 3);
@@ -180,7 +181,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       ['roles.gateway.replicaCounnt=2'], ['ingress.gateway.classname=nginx'], ['ingress.enabled=true'], ['ingress.gateway.enabled=true'], ['ingress.control.enabled=true'],
       ['ingress.control.enabled=true','ingress.control.host=x'], ['ingress.control.enabled=true','ingress.control.className=higress-private','ingress.control.host=x','ingress.control.sourceRanges[0]=0.0.0.0/0','ingress.control.tlsSecretName=x'],
       ['roles.control.service.type=NodePort'], ['roles.control.service.type=LoadBalancer'], ['roles.all.service.type=NodePort'], ['roles.all.service.type=LoadBalancer'],
-      ['serviceAccount.automount=true'], ['plugins.mountpath=/plugins'], ['hostAliases[0].ip=10.28.0.22'], ['config.databaseMaxConnection=8'], ['config.gatewayBodyReadConcurrency=8193'], ['config.responsesBodyMaxBytes=67108865'], ['config.responsesBodyReadConcurrency=9'],
+      ['serviceAccount.automount=true'], ['plugins.mountpath=/plugins'], ['hostAliases[0].ip=10.28.0.22'], ['config.databaseMaxConnection=8'], ['config.gatewayBodyReadConcurrency=8193'], ['config.responsesBodyMaxBytes=67108865'], ['config.audioBodyMaxBytes=-1'], ['config.responsesBodyReadConcurrency=9'],
       ['config.runtimeProfiling.enabled=not-a-boolean'], ['config.runtimeProfiling.unknown=true'],
       ['config.archiveSpoolCompression.enabled=not-a-boolean'], ['config.archiveSpoolCompression.unknown=true'],
       ['config.proxyMemoryBudgetBytes=268435455'], ['config.proxyMemoryBudgetBytes=2147483649'],

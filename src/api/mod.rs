@@ -30,6 +30,7 @@ use tower_http::{
 };
 use uuid::Uuid;
 
+mod audio;
 mod auth;
 mod billing;
 mod cloud_entitlements;
@@ -67,6 +68,7 @@ mod upstreams;
 mod usage_analysis;
 mod web;
 
+use audio::create_audio_transcription;
 use auth::{
     admit_cloud_webhook_before_body, authenticate_control_before_body, authenticate_downstream,
     authenticate_gateway_before_body, authenticated_service, management_tenant,

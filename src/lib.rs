@@ -75,6 +75,7 @@ pub struct AppState {
     pub(crate) request_event_streams: request_event_stream::RequestEventStreamLimiter,
     pub(crate) gateway_body_read_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) responses_body_read_permits: Arc<tokio::sync::Semaphore>,
+    /// Shared bounded lifecycle admission for synchronous media requests.
     pub(crate) image_response_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) gateway_body_rejections: Arc<gateway_body::GatewayBodyRejectionMetrics>,
     pub(crate) proxy_lifecycle_permits: Arc<tokio::sync::Semaphore>,
@@ -193,7 +194,8 @@ impl AppState {
             responses_body_read_permits: Arc::new(tokio::sync::Semaphore::new(
                 responses_body_read_concurrency,
             )),
-            // Cloned request/router states share the same bounded image budget;
+            // Cloned request/router states share the same bounded synchronous
+            // media budget (OpenAI Images and Audio transcription);
             // independently initialized applications do not contend with it.
             image_response_permits: Arc::new(tokio::sync::Semaphore::new(2)),
             gateway_body_rejections: Arc::new(gateway_body::GatewayBodyRejectionMetrics::default()),

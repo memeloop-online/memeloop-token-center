@@ -83,7 +83,7 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
   const protocol = await addTypedFilterCondition(dialog, 'protocol');
   const protocolValues = await protocol.getByLabel('值').locator('option').evaluateAll((options) =>
     options.map((option) => (option as HTMLOptionElement).value));
-  assert.deepEqual(protocolValues, ['openai', 'anthropic', 'openai-image', 'generation']);
+  assert.deepEqual(protocolValues, ['openai', 'anthropic', 'openai-image', 'audio-transcription', 'generation']);
   await protocol.getByLabel('值').selectOption('openai');
 
   const modelCondition = await addTypedFilterCondition(dialog, 'model');

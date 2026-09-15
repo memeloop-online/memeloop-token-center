@@ -243,11 +243,13 @@ impl ProviderCatalog {
             protocols: vec![
                 "openai".to_owned(),
                 "anthropic".to_owned(),
+                "audio".to_owned(),
                 "generation".to_owned(),
             ],
             modalities: vec![
                 "text".to_owned(),
                 "embedding".to_owned(),
+                "audio".to_owned(),
                 "image".to_owned(),
                 "video".to_owned(),
             ],

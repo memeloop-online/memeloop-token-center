@@ -148,7 +148,12 @@ pub(super) async fn authenticate_gateway_before_body(
     if let Some(phase) = authentication {
         phase.finish("completed", None, None);
     }
-    let image_lifecycle_permit = if request.uri().path() == "/v1/images/generations" {
+    let audio_request = request.method() == axum::http::Method::POST
+        && request.uri().path() == "/v1/audio/transcriptions";
+    let mut media_lifecycle_permit = if matches!(
+        request.uri().path(),
+        "/v1/images/generations" | "/v1/audio/transcriptions"
+    ) {
         Some(
             state
                 .image_response_permits
@@ -171,6 +176,7 @@ pub(super) async fn authenticate_gateway_before_body(
             state.gateway_body_read_permits.clone(),
             state.responses_body_read_permits.clone(),
             state.config.responses_body_max_bytes as usize,
+            state.config.audio_body_max_bytes as usize,
             Some(&state.proxy_memory_budget),
         )
         .await
@@ -192,12 +198,21 @@ pub(super) async fn authenticate_gateway_before_body(
         .extensions()
         .get::<std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>>()
         .cloned();
+    if audio_request {
+        request.extensions_mut().insert(AudioRequestResources {
+            lifecycle: std::sync::Arc::new(
+                media_lifecycle_permit.take().ok_or(AppError::Internal)?,
+            ),
+            memory: memory.clone().ok_or(AppError::Internal)?,
+        });
+    }
     let response = next.run(request).await;
-    let response = match memory {
-        Some(permit) => hold_response_body_permit(response, permit),
-        None => response,
+    let response = match (audio_request, memory) {
+        (true, _) => response,
+        (false, Some(permit)) => hold_response_body_permit(response, permit),
+        (false, None) => response,
     };
-    Ok(match image_lifecycle_permit {
+    Ok(match media_lifecycle_permit {
         Some(permit) => hold_response_body_permit(response, permit),
         None => response,
     })
@@ -268,7 +283,7 @@ fn safe_gateway_request_id(headers: &HeaderMap) -> String {
 /// or is dropped by the downstream connection. Returning an Axum response does
 /// not mean Hyper has delivered its body, so a middleware-local guard is
 /// otherwise released too early for large synchronous image responses.
-fn hold_response_body_permit<P>(response: Response, permit: P) -> Response
+pub(super) fn hold_response_body_permit<P>(response: Response, permit: P) -> Response
 where
     P: Send + 'static,
 {
@@ -285,6 +300,12 @@ where
         },
     );
     Response::from_parts(parts, Body::from_stream(stream))
+}
+
+#[derive(Clone)]
+pub(super) struct AudioRequestResources {
+    pub(super) lifecycle: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
+    pub(super) memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 }
 
 pub(super) async fn admit_cloud_webhook_before_body(

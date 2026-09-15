@@ -143,6 +143,7 @@ pub(crate) async fn admit_gateway_request_body(
         permits,
         responses_permits,
         responses_maximum,
+        crate::config::DEFAULT_AUDIO_BODY_MAX_BYTES as usize,
         None,
     )
     .await
@@ -154,13 +155,15 @@ pub(crate) async fn admit_gateway_request_body_with_memory(
     permits: Arc<tokio::sync::Semaphore>,
     responses_permits: Arc<tokio::sync::Semaphore>,
     responses_maximum: usize,
+    audio_maximum: usize,
     memory_budget: Option<&memory::ProxyMemoryBudget>,
 ) -> Result<Request, GatewayBodyAdmissionError> {
     // This guard is intentionally local to buffering. Downstream parsing,
     // routing, proxying and response streaming have their own limits, so a
     // slow lifecycle cannot turn this high-cardinality body-read admission
     // into a fixed low global request cap.
-    let (maximum, route_class) = gateway_body_limit(request.uri().path(), responses_maximum);
+    let (maximum, route_class) =
+        gateway_body_limit(request.uri().path(), responses_maximum, audio_maximum);
     let _responses_body_read_permit = (route_class == GatewayBodyRouteClass::Responses)
         .then(|| {
             responses_permits
@@ -172,12 +175,12 @@ pub(crate) async fn admit_gateway_request_body_with_memory(
         .try_acquire_owned()
         .map_err(|_| GatewayBodyAdmissionError::CapacityExhausted)?;
     let reservation = memory_budget
-        .filter(|_| is_text_proxy_path(request.uri().path()))
+        .filter(|_| uses_proxy_memory_budget(request.uri().path()))
         .map(memory::ProxyMemoryBudget::reservation);
     admit_request_body_for_route(request, deadline, maximum, route_class, reservation).await
 }
 
-fn is_text_proxy_path(path: &str) -> bool {
+fn uses_proxy_memory_budget(path: &str) -> bool {
     matches!(
         path,
         "/v1/responses"
@@ -185,6 +188,7 @@ fn is_text_proxy_path(path: &str) -> bool {
             | "/v1/embeddings"
             | "/v1/messages"
             | "/v1/messages/count_tokens"
+            | "/v1/audio/transcriptions"
     )
 }
 
@@ -293,13 +297,18 @@ async fn admit_request_body_for_route(
     Ok(Request::from_parts(parts, Body::from(bytes)))
 }
 
-fn gateway_body_limit(path: &str, responses_maximum: usize) -> (usize, GatewayBodyRouteClass) {
+fn gateway_body_limit(
+    path: &str,
+    responses_maximum: usize,
+    audio_maximum: usize,
+) -> (usize, GatewayBodyRouteClass) {
     match path {
         "/v1/responses" => (
             responses_maximum.min(crate::config::MAX_RESPONSES_BODY_MAX_BYTES as usize),
             GatewayBodyRouteClass::Responses,
         ),
         "/v1/images/generations" => (MAX_IMAGE_BODY, GatewayBodyRouteClass::Images),
+        "/v1/audio/transcriptions" => (audio_maximum, GatewayBodyRouteClass::Other),
         _ => (MAX_DEFAULT_BODY, GatewayBodyRouteClass::Default),
     }
 }
@@ -357,6 +366,7 @@ mod tests {
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(tokio::sync::Semaphore::new(1)),
             16 * 1024 * 1024,
+            crate::config::DEFAULT_AUDIO_BODY_MAX_BYTES as usize,
             Some(&budget),
         )
         .await;
@@ -385,6 +395,7 @@ mod tests {
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(tokio::sync::Semaphore::new(1)),
             16 * 1024 * 1024,
+            crate::config::DEFAULT_AUDIO_BODY_MAX_BYTES as usize,
             Some(&budget),
         )
         .await;
@@ -410,6 +421,7 @@ mod tests {
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(tokio::sync::Semaphore::new(1)),
             16 * 1024 * 1024,
+            crate::config::DEFAULT_AUDIO_BODY_MAX_BYTES as usize,
             Some(&budget),
         )
         .await
