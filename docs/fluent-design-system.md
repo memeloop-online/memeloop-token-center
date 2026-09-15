@@ -108,3 +108,19 @@ touch operation and contrast checks; screenshots alone cannot establish completi
 - [Tooltip content and accessibility](https://fluent2.microsoft.design/components/web/react/core/tooltip/usage)
 - [Microsoft Fluent UI source and MIT license](https://github.com/microsoft/fluentui)
 - [Griffel SSR implementation guidance](https://griffel.js.org/react/guides/ssr-usage/)
+# Global typography and acceptance boundary
+
+Shared page titles, section headings, and supporting text use Fluent typography
+tokens from the existing provider. The baseline keeps readable fallbacks for
+standalone surfaces. Technical IDs, credentials, code, and machine payloads keep
+their monospace presentation; explanatory prose does not inherit it from a
+generic panel-heading selector. Remaining native actions use tokenized baseline
+states, while Fluent actions own their geometry, focus, disabled, and pressed
+states without global button overrides.
+
+`app-typography-browser-contract.test.ts` renders the production `index.html` /
+`main.tsx` / `Application` / `AppShell` / `Operator` graph at desktop and mobile
+widths in both themes. Only API responses and the idle event stream are synthetic;
+unexpected network calls and writes are rejected. Its full-page captures validate
+the actual stylesheet graph, not a manually assembled component shell. They are
+CI candidate evidence, not evidence that a deployment or real account is healthy.

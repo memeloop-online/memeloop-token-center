@@ -1,5 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
-import { Button } from '@fluentui/react-components';
+import { Button, ToggleButton } from '@fluentui/react-components';
 import { DetailTooltip } from '../../design-system';
 import { api, apiDiagnosticMessage } from '../../api';
 import { DrawerFrame, RequestDiagnostics, RequestTable } from '../../components';
@@ -334,9 +334,9 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   const points = useMemo(() => visibleRequestMetricSeries(requests), [requests]);
   const sampling = { timestamps: points.map(point => point.timestamp), timeZone: displayTimeZone() };
   const count = (value: number) => formatMetricDisplay(value, locale);
-  return <article className="panel request-page-surface"><div className="panel-title traffic-heading"><div><h2>{typedFiltersActive(filters) ? t('traffic.filtered') : t('traffic.live')}</h2><span>{typedFiltersActive(filters) ? t('traffic.filteredHint') : t('traffic.liveHint')}</span></div><div className="traffic-heading-actions"><div className={`request-live-state session-live-state ${streamState}`} role="status">{t(`sessions.live.${streamState}`)}</div><div className="segmented" role="group" aria-label={t('sessions.monitorMode')}><button type="button" className="active" aria-pressed="true">{t('sessions.requestsMode')}</button><button type="button" aria-pressed="false" onClick={onOpenSessions}>{t('sessions.sessionsMode')}</button></div></div></div>
+  return <article className="panel request-page-surface"><div className="panel-title traffic-heading"><div><h2>{typedFiltersActive(filters) ? t('traffic.filtered') : t('traffic.live')}</h2><span>{typedFiltersActive(filters) ? t('traffic.filteredHint') : t('traffic.liveHint')}</span></div><div className="traffic-heading-actions"><div className={`request-live-state session-live-state ${streamState}`} role="status">{t(`sessions.live.${streamState}`)}</div><div className="segmented" role="group" aria-label={t('sessions.monitorMode')}><ToggleButton appearance="subtle" checked>{t('sessions.requestsMode')}</ToggleButton><ToggleButton appearance="subtle" checked={false} onClick={onOpenSessions}>{t('sessions.sessionsMode')}</ToggleButton></div></div></div>
     <TypedFilterBuilder ast={filters} disabled={loading} onApply={onApply} onClear={onClear} scope="requests" token={token} tenant={tenant} upstreams={upstreams} />
-    {olderFilteredResultsStale && <div className="notice warning" role="status">{t('traffic.olderFilteredResultsStale')}<button type="button" className="secondary" disabled={loading} onClick={onRefreshFilteredResults}>{t('traffic.refreshFilteredResults')}</button></div>}
+    {olderFilteredResultsStale && <div className="notice warning" role="status">{t('traffic.olderFilteredResultsStale')}<Button appearance="secondary" disabled={loading} onClick={onRefreshFilteredResults}>{t('traffic.refreshFilteredResults')}</Button></div>}
     {requests.length > 0 && <section className="metrics request-traffic-metrics" aria-label={t('monitoring.summary')}>
       <AnalyticsMetric {...sampling} label={t('usage.requests')} value={count(summary.requests).text} title={count(summary.requests).title} trend={points.map(point => point.requests)} ratio={1} />
       <AnalyticsMetric {...sampling} label={t('traffic.success')} value={count(summary.successful).text} title={count(summary.successful).title} tone="positive" trend={points.map(point => point.successful)} ratio={summary.successful / summary.requests} />
@@ -348,7 +348,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
     </section>}
     {requests.length > 0 && <p className="request-metrics-scope">{locale === 'zh-CN' ? '仅统计当前已加载请求；背景图按接收时间展示这些记录的分布，不代表全量流量。' : 'Loaded requests only. Background charts group these records by reception time, not total traffic.'}</p>}
     {loading && requests.length === 0 ? <div className="empty" role="status">{t('common.loading')}</div> : <RequestTable requests={requests} upstreamNames={new Map(upstreams.map((account) => [account.id, account.name]))} onSelect={(request) => void onSelect(request)} onOpenSession={onOpenSession} />}
-    {hasOlder && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('traffic.loadOlder')}</button></div>}
+    {hasOlder && <div className="load-more"><Button appearance="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('traffic.loadOlder')}</Button></div>}
   </article>;
 }
 
