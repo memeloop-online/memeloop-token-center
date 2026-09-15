@@ -166,6 +166,21 @@ pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>
                     tracing::error!(%error, "worker failed to delete expired budget rollup detail");
                 }
             }
+            #[cfg(feature = "experimental-plugin-revisions")]
+            if let Some(plugins) = &state.application_plugins {
+                match plugins.reclaim_unreferenced_installation_attempts().await {
+                    Ok(reclaimed) if reclaimed > 0 => {
+                        tracing::info!(
+                            reclaimed,
+                            "worker reclaimed unpublished plugin installation attempts"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "worker failed to reclaim unpublished plugin installation attempts");
+                    }
+                }
+            }
         }
     );
     periodic!(

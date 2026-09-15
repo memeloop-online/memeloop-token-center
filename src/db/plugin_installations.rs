@@ -3,11 +3,6 @@ use crate::plugin::application::installation::{
     InstallationRecord, PackageCheckpoint, PluginAuditEntry,
 };
 
-// Every failed attempt may leave a complete unpublished inventory on shared
-// storage. Bound operator retries until a separately audited reclamation path
-// can prove ownership and remove those immutable trees safely.
-const MAX_PLUGIN_INSTALLATION_ATTEMPTS: i64 = 3;
-
 impl Database {
     pub(crate) async fn replay_plugin_installation(
         &self,
@@ -97,13 +92,6 @@ impl Database {
             tx.commit().await?;
             return Ok((record, false));
         }
-        let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM application_plugin_audit WHERE action='install' AND inventory_id=$1 AND outcome='started'")
-            .bind(inventory_id).fetch_one(&mut *tx).await?;
-        if attempts >= MAX_PLUGIN_INSTALLATION_ATTEMPTS {
-            return Err(AppError::Conflict(
-                "installation retry limit reached; operator storage reclamation is required".into(),
-            ));
-        }
         sqlx::query("INSERT INTO application_plugin_install_lock (scope, operation_id, lease_until) VALUES ('global',$1,$2) ON CONFLICT(scope) DO NOTHING")
             .bind(&id).bind(lease_until).execute(&mut *tx).await?;
         let locked = sqlx::query("UPDATE application_plugin_install_lock SET operation_id=$1, lease_until=$2 WHERE scope='global' AND (lease_until <= $3 OR operation_id=$1)")
@@ -127,6 +115,14 @@ impl Database {
         .await?;
         tx.commit().await?;
         Ok((self.plugin_installation(&record.id).await?, true))
+    }
+
+    pub(crate) async fn referenced_plugin_installation_attempts(
+        &self,
+    ) -> Result<std::collections::BTreeSet<String>, AppError> {
+        let now = unix_millis();
+        Ok(sqlx::query_scalar::<_, String>("SELECT attempt_id FROM application_plugin_installations WHERE status IN ('review','registered') OR (status='installing' AND lease_until > $1)")
+            .bind(now).fetch_all(&self.pool).await?.into_iter().collect())
     }
 
     pub(crate) async fn renew_plugin_installation(

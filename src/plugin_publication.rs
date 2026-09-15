@@ -46,7 +46,7 @@ pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     file.sync_all()
 }
 
-fn verify_owner(path: &Path, owner: &[u8]) -> io::Result<()> {
+pub(crate) fn verify_owner(path: &Path, owner: &[u8]) -> io::Result<()> {
     let mut bytes = Vec::new();
     regular_file(path)?
         .take(OWNER_LIMIT + 1)
@@ -102,6 +102,77 @@ fn claim_name(root: &Path, owner: &[u8]) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => verify_owner(&marker, owner)?,
         Err(error) => return Err(error),
     }
+    sync_directory(parent)
+}
+
+pub(crate) fn reserve_directory_name(root: &Path, owner: &[u8]) -> io::Result<()> {
+    claim_name(root, owner)
+}
+
+pub(crate) fn bind_existing_directory(
+    root: &Path,
+    owner: &[u8],
+) -> io::Result<rustix::fd::OwnedFd> {
+    claim_name(root, owner)?;
+    let parent = root.parent().ok_or(io::ErrorKind::InvalidInput)?;
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(io::ErrorKind::InvalidInput)?;
+    let metadata = fs::symlink_metadata(root)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::ErrorKind::AlreadyExists.into());
+    }
+    let directory = directory_fd(root)?;
+    let identity = rustix::fs::fstat(&directory)?.st_ino.to_string();
+    let binding = parent.join(format!(".mtc-publish-inode-{name}"));
+    match fs::symlink_metadata(&binding) {
+        Ok(_) => verify_owner(&binding, identity.as_bytes())?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let temporary = parent.join(format!(".mtc-publish-claim-{}", uuid::Uuid::now_v7()));
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            let _cleanup = TemporaryClaim(temporary.clone());
+            file.write_all(identity.as_bytes())?;
+            file.sync_all()?;
+            match fs::hard_link(&temporary, &binding) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    verify_owner(&binding, identity.as_bytes())?
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    sync_directory(parent)?;
+    Ok(directory)
+}
+
+pub(crate) fn remove_claimed_directory(root: &Path, owner: &[u8]) -> io::Result<()> {
+    let parent = root.parent().ok_or(io::ErrorKind::InvalidInput)?;
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(io::ErrorKind::InvalidInput)?;
+    let directory = bind_existing_directory(root, owner)?;
+    let identity = rustix::fs::fstat(&directory)?.st_ino.to_string();
+    drop(directory);
+    fs::remove_dir_all(root)?;
+    match fs::symlink_metadata(root) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Ok(_) => return Err(io::ErrorKind::AlreadyExists.into()),
+        Err(error) => return Err(error),
+    }
+    let owner_marker = parent.join(format!(".mtc-publish-owner-{name}"));
+    let inode_marker = parent.join(format!(".mtc-publish-inode-{name}"));
+    verify_owner(&owner_marker, owner)?;
+    verify_owner(&inode_marker, identity.as_bytes())?;
+    fs::remove_file(inode_marker)?;
+    fs::remove_file(owner_marker)?;
     sync_directory(parent)
 }
 

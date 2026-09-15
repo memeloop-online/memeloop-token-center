@@ -11,6 +11,8 @@ const INSTALLER: &str = "/usr/local/bin/install-plugin-oci";
 const PACKAGE_DEADLINE: Duration = Duration::from_secs(3 * 60 * 60);
 const STORAGE_DEADLINE: Duration = Duration::from_secs(60);
 const LEASE_RENEWAL: Duration = Duration::from_secs(30);
+const ATTEMPT_RECLAMATION_GRACE: Duration = Duration::from_secs(60);
+const ATTEMPT_RECLAMATION_LIMIT: usize = 8;
 static INSTALL_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
 // An uninterruptible filesystem read retains this permit until it actually
@@ -242,7 +244,7 @@ impl ApplicationPlugins {
             return Ok(replay);
         }
         let policy = self.install_policy().await?;
-        self.refresh_inventory().await?;
+        self.reclaim_unreferenced_installation_attempts().await?;
         if self
             .inventory
             .read()
@@ -552,6 +554,105 @@ impl ApplicationPlugins {
             .register_plugin_installation(id, digest, actor)
             .await
     }
+
+    pub(crate) async fn reclaim_unreferenced_installation_attempts(
+        &self,
+    ) -> Result<usize, AppError> {
+        if self.installation_policy_file.is_none() {
+            return Ok(0);
+        }
+        let policy = self.install_policy().await?;
+        self.refresh_inventory().await?;
+        let inventory_roots = self
+            .inventory
+            .read()
+            .await
+            .values()
+            .map(|entry| entry.root.clone())
+            .collect::<BTreeSet<_>>();
+        let referenced_attempts = self.db.referenced_plugin_installation_attempts().await?;
+        let plugin_root = policy.plugin_root;
+        tokio::task::spawn_blocking(move || {
+            reclaim_installation_attempt_roots(
+                &plugin_root,
+                &inventory_roots,
+                &referenced_attempts,
+                ATTEMPT_RECLAMATION_GRACE,
+            )
+        })
+        .await
+        .map_err(|_| AppError::Internal)?
+    }
+}
+
+fn inventory_attempt_id(name: &std::ffi::OsStr) -> Option<String> {
+    let value = name.to_str()?.strip_prefix("mtc-attempt-")?;
+    let attempt = uuid::Uuid::parse_str(value).ok()?;
+    (attempt.to_string() == value).then(|| value.to_owned())
+}
+
+fn reclaim_installation_attempt_roots(
+    plugin_root: &std::path::Path,
+    inventory_roots: &BTreeSet<PathBuf>,
+    referenced_attempts: &BTreeSet<String>,
+    minimum_age: Duration,
+) -> Result<usize, AppError> {
+    let parent = std::fs::symlink_metadata(plugin_root).map_err(|_| AppError::Internal)?;
+    if !parent.is_dir() || parent.file_type().is_symlink() {
+        return Err(AppError::Forbidden);
+    }
+    let entries = std::fs::read_dir(plugin_root).map_err(|_| AppError::Internal)?;
+    let mut reclaimed = 0usize;
+    for entry in entries {
+        if reclaimed >= ATTEMPT_RECLAMATION_LIMIT {
+            break;
+        }
+        let entry = entry.map_err(|_| AppError::Internal)?;
+        let root = entry.path();
+        let Some(attempt_id) = inventory_attempt_id(&entry.file_name()) else {
+            continue;
+        };
+        if referenced_attempts.contains(&attempt_id) || inventory_roots.contains(&root) {
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(&root) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => metadata,
+            _ => continue,
+        };
+        if metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_none_or(|age| age < minimum_age)
+        {
+            continue;
+        }
+        let inode_marker = plugin_root.join(format!(".mtc-publish-inode-mtc-attempt-{attempt_id}"));
+        let result = match std::fs::symlink_metadata(&inode_marker) {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A crash after reserving/renaming but before binding the inode
+                // may be adopted only with the matching root-local receipt.
+                crate::plugin_publication::verify_owner(
+                    &root.join(".mtc-install-owner"),
+                    attempt_id.as_bytes(),
+                )
+            }
+            Err(error) => Err(error),
+        }
+        .and_then(|()| {
+            crate::plugin_publication::remove_claimed_directory(&root, attempt_id.as_bytes())
+        });
+        match result {
+            Ok(()) => reclaimed += 1,
+            Err(error) => tracing::warn!(
+                stage = "inventory_reclaim",
+                errno = error.raw_os_error(),
+                "plugin installation attempt reclamation failed"
+            ),
+        }
+    }
+    Ok(reclaimed)
 }
 
 async fn bounded_install_phase<T>(
@@ -688,6 +789,16 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
         std::fs::File::open(&temporary)
             .and_then(|file| file.sync_all())
             .map_err(|_| AppError::Internal)?;
+        crate::plugin_publication::reserve_directory_name(root, owner.as_bytes()).map_err(
+            |error| {
+                crate::plugin_publication::report_io("inventory_claim", &error);
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    AppError::Forbidden
+                } else {
+                    AppError::Internal
+                }
+            },
+        )?;
         let directory = open(
             parent,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
@@ -750,6 +861,16 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
                 return Err(AppError::Internal);
             }
         }
+        crate::plugin_publication::bind_existing_directory(root, owner.as_bytes()).map_err(
+            |error| {
+                crate::plugin_publication::report_io("inventory_claim", &error);
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    AppError::Forbidden
+                } else {
+                    AppError::Internal
+                }
+            },
+        )?;
         std::fs::File::open(parent)
             .and_then(|file| file.sync_all())
             .map_err(|_| AppError::Internal)
@@ -1559,6 +1680,14 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(
+            !state
+                .db
+                .referenced_plugin_installation_attempts()
+                .await
+                .unwrap()
+                .contains(&old.attempt_id)
+        );
         let (new, run) = state
             .db
             .begin_plugin_installation(
@@ -1574,6 +1703,14 @@ mod tests {
         assert!(run);
         assert_eq!(old.id, new.id);
         assert_ne!(old.attempt_id, new.attempt_id);
+        assert!(
+            state
+                .db
+                .referenced_plugin_installation_attempts()
+                .await
+                .unwrap()
+                .contains(&new.attempt_id)
+        );
         assert!(
             state
                 .db
@@ -1613,38 +1750,14 @@ mod tests {
             state.db.plugin_installation(&new.id).await.unwrap().status,
             "failed"
         );
-        let (last, run) = state
-            .db
-            .begin_plugin_installation(
-                "retry",
-                &packages,
-                "hash",
-                "key",
-                "bootstrap",
-                crate::db::unix_millis() + 270000,
-            )
-            .await
-            .unwrap();
-        assert!(run);
-        state
-            .db
-            .finish_plugin_installation(&last.id, &last.attempt_id, None)
-            .await
-            .unwrap();
-        assert!(matches!(
-            state
+        assert!(
+            !state
                 .db
-                .begin_plugin_installation(
-                    "retry",
-                    &packages,
-                    "hash",
-                    "key",
-                    "bootstrap",
-                    crate::db::unix_millis() + 270000,
-                )
-                .await,
-            Err(AppError::Conflict(message)) if message.contains("retry limit")
-        ));
+                .referenced_plugin_installation_attempts()
+                .await
+                .unwrap()
+                .contains(&new.attempt_id)
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1677,6 +1790,87 @@ mod tests {
         let unrelated = directory.path().join("unrelated");
         std::fs::create_dir(&unrelated).unwrap();
         assert!(claim_inventory_root(&unrelated, "owner").is_err());
+        assert!(
+            crate::plugin_publication::remove_claimed_directory(&root, b"another-owner").is_err()
+        );
+        assert!(root.exists());
+        // A prior partial remove may already have consumed the root-local
+        // receipt. The durable parent owner + inode binding remains sufficient.
+        std::fs::remove_file(root.join(".mtc-install-owner")).unwrap();
+        crate::plugin_publication::remove_claimed_directory(&root, b"owner").unwrap();
+        assert!(!root.exists());
+        assert!(
+            !directory
+                .path()
+                .join(".mtc-publish-owner-inventory")
+                .exists()
+        );
+        assert!(
+            !directory
+                .path()
+                .join(".mtc-publish-inode-inventory")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn attempt_storage_names_require_exact_canonical_uuid() {
+        let attempt = uuid::Uuid::now_v7().to_string();
+        assert_eq!(
+            inventory_attempt_id(std::ffi::OsStr::new(&format!("mtc-attempt-{attempt}"))),
+            Some(attempt.clone())
+        );
+        assert_eq!(
+            inventory_attempt_id(std::ffi::OsStr::new(&format!(
+                "mtc-attempt-{}",
+                attempt.to_uppercase()
+            ))),
+            None
+        );
+        assert_eq!(inventory_attempt_id(std::ffi::OsStr::new(&attempt)), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reclamation_removes_only_unreferenced_owned_attempt_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        let attempts = [
+            uuid::Uuid::now_v7().to_string(),
+            uuid::Uuid::now_v7().to_string(),
+            uuid::Uuid::now_v7().to_string(),
+        ];
+        let roots = attempts
+            .iter()
+            .map(|attempt| {
+                let root = directory
+                    .path()
+                    .join(inventory_attempt_storage_id(attempt).unwrap());
+                claim_inventory_root(&root, attempt).unwrap();
+                std::fs::write(root.join("payload"), b"immutable").unwrap();
+                root
+            })
+            .collect::<Vec<_>>();
+        let inventory_roots = BTreeSet::from([roots[0].clone()]);
+        let referenced_attempts = BTreeSet::from([attempts[1].clone()]);
+        std::fs::remove_file(
+            directory
+                .path()
+                .join(format!(".mtc-publish-inode-mtc-attempt-{}", attempts[2])),
+        )
+        .unwrap();
+        assert_eq!(
+            reclaim_installation_attempt_roots(
+                directory.path(),
+                &inventory_roots,
+                &referenced_attempts,
+                Duration::ZERO,
+            )
+            .unwrap(),
+            1
+        );
+        assert!(roots[0].exists());
+        assert!(roots[1].exists());
+        assert!(!roots[2].exists());
     }
 
     #[test]
