@@ -189,12 +189,8 @@ fn clear_directory_contents(directory: &rustix::fd::OwnedFd) -> io::Result<()> {
             Ok(child) => {
                 clear_directory_contents(&child)?;
                 rustix::fs::fsync(&child)?;
-                drop(child);
-                match unlinkat(directory, name, AtFlags::REMOVEDIR) {
-                    Ok(()) => {}
-                    Err(error) if error == rustix::io::Errno::NOENT => {}
-                    Err(error) => return Err(error.into()),
-                }
+                // Keep directory inodes: unlinking a pathname cannot be made
+                // conditional on the inode that was opened and verified.
             }
             Err(error) if matches!(error, rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP) => {
                 match unlinkat(directory, name, AtFlags::empty()) {
