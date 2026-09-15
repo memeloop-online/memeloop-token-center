@@ -193,21 +193,21 @@ fn clear_directory_contents(directory: &rustix::fd::OwnedFd) -> io::Result<()> {
                 match unlinkat(directory, name, AtFlags::REMOVEDIR) {
                     Ok(()) => {}
                     Err(error) if error == rustix::io::Errno::NOENT => {}
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(error.into()),
                 }
             }
             Err(error) if matches!(error, rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP) => {
                 match unlinkat(directory, name, AtFlags::empty()) {
                     Ok(()) => {}
                     Err(error) if error == rustix::io::Errno::NOENT => {}
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(error.into()),
                 }
             }
             Err(error) if error == rustix::io::Errno::NOENT => {}
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         }
     }
-    rustix::fs::fsync(directory)
+    Ok(rustix::fs::fsync(directory)?)
 }
 
 pub(crate) fn claim_directory(root: &Path, owner: &[u8]) -> io::Result<rustix::fd::OwnedFd> {
