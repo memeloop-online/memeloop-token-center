@@ -511,6 +511,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "native Kimi device OAuth sessions",
         sql: include_str!("../../../migrations/sqlite/0096_kimi_device_oauth.sql"),
     },
+    Migration {
+        version: 97,
+        name: "native OAuth single-account source bindings",
+        sql: include_str!("../../../migrations/common/0097_native_oauth_source_bindings.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1007,6 +1012,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 96,
         name: "native Kimi device OAuth sessions",
         sql: include_str!("../../../migrations/postgres/0096_kimi_device_oauth.sql"),
+    },
+    Migration {
+        version: 97,
+        name: "native OAuth single-account source bindings",
+        sql: include_str!("../../../migrations/common/0097_native_oauth_source_bindings.sql"),
     },
 ];
 

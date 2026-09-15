@@ -17,6 +17,107 @@ use uuid::Uuid;
 const CAPABILITIES: &str = "/internal/v1/native-oauth-imports/capabilities";
 const COHORT: &str = "/internal/v1/native-oauth-imports/kimi-cohort";
 
+#[tokio::test]
+async fn native_cursor_source_http_contract_preserves_identity_and_hides_tokens() {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    let directory = tempfile::tempdir().unwrap();
+    let state = AppState::initialize(Config::for_test(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("cursor-source.db").display()
+    )))
+    .await
+    .unwrap();
+    state.db.create_tenant("cursor-source", None).await.unwrap();
+    let mut tokens = Vec::new();
+    for (name, tenant, scopes) in [
+        ("global", None, vec!["upstreams:import:write".into()]),
+        (
+            "tenant",
+            Some("cursor-source".into()),
+            vec!["upstreams:import:write".into()],
+        ),
+        ("wrong", None, vec!["providers:write".into()]),
+    ] {
+        tokens.push(
+            state
+                .db
+                .create_service_token(
+                    CreateServiceTokenInput {
+                        name: name.into(),
+                        tenant_external_id: tenant,
+                        scopes,
+                    },
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    let access = format!(
+        "{}.{}.synthetic-signature",
+        URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256"}"#),
+        URL_SAFE_NO_PAD.encode(r#"{"sub":"cursor-native-http-fixture","exp":1000}"#)
+    );
+    let document = json!({"accessToken":access,"refreshToken":"cursor-source-synthetic-refresh", "unrelatedTheme":"light"});
+    let mut body = json!({
+        "contract":"source-bound-native-cursor-v1", "tenant_external_id":"cursor-source",
+        "account_name":"Cursor Imported", "source_identity_hash":"a".repeat(64),
+        "source_document_sha256":digest(&document), "source_layout":"legacy-auth-v1",
+        "source_relative_path":"account-home/legacy-auth.json", "document":document,
+        "proxy_url":"socks5h://192.168.1.20:1080",
+    });
+    let path = "/internal/v1/native-oauth-imports/cursor";
+    for token in &tokens[1..] {
+        assert_eq!(
+            call(&state, "POST", path, &token.token, Some(&body))
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+    body["source_document_sha256"] = json!("b".repeat(64));
+    assert_eq!(
+        call(&state, "POST", path, &tokens[0].token, Some(&body))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    body["source_document_sha256"] = json!(digest(&body["document"]));
+    let (status, created, bytes) = call(&state, "POST", path, &tokens[0].token, Some(&body)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["disposition"], "created");
+    assert_eq!(created["account"]["driver"], "cursor");
+    assert_eq!(created["account"]["credential_expires_at"], 1_000_000);
+    assert_eq!(
+        created["account"]["import_source_document_sha256"],
+        body["source_document_sha256"]
+    );
+    let response = String::from_utf8(bytes).unwrap();
+    assert!(!response.contains(&access));
+    assert!(!response.contains("cursor-source-synthetic-refresh"));
+    let (status, replay, _) = call(&state, "POST", path, &tokens[0].token, Some(&body)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replay["disposition"], "replayed");
+    assert_eq!(replay["account"]["id"], created["account"]["id"]);
+    assert_eq!(replay["account"]["credential_generation"], 1);
+    body["document"]["accessToken"] = json!(format!(
+        "{}.{}.synthetic-signature",
+        URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256"}"#),
+        URL_SAFE_NO_PAD.encode(r#"{"sub":"another-subject","exp":1000}"#)
+    ));
+    body["source_document_sha256"] = json!(digest(&body["document"]));
+    body["expected_current_account_id"] = created["account"]["id"].clone();
+    body["expected_current_document_sha256"] =
+        created["account"]["import_source_document_sha256"].clone();
+    body["expected_current_credential_generation"] = json!(1);
+    assert_eq!(
+        call(&state, "POST", path, &tokens[0].token, Some(&body))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+}
+
 async fn call(
     state: &AppState,
     method: &str,

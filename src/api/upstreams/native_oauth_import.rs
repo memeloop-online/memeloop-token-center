@@ -80,7 +80,8 @@ pub(in crate::api) async fn native_oauth_import_capabilities(
     require_global_service(&service)?;
     Ok(Json(json!({
         "contract_version": CONTRACT_VERSION,
-        "source_types": ["kimi"],
+        "source_types": ["kimi", "cursor"],
+        "single_account_contracts": {"cursor": "source-bound-native-cursor-v1"},
         "source_identity_contract": SOURCE_IDENTITY_CONTRACT,
         "account_name_policies": {"kimi": ACCOUNT_NAME_POLICY},
         "atomic_cohort_contracts": [KIMI_COHORT_CONTRACT],
@@ -274,7 +275,7 @@ fn validate_source(account: &NativeKimiCohortAccount) -> Result<(), AppError> {
     Ok(())
 }
 
-fn valid_relative_path(value: &str) -> bool {
+pub(super) fn valid_relative_path(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 512
         && !value.contains('\\')
@@ -284,7 +285,7 @@ fn valid_relative_path(value: &str) -> bool {
             .all(|component| !component.is_empty() && !matches!(component, "." | ".."))
 }
 
-fn validate_lower_hex_digest(value: &str, label: &str) -> Result<(), AppError> {
+pub(super) fn validate_lower_hex_digest(value: &str, label: &str) -> Result<(), AppError> {
     if value.len() == 64
         && value
             .bytes()
@@ -298,7 +299,7 @@ fn validate_lower_hex_digest(value: &str, label: &str) -> Result<(), AppError> {
     }
 }
 
-fn canonical_json(value: &Value) -> Value {
+pub(super) fn canonical_json(value: &Value) -> Value {
     match value {
         Value::Array(values) => Value::Array(values.iter().map(canonical_json).collect()),
         Value::Object(object) => Value::Object(

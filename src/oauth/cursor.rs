@@ -4,7 +4,7 @@ use base64::{
 };
 use getrandom::fill;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -708,6 +708,50 @@ pub fn cursor_account_id(credential: &UpstreamCredential) -> Result<String, AppE
     Ok(state.account_id)
 }
 
+/// Project a source-bound official Cursor auth store into the native lifecycle.
+/// Only OAuth fields are copied: the file may contain unrelated CLI settings.
+/// The importer owns provenance verification; a filename or display email is
+/// never used as account identity, and expired tokens are left expired for the
+/// existing generation-locked worker to refresh before any model dispatch.
+pub(crate) fn credential_from_cursor_auth_store(
+    document: &Value,
+    proxy_url: Option<String>,
+) -> Result<UpstreamCredential, AppError> {
+    let invalid = || {
+        AppError::BadRequest("Cursor OAuth source has no usable native identity or expiry".into())
+    };
+    let access = document["accessToken"].as_str().ok_or_else(invalid)?;
+    let refresh = document["refreshToken"].as_str().ok_or_else(invalid)?;
+    if access.is_empty()
+        || refresh.is_empty()
+        || refresh.len() > MAX_CURSOR_TOKEN_BYTES
+        || refresh.trim() != refresh
+        || refresh.chars().any(char::is_control)
+    {
+        return Err(invalid());
+    }
+    let claims = jwt_payload(access).ok_or_else(invalid)?;
+    let account_id = claims["sub"]
+        .as_str()
+        .filter(|id| valid_stable_identity(id))
+        .ok_or_else(invalid)?;
+    let expires_at = token_expiry_millis(access)
+        .filter(|at| *at > 0)
+        .ok_or_else(invalid)?;
+    let credential = UpstreamCredential::OAuth {
+        access_token: access.to_owned(),
+        refresh_token: Some(refresh.to_owned()),
+        expires_at: Some(expires_at),
+        header: "authorization".into(),
+        prefix: "Bearer ".into(),
+        adapter_state: Some(json!({"schema":CURSOR_ADAPTER_SCHEMA,"account_id":account_id})),
+        proxy_network_scope: proxy_url.as_ref().map(|_| OutboundScope::Private),
+        proxy_url,
+    };
+    credential.validate(i64::MIN).map_err(|_| invalid())?;
+    Ok(credential)
+}
+
 fn stable_account_id_from_tokens(tokens: &CursorTokens) -> Result<Option<String>, AppError> {
     let explicit = tokens
         .account_id
@@ -825,6 +869,44 @@ mod tests {
             })),
             proxy_url: None,
             proxy_network_scope: None,
+        }
+    }
+
+    #[test]
+    fn native_auth_projection_ignores_settings_but_requires_subject_and_real_expiry() {
+        let source = json!({
+            "accessToken":jwt(json!({"sub":"cursor-native-subject", "exp":100})),
+            "refreshToken":"native-refresh-fixture", "email":"display@example.test",
+            "accountId":"unrelated-setting-must-not-override-subject",
+            "theme":"dark", "permissions":{"allow":["Read"]}
+        });
+        let credential = credential_from_cursor_auth_store(&source, None).unwrap();
+        assert_eq!(
+            cursor_account_id(&credential).unwrap(),
+            "cursor-native-subject"
+        );
+        assert_eq!(credential.expires_at(), Some(100_000));
+        assert!(
+            credential.validate(100_001).is_err(),
+            "expired imported access never becomes dispatchable"
+        );
+        assert_eq!(
+            credential
+                .adapter_state()
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
+        for claims in [
+            json!({"email":"display@example.test","exp":100}),
+            json!({"sub":"cursor-native-subject"}),
+            json!({"sub":"cursor-native-subject","exp":"100"}),
+        ] {
+            let invalid =
+                json!({"accessToken":jwt(claims),"refreshToken":"native-refresh-fixture"});
+            assert!(credential_from_cursor_auth_store(&invalid, None).is_err());
         }
     }
 

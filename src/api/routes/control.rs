@@ -162,6 +162,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             "/internal/v1/native-oauth-imports/kimi-cohort",
             post(import_native_kimi_oauth_cohort),
         )
+        .route(
+            "/internal/v1/native-oauth-imports/cursor",
+            post(import_native_cursor_oauth),
+        )
         .route("/internal/v1/requests", get(internal_requests))
         .route(
             "/internal/v1/requests/{request_id}",
