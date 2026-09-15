@@ -273,10 +273,11 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 .memory_usage(crate::metrics::MemoryComponent::StreamCapture, 0);
             let mut downstream_closed_observed = false;
             let mut downstream_ready_bytes = 0_usize;
-            // This stays `None` until a validated `response.created` or
-            // `response.in_progress` was delivered. The synthetic event is
-            // downstream-only, so it cannot alter archive contents, usage,
-            // settlement, or the delivery transition.
+            // This stays `None` until a validated lifecycle identity is safe
+            // to expose downstream. A successful terminal may provide that
+            // first identity while it remains privately held for EOF. The
+            // synthetic event is downstream-only, so it cannot alter archive
+            // contents, usage, settlement, or the delivery transition.
             let mut progress_heartbeat_deadline = None;
             loop {
                 let mut flushing_terminal = false;
@@ -486,6 +487,21 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         // SSE event. Empty partial output must not occupy the
                         // bounded archive channel or cancel a healthy archive.
                         if chunk.is_empty() {
+                            // A valid success terminal is held until EOF and
+                            // can therefore be the first event to establish a
+                            // real response identity. Arm its downstream-only
+                            // heartbeat even though no provider bytes are ready
+                            // to deliver yet.
+                            if codex_responses_progress_heartbeat
+                                && progress_heartbeat_deadline.is_none()
+                                && let Some(sanitizer) = responses_streaming_sanitizer.as_ref()
+                                && sanitizer.progress_heartbeat().is_some()
+                            {
+                                progress_heartbeat_deadline = Some(
+                                    tokio::time::Instant::now()
+                                        + CODEX_RESPONSES_PROGRESS_HEARTBEAT_INTERVAL,
+                                );
+                            }
                             let terminal_evidence_pending = pending_delivery_can_advance(
                                 responses_streaming_sanitizer.as_ref(),
                                 raw_chunk_len,

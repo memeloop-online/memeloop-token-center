@@ -5,8 +5,8 @@ import type { RequestDetail } from './types.js';
 export const SESSION_REPLAY_PROJECTION_PRIORITY = 'P1';
 export const SESSION_REPLAY_MAX_REQUESTS = 100;
 export const SESSION_REPLAY_MAX_ITEMS = 300;
-export const SESSION_REPLAY_MAX_TEXT_LENGTH = 8_192;
-const MAX_BODY_ITEMS = 300;
+type CallEvidence = { requestId: string; count: number };
+type ProjectionLimit = { truncated: boolean; itemOffset: number; seen: number; unknownKeys: Set<string>; calls: Map<string, CallEvidence>; results: Map<string, CallEvidence> };
 
 export type ReplayBody = 'request' | 'response';
 export type ReplayUnknownReason =
@@ -21,7 +21,7 @@ export interface ReplayMessage {
   kind: 'message';
   requestId: string;
   body: ReplayBody;
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'agent';
   /** Null means the archive named the role but did not retain readable text. */
   text: string | null;
   unknown: Extract<ReplayUnknownReason, 'redacted' | 'missing_text'> | null;
@@ -68,6 +68,8 @@ export interface SessionReplayProjection {
   items: SessionReplayItem[];
   /** True when this projection intentionally omitted retained data at a safe UI bound. */
   truncated: boolean;
+  totalItems: number;
+  nextItemOffset: number | null;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -92,9 +94,9 @@ function redacted(value: unknown): boolean {
 }
 
 function clipped(value: string): { value: string; truncated: boolean } {
-  return value.length > SESSION_REPLAY_MAX_TEXT_LENGTH
-    ? { value: value.slice(0, SESSION_REPLAY_MAX_TEXT_LENGTH), truncated: true }
-    : { value, truncated: false };
+  // The API already bounds archived bodies. Long retained text is expanded
+  // on demand by ArchiveText instead of being irreversibly sliced here.
+  return { value, truncated: false };
 }
 
 function textFromContent(value: unknown): { text: string | null; unknown: ReplayMessage['unknown']; truncated: boolean } {
@@ -109,37 +111,42 @@ function textFromContent(value: unknown): { text: string | null; unknown: Replay
 
   let text = '';
   let foundText = false;
-  let truncated = parts.length > MAX_BODY_ITEMS;
-  for (const part of parts.slice(0, MAX_BODY_ITEMS)) {
+  const truncated = false;
+  for (const part of parts) {
     if (redacted(part)) return { text: null, unknown: 'redacted', truncated };
     const record = object(part);
     if (!record) continue;
     const candidate = string(record.text) ?? string(record.input_text) ?? string(record.output_text);
     if (candidate === undefined) continue;
     foundText = true;
-    const remaining = SESSION_REPLAY_MAX_TEXT_LENGTH - text.length;
-    if (remaining <= 0) { truncated = true; continue; }
-    if (candidate.length > remaining) truncated = true;
-    text += candidate.slice(0, remaining);
+    text += candidate;
   }
   if (!foundText) return { text: null, unknown: 'missing_text', truncated };
   return { text, unknown: null, truncated };
 }
 
-function push(items: SessionReplayItem[], item: SessionReplayItem, limit: { truncated: boolean }): boolean {
-  if (items.length >= SESSION_REPLAY_MAX_ITEMS) {
-    limit.truncated = true;
-    return false;
+function push(items: SessionReplayItem[], item: SessionReplayItem, limit: ProjectionLimit): boolean {
+  if ((item.kind === 'tool_call' || item.kind === 'tool_result') && item.callId) {
+    const evidence = item.kind === 'tool_call' ? limit.calls : limit.results;
+    const previous = evidence.get(item.callId);
+    evidence.set(item.callId, { requestId: item.requestId, count: (previous?.count ?? 0) + 1 });
   }
+  const position = limit.seen++;
+  if (position < limit.itemOffset || items.length >= SESSION_REPLAY_MAX_ITEMS) return true;
   items.push(item);
   return true;
 }
 
-function unknown(items: SessionReplayItem[], requestId: string, body: ReplayBody, reason: ReplayUnknownReason, limit: { truncated: boolean }) {
+function unknown(items: SessionReplayItem[], requestId: string, body: ReplayBody, reason: ReplayUnknownReason, limit: ProjectionLimit) {
+  // A body may contain hundreds of opaque reasoning/compaction records. One
+  // honest gap per reason is enough; repeated warnings must not crowd out text.
+  const key = JSON.stringify([requestId, body, reason]);
+  if (limit.unknownKeys.has(key)) return;
+  limit.unknownKeys.add(key);
   push(items, { kind: 'unknown', requestId, body, reason }, limit);
 }
 
-function message(items: SessionReplayItem[], requestId: string, body: ReplayBody, role: 'user' | 'assistant', content: unknown, limit: { truncated: boolean }) {
+function message(items: SessionReplayItem[], requestId: string, body: ReplayBody, role: ReplayMessage['role'], content: unknown, limit: ProjectionLimit) {
   const extracted = textFromContent(content);
   if (extracted.truncated) limit.truncated = true;
   push(items, {
@@ -148,7 +155,7 @@ function message(items: SessionReplayItem[], requestId: string, body: ReplayBody
   }, limit);
 }
 
-function toolCall(items: SessionReplayItem[], requestId: string, body: ReplayBody, value: unknown, limit: { truncated: boolean }) {
+function toolCall(items: SessionReplayItem[], requestId: string, body: ReplayBody, value: unknown, limit: ProjectionLimit) {
   const record = object(value);
   if (!record || redacted(record)) {
     unknown(items, requestId, body, redacted(record) ? 'redacted' : 'unsupported_body', limit);
@@ -172,7 +179,7 @@ function toolCall(items: SessionReplayItem[], requestId: string, body: ReplayBod
   }, limit);
 }
 
-function toolResult(items: SessionReplayItem[], requestId: string, body: ReplayBody, value: unknown, limit: { truncated: boolean }) {
+function toolResult(items: SessionReplayItem[], requestId: string, body: ReplayBody, value: unknown, limit: ProjectionLimit) {
   const record = object(value);
   if (!record || redacted(record)) {
     unknown(items, requestId, body, redacted(record) ? 'redacted' : 'unsupported_body', limit);
@@ -194,18 +201,19 @@ function toolResult(items: SessionReplayItem[], requestId: string, body: ReplayB
   }, limit);
 }
 
-function chatMessage(items: SessionReplayItem[], requestId: string, body: ReplayBody, value: unknown, limit: { truncated: boolean }) {
+function chatMessage(items: SessionReplayItem[], requestId: string, body: ReplayBody, value: unknown, limit: ProjectionLimit) {
   const record = object(value);
   if (!record || redacted(record)) {
     unknown(items, requestId, body, redacted(record) ? 'redacted' : 'unsupported_body', limit);
     return;
   }
   const role = string(record.role);
+  // Instructions are valid protocol input, not conversation turns.
+  if (role === 'system' || role === 'developer') return;
   if (role === 'user' || role === 'assistant') message(items, requestId, body, role, record.content, limit);
   const calls = array(record.tool_calls);
   if (calls) {
-    if (calls.length > MAX_BODY_ITEMS) limit.truncated = true;
-    for (const call of calls.slice(0, MAX_BODY_ITEMS)) toolCall(items, requestId, body, call, limit);
+    for (const call of calls) toolCall(items, requestId, body, call, limit);
   }
   if (record.function_call !== undefined) toolCall(items, requestId, body, record.function_call, limit);
   if (role === 'tool' || role === 'function') toolResult(items, requestId, body, record, limit);
@@ -214,13 +222,17 @@ function chatMessage(items: SessionReplayItem[], requestId: string, body: Replay
   }
 }
 
-function responsesItem(items: SessionReplayItem[], requestId: string, body: ReplayBody, value: unknown, limit: { truncated: boolean }) {
+function responsesItem(items: SessionReplayItem[], requestId: string, body: ReplayBody, value: unknown, limit: ProjectionLimit) {
   const record = object(value);
   if (!record || redacted(record)) {
     unknown(items, requestId, body, redacted(record) ? 'redacted' : 'unsupported_body', limit);
     return;
   }
   const type = string(record.type);
+  if (type === 'additional_tools' || record.role === 'system' || record.role === 'developer') return;
+  if (type === 'agent_message') { message(items, requestId, body, 'agent', record.content, limit); return; }
+  if (type === 'custom_tool_call') { toolCall(items, requestId, body, { ...record, arguments: record.input }, limit); return; }
+  if (type === 'custom_tool_call_output') { toolResult(items, requestId, body, record, limit); return; }
   if (type === 'function_call') { toolCall(items, requestId, body, record, limit); return; }
   if (type === 'function_call_output') { toolResult(items, requestId, body, record, limit); return; }
   if (type === 'message') {
@@ -236,25 +248,23 @@ function responsesItem(items: SessionReplayItem[], requestId: string, body: Repl
   unknown(items, requestId, body, 'unsupported_body', limit);
 }
 
-function responsesRequest(items: SessionReplayItem[], requestId: string, body: ReplayBody, input: unknown, limit: { truncated: boolean }) {
+function responsesRequest(items: SessionReplayItem[], requestId: string, body: ReplayBody, input: unknown, limit: ProjectionLimit) {
   if (typeof input === 'string') { message(items, requestId, body, 'user', input, limit); return; }
   const entries = array(input);
   if (!entries) { unknown(items, requestId, body, 'unsupported_body', limit); return; }
-  if (entries.length > MAX_BODY_ITEMS) limit.truncated = true;
-  for (const entry of entries.slice(0, MAX_BODY_ITEMS)) {
+  for (const entry of entries) {
     if (typeof entry === 'string') message(items, requestId, body, 'user', entry, limit);
     else responsesItem(items, requestId, body, entry, limit);
   }
 }
 
-function responsesResponse(items: SessionReplayItem[], requestId: string, body: ReplayBody, output: unknown, limit: { truncated: boolean }) {
+function responsesResponse(items: SessionReplayItem[], requestId: string, body: ReplayBody, output: unknown, limit: ProjectionLimit) {
   const entries = array(output);
   if (!entries) { unknown(items, requestId, body, 'unsupported_body', limit); return; }
-  if (entries.length > MAX_BODY_ITEMS) limit.truncated = true;
-  for (const entry of entries.slice(0, MAX_BODY_ITEMS)) responsesItem(items, requestId, body, entry, limit);
+  for (const entry of entries) responsesItem(items, requestId, body, entry, limit);
 }
 
-function projectRequestBody(items: SessionReplayItem[], detail: RequestDetail, limit: { truncated: boolean }) {
+function projectRequestBody(items: SessionReplayItem[], detail: RequestDetail, limit: ProjectionLimit) {
   const body = detail.request_body;
   if (body === null || body === undefined) {
     unknown(items, detail.request_id, 'request', 'archive_unavailable', limit);
@@ -265,16 +275,42 @@ function projectRequestBody(items: SessionReplayItem[], detail: RequestDetail, l
   if (!record) { unknown(items, detail.request_id, 'request', 'unsupported_body', limit); return; }
   const messages = array(record.messages);
   if (messages) {
-    if (messages.length > MAX_BODY_ITEMS) limit.truncated = true;
-    for (const value of messages.slice(0, MAX_BODY_ITEMS)) chatMessage(items, detail.request_id, 'request', value, limit);
+    for (const value of messages) chatMessage(items, detail.request_id, 'request', value, limit);
     return;
   }
   if ('input' in record) { responsesRequest(items, detail.request_id, 'request', record.input, limit); return; }
   unknown(items, detail.request_id, 'request', 'unsupported_body', limit);
 }
 
-function projectResponseBody(items: SessionReplayItem[], detail: RequestDetail, limit: { truncated: boolean }) {
-  const body = detail.response_body;
+/** Archive storage retains streaming responses as SSE text, not a JSON response.
+ * Read every returned event; the archive API owns body-size validation. */
+function archivedSseResponse(value: unknown): JsonObject | undefined {
+  if (typeof value !== 'string' || !/^data:/m.test(value)) return undefined;
+  const completedItems = new Map<number, JsonObject>();
+  let terminal: JsonObject | undefined;
+  const blocks = value.replaceAll('\r\n', '\n').split('\n\n');
+  for (const block of blocks) {
+    const data = block.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
+    if (!data || data === '[DONE]') continue;
+    let event: JsonObject | undefined;
+    try { event = object(JSON.parse(data)); } catch { continue; }
+    if (!event) continue;
+    if (event.type === 'response.output_item.done' && Number.isInteger(event.output_index)
+      && (event.output_index as number) >= 0 && object(event.item)) {
+      completedItems.set(event.output_index as number, object(event.item)!);
+    }
+    if (event.type === 'response.completed' || event.type === 'response.incomplete' || event.type === 'response.failed') {
+      terminal = object(event.response);
+      break;
+    }
+  }
+  if (array(terminal?.output)?.length) return terminal;
+  if (completedItems.size) return { ...terminal, output: [...completedItems].sort(([a], [b]) => a - b).map(([, item]) => item), replay_partial: !terminal };
+  return terminal;
+}
+
+function projectResponseBody(items: SessionReplayItem[], detail: RequestDetail, limit: ProjectionLimit) {
+  const body = archivedSseResponse(detail.response_body) ?? detail.response_body;
   if (body === null || body === undefined) {
     unknown(items, detail.request_id, 'response', 'archive_unavailable', limit);
     return;
@@ -285,38 +321,30 @@ function projectResponseBody(items: SessionReplayItem[], detail: RequestDetail, 
   if (!record) { unknown(items, detail.request_id, 'response', 'unsupported_body', limit); return; }
   const choices = array(record.choices);
   if (choices) {
-    if (choices.length > MAX_BODY_ITEMS) limit.truncated = true;
-    for (const choice of choices.slice(0, MAX_BODY_ITEMS)) chatMessage(items, detail.request_id, 'response', object(choice)?.message, limit);
+    for (const choice of choices) chatMessage(items, detail.request_id, 'response', object(choice)?.message, limit);
     return;
   }
-  if ('output' in record) { responsesResponse(items, detail.request_id, 'response', record.output, limit); return; }
+  if ('output' in record) {
+    responsesResponse(items, detail.request_id, 'response', record.output, limit);
+    if (record.replay_partial) unknown(items, detail.request_id, 'response', 'archive_unavailable', limit);
+    return;
+  }
   const outputText = string(record.output_text);
   if (outputText !== undefined) { message(items, detail.request_id, 'response', 'assistant', outputText, limit); return; }
   unknown(items, detail.request_id, 'response', 'unsupported_body', limit);
 }
 
-function pairToolCalls(items: SessionReplayItem[]) {
-  const calls = new Map<string, ReplayToolCall[]>();
-  const results = new Map<string, ReplayToolResult[]>();
+function pairToolCalls(items: SessionReplayItem[], evidence: ProjectionLimit) {
   for (const item of items) {
-    if (item.kind === 'tool_call' && item.callId) calls.set(item.callId, [...(calls.get(item.callId) ?? []), item]);
-    if (item.kind === 'tool_result' && item.callId) results.set(item.callId, [...(results.get(item.callId) ?? []), item]);
-  }
-  for (const [callId, callEntries] of calls) {
-    const resultEntries = results.get(callId) ?? [];
-    if (callEntries.length !== 1 || resultEntries.length !== 1) {
-      if (callEntries.length > 1 || resultEntries.length > 1) {
-        for (const call of callEntries) call.pairing = 'unknown';
-        for (const result of resultEntries) result.pairing = 'unknown';
-      }
-      continue;
+    if ((item.kind !== 'tool_call' && item.kind !== 'tool_result') || !item.callId) continue;
+    const call = evidence.calls.get(item.callId);
+    const result = evidence.results.get(item.callId);
+    if ((call?.count ?? 0) > 1 || (result?.count ?? 0) > 1) item.pairing = 'unknown';
+    else if (call?.count === 1 && result?.count === 1) {
+      item.pairing = 'paired';
+      if (item.kind === 'tool_call') item.pairedResultRequestId = result.requestId;
+      else item.pairedCallRequestId = call.requestId;
     }
-    const [call] = callEntries;
-    const [result] = resultEntries;
-    call.pairedResultRequestId = result.requestId;
-    call.pairing = 'paired';
-    result.pairedCallRequestId = call.requestId;
-    result.pairing = 'paired';
   }
 }
 
@@ -324,24 +352,41 @@ function pairToolCalls(items: SessionReplayItem[]) {
  * Projects only details explicitly belonging to `sessionId`. It never guesses
  * a session, pairs a tool result by name/order, parses HTML, or evaluates data.
  */
-export function projectSessionReplay(sessionId: string, details: readonly RequestDetail[]): SessionReplayProjection {
+export function projectSessionReplay(sessionId: string, details: readonly RequestDetail[], itemOffset = 0): SessionReplayProjection {
   const items: SessionReplayItem[] = [];
-  const limit = { truncated: details.length > SESSION_REPLAY_MAX_REQUESTS };
+  const limit: ProjectionLimit = { truncated: details.length > SESSION_REPLAY_MAX_REQUESTS, itemOffset: Math.max(0, itemOffset), seen: 0, unknownKeys: new Set(), calls: new Map(), results: new Map() };
   const requests = details.slice(0, SESSION_REPLAY_MAX_REQUESTS)
     .sort((left, right) => left.created_at - right.created_at || left.request_id.localeCompare(right.request_id));
+  let previousHistory: string[] = [];
+  let previousFormat = '';
 
   for (const detail of requests) {
     if (detail.session_context?.session_id !== sessionId) {
       unknown(items, detail.request_id, 'request', 'outside_session', limit);
       unknown(items, detail.request_id, 'response', 'outside_session', limit);
+      previousHistory = [];
       continue;
     }
-    projectRequestBody(items, detail, limit);
-    projectResponseBody(items, detail, limit);
+    const body = object(detail.request_body);
+    const format = array(body?.input) ? 'input' : array(body?.messages) ? 'messages' : '';
+    const history = format ? array(body?.[format]) ?? [] : [];
+    const identities = history.map(item => JSON.stringify(item));
+    let repeated = 0;
+    // Only an exact ordered prefix is carried history. Never globally dedupe
+    // equal text, which would erase a user's deliberate repeated turn.
+    if (format && format === previousFormat) {
+      while (repeated < identities.length && repeated < previousHistory.length && identities[repeated] === previousHistory[repeated]) repeated += 1;
+    }
+    projectRequestBody(items, repeated && body ? { ...detail, request_body: { ...body, [format]: history.slice(repeated) } } : detail, limit);
+    const response = archivedSseResponse(detail.response_body) ?? object(detail.response_body);
+    projectResponseBody(items, response ? { ...detail, response_body: response } : detail, limit);
+    const output = format === 'input' ? array(response?.output) : array(response?.choices)?.flatMap(choice => object(choice)?.message ? [object(choice)?.message] : []);
+    previousHistory = [...identities, ...(output ?? []).map(item => JSON.stringify(item))];
+    previousFormat = format;
   }
   if (details.length > SESSION_REPLAY_MAX_REQUESTS) {
     unknown(items, '', 'request', 'input_limit', limit);
   }
-  pairToolCalls(items);
-  return { sessionId, items, truncated: limit.truncated };
+  pairToolCalls(items, limit);
+  return { sessionId, items, truncated: limit.truncated, totalItems: limit.seen, nextItemOffset: limit.seen > limit.itemOffset + items.length ? limit.itemOffset + items.length : null };
 }

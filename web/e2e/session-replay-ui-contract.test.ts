@@ -28,7 +28,7 @@ test('replay reads are bounded, abortable, and accept only an exact request and 
   assert.match(replayView, /const controller = new AbortController\(\)/);
   assert.match(replayView, /candidate\.request_id !== request\.request_id \|\| candidate\.session_context\?\.session_id !== scope\.sessionId/);
   assert.match(replayView, /controller\.abort\(\)/);
-  assert.match(replayView, /projectSessionReplay\(detail\.session_id, archiveDetails\)/);
+  assert.match(replayView, /projectSessionReplay\(detail\.session_id, archiveDetails, itemOffset\)/);
   assert.match(replayView, /outside_session/);
   assert.doesNotMatch(replayView, /dangerouslySetInnerHTML|\beval\s*\(/);
 });

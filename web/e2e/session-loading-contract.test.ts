@@ -23,7 +23,16 @@ test('initial list work and SSE refreshes do not overlap and amplify slow databa
   assert.match(list, /listInFlight\.current = true/);
   assert.match(list, /listInFlight\.current = false/);
   assert.match(list, /if \(!background && refreshDirty\.current\) scheduleRefresh\(\)/);
-  assert.match(source, /await loadSessions\(false, filtersRef\.current, true\);\s*if \(generation !== scopeGeneration\.current\) return/);
+  assert.match(source, /await loadSessions\(false, filtersRef\.current, true\);\s*if \(generation !== scopeGeneration\.current \|\| !autoRefreshRef\.current\) return/);
+});
+
+test('live refresh is explicitly opt-in, rate-limited and does not interrupt detail reads', () => {
+  assert.match(source, /\[autoRefresh, setAutoRefresh\] = useState\(false\)/);
+  assert.match(source, /if \(!autoRefreshRef\.current \|\| refreshTimer/);
+  assert.match(source, /}, 3_000\)/);
+  assert.match(source, /checked=\{autoRefresh\}/);
+  assert.match(source, /if \(!session \|\| detailInFlight\.current\) return/);
+  assert.match(source, /sessions\.refreshNow/);
 });
 
 test('detail loading does not disable the usable list and has its own progress indicator', () => {

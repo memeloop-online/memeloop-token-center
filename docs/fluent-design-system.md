@@ -1,5 +1,21 @@
 # Operator design system
 
+## Shared task and extension composition
+
+Credential rows keep selection next to identity, metadata next to the record,
+and copy/secondary operations in one action group. Editing continues in the
+existing single `CreateJourney`; do not add a second row editor or duplicate
+authorization/policy forms. Filters stretch their existing Fluent controls to
+the assigned column instead of separating labels from short floating inputs.
+
+Typed plugin slots render scalar metrics with the same `AnalyticsMetric` used
+by built-in monitoring. A scalar value supplies neither a fake history nor a
+ratio. Text, status and approved links preserve projection order and span the
+slot width; adjacent metrics share a responsive grid. Long plugin values wrap.
+The slot remains a core-owned, authenticated, lazy, scoped read boundary, not a
+place for plugin code, credentials, arbitrary HTML or invented editing actions.
+No new contribution placement or permission is introduced by layout reuse.
+
 ## Foundation and boundaries
 
 Use Microsoft Fluent UI React v9, exact `@fluentui/react-components@9.74.7`.
@@ -109,3 +125,20 @@ and read-failure provenance, using the existing shared expiration clock.
 `overview-quota-browser-contract.test.ts` exercises this composition through the
 production app entry and AppShell with synthetic network responses, including
 multiple models sharing one account, unobserved zeroes, and a failed refresh.
+
+# Global typography and acceptance boundary
+
+Shared page titles, section headings, and supporting text use Fluent typography
+tokens from the existing provider. The baseline keeps readable fallbacks for
+standalone surfaces. Technical IDs, credentials, code, and machine payloads keep
+their monospace presentation; explanatory prose does not inherit it from a
+generic panel-heading selector. Remaining native actions use tokenized baseline
+states, while Fluent actions own their geometry, focus, disabled, and pressed
+states without global button overrides.
+
+`app-typography-browser-contract.test.ts` renders the production `index.html` /
+`main.tsx` / `Application` / `AppShell` / `Operator` graph at desktop and mobile
+widths in both themes. Only API responses and the idle event stream are synthetic;
+unexpected network calls and writes are rejected. Its full-page captures validate
+the actual stylesheet graph, not a manually assembled component shell. They are
+CI candidate evidence, not evidence that a deployment or real account is healthy.

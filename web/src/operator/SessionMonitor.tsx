@@ -92,10 +92,14 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
   const [draft, setDraft] = useState<SessionFilters>(emptySessionFilters);
   const [filters, setFilters] = useState<SessionFilters>(emptySessionFilters);
   const [refreshing, setRefreshing] = useState(false);
+  const [autoRefresh, setAutoRefresh] = useState(false);
+  const autoRefreshRef = useRef(autoRefresh);
+  autoRefreshRef.current = autoRefresh;
   const listSequence = useRef(0);
   const listRequests = useRef(new LatestRequestGate());
   const listInFlight = useRef(false);
   const detailRequests = useRef(new LatestRequestGate());
+  const detailInFlight = useRef(false);
   const handledFocus = useRef(0);
   const firstPageSize = useRef(0);
   const loadedOlderList = useRef(false);
@@ -185,6 +189,8 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
 
   async function selectSession(session: LogicalSessionSummary) {
     const request = detailRequests.current.begin();
+    detailInFlight.current = true;
+    selectedRef.current = session;
     const requestScope = scopeKey;
     loadedOlderDetail.current = false;
     setSelected(session); setDetail(undefined); setDetailScope(''); setDetailLoading(true); setError(''); setErrorScope('');
@@ -200,13 +206,14 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
         setErrorScope(requestScope);
       }
     } finally {
-      if (request.isCurrent()) setDetailLoading(false);
+      if (request.isCurrent()) { detailInFlight.current = false; setDetailLoading(false); }
     }
   }
 
   async function refreshSelected(session = selectedRef.current) {
-    if (!session) return;
+    if (!session || detailInFlight.current) return;
     const request = detailRequests.current.begin();
+    detailInFlight.current = true;
     const requestScope = scopeKey;
     try {
       const page = await api<LogicalSessionDetail>(detailPath(tenant, session), token.trim(), { signal: AbortSignal.any([request.signal, AbortSignal.timeout(15_000)]) });
@@ -235,15 +242,16 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
         setErrorScope(requestScope);
       }
     } finally {
-      if (request.isCurrent()) setDetailLoading(false);
+      if (request.isCurrent()) { detailInFlight.current = false; setDetailLoading(false); }
     }
   }
 
   async function loadEarlier() {
     const current = detail;
     const session = selected;
-    if (!current?.next_cursor || !session) return;
+    if (!current?.next_cursor || !session || detailInFlight.current) return;
     const request = detailRequests.current.begin();
+    detailInFlight.current = true;
     const requestScope = scopeKey;
     setDetailLoading(true); setError('');
     try {
@@ -268,19 +276,19 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
         setErrorScope(requestScope);
       }
     } finally {
-      if (request.isCurrent()) setDetailLoading(false);
+      if (request.isCurrent()) { detailInFlight.current = false; setDetailLoading(false); }
     }
   }
 
   function scheduleRefresh() {
     // Do not launch a second full list read while its initial/manual page is
     // still loading. The dirty set is drained once that read has settled.
-    if (refreshTimer.current !== undefined || refreshInFlight.current || listInFlight.current) return;
+    if (!autoRefreshRef.current || refreshTimer.current !== undefined || refreshInFlight.current || listInFlight.current) return;
     const generation = scopeGeneration.current;
     setRefreshing(true);
     refreshTimer.current = window.setTimeout(() => {
-      if (generation !== scopeGeneration.current) return;
       refreshTimer.current = undefined;
+      if (generation !== scopeGeneration.current || !autoRefreshRef.current) return;
       refreshInFlight.current = true;
       refreshDirty.current = false;
       dirtyEventIdentities.current.clear();
@@ -290,7 +298,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       const selectedIdentity = selectedAtBatchStart ? sessionIdentityKey(selectedAtBatchStart) : undefined;
       const refresh = async () => {
         await loadSessions(false, filtersRef.current, true);
-        if (generation !== scopeGeneration.current) return;
+        if (generation !== scopeGeneration.current || !autoRefreshRef.current) return;
         const latestSelection = selectedRef.current;
         if (selectedAtBatchStart && latestSelection && sessionIdentityKey(latestSelection) === selectedIdentity
           && sessionEventsRequireDetailRefresh(batchDetailEvents, latestSelection, detailRef.current)) {
@@ -302,7 +310,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
         refreshInFlight.current = false;
         if (refreshDirty.current || dirtyEventIdentities.current.size > 0) scheduleRefresh();
       });
-    }, 500);
+    }, 3_000);
   }
 
   useEffect(() => {
@@ -331,6 +339,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     listRequests.current.invalidate();
     listInFlight.current = false;
     detailRequests.current.invalidate();
+    detailInFlight.current = false;
     firstPageSize.current = 0;
     loadedOlderList.current = false;
     loadedOlderDetail.current = false;
@@ -360,6 +369,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
   useEffect(() => {
     if (!token.trim() || revision === 0) return;
     const eventIdentities = drainSessionEventIdentities(eventKeyIds.current);
+    if (!autoRefreshRef.current) return;
     for (const identity of eventIdentities) dirtyEventIdentities.current.add(identity);
     const selectedAtEvent = selectedRef.current;
     if (selectedAtEvent && sessionEventTargetsSelection(eventIdentities, selectedAtEvent)) {
@@ -369,6 +379,20 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     scheduleRefresh();
   }, [revision, eventKeyIds]);
 
+  function toggleAutoRefresh(enabled: boolean) {
+    autoRefreshRef.current = enabled;
+    setAutoRefresh(enabled);
+    if (enabled) { refreshDirty.current = true; scheduleRefresh(); }
+    else {
+      if (refreshTimer.current !== undefined) window.clearTimeout(refreshTimer.current);
+      refreshTimer.current = undefined;
+      refreshDirty.current = false;
+      dirtyEventIdentities.current.clear();
+      dirtyDetailEvents.current.clear();
+      if (!refreshInFlight.current) setRefreshing(false);
+    }
+  }
+
   const hasScope = Boolean(token.trim());
   const status = !hasScope ? 'idle' : refreshing ? 'refreshing' : streamState;
   const visibleSessions = listScope === scopeKey ? sessions : [];
@@ -376,7 +400,11 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
   const visibleError = errorScope === scopeKey ? error : '';
   return <>
     {visibleError && <div className="notice error" role="alert">{visibleError} <button type="button" className="secondary" disabled={loading} onClick={() => void loadSessions(false, filters, visibleSessions.length > 0)}>{t('sessions.retryLoad')}</button></div>}
-    <div className={`session-live-state ${status}`} role="status">{t(`sessions.live.${status}`)}</div>
+    <div className="session-refresh-controls">
+      <label><input type="checkbox" checked={autoRefresh} onChange={(event) => toggleAutoRefresh(event.target.checked)} />{t('sessions.autoRefresh')}</label>
+      <span className={`session-live-state ${status}`} role="status">{autoRefresh ? t(`sessions.live.${status}`) : t('sessions.paused')}</span>
+      <button type="button" className="secondary" disabled={loading || refreshing || detailLoading} onClick={() => { void loadSessions(false, filters, visibleSessions.length > 0); if (selected) void refreshSelected(selected); }}>{t('sessions.refreshNow')}</button>
+    </div>
     <form className="session-controls" onSubmit={(event) => { event.preventDefault(); setFilters({ ...draft }); }}>
       <label>{t('sessions.search')}<input value={draft.q} onChange={(event) => setDraft({ ...draft, q: event.target.value })} placeholder={t('sessions.searchPlaceholder')} /></label>
       <SessionCredentialFilter value={draft.keyId} sessions={visibleSessions} token={token} tenant={tenant} onChange={(keyId) => setDraft({ ...draft, keyId })} />
@@ -384,7 +412,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       <label>{t('sessions.state')}<select value={draft.state} onChange={(event) => setDraft({ ...draft, state: event.target.value as SessionFilters['state'] })}><option value="">{t('common.all')}</option><option value="active">{t('sessions.filter.active')}</option><option value="has_errors">{t('sessions.filter.hasErrors')}</option></select></label>
       <div className="filter-actions"><button type="submit" disabled={loading}>{t('traffic.applyFilters')}</button><button type="button" className="secondary" disabled={loading || !Object.values(filters).some(Boolean)} onClick={() => { setDraft(emptySessionFilters); setFilters(emptySessionFilters); }}>{t('traffic.clearFilters')}</button></div>
     </form>
-    <p className="muted session-result-count">{t('sessions.serverFiltered', { count: visibleSessions.length })}{listScope === scopeKey && generatedAt > 0 && <> · {t('sessions.generatedAt', { time: new Date(generatedAt).toLocaleString(locale) })}</>}</p>
+    <p className="muted session-result-count">{loading && !visibleSessions.length ? t('common.loading') : t('sessions.serverFiltered', { count: visibleSessions.length })}{listScope === scopeKey && generatedAt > 0 && <> · {t('sessions.generatedAt', { time: new Date(generatedAt).toLocaleString(locale) })}</>}</p>
     <div className="session-workspace">
       <section className="session-browser" aria-label={t('sessions.recent')}>
         <SessionList values={visibleSessions} loading={loading} showCredential selected={selected} layout="sidebar" onSelect={(session) => void selectSession(session)} />
@@ -392,7 +420,8 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       </section>
       <div className="session-detail-region">
         {!visibleDetail && detailLoading && <div className="empty" role="status">{t('common.loading')}</div>}
-        {visibleDetail && <SessionDetailSurface detail={visibleDetail} summary={selected} showDiagnosticIds loading={detailLoading} onLoadOlder={() => void loadEarlier()} loadReplayArchive={loadReplayArchive} onSelect={(request) => { void onSelectRequest(request); }} onClose={() => { setDetail(undefined); setDetailScope(''); setSelected(undefined); }} />}
+        {!visibleDetail && !detailLoading && <div className="empty">{selected && visibleError ? <button type="button" className="secondary" onClick={() => void selectSession(selected)}>{t('sessions.retryLoad')}</button> : t('sessions.selectHint')}</div>}
+        {visibleDetail && <SessionDetailSurface detail={visibleDetail} summary={selected} showDiagnosticIds loading={detailLoading} onLoadOlder={() => void loadEarlier()} loadReplayArchive={loadReplayArchive} onSelect={(request) => { void onSelectRequest(request); }} onClose={() => { detailRequests.current.invalidate(); detailInFlight.current = false; setDetailLoading(false); setDetail(undefined); setDetailScope(''); setSelected(undefined); selectedRef.current = undefined; }} />}
       </div>
     </div>
   </>;

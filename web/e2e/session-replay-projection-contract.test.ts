@@ -3,7 +3,6 @@ import test from 'node:test';
 import {
   projectSessionReplay,
   SESSION_REPLAY_MAX_ITEMS,
-  SESSION_REPLAY_MAX_TEXT_LENGTH,
 } from '../src/sessionReplayProjection.js';
 import type { RequestDetail } from '../src/types.js';
 
@@ -95,15 +94,64 @@ test('reports unavailable, redacted, and out-of-session data as unknown rather t
   assert.deepEqual({ text: redactedMessage.text, unknown: redactedMessage.unknown }, { text: null, unknown: 'redacted' });
 });
 
-test('bounds retained text and projection item count with explicit truncation', () => {
+test('pages projection items without discarding long retained text or later items', () => {
   const long = detail('long', 1,
-    { messages: Array.from({ length: SESSION_REPLAY_MAX_ITEMS + 5 }, (_, index) => ({ role: 'user', content: index === 0 ? 'x'.repeat(SESSION_REPLAY_MAX_TEXT_LENGTH + 1) : `message-${index}` })) },
+    { messages: Array.from({ length: SESSION_REPLAY_MAX_ITEMS + 5 }, (_, index) => ({ role: 'user', content: index === 0 ? 'x'.repeat(20_000) : `message-${index}` })) },
     { choices: [] },
   );
   const replay = projectSessionReplay('session-a', [long]);
   const first = replay.items.find((item) => item.kind === 'message');
-  assert.equal(first?.text?.length, SESSION_REPLAY_MAX_TEXT_LENGTH);
-  assert.equal(first?.truncated, true);
-  assert.equal(replay.truncated, true);
+  assert.equal(first?.text?.length, 20_000);
+  assert.equal(first?.truncated, false);
+  assert.equal(replay.truncated, false);
   assert.ok(replay.items.length <= SESSION_REPLAY_MAX_ITEMS);
+  assert.equal(replay.nextItemOffset, SESSION_REPLAY_MAX_ITEMS);
+  const next = projectSessionReplay('session-a', [long], replay.nextItemOffset!);
+  assert.equal(next.items.length, 5);
+  assert.equal(next.nextItemOffset, null);
+  assert.equal(next.totalItems, SESSION_REPLAY_MAX_ITEMS + 5);
+});
+
+test('projects archived Codex custom tools and agent messages without opaque-item floods', () => {
+  const archive = detail('codex', 1, { input: [
+    { type: 'additional_tools', role: 'developer', tools: [] },
+    { type: 'message', role: 'developer', content: 'instructions' },
+    ...Array.from({ length: 250 }, () => ({ type: 'reasoning', encrypted_content: 'opaque' })),
+    { type: 'agent_message', author: 'worker', content: [{ type: 'input_text', text: 'Found the cause' }] },
+    { type: 'custom_tool_call', call_id: 'patch-1', name: 'apply_patch', input: 'patch text' },
+    { type: 'custom_tool_call_output', call_id: 'patch-1', output: 'applied' },
+  ] }, { output: [{ type: 'message', role: 'assistant', content: 'Done' }] });
+  const replay = projectSessionReplay('session-a', [archive]);
+  assert.equal(replay.items.filter(item => item.kind === 'unknown').length, 1);
+  assert.ok(replay.items.some(item => item.kind === 'message' && item.role === 'agent' && item.text === 'Found the cause'));
+  assert.ok(replay.items.some(item => item.kind === 'tool_call' && item.arguments === 'patch text' && item.pairing === 'paired'));
+  assert.ok(replay.items.some(item => item.kind === 'tool_result' && item.output === 'applied'));
+  assert.ok(replay.items.some(item => item.kind === 'message' && item.role === 'assistant' && item.text === 'Done'));
+  assert.equal(replay.truncated, false);
+});
+
+test('removes only carried history prefixes and preserves a repeated new user turn', () => {
+  const user = { type: 'message', role: 'user', content: 'Again' };
+  const assistant = { type: 'message', role: 'assistant', content: 'Done' };
+  const first = detail('history-1', 1, { input: [user] }, { output: [assistant] });
+  const second = detail('history-2', 2, { input: [user, assistant, user] }, { output: [] });
+  const replay = projectSessionReplay('session-a', [first, second]);
+  assert.deepEqual(replay.items.filter(item => item.kind === 'message').map(item => [item.role, item.text]), [
+    ['user', 'Again'], ['assistant', 'Done'], ['user', 'Again'],
+  ]);
+});
+
+test('reads retained Responses SSE terminal output and ordered completed tool items', () => {
+  const stream = [
+    'event: response.output_item.done\r\ndata: {"type":"response.output_item.done","output_index":1,"item":{"type":"custom_tool_call","call_id":"c","name":"patch","input":"actual patch"}}',
+    'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Working"}]}}',
+    'data: {"type":"response.completed","response":{"output":[]}}',
+    'data: [DONE]',
+  ].join('\r\n\r\n');
+  const replay = projectSessionReplay('session-a', [detail('sse', 1, { input: 'Task' }, stream)]);
+  assert.deepEqual(replay.items.map(item => item.kind), ['message', 'message', 'tool_call']);
+  assert.ok(replay.items.some(item => item.kind === 'message' && item.role === 'assistant' && item.text === 'Working'));
+  assert.ok(replay.items.some(item => item.kind === 'tool_call' && item.arguments === 'actual patch'));
+  const partial = projectSessionReplay('session-a', [detail('partial', 1, { input: 'Task' }, stream.split('data: {"type":"response.completed"')[0])]);
+  assert.ok(partial.items.some(item => item.kind === 'unknown' && item.body === 'response' && item.reason === 'archive_unavailable'));
 });

@@ -99,7 +99,7 @@ fn sanitizer_redacts_failures_and_rejects_terminal_conflicts() {
 }
 
 #[test]
-fn sanitizer_mints_progress_heartbeats_only_for_an_active_response() {
+fn sanitizer_mints_progress_heartbeats_until_downstream_terminal_release() {
     let mut sanitizer = ResponsesStreamingSanitizer::default();
     assert!(sanitizer.progress_heartbeat().is_none());
 
@@ -131,7 +131,37 @@ fn sanitizer_mints_progress_heartbeats_only_for_an_active_response() {
             b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-heartbeat\"}}\n\n",
         )
         .unwrap();
+    assert!(sanitizer.progress_heartbeat().is_some());
+    assert!(!sanitizer.finish().unwrap().is_empty());
     assert!(sanitizer.progress_heartbeat().is_none());
+
+    let mut terminal_only = ResponsesStreamingSanitizer::default();
+    assert!(
+        terminal_only
+            .push(
+                b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-terminal-only\"}}\n\n",
+            )
+            .unwrap()
+            .is_empty()
+    );
+    let heartbeat = terminal_only.progress_heartbeat().unwrap();
+    assert!(String::from_utf8_lossy(&heartbeat).contains("resp-terminal-only"));
+    assert!(!terminal_only.finish().unwrap().is_empty());
+    assert!(terminal_only.progress_heartbeat().is_none());
+
+    let mut failed = ResponsesStreamingSanitizer::default();
+    failed
+        .push(
+            b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-failed-heartbeat\"}}\n\n",
+        )
+        .unwrap();
+    assert!(failed.progress_heartbeat().is_some());
+    failed
+        .push(
+            b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-failed-heartbeat\",\"error\":{\"message\":\"private\"}}}\n\n",
+        )
+        .unwrap();
+    assert!(failed.progress_heartbeat().is_none());
 }
 
 #[test]

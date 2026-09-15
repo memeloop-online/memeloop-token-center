@@ -48,6 +48,8 @@ test('session initial spinner, retry failure and background retry preserve the r
     await page.locator('.session-browser').getByText('Loading…', { exact: true }).waitFor();
     await page.evaluate(() => window.resolveSessionList(true));
     await page.getByText('Retained session', { exact: true }).first().waitFor();
+    assert.equal(await page.getByRole('checkbox', { name: 'Auto-refresh', exact: true }).isChecked(), false);
+    await page.getByRole('checkbox', { name: 'Auto-refresh', exact: true }).check();
     await page.getByRole('button', { name: 'Simulate session event' }).click();
     await page.waitForFunction(() => window.sessionListReads === 3);
     assert.ok(await page.getByText('Retained session', { exact: true }).count() > 0);
@@ -105,6 +107,7 @@ test('session events refresh only the exact selected credential and session deta
     await page.evaluate(() => window.resolveSessionList(true));
     await page.waitForFunction(() => window.sessionDetailReads === 2);
 
+    await page.getByRole('checkbox', { name: 'Auto-refresh', exact: true }).check();
     await page.getByRole('button', { name: 'Simulate other credential event', exact: true }).click();
     await page.waitForFunction(() => window.sessionListReads === 3);
     await page.evaluate(() => window.resolveSessionList(true));

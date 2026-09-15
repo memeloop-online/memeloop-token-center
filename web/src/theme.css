@@ -77,7 +77,8 @@
 :root[data-theme='light'] .hero p,
 :root[data-theme='light'] .muted,
 :root[data-theme='light'] .bucket span,
-:root[data-theme='light'] .panel-title span,
+:root[data-theme='light'] .panel-title > span,
+:root[data-theme='light'] .panel-title > div > span,
 :root[data-theme='light'] .empty,
 :root[data-theme='light'] .account span,
 :root[data-theme='light'] .form-panel .field-description {
@@ -135,8 +136,7 @@
 }
 
 :root[data-theme='light'] .theme-toggle,
-:root[data-theme='light'] .language-toggle,
-:root[data-theme='light'] .secondary {
+:root[data-theme='light'] .language-toggle {
   color: #087d70;
   border-color: #86b9b1;
 }

@@ -1,19 +1,9 @@
 name: Plugin UI projection
 
 on:
-  pull_request:
-    paths:
-      - '.github/workflows/plugin-ui-projection.yml'
-      - 'schemas/plugin-ui-projection.schema.json'
-      - 'web/src/plugins/**'
-      - 'web/e2e/plugin-ui-*-contract.test.ts'
-      - 'web/e2e/fixtures/plugin-ui-slot.*'
-      - 'web/src/operator/pluginContributions.tsx'
-      - 'web/src/operator/Operator.tsx'
-      - 'web/e2e/operator-plugin-projection-browser-contract.test.ts'
-      - 'web/e2e/fixtures/operator-plugin-projection.*'
-      - 'src/plugin/ui_projection.rs'
-      - 'src/api/plugins.rs'
+  # These three browser contracts are part of ci.yml's mandatory web suite on
+  # every matching PR. Keep this workflow for a focused manual diagnostic run
+  # without paying to install and execute the same browser stack twice.
   workflow_dispatch:
 
 permissions:
@@ -49,6 +39,6 @@ jobs:
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
         with:
           name: plugin-ui-slots-${{ github.sha }}
-          path: web/e2e-artifacts/plugin-ui-slots/
+          path: web/e2e-artifacts/ui-system/plugin-ui-slots/
           if-no-files-found: warn
           retention-days: 14

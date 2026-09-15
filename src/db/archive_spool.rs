@@ -1,5 +1,7 @@
-//! Bounded encrypted spool. Mutations and GC serialize budget-first; uploads
-//! read bounded snapshot batches. No transaction encompasses object-storage I/O.
+//! Bounded encrypted spool. Buffered lifecycle transactions serialize
+//! budget-first; streaming append and GC take request-local spool rows first
+//! and update the budget only at the transaction tail. All paths acquire the
+//! global event cursor after the budget. No transaction encompasses object I/O.
 use crate::response_archive_spool::BufferedArchivePurpose;
 mod hold_diagnostics;
 pub(crate) use hold_diagnostics::BudgetHold;
@@ -331,9 +333,13 @@ impl Database {
         identity: ArchiveSpoolIdentity,
     ) -> Result<bool, AppError> {
         let purpose = BufferedArchivePurpose::Response;
-        let (mut tx, now, mut hold) = self
-            .tracked_spool_transaction("response_begin", Some(identity.request_id))
-            .await?;
+        // Validate and create the request-owned spool before touching the
+        // cross-request budget row. The final budget update still commits in
+        // this transaction, but no longer serializes unrelated streams while
+        // their request ownership is read.
+        let mut tx = self.archive_state_transaction().await?;
+        let mut hold = BudgetHold::late("response_begin", Some(identity.request_id));
+        let now = archive_clock(&mut tx, self.backend).await?;
         hold.phase("request_and_spool_owner");
         // The response writer is owned independently from the proxy lifecycle.
         // A short stream may therefore finalize its request before the writer's
@@ -364,20 +370,39 @@ impl Database {
             if !accepted { spool_write_rejected(identity, "begin", "existing_spool_not_eligible"); }
             return Ok(accepted);
         }
+        let inserted = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "INSERT INTO response_archive_spools (request_id, tenant_id, reservation_id, state, next_attempt_at, created_at, updated_at, expires_at, cipher_bytes) VALUES ($1, $2, $3, 'capturing', $4, $4, $4, $5, $6) ON CONFLICT(request_id) DO NOTHING")))
+            .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
+            .bind(identity.reservation_id.to_string()).bind(now).bind(now + CAPTURE_TTL)
+            .bind(SPOOL_OVERHEAD)
+            .execute(&mut *tx).await?;
+        if inserted.rows_affected() == 0 {
+            // A same-identity begin may win after our optimistic read. Recheck
+            // the committed owner instead of surfacing a unique-key error or
+            // charging the fixed budget overhead twice.
+            let row = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT tenant_id, reservation_id, state, expires_at FROM response_archive_spools WHERE request_id = $1")))
+                .bind(identity.request_id.to_string()).fetch_one(&mut *tx).await?;
+            let accepted = row.try_get::<String, _>("tenant_id")? == identity.tenant_id.to_string()
+                && row.try_get::<String, _>("reservation_id")?
+                    == identity.reservation_id.to_string()
+                && row.try_get::<String, _>("state")? == "capturing"
+                && row.try_get::<i64, _>("expires_at")? > now;
+            BudgetHold::rollback_optional(tx, Some(hold)).await?;
+            if !accepted {
+                spool_write_rejected(identity, "begin", "existing_spool_not_eligible");
+            }
+            return Ok(accepted);
+        }
+        hold.phase("budget_update");
         let budget = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1 WHERE singleton = 1 AND cipher_bytes <= $2")))
             .bind(SPOOL_OVERHEAD).bind(CIPHER_LIMIT - SPOOL_OVERHEAD).execute(&mut *tx).await?;
         if budget.rows_affected() != 1 {
+            BudgetHold::rollback_optional(tx, Some(hold)).await?;
             return Ok(spool_write_rejected(
                 identity,
                 "begin",
                 "global_cipher_capacity",
             ));
         }
-        sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "INSERT INTO response_archive_spools (request_id, tenant_id, reservation_id, state, next_attempt_at, created_at, updated_at, expires_at, cipher_bytes) VALUES ($1, $2, $3, 'capturing', $4, $4, $4, $5, $6)")))
-            .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
-            .bind(identity.reservation_id.to_string()).bind(now).bind(now + CAPTURE_TTL)
-            .bind(SPOOL_OVERHEAD)
-            .execute(&mut *tx).await?;
         hold.commit(tx).await?;
         Ok(true)
     }
@@ -398,9 +423,12 @@ impl Database {
         {
             return Ok(spool_write_rejected(identity, "append", "invalid_chunk"));
         }
-        let (mut tx, now, mut hold) = self
-            .tracked_spool_transaction("response_append", Some(identity.request_id))
-            .await?;
+        // Serialize chunks on their own spool first. The singleton budget is
+        // updated last, so its row lock covers only the capacity check and
+        // commit rather than every request-local validation and write.
+        let mut tx = self.archive_state_transaction().await?;
+        let mut hold = BudgetHold::late("response_append", Some(identity.request_id));
+        let now = archive_clock(&mut tx, self.backend).await?;
         hold.phase("spool_owner_and_append");
         let Some(row) = locked_spool_row(&mut tx, self.backend, identity, purpose).await? else {
             return Ok(spool_write_rejected(
@@ -443,19 +471,21 @@ impl Database {
         }
         // Accounting includes a fixed row/index overhead, not just ciphertext.
         let cipher_bytes = ciphertext.len() as i64 + CHUNK_OVERHEAD;
+        sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "INSERT INTO response_archive_spool_chunks (request_id, seq, ciphertext, byte_count) VALUES ($1, $2, $3, $4)")))
+            .bind(identity.request_id.to_string()).bind(seq).bind(ciphertext).bind(byte_count).execute(&mut *tx).await?;
+        sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET chunk_count = chunk_count + 1, byte_count = byte_count + $1, cipher_bytes = cipher_bytes + $2, updated_at = $3, expires_at = $4 WHERE request_id = $5")))
+            .bind(byte_count).bind(cipher_bytes).bind(now).bind(now + CAPTURE_TTL).bind(identity.request_id.to_string()).execute(&mut *tx).await?;
+        hold.phase("budget_update");
         let budget = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1 WHERE singleton = 1 AND cipher_bytes <= $2")))
             .bind(cipher_bytes).bind(CIPHER_LIMIT - cipher_bytes).execute(&mut *tx).await?;
         if budget.rows_affected() != 1 {
+            BudgetHold::rollback_optional(tx, Some(hold)).await?;
             return Ok(spool_write_rejected(
                 identity,
                 "append",
                 "global_cipher_capacity",
             ));
         }
-        sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "INSERT INTO response_archive_spool_chunks (request_id, seq, ciphertext, byte_count) VALUES ($1, $2, $3, $4)")))
-            .bind(identity.request_id.to_string()).bind(seq).bind(ciphertext).bind(byte_count).execute(&mut *tx).await?;
-        sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET chunk_count = chunk_count + 1, byte_count = byte_count + $1, cipher_bytes = cipher_bytes + $2, updated_at = $3, expires_at = $4 WHERE request_id = $5")))
-            .bind(byte_count).bind(cipher_bytes).bind(now).bind(now + CAPTURE_TTL).bind(identity.request_id.to_string()).execute(&mut *tx).await?;
         hold.commit(tx).await?;
         Ok(true)
     }
@@ -853,10 +883,12 @@ impl Database {
         &self,
         purpose: BufferedArchivePurpose,
     ) -> Result<Option<bool>, AppError> {
-        // Use the producer lock order and the connection's bounded lock
-        // timeout. PostgreSQL's lock queue prevents sustained admissions from
-        // starving GC; each transaction still deletes at most 64 chunks/1 MiB.
-        let (mut tx, _, mut hold) = self.tracked_spool_transaction("cleanup", None).await?;
+        // Select and mutate one request-owned spool before touching the global
+        // counter. Empty GC polls therefore never queue behind active streams,
+        // and a real cleanup holds the budget row only for its final decrement
+        // and commit. Each transaction remains bounded to 64 chunks/1 MiB.
+        let mut tx = self.archive_state_transaction().await?;
+        let mut hold = BudgetHold::late("cleanup", None);
         hold.phase("gc_select_and_delete");
         let row = match self.backend {
             DatabaseBackend::PostgreSql => {
@@ -982,10 +1014,18 @@ impl Database {
         sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET state = $1, cleaned_at = $2, cipher_bytes = cipher_bytes - $3, updated_at = $4, expires_at = CASE WHEN $5 = 1 THEN expires_at ELSE $4 END, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $6")))
             .bind(if bound { "bound" } else { "gap" }).bind(cleaned.then_some(now))
             .bind(released).bind(now).bind(i64::from(bound)).bind(&id).execute(&mut *tx).await?;
-        // The shared budget and this bounded spool mutation commit atomically.
-        sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes - $1 WHERE singleton = 1")))
+        // The shared budget and this bounded spool mutation still commit or
+        // roll back together; acquire it before the global request-event
+        // cursor to preserve the budget -> cursor order used by admission and
+        // buffered terminal transactions. Empty polls still touch neither.
+        hold.phase("budget_update");
+        let budget = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes - $1 WHERE singleton = 1 AND cipher_bytes >= $1")))
             .bind(released).execute(&mut *tx).await?;
+        if budget.rows_affected() != 1 {
+            return Err(AppError::Internal);
+        }
         if !matches!(previous_state.as_str(), "bound" | "gap") {
+            hold.phase("event_cursor");
             let request_id = Uuid::parse_str(&id).map_err(|_| AppError::Internal)?;
             emit_response_archive_transition_event_in_transaction(
                 &mut tx,
@@ -1019,9 +1059,10 @@ impl Database {
                 "archive transaction acquisition failed before budget ownership");
         })?;
         let pool_wait_ms = pool_started.elapsed().as_millis() as u64;
-        // First for every accounting mutation, including GC. State-only
-        // transactions may lock a spool row but never wait for this row, so no
-        // transaction can hold a spool row while requesting the reverse order.
+        // Buffered admission and terminal capture reserve the budget before
+        // acquiring their lifecycle rows. Streaming append and GC deliberately
+        // use archive_state_transaction instead and update the budget last;
+        // they never precede that update with the global request-event cursor.
         let lock = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT cipher_bytes, CAST(pg_backend_pid() AS BIGINT) AS backend_pid FROM response_archive_spool_budget WHERE singleton = 1 FOR UPDATE"

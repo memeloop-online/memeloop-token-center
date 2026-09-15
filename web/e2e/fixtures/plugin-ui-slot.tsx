@@ -1,8 +1,11 @@
 import { useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { PluginUiSlot } from '../../src/plugins/PluginUiSlot';
+import { I18nProvider } from '../../src/i18n';
+import { MtcFluentProvider } from '../../src/design-system';
 import '../../src/styles.css';
 import '../../src/theme.css';
+import '../../src/styles/metrics.css';
 import '../../src/plugins/pluginUiSlot.css';
 
 const messages = { loading: 'Loading', unavailable: 'Plugin unavailable', empty: 'No data', states: { ok: 'Healthy', warning: 'Warning', error: 'Error', unknown: 'Unknown' } };
@@ -18,4 +21,4 @@ function Fixture() {
       load={(signal) => fetch(`/fixture/projection/${pluginId}?tenant=${scope}`, { signal }).then((response) => response.json())} />)}
   </main>;
 }
-createRoot(document.getElementById('root')!).render(<Fixture />);
+createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><Fixture /></MtcFluentProvider></I18nProvider>);

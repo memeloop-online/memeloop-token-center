@@ -8,7 +8,7 @@ const credential = await readFile(new URL('../src/operator/SessionCredentialFilt
 
 test('conversation content precedes optional operational timelines', () => {
   assert.ok(view.indexOf('<SessionReplayPanel detail=') < view.indexOf('<SessionActivity detail='));
-  assert.match(view, /Disclosure title=\{t\('sessions.executionTimeline'\)\}/);
+  assert.match(view, /Disclosure title=\{t\('sessions.executionTimeline'\)\} defaultOpen=\{detail.unlinked\}/);
   assert.match(view, /className="session-event-model" tabIndex=\{0\}>\{request.model\}/);
   assert.match(view, /formatMetricDisplay/);
   assert.match(view, /formatCurrencyDisplay/);

@@ -84,16 +84,21 @@ if (eventName === 'pull_request' && !forceFull && changes.length === 0) {
 const memorySafe = /^(?:docs\/|web\/|charts\/|openapi\/|tests\/(?!load(?:\/|$))|README\.md$|LICENSE$|\.gitignore$|compose\.yaml$)/;
 const fullCoverage = forceFull || (eventName === 'push' && !verifiedMergeMode);
 const memory = eventName === 'push' || fullCoverage || paths.some((path) => !memorySafe.test(path));
-// Both sides of rename/copy records participate, so boundary crossings stay
-// full. Static operator-contract tests neither build nor execute the service;
-// their packaging contract job remains mandatory, while production source,
-// browser, workflow, and CI-script changes remain full coverage.
-const webOnly = changes.length > 0 && changes.every(({ paths }) => paths.every((path) => path.startsWith('web/')));
-const memoryAcceptance = fullCoverage || (eventName === 'push' ? !webOnly : memory);
+// Both sides of rename/copy records participate, so a move to or from any
+// executable path stays full. Documentation and the browser application have
+// no service-binary inputs; treating that combined presentation-only surface
+// as one scope keeps a UI change accompanied by its design documentation from
+// rebuilding Rust, replaying migrations, or running the memory harness.
+// Static operator-contract tests neither build nor execute the service; their
+// packaging contract job remains mandatory, while production source, workflow,
+// and CI-script changes remain full coverage.
+const presentationOnly = changes.length > 0
+  && changes.every(({ paths }) => paths.every((path) => /^(?:docs|web)\//.test(path)));
+const memoryAcceptance = fullCoverage || (eventName === 'push' ? !presentationOnly : memory);
 const staticContractsOnly = changes.length > 0 && changes.every(({ paths }) => paths.every((path) => path.startsWith('tests/ops/')));
-const rust = fullCoverage || !(webOnly || staticContractsOnly);
+const rust = fullCoverage || !(presentationOnly || staticContractsOnly);
 const web = fullCoverage || !staticContractsOnly;
-const migration = fullCoverage || !(webOnly || staticContractsOnly);
+const migration = fullCoverage || !(presentationOnly || staticContractsOnly);
 const pluginInstaller = fullCoverage || paths.some((path) => /^(?:\.cargo\/|\.dockerignore$|\.github\/workflows\/ci\.yml$|Cargo\.(?:toml|lock)$|Dockerfile\.plugin-installer$|packaging\/cosign\/|src\/|migrations\/|schemas\/|wit\/|vendor\/|tests\/ops\/plugin-installer-image-contract\.test\.ts$)/.test(path));
 
 appendFileSync(
@@ -101,4 +106,4 @@ appendFileSync(
   `rust=${String(rust)}\nweb=${String(web)}\nmigration=${String(migration)}\nmemory=${String(memory)}\nmemory_acceptance=${String(memoryAcceptance)}\nplugin_installer=${String(pluginInstaller)}\n`,
   'utf8',
 );
-console.log(JSON.stringify({ event: eventName, comparison_base: merge?.base, force_full: forceFull, change_count: changes.length, web_only: webOnly, static_contracts_only: staticContractsOnly, rust, web, migration, memory, memory_acceptance: memoryAcceptance, plugin_installer: pluginInstaller }));
+console.log(JSON.stringify({ event: eventName, comparison_base: merge?.base, force_full: forceFull, change_count: changes.length, presentation_only: presentationOnly, static_contracts_only: staticContractsOnly, rust, web, migration, memory, memory_acceptance: memoryAcceptance, plugin_installer: pluginInstaller }));

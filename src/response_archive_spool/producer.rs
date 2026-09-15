@@ -870,7 +870,7 @@ mod tests {
             })
             .now_or_never()
             .unwrap();
-            assert!(matches!(result, Err(AppError::Internal)));
+            assert!(matches!(result, Err(AppError::Overloaded)));
             let result = observe_writer_database(identity(), "response_spool_seal", 8, async {
                 Err(AppError::Storage("SECRET_CANARY".to_owned()))
             })
