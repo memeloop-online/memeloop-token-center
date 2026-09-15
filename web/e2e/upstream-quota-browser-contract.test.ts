@@ -115,6 +115,14 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     await page.waitForFunction(() => window.quotaReconciles === 1 && !document.querySelector<HTMLButtonElement>('.upstream-quota-reset-action button')?.disabled);
     assert.deepEqual(await page.evaluate(() => [window.quotaPrepares, window.quotaConfirms, window.quotaStatuses, window.quotaReconciles, window.quotaWrites]), [1, 1, 1, 1, 3], 'inspection never repeats preparation or consumption');
     assert.equal(await reset.count(), 0);
+    // A driver with no quota adapter is an explicit product limitation, not
+    // evidence that the supplier has no quota or that reset is unsupported.
+    // Keep the useful read result and omit the empty reset-action surface.
+    await page.goto(`${base}/e2e/fixtures/upstream-quota.html?mode=unsupported`);
+    await view.click();
+    await page.getByText('Quota reading is not yet available for this upstream.', { exact: true }).waitFor();
+    assert.equal(await page.getByRole('region', { name: 'Quota reset', exact: true }).count(), 0);
+    assert.deepEqual(await page.evaluate(() => [window.quotaReads, window.quotaWrites, window.quotaPrepares, window.quotaConfirms]), [1, 0, 0, 0]);
     // Read failures are mock-only; no reset/prepare/reconcile calls are made.
     for (const [mode, message] of [
       ['stale-error', 'Quota connection configuration validation failed. Check this account’s network proxy and destination access policy configuration.'],

@@ -19,10 +19,11 @@ window.fetch = async (input, init) => {
   window.quotaActive--;
   const now = Date.now();
   const snapshot: UpstreamQuotaSnapshot = {
-    contract_version: 'upstream_quota_v1', upstream_account_id: id, tenant_external_id: url.searchParams.get('tenant_external_id')!, provider: 'openai-codex', status: 'ready', observed_at: now, stale_after: now + 60_000, stale: false, plan_type: null,
-    credits: { balance: null, unlimited: null, has_credits: null }, windows: [], error_code: null,
+    contract_version: 'upstream_quota_v1', upstream_account_id: id, tenant_external_id: url.searchParams.get('tenant_external_id')!, provider: 'openai-codex', status: 'ready', observed_at: now, stale_after: now + 60_000, stale: false, freshness: 'fresh', plan_type: null, workspace: null,
+    capabilities: { read: true, plan: true, workspace: false, window_amounts: false, window_amount_unit: false, window_percent: true, reset_credit_expiry: true, subscription_expiry: false, supplier_read_only: true, refreshes_credentials: false, consumes_reset_credit: false }, subscription_active_until: null,
+    credits: { balance: null, unlimited: null, has_credits: null, source: null }, windows: [], error_code: null,
     reset_credits: [{ status: 'available', granted_at: now - 60_000, expires_at: id === 'account-1' ? null : now + 86400_000, source: 'codex_reset_credits' }],
-    reset_capability: { provider_supported: true, implementation_available: false, prepare_available: false, confirmation_required: true, retryable: false, available_credits: 1, applicable_credits: 1, reason: null, credit_error_code: null },
+    reset_capability: { provider_supported: true, implementation_available: false, prepare_available: false, confirmation_required: true, retryable: false, available_credits: 1, applicable_credits: 1, reason: 'quota_reset_not_supported', credit_error_code: null, evidence: 'server_driver_contract' },
   };
   return new Response(JSON.stringify(status === 200 ? snapshot : { error: { code: 'test_unavailable', message: 'fixture failure' } }), { status });
 };

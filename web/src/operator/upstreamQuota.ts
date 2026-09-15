@@ -7,15 +7,32 @@ export interface UpstreamQuotaSnapshot {
   observed_at: number | null;
   stale_after: number | null;
   stale: boolean;
+  freshness: 'unobserved' | 'fresh' | 'stale';
   plan_type: string | null;
-  credits: { balance: string | null; unlimited: boolean | null; has_credits: boolean | null; source?: string | null };
+  workspace: string | null;
+  capabilities: {
+    read: boolean;
+    plan: boolean;
+    workspace: boolean;
+    window_amounts: boolean;
+    window_amount_unit: boolean;
+    window_percent: boolean;
+    reset_credit_expiry: boolean;
+    subscription_expiry: boolean;
+    supplier_read_only: boolean;
+    refreshes_credentials: boolean;
+    consumes_reset_credit: boolean;
+  };
+  subscription_active_until: number | null;
+  credits: { balance: string | null; unlimited: boolean | null; has_credits: boolean | null; source: 'codex_usage' | null };
   windows: {
     id: string;
     label: string;
     used_percent: number | null;
+    used: number | null;
     remaining: number | null;
     limit: number | null;
-    unit?: string | null;
+    unit: string | null;
     reset_at: number | null;
     period_seconds: number | null;
     source: string;
@@ -31,11 +48,12 @@ export interface UpstreamQuotaSnapshot {
     retryable: boolean;
     available_credits: number | null;
     applicable_credits: number | null;
-    reason: string | null;
+    reason: string;
     credit_error_code: string | null;
+    evidence: 'server_driver_contract' | 'unknown_provider';
   };
   error_code: string | null;
-  reset_credits?: { status: string | null; granted_at: number | null; expires_at: number | null; source: string }[];
+  reset_credits: { status: string | null; granted_at: number | null; expires_at: number | null; source: 'codex_reset_credits' }[];
 }
 
 /** The next expiration belongs to reset opportunities, not a usage window. */

@@ -11,19 +11,25 @@ const params = new URLSearchParams(location.search);
 const mode = params.get('mode');
 const snapshot: UpstreamQuotaSnapshot = {
   contract_version: 'upstream_quota_v1', upstream_account_id: 'quota-account', tenant_external_id: 'default',
-  provider: 'openai-codex', status: mode === 'unsupported' ? 'unsupported' : 'ready',
-  observed_at: now - 60_000, stale_after: now - 1, stale: true, plan_type: 'Pro',
-  credits: { balance: '12.50', unlimited: false, has_credits: true },
+  provider: mode === 'unsupported' ? 'cursor' : 'openai-codex', status: mode === 'unsupported' ? 'unsupported' : 'ready',
+  observed_at: mode === 'unsupported' ? null : now - 60_000, stale_after: mode === 'unsupported' ? null : now - 1,
+  stale: mode !== 'unsupported', freshness: mode === 'unsupported' ? 'unobserved' : 'stale', plan_type: mode === 'unsupported' ? null : 'Pro',
+  workspace: null,
+  capabilities: { read: mode !== 'unsupported', plan: mode !== 'unsupported', workspace: false, window_amounts: false, window_amount_unit: false, window_percent: mode !== 'unsupported', reset_credit_expiry: mode !== 'unsupported', subscription_expiry: false, supplier_read_only: true, refreshes_credentials: false, consumes_reset_credit: false },
+  subscription_active_until: null,
+  credits: { balance: mode === 'unsupported' ? null : '12.50', unlimited: mode === 'unsupported' ? null : false, has_credits: mode === 'unsupported' ? null : true, source: mode === 'unsupported' ? null : 'codex_usage' },
   windows: mode === 'unsupported' ? [] : [
-    { id: 'code:primary_window', label: 'code:primary_window', used_percent: 75, remaining: 25, limit: 100, reset_at: now + 3600_000, period_seconds: 18000, source: 'codex_usage', reset_is_estimated: false, allowed: true, limit_reached: false },
-    { id: 'code:secondary_window', label: 'code:secondary_window', used_percent: null, remaining: null, limit: null, reset_at: null, period_seconds: 604800, source: 'codex_usage', reset_is_estimated: false, allowed: null, limit_reached: null },
+    { id: 'code:primary_window', label: 'code:primary_window', used_percent: 75, used: null, remaining: 25, limit: 100, unit: null, reset_at: now + 3600_000, period_seconds: 18000, source: 'codex_usage', reset_is_estimated: false, allowed: true, limit_reached: false },
+    { id: 'code:secondary_window', label: 'code:secondary_window', used_percent: null, used: null, remaining: null, limit: null, unit: null, reset_at: null, period_seconds: 604800, source: 'codex_usage', reset_is_estimated: false, allowed: null, limit_reached: null },
   ],
-  reset_capability: { provider_supported: mode === 'unsupported' ? false : true, implementation_available: mode === 'reset' || mode === 'unknown', prepare_available: mode === 'reset' || mode === 'unknown', confirmation_required: mode === 'reset' || mode === 'unknown', retryable: false, available_credits: 2, applicable_credits: 1, reason: null, credit_error_code: null },
+  reset_capability: { provider_supported: mode === 'unsupported' ? null : true, implementation_available: mode === 'reset' || mode === 'unknown', prepare_available: mode === 'reset' || mode === 'unknown', confirmation_required: mode === 'reset' || mode === 'unknown', retryable: false, available_credits: mode === 'unsupported' ? null : 2, applicable_credits: mode === 'unsupported' ? null : 1, reason: mode === 'unsupported' ? 'quota_reset_not_supported' : 'explicit_confirmation_required', credit_error_code: null, evidence: mode === 'unsupported' ? 'unknown_provider' : 'server_driver_contract' },
+  reset_credits: [],
   error_code: mode === 'stale-error' ? 'quota_destination_invalid' : mode === 'rate-limited' ? 'quota_rate_limited' : null,
 };
 if (mode === 'kimi') {
   snapshot.provider = 'kimi-oauth'; snapshot.stale = false; snapshot.stale_after = now + 300_000;
-  snapshot.reset_capability = { ...snapshot.reset_capability, provider_supported: false, implementation_available: false, prepare_available: false, available_credits: null, applicable_credits: null };
+  snapshot.freshness = 'fresh'; snapshot.capabilities = { ...snapshot.capabilities, plan: false, window_amounts: true, reset_credit_expiry: false };
+  snapshot.reset_capability = { ...snapshot.reset_capability, provider_supported: false, implementation_available: false, prepare_available: false, confirmation_required: false, available_credits: null, applicable_credits: null };
   snapshot.windows = snapshot.windows.map((window, index) => ({ ...window, id: index ? 'summary' : 'limit-0', label: index ? 'summary' : 'limit-0', source: 'kimi_usage', unit: null, used_percent: index ? 25 : 0, remaining: 100, limit: 100, reset_at: now + (index ? 604_800_000 : 18_000_000) }));
   if (params.has('units')) snapshot.windows.push(...['requests', 'tokens', 'Vendor Compute Units'].map(unit => ({ ...snapshot.windows[0], id: unit, label: unit, period_seconds: null, reset_at: null, used_percent: null, remaining: 25, limit: 100, unit })));
 }
