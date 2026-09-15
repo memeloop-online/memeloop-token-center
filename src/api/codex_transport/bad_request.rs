@@ -160,10 +160,8 @@ fn sanitize_diagnostic_reason(value: &str) -> Option<String> {
     static SENSITIVE: OnceLock<Regex> = OnceLock::new();
     let redacted = SENSITIVE
         .get_or_init(|| {
-            Regex::new(
-                r#"(?i:bearer)\s+\S+|https?://\S+|\"[^\"]*\"|'[^']*'|[A-Za-z0-9_./+=-]{32,}"#,
-            )
-            .expect("static diagnostic redaction regex")
+            Regex::new(r#"(?i:bearer)\s+\S+|https?://\S+|"[^"]*"|'[^']*'|[A-Za-z0-9_./+=-]{32,}"#)
+                .expect("static diagnostic redaction regex")
         })
         .replace_all(value, "[redacted]");
     let normalized = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
