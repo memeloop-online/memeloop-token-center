@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../api';
+import { readArchiveRange, type ArchiveRangeLoader } from '../archiveRange';
 import { formatNumber } from '../format';
 import { useI18n } from '../i18n';
 import { SessionDetailSurface, SessionList } from '../SessionViews';
@@ -27,6 +28,9 @@ export function SessionsPage({ credential, credentialView, focusSessionId, onErr
   const detailController = useRef<AbortController | undefined>(undefined);
   const loadReplayArchive = useCallback((request: RequestView, signal: AbortSignal) => api<RequestDetail>(
     `/self/v1/requests/${encodeURIComponent(request.request_id)}`, credential, { signal },
+  ), [credential]);
+  const loadArchiveRange = useCallback<ArchiveRangeLoader>((requestId, side, offset, length, etag, signal) => readArchiveRange(
+    `/self/v1/requests/${encodeURIComponent(requestId)}/archive/${side}`, credential, offset, length, etag, AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
   ), [credential]);
 
   async function fetchSessions(before?: LogicalSessionCursor) {
@@ -136,7 +140,7 @@ export function SessionsPage({ credential, credentialView, focusSessionId, onErr
           {nextCursor && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={() => void fetchSessions(nextCursor)}>{loading ? t('common.loading') : t('sessions.loadOlder')}</button></div>}
         </section>
         <div className="session-detail-region">
-          {detail && <SessionDetailSurface detail={detail} summary={selected} currency={credentialView.currency} loading={loading} onLoadOlder={() => void fetchEarlierDetail()} loadReplayArchive={loadReplayArchive} onSelect={(request) => { setDetail(undefined); setSelected(undefined); onOpenRequest(request); }} onClose={() => { setDetail(undefined); setSelected(undefined); }} />}
+          {detail && <SessionDetailSurface detail={detail} summary={selected} currency={credentialView.currency} loading={loading} onLoadOlder={() => void fetchEarlierDetail()} loadReplayArchive={loadReplayArchive} loadArchiveRange={loadArchiveRange} onSelect={(request) => { setDetail(undefined); setSelected(undefined); onOpenRequest(request); }} onClose={() => { setDetail(undefined); setSelected(undefined); }} />}
         </div>
       </div>
     </article>

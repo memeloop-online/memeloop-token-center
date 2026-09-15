@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from 'react';
 import { api } from '../api.js';
+import { readArchiveRange, type ArchiveRangeLoader } from '../archiveRange.js';
 import { useI18n } from '../i18n.js';
 import { SessionDetailSurface, SessionList } from '../SessionViews.js';
 import { SessionCredentialFilter } from './SessionCredentialFilter.js';
@@ -56,11 +57,11 @@ function detailPath(tenant: string, session: LogicalSessionSummary, cursor?: Log
   return `/internal/v1/sessions/${encodeURIComponent(session.session_id)}?${params}`;
 }
 
-function requestArchivePath(tenant: string, requestId: string) {
+function requestArchivePath(tenant: string, requestId: string, side?: 'request' | 'response') {
   const params = new URLSearchParams();
   if (tenant) params.set('tenant_external_id', tenant);
   const query = params.toString();
-  return `/internal/v1/requests/${encodeURIComponent(requestId)}${query ? `?${query}` : ''}`;
+  return `/internal/v1/requests/${encodeURIComponent(requestId)}${side ? `/archive/${side}` : ''}${query ? `?${query}` : ''}`;
 }
 
 function messageOf(reason: unknown, fallback: string) {
@@ -118,6 +119,9 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
   detailRef.current = detail;
   const loadReplayArchive = useCallback((request: RequestView, signal: AbortSignal) => api<RequestDetail>(
     requestArchivePath(tenant, request.request_id), token.trim(), { signal },
+  ), [tenant, token]);
+  const loadArchiveRange = useCallback<ArchiveRangeLoader>((requestId, side, offset, length, etag, signal) => readArchiveRange(
+    requestArchivePath(tenant, requestId, side), token.trim(), offset, length, etag, AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
   ), [tenant, token]);
 
   async function loadSessions(older = false, selectedFilters = filters, background = false) {
@@ -421,7 +425,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       <div className="session-detail-region">
         {!visibleDetail && detailLoading && <div className="empty" role="status">{t('common.loading')}</div>}
         {!visibleDetail && !detailLoading && <div className="empty">{selected && visibleError ? <button type="button" className="secondary" onClick={() => void selectSession(selected)}>{t('sessions.retryLoad')}</button> : t('sessions.selectHint')}</div>}
-        {visibleDetail && <SessionDetailSurface detail={visibleDetail} summary={selected} showDiagnosticIds loading={detailLoading} onLoadOlder={() => void loadEarlier()} loadReplayArchive={loadReplayArchive} onSelect={(request) => { void onSelectRequest(request); }} onClose={() => { detailRequests.current.invalidate(); detailInFlight.current = false; setDetailLoading(false); setDetail(undefined); setDetailScope(''); setSelected(undefined); selectedRef.current = undefined; }} />}
+        {visibleDetail && <SessionDetailSurface detail={visibleDetail} summary={selected} showDiagnosticIds loading={detailLoading} onLoadOlder={() => void loadEarlier()} loadReplayArchive={loadReplayArchive} loadArchiveRange={loadArchiveRange} onSelect={(request) => { void onSelectRequest(request); }} onClose={() => { detailRequests.current.invalidate(); detailInFlight.current = false; setDetailLoading(false); setDetail(undefined); setDetailScope(''); setSelected(undefined); selectedRef.current = undefined; }} />}
       </div>
     </div>
   </>;
