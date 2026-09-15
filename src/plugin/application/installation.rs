@@ -634,7 +634,8 @@ fn reclaim_installation_attempt_roots(
                 crate::plugin_publication::clear_claimed_directory(&root, attempt_id.as_bytes())
             });
         match result {
-            Ok(()) => reclaimed += 1,
+            Ok(true) => reclaimed += 1,
+            Ok(false) => {}
             Err(error) => tracing::warn!(
                 stage = "inventory_reclaim",
                 errno = error.raw_os_error(),
@@ -1786,7 +1787,7 @@ mod tests {
         assert!(root.exists());
         crate::plugin_publication::clear_claimed_directory(&root, b"owner").unwrap();
         assert!(root.exists());
-        assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
+        assert!(root.join(".mtc-install-reclaimed").exists());
         assert!(
             directory
                 .path()
@@ -1861,7 +1862,18 @@ mod tests {
         assert!(roots[1].exists());
         assert!(roots[2].join("payload").exists());
         assert!(roots[3].exists());
-        assert_eq!(std::fs::read_dir(&roots[3]).unwrap().count(), 0);
+        assert!(!roots[3].join("payload").exists());
+        assert!(roots[3].join(".mtc-install-reclaimed").exists());
+        assert_eq!(
+            reclaim_installation_attempt_roots(
+                directory.path(),
+                &inventory_roots,
+                &referenced_attempts,
+                Duration::ZERO,
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[test]
