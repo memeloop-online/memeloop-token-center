@@ -48,6 +48,7 @@ async fn preferred_account_real_component_retains_identity_and_native_health_man
         seed: 42,
         remaining_deadline_ms: 1000,
         config: json!({"preferred_account_ids":["blocked","preferred","outside-group"]}),
+        quota_context: None,
         candidates: vec![
             candidate("r0", "other", GroupRoutingHealth::Healthy),
             candidate("r1", "preferred", GroupRoutingHealth::Healthy),

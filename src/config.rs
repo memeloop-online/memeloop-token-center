@@ -149,6 +149,9 @@ pub struct Config {
     pub responses_body_read_concurrency: u32,
     /// Shared per-upstream-account circuit-breaker and half-open probe timings.
     pub upstream_health: UpstreamHealthConfig,
+    pub quota_observation_interval_millis: u32,
+    pub quota_observation_batch_limit: u32,
+    pub quota_observation_timeout_millis: u32,
     pub run_migrations_on_start: bool,
     pub key_pepper: String,
     pub service_token: String,
@@ -394,6 +397,18 @@ impl Config {
                 DEFAULT_RESPONSES_BODY_READ_CONCURRENCY,
             )?),
             upstream_health,
+            quota_observation_interval_millis: env_u32(
+                "MTC_QUOTA_OBSERVATION_INTERVAL_MILLIS",
+                10_000,
+            )?
+            .clamp(1_000, 60_000),
+            quota_observation_batch_limit: env_u32("MTC_QUOTA_OBSERVATION_BATCH_LIMIT", 4)?
+                .clamp(1, 16),
+            quota_observation_timeout_millis: env_u32(
+                "MTC_QUOTA_OBSERVATION_TIMEOUT_MILLIS",
+                10_000,
+            )?
+            .clamp(1_000, 30_000),
             run_migrations_on_start: env_bool("MTC_RUN_MIGRATIONS_ON_START", true),
             key_pepper,
             service_token,
@@ -451,6 +466,9 @@ impl Config {
             responses_body_max_bytes: DEFAULT_RESPONSES_BODY_MAX_BYTES,
             responses_body_read_concurrency: DEFAULT_RESPONSES_BODY_READ_CONCURRENCY,
             upstream_health: UpstreamHealthConfig::DEFAULT,
+            quota_observation_interval_millis: 10_000,
+            quota_observation_batch_limit: 4,
+            quota_observation_timeout_millis: 10_000,
             run_migrations_on_start: true,
             key_pepper: "test-pepper-must-have-at-least-32-bytes".to_owned(),
             service_token: "test-service-token".to_owned(),

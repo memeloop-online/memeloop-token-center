@@ -2,6 +2,7 @@
 mod antigravity;
 mod kimi;
 mod normalize;
+pub(crate) mod observations;
 pub(crate) mod reset;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};

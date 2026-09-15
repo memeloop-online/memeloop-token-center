@@ -118,6 +118,13 @@ pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>
     });
 
     // No spawn-per-tick: generation remains single-flight and OAuth remains serial.
+    let quota_state = state.clone();
+    let quota_shutdown = role_shutdown.clone();
+    roles.spawn(async move {
+        crate::upstream_quota::observations::run(quota_state, quota_shutdown).await;
+        "quota_observations"
+    });
+
     macro_rules! periodic {
         ($name:literal, $period:expr, $operation:expr) => {{
             let state = state.clone();

@@ -12,9 +12,10 @@ mod bindings {
 
 pub const GROUP_ROUTING_VERSION: &str = "group-routing-v1";
 const MAX_CANDIDATES: usize = 1024;
-const MAX_JSON_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_GROUP_ROUTING_JSON_BYTES: usize = 1024 * 1024;
 const MAX_DELAY_MS: u64 = 300_000;
 const EXECUTION_LIMIT: Duration = Duration::from_millis(100);
+pub const GROUP_ROUTING_QUOTA_VERSION: &str = "account-windows-v1";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -78,6 +79,39 @@ pub struct GroupRoutingInput {
     pub remaining_deadline_ms: u64,
     pub config: Value,
     pub candidates: Vec<GroupRoutingCandidate>,
+    /// Omitted for existing guests, including strict v1 JSON decoders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_context: Option<GroupRoutingQuotaContext>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupRoutingQuotaContext {
+    pub version: String,
+    pub now_ms: i64,
+    pub accounts: Vec<GroupRoutingQuotaAccount>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupRoutingQuotaAccount {
+    pub account_id: String,
+    pub generation: u64,
+    pub provider: String,
+    pub observed_at: i64,
+    pub valid_until: i64,
+    pub windows: Vec<GroupRoutingQuotaWindow>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupRoutingQuotaWindow {
+    pub id: String,
+    pub period_seconds: Option<i64>,
+    pub reset_at: Option<i64>,
+    pub reset_is_estimated: bool,
+    pub remaining_fraction: Option<f64>,
+    pub exhausted: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -126,6 +160,17 @@ fn invalid() -> AppError {
 }
 
 pub(super) fn validate_contribution(manifest: &PluginManifest) -> Result<(), AppError> {
+    if manifest
+        .capabilities
+        .contains(&PluginCapability::GroupRoutingQuota)
+        && !manifest
+            .contributions
+            .group_routing
+            .as_ref()
+            .is_some_and(|routing| routing.health_policy == GroupRoutingHealthPolicy::Native)
+    {
+        return Err(invalid());
+    }
     let Some(contribution) = &manifest.contributions.group_routing else {
         return Ok(());
     };
@@ -228,10 +273,91 @@ fn validate_input(input: &GroupRoutingInput) -> Result<(), AppError> {
             return Err(invalid());
         }
     }
+    if let Some(context) = &input.quota_context {
+        validate_quota_context(input, context)?;
+    }
+    Ok(())
+}
+
+fn validate_quota_context(
+    input: &GroupRoutingInput,
+    context: &GroupRoutingQuotaContext,
+) -> Result<(), AppError> {
+    let expected: BTreeSet<_> = input
+        .candidates
+        .iter()
+        .map(|candidate| (candidate.account_id.as_str(), candidate.generation))
+        .collect();
+    if context.version != GROUP_ROUTING_QUOTA_VERSION
+        || context.now_ms < 0
+        || context.accounts.len() != expected.len()
+    {
+        return Err(invalid());
+    }
+    let mut seen = BTreeSet::new();
+    for account in &context.accounts {
+        let identity = (account.account_id.as_str(), account.generation);
+        if !expected.contains(&identity)
+            || !seen.insert(identity)
+            || !valid_identifier(&account.provider)
+            || account.observed_at < 0
+            || account.observed_at > context.now_ms
+            || account.valid_until <= context.now_ms
+            || account.windows.is_empty()
+            || account.windows.len() > 64
+        {
+            return Err(invalid());
+        }
+        let mut windows = BTreeSet::new();
+        for window in &account.windows {
+            if window.id.is_empty()
+                || window.id.len() > 512
+                || window.id.chars().any(char::is_control)
+                || !windows.insert(&window.id)
+                || window.period_seconds.is_some_and(|period| period <= 0)
+                || window.remaining_fraction.is_some_and(|fraction| {
+                    !fraction.is_finite() || !(0.0..=1.0).contains(&fraction)
+                })
+            {
+                return Err(invalid());
+            }
+        }
+    }
     Ok(())
 }
 
 impl PluginRuntime {
+    pub(crate) fn quota_observation_plugin_ids(&self) -> Vec<String> {
+        self.plugins
+            .iter()
+            .filter(|plugin| {
+                plugin
+                    .manifest
+                    .capabilities
+                    .contains(&PluginCapability::GroupRoutingQuota)
+                    && plugin
+                        .manifest
+                        .contributions
+                        .group_routing
+                        .as_ref()
+                        .is_some_and(|routing| {
+                            routing.health_policy == GroupRoutingHealthPolicy::Native
+                        })
+            })
+            .map(|plugin| plugin.manifest.id.clone())
+            .collect()
+    }
+
+    pub(crate) fn group_routing_uses_quota_context(&self, plugin_id: &str) -> bool {
+        self.plugins.iter().any(|plugin| {
+            plugin.manifest.id == plugin_id
+                && plugin
+                    .manifest
+                    .capabilities
+                    .contains(&PluginCapability::GroupRoutingQuota)
+        })
+    }
+
     pub(crate) fn group_routing_uses_native_health(&self, plugin_id: &str) -> bool {
         self.plugins
             .iter()
@@ -283,6 +409,9 @@ impl PluginRuntime {
         input: &GroupRoutingInput,
     ) -> Result<GroupRoutingPlan, AppError> {
         validate_input(input)?;
+        if self.group_routing_uses_quota_context(plugin_id) != input.quota_context.is_some() {
+            return Err(invalid());
+        }
         self.validate_group_routing_configuration(plugin_id, &input.config)?;
         let output =
             self.call_group_routing(plugin_id, input, input.remaining_deadline_ms, false)?;
@@ -327,7 +456,7 @@ impl PluginRuntime {
         observe: bool,
     ) -> Result<String, AppError> {
         let encoded = serde_json::to_string(input).map_err(|_| invalid())?;
-        if encoded.len() > MAX_JSON_BYTES {
+        if encoded.len() > MAX_GROUP_ROUTING_JSON_BYTES {
             return Err(invalid());
         }
         let plugin = self
@@ -379,7 +508,7 @@ impl PluginRuntime {
         }
         .map_err(|error| plugin_failure(plugin_id, error))?
         .map_err(|_| invalid())?;
-        if Instant::now() >= deadline || output.len() > MAX_JSON_BYTES {
+        if Instant::now() >= deadline || output.len() > MAX_GROUP_ROUTING_JSON_BYTES {
             return Err(invalid());
         }
         Ok(output)
@@ -413,6 +542,77 @@ mod tests {
         let parsed: GroupRoutingContribution = serde_json::from_value(native.clone()).unwrap();
         assert_eq!(parsed.health_policy, GroupRoutingHealthPolicy::Native);
         assert_eq!(serde_json::to_value(parsed).unwrap(), native);
+        let (input, _) = fixture();
+        let encoded = serde_json::to_value(input).unwrap();
+        assert!(
+            encoded.get("quota_context").is_none(),
+            "legacy strict guests receive no new field"
+        );
+    }
+
+    #[test]
+    fn quota_capability_requires_native_routing_and_exact_fresh_candidate_scope() {
+        let mut manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id":"quota-order", "version":"1.0.0", "wit_version":"0.2.0", "wasm":"plugin.wasm",
+            "capabilities":[{"kind":"group_routing_quota"}],
+            "contributions":{"group_routing":{"version":"group-routing-v1", "health_policy":"native", "schema":{"type":"object"}, "default":{}}}
+        })).unwrap();
+        assert!(validate_contribution(&manifest).is_ok());
+        manifest
+            .contributions
+            .group_routing
+            .as_mut()
+            .unwrap()
+            .health_policy = GroupRoutingHealthPolicy::Plugin;
+        assert!(validate_contribution(&manifest).is_err());
+        manifest.contributions.group_routing = None;
+        assert!(validate_contribution(&manifest).is_err());
+
+        let (mut input, plan) = fixture();
+        let context = GroupRoutingQuotaContext {
+            version: GROUP_ROUTING_QUOTA_VERSION.into(),
+            now_ms: 1000,
+            accounts: vec![GroupRoutingQuotaAccount {
+                account_id: "account".into(),
+                generation: 7,
+                provider: "kimi-oauth".into(),
+                observed_at: 900,
+                valid_until: 1100,
+                windows: vec![GroupRoutingQuotaWindow {
+                    id: "summary".into(),
+                    period_seconds: Some(604800),
+                    reset_at: Some(2000),
+                    reset_is_estimated: false,
+                    remaining_fraction: None,
+                    exhausted: None,
+                }],
+            }],
+        };
+        input.quota_context = Some(context.clone());
+        assert!(validate_group_routing_plan(&input, &plan).is_ok());
+        let encoded = serde_json::to_value(&input).unwrap();
+        assert!(encoded["quota_context"]["accounts"][0]["windows"][0]["exhausted"].is_null());
+        for variant in 0..8 {
+            let mut broken = context.clone();
+            match variant {
+                0 => broken.accounts[0].account_id = "outside-group".into(),
+                1 => broken.accounts[0].generation += 1,
+                2 => broken.accounts[0].valid_until = broken.now_ms,
+                3 => broken.accounts[0].observed_at = broken.now_ms + 1,
+                4 => broken.accounts.push(broken.accounts[0].clone()),
+                5 => broken.accounts[0].windows[0].remaining_fraction = Some(f64::NAN),
+                6 => broken.accounts[0].windows[0].remaining_fraction = Some(1.01),
+                _ => {
+                    let window = broken.accounts[0].windows[0].clone();
+                    broken.accounts[0].windows.push(window);
+                }
+            }
+            input.quota_context = Some(broken);
+            assert!(
+                validate_group_routing_plan(&input, &plan).is_err(),
+                "variant {variant}"
+            );
+        }
     }
     fn fixture() -> (GroupRoutingInput, GroupRoutingPlan) {
         let candidate = GroupRoutingCandidate {
@@ -440,6 +640,7 @@ mod tests {
                 remaining_deadline_ms: 1000,
                 config: serde_json::json!({}),
                 candidates: vec![candidate],
+                quota_context: None,
             },
             GroupRoutingPlan {
                 candidates: vec![directive],
