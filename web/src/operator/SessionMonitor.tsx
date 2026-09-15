@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from 'react';
 import { api } from '../api.js';
 import { useI18n } from '../i18n.js';
+import { Button, Checkbox } from '../design-system';
 import { SessionDetailSurface, SessionList } from '../SessionViews.js';
 import { SessionCredentialFilter } from './SessionCredentialFilter.js';
 import {
@@ -401,9 +402,9 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
   return <>
     {visibleError && <div className="notice error" role="alert">{visibleError} <button type="button" className="secondary" disabled={loading} onClick={() => void loadSessions(false, filters, visibleSessions.length > 0)}>{t('sessions.retryLoad')}</button></div>}
     <div className="session-refresh-controls">
-      <label><input type="checkbox" checked={autoRefresh} onChange={(event) => toggleAutoRefresh(event.target.checked)} />{t('sessions.autoRefresh')}</label>
+      <Checkbox checked={autoRefresh} onChange={(_, data) => toggleAutoRefresh(data.checked === true)} label={t('sessions.autoRefresh')} />
       <span className={`session-live-state ${status}`} role="status">{autoRefresh ? t(`sessions.live.${status}`) : t('sessions.paused')}</span>
-      <button type="button" className="secondary" disabled={loading || refreshing || detailLoading} onClick={() => { void loadSessions(false, filters, visibleSessions.length > 0); if (selected) void refreshSelected(selected); }}>{t('sessions.refreshNow')}</button>
+      <Button appearance="secondary" disabled={loading || refreshing || detailLoading} onClick={() => { void loadSessions(false, filters, visibleSessions.length > 0); if (selected) void refreshSelected(selected); }}>{t('sessions.refreshNow')}</Button>
     </div>
     <form className="session-controls" onSubmit={(event) => { event.preventDefault(); setFilters({ ...draft }); }}>
       <label>{t('sessions.search')}<input value={draft.q} onChange={(event) => setDraft({ ...draft, q: event.target.value })} placeholder={t('sessions.searchPlaceholder')} /></label>
@@ -416,7 +417,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     <div className="session-workspace">
       <section className="session-browser" aria-label={t('sessions.recent')}>
         <SessionList values={visibleSessions} loading={loading} showCredential selected={selected} layout="sidebar" onSelect={(session) => void selectSession(session)} />
-        {listScope === scopeKey && nextCursor && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={() => void loadSessions(true, filters)}>{loading ? t('common.loading') : t('sessions.loadOlder')}</button></div>}
+        {listScope === scopeKey && nextCursor && <div className="load-more"><Button appearance="secondary" disabled={loading} onClick={() => void loadSessions(true, filters)}>{loading ? t('common.loading') : t('sessions.loadOlder')}</Button></div>}
       </section>
       <div className="session-detail-region">
         {!visibleDetail && detailLoading && <div className="empty" role="status">{t('common.loading')}</div>}

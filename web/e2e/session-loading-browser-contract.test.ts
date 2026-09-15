@@ -76,6 +76,12 @@ test('session initial spinner, retry failure and background retry preserve the r
     await page.keyboard.press('Escape');
     await page.getByRole('button', { name: 'Clear filters', exact: true }).click();
     assert.equal(await credential.evaluate(input => (input as HTMLInputElement).checkValidity()), true, 'authoritative clearing removes stale custom validity');
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-loading.html?titles=1`);
+    await page.waitForFunction(() => window.sessionListReads === 1);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await page.getByRole('heading', { name: 'Current context name', exact: true }).waitFor();
+    assert.match(await page.locator('.session-sidebar-item[aria-pressed="true"]').getAttribute('aria-label') ?? '', /Fixture key/);
+    assert.doesNotMatch(await page.locator('.session-sidebar-item[aria-pressed="true"]').getAttribute('aria-label') ?? '', /fixture-session/);
   } finally { await browser.close(); await server.close(); }
 });
 

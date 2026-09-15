@@ -1,8 +1,6 @@
 /* Session browsing is intentionally separate from the shared shell.  It can be
  * embedded by either the operator console or a credential's self-service view. */
 .session-refresh-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin: 12px 0; }
-.session-refresh-controls label { display: inline-flex; align-items: center; gap: 6px; }
-.session-refresh-controls input { width: auto; margin: 0; accent-color: var(--colorBrandBackground); }
 .session-refresh-controls .session-live-state { margin: 0; flex: 1; }
 .panel.sessions-page { border: 0; box-shadow: none; padding: 0; background: transparent; }
 .sessions-page .session-controls > label { display: grid; gap: 4px; min-width: 0; }
