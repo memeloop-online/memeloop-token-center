@@ -155,16 +155,17 @@ export function PluginRuntimeManager({ token, canManage, onPublished }: { token:
         <p className="muted">{text.scope}</p>
       </>}
       {historyError && <p className="notice error" role="alert">{historyError}</p>}
-      {status && <div className="plugin-runtime-disclosures">
+      <div className="plugin-runtime-disclosures">
         <Disclosure title={text.inventoryFlow} defaultOpen><div className="plugin-runtime-section">
-          <h3>{text.candidates}</h3>
-          {canManage && <Checkbox label={text.confirm} checked={confirmation} onChange={(_, data) => setConfirmation(data.checked === true)} />}
-          <div className="plugin-runtime-list">{status.candidates.map((candidate) => <div className="managed-resource" key={candidate.inventory_id}>
-            <div className="plugin-runtime-resource-heading"><b>{candidate.inventory_id}</b><span className="pill">{candidate.staged ? text.staged : text.unstaged}</span></div>
-            <p>{Object.entries(candidate.plugins).map(([id, versions]) => `${id}: ${versions.join(', ')}`).join(' · ')}</p>
-            <div className="plugin-runtime-actions"><button type="button" className="secondary" disabled={busy || !canManage} onClick={() => void mutate('/internal/v1/plugin-runtime/candidates', { inventory_id: candidate.inventory_id })}>{text.stage}</button>
-            <button type="button" disabled={busy || !canManage || !confirmation || candidate.inventory_id === status.current?.inventory_id} onClick={() => void mutate('/internal/v1/plugin-runtime/publish', { inventory_id: candidate.inventory_id, expected_revision: status.current?.revision ?? 0 }, true)}>{text.publish}</button></div>
-          </div>)}</div>
+          {status && <><h3>{text.candidates}</h3>
+            {canManage && <Checkbox label={text.confirm} checked={confirmation} onChange={(_, data) => setConfirmation(data.checked === true)} />}
+            <div className="plugin-runtime-list">{status.candidates.map((candidate) => <div className="managed-resource" key={candidate.inventory_id}>
+              <div className="plugin-runtime-resource-heading"><b>{candidate.inventory_id}</b><span className="pill">{candidate.staged ? text.staged : text.unstaged}</span></div>
+              <p>{Object.entries(candidate.plugins).map(([id, versions]) => `${id}: ${versions.join(', ')}`).join(' · ')}</p>
+              <div className="plugin-runtime-actions"><button type="button" className="secondary" disabled={busy || !canManage} onClick={() => void mutate('/internal/v1/plugin-runtime/candidates', { inventory_id: candidate.inventory_id })}>{text.stage}</button>
+              <button type="button" disabled={busy || !canManage || !confirmation || candidate.inventory_id === status.current?.inventory_id} onClick={() => void mutate('/internal/v1/plugin-runtime/publish', { inventory_id: candidate.inventory_id, expected_revision: status.current?.revision ?? 0 }, true)}>{text.publish}</button></div>
+            </div>)}</div>
+          </>}
           {!history && !historyError && <p role="status">{text.history}: {text.loading}</p>}
           {history && (!history.installation_enabled ? <p className="notice">{text.disabled}</p> : canManage && <form className="plugin-runtime-install-form" onSubmit={(event) => { event.preventDefault(); void mutate('/internal/v1/plugin-runtime/installations', { inventory_id: inventory.trim(), packages: packages.split('\n').map((line) => line.trim()).filter(Boolean) }); }}>
             <label>{text.inventory}<input required pattern="[A-Za-z0-9_-]{1,64}" value={inventory} onChange={(event) => setInventory(event.target.value)} disabled={busy} /></label>
@@ -196,7 +197,7 @@ export function PluginRuntimeManager({ token, canManage, onPublished }: { token:
             {history.audit.length === 0 ? <p className="muted">{text.empty}</p> : <><ul>{history.audit.map((entry) => <li key={entry.id}>{new Date(entry.created_at).toLocaleString(locale)} · {entry.actor} · {entry.action} · {entry.inventory_id ?? '—'} · {entry.revision ?? '—'} · {entry.outcome}</li>)}</ul><button type="button" className="secondary" disabled={busy} onClick={() => void olderAudit()}>{text.olderAudit}</button></>}</section>
           </>}
         </div></Disclosure>
-      </div>}
+      </div>
     </>}
   </article>;
 }

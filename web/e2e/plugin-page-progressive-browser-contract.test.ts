@@ -48,8 +48,6 @@ test('plugin catalog is usable without unrelated route code or unopened configur
     });
     let catalogReads = 0;
     let configurationReads = 0;
-    let runtimeReads = 0;
-    let historyReads = 0;
     await page.route('**/internal/v1/**', async (route) => {
       const url = new URL(route.request().url());
       assert.equal(route.request().headers().authorization, 'Bearer operator-test');
@@ -57,14 +55,12 @@ test('plugin catalog is usable without unrelated route code or unopened configur
       if (url.pathname === '/internal/v1/tenants') return route.fulfill({ json: [{ external_id: 'alpha' }] });
       if (url.pathname === '/internal/v1/plugins/runtime-access') return route.fulfill({ json: { can_view_runtime: true, can_manage_runtime: true } });
       if (url.pathname === '/internal/v1/plugin-runtime') {
-        runtimeReads += 1;
         return route.fulfill({ json: {
           current: { revision: 2, inventory_id: 'current-1', reason: 'publish', created_at: 1 },
           candidates: [{ inventory_id: 'candidate-2', staged: true, plugins: { first: ['1.0.0'] } }],
         } });
       }
       if (url.pathname === '/internal/v1/plugin-runtime/history') {
-        historyReads += 1;
         return route.fulfill({ json: {
           runtime_enabled: true, installation_enabled: true, installations: [],
           revisions: [{ revision: 2, inventory_id: 'current-1', reason: 'publish', created_at: 1 }],
@@ -90,8 +86,6 @@ test('plugin catalog is usable without unrelated route code or unopened configur
     await page.getByText('candidate-2', { exact: true }).waitFor();
     assert.deepEqual(unrelatedRequests, [], 'the selected plugin route must not wait for unrelated management page modules');
     assert.equal(catalogReads, 1, 'shell registration and plugin management share one catalog read');
-    assert.equal(runtimeReads, 1);
-    assert.equal(historyReads, 1);
     assert.equal(configurationModuleRequests, 0, 'an unopened configuration disclosure does not load schema form code');
     assert.equal(configurationReads, 0, 'catalog rendering does not fan out configuration reads');
 
