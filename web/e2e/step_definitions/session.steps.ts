@@ -387,6 +387,7 @@ Then('其他凭据事件和无事件重连不会污染已打开的会话', async
   await controls.getByRole('button', { name: '应用筛选', exact: true }).click();
   await page.getByRole('button', { name: '打开 Codex release dogfood', exact: true }).click();
   await visible(page.locator('.session-detail-region .session-detail'));
+  await page.getByRole('checkbox', { name: '自动刷新', exact: true }).check();
   const observation = observations.get(this)!;
   const detailCount = observation.detailRequests.length;
   releaseOtherEvent();
