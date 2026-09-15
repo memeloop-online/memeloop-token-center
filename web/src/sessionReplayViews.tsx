@@ -80,8 +80,12 @@ function ArchiveText({ value, kind, t }: { value: string; kind: 'message' | 'too
   </>;
 }
 
-function EntryContent({ entry, t }: { entry: ReplayEntry; t: Translate }) {
+function EntryContent({ entry, t, summaryOnly = false }: { entry: ReplayEntry; t: Translate; summaryOnly?: boolean }) {
   const { item } = entry;
+  if (item.kind === 'unknown' && summaryOnly) return <article className="session-replay-entry" data-replay-kind={item.kind}>
+    <header><b>{t('sessionReplay.fullArchive')}</b></header>
+    <p>{t('sessionReplay.fullArchiveHint')}</p>
+  </article>;
   if (item.kind === 'unknown') return <article className="session-replay-entry unknown" data-replay-kind={item.kind}>
     <header><b>{t('sessionReplay.archiveUnknown')}</b></header>
     <p>{unknownLabel(t, item.reason, entry.archiveBodies === 2)}</p>
@@ -155,6 +159,7 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
   // Scope and per-request freshness are checked during render, before effect cleanup.
   const archiveDetails = archivePage.sessionId === detail.session_id && archivePage.scopeKey === scopeKey && archivePage.loader === loadArchiveDetail
     ? archivePage.values.filter(request => visibleRevisions.has(request.request_id) && archivePage.revisions.get(request.request_id) === visibleRevisions.get(request.request_id)) : [];
+  const incompleteSnapshot = archiveDetails.some(request => request.archive?.request?.reason === 'archive_payload_invalid' || request.archive?.response?.reason === 'archive_payload_invalid');
   const readScope = useRef<ReplayReadScope | undefined>(undefined);
   const [mismatchedIds, setMismatchedIds] = useState<Set<string>>(new Set());
   const [archiveLoading, setArchiveLoading] = useState(Boolean(loadArchiveDetail));
@@ -328,7 +333,7 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
     </nav>}
     <div className="session-replay-layout">
       <aside className="session-replay-turns" aria-label={t('sessionReplay.userTurns')}>
-        <div className="session-replay-turn-heading"><span>{t('sessionReplay.userTurns')}</span><b>{archiveLoading && !turns.length ? '—' : turns.length}</b></div>
+        <div className="session-replay-turn-heading"><span>{t('sessionReplay.userTurns')}</span><b>{incompleteSnapshot || (archiveLoading && !turns.length) ? '—' : turns.length}</b></div>
         {turns.length > 0 ? <ol>{turns.map((turn, index) => {
           const message = turn.item.kind === 'message' ? turn.item : undefined;
           const fullText = message?.text ?? unknownLabel(t, message?.unknown ?? null);
@@ -339,8 +344,8 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
             aria-pressed={selectedTurn === turn.identity}
             onClick={() => selectTurn(turn)}
           ><span>{index + 1}</span><b>{fullText}</b></button></li>;
-        })}</ol> : <p role="status">{archiveLoading ? t('sessionReplay.loading') : t('sessionReplay.noUserTurns')}</p>}
-        <div className="session-replay-turn-heading"><span>{t('sessionReplay.activity')}</span><b>{archiveLoading && !activity.length ? '—' : activity.length}</b></div>
+        })}</ol> : <p role="status">{archiveLoading ? t('sessionReplay.loading') : incompleteSnapshot ? t('sessionReplay.snapshotOnly') : t('sessionReplay.noUserTurns')}</p>}
+        <div className="session-replay-turn-heading"><span>{t('sessionReplay.activity')}</span><b>{incompleteSnapshot || (archiveLoading && !activity.length) ? '—' : activity.length}</b></div>
         <ol>{activity.map((entry, index) => <li key={entry.identity}><button type="button" aria-pressed={selectedTurn === entry.identity} onClick={() => selectTurn(entry)}><span>{index + 1}</span><b>{entry.item.kind === 'message' ? entry.item.text || t('sessionReplay.agent') : entry.item.kind === 'tool_call' ? entry.item.name || t('sessionReplay.toolCall') : entry.item.kind === 'tool_result' ? entry.item.name || t('sessionReplay.toolResult') : ''}</b></button></li>)}</ol>
       </aside>
       <ol className="session-replay-feed" aria-label={t('sessionReplay.archiveSequence')}>
@@ -351,7 +356,8 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
             if (node) entryRefs.current.set(entry.identity, node);
             else entryRefs.current.delete(entry.identity);
           }}
-        ><EntryContent entry={entry} t={t} />
+        ><EntryContent entry={entry} t={t} summaryOnly={Boolean(loadArchiveRange) && entry.item.kind === 'unknown' && archiveDetails.some(request => request.request_id === entry.item.requestId
+          && (entry.archiveBodies === 2 ? request.archive?.request?.reason === 'archive_payload_invalid' && request.archive?.response?.reason === 'archive_payload_invalid' : request.archive?.[entry.item.body]?.reason === 'archive_payload_invalid'))} />
           {entry.item.kind === 'unknown' && loadArchiveRange && (() => {
             const request = sourceRequests.find(value => value.request_id === entry.item.requestId);
             const snapshot = archiveDetails.find(value => value.request_id === entry.item.requestId);
