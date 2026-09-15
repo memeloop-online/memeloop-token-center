@@ -17,8 +17,10 @@ vendored here. The relevant named bundle modules are:
   repeated custom_model_ids; response field 1 repeated ModelDetails.
 - Generated `agent/v1/agent_pb.js`: ModelDetails field 1 model_id; fields
   8–10 are optional BYOK credential messages, not public model metadata.
-- `7397.index.js` model discovery: actual GetUsableModels invocation with an
-  empty custom-model list, not just an unused service declaration.
+- `5727.index.js` model-list command constructs `src/client.ts`'s AiService
+  client; `7397.index.js` model discovery invokes its GetUsableModels with an
+  empty custom-model list. AgentService declares the same messages, but that
+  declaration alone does not establish the CLI's model-list endpoint.
 - `1931.index.js`, `src/usage/usage-data.ts`: actual DashboardService usage,
   hard-limit and plan reads under the signed-in OAuth client.
 
@@ -45,7 +47,7 @@ override is exposed for fixtures.
 
 ## Model catalog semantics
 
-`/agent.v1.AgentService/GetUsableModels` yields public model IDs. The persisted
+`/aiserver.v1.AiService/GetUsableModels` yields public model IDs. The persisted
 source is `cursor_native`, protocol `cursor_agent`. This protocol marker does
 not promise a working inference adapter. The current catalog schema does not
 store display names; raw supplier messages are never persisted because they

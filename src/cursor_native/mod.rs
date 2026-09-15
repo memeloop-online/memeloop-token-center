@@ -23,7 +23,7 @@ pub(crate) enum Method {
 impl Method {
     fn path(self) -> &'static str {
         match self {
-            Self::GetUsableModels => "/agent.v1.AgentService/GetUsableModels",
+            Self::GetUsableModels => "/aiserver.v1.AiService/GetUsableModels",
             Self::GetCurrentPeriodUsage => "/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
             Self::GetPlanInfo => "/aiserver.v1.DashboardService/GetPlanInfo",
         }
