@@ -185,7 +185,6 @@ pub(crate) fn clear_claimed_directory(root: &Path, owner: &[u8]) -> io::Result<b
     let name_text = name.to_str().ok_or(io::ErrorKind::InvalidInput)?;
     let parent = directory_fd(parent_path)?;
     let owner_marker = format!(".mtc-publish-owner-{name_text}");
-    verify_owner_at(&parent, &owner_marker, owner)?;
     let inode_marker = format!(".mtc-publish-inode-{name_text}");
     let quarantine = format!(".mtc-reclaim-{name_text}");
     match mkdirat(
@@ -212,10 +211,35 @@ pub(crate) fn clear_claimed_directory(root: &Path, owner: &[u8]) -> io::Result<b
     ) {
         Ok(_) => {}
         Err(rustix::io::Errno::NOENT) => {
+            match verify_owner_at(&parent, &owner_marker, owner) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    match openat2(
+                        &parent,
+                        name,
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                        Mode::empty(),
+                        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
+                    ) {
+                        Err(rustix::io::Errno::NOENT) => {
+                            finish_reclamation(
+                                &parent,
+                                quarantine.as_str(),
+                                &owner_marker,
+                                &inode_marker,
+                            )?;
+                            return Ok(false);
+                        }
+                        Ok(_) => return Err(error),
+                        Err(open_error) => return Err(open_error.into()),
+                    }
+                }
+                Err(error) => return Err(error),
+            }
             match renameat(&parent, name, &quarantine_directory, "root") {
                 Ok(()) => {}
                 Err(rustix::io::Errno::NOENT) => {
-                    let _ = unlinkat(&parent, quarantine.as_str(), AtFlags::REMOVEDIR);
+                    finish_reclamation(&parent, quarantine.as_str(), &owner_marker, &inode_marker)?;
                     return Ok(false);
                 }
                 Err(error) => return Err(error.into()),
@@ -223,6 +247,8 @@ pub(crate) fn clear_claimed_directory(root: &Path, owner: &[u8]) -> io::Result<b
         }
         Err(error) => return Err(error.into()),
     }
+    rustix::fs::fsync(&parent)?;
+    rustix::fs::fsync(&quarantine_directory)?;
     let result = (|| {
         let directory = openat2(
             &quarantine_directory,
@@ -233,15 +259,13 @@ pub(crate) fn clear_claimed_directory(root: &Path, owner: &[u8]) -> io::Result<b
         )?;
         let stat = rustix::fs::fstat(&directory)?;
         let identity = stat.st_ino.to_string();
+        verify_owner_at(&parent, &owner_marker, owner)?;
         verify_owner_at(&parent, &inode_marker, identity.as_bytes())?;
         clear_directory_contents(&directory)?;
         rustix::fs::fsync(&directory)?;
         unlinkat(&quarantine_directory, "root", AtFlags::REMOVEDIR)?;
         rustix::fs::fsync(&quarantine_directory)?;
-        unlinkat(&parent, quarantine.as_str(), AtFlags::REMOVEDIR)?;
-        unlinkat(&parent, owner_marker.as_str(), AtFlags::empty())?;
-        unlinkat(&parent, inode_marker.as_str(), AtFlags::empty())?;
-        rustix::fs::fsync(&parent)?;
+        finish_reclamation(&parent, quarantine.as_str(), &owner_marker, &inode_marker)?;
         Ok(true)
     })();
     if result.is_err() {
@@ -255,6 +279,28 @@ pub(crate) fn clear_claimed_directory(root: &Path, owner: &[u8]) -> io::Result<b
         let _ = rustix::fs::fsync(&parent);
     }
     result
+}
+
+#[cfg(target_os = "linux")]
+fn finish_reclamation(
+    parent: &rustix::fd::OwnedFd,
+    quarantine: &str,
+    owner_marker: &str,
+    inode_marker: &str,
+) -> io::Result<()> {
+    use rustix::fs::{AtFlags, unlinkat};
+    for marker in [owner_marker, inode_marker] {
+        match unlinkat(parent, marker, AtFlags::empty()) {
+            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    rustix::fs::fsync(parent)?;
+    match unlinkat(parent, quarantine, AtFlags::REMOVEDIR) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(rustix::fs::fsync(parent)?)
 }
 
 #[cfg(not(target_os = "linux"))]

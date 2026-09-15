@@ -1838,6 +1838,7 @@ mod tests {
             uuid::Uuid::now_v7().to_string(),
             uuid::Uuid::now_v7().to_string(),
             uuid::Uuid::now_v7().to_string(),
+            uuid::Uuid::now_v7().to_string(),
         ];
         let roots = attempts
             .iter()
@@ -1857,6 +1858,12 @@ mod tests {
             .join(format!(".mtc-reclaim-mtc-attempt-{}", attempts[4]));
         std::fs::create_dir(&interrupted_quarantine).unwrap();
         std::fs::rename(&roots[4], interrupted_quarantine.join("root")).unwrap();
+        let terminal_quarantine = directory
+            .path()
+            .join(format!(".mtc-reclaim-mtc-attempt-{}", attempts[5]));
+        std::fs::create_dir(&terminal_quarantine).unwrap();
+        std::fs::rename(&roots[5], terminal_quarantine.join("root")).unwrap();
+        std::fs::remove_dir_all(terminal_quarantine.join("root")).unwrap();
         let inventory_roots = BTreeSet::from([roots[0].clone()]);
         let referenced_attempts = BTreeSet::from([attempts[1].clone()]);
         std::fs::remove_file(
@@ -1880,6 +1887,13 @@ mod tests {
         assert!(roots[2].join("payload").exists());
         assert!(!roots[3].exists());
         assert!(!interrupted_quarantine.exists());
+        assert!(!terminal_quarantine.exists());
+        assert!(
+            !directory
+                .path()
+                .join(format!(".mtc-publish-owner-mtc-attempt-{}", attempts[5]))
+                .exists()
+        );
         assert_eq!(
             reclaim_installation_attempt_roots(
                 directory.path(),
