@@ -24,6 +24,7 @@ test('live metrics share real-data backgrounds and neutral rates across themes a
     const cards = page.locator('.request-traffic-metrics .analytics-metric');
     await cards.first().waitFor();
     assert.equal(await cards.count(), 6);
+    assert.deepEqual(await cards.first().locator('.metric-label').evaluate(node => { const style = getComputedStyle(node); return { transform: style.textTransform, size: style.fontSize }; }), { transform: 'none', size: '13px' });
     assert.deepEqual(await cards.locator('.metric-value').allTextContents(), ['3', '1', '1', '1', '50%', '25 s']);
     const rate = cards.filter({ hasText: 'Finished request success rate' });
     assert.equal(await rate.locator('.analytics-metric-ratio').getAttribute('data-ratio'), '0.5');
