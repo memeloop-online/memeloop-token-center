@@ -64,3 +64,9 @@ messages, not an OpenAI chat-completions payload. Discovery and quota reads
 must not enable a generic OpenAI inference fallback. A future adapter must
 also preserve optional authoritative TurnEndedUpdate token counters instead
 of treating missing usage as zero.
+
+The final proxy dispatch boundary currently rejects native `cursor` candidates
+as locally unavailable before any outbound attempt, for buffered and streamed
+requests alike. Existing generic-driver OAuth lifecycle fixtures remain generic
+driver tests; they are not evidence of native Cursor inference. No new manual
+confirmation flow is introduced by this capability guard.
