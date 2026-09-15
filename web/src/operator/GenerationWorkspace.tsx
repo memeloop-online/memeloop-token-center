@@ -1,12 +1,15 @@
 import { useConfirmDialog } from '../useConfirmDialog';
 import { ImageGenerationQuarantine } from './ImageGenerationQuarantine';
 import { useEffect, useRef, useState } from 'react';
+import { Menu, MenuItem, MenuList, MenuPopover, MenuTrigger } from '@fluentui/react-components';
 import { ApiError, api } from '../api';
 import { DrawerFrame } from '../components';
+import { Button } from '../design-system';
 import { formatCurrency, formatNumber } from '../format';
 import { useI18n } from '../i18n';
 import { tenantDisplayName } from '../tenantDisplayName';
 import type { GenerationAsset, OperatorGenerationJob } from '../types';
+import './generationWorkspace.css';
 
 function tenantQuery(tenant: string) {
   const query = new URLSearchParams();
@@ -16,6 +19,12 @@ function tenantQuery(tenant: string) {
 
 function canCancel(job: OperatorGenerationJob) {
   return job.status === 'queued' || job.status === 'running';
+}
+
+function statusTone(status: OperatorGenerationJob['status']) {
+  if (status === 'succeeded') return 'ok';
+  if (status === 'failed' || status === 'cancelled') return 'bad';
+  return 'pending';
 }
 
 /** `tenant` scopes reads; `writeTenant` is always an explicit mutation target. */
@@ -28,6 +37,9 @@ export function GenerationWorkspace({ token, tenant, writeTenant = tenant }: { t
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const reviewTrigger = useRef<HTMLButtonElement>(null);
+  const hadReview = useRef(false);
   const loadSequence = useRef(0);
   const detailSequence = useRef(0);
   const scope = useRef({ token, tenant, writeTenant });
@@ -53,9 +65,15 @@ export function GenerationWorkspace({ token, tenant, writeTenant = tenant }: { t
 
   useEffect(() => {
     loadSequence.current += 1; detailSequence.current += 1;
-    setJobs([]); setDetail(undefined); setBusy(''); setLoading(false); setMessage(''); setError('');
+    setJobs([]); setDetail(undefined); setBusy(''); setLoading(false); setMessage(''); setError(''); setReviewOpen(false);
     void load();
   }, [token, tenant, writeTenant]);
+
+  // Closing the review workspace returns focus to its entry point.
+  useEffect(() => {
+    if (reviewOpen) { hadReview.current = true; return; }
+    if (hadReview.current) { hadReview.current = false; reviewTrigger.current?.focus(); }
+  }, [reviewOpen]);
 
   const select = async (job: OperatorGenerationJob) => {
     const sequence = ++detailSequence.current;
@@ -106,28 +124,34 @@ export function GenerationWorkspace({ token, tenant, writeTenant = tenant }: { t
   const canManage = (job: OperatorGenerationJob) => Boolean(writeTenant) && job.tenant_external_id === writeTenant;
 
   return <>{confirmationDialog}
-    <ImageGenerationQuarantine token={token} tenant={tenant} writeTenant={writeTenant} />
     {!detail && error && <div className="notice error" role="alert">{error}</div>}
     {!detail && message && <div className="notice success" role="status">{message}</div>}
     <article className="panel operator-generations">
-      <div className="panel-title"><div><h2>{t('generations.title')}</h2><p className="muted">{t('generations.description')}</p></div><div className="row-actions"><span>{formatNumber(jobs.length, locale)}</span><button type="button" className="secondary" disabled={loading || !token.trim()} onClick={() => void load()}>{loading ? t('common.loading') : t('usage.refresh')}</button></div></div>
-      {jobs.length === 0 ? <div className="empty">{loading ? t('common.loading') : t('generations.empty')}</div> : <div className="table-scroll"><table>
+      <div className="panel-title"><div><h2>{t('generations.title')}</h2><p className="muted">{t('generations.description')}</p></div><div className="row-actions"><span>{formatNumber(jobs.length, locale)}</span><Button appearance="secondary" disabled={loading || !token.trim()} onClick={() => void load()}>{loading ? t('common.loading') : t('usage.refresh')}</Button>
+        <Menu><MenuTrigger disableButtonEnhancement><Button ref={reviewTrigger} appearance="secondary">{t('generations.moreActions')}</Button></MenuTrigger>
+          <MenuPopover><MenuList><MenuItem disabled={reviewOpen || !tenant || !token.trim()} onClick={() => setReviewOpen(true)}>{t('quarantine.menuItem')}</MenuItem></MenuList></MenuPopover>
+        </Menu></div></div>
+      {jobs.length === 0 ? <div className="empty">{loading ? t('common.loading') : t('generations.empty')}</div> : <div className="table-scroll generation-table-scroll"><table className="generation-table">
         <thead><tr><th>{t('request.time')}</th><th>{t('operator.tenant')}</th><th>{t('generations.credential')}</th><th>{t('request.model')}</th><th>{t('generations.driver')}</th><th>{t('request.status')}</th><th>{t('generations.units')}</th><th>{t('request.cost')}</th><th>{t('request.actions')}</th></tr></thead>
         <tbody>{jobs.map((job) => <tr key={job.job_id}>
-          <td>{new Date(job.created_at).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN')}</td>
-          <td>{tenantDisplayName(job.tenant_external_id, locale)}</td><td><button type="button" className="table-link" onClick={() => void select(job)}>{job.key_alias}</button><small className="break-anywhere">{job.key_id}</small></td>
-          <td><code>{job.model}</code></td><td>{job.driver}</td><td><span className={'status ' + (job.status === 'succeeded' ? 'ok' : job.status === 'failed' || job.status === 'cancelled' ? 'bad' : 'pending')}>{t('status.' + job.status)}</span></td>
-          <td>{formatNumber(job.billed_units ?? job.estimated_units, locale)} · {t('billingUnit.' + job.billing_unit)}</td>
-          <td>{formatCurrency(job.cost, job.currency, locale)}</td>
-          <td><div className="row-actions"><button type="button" className="secondary" onClick={() => void select(job)}>{t('generations.details')}</button><button type="button" className="danger" disabled={!canManage(job) || !canCancel(job) || busy === job.job_id} onClick={() => void cancel(job)}>{t('common.cancel')}</button></div></td>
+          <td className="generation-time-cell" data-label={t('request.time')}>{new Date(job.created_at).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN')}</td>
+          <td className="generation-tenant-cell" data-label={t('operator.tenant')}>{tenantDisplayName(job.tenant_external_id, locale)}</td><td className="generation-credential-cell" data-label={t('generations.credential')}><button type="button" className="table-link" onClick={() => void select(job)}>{job.key_alias}</button><small className="break-anywhere">{job.key_id}</small></td>
+          <td className="generation-model-cell"><code>{job.model}</code></td><td className="generation-driver-cell" data-label={t('generations.driver')}>{job.driver}</td><td className="generation-status-cell" data-label={t('request.status')}><span className={'status ' + statusTone(job.status)}>{t('generations.status.' + job.status)}</span></td>
+          <td className="generation-units-cell" data-label={t('generations.units')}>{formatNumber(job.billed_units ?? job.estimated_units, locale)} · {t('billingUnit.' + job.billing_unit)}</td>
+          <td className="generation-cost-cell" data-label={t('request.cost')}>{formatCurrency(job.cost, job.currency, locale)}</td>
+          <td className="generation-actions-cell"><div className="row-actions"><Button appearance="secondary" size="small" onClick={() => void select(job)}>{t('generations.details')}</Button>{canManage(job) && canCancel(job) && <button type="button" className="danger" disabled={busy === job.job_id} onClick={() => void cancel(job)}>{t('common.cancel')}</button>}</div></td>
         </tr>)}</tbody>
       </table></div>}
     </article>
+    {reviewOpen && <section className="generation-review" aria-label={t('quarantine.title')}>
+      <div className="row-actions generation-review-actions"><Button appearance="secondary" onClick={() => setReviewOpen(false)}>{t('generations.backToJobs')}</Button></div>
+      <ImageGenerationQuarantine token={token} tenant={tenant} writeTenant={writeTenant} />
+    </section>}
     {detail && <DrawerFrame title={detail.model} eyebrow={t('generations.detailTitle')} onClose={() => setDetail(undefined)}>
       {error && <div className="notice error" role="alert">{error}</div>}
       {message && <div className="notice success" role="status">{message}</div>}
       <p className="muted break-anywhere">{detail.job_id} · {tenantDisplayName(detail.tenant_external_id, locale)} · {detail.key_alias}</p>
-      <h3>{t('request.status')}</h3><pre>{detail.status}</pre>
+      <h3>{t('request.status')}</h3><p><span className={'status ' + statusTone(detail.status)}>{t('generations.status.' + detail.status)}</span> <code>{detail.status}</code></p>
       <h3>{t('generations.units')}</h3><pre>{JSON.stringify({ estimated: detail.estimated_units, billed: detail.billed_units, billing_unit: detail.billing_unit, cost: detail.cost, currency: detail.currency }, null, 2)}</pre>
       <h3>{t('request.error')}</h3><pre>{detail.error_code ?? t('common.none')}</pre>
       <h3>{t('generations.result')}</h3><pre>{JSON.stringify(detail.result, null, 2)}</pre>
