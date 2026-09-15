@@ -1,4 +1,5 @@
 //! Supplier quota projection; mutations live in the explicit durable reset workflow.
+mod antigravity;
 mod kimi;
 mod normalize;
 pub(crate) mod reset;
@@ -255,12 +256,18 @@ struct QuotaCapabilities {
 impl QuotaCapabilities {
     fn for_provider(provider: &str) -> Self {
         Self {
-            read: matches!(provider, "openai-codex" | "kimi-oauth"),
+            read: matches!(
+                provider,
+                "openai-codex" | "kimi-oauth" | "google-antigravity"
+            ),
             plan: provider == "openai-codex",
             workspace: false,
             window_amounts: provider == "kimi-oauth",
             window_amount_unit: false,
-            window_percent: matches!(provider, "openai-codex" | "kimi-oauth"),
+            window_percent: matches!(
+                provider,
+                "openai-codex" | "kimi-oauth" | "google-antigravity"
+            ),
             reset_credit_expiry: provider == "openai-codex",
             subscription_expiry: false,
             supplier_read_only: true,
@@ -307,7 +314,7 @@ struct ResetCapability {
 impl QuotaSnapshot {
     fn empty(account: &UpstreamAccountView, tenant: &str, error: Option<&'static str>) -> Self {
         let codex = account.driver == "openai-codex";
-        let known_read_adapter = matches!(account.driver.as_str(), "openai-codex" | "kimi-oauth");
+        let known_read_adapter = QuotaCapabilities::for_provider(&account.driver).read;
         Self {
             contract_version: "upstream_quota_v1",
             upstream_account_id: account.id,
@@ -442,7 +449,7 @@ impl QuotaCache {
         let Ok(_permit) = self.permits.try_acquire() else {
             return fallback("quota_busy");
         };
-        // Includes DNS/proxy setup, both GETs and bounded body decoding.
+        // Includes DNS/proxy setup, supplier reads and bounded body decoding.
         let refresh_started = tokio::time::Instant::now();
         let overall_timeout = if account.driver == "openai-codex" {
             codex_quota_budget(&account.config)
@@ -452,10 +459,12 @@ impl QuotaCache {
             QUOTA_TIMEOUT
         };
         let result = match tokio::time::timeout(overall_timeout, async {
-            if account.driver == "kimi-oauth" {
-                kimi::read(state, account, credential, empty(None)).await
-            } else {
-                read_codex(state, account, credential, empty(None)).await
+            match account.driver.as_str() {
+                "google-antigravity" => {
+                    antigravity::read(state, account, credential, empty(None)).await
+                }
+                "kimi-oauth" => kimi::read(state, account, credential, empty(None)).await,
+                _ => read_codex(state, account, credential, empty(None)).await,
             }
         })
         .await

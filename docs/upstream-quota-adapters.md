@@ -17,6 +17,7 @@ it is not a supplier mutation or a generic assertion that the account is healthy
 | --- | --- | --- | --- | --- | --- | --- |
 | openai-codex | WHAM usage and reset-credit GET endpoints | Supplier plan; workspace null | Percent used only; absolute amounts and unit null | Supplier instant or marked estimate | Per Codex credit status/granted/expiry, source `codex_reset_credits`, with no identifier or secret | Null, capability false |
 | kimi-oauth | Kimi coding v1 usages GET | Null; capability false | Total/used/remaining when supplied or safely derived; unit null because the supplier field has no verified unit contract | Supplier instant or marked relative estimate | Unsupported | Unsupported |
+| google-antigravity | `retrieveUserQuotaSummary` POST, read-only project query | Null; capability false | Percent used from supplier remaining fraction; absolute amounts and unit null | Exact supplier RFC3339 instant; cadence only from explicit window metadata | Unsupported | Unsupported |
 | Other drivers | No network call | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported |
 
 Capabilities describe implemented fields, not current sample availability. Missing
@@ -59,6 +60,38 @@ expiry comes from stored auth-file metadata or ID-token claims, not WHAM usage;
 the native credential schema does not currently preserve that verified metadata.
 OAuth access-token expiry must not be substituted for subscription expiry.
 Implementing that requires a separately reviewed native metadata/import contract.
+
+### Antigravity quota contract
+
+Reference: the official CPA management panel's
+[endpoint constants](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/blob/c12997e1a544374336ea385d5e9a9bbabe1e4767/src/utils/quota/constants.ts)
+and [group/bucket parser](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/blob/c12997e1a544374336ea385d5e9a9bbabe1e4767/src/utils/quota/builders.ts),
+which passes remaining fractions to the [fraction normalizer](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/blob/c12997e1a544374336ea385d5e9a9bbabe1e4767/src/utils/quota/parsers.ts).
+The adapter sends one POST to the account's configured `base_url` plus
+`/v1internal:retrieveUserQuotaSummary`, with only `{"project": project_id}` as
+the JSON body. It uses the existing OAuth credential, validated native request
+headers, and account proxy policy. No alternative origin is probed, no client
+identity is fabricated, and no token refresh, project discovery/onboarding,
+catalog synchronization, model request, or quota-reset operation occurs.
+Missing project configuration returns `quota_project_required`; an expired
+credential returns `credential_invalid` without refreshing it.
+
+The `groups[].buckets[]` projection supports camelCase and snake_case fields.
+Remaining fraction becomes percent used, never an invented token count.
+Numeric fractions and numeric strings must be finite and within 0–1; explicit
+percentage strings such as `25%` are divided by 100 and bounded to 0–100%.
+Only explicit `5h`/`five-hour`/`five_hour` or `weekly`/`week` metadata establishes
+a window period. A reset timestamp does not establish cadence; missing or
+unrecognized dates and periods remain null. Group/bucket identifiers are scoped
+and bounded, duplicate identifiers and malformed fractions fail closed.
+When supplier group labels or bucket identifiers/window metadata are absent,
+ordinal fallback IDs depend on response ordering; anonymous rows are not promised
+stable identity across reordering.
+This provider never supplies inferred routing health, subscription expiry or
+reset credits. Quota reading is available; reset implementation and preparation
+remain unavailable. Supplier-side reset support itself is unknown, not asserted
+from local cooldown clearing behavior. All observations share the existing
+tenant/generation-scoped cache and bounded stale fallback.
 
 Reset controls retain the existing explicit prepare/confirmation contract. This
 read adapter never invokes reset, prepare, reconcile, model traffic, or catalog
