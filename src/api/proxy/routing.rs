@@ -90,6 +90,7 @@ pub(super) fn plan_proxy_route(
             &route.upstream_model,
             &route.config,
             request_id,
+            protocol,
         )?)
     } else {
         None

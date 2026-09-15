@@ -79,6 +79,8 @@ pub(super) struct StreamingResponse<'a> {
     pub(super) is_codex_route: bool,
     pub(super) is_kimi_route: bool,
     pub(super) codex_retry: CodexRetryTerminalGuard,
+    pub(super) codex_chat_model: Option<String>,
+    pub(super) codex_chat_include_usage: bool,
     pub(super) upstream_attempt: UpstreamAttemptGuard,
     pub(super) strict_openai_chat_usage: bool,
     pub(super) upstream_activity: crate::metrics::ActivityGuard,
@@ -106,6 +108,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         is_codex_route,
         is_kimi_route,
         codex_retry,
+        codex_chat_model,
+        codex_chat_include_usage,
         mut upstream_attempt,
         strict_openai_chat_usage,
         upstream_activity,
@@ -193,7 +197,17 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let mut capture_memory = background_state
                 .metrics
                 .memory_usage(crate::metrics::MemoryComponent::StreamCapture, 0);
+            let mut codex_chat_translator = codex_chat_model.map(|model| {
+                codex_transport::CodexChatStreamTranslator::new(
+                    request_id,
+                    model,
+                    codex_chat_include_usage,
+                )
+            });
             let mut sse_capture = is_sse.then(|| match protocol {
+                Protocol::OpenAiChat if is_codex_route => {
+                    ResponsesSseCapture::for_codex_responses()
+                }
                 Protocol::OpenAiChat if strict_openai_chat_usage => {
                     chat_usage_capture(is_kimi_route)
                 }
@@ -204,7 +218,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 _ => ResponsesSseCapture::for_delivery(),
             });
             let mut responses_streaming_sanitizer = (is_sse
-                && matches!(protocol, Protocol::OpenAiResponses))
+                && (is_codex_route || matches!(protocol, Protocol::OpenAiResponses)))
             .then(crate::api::sse::ResponsesStreamingSanitizer::default);
             let mut transport_error: Option<&'static str> = None;
             let mut response_bytes = 0_usize;
@@ -418,7 +432,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         // fragmented comment/control frame never confirms
                         // delivery or occupies the archive channel as output.
                         let CapturedSseDelivery {
-                            frames: delivery_frames,
+                            frames: mut delivery_frames,
                             strict_chat_terminal_ready,
                         } = match capture_sse_delivery(
                             sse_capture.as_mut(),
@@ -445,6 +459,42 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 break;
                             }
                         };
+                        if let Some(translator) = codex_chat_translator.as_mut() {
+                            let mut translated = Vec::with_capacity(delivery_frames.len());
+                            for mut frame in delivery_frames {
+                                match translator.translate_frame(&frame.bytes) {
+                                    Ok(Some(bytes)) => {
+                                        frame.bytes = bytes;
+                                        translated.push(frame);
+                                    }
+                                    Ok(None) => {}
+                                    Err(error_code) => {
+                                        transport_error =
+                                            Some(transport_error_with_downstream_precedence(
+                                                downstream_closed_observed
+                                                    || body_sender.is_closed(),
+                                                error_code,
+                                            ));
+                                        drop(archive_sender.take());
+                                        let _ = tokio::time::timeout(
+                                            MAX_DOWNSTREAM_SEND_WAIT,
+                                            body_sender.send(downstream_stream_failure(
+                                                protocol,
+                                                is_sse,
+                                                responses_streaming_sanitizer.as_ref(),
+                                                "upstream response could not be represented as Chat Completions",
+                                            )),
+                                        )
+                                        .await;
+                                        break;
+                                    }
+                                }
+                            }
+                            if transport_error.is_some() {
+                                break;
+                            }
+                            delivery_frames = translated;
+                        }
                         let observed_ms = diagnostic_context.elapsed_millis_at(Instant::now());
                         for frame in &delivery_frames {
                             output_timing.observe(&frame.bytes, frame.terminal, observed_ms);
@@ -498,7 +548,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                     requested_service_tier: requested_service_tier.as_deref(),
                                     confirmed: &mut delivery_confirmed,
                                     probe: ((matches!(protocol, Protocol::OpenAiResponses)
-                                        || strict_openai_chat_usage)
+                                        || strict_openai_chat_usage
+                                        || is_codex_route)
                                         && sse_capture.as_ref().is_some_and(
                                             ResponsesSseCapture::can_confirm_probe_delivery,
                                         ))
@@ -646,7 +697,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             requested_service_tier: requested_service_tier.as_deref(),
                             confirmed: &mut delivery_confirmed,
                             probe: ((matches!(protocol, Protocol::OpenAiResponses)
-                                || strict_openai_chat_usage)
+                                || strict_openai_chat_usage
+                                || is_codex_route)
                                 && sse_summary
                                     .as_ref()
                                     .is_some_and(|summary| !summary.usage_invalid))

@@ -1366,6 +1366,12 @@ pub(in crate::api) async fn proxy_with_identity(
         &active_route.route.config,
         &request_json,
     );
+    let codex_chat_include_usage = active_route.is_codex()
+        && matches!(protocol, Protocol::OpenAiChat)
+        && request_json
+            .pointer("/stream_options/include_usage")
+            .and_then(Value::as_bool)
+            == Some(true);
     drop(request_json);
     active_route.release_request_buffers();
     let is_codex_route = active_route.is_codex();
@@ -1445,6 +1451,49 @@ pub(in crate::api) async fn proxy_with_identity(
                 return result;
             }
         };
+        if matches!(protocol, Protocol::OpenAiResponses) && buffered.terminal.is_incomplete() {
+            buffer_phase.finish(
+                "upstream_incomplete_response",
+                Some(200),
+                Some(buffered.body.len()),
+            );
+            let result = finish_buffered_request(
+                &buffered_request,
+                StatusCode::BAD_GATEWAY,
+                Bytes::from_static(
+                    b"{\"error\":{\"message\":\"upstream response was incomplete\",\"type\":\"upstream_error\"}}",
+                ),
+                "application/json",
+                (
+                    buffered.usage,
+                    crate::model::RequestUsageBasis::ProviderReported,
+                ),
+                Some("upstream_incomplete_response".to_owned()),
+            )
+            .await;
+            upstream_attempt
+                .complete(UpstreamAttemptTerminal::Inconclusive)
+                .await;
+            codex_retry.complete(CodexRetryTerminal::Failed);
+            return result;
+        }
+        let buffered = if matches!(protocol, Protocol::OpenAiChat) {
+            match codex_transport::translate_buffered_chat_response(buffered, request_id, &model) {
+                Ok(buffered) => buffered,
+                Err(error_code) => {
+                    buffer_phase.finish(error_code, None, None);
+                    tracing::warn!(%request_id, stage = error_code, "Codex Chat response translation failed");
+                    let result = finish_proxy_failure(&buffered_request, error_code).await;
+                    upstream_attempt
+                        .complete(UpstreamAttemptTerminal::invalid_response())
+                        .await;
+                    codex_retry.complete(CodexRetryTerminal::Failed);
+                    return result;
+                }
+            }
+        } else {
+            buffered
+        };
         buffer_phase.finish("completed", Some(200), Some(buffered.body.len()));
         let result = finish_buffered_request(
             &buffered_request,
@@ -1522,6 +1571,9 @@ pub(in crate::api) async fn proxy_with_identity(
         is_codex_route,
         codex_retry,
         strict_openai_chat_usage,
+        codex_chat_model: (is_codex_route && matches!(protocol, Protocol::OpenAiChat))
+            .then(|| model.clone()),
+        codex_chat_include_usage,
         is_kimi_route: active_route.route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER,
         upstream_attempt,
         upstream_activity,
