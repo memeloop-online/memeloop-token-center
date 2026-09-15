@@ -1,6 +1,6 @@
 import { createRoot } from 'react-dom/client';
 import { I18nProvider } from '../../src/i18n';
-import { UpstreamQuotaResetSection } from '../../src/operator/UpstreamQuota';
+import { UpstreamQuotaResetSection } from '../../src/operator/UpstreamQuotaPanel';
 import type { UpstreamQuotaSnapshot } from '../../src/operator/upstreamQuota';
 import '../../src/styles.css';
 import '../../src/theme.css';

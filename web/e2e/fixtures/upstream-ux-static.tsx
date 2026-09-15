@@ -3,7 +3,7 @@ import Form from '@rjsf/core/lib/components/Form.js';
 import { createRoot } from 'react-dom/client';
 import { I18nProvider, useI18n } from '../../src/i18n';
 import { MtcFluentProvider } from '../../src/design-system';
-import { UpstreamQuotaDetails } from '../../src/operator/UpstreamQuota';
+import { UpstreamQuotaDetails } from '../../src/operator/UpstreamQuotaPanel';
 import { UpstreamQuotaReset } from '../../src/operator/UpstreamQuotaReset';
 import { UpstreamConnection, connectionSchema } from '../../src/operator/UpstreamConnection';
 import { upstreamFormTemplates } from '../../src/operator/UpstreamFormTemplates';

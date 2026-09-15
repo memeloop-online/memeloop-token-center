@@ -68,6 +68,20 @@ export function quotaResetCreditExpiry(snapshot: UpstreamQuotaSnapshot, now = Da
   return { state: credits.length === 0 && snapshot.reset_capability.available_credits !== 0 ? 'unknown' : 'none' };
 }
 
+export function quotaAvailableResetCredits(snapshot: UpstreamQuotaSnapshot, now = Date.now()): number | null {
+  if (snapshot.reset_capability.available_credits !== null && Number.isFinite(snapshot.reset_capability.available_credits)) return snapshot.reset_capability.available_credits;
+  const credits = snapshot.reset_credits;
+  if (!credits || credits.some((credit) => credit.status === null)) return null;
+  let available = 0;
+  for (const credit of credits) {
+    if (credit.status !== 'available') continue;
+    if (credit.granted_at === null || credit.expires_at === null) return null;
+    if (!Number.isFinite(credit.granted_at) || !Number.isFinite(credit.expires_at)) return null;
+    if (credit.granted_at <= now && credit.expires_at > now) available += 1;
+  }
+  return available;
+}
+
 export function upstreamQuotaPath(accountId: string, tenant: string) {
   if (!accountId || !tenant.trim()) throw new Error('Quota requires an account and tenant');
   return `/internal/v1/upstreams/${encodeURIComponent(accountId)}/quota?${new URLSearchParams({ tenant_external_id: tenant })}`;
