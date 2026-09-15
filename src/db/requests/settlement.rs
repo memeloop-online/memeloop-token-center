@@ -168,16 +168,7 @@ impl Database {
                         duration_ms: request_created_at
                             .map(|created_at| now.saturating_sub(created_at))
                             .unwrap_or_default(),
-                        usage: if delivery_started {
-                            TokenUsage {
-                                input_tokens: input_token_ceiling,
-                                output_tokens: output_token_ceiling,
-                                ..TokenUsage::default()
-                            }
-                        } else {
-                            TokenUsage::default()
-                        },
-                        charge_contract_ceiling: delivery_started,
+                        usage: TokenUsage::default(),
                         error_code: Some("request_expired"),
                         response_object: &response_object,
                         conversation: None,
@@ -794,22 +785,7 @@ pub(crate) async fn settle_token_usage_in_transaction(
     usage: &TokenUsage,
     now: i64,
 ) -> Result<i64, AppError> {
-    settle_token_usage_in_transaction_with_charge(tx, reservation, usage, now, None).await
-}
-
-pub(crate) async fn settle_token_usage_in_transaction_with_charge(
-    tx: &mut Transaction<'_, Any>,
-    reservation: &UsageReservation,
-    usage: &TokenUsage,
-    now: i64,
-    forced_actual_micros: Option<i64>,
-) -> Result<i64, AppError> {
-    if forced_actual_micros
-        .is_some_and(|forced| !(0..=reservation.reserved_micros).contains(&forced))
-    {
-        return Err(AppError::Internal);
-    }
-    settle_token_usage_with_explicit_charge(tx, reservation, usage, now, forced_actual_micros).await
+    settle_token_usage_with_explicit_charge(tx, reservation, usage, now, None).await
 }
 
 pub(crate) async fn settle_confirmed_image_charge_in_transaction(
@@ -1203,89 +1179,6 @@ async fn key_budget_rolling_weekly_settled(
     .fetch_one(&mut **tx)
     .await?
     .try_get("amount")?)
-}
-
-pub(crate) fn proxy_contract_ceiling_micros(
-    reservation: &UsageReservation,
-    input_token_ceiling: i64,
-    output_token_ceiling: i64,
-    requested_service_tier: Option<&str>,
-) -> Result<i64, AppError> {
-    if input_token_ceiling < 0
-        || output_token_ceiling < 0
-        || input_token_ceiling.checked_add(output_token_ceiling)
-            != Some(reservation.reserved_tokens)
-    {
-        return Err(AppError::Internal);
-    }
-    if let Some(tier) = requested_service_tier {
-        validate_service_tier(tier).map_err(|_| AppError::Internal)?;
-    }
-
-    let fallback = ModelPriceTier {
-        service_tier: "default".to_owned(),
-        input_micros_per_million: reservation.input_micros_per_million,
-        cached_input_micros_per_million: reservation.input_micros_per_million,
-        cache_write_micros_per_million: reservation.input_micros_per_million,
-        output_micros_per_million: reservation.output_micros_per_million,
-        source: "legacy-snapshot".to_owned(),
-    };
-    let default_tier = reservation
-        .price_tiers
-        .iter()
-        .find(|tier| tier.service_tier == "default")
-        .unwrap_or(&fallback);
-    let selected: Vec<&ModelPriceTier> = match requested_service_tier {
-        Some("auto") => {
-            if reservation.price_tiers.is_empty() {
-                vec![default_tier]
-            } else {
-                reservation.price_tiers.iter().collect()
-            }
-        }
-        Some("standard_only") => {
-            let tiers = reservation
-                .price_tiers
-                .iter()
-                .filter(|tier| matches!(tier.service_tier.as_str(), "default" | "standard_only"))
-                .collect::<Vec<_>>();
-            if tiers.is_empty() {
-                vec![default_tier]
-            } else {
-                tiers
-            }
-        }
-        Some(requested) => match reservation
-            .price_tiers
-            .iter()
-            .find(|tier| tier.service_tier == requested)
-        {
-            Some(tier) => vec![tier],
-            None if reservation.price_tiers.is_empty() => vec![default_tier],
-            None => reservation.price_tiers.iter().collect(),
-        },
-        None => vec![default_tier],
-    };
-    let maximum_input_price = selected
-        .iter()
-        .flat_map(|tier| {
-            [
-                tier.input_micros_per_million,
-                tier.cached_input_micros_per_million,
-                tier.cache_write_micros_per_million,
-            ]
-        })
-        .max()
-        .ok_or(AppError::Internal)?;
-    let maximum_output_price = selected
-        .iter()
-        .map(|tier| tier.output_micros_per_million)
-        .max()
-        .ok_or(AppError::Internal)?;
-    priced_tokens(input_token_ceiling, maximum_input_price)
-        .checked_add(priced_tokens(output_token_ceiling, maximum_output_price))
-        .map(|charge| charge.min(reservation.reserved_micros))
-        .ok_or(AppError::Internal)
 }
 
 pub(crate) fn price_token_usage(

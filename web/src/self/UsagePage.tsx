@@ -1,4 +1,4 @@
-import { LocalSettlementNotice, localSettlementLabel } from '../LocalSettlementNotice';
+import { LocalSettlementNotice, localSettlementLabel, localSettlementTrendLabel } from '../LocalSettlementNotice';
 import { displayTimeZone, bucketTimeZoneNote } from '../charts/displayTimeZone';
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from '../api';
@@ -32,7 +32,7 @@ function CostLines({ values }: { values: UsageAnalysisCost[] }) {
 function ChartDataTable({ timeZone, values }: { timeZone: string; values: UsageAnalysisTimeBucket[] }) {
   const { locale, t } = useI18n();
   return <div className="usage-chart-table" aria-label={t('usage.trendData')}><div className="table-scroll"><table>
-    <thead><tr><th>{t('request.time')} · {timeZone}</th><th>{t('traffic.success')}</th><th>{t('traffic.failure')}</th><th>{t('usage.totalTokens')}</th><th>{t('usage.average')}</th><th>{t('usage.p95Approx')}</th><th>{t('usage.cost')}</th></tr></thead>
+    <thead><tr><th>{t('request.time')} · {timeZone}</th><th>{t('traffic.success')}</th><th>{t('traffic.failure')}</th><th>{t('usage.totalTokens')}</th><th>{t('usage.average')}</th><th>{t('usage.p95Approx')}</th><th><LocalSettlementNotice /></th></tr></thead>
     <tbody>{values.map((value) => { const success = formatMetricDisplay(value.success, locale); const failed = formatMetricDisplay(value.failed, locale); const tokens = formatMetricDisplay(totalTokens(value), locale); return <tr key={value.bucket_start}><td>{new Date(value.bucket_start).toLocaleString(locale, { timeZone })}</td><td title={success.title}>{success.text}</td><td title={failed.title}>{failed.text}</td><td title={tokens.title}>{tokens.text}</td><td>{formatMilliseconds(value.avg_duration_ms, locale)}</td><td>{formatMilliseconds(value.p95_duration_ms, locale)}</td><td><CostLines values={value.costs} /></td></tr>; })}</tbody>
   </table></div></div>;
 }
@@ -45,7 +45,7 @@ function ChartPanel({ children, timeZone, title, values }: { children: ReactNode
 function DimensionTable({ title, values }: { title: string; values: UsageAnalysisBucket[] }) {
   const { locale, t } = useI18n();
   return <article className="panel usage-dimension"><div className="panel-title"><h2>{title}</h2><span>{formatNumber(values.length, locale)}</span></div>
-    {values.length === 0 ? <div className="empty">{t('usage.noDimensionData')}</div> : <div className="table-scroll"><table><thead><tr><th>{title}</th><th>{t('usage.requests')}</th><th>{t('usage.successRate')}</th><th>{t('usage.totalTokens')}</th><th>{t('usage.cost')}</th></tr></thead><tbody>
+    {values.length === 0 ? <div className="empty">{t('usage.noDimensionData')}</div> : <div className="table-scroll"><table><thead><tr><th>{title}</th><th>{t('usage.requests')}</th><th>{t('usage.successRate')}</th><th>{t('usage.totalTokens')}</th><th><LocalSettlementNotice /></th></tr></thead><tbody>
       {values.map((value) => { const requests = formatMetricDisplay(value.requests, locale); const tokens = formatMetricDisplay(totalTokens(value), locale); return <tr key={value.id}><td>{value.label}</td><td title={requests.title}>{requests.text}</td><td>{formatPercent(value.requests ? value.success / value.requests : null, locale)}</td><td title={tokens.title}>{tokens.text}</td><td><CostLines values={value.costs} /></td></tr>; })}
     </tbody></table></div>}
   </article>;
@@ -88,8 +88,8 @@ export function UsagePage({ credential, credentialView, onError }: {
 
   const copy: UsageChartCopy = useMemo(() => ({
     requests: t('usage.requests'), success: t('traffic.success'), failures: t('traffic.failure'), averageLatency: t('usage.average'),
-    p95Latency: t('usage.p95Approx'), cost: t('usage.cost'), noData: t('usage.noTrendData'),
-  }), [t]);
+    p95Latency: t('usage.p95Approx'), cost: localSettlementLabel(locale), noData: t('usage.noTrendData'),
+  }), [locale, t]);
   const formatters: UsageChartFormatters = useMemo(() => ({
     bucket: (epoch) => new Date(epoch).toLocaleString(locale, { timeZone }),
     cost: (value, currency) => formatCurrency(value, currency, locale), duration: (value) => formatMilliseconds(value, locale),
@@ -122,7 +122,7 @@ export function UsagePage({ credential, credentialView, onError }: {
       <section className="usage-chart-grid self-usage-charts">
         <ChartPanel timeZone={timeZone} title={t('usage.throughput')} values={stats.time_series}><EChart ariaLabel={t('usage.throughput')} locale={locale} option={throughput} timeZone={timeZone} /></ChartPanel>
         <ChartPanel timeZone={timeZone} title={t('usage.latencyTrend')} values={stats.time_series}><EChart ariaLabel={t('usage.latencyTrend')} locale={locale} option={latency} timeZone={timeZone} /></ChartPanel>
-        <ChartPanel timeZone={timeZone} title={t('usage.costTrend')} values={stats.time_series}><EChart ariaLabel={t('usage.costTrend')} locale={locale} option={costs} timeZone={timeZone} /></ChartPanel>
+        <ChartPanel timeZone={timeZone} title={localSettlementTrendLabel(locale)} values={stats.time_series}><EChart ariaLabel={localSettlementTrendLabel(locale)} locale={locale} option={costs} timeZone={timeZone} /></ChartPanel>
         <article className="panel usage-chart-card usage-heatmap-panel"><ChartDataView title={t('usage.heatmap')} metadata={<span>{heatmapTimeZone}</span>} data={<HeatmapDataTable currency={credentialView.currency} format={formatters} metric="requests" summary={t('usage.trendData')} timeZone={heatmapTimeZone} valueLabel={t('usage.requests')} values={stats.heatmap} weekdays={weekdays} />}>{stats.heatmap.length === 0 ? <div className="empty">{t('usage.noHeatmapData')}</div> : <><EChart ariaLabel={t('usage.heatmapLabel')} className="usage-echart-heatmap" locale={locale} option={heatmap} timeZone={heatmapTimeZone} /></>}</ChartDataView></article>
       </section>
     </Suspense>

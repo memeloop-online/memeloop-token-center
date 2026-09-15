@@ -94,8 +94,6 @@ async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_origina
         content_type: Some(HeaderValue::from_static("application/json")),
         protocol: Protocol::OpenAiChat,
         capture_json_usage: true,
-        input_token_ceiling: 20,
-        output_token_ceiling: 8,
         upstream_attempt: &mut attempt,
     })
     .await

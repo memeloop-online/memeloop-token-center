@@ -43,6 +43,31 @@ export function requestUsageCopy(request: RequestView, locale: string) {
   }
 }
 
+export function requestCostCopy(request: RequestView, locale: string) {
+  const zh = locale === 'zh-CN';
+  if (request.usage_basis === 'not_observed') return {
+    unknown: true,
+    label: zh ? '费用未知' : 'Cost unknown',
+    hint: zh
+      ? '本地账本以 0 结算并释放了预留，但未观测到供应商实际用量；0 不是供应商免费或实际费用为零的证明。'
+      : 'The local ledger settled zero and released the reservation, but supplier usage was not observed; zero does not prove the supplier charged nothing.',
+  };
+  if (request.usage_basis === 'contract_ceiling') return {
+    unknown: false,
+    label: '',
+    hint: zh
+      ? '历史本地结算采用保守合同上限；这是已记账的本地金额，不是供应商实际用量或发票证明。'
+      : 'Historical local settlement used a conservative contract ceiling; this is the locally recorded amount, not proof of supplier usage or invoice cost.',
+  };
+  return {
+    unknown: false,
+    label: '',
+    hint: zh
+      ? '本地已结算金额；不是供应商实际消耗账单。'
+      : 'Locally settled amount; not the supplier’s actual usage invoice.',
+  };
+}
+
 export function requestCredentialLabel(request: RequestView, fallback: string | undefined): { label: string } | { key: 'request.unnamedCredential' | 'request.missingCredential' } {
   if (request.credential_identity) {
     const label = request.credential_identity.key_alias?.trim();
