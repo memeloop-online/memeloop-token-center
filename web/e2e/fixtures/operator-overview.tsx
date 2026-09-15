@@ -3,6 +3,7 @@ import { useState } from 'react';
 
 import { Shell } from '../../src/components';
 import { I18nProvider } from '../../src/i18n';
+import { MtcFluentProvider } from '../../src/design-system';
 import { OverviewPage } from '../../src/operator/pages/OperatorPages';
 import type { OperatorMonitoringSnapshot, OperatorUsageAnalysisTrends, RequestView, TypedFilterAst, UsageAnalysisMetrics } from '../../src/types';
 import '../../src/styles.css';
@@ -127,4 +128,4 @@ function Fixture() {
   </Shell>;
 }
 
-createRoot(document.getElementById('root')!).render(<I18nProvider><Fixture /></I18nProvider>);
+createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><Fixture /></MtcFluentProvider></I18nProvider>);
