@@ -45,6 +45,7 @@ test('large archive content is explicit, paged to its real end, and cleared on v
   const browser = await chromium.launch({ executablePath, headless: true });
   try {
     const page = await browser.newPage();
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-replay.html?full=1`);
     const open = page.getByRole('button', { name: 'Read full Response content', exact: true });
     await open.waitFor();
@@ -56,6 +57,15 @@ test('large archive content is explicit, paged to its real end, and cleared on v
     await nextPaint(page);
     assert.equal(await page.evaluate(() => window.archiveRangeReads), firstReads, 'reading stops at the displayed item page');
     assert.equal(await reader.locator('.session-replay-entry.message').count(), 30);
+    await mkdir(artifactRoot, { recursive: true });
+    for (const theme of ['light', 'dark']) {
+      await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
+      for (const width of [390, 1440]) {
+        await page.setViewportSize({ width, height: 900 });
+        await nextPaint(page);
+        await page.screenshot({ path: join(artifactRoot, `full-archive-${theme}-${width}.png`), fullPage: true });
+      }
+    }
     await reader.getByRole('button', { name: 'Next content', exact: true }).click();
     await reader.getByText(/^Archived step 31:/).first().waitFor();
     assert.equal(await reader.locator('.session-replay-entry.message').count(), 30);
@@ -73,6 +83,11 @@ test('large archive content is explicit, paged to its real end, and cleared on v
     await reader.getByText(/^Archived step 75:/).first().waitFor();
     assert.equal(await reader.locator('.session-replay-entry.message').count(), 15);
     assert.equal(await reader.getByRole('button', { name: 'Next content', exact: true }).isDisabled(), true);
+    await reader.getByRole('button', { name: 'Close', exact: true }).click();
+    await open.waitFor();
+    assert.equal(await page.locator('.archive-content-reader .session-replay-entry.message').count(), 0);
+    await open.click();
+    await reader.getByText(/^Archived step 1:/).first().waitFor();
     await page.getByRole('button', { name: 'Change full scope', exact: true }).click();
     await open.waitFor();
     assert.equal(await page.locator('.archive-content-reader .session-replay-entry.message').count(), 0);
