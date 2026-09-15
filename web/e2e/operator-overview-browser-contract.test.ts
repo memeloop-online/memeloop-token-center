@@ -9,6 +9,7 @@ import { chromium } from 'playwright';
 import { createServer } from 'vite';
 import { fixtureAssets } from './support/fixture-assets.js';
 import { metricArea } from '../src/operator/analyticsPresentation.js';
+import { dataThemes } from '../src/design-system/dataTheme.js';
 
 declare global {
   interface Window {
@@ -150,6 +151,24 @@ test('Overview keeps current sections visible through independent endpoint failu
         await page.screenshot({ path: screenshotPath, fullPage: true });
         assert.ok((await stat(screenshotPath)).size > 0, `${theme} ${width}px screenshot must be saved for the CI artifact`);
       }
+      await firstChart.getByRole('tab', { name: 'Chart', exact: true }).click();
+      await page.setViewportSize({ width: 1440, height: 1000 });
+      for (const color of [dataThemes[theme].primary, dataThemes[theme].negative]) {
+        await page.waitForFunction(hex => {
+          const expected = [1, 3, 5].map(offset => parseInt(hex.slice(offset, offset + 2), 16));
+          return [...document.querySelectorAll<HTMLCanvasElement>('.overview-trend-card:first-child canvas')].some(canvas => {
+            if (!canvas.width || !canvas.height) return false;
+            const pixels = canvas.getContext('2d')?.getImageData(0, 0, canvas.width, canvas.height).data;
+            if (!pixels) return false;
+            for (let index = 0; index < pixels.length; index += 4) {
+              if (pixels[index] === expected[0] && pixels[index + 1] === expected[1] && pixels[index + 2] === expected[2] && pixels[index + 3] > 200) return true;
+            }
+            return false;
+          });
+        }, color, { timeout: 10_000 });
+      }
+      await page.screenshot({ path: join(artifactRoot, `overview-canvas-${theme}.png`), fullPage: true });
+      await firstChart.getByRole('tab', { name: 'Data', exact: true }).click();
     }
   } finally {
     await browser.close();
