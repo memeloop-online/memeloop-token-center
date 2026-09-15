@@ -11,6 +11,7 @@ import type { LogicalSessionDetail, RequestDetail, RequestView } from './types.j
 import './sessionReplay.css';
 
 const REPLAY_ARCHIVE_CONCURRENCY = 4;
+const REPLAY_ARCHIVE_PAGE_SIZE = 12;
 const REPLAY_EXPAND_TEXT_LENGTH = 1_600;
 
 export type SessionReplayArchiveLoader = (request: RequestView, signal: AbortSignal) => Promise<RequestDetail>;
@@ -129,7 +130,9 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
   loadArchiveDetail?: SessionReplayArchiveLoader;
 }) {
   const { t } = useI18n();
-  const orderedRequests = [...detail.requests].sort(requestOrder).slice(0, SESSION_REPLAY_MAX_REQUESTS);
+  const [archiveWindow, setArchiveWindow] = useState({ scopeKey, sessionId: detail.session_id, limit: REPLAY_ARCHIVE_PAGE_SIZE });
+  const archiveLimit = archiveWindow.scopeKey === scopeKey && archiveWindow.sessionId === detail.session_id ? archiveWindow.limit : REPLAY_ARCHIVE_PAGE_SIZE;
+  const orderedRequests = [...detail.requests].sort(requestOrder).slice(-Math.min(archiveLimit, SESSION_REPLAY_MAX_REQUESTS));
   const visibleRevisions = new Map(orderedRequests.map(request => [request.request_id, archiveRevision(request)]));
   const [archivePage, setArchivePage] = useState<{ sessionId: string; scopeKey: string; loader?: SessionReplayArchiveLoader; values: RequestDetail[]; revisions: Map<string, string> }>({ sessionId: '', scopeKey: '', values: [], revisions: new Map() });
   // Scope and per-request freshness are checked during render, before effect cleanup.
@@ -292,7 +295,9 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
         {archiveLoading && <span>{t('sessionReplay.loadingProgress', { loaded: archiveDetails.length, total: sourceRequests.length })}</span>}
         {!archiveLoading && unreadCount > 0 && <button type="button" className="secondary" onClick={retryUnread}>{t('sessionReplay.retryArchives')}</button>}
         {incompleteCount > 0 && <span>{t('sessionReplay.incomplete', { count: incompleteCount })}</span>}
-        {(projection.truncated || detail.requests.length > sourceRequests.length) && <span>{t('sessionReplay.truncated')}</span>}
+        {projection.truncated && <span>{t('sessionReplay.truncated')}</span>}
+        {detail.requests.length > sourceRequests.length && archiveLimit < SESSION_REPLAY_MAX_REQUESTS && <button type="button" className="secondary" onClick={() => setArchiveWindow({ scopeKey, sessionId: detail.session_id, limit: Math.min(archiveLimit + REPLAY_ARCHIVE_PAGE_SIZE, SESSION_REPLAY_MAX_REQUESTS) })}>{t('sessionReplay.loadEarlierArchives')}</button>}
+        {detail.requests.length > SESSION_REPLAY_MAX_REQUESTS && archiveLimit >= SESSION_REPLAY_MAX_REQUESTS && <span>{t('sessionReplay.truncated')}</span>}
       </div>
     </header>
     <div className="session-replay-layout">
