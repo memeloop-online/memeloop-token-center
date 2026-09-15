@@ -530,7 +530,6 @@ mod tests {
                     output_tokens: 1,
                     ..TokenUsage::default()
                 },
-                charge_contract_ceiling: false,
                 error_code: None,
                 response_object: "gap://worker-metered-projection/response",
                 conversation: None,

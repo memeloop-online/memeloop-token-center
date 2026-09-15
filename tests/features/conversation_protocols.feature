@@ -25,12 +25,12 @@ Feature: Logical conversations across supported coding clients and protocols
     Then the response status is 200
     And the failed Responses id does not form a continuation edge
 
-  Scenario: Delivered streaming output with invalid usage is charged to its admitted ceiling
+  Scenario: Delivered streaming output with invalid usage keeps supplier usage unknown
     Given a token center backed by SQLite and memory object storage
     And the mock streaming Responses upstream exceeds the admitted usage
     When the service creates a key for principal "responses-invalid-usage" allowing model "gpt-test"
     And the Responses client consumes the invalid usage stream for model "gpt-test"
-    Then the delivered invalid stream is a fully billed failure without response lineage
+    Then the delivered invalid stream is an unobserved failure without response lineage
 
   Scenario: Consecutive compactions and a later branch retain their ancestry
     Given a token center backed by SQLite and memory object storage

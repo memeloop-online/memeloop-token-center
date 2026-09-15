@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCredentialLabel, requestIsPending } from '../src/requestTablePresentation.js';
+import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestIsPending } from '../src/requestTablePresentation.js';
 import { requestViewFromEvent } from '../src/operator/traffic/requestTraffic.js';
 import type { RequestEvent } from '../src/types.js';
 import type { RequestView } from '../src/types.js';
@@ -54,6 +54,14 @@ test('average output TPS uses recorded total seconds, distinguishes valid zero f
   for (const duration_ms of [null, 0, -1, Number.NaN, Number.POSITIVE_INFINITY]) assert.equal(averageRequestOutputTps({ ...request, duration_ms }), null);
   assert.equal(averageRequestOutputTps({ ...request, status_code: null }), null);
   assert.equal(averageRequestOutputTps({ ...request, output_tokens: -1 }), null);
+});
+
+test('unobserved local zero is presented as unknown supplier cost', () => {
+  const unknown = requestCostCopy({ ...request, usage_basis: 'not_observed', cost: '0' }, 'en');
+  assert.equal(unknown.unknown, true);
+  assert.equal(unknown.label, 'Cost unknown');
+  assert.match(unknown.hint, /does not prove/);
+  assert.equal(requestCostCopy(request, 'en').unknown, false);
 });
 
 test('credential identity remains meaningful without inventing an alias for explicitly unbound history', () => {

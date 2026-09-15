@@ -40,7 +40,12 @@ async fn non_opt_in_chat_routes_transparently_forward_n() {
         .await
         .unwrap();
     assert_eq!(rows[0].status_code, Some(200));
-    assert_eq!(rows[0].output_tokens, 32);
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
+    assert_eq!(
+        rows[0].usage_basis,
+        Some(crate::model::RequestUsageBasis::NotObserved)
+    );
+    assert_eq!(rows[0].cost, "0");
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
 }
 

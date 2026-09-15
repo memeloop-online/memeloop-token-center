@@ -59,7 +59,7 @@ async fn provider_incomplete_settles_reported_usage_through_the_codex_pipeline()
 }
 
 #[tokio::test]
-async fn incomplete_error_invalid_usage_and_out_of_budget_usage_remain_conservative() {
+async fn incomplete_error_invalid_usage_and_out_of_budget_usage_remain_unobserved() {
     for defect in ["error", "inconsistent", "over_budget"] {
         let fixture = codex_route_fixture(&format!("incomplete-untrusted-{defect}")).await;
         let upstream = MockServer::start().await;
@@ -111,10 +111,15 @@ async fn incomplete_error_invalid_usage_and_out_of_budget_usage_remain_conservat
             .unwrap();
         assert_eq!(
             rows[0].usage_basis,
-            Some(crate::model::RequestUsageBasis::ContractCeiling),
+            Some(crate::model::RequestUsageBasis::NotObserved),
             "{defect}"
         );
-        assert_eq!(rows[0].output_tokens, 64, "{defect}");
+        assert_eq!(
+            (rows[0].input_tokens, rows[0].output_tokens),
+            (0, 0),
+            "{defect}"
+        );
+        assert_eq!(rows[0].cost, "0", "{defect}");
         assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
         upstream.verify().await;
     }

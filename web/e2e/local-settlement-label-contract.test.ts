@@ -16,3 +16,15 @@ test('summary monetary surfaces label local settlement without changing their am
   assert.match(notice,/历史用量来源未记录/);
   assert.doesNotMatch(notice,/fetch\(|api\(|reduce\(/);
 });
+
+test('standalone aggregate cost surfaces keep the local-settlement caveat visible', () => {
+  for (const path of ['operator/UsageAnalysis.tsx', 'operator/OverviewTrends.tsx']) {
+    const source=readFileSync(new URL(`../src/${path}`,import.meta.url),'utf8');
+    assert.match(source,/className="analytics-settlement-note"><LocalSettlementNotice\s*\/>/);
+    assert.match(source,/localSettlementTrendLabel\(locale\)/);
+    assert.match(source,/<th><LocalSettlementNotice\s*\/><\/th>/);
+  }
+  const selfUsage=readFileSync(new URL('../src/self/UsagePage.tsx',import.meta.url),'utf8');
+  assert.match(selfUsage,/localSettlementTrendLabel\(locale\)/);
+  assert.match(selfUsage,/<th><LocalSettlementNotice\s*\/><\/th>/);
+});

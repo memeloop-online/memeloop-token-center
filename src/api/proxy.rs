@@ -522,8 +522,6 @@ struct NonSseProxyResponseInput<'buffered, 'state, 'attempt> {
     content_type: Option<HeaderValue>,
     protocol: Protocol,
     capture_json_usage: bool,
-    input_token_ceiling: i64,
-    output_token_ceiling: i64,
     upstream_attempt: &'attempt mut UpstreamAttemptGuard,
 }
 
@@ -538,8 +536,6 @@ async fn finish_non_sse_proxy_response(
         content_type,
         protocol,
         capture_json_usage,
-        input_token_ceiling,
-        output_token_ceiling,
         upstream_attempt,
     } = input;
     let response_content_type = content_type
@@ -620,12 +616,8 @@ async fn finish_non_sse_proxy_response(
                 (usage, crate::model::RequestUsageBasis::ProviderReported)
             }
             ExtractedUsage::Missing => (
-                TokenUsage {
-                    input_tokens: input_token_ceiling,
-                    output_tokens: output_token_ceiling,
-                    ..TokenUsage::default()
-                },
-                crate::model::RequestUsageBasis::ContractCeiling,
+                TokenUsage::default(),
+                crate::model::RequestUsageBasis::NotObserved,
             ),
             ExtractedUsage::Invalid => {
                 let result = finish_proxy_failure(buffered_request, "upstream_invalid_usage").await;
@@ -637,12 +629,8 @@ async fn finish_non_sse_proxy_response(
         }
     } else {
         (
-            TokenUsage {
-                input_tokens: input_token_ceiling,
-                output_tokens: output_token_ceiling,
-                ..TokenUsage::default()
-            },
-            crate::model::RequestUsageBasis::ContractCeiling,
+            TokenUsage::default(),
+            crate::model::RequestUsageBasis::NotObserved,
         )
     };
     let result = finish_buffered_request(
@@ -1564,8 +1552,6 @@ pub(in crate::api) async fn proxy_with_identity(
     }
     let capture_json_usage = should_capture_buffered_usage(is_sse, content_type.as_ref());
     if !is_sse {
-        let selected_input_token_ceiling = buffered_request.input_token_ceiling;
-        let selected_output_token_ceiling = buffered_request.output_token_ceiling;
         return finish_non_sse_proxy_response(NonSseProxyResponseInput {
             buffered_request: &buffered_request,
             selected_driver: active_route.route.driver.as_str(),
@@ -1574,8 +1560,6 @@ pub(in crate::api) async fn proxy_with_identity(
             content_type,
             protocol,
             capture_json_usage,
-            input_token_ceiling: selected_input_token_ceiling,
-            output_token_ceiling: selected_output_token_ceiling,
             upstream_attempt: &mut upstream_attempt,
         })
         .await;
@@ -2193,7 +2177,6 @@ async fn finish_buffered_request_with_upstream_attribution(
         duration_ms: request.started.elapsed().as_millis() as i64,
         usage,
         usage_basis: Some(usage_basis),
-        charge_contract_ceiling: false,
         error_code: error_code.as_deref(),
         response_object: &stored_response,
         conversation,

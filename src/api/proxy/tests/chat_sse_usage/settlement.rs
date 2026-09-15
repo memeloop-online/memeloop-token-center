@@ -212,7 +212,7 @@ async fn strict_chat_success_with_a_non_sse_body_fails_closed_before_delivery() 
 }
 
 #[tokio::test]
-async fn strict_chat_logprobs_and_named_failure_start_delivery_and_charge_once() {
+async fn strict_chat_logprobs_and_named_failure_keep_usage_unobserved() {
     let upstream = MockServer::start().await;
     let sse = [
         chat_chunk(
@@ -267,8 +267,12 @@ async fn strict_chat_logprobs_and_named_failure_start_delivery_and_charge_once()
         rows[0].error_code.as_deref(),
         Some("upstream_failed_response")
     );
-    assert_eq!(rows[0].output_tokens, 16);
-    assert_ne!(rows[0].cost, "0");
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
+    assert_eq!(
+        rows[0].usage_basis,
+        Some(crate::model::RequestUsageBasis::NotObserved)
+    );
+    assert_eq!(rows[0].cost, "0");
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
 }
 
@@ -353,7 +357,7 @@ async fn strict_chat_empty_logprobs_preamble_fails_without_contract_charge() {
 }
 
 #[tokio::test]
-async fn strict_chat_usage_failures_charge_the_delivered_contract_once() {
+async fn strict_chat_usage_failures_do_not_promote_reservations_to_actual_cost() {
     let mut cases = vec![
         (
             "missing-usage",
@@ -443,8 +447,16 @@ async fn strict_chat_usage_failures_charge_the_delivered_contract_once() {
         assert_eq!(rows.len(), 1, "{label}");
         assert_eq!(rows[0].status_code, Some(502), "{label}");
         assert!(rows[0].error_code.is_some(), "{label}");
-        assert_eq!(rows[0].output_tokens, 16, "{label}");
-        assert!(rows[0].input_tokens > 0, "{label}");
+        assert_eq!(
+            (rows[0].input_tokens, rows[0].output_tokens),
+            (0, 0),
+            "{label}"
+        );
+        assert_eq!(
+            rows[0].usage_basis,
+            Some(crate::model::RequestUsageBasis::NotObserved),
+            "{label}"
+        );
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
         let actual_micros: i64 = sqlx::query_scalar(
             "SELECT r.actual_micros FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id WHERE q.id = $1",
@@ -454,12 +466,7 @@ async fn strict_chat_usage_failures_charge_the_delivered_contract_once() {
         .await
         .unwrap();
         pool.close().await;
-        assert_eq!(
-            actual_micros,
-            rows[0].input_tokens + rows[0].output_tokens,
-            "{label} must settle the priced contract ceiling exactly once",
-        );
-        assert!(actual_micros > 0, "{label}");
+        assert_eq!(actual_micros, 0, "{label} has no observed actual usage");
         assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
     }
 }
