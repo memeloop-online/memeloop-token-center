@@ -37,7 +37,7 @@ test('wrapped response scalar, empty supported arrays, and bare text retain thei
 
 test('unsupported, truncated, and malformed envelopes do not become a successful empty archive', () => {
   for (const archive of ['{"error":{"message":"unavailable"}}', '{"input":"wrong side"}', '{"output":[', '{"output":[]}garbage', '{"output":[] "other":1}', '{"output":[],}', '{"output":[],"ignored":"bad\\q"}']) {
-    assert.throws(() => read(archive, 'response', 1), undefined, archive);
+    assert.throws(() => read(archive, 'response', 1), archive);
   }
 });
 

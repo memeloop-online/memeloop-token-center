@@ -72,7 +72,7 @@ class JsonStructure {
 /**
  * Incremental archive framing. Keeps one unfinished JSON item/SSE event and
  * the unread part of the current byte page, not the entire response archive.
- * Byte decoding belongs to the range reader so UTF-8 can cross network pages.
+ * The caller retains a streaming decoder so UTF-8 can cross network pages.
  */
 export class ArchiveItemStream {
   private buffer = '';
@@ -87,6 +87,7 @@ export class ArchiveItemStream {
   private seenOutput = new Set<number>();
   private waitingOutput = new Map<number, unknown>();
   private nextOutput = 0;
+  private sseSearchFrom = 0;
   private pendingSse: ArchiveStreamItem[] = [];
   private ended = false;
   private recognized = false;
@@ -127,10 +128,12 @@ export class ArchiveItemStream {
     const items: ArchiveStreamItem[] = [];
     while (items.length < count) {
       if (this.pendingSse.length) { items.push(this.pendingSse.shift()!); continue; }
-      const boundary = /\r?\n\r?\n/.exec(this.buffer);
-      if (!boundary) break;
-      const block = this.buffer.slice(0, boundary.index);
-      this.buffer = this.buffer.slice(boundary.index + boundary[0].length);
+      const boundary = /\r?\n\r?\n/.exec(this.buffer.slice(this.sseSearchFrom));
+      if (!boundary) { this.sseSearchFrom = Math.max(0, this.buffer.length - 3); break; }
+      const boundaryIndex = this.sseSearchFrom + boundary.index;
+      const block = this.buffer.slice(0, boundaryIndex);
+      this.buffer = this.buffer.slice(boundaryIndex + boundary[0].length);
+      this.sseSearchFrom = 0;
       const data = block.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).replace(/^ /, '')).join('\n');
       if (!data || data === '[DONE]') continue;
       const event = JSON.parse(data) as { type?: string; output_index?: number; item?: unknown; response?: { output?: unknown[] } };
