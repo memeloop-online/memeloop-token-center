@@ -137,7 +137,7 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
   const archiveLimit = sameWindow ? archiveWindow.limit : REPLAY_ARCHIVE_PAGE_SIZE;
   const archiveOffset = sameWindow ? archiveWindow.offset : 0;
   const orderedRequests = [...detail.requests].sort(requestOrder).slice(-archiveOffset - archiveLimit, archiveOffset ? -archiveOffset : undefined);
-  const pendingEarlier = useRef<{ sessionId: string; scopeKey: string; count: number; offset: number }>();
+  const pendingEarlier = useRef<{ sessionId: string; scopeKey: string; count: number; offset: number } | undefined>(undefined);
   useEffect(() => {
     const pending = pendingEarlier.current;
     if (!pending) return;
