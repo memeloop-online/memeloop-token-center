@@ -48,6 +48,15 @@ function archiveRevision(request: RequestView) {
   return JSON.stringify([request.request_id, request.created_at, request.archive_state, request.status_code, request.completed_at, request.session_context?.association, request.session_context?.session_id]);
 }
 
+function canTryFullArchive(snapshot: RequestDetail | undefined, side: 'request' | 'response') {
+  const archive = snapshot?.archive?.[side];
+  // The snapshot currently maps an object-store size-limit rejection to
+  // object_unavailable too. A bound object can be tried explicitly; the range
+  // endpoint, not this hint, decides whether its bytes are actually available.
+  return archive?.reason === 'archive_payload_invalid'
+    || (archive?.state === 'bound' && archive.reason === 'archive_object_unavailable');
+}
+
 function unknownLabel(t: Translate, reason: ReplayUnknownReason | null, requestAndResponse = false) {
   switch (reason) {
     case 'archive_unavailable': return requestAndResponse ? t('sessionReplay.archiveUnavailableBoth') : t('sessionReplay.archiveUnavailable');
@@ -159,7 +168,7 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
   // Scope and per-request freshness are checked during render, before effect cleanup.
   const archiveDetails = archivePage.sessionId === detail.session_id && archivePage.scopeKey === scopeKey && archivePage.loader === loadArchiveDetail
     ? archivePage.values.filter(request => visibleRevisions.has(request.request_id) && archivePage.revisions.get(request.request_id) === visibleRevisions.get(request.request_id)) : [];
-  const incompleteSnapshot = archiveDetails.some(request => request.archive?.request?.reason === 'archive_payload_invalid' || request.archive?.response?.reason === 'archive_payload_invalid');
+  const incompleteSnapshot = archiveDetails.length < orderedRequests.length || archiveDetails.some(request => !request.archive_complete || request.request_body == null || request.response_body == null);
   const readScope = useRef<ReplayReadScope | undefined>(undefined);
   const [mismatchedIds, setMismatchedIds] = useState<Set<string>>(new Set());
   const [archiveLoading, setArchiveLoading] = useState(Boolean(loadArchiveDetail));
@@ -357,13 +366,13 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
             else entryRefs.current.delete(entry.identity);
           }}
         ><EntryContent entry={entry} t={t} summaryOnly={Boolean(loadArchiveRange) && entry.item.kind === 'unknown' && archiveDetails.some(request => request.request_id === entry.item.requestId
-          && (entry.archiveBodies === 2 ? request.archive?.request?.reason === 'archive_payload_invalid' && request.archive?.response?.reason === 'archive_payload_invalid' : request.archive?.[entry.item.body]?.reason === 'archive_payload_invalid'))} />
+          && (entry.archiveBodies === 2 ? canTryFullArchive(request, 'request') && canTryFullArchive(request, 'response') : canTryFullArchive(request, entry.item.body)))} />
           {entry.item.kind === 'unknown' && loadArchiveRange && (() => {
             const request = sourceRequests.find(value => value.request_id === entry.item.requestId);
             const snapshot = archiveDetails.find(value => value.request_id === entry.item.requestId);
             if (!request || request.session_context?.session_id !== detail.session_id) return null;
             const sides: Array<'request' | 'response'> = entry.archiveBodies === 2 ? ['request', 'response'] : [entry.item.body];
-            return sides.filter(side => snapshot?.archive?.[side]?.reason === 'archive_payload_invalid').map(side => <ArchiveContentReader
+            return sides.filter(side => canTryFullArchive(snapshot, side)).map(side => <ArchiveContentReader
               key={`${request.request_id}:${side}`} request={request} sessionId={detail.session_id} side={side} loadRange={loadArchiveRange}
               renderItem={(item, index) => <EntryContent entry={{ item, index, identity: `${request.request_id}:${side}:${index}` }} t={t} />}
             />);

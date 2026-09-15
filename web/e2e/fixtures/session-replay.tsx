@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react';
 
 import { I18nProvider } from '../../src/i18n';
 import { SessionReplayPanel } from '../../src/sessionReplayViews';
-import { ArchiveChangedError, type ArchiveRangeLoader } from '../../src/archiveRange';
+import { ArchiveChangedError, ArchiveUnavailableError, type ArchiveRangeLoader } from '../../src/archiveRange';
 import { MtcFluentProvider } from '../../src/design-system';
 import type { ConversationRequest, LogicalSessionDetail, RequestDetail } from '../../src/types';
 import '../../src/styles.css';
@@ -70,6 +70,9 @@ const archives = new Map<string, RequestDetail>([
 
 const liveFixture = new URLSearchParams(location.search).has('live');
 const fullFixture = new URLSearchParams(location.search).has('full');
+const fullInvalid = new URLSearchParams(location.search).has('invalid');
+const fullGap = new URLSearchParams(location.search).has('gap');
+const fullMissing = new URLSearchParams(location.search).has('missing');
 const fullBytes = fullFixture ? new TextEncoder().encode(JSON.stringify({ output: Array.from({ length: 75 }, (_, index) => ({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: `Archived step ${index + 1}: ${'保留完整工作内容。'.repeat(2500)}` }] })) })) : new Uint8Array();
 let fullVersion = '"fixture-v1"';
 declare global { interface Window { archiveRangeReads: number } }
@@ -81,6 +84,7 @@ const loadFullArchive: ArchiveRangeLoader = async (_id, _side, offset, length, e
     signal.addEventListener('abort', () => { window.clearTimeout(timer); reject(signal.reason); }, { once: true });
   });
   if (etag && etag !== fullVersion) throw new ArchiveChangedError();
+  if (fullMissing) throw new ArchiveUnavailableError('archive_object_unavailable');
   return { bytes: fullBytes.slice(offset, offset + length), offset, totalBytes: fullBytes.length, etag: fullVersion };
 };
 declare global { interface Window { sessionReplayReads: Record<string, number>; sessionReplayAborts: number } }
@@ -103,7 +107,7 @@ function releaseAll(waiters: Set<() => void>) { for (const release of [...waiter
 async function loadArchive(requestView: ConversationRequest, signal: AbortSignal) {
   if (fullFixture) return { ...archive(requestView, { input: [] }, null), archive: {
     request: { state: 'bound' as const, complete: true, reason: null },
-    response: { state: 'bound' as const, complete: false, reason: 'archive_payload_invalid' },
+    response: { state: fullGap ? 'gap' as const : 'bound' as const, complete: false, reason: fullInvalid ? 'archive_payload_invalid' : 'archive_object_unavailable' },
   } };
   window.sessionReplayReads[requestView.request_id] = (window.sessionReplayReads[requestView.request_id] ?? 0) + 1;
   if (liveFixture && scopePaused) await waitForRelease(scopeWaiters, signal);

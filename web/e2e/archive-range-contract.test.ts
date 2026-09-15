@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { ArchiveChangedError, readArchiveRange } from '../src/archiveRange.js';
+import { ArchiveChangedError, ArchiveUnavailableError, readArchiveRange } from '../src/archiveRange.js';
 
 test('authorized archive byte pages require precise ranges and carry the first strong ETag', async (context) => {
   let request: RequestInit | undefined;
@@ -38,4 +38,10 @@ test('malformed range headers, weak ETags, and short or excess bodies are reject
     response = new Response(body, { status: 206, headers: { ETag: etag, 'Content-Range': range } });
     await assert.rejects(() => readArchiveRange('/fixture', 'fixture-only', 0, 2, undefined, new AbortController().signal));
   }
+});
+
+test('unreadable bound objects preserve the product API reason without exposing server messages', async (context) => {
+  context.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify({ error: { code: 'archive_content_unavailable', reason: 'archive_object_unavailable' } }), { status: 409 }));
+  await assert.rejects(() => readArchiveRange('/fixture', 'fixture-only', 0, 2, undefined, new AbortController().signal),
+    error => error instanceof ArchiveUnavailableError && error.reason === 'archive_object_unavailable');
 });

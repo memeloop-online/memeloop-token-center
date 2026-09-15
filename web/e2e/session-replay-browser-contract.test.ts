@@ -94,6 +94,21 @@ test('large archive content is explicit, paged to its real end, and cleared on v
     await page.getByRole('button', { name: 'Change full scope', exact: true }).click();
     await open.waitFor();
     assert.equal(await page.locator('.archive-content-reader .session-replay-entry.message').count(), 0);
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-replay.html?full=1&invalid=1`);
+    await open.waitFor();
+    assert.equal(await page.evaluate(() => window.archiveRangeReads), 0, 'invalid snapshots also require explicit reading');
+    await open.click();
+    await reader.getByText(/^Archived step 1:/).first().waitFor();
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-replay.html?full=1&gap=1`);
+    await page.getByText('Archive unavailable', { exact: true }).waitFor();
+    assert.equal(await open.count(), 0, 'a confirmed archive gap is not offered as a readable bound object');
+    assert.equal(await page.evaluate(() => window.archiveRangeReads), 0);
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-replay.html?full=1&missing=1`);
+    await open.waitFor();
+    assert.equal(await page.evaluate(() => window.archiveRangeReads), 0);
+    await open.click();
+    await reader.getByRole('alert').getByText('Archive unavailable', { exact: true }).waitFor();
+    assert.equal(await reader.locator('.session-replay-entry.message').count(), 0, 'a truly missing bound object remains an error, never an empty successful archive');
   } finally { await browser.close(); await server.close(); }
 });
 
