@@ -15,8 +15,12 @@ use memeloop_token_center::{
 };
 use serde_json::{Value, json};
 use sqlx::any::AnyPoolOptions;
+use std::sync::Arc;
+use tokio::sync::Barrier;
 use tower::ServiceExt;
 use uuid::Uuid;
+
+const CONCURRENT_ROUTE_CREATE_REQUESTS: usize = 16;
 
 struct RouteCreateFixture {
     state: AppState,
@@ -764,15 +768,45 @@ async fn exercise_route_create_idempotency(database_url: String, tenant: String)
 
     let concurrent_body = create_body(&fixture, "route-create-concurrent");
     let concurrent_key = "route-create-idempotency:concurrent";
-    let responses = join_all((0..16).map(|_| {
-        request_json(
-            fixture.state.clone(),
-            &fixture.write_token,
-            concurrent_body.clone(),
-            Some(concurrent_key),
-        )
+    // Make the write race explicit. A pool-capacity or SQLite-lock failure must
+    // be reported below, never be mistaken for an idempotency disposition.
+    let start = Arc::new(Barrier::new(CONCURRENT_ROUTE_CREATE_REQUESTS));
+    let responses = join_all((0..CONCURRENT_ROUTE_CREATE_REQUESTS).map(|_| {
+        let start = Arc::clone(&start);
+        let state = fixture.state.clone();
+        let body = concurrent_body.clone();
+        let token = fixture.write_token.as_str();
+        async move {
+            start.wait().await;
+            request_json(state, token, body, Some(concurrent_key)).await
+        }
     }))
     .await;
+    let response_summaries = responses
+        .iter()
+        .enumerate()
+        .map(|(index, (status, headers, body))| {
+            let response_disposition = headers
+                .get("x-mtc-route-create-disposition")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("<missing-or-non-ascii>");
+            format!("{index}: status={status}, disposition={response_disposition}, body={body}")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        responses.iter().all(|(status, headers, _)| {
+            matches!(
+                (
+                    *status,
+                    headers
+                        .get("x-mtc-route-create-disposition")
+                        .and_then(|value| value.to_str().ok())
+                ),
+                (StatusCode::CREATED, Some("created")) | (StatusCode::OK, Some("reused"))
+            )
+        }),
+        "every concurrent request must create or replay; responses: {response_summaries:#?}"
+    );
     let created = responses
         .iter()
         .filter(|(status, headers, _)| {
@@ -786,7 +820,11 @@ async fn exercise_route_create_idempotency(database_url: String, tenant: String)
         })
         .count();
     assert_eq!(created, 1, "exactly one concurrent request owns creation");
-    assert_eq!(reused, 15, "all remaining concurrent requests must replay");
+    assert_eq!(
+        reused,
+        CONCURRENT_ROUTE_CREATE_REQUESTS - 1,
+        "all remaining concurrent requests must replay"
+    );
     let route_ids = responses
         .iter()
         .map(|(_, _, body)| body["id"].as_str().expect("route ID"))
