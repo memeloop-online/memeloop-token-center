@@ -210,6 +210,18 @@ async fn refresh_batch(state: &AppState) -> Result<(), AppError> {
     Ok(())
 }
 
+pub(crate) async fn routing_observations(
+    state: &AppState,
+    tenant_id: Uuid,
+    candidates: &[AuthorizedUpstreamCandidate],
+    now_ms: i64,
+) -> Result<BTreeMap<(Uuid, i64), RoutingQuotaObservation>, AppError> {
+    state
+        .db
+        .routing_quota_observations(tenant_id, candidates, now_ms)
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,16 +283,4 @@ mod tests {
             .await
             .unwrap();
     }
-}
-
-pub(crate) async fn routing_observations(
-    state: &AppState,
-    tenant_id: Uuid,
-    candidates: &[AuthorizedUpstreamCandidate],
-    now_ms: i64,
-) -> Result<BTreeMap<(Uuid, i64), RoutingQuotaObservation>, AppError> {
-    state
-        .db
-        .routing_quota_observations(tenant_id, candidates, now_ms)
-        .await
 }
