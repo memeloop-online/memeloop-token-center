@@ -21,7 +21,7 @@ export interface ReplayMessage {
   kind: 'message';
   requestId: string;
   body: ReplayBody;
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'agent';
   /** Null means the archive named the role but did not retain readable text. */
   text: string | null;
   unknown: Extract<ReplayUnknownReason, 'redacted' | 'missing_text'> | null;
@@ -136,10 +136,13 @@ function push(items: SessionReplayItem[], item: SessionReplayItem, limit: { trun
 }
 
 function unknown(items: SessionReplayItem[], requestId: string, body: ReplayBody, reason: ReplayUnknownReason, limit: { truncated: boolean }) {
+  // A body may contain hundreds of opaque reasoning/compaction records. One
+  // honest gap per reason is enough; repeated warnings must not crowd out text.
+  if (items.some(item => item.kind === 'unknown' && item.requestId === requestId && item.body === body && item.reason === reason)) return;
   push(items, { kind: 'unknown', requestId, body, reason }, limit);
 }
 
-function message(items: SessionReplayItem[], requestId: string, body: ReplayBody, role: 'user' | 'assistant', content: unknown, limit: { truncated: boolean }) {
+function message(items: SessionReplayItem[], requestId: string, body: ReplayBody, role: ReplayMessage['role'], content: unknown, limit: { truncated: boolean }) {
   const extracted = textFromContent(content);
   if (extracted.truncated) limit.truncated = true;
   push(items, {
@@ -201,6 +204,8 @@ function chatMessage(items: SessionReplayItem[], requestId: string, body: Replay
     return;
   }
   const role = string(record.role);
+  // Instructions are valid protocol input, not conversation turns.
+  if (role === 'system' || role === 'developer') return;
   if (role === 'user' || role === 'assistant') message(items, requestId, body, role, record.content, limit);
   const calls = array(record.tool_calls);
   if (calls) {
@@ -221,6 +226,10 @@ function responsesItem(items: SessionReplayItem[], requestId: string, body: Repl
     return;
   }
   const type = string(record.type);
+  if (type === 'additional_tools' || record.role === 'system' || record.role === 'developer') return;
+  if (type === 'agent_message') { message(items, requestId, body, 'agent', record.content, limit); return; }
+  if (type === 'custom_tool_call') { toolCall(items, requestId, body, { ...record, arguments: record.input }, limit); return; }
+  if (type === 'custom_tool_call_output') { toolResult(items, requestId, body, record, limit); return; }
   if (type === 'function_call') { toolCall(items, requestId, body, record, limit); return; }
   if (type === 'function_call_output') { toolResult(items, requestId, body, record, limit); return; }
   if (type === 'message') {

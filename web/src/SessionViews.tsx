@@ -168,7 +168,7 @@ export function SessionList({ values, loading, showCredential, onSelect, selecte
   if (!values.length) return <div className="empty">{loading ? t('common.loading') : t('sessions.empty')}</div>;
   if (layout === 'sidebar') return <div className="session-list session-list-sidebar" aria-label={t('sessions.recent')}>
     {values.map((session) => {
-      const title = session.unlinked ? t('sessions.unlinkedRequests') : session.session_name || t('sessions.reportedNameMissing');
+      const title = session.unlinked ? t('sessions.unlinkedRequests') : session.session_name || t('sessions.displayNameFallback', { id: session.session_id.slice(-8) });
       const isSelected = selected?.session_id === session.session_id && selected?.key_id === session.key_id;
       return <article className="session-card session-sidebar-card" key={`${session.key_id}:${session.session_id}`}>
         <button type="button" className={`session-sidebar-item${isSelected ? ' selected' : ''}`} onClick={() => onSelect(session)} aria-pressed={isSelected} aria-label={t('sessions.open', { name: title })}>
@@ -182,7 +182,7 @@ export function SessionList({ values, loading, showCredential, onSelect, selecte
   return <div className="session-list">{values.map((session) => {
     const title = session.unlinked
       ? t('sessions.unlinkedRequests')
-      : session.session_name || t('sessions.reportedNameMissing');
+      : session.session_name || t('sessions.displayNameFallback', { id: session.session_id.slice(-8) });
     return <article className="session-card" key={`${session.key_id}:${session.session_id}`}>
       <div className="session-card-heading"><b>{title}</b><span>{session.task_kind && <span className="pill">{session.task_kind}</span>}<span className={`status ${statusTone(session.last_status)}`}>{t(`sessions.status.${session.last_status}`)}</span></span></div>
       {session.unlinked && <span className="session-unlinked-label">{t('sessions.unlinkedReason')}</span>}
@@ -292,7 +292,7 @@ export function SessionDetailSurface({ detail, summary, currency, showDiagnostic
   const reportedSessionId = [...detail.requests].reverse().find((request) => request.structure?.session_id)?.structure?.session_id;
   const title = detail.unlinked
     ? t('sessions.unlinkedRequests')
-    : declaredSessionName || summary?.session_name || t('sessions.reportedNameMissing');
+    : declaredSessionName || summary?.session_name || t('sessions.displayNameFallback', { id: detail.session_id.slice(-8) });
   const confirmedEdges = detail.edges.filter((edge) => edge.relation !== 'candidate');
   const candidateEdges = detail.edges.filter((edge) => edge.relation === 'candidate');
   const requestPositions = new Map(detail.requests.map((request, index) => [request.request_id, { index: index + 1, createdAt: request.created_at }]));
@@ -332,7 +332,7 @@ export function SessionDrawer({ detail, summary, currency, showDiagnosticIds = f
   const declaredSessionName = [...detail.requests].reverse().find((request) => request.execution?.session_name)?.execution?.session_name;
   const title = detail.unlinked
     ? t('sessions.unlinkedRequests')
-    : declaredSessionName || summary?.session_name || t('sessions.reportedNameMissing');
+    : declaredSessionName || summary?.session_name || t('sessions.displayNameFallback', { id: detail.session_id.slice(-8) });
   return <DrawerFrame title={title} eyebrow={t('sessions.logicalSession')} onClose={onClose}>
     <SessionDetailSurface detail={detail} summary={summary} currency={currency} showDiagnosticIds={showDiagnosticIds} loading={loading} onLoadOlder={onLoadOlder} onSelect={onSelect} />
   </DrawerFrame>;

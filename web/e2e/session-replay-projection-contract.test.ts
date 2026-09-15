@@ -107,3 +107,21 @@ test('bounds retained text and projection item count with explicit truncation', 
   assert.equal(replay.truncated, true);
   assert.ok(replay.items.length <= SESSION_REPLAY_MAX_ITEMS);
 });
+
+test('projects archived Codex custom tools and agent messages without opaque-item floods', () => {
+  const archive = detail('codex', 1, { input: [
+    { type: 'additional_tools', role: 'developer', tools: [] },
+    { type: 'message', role: 'developer', content: 'instructions' },
+    ...Array.from({ length: 250 }, () => ({ type: 'reasoning', encrypted_content: 'opaque' })),
+    { type: 'agent_message', author: 'worker', content: [{ type: 'input_text', text: 'Found the cause' }] },
+    { type: 'custom_tool_call', call_id: 'patch-1', name: 'apply_patch', input: 'patch text' },
+    { type: 'custom_tool_call_output', call_id: 'patch-1', output: 'applied' },
+  ] }, { output: [{ type: 'message', role: 'assistant', content: 'Done' }] });
+  const replay = projectSessionReplay('session-a', [archive]);
+  assert.equal(replay.items.filter(item => item.kind === 'unknown').length, 1);
+  assert.ok(replay.items.some(item => item.kind === 'message' && item.role === 'agent' && item.text === 'Found the cause'));
+  assert.ok(replay.items.some(item => item.kind === 'tool_call' && item.arguments === 'patch text' && item.pairing === 'paired'));
+  assert.ok(replay.items.some(item => item.kind === 'tool_result' && item.output === 'applied'));
+  assert.ok(replay.items.some(item => item.kind === 'message' && item.role === 'assistant' && item.text === 'Done'));
+  assert.equal(replay.truncated, false);
+});

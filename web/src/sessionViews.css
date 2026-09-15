@@ -1,5 +1,9 @@
 /* Session browsing is intentionally separate from the shared shell.  It can be
  * embedded by either the operator console or a credential's self-service view. */
+.session-refresh-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin: 12px 0; }
+.session-refresh-controls label { display: inline-flex; align-items: center; gap: 6px; }
+.session-refresh-controls input { width: auto; margin: 0; accent-color: var(--colorBrandBackground); }
+.session-refresh-controls .session-live-state { margin: 0; flex: 1; }
 .panel.sessions-page { border: 0; box-shadow: none; padding: 0; background: transparent; }
 .sessions-page .session-controls > label { display: grid; gap: 4px; min-width: 0; }
 .sessions-page .session-controls .fui-Combobox { min-width: 0; width: 100%; }
@@ -242,3 +246,15 @@
   .session-event-open { width: 100%; margin-left: 0; }
   .session-analysis > .semantic-execution { padding: 12px; }
 }
+
+/* Follow the same Fluent surface and text tokens as the surrounding console. */
+.mtc-fluent-root .session-browser { background: var(--colorNeutralBackground1); }
+.mtc-fluent-root .session-sidebar-item { color: var(--colorNeutralForeground1); border-color: var(--colorNeutralStroke2); padding: 14px 12px; }
+.mtc-fluent-root .session-sidebar-item:hover { background: var(--colorNeutralBackground1Hover); }
+.mtc-fluent-root .session-sidebar-item.selected { background: var(--colorBrandBackground2); box-shadow: inset 3px 0 var(--colorBrandForeground1); }
+.mtc-fluent-root .session-sidebar-title b { font-size: var(--fontSizeBase300); }
+.mtc-fluent-root .session-sidebar-context,
+.mtc-fluent-root .session-sidebar-meta { color: var(--colorNeutralForeground2); font-size: var(--fontSizeBase200); }
+.mtc-fluent-root .session-sidebar-context span:last-child { color: var(--colorNeutralForeground2); }
+.mtc-fluent-root .session-relationships { background: transparent; border: 0; border-radius: 0; }
+.mtc-fluent-root .session-relationships > summary { color: var(--colorNeutralForeground1); padding: 12px 0; }
