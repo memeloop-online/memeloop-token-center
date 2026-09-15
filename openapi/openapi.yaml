@@ -6985,10 +6985,12 @@ components:
     StartProviderAuthorizationCodeRequest:
       type: object
       additionalProperties: false
-      required: [account_name, provider_driver, provider_config]
+      description: When upstream_account_id is provided, bind authorization to that existing tenant/provider/account and credential generation. Name must match; omit provider_config to reuse it, or provide the identical config. Proxy changes are rejected. Omit client to reuse the installed OAuth client; old credentials without saved login settings use the deployment default or an explicit matching client. Completion returns the same account with HTTP 200, preserving name/config/status/grants. New-account creation requires provider_config and completes with HTTP 201.
+      required: [account_name, provider_driver]
       properties:
         tenant_external_id: { type: string, default: default }
         account_name: { type: string, minLength: 1, maxLength: 200 }
+        upstream_account_id: { type: [string, 'null'], format: uuid }
         provider_driver: { type: string }
         provider_config: { type: object }
         proxy_url: { type: string, writeOnly: true }

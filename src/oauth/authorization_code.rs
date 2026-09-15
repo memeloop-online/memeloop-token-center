@@ -66,6 +66,8 @@ struct RefreshState {
     client_secret: Option<String>,
     refresh_url: String,
     network_scope: OutboundScope,
+    #[serde(default)]
+    login_client: Option<ClientConfig>,
 }
 
 fn refresh_state(input: &StartInput) -> Result<Value, AppError> {
@@ -74,9 +76,55 @@ fn refresh_state(input: &StartInput) -> Result<Value, AppError> {
         client_secret: input.client.client_secret.clone(),
         refresh_url: input.adapter.refresh_url.clone(),
         network_scope: network::scope_from_config(&input.provider_config),
+        login_client: Some(input.client.clone()),
     }});
     crate::provider::validate_adapter_state(&state)?;
     Ok(state)
+}
+
+/// Reuse the installed OAuth client, not a newly selected client for the same
+/// provider. Older credentials predate persisted callback/scopes; their explicit
+/// operator choice or deployment default must still match the installed client.
+pub(crate) fn reauthorization_client(
+    credential: &UpstreamCredential,
+    requested: Option<ClientConfig>,
+    provider_driver: &str,
+    refresh_url: &str,
+) -> Result<ClientConfig, AppError> {
+    let state: RefreshState = serde_json::from_value(
+        credential
+            .adapter_state()
+            .and_then(|value| value.get("authorization_code"))
+            .cloned()
+            .ok_or_else(|| {
+                AppError::Conflict("installed OAuth client metadata is unavailable".into())
+            })?,
+    )
+    .map_err(|_| AppError::Conflict("installed OAuth client metadata is invalid".into()))?;
+    let client = match (state.login_client, requested) {
+        (Some(installed), None) => installed,
+        (Some(installed), Some(requested)) => {
+            if serde_json::to_value(&installed).map_err(|_| AppError::Internal)?
+                != serde_json::to_value(&requested).map_err(|_| AppError::Internal)?
+            {
+                return Err(AppError::BadRequest(
+                    "reauthorization cannot change the installed OAuth client or scopes".into(),
+                ));
+            }
+            installed
+        }
+        (None, Some(requested)) => requested,
+        (None, None) => deployment_client_default(provider_driver)?,
+    };
+    if client.client_id != state.client_id
+        || client.client_secret != state.client_secret
+        || refresh_url != state.refresh_url
+    {
+        return Err(AppError::Conflict(
+            "reauthorization must use the installed OAuth client and refresh endpoint".into(),
+        ));
+    }
+    Ok(client)
 }
 
 fn validate_start_proxy(input: &StartInput) -> Result<(), AppError> {
@@ -101,6 +149,8 @@ fn validate_start_proxy(input: &StartInput) -> Result<(), AppError> {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StartInput {
+    #[serde(default)]
+    pub reauthorize: Option<super::OAuthReauthorizationTarget>,
     #[serde(default)]
     pub application_plugin_revision: Option<i64>,
     pub tenant_external_id: String,
@@ -144,6 +194,8 @@ struct LoginState {
 
 #[derive(Serialize, Deserialize)]
 pub struct ReadyLogin {
+    #[serde(default)]
+    pub reauthorize: Option<super::OAuthReauthorizationTarget>,
     #[serde(default)]
     pub application_plugin_revision: Option<i64>,
     pub session_id: Uuid,
@@ -446,6 +498,7 @@ pub async fn complete(
         }
     };
     let ready = ReadyLogin {
+        reauthorize: login.input.reauthorize,
         application_plugin_revision: session.application_plugin_revision,
         session_id: session.session_id,
         tenant_external_id: login.input.tenant_external_id,
@@ -736,6 +789,70 @@ fn callback_code(callback: &str, redirect: &str, state: &str) -> Result<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reauthorization_preserves_installed_client_and_encrypted_target() {
+        let mut original = input("https://tokens.example.com/token".into());
+        let target = super::super::OAuthReauthorizationTarget {
+            account_id: Uuid::now_v7(),
+            expected_updated_at: 123,
+            expected_credential_generation: 4,
+        };
+        original.reauthorize = Some(target.clone());
+        let issued = credential(
+            TokenResponse {
+                access_token: "fixture-access".into(),
+                refresh_token: Some("fixture-refresh".into()),
+                expires_in: 3600,
+                token_type: None,
+            },
+            &original,
+            1000,
+            None,
+        )
+        .unwrap();
+        let reused = reauthorization_client(
+            &issued,
+            None,
+            "fixture-provider",
+            &original.adapter.refresh_url,
+        )
+        .unwrap();
+        assert_eq!(reused.scopes, original.client.scopes);
+        assert_eq!(reused.redirect_uri, original.client.redirect_uri);
+        let mut changed = original.client.clone();
+        changed.scopes.push("unrequested-scope".into());
+        assert!(
+            reauthorization_client(
+                &issued,
+                Some(changed),
+                "fixture-provider",
+                &original.adapter.refresh_url
+            )
+            .is_err()
+        );
+        assert!(
+            reauthorization_client(
+                &issued,
+                None,
+                "fixture-provider",
+                "https://other.example.com/token"
+            )
+            .is_err()
+        );
+        let key = b"generic reauthorization fixture encryption key";
+        let cipher = seal_private_json(&original, key, STATE_AAD).unwrap();
+        let restored: StartInput = open_private_json(&cipher, key, STATE_AAD).unwrap();
+        assert_eq!(restored.reauthorize, Some(target));
+        let mut legacy = serde_json::to_value(&original).unwrap();
+        legacy.as_object_mut().unwrap().remove("reauthorize");
+        assert!(
+            serde_json::from_value::<StartInput>(legacy)
+                .unwrap()
+                .reauthorize
+                .is_none()
+        );
+    }
     #[tokio::test]
     async fn issued_ready_result_recovers_after_authorization_expiry_without_reexchange() {
         let directory = tempfile::tempdir().unwrap();
@@ -777,6 +894,7 @@ mod tests {
         )
         .unwrap();
         let ready = ReadyLogin {
+            reauthorize: None,
             application_plugin_revision: session.application_plugin_revision,
             session_id: session.session_id,
             tenant_external_id: session.tenant_external_id,
@@ -1032,6 +1150,7 @@ mod tests {
 
     fn input(token_endpoint: String) -> StartInput {
         StartInput {
+            reauthorize: None,
             application_plugin_revision: Some(7),
             tenant_external_id: "fixture-tenant".into(),
             account_name: "fixture-account".into(),
@@ -1121,6 +1240,7 @@ mod tests {
         );
         let session: Session = open_private_json(&started.session_token, key, TOKEN_AAD).unwrap();
         let ready = ReadyLogin {
+            reauthorize: None,
             application_plugin_revision: Some(8),
             session_id: session.session_id,
             tenant_external_id: session.tenant_external_id.clone(),
