@@ -621,6 +621,13 @@ impl InstallPolicy {
 // killed creator leaves only an unreferenced hidden temporary directory; retries
 // can claim the final name without deleting or adopting arbitrary existing roots.
 fn log_installer_diagnostics(bytes: &[u8]) {
+    for (stage, category, errno) in installer_diagnostics(bytes) {
+        tracing::warn!(stage, category, errno, "plugin installer diagnostic");
+    }
+}
+
+fn installer_diagnostics(bytes: &[u8]) -> Vec<(&'static str, &'static str, Option<i64>)> {
+    let mut diagnostics = Vec::new();
     for line in bytes.split(|byte| *byte == b'\n') {
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
             continue;
@@ -653,8 +660,9 @@ fn log_installer_diagnostics(bytes: &[u8]) {
             .get("errno")
             .and_then(serde_json::Value::as_i64)
             .filter(|value| (1..=4095).contains(value));
-        tracing::warn!(stage, category, errno, "plugin installer diagnostic");
+        diagnostics.push((stage, category, errno));
     }
+    diagnostics
 }
 
 #[cfg(target_os = "linux")]
@@ -992,6 +1000,24 @@ async fn append_inventory_file(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn installer_diagnostic_projection_never_forwards_untrusted_text() {
+        let bytes = br#"raw secret/path/provider body
+{"mtc_plugin_install":1,"stage":"package_publish","category":"storage","errno":22,"message":"secret/path"}
+{"mtc_plugin_install":1,"stage":"secret/path","category":"storage","errno":22}
+{"mtc_plugin_install":1,"stage":"install","category":"secret/path"}
+{"mtc_plugin_install":1,"stage":"install","category":"signature","errno":"secret/path"}
+{"mtc_plugin_install":1,"stage":"package_rename","category":"storage","errno":999999}
+"#;
+        assert_eq!(
+            super::installer_diagnostics(bytes),
+            vec![
+                ("package_publish", "storage", Some(22)),
+                ("install", "signature", None),
+                ("package_rename", "storage", None),
+            ]
+        );
+    }
     use super::*;
     use crate::{
         AppState,

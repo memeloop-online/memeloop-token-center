@@ -28,7 +28,7 @@ impl Drop for TemporaryClaim {
 fn regular_file(path: &Path) -> io::Result<fs::File> {
     let file = fs::File::from(open(
         path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
         Mode::empty(),
     )?);
     if !file.metadata()?.is_file() {
@@ -74,7 +74,17 @@ fn claim_name(root: &Path, owner: &[u8]) -> io::Result<()> {
     }
     // Do not adopt an existing unowned directory, even an empty one.
     match fs::symlink_metadata(root) {
-        Ok(_) => return Err(io::ErrorKind::AlreadyExists.into()),
+        // A concurrent owner may have published its claim and mkdir since our
+        // first lookup. It is safe only if that exact owner is now provable.
+        Ok(_) => {
+            return verify_owner(&marker, owner).map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    io::ErrorKind::AlreadyExists.into()
+                } else {
+                    error
+                }
+            });
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
@@ -201,7 +211,7 @@ pub(crate) fn link_file_at(
     let target_parent = parent_at(directory, relative)?;
     let source_name = source.file_name().ok_or(io::ErrorKind::InvalidInput)?;
     let target_name = relative.file_name().ok_or(io::ErrorKind::InvalidInput)?;
-    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
     let mut source_file =
         fs::File::from(openat(&source_parent, source_name, flags, Mode::empty())?);
     if !source_file.metadata()?.is_file() {
