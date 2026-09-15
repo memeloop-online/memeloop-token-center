@@ -136,3 +136,18 @@ test('removes only carried history prefixes and preserves a repeated new user tu
     ['user', 'Again'], ['assistant', 'Done'], ['user', 'Again'],
   ]);
 });
+
+test('reads retained Responses SSE terminal output and ordered completed tool items', () => {
+  const stream = [
+    'event: response.output_item.done\r\ndata: {"type":"response.output_item.done","output_index":1,"item":{"type":"custom_tool_call","call_id":"c","name":"patch","input":"actual patch"}}',
+    'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Working"}]}}',
+    'data: {"type":"response.completed","response":{"output":[]}}',
+    'data: [DONE]',
+  ].join('\r\n\r\n');
+  const replay = projectSessionReplay('session-a', [detail('sse', 1, { input: 'Task' }, stream)]);
+  assert.deepEqual(replay.items.map(item => item.kind), ['message', 'message', 'tool_call']);
+  assert.ok(replay.items.some(item => item.kind === 'message' && item.role === 'assistant' && item.text === 'Working'));
+  assert.ok(replay.items.some(item => item.kind === 'tool_call' && item.arguments === 'actual patch'));
+  const partial = projectSessionReplay('session-a', [detail('partial', 1, { input: 'Task' }, stream.split('data: {"type":"response.completed"')[0])]);
+  assert.ok(partial.items.some(item => item.kind === 'unknown' && item.body === 'response' && item.reason === 'archive_unavailable'));
+});

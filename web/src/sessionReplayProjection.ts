@@ -282,8 +282,34 @@ function projectRequestBody(items: SessionReplayItem[], detail: RequestDetail, l
   unknown(items, detail.request_id, 'request', 'unsupported_body', limit);
 }
 
+/** Archive storage retains streaming responses as SSE text, not a JSON response. */
+function archivedSseResponse(value: unknown): JsonObject | undefined {
+  if (typeof value !== 'string' || value.length > 1024 * 1024 || !/^data:/m.test(value)) return undefined;
+  const completedItems = new Map<number, JsonObject>();
+  let terminal: JsonObject | undefined;
+  const blocks = value.replaceAll('\r\n', '\n').split('\n\n');
+  for (const block of blocks.slice(0, 8_192)) {
+    const data = block.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
+    if (!data || data === '[DONE]') continue;
+    let event: JsonObject | undefined;
+    try { event = object(JSON.parse(data)); } catch { continue; }
+    if (!event) continue;
+    if (event.type === 'response.output_item.done' && Number.isInteger(event.output_index)
+      && (event.output_index as number) >= 0 && (event.output_index as number) < MAX_BODY_ITEMS && object(event.item)) {
+      completedItems.set(event.output_index as number, object(event.item)!);
+    }
+    if (event.type === 'response.completed' || event.type === 'response.incomplete' || event.type === 'response.failed') {
+      terminal = object(event.response);
+      break;
+    }
+  }
+  if (array(terminal?.output)?.length) return terminal;
+  if (completedItems.size) return { ...terminal, output: [...completedItems].sort(([a], [b]) => a - b).map(([, item]) => item), replay_partial: !terminal };
+  return terminal;
+}
+
 function projectResponseBody(items: SessionReplayItem[], detail: RequestDetail, limit: { truncated: boolean }) {
-  const body = detail.response_body;
+  const body = archivedSseResponse(detail.response_body) ?? detail.response_body;
   if (body === null || body === undefined) {
     unknown(items, detail.request_id, 'response', 'archive_unavailable', limit);
     return;
@@ -298,7 +324,11 @@ function projectResponseBody(items: SessionReplayItem[], detail: RequestDetail, 
     for (const choice of choices.slice(0, MAX_BODY_ITEMS)) chatMessage(items, detail.request_id, 'response', object(choice)?.message, limit);
     return;
   }
-  if ('output' in record) { responsesResponse(items, detail.request_id, 'response', record.output, limit); return; }
+  if ('output' in record) {
+    responsesResponse(items, detail.request_id, 'response', record.output, limit);
+    if (record.replay_partial) unknown(items, detail.request_id, 'response', 'archive_unavailable', limit);
+    return;
+  }
   const outputText = string(record.output_text);
   if (outputText !== undefined) { message(items, detail.request_id, 'response', 'assistant', outputText, limit); return; }
   unknown(items, detail.request_id, 'response', 'unsupported_body', limit);
@@ -359,8 +389,8 @@ export function projectSessionReplay(sessionId: string, details: readonly Reques
       while (repeated < identities.length && repeated < previousHistory.length && identities[repeated] === previousHistory[repeated]) repeated += 1;
     }
     projectRequestBody(items, repeated && body ? { ...detail, request_body: { ...body, [format]: history.slice(repeated) } } : detail, limit);
-    projectResponseBody(items, detail, limit);
-    const response = object(detail.response_body);
+    const response = archivedSseResponse(detail.response_body) ?? object(detail.response_body);
+    projectResponseBody(items, response ? { ...detail, response_body: response } : detail, limit);
     const output = format === 'input' ? array(response?.output) : array(response?.choices)?.flatMap(choice => object(choice)?.message ? [object(choice)?.message] : []);
     previousHistory = [...identities, ...(output ?? []).map(item => JSON.stringify(item))];
     previousFormat = format;
