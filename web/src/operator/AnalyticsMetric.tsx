@@ -1,9 +1,8 @@
 import { useId, useState, type ReactNode } from 'react';
-import { Tooltip } from '../design-system';
-import { useI18n } from '../i18n';
-import { formatNumber } from '../format';
-import { metricArea } from './analyticsPresentation';
-import './analyticsMetrics.css';
+import { Tooltip } from '@fluentui/react-components';
+import { useI18n } from '../i18n.js';
+import { formatNumber } from '../format.js';
+import { metricArea } from './analyticsPresentation.js';
 
 export function AnalyticsMetric({ label, labelContent, value, title, tone = '', trend, ratio, note, timestamps, timeZone, formatSample }: {
   label: string; labelContent?: ReactNode; value: ReactNode; title?: string; tone?: string;
