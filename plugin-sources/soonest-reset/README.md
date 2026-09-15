@@ -52,6 +52,10 @@ multiple routes for one account, ties, unknown and exhausted windows. Additional
 cases exercise expiry, estimates, bad data, non-target windows and native health.
 The host fixture requires `MTC_SOONEST_RESET_PACKAGE` and runs as
 `cargo test --all-features --test first_party_soonest_reset -- --ignored` in CI.
+The real gateway fixture `soonest_reset_real_gateway` seeds current-generation,
+current-config observations into its isolated database and checks earliest-reset
+selection, expired-evidence native fallback and native exhausted-account fallback.
+It also checks durable strategy state contains no guest health override.
 No supplier account or paid model request is needed for these checks.
 
 Installation requires a runtime/installer supporting `group_routing_quota` and

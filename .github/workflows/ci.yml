@@ -331,10 +331,12 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Verify soonest-reset guest through the real host
+      - name: Verify soonest-reset guest through the real host and gateway
         env:
           MTC_SOONEST_RESET_PACKAGE: ${{ runner.temp }}/soonest-reset-package
-        run: cargo test --locked --all-features --test first_party_soonest_reset -- --ignored
+        run: |
+          cargo test --locked --all-features --test first_party_soonest_reset -- --ignored
+          cargo test --locked --all-features --lib soonest_reset_real_gateway -- --ignored
       - name: Retain the tested soonest-reset component
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
         with:
