@@ -261,7 +261,7 @@ async fn postgres_response_writer_does_not_block_streaming_on_the_budget_lock() 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let waiting: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock' AND query LIKE 'SELECT cipher_bytes%FROM response_archive_spool_budget%FOR UPDATE%'",
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock' AND query LIKE 'UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes +%'",
             )
             .bind(&application_name)
             .fetch_one(&fixture.admin)
@@ -294,6 +294,38 @@ async fn postgres_response_writer_does_not_block_streaming_on_the_budget_lock() 
         crate::response_archive_spool::CHUNK_BYTES as i64 + 4
     );
     state.db.close().await;
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_concurrent_response_begins_share_one_spool_and_budget_charge() {
+    let Some(fixture) = PgFixture::new().await else {
+        return;
+    };
+    let contenders = 8;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(contenders + 1));
+    let mut tasks = Vec::new();
+    for _ in 0..contenders {
+        let db = fixture.db.clone();
+        let barrier = barrier.clone();
+        let identity = fixture.id;
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            db.begin_response_archive_spool(identity).await
+        }));
+    }
+    barrier.wait().await;
+    for task in tasks {
+        assert!(task.await.unwrap().unwrap());
+    }
+    let spools: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1")
+            .bind(fixture.id.request_id.to_string())
+            .fetch_one(&fixture.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(spools, 1);
+    assert_eq!(budget(&fixture.db).await, SPOOL_OVERHEAD);
     fixture.finish().await;
 }
 
