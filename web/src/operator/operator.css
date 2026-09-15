@@ -984,9 +984,11 @@
 }
 
 .credential-list-controls label {
-  display: block;
+  display: grid;
+  gap: 6px;
   min-width: 0;
 }
+.credential-list-controls :is(.fui-Input, .fui-Select) { width: 100%; min-width: 0; }
 
 .credential-list-summary {
   color: #71868d;
@@ -1103,6 +1105,10 @@
 }
 
 .credential-compact-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px 24px;
+  align-items: center;
   border: 0;
   border-bottom: 1px solid #24383e;
   padding: 10px 0;
@@ -1119,6 +1125,21 @@
 
 .credential-compact-row .managed-resource-header {
   align-items: center;
+  flex-direction: row;
+  min-width: 0;
+}
+.credential-compact-row .credential-row-identity { flex: 1; min-width: 0; }
+.credential-compact-row .managed-resource-header > :is(.fui-Checkbox, .account-meta) { flex: 0 0 auto; }
+.credential-compact-row .credential-row-actions { margin: 0; justify-content: flex-end; }
+.credential-compact-row .managed-resource-header .credential-budget,
+.credential-compact-row .managed-resource-header .credential-group-summary { font-size: 12px; line-height: 1.5; }
+@media (width <= 850px) {
+  .credential-compact-row { grid-template-columns: minmax(0, 1fr); }
+  .credential-compact-row .credential-row-actions { justify-content: flex-start; padding-inline-start: 44px; }
+}
+@media (width <= 480px) {
+  .credential-compact-row .managed-resource-header { flex-wrap: wrap; }
+  .credential-compact-row .managed-resource-header > .account-meta { margin-inline-start: 44px; width: calc(100% - 44px); }
 }
 
 .credential-compact-row .managed-resource-header b {

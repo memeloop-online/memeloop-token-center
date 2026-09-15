@@ -1,5 +1,21 @@
 # Operator design system
 
+## Shared task and extension composition
+
+Credential rows keep selection next to identity, metadata next to the record,
+and copy/secondary operations in one action group. Editing continues in the
+existing single `CreateJourney`; do not add a second row editor or duplicate
+authorization/policy forms. Filters stretch their existing Fluent controls to
+the assigned column instead of separating labels from short floating inputs.
+
+Typed plugin slots render scalar metrics with the same `AnalyticsMetric` used
+by built-in monitoring. A scalar value supplies neither a fake history nor a
+ratio. Text, status and approved links preserve projection order and span the
+slot width; adjacent metrics share a responsive grid. Long plugin values wrap.
+The slot remains a core-owned, authenticated, lazy, scoped read boundary, not a
+place for plugin code, credentials, arbitrary HTML or invented editing actions.
+No new contribution placement or permission is introduced by layout reuse.
+
 ## Foundation and boundaries
 
 Use Microsoft Fluent UI React v9, exact `@fluentui/react-components@9.74.7`.

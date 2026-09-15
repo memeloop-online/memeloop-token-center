@@ -1,5 +1,8 @@
 .plugin-ui-slot { min-inline-size: 0; max-inline-size: 100%; overflow-wrap: anywhere; }
 .plugin-ui-components { display: grid; gap: .75rem; }
+.plugin-ui-components.metrics { grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); margin: 0; }
+.plugin-ui-components > :not(.analytics-metric) { grid-column: 1 / -1; }
+.plugin-ui-components .analytics-metric .metric-value { white-space: normal; overflow-wrap: anywhere; }
 .plugin-ui-components p, .plugin-ui-components dl { margin: 0; }
 .plugin-ui-components dd { margin-inline-start: 0; font-size: 1.25em; font-weight: 600; }
 .plugin-ui-components a { color: inherit; text-decoration: underline; }

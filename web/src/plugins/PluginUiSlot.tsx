@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { parsePluginUiProjection, type PluginUiPolicy, type PluginUiProjection } from './uiProjection.js';
+import { AnalyticsMetric } from '../operator/AnalyticsMetric';
 
 export interface PluginUiSlotProps extends PluginUiPolicy {
   /** Changes on tenant, principal, credential/authorization revision, or plugin revision. */
@@ -48,10 +49,10 @@ function ScopedSlot({ title, messages, load, ...policy }: PluginUiSlotProps) {
     {result === null ? <p role="status">{messages.loading}</p>
       : result === 'error' ? <p role="status">{messages.unavailable}</p>
         : result.components.length === 0 ? <p>{messages.empty}</p>
-          : <div className="plugin-ui-components">{result.components.map((component, index) => {
+          : <div className="plugin-ui-components metrics">{result.components.map((component, index) => {
             switch (component.kind) {
               case 'text': return <p key={index}>{component.text}</p>;
-              case 'metric': return <dl key={index}><dt>{component.label}</dt><dd>{component.value}</dd></dl>;
+              case 'metric': return <AnalyticsMetric key={index} label={component.label} value={component.value} />;
               case 'status': return <p key={index}>{component.label}: <span className="plugin-ui-state">{messages.states[component.state]}</span></p>;
               case 'link': return <a key={index} href={component.href} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer">{component.label}</a>;
             }

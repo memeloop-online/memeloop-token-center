@@ -39,6 +39,9 @@ test('plugin slots are lazy, scoped, isolated and safe on mobile in both themes'
     await healthy.getByText('<img src=x onerror=alert(1)> alpha', { exact: true }).waitFor();
     await broken.getByText('Plugin unavailable', { exact: true }).waitFor();
     assert.equal(await healthy.locator('img, script, iframe').count(), 0);
+    assert.equal(await healthy.locator('.analytics-metric').count(), 1, 'typed plugin metrics reuse the same core metric component');
+    assert.equal(await healthy.locator('.analytics-metric .metric-value').textContent(), '12');
+    assert.equal(await healthy.locator('.analytics-metric-trend, .analytics-metric-ratio').count(), 0, 'a scalar projection cannot invent historical samples');
     assert.equal(await broken.getByRole('link').count(), 0);
     const link = healthy.getByRole('link', { name: 'Documentation' });
     assert.equal(await link.getAttribute('rel'), 'noopener noreferrer');
@@ -49,7 +52,7 @@ test('plugin slots are lazy, scoped, isolated and safe on mobile in both themes'
     assert.equal(await page.getByText('<img src=x onerror=alert(1)> alpha', { exact: true }).count(), 0);
     await broken.scrollIntoViewIfNeeded();
     await healthy.getByText('<img src=x onerror=alert(1)> beta', { exact: true }).waitFor();
-    const evidence = fileURLToPath(new URL('../e2e-artifacts/plugin-ui-slots/', import.meta.url));
+    const evidence = fileURLToPath(new URL('../e2e-artifacts/ui-system/plugin-ui-slots/', import.meta.url));
     await mkdir(evidence, { recursive: true });
     await page.screenshot({ path: `${evidence}/mobile-dark.png` });
     await page.getByRole('button', { name: 'Light theme' }).click();
