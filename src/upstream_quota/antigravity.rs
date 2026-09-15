@@ -249,10 +249,10 @@ mod tests {
         assert_ne!(a[0].id, a[1].id);
         assert_eq!(a[0].id, b[1].id);
         assert!(a.iter().all(|row| row.period_seconds.is_none()));
-        assert_eq!(
-            windows(&json!({"groups":[group("A"),group("A")]})).unwrap_err(),
-            "quota_duplicate_window"
-        );
+        assert!(matches!(
+            windows(&json!({"groups":[group("A"),group("A")]})),
+            Err("quota_duplicate_window")
+        ));
     }
 
     #[test]
