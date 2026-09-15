@@ -35,6 +35,45 @@ fn request_json() -> Value {
     json!({"model":"image-replay-model","prompt":"draw a fox","n":1,"size":"1024x1024"})
 }
 
+#[tokio::test]
+async fn native_image_parameter_validation_does_not_restrict_openai_forwarding() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "created":1,"data":[{"b64_json":"bW9jay1wbmc="}]
+        })))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = fixture(&upstream).await;
+    let mut payload = request_json();
+    payload["quality"] = json!("high");
+    payload["background"] = json!("transparent");
+    payload["output_format"] = json!("png");
+    payload["user"] = json!("fixture-user");
+    let response = router_for_role(fixture.state.clone(), RuntimeRole::Gateway)
+        .oneshot(
+            Request::post("/v1/images/generations")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", fixture.credential),
+                )
+                .header("idempotency-key", "openai-parameter-forwarding")
+                .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = upstream.received_requests().await.unwrap();
+    let forwarded: Value = requests[0].body_json().unwrap();
+    for field in ["quality", "background", "output_format", "user"] {
+        assert_eq!(forwarded[field], payload[field]);
+    }
+}
+
 async fn post(state: AppState, credential: &str, idempotency: &str) -> Response {
     router_for_role(state, RuntimeRole::Gateway)
         .oneshot(

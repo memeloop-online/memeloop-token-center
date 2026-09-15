@@ -376,6 +376,21 @@ mod tests {
         idempotency_key: &str,
         prompt: &str,
     ) -> Response {
+        post_openai_image_json(
+            state,
+            credential,
+            idempotency_key,
+            json!({"model":"image-replay-model", "prompt":prompt, "n":1, "size":"1024x1024"}),
+        )
+        .await
+    }
+
+    async fn post_openai_image_json(
+        state: &AppState,
+        credential: &str,
+        idempotency_key: &str,
+        payload: Value,
+    ) -> Response {
         router_for_role(state.clone(), RuntimeRole::Gateway)
             .oneshot(
                 Request::post("/v1/images/generations")
@@ -383,13 +398,7 @@ mod tests {
                     .header(header::AUTHORIZATION, format!("Bearer {credential}"))
                     .header("idempotency-key", idempotency_key)
                     .body(Body::from(
-                        serde_json::to_vec(&json!({
-                            "model": "image-replay-model",
-                            "prompt": prompt,
-                            "n": 1,
-                            "size": "1024x1024"
-                        }))
-                        .expect("image request JSON"),
+                        serde_json::to_vec(&payload).expect("image request JSON"),
                     ))
                     .expect("image request"),
             )
@@ -406,10 +415,11 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"response": {"candidates": [{"content": {"parts": [{"inlineData": {"mimeType": "image/png", "data": "bW9jay1wbmc="}}]}}]}})))
             .expect(1).mount(&upstream).await;
         let directory = tempfile::tempdir().unwrap();
-        let mut config = Config::for_test(format!(
+        let database_url = format!(
             "sqlite://{}?mode=rwc",
             directory.path().join("native-image.db").display()
-        ));
+        );
+        let mut config = Config::for_test(database_url.clone());
         config.plugin_dir = Some("plugins".into());
         let state = AppState::initialize(config).await.unwrap();
         let tenant = "native-image-fixture";
@@ -454,6 +464,35 @@ mod tests {
             )
             .await
             .unwrap();
+        // Rejected parameters release the preliminary idempotency claim before
+        // any monetary reservation or upstream dispatch. The valid request below
+        // reuses the exact same key and must still succeed.
+        for (field, value) in [
+            ("background", json!("transparent")),
+            ("response_format", json!("url")),
+            ("size", json!(1024)),
+            ("quality", json!("high")),
+            ("output_format", json!("png")),
+        ] {
+            let mut payload = json!({"model":"image-replay-model","prompt":"draw a fox"});
+            payload[field] = value;
+            let rejected =
+                post_openai_image_json(&state, &granted.key, "native-stable-replay", payload).await;
+            assert_eq!(rejected.status(), StatusCode::BAD_REQUEST, "field {field}");
+        }
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+        let pool = sqlx::SqlitePool::connect(&database_url).await.unwrap();
+        let reservations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_reservations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(reservations, 0);
+        let submissions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(submissions, 0);
+        pool.close().await;
         let first =
             post_openai_image(&state, &granted.key, "native-stable-replay", "draw a fox").await;
         assert_eq!(first.status(), StatusCode::OK);

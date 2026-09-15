@@ -296,22 +296,46 @@ pub fn openai_image_request(
     project: &str,
     request: &Value,
 ) -> Result<Value, AppError> {
+    let object = request
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest("image request must be an object".into()))?;
+    // This adapter rebuilds the native request rather than forwarding OpenAI
+    // options. Preserve common no-op defaults, but never silently promise an
+    // unsupported generation control or output encoding. `model` is consumed
+    // by the authorized public route; the actual upstream model is supplied
+    // separately. The response writer always emits b64_json, not a URL.
+    for (field, value) in object {
+        let supported = match field.as_str() {
+            "model" => value.is_string(),
+            "prompt" | "n" | "size" => true, // Validated below.
+            "response_format" => value.as_str() == Some("b64_json"),
+            "quality" | "background" | "moderation" => value.as_str() == Some("auto"),
+            "stream" => value.as_bool() == Some(false),
+            "partial_images" => value.as_i64() == Some(0),
+            _ => false,
+        };
+        if !supported {
+            // Do not echo arbitrary field names or values into client errors.
+            return Err(AppError::BadRequest(
+                "unsupported Antigravity image parameter or value".into(),
+            ));
+        }
+    }
     let prompt = request
         .get("prompt")
         .and_then(Value::as_str)
         .filter(|prompt| !prompt.trim().is_empty())
         .ok_or_else(|| AppError::BadRequest("image prompt is required".into()))?;
-    if request
-        .get("n")
-        .and_then(Value::as_i64)
-        .is_some_and(|n| n != 1)
-    {
+    if request.get("n").is_some_and(|n| n.as_i64() != Some(1)) {
         return Err(AppError::BadRequest(
             "Antigravity image generation requires n=1".into(),
         ));
     }
     let mut generation_config = json!({});
-    if let Some(size) = request.get("size").and_then(Value::as_str) {
+    if let Some(size) = request.get("size") {
+        let size = size.as_str().ok_or_else(|| {
+            AppError::BadRequest("Antigravity image size must be a string".into())
+        })?;
         let ratio = match size {
             "auto" => None,
             "1024x1024" => Some("1:1"),
@@ -513,6 +537,82 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{header, method, path},
     };
+
+    #[test]
+    fn openai_image_defaults_preserve_supported_mapping() {
+        let request = openai_image_request(
+            "gemini-3-pro-image",
+            "project-fixture",
+            &json!({
+                "model":"public-alias", "prompt":"a tree", "n":1, "size":"1536x1024",
+                "response_format":"b64_json", "quality":"auto", "background":"auto",
+                "moderation":"auto", "stream":false, "partial_images":0
+            }),
+        )
+        .unwrap();
+        assert_eq!(request["model"], "gemini-3-pro-image");
+        assert_eq!(
+            request["request"]["generationConfig"]["imageConfig"]["aspectRatio"],
+            "3:2"
+        );
+        assert_eq!(
+            request["request"]["contents"][0]["parts"][0]["text"],
+            "a tree"
+        );
+        for size in [None, Some("auto"), Some("1024x1024"), Some("1024x1536")] {
+            let mut input = json!({"prompt":"a tree"});
+            if let Some(size) = size {
+                input["size"] = json!(size);
+            }
+            let output =
+                openai_image_request("gemini-3-pro-image", "project-fixture", &input).unwrap();
+            let ratio = &output["request"]["generationConfig"]["imageConfig"]["aspectRatio"];
+            match size {
+                Some("1024x1024") => assert_eq!(ratio, "1:1"),
+                Some("1024x1536") => assert_eq!(ratio, "2:3"),
+                _ => assert!(ratio.is_null()),
+            }
+        }
+    }
+
+    #[test]
+    fn openai_image_rejects_unmapped_controls_and_wrong_types() {
+        for (field, value) in [
+            ("quality", json!("high")),
+            ("background", json!("transparent")),
+            ("moderation", json!("low")),
+            ("response_format", json!("url")),
+            ("output_format", json!("png")),
+            ("output_compression", json!(100)),
+            ("style", json!("natural")),
+            ("user", json!("user-id")),
+            ("stream", json!(true)),
+            ("partial_images", json!(1)),
+            ("future_control", json!(true)),
+            ("size", json!(1024)),
+            ("size", json!({})),
+            ("size", Value::Null),
+            ("size", json!("1792x1024")),
+            ("n", json!("1")),
+            ("n", json!(1.5)),
+            ("n", Value::Null),
+            ("n", json!(2)),
+            ("quality", json!(true)),
+            ("stream", json!("false")),
+            ("partial_images", json!("0")),
+            ("response_format", json!(false)),
+        ] {
+            let mut input = json!({"prompt":"a tree"});
+            input[field] = value;
+            assert!(
+                matches!(
+                    openai_image_request("gemini-3-pro-image", "project-fixture", &input),
+                    Err(AppError::BadRequest(_))
+                ),
+                "field {field}"
+            );
+        }
+    }
 
     #[test]
     fn image_wire_envelope_preserves_safety_and_rejects_routing_override() {
