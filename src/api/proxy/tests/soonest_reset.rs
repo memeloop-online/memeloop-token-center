@@ -27,8 +27,10 @@ async fn soonest_reset_real_gateway_uses_shared_evidence_and_preserves_native_he
             .await;
     }
     let label = "soonest-reset-native-health";
+    // Native route priority is ascending: the plugin must override this
+    // deliberate baseline only while complete fresh evidence is available.
     let mut fixture =
-        resilient_route_fixture(label, &[(native.uri(), 100), (preferred.uri(), 0)]).await;
+        resilient_route_fixture(label, &[(native.uri(), 0), (preferred.uri(), 100)]).await;
     let tenant_external_id = format!("resilient-{label}");
     let group = fixture
         .state
@@ -78,7 +80,6 @@ async fn soonest_reset_real_gateway_uses_shared_evidence_and_preserves_native_he
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let rows = sqlx::query("SELECT route.id, route.upstream_account_id, account.credential_generation, account.updated_at, account.driver FROM model_routes route JOIN upstream_accounts account ON account.id = route.upstream_account_id WHERE route.tenant_id = $1 ORDER BY route.id")
         .bind(group.tenant_id.to_string()).fetch_all(&pool).await.unwrap();
-    let mut candidates = Vec::new();
     let mut preferred_generation = 0;
     for row in rows {
         let route: String = row.get("id");
@@ -104,15 +105,27 @@ async fn soonest_reset_real_gateway_uses_shared_evidence_and_preserves_native_he
         sqlx::query("INSERT INTO upstream_quota_observations (upstream_account_id,tenant_id,credential_generation,config_revision,observation_json,valid_until) VALUES ($1,$2,$3,$4,$5,$6)")
             .bind(&account).bind(group.tenant_id.to_string()).bind(generation).bind(revision)
             .bind(observation.to_string()).bind(now + 300_000).execute(&pool).await.unwrap();
-        candidates.push(crate::provider::AuthorizedUpstreamCandidate {
-            route_id: Uuid::parse_str(&route).unwrap(),
-            account_id,
-            driver,
-            transport_revision: revision,
-            credential_generation: generation,
-        });
     }
     pool.close().await;
+    let mut candidates = fixture
+        .state
+        .db
+        .list_authorized_upstream_candidates_with_hint(
+            fixture.key_id,
+            group.tenant_id,
+            &fixture.model,
+            "openai",
+            crate::db::RouteSelectionOptions {
+                upstream_account_hint: None,
+                selection_seed: Uuid::from_u128(7),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        candidates[0].account_id, fixture.accounts[0],
+        "the real native resolver must prefer the lower-priority-number route before quota ordering"
+    );
     let source = std::path::PathBuf::from(
         std::env::var("MTC_SOONEST_RESET_PACKAGE").expect("real guest package required"),
     );
