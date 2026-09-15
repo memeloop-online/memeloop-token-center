@@ -105,7 +105,7 @@ function waitForRelease(waiters: Set<() => void>, signal: AbortSignal) {
 }
 function releaseAll(waiters: Set<() => void>) { for (const release of [...waiters]) release(); }
 async function loadArchive(requestView: ConversationRequest, signal: AbortSignal) {
-  if (fullFixture) return { ...archive(requestView, { input: [] }, null), archive: {
+  if (fullFixture) return { ...archive(requestView, { input: [] }, null, false), archive: {
     request: { state: 'bound' as const, complete: true, reason: null },
     response: { state: fullGap ? 'gap' as const : 'bound' as const, complete: false, reason: fullInvalid ? 'archive_payload_invalid' : 'archive_object_unavailable' },
   } };
