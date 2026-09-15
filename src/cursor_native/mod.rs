@@ -15,17 +15,17 @@ const TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Copy)]
 pub(crate) enum Method {
-    GetUsableModels,
-    GetCurrentPeriodUsage,
-    GetPlanInfo,
+    UsableModels,
+    CurrentPeriodUsage,
+    PlanInfo,
 }
 
 impl Method {
     fn path(self) -> &'static str {
         match self {
-            Self::GetUsableModels => "/aiserver.v1.AiService/GetUsableModels",
-            Self::GetCurrentPeriodUsage => "/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
-            Self::GetPlanInfo => "/aiserver.v1.DashboardService/GetPlanInfo",
+            Self::UsableModels => "/aiserver.v1.AiService/GetUsableModels",
+            Self::CurrentPeriodUsage => "/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
+            Self::PlanInfo => "/aiserver.v1.DashboardService/GetPlanInfo",
         }
     }
 }
@@ -150,7 +150,7 @@ mod tests {
     #[tokio::test]
     async fn binary_unary_contract_and_redacted_errors() {
         let server = MockServer::start().await;
-        let path_value = Method::GetUsableModels.path();
+        let path_value = Method::UsableModels.path();
         Mock::given(method("POST"))
             .and(path(path_value))
             .and(header("authorization", "Bearer fixture-token"))

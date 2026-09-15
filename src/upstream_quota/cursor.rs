@@ -16,10 +16,10 @@ pub(super) async fn read(
     // Optional plan metadata must not hold a successful quota read until that
     // deadline; failure leaves its name/reset fallback unknown.
     let (usage, plan_info) = tokio::join!(
-        cursor_native::unary(state, credential, Method::GetCurrentPeriodUsage),
+        cursor_native::unary(state, credential, Method::CurrentPeriodUsage),
         tokio::time::timeout(
             Duration::from_secs(3),
-            cursor_native::unary(state, credential, Method::GetPlanInfo)
+            cursor_native::unary(state, credential, Method::PlanInfo)
         ),
     );
     let usage = usage.map_err(error_code)?;
