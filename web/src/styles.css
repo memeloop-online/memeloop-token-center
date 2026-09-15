@@ -4,7 +4,6 @@
   color:#dbe7ef;
   font-synthesis:none;
   background:#071014;
-  font-size:var(--fontSizeBase300,14px);
   line-height:var(--lineHeightBase300,20px);
   font-family:var(--fontFamilyBase,Inter,ui-sans-serif,system-ui,-apple-system,sans-serif)
 }
@@ -152,7 +151,7 @@ input:focus,select:focus,textarea:focus {
   border-color:var(--colorNeutralStrokeDisabled,#2a3d43)
 }
 .secondary {
-  color:var(--colorNeutralForeground1,#dbe7ef);
+  color:var(--colorNeutralForeground1,var(--picker-text,#dbe7ef));
   background:var(--colorNeutralBackground1,#12282b);
   border-color:var(--colorNeutralStroke1,#3f575c)
 }

@@ -130,7 +130,12 @@ test('shared surfaces contain long content and retain keyboard actions across lo
         await page.keyboard.press('Tab');
         await action.focus();
         assert.equal(await action.evaluate(element => element === document.activeElement), true, `${label}: keyboard focus`);
-        assert.equal(await action.evaluate(element => getComputedStyle(element).outlineStyle !== 'none'), true, `${label}: visible focus ring`);
+        assert.equal(await action.evaluate(element => {
+          // Fluent draws focus on pseudo-elements; native controls use outline.
+          const styles = [getComputedStyle(element), getComputedStyle(element, '::before'), getComputedStyle(element, '::after')];
+          return styles.some(style => (style.outlineStyle !== 'none' && parseFloat(style.outlineWidth) > 0)
+            || (style.content !== 'none' && style.opacity !== '0' && style.borderTopColor !== 'rgba(0, 0, 0, 0)' && style.borderTopStyle === 'solid' && parseFloat(style.borderTopWidth) >= 2));
+        }), true, `${label}: visible focus ring`);
         if (width <= 390 && route.name !== 'operator-overview') {
           assert.ok(await action.evaluate(element => element.getBoundingClientRect().height >= 44), `${label}: touch action size`);
         }
