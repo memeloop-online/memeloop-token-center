@@ -310,12 +310,9 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             break;
                         }
                         StreamPoll::ProgressHeartbeat => {
-                            let Some(heartbeat) = responses_streaming_sanitizer
-                                .as_ref()
-                                .and_then(
-                                    crate::api::sse::ResponsesStreamingSanitizer::progress_heartbeat,
-                                )
-                            else {
+                            let Some(heartbeat) = responses_streaming_sanitizer.as_ref().and_then(
+                                crate::api::sse::ResponsesStreamingSanitizer::progress_heartbeat,
+                            ) else {
                                 progress_heartbeat_deadline = None;
                                 continue;
                             };
