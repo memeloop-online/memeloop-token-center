@@ -1,8 +1,9 @@
-import { DetailTooltip } from '../design-system';
+import { DetailTooltip, ProgressBar } from '../design-system';
 import { formatPercent } from '../format';
 import { useI18n } from '../i18n';
 import { quotaHighestUsageWindow, quotaObservationState, quotaSummaryPresentation, quotaUsedPercent, quotaWindowPresentation, type UpstreamQuotaSnapshot } from './upstreamQuota';
 import './upstreamQuota.css';
+import { useQuotaClock } from './useQuotaClock';
 
 /** Compact and expanded quota surfaces share the supplier-window naming contract. */
 export function useQuotaWindowLabel() {
@@ -15,10 +16,12 @@ export function useQuotaWindowLabel() {
   };
 }
 
-export function QuotaSummary({ snapshot, refreshFailed = false, now = Date.now() }: {
+export function QuotaSummary({ snapshot, refreshFailed = false, now: suppliedNow }: {
   snapshot?: UpstreamQuotaSnapshot; refreshFailed?: boolean; now?: number;
 }) {
   const { t, locale } = useI18n();
+  const clock = useQuotaClock();
+  const now = suppliedNow ?? clock;
   const label = useQuotaWindowLabel();
   const presentation = quotaSummaryPresentation(snapshot, now, refreshFailed);
   const highest = presentation.usedPercent !== null && snapshot ? quotaHighestUsageWindow(snapshot.windows) : undefined;
@@ -40,6 +43,6 @@ export function QuotaSummary({ snapshot, refreshFailed = false, now = Date.now()
   </div>;
   return <DetailTooltip content={content}><span className="quota-summary" tabIndex={0}>
     <span>{text}</span>
-    {highest && <meter className="quota-summary-meter" min={0} max={100} value={Math.max(0, Math.min(100, presentation.usedPercent!))} aria-label={t(historical ? 'quota.lastObservedUsedPercent' : 'quota.usedPercent', { name: label(snapshot.provider, highest) })} />}
+    {highest && <ProgressBar className="quota-summary-meter" max={100} value={Math.max(0, Math.min(100, presentation.usedPercent!))} role="meter" aria-valuetext={text} aria-label={t(historical ? 'quota.lastObservedUsedPercent' : 'quota.usedPercent', { name: label(snapshot.provider, highest) })} />}
   </span></DetailTooltip>;
 }

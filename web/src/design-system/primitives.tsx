@@ -11,7 +11,7 @@ export function DetailTooltip({ children, content }: {
   children: ReactElement<HTMLAttributes<HTMLElement>>; content: ReactNode;
 }) {
   const [visible, setVisible] = useState(false);
-  return <Tooltip content={content} relationship="description" withArrow
+  return <Tooltip content={{ children: content }} relationship="description" withArrow
     visible={visible} onVisibleChange={(_, data) => setVisible(data.visible)}>
     {cloneElement(children, {
       onClick: (event) => {

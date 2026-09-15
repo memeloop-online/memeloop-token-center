@@ -17,6 +17,7 @@ test('failed quota refresh labels retained zeroes as historical and hides unobse
   const browser = await chromium.launch({ headless: true });
   try {
     const page = await browser.newPage();
+    await page.clock.install();
     const forbiddenRequests: string[] = [];
     const pageErrors: string[] = [];
     page.on('pageerror', error => pageErrors.push(error.message));
@@ -32,7 +33,8 @@ test('failed quota refresh labels retained zeroes as historical and hides unobse
 
     const summary = page.locator('[data-case="summary"]');
     assert.match(await summary.innerText(), /Codex usage · 5-hour limit · 51% used/);
-    assert.equal(await summary.locator('meter').getAttribute('value'), '51');
+    assert.equal(await summary.getByRole('meter').getAttribute('aria-valuenow'), '51');
+    assert.match(await summary.getByRole('meter').getAttribute('aria-valuetext') ?? '', /51% used/);
     await summary.locator('[tabindex="0"]').focus();
     const windows = page.getByRole('tooltip').filter({ hasText: 'Weekly limit' });
     await windows.waitFor();
@@ -41,7 +43,11 @@ test('failed quota refresh labels retained zeroes as historical and hides unobse
     assert.match(await windows.innerText(), /—/);
     await page.keyboard.press('Escape');
     assert.match(await page.locator('[data-case="summary-retained"]').innerText(), /Refresh failed · last observed Codex usage · 5-hour limit 0% used/);
-    assert.equal(await page.locator('[data-case="summary-unobserved"] meter').count(), 0);
+    assert.equal(await page.locator('[data-case="summary-unobserved"]').getByRole('meter').count(), 0);
+    const expiring = page.locator('[data-case="summary-expiring"]');
+    assert.doesNotMatch(await expiring.innerText(), /Last observed/);
+    await page.clock.fastForward(6_000);
+    await page.waitForFunction(() => document.querySelector('[data-case="summary-expiring"]')?.textContent?.includes('Last observed'));
 
     const retained = page.locator('[data-case="retained"]');
     const retainedText = await retained.innerText();

@@ -4,6 +4,7 @@ import { formatCountdown, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
 import { quotaObservationState, quotaReadErrorMessage, quotaRemaining, quotaResetCreditExpiry, quotaSourceLabel, quotaUnitMessage, quotaUsedPercent, upstreamQuotaPath, type UpstreamQuotaSnapshot } from './upstreamQuota';
 import { useQuotaWindowLabel } from './QuotaSummary';
+import { useQuotaClock } from './useQuotaClock';
 import type { QuotaReadState } from './useUpstreamQuotaReads';
 import './upstreamQuota.css';
 import { UpstreamQuotaReset } from './UpstreamQuotaReset';
@@ -12,11 +13,7 @@ import { DetailTooltip } from '../design-system';
 export function UpstreamQuotaDetails({ snapshot, refreshError }: { snapshot: UpstreamQuotaSnapshot; refreshError?: 'quota.readFailed' | 'quota.errorPermission' }) {
   const { locale, t } = useI18n();
   const windowLabel = useQuotaWindowLabel();
-  const [now, setNow] = useState(Date.now);
-  useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 30_000);
-    return () => window.clearInterval(timer);
-  }, []);
+  const now = useQuotaClock();
   const observation = quotaObservationState(snapshot, now, Boolean(refreshError));
   const hasObservation = observation !== 'unobserved';
   const readFailed = Boolean(refreshError) || snapshot.status === 'error' || Boolean(snapshot.error_code);
@@ -58,12 +55,7 @@ export function UpstreamQuotaDetails({ snapshot, refreshError }: { snapshot: Ups
 
 export function QuotaResetCreditExpiry({ snapshot, now }: { snapshot: UpstreamQuotaSnapshot; now?: number }) {
   const { t, locale } = useI18n();
-  const [clock, setClock] = useState(Date.now);
-  useEffect(() => {
-    if (now !== undefined) return;
-    const timer = window.setInterval(() => setClock(Date.now()), 30_000);
-    return () => window.clearInterval(timer);
-  }, [now]);
+  const clock = useQuotaClock();
   const expiry = quotaResetCreditExpiry(snapshot, now ?? clock);
   return <span data-reset-credit-expiry={expiry.state}>{t(expiry.state === 'known' ? 'quota.creditExpiresAt' : expiry.state === 'none' ? 'quota.noUnexpiredCredits' : 'quota.creditExpiryUnknown', { time: expiry.at === undefined ? '—' : new Date(expiry.at).toLocaleString(locale) })}</span>;
 }

@@ -39,6 +39,7 @@ function Preview() {
       { ...retained.windows[0], id: 'code_review:primary_window', used_percent: null },
     ] }} /></section>
     <section data-case="summary-retained"><QuotaSummary snapshot={retained} refreshFailed /></section>
+    <section data-case="summary-expiring"><QuotaSummary snapshot={{ ...retained, error_code: null, stale: false, stale_after: Date.now() + 5_000 }} /></section>
     <section data-case="summary-unobserved"><QuotaSummary snapshot={unobserved} /></section>
     <section className="upstream-quota" aria-label="Retained failed refresh" data-case="retained"><UpstreamQuotaDetails snapshot={retained} /></section>
     <section className="upstream-quota" aria-label="Failed refresh without observation" data-case="unobserved"><UpstreamQuotaDetails snapshot={unobserved} /></section>
