@@ -215,7 +215,7 @@ impl Database {
         if models.len() > 10_000
             || !matches!(
                 source_kind,
-                "openai_v1" | "component" | "codex_models" | "kimi_builtin"
+                "openai_v1" | "component" | "codex_models" | "kimi_builtin" | "cursor_native"
             )
         {
             return Err(AppError::BadRequest(

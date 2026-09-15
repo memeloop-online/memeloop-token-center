@@ -70,6 +70,77 @@ async fn request_as(
 }
 
 #[tokio::test]
+async fn cursor_native_snapshot_preserves_unknown_limits_and_generation_fence() {
+    let (state, _directory) = state("cursor-native-catalog").await;
+    let tenant = "cursor-native-catalog";
+    let account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant.into(),
+                name: "native-cursor".into(),
+                driver: "cursor".into(),
+                config: json!({"base_url":"https://api2.cursor.sh"}),
+                credential: UpstreamCredential::None,
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let lease = Uuid::now_v7();
+    assert!(
+        state
+            .db
+            .claim_upstream_model_catalog_sync(account.id, tenant, 1, lease)
+            .await
+            .unwrap()
+    );
+    let models = [DiscoveredUpstreamModel {
+        model_id: "fixture-model".into(),
+        protocol: "cursor_agent".into(),
+        context_window: None,
+        reservation_token_bound: None,
+        reservation_bound_source: None,
+    }];
+    assert_eq!(
+        state
+            .db
+            .replace_upstream_model_catalog(account.id, tenant, 2, lease, "cursor_native", &models)
+            .await
+            .unwrap(),
+        ReplaceModelCatalogResult::CredentialGenerationChanged
+    );
+    assert_eq!(
+        state
+            .db
+            .replace_upstream_model_catalog(account.id, tenant, 1, lease, "cursor_native", &models)
+            .await
+            .unwrap(),
+        ReplaceModelCatalogResult::Replaced
+    );
+    let (status, catalog) = request(
+        &state,
+        "GET",
+        &format!(
+            "/internal/v1/upstreams/{}/models?tenant_external_id={tenant}",
+            account.id
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        catalog["models"],
+        json!([{
+            "id":"fixture-model", "protocol":"cursor_agent", "context_window":null,
+            "reservation_token_bound":null, "reservation_bound_source":null,
+        }])
+    );
+}
+
+#[tokio::test]
 async fn aggregate_distinguishes_terminal_unsupported_from_unknown_network_and_auth_failures() {
     let (state, _directory) = state("catalog-discovery-capability").await;
     let tenant = "discovery-capability-tenant";
