@@ -3,6 +3,7 @@ import { Disclosure } from './design-system';
 import {
   projectSessionReplay,
   SESSION_REPLAY_MAX_REQUESTS,
+  SESSION_REPLAY_MAX_ITEMS,
   type ReplayUnknownReason,
   type SessionReplayItem,
 } from './sessionReplayProjection.js';
@@ -159,6 +160,8 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
   const [retryRevision, setRetryRevision] = useState(0);
 
   const requestKey = JSON.stringify(orderedRequests.map(archiveRevision));
+  const [itemWindow, setItemWindow] = useState({ requestKey, scopeKey, offset: 0 });
+  const itemOffset = itemWindow.requestKey === requestKey && itemWindow.scopeKey === scopeKey ? itemWindow.offset : 0;
   // Live list refreshes create fresh objects even when archive inputs are unchanged.
   // Keep the bounded read batch stable so a busy session cannot starve its replay.
   const sourceRequests = useMemo(() => orderedRequests, [requestKey]);
@@ -238,7 +241,7 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
     publish(scope);
   }, [detail.session_id, scopeKey, loadArchiveDetail, requestKey, sourceRequests, retryRevision]);
 
-  const projection = projectSessionReplay(detail.session_id, archiveDetails);
+  const projection = useMemo(() => projectSessionReplay(detail.session_id, archiveDetails, itemOffset), [detail.session_id, archivePage, scopeKey, loadArchiveDetail, requestKey, itemOffset]);
   const loadedIds = new Set(archiveDetails.map((request) => request.request_id));
   const missingEntries: SessionReplayItem[] = archiveLoading ? [] : sourceRequests
     .filter((request) => !loadedIds.has(request.request_id))
@@ -258,7 +261,7 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
       const source = JSON.stringify([item.requestId, item.body]);
       const ordinal = sourceOrdinals.get(source) ?? 0;
       sourceOrdinals.set(source, ordinal + 1);
-      return { item, index, identity: JSON.stringify([item.requestId, item.body, ordinal]) };
+      return { item, index, identity: JSON.stringify([item.requestId, item.body, ordinal, itemOffset]) };
     })
     .sort((left, right) => (requestPositions.get(left.item.requestId) ?? Number.MAX_SAFE_INTEGER) - (requestPositions.get(right.item.requestId) ?? Number.MAX_SAFE_INTEGER)
       || bodyOrder(left.item) - bodyOrder(right.item)
@@ -315,6 +318,11 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
         {detail.requests.length <= archiveOffset + sourceRequests.length && detail.has_more && onLoadEarlierRequests && <button type="button" className="secondary" disabled={loadingEarlier} onClick={() => { pendingEarlier.current = { sessionId: detail.session_id, scopeKey, count: detail.requests.length, offset: archiveOffset + sourceRequests.length }; onLoadEarlierRequests(); }}>{loadingEarlier ? t('common.loading') : t('sessionReplay.loadEarlierArchives')}</button>}
       </div>
     </header>
+    {(itemOffset > 0 || projection.nextItemOffset !== null) && <nav className="session-refresh-controls" aria-label={t('sessionReplay.content')}>
+      <button type="button" className="secondary" disabled={archiveLoading || itemOffset === 0} onClick={() => setItemWindow({ requestKey, scopeKey, offset: Math.max(0, itemOffset - SESSION_REPLAY_MAX_ITEMS) })}>{t('sessionReplay.previousContent')}</button>
+      <span>{t('sessionReplay.itemRange', { start: itemOffset + 1, end: itemOffset + projection.items.length, total: projection.totalItems })}</span>
+      <button type="button" className="secondary" disabled={archiveLoading || projection.nextItemOffset === null} onClick={() => setItemWindow({ requestKey, scopeKey, offset: projection.nextItemOffset ?? itemOffset })}>{t('sessionReplay.nextContent')}</button>
+    </nav>}
     <div className="session-replay-layout">
       <aside className="session-replay-turns" aria-label={t('sessionReplay.userTurns')}>
         <div className="session-replay-turn-heading"><span>{t('sessionReplay.userTurns')}</span><b>{archiveLoading && !turns.length ? '—' : turns.length}</b></div>

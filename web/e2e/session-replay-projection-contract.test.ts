@@ -3,7 +3,6 @@ import test from 'node:test';
 import {
   projectSessionReplay,
   SESSION_REPLAY_MAX_ITEMS,
-  SESSION_REPLAY_MAX_TEXT_LENGTH,
 } from '../src/sessionReplayProjection.js';
 import type { RequestDetail } from '../src/types.js';
 
@@ -95,17 +94,22 @@ test('reports unavailable, redacted, and out-of-session data as unknown rather t
   assert.deepEqual({ text: redactedMessage.text, unknown: redactedMessage.unknown }, { text: null, unknown: 'redacted' });
 });
 
-test('bounds retained text and projection item count with explicit truncation', () => {
+test('pages projection items without discarding long retained text or later items', () => {
   const long = detail('long', 1,
-    { messages: Array.from({ length: SESSION_REPLAY_MAX_ITEMS + 5 }, (_, index) => ({ role: 'user', content: index === 0 ? 'x'.repeat(SESSION_REPLAY_MAX_TEXT_LENGTH + 1) : `message-${index}` })) },
+    { messages: Array.from({ length: SESSION_REPLAY_MAX_ITEMS + 5 }, (_, index) => ({ role: 'user', content: index === 0 ? 'x'.repeat(20_000) : `message-${index}` })) },
     { choices: [] },
   );
   const replay = projectSessionReplay('session-a', [long]);
   const first = replay.items.find((item) => item.kind === 'message');
-  assert.equal(first?.text?.length, SESSION_REPLAY_MAX_TEXT_LENGTH);
-  assert.equal(first?.truncated, true);
-  assert.equal(replay.truncated, true);
+  assert.equal(first?.text?.length, 20_000);
+  assert.equal(first?.truncated, false);
+  assert.equal(replay.truncated, false);
   assert.ok(replay.items.length <= SESSION_REPLAY_MAX_ITEMS);
+  assert.equal(replay.nextItemOffset, SESSION_REPLAY_MAX_ITEMS);
+  const next = projectSessionReplay('session-a', [long], replay.nextItemOffset!);
+  assert.equal(next.items.length, 5);
+  assert.equal(next.nextItemOffset, null);
+  assert.equal(next.totalItems, SESSION_REPLAY_MAX_ITEMS + 5);
 });
 
 test('projects archived Codex custom tools and agent messages without opaque-item floods', () => {
