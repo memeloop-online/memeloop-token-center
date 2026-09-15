@@ -71,6 +71,8 @@ test('production overview reads each leading account once and preserves unknown 
     for (const theme of ['light', 'dark']) for (const width of [390, 1440]) {
       await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
       await page.setViewportSize({ width, height: 1000 });
+      await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'instant' }));
+      await page.screenshot({ path: `${artifacts}/overview-${theme}-${width}.png`, fullPage: true });
       const trigger = section.locator('.quota-summary').first();
       await trigger.focus();
       const tooltip = page.getByRole('tooltip'); await tooltip.waitFor();
@@ -78,7 +80,7 @@ test('production overview reads each leading account once and preserves unknown 
       assert.ok((await tooltip.innerText()).includes('20% used'));
       assert.ok((await tooltip.innerText()).includes('Remaining quota unknown'));
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
-      await page.screenshot({ path: `${artifacts}/overview-${theme}-${width}.png`, fullPage: true });
+      await page.screenshot({ path: `${artifacts}/quota-detail-${theme}-${width}.png` });
       await page.keyboard.press('Escape');
       await section.getByRole('button', { name: 'Refresh quota', exact: true }).focus();
     }
