@@ -11,6 +11,7 @@ import {
   VisualMapComponent,
 } from 'echarts/components';
 import { CanvasRenderer } from 'echarts/renderers';
+import { dataThemes } from '../design-system/dataTheme';
 
 use([
   LineChart,
@@ -40,14 +41,17 @@ interface EChartProps {
   timeZone: string;
 }
 
-const darkTheme = {
-  color: ['#68dec9', '#ff9c72', '#82aaff', '#d7a9ff', '#ffd166', '#80cbc4'],
+function chartTheme(mode: 'light' | 'dark') {
+  const colors = dataThemes[mode];
+  return {
+  color: [colors.primary, colors.negative, colors.secondary, '#9279a6', '#a98432', '#548c81'],
   backgroundColor: 'transparent',
-  textStyle: { color: '#a6bac0' },
-  legend: { textStyle: { color: '#a6bac0' } },
-  categoryAxis: { axisLine: { lineStyle: { color: '#30474e' } }, axisLabel: { color: '#82979e' }, splitLine: { lineStyle: { color: '#1d3036' } } },
-  valueAxis: { axisLine: { lineStyle: { color: '#30474e' } }, axisLabel: { color: '#82979e' }, splitLine: { lineStyle: { color: '#1d3036' } } },
-};
+  textStyle: { color: colors.muted, fontSize: 12 },
+  legend: { textStyle: { color: colors.muted, fontSize: 12 } },
+  categoryAxis: { axisLine: { lineStyle: { color: colors.border } }, axisLabel: { color: colors.muted }, splitLine: { lineStyle: { color: colors.border } } },
+  valueAxis: { axisLine: { lineStyle: { color: colors.border } }, axisLabel: { color: colors.muted }, splitLine: { lineStyle: { color: colors.border } } },
+  };
+}
 
 function currentTheme() {
   return document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
@@ -71,7 +75,7 @@ export function EChart({ ariaLabel, className = '', locale, onClick, option, tim
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
-    const chart = init(host, theme === 'dark' ? darkTheme : undefined, {
+    const chart = init(host, chartTheme(theme), {
       locale: locale === 'zh-CN' ? 'ZH' : 'EN',
       renderer: 'canvas',
     });

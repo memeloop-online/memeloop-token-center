@@ -1,9 +1,11 @@
-import { useEffect, useId, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Button } from '@fluentui/react-components';
 import { DetailTooltip } from '../../design-system';
 import { api, apiDiagnosticMessage } from '../../api';
-import { DrawerFrame, Metric, NumberMetric, RequestDiagnostics, RequestTable } from '../../components';
-import { formatDurationDisplay, formatPercent } from '../../format';
+import { DrawerFrame, RequestDiagnostics, RequestTable } from '../../components';
+import { formatDurationDisplay, formatMetricDisplay, formatPercent } from '../../format';
+import { AnalyticsMetric } from '../AnalyticsMetric';
+import { displayTimeZone } from '../../charts/displayTimeZone';
 import { useI18n } from '../../i18n';
 import type { RequestDetail, RequestEvent, RequestListResponse, RequestView, TypedFilterAst, UpstreamAccount } from '../../types';
 import type { SessionStreamState } from '../SessionMonitor';
@@ -11,7 +13,7 @@ import { queryForTenant } from '../scope/operatorShared';
 import { TypedFilterBuilder } from '../TypedFilterBuilder';
 import {
   emptyTypedFilterAst, filteredRequestRefreshDelay, mergeLiveRequestEvents, mergeRefreshedRequestPage,
-  summarizeVisibleRequests, typedFiltersActive, typedRequestQueryBody,
+  summarizeVisibleRequests, typedFiltersActive, typedRequestQueryBody, visibleRequestMetricSeries,
 } from '../traffic/requestTraffic';
 
 export function RequestsPage({ token, tenant, liveEvents, streamRevision, streamState, streamError, onOpenSessions, onOpenSession, requestFocus, onRequestFocusHandled, requestDrilldown, onRequestDrilldownHandled }: {
@@ -329,18 +331,22 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   const { locale, t } = useI18n();
   const summary = summarizeVisibleRequests(requests);
   const averageDuration = formatDurationDisplay(summary.averageDurationMs, locale);
+  const points = useMemo(() => visibleRequestMetricSeries(requests), [requests]);
+  const sampling = { timestamps: points.map(point => point.timestamp), timeZone: displayTimeZone() };
+  const count = (value: number) => formatMetricDisplay(value, locale);
   return <article className="panel request-page-surface"><div className="panel-title traffic-heading"><div><h2>{typedFiltersActive(filters) ? t('traffic.filtered') : t('traffic.live')}</h2><span>{typedFiltersActive(filters) ? t('traffic.filteredHint') : t('traffic.liveHint')}</span></div><div className="traffic-heading-actions"><div className={`request-live-state session-live-state ${streamState}`} role="status">{t(`sessions.live.${streamState}`)}</div><div className="segmented" role="group" aria-label={t('sessions.monitorMode')}><button type="button" className="active" aria-pressed="true">{t('sessions.requestsMode')}</button><button type="button" aria-pressed="false" onClick={onOpenSessions}>{t('sessions.sessionsMode')}</button></div></div></div>
     <TypedFilterBuilder ast={filters} disabled={loading} onApply={onApply} onClear={onClear} scope="requests" token={token} tenant={tenant} upstreams={upstreams} />
     {olderFilteredResultsStale && <div className="notice warning" role="status">{t('traffic.olderFilteredResultsStale')}<button type="button" className="secondary" disabled={loading} onClick={onRefreshFilteredResults}>{t('traffic.refreshFilteredResults')}</button></div>}
     {requests.length > 0 && <section className="metrics request-traffic-metrics" aria-label={t('monitoring.summary')}>
-      <NumberMetric label={t('usage.requests')} value={summary.requests} />
-      <NumberMetric label={t('traffic.success')} value={summary.successful} tone="positive" />
-      <NumberMetric label={t('traffic.failure')} value={summary.failed} tone="negative" />
-      <NumberMetric label={t('common.running')} value={summary.running} tone={summary.running > 0 ? 'pending' : undefined} />
-      {summary.unknown > 0 && <NumberMetric label={locale === 'zh-CN' ? '终态未知' : 'Outcome unknown'} value={summary.unknown} />}
-      <Metric label={locale === 'zh-CN' ? '已结束请求成功率' : 'Finished request success rate'} labelContent={<DetailTooltip content={locale === 'zh-CN' ? '仅当前已加载记录：成功 ÷（成功 + 非成功）。客户端断开、取消、中断和失败计入非成功；运行中、交付中和终态未知不进入分母。无明确终态时显示 —。' : 'Loaded records only: successful ÷ (successful + unsuccessful). Client disconnection, cancellation, interruption and failure count as unsuccessful. Running, delivering and unknown outcomes are excluded. Shows — when no terminal outcome is known.'}><span tabIndex={0}>{locale === 'zh-CN' ? '已结束请求成功率' : 'Finished request success rate'}</span></DetailTooltip>} value={formatPercent(summary.successRate, locale)} tone="positive" />
-      <Metric label={t('usage.average')} value={<span title={averageDuration.title}>{averageDuration.text}</span>} />
+      <AnalyticsMetric {...sampling} label={t('usage.requests')} value={count(summary.requests).text} title={count(summary.requests).title} trend={points.map(point => point.requests)} ratio={1} />
+      <AnalyticsMetric {...sampling} label={t('traffic.success')} value={count(summary.successful).text} title={count(summary.successful).title} tone="positive" trend={points.map(point => point.successful)} ratio={summary.successful / summary.requests} />
+      <AnalyticsMetric {...sampling} label={t('traffic.failure')} value={count(summary.failed).text} title={count(summary.failed).title} tone="negative" trend={points.map(point => point.failed)} ratio={summary.failed / summary.requests} />
+      <AnalyticsMetric {...sampling} label={t('common.running')} value={count(summary.running).text} title={count(summary.running).title} trend={points.map(point => point.running)} ratio={summary.running / summary.requests} />
+      {summary.unknown > 0 && <AnalyticsMetric {...sampling} label={locale === 'zh-CN' ? '终态未知' : 'Outcome unknown'} value={count(summary.unknown).text} title={count(summary.unknown).title} trend={points.map(point => point.unknown)} ratio={summary.unknown / summary.requests} />}
+      <AnalyticsMetric label={locale === 'zh-CN' ? '已结束请求成功率' : 'Finished request success rate'} labelContent={<DetailTooltip content={locale === 'zh-CN' ? '仅当前已加载记录：成功 ÷（成功 + 非成功）。客户端断开、取消、中断和失败计入非成功；运行中、交付中和终态未知不进入分母。无明确终态时显示 —。' : 'Loaded records only: successful ÷ (successful + unsuccessful). Client disconnection, cancellation, interruption and failure count as unsuccessful. Running, delivering and unknown outcomes are excluded. Shows — when no terminal outcome is known.'}><span tabIndex={0}>{locale === 'zh-CN' ? '已结束请求成功率' : 'Finished request success rate'}</span></DetailTooltip>} value={formatPercent(summary.successRate, locale)} ratio={summary.successRate} />
+      <AnalyticsMetric {...sampling} label={t('usage.average')} value={averageDuration.text} title={averageDuration.title} trend={points.map(point => point.averageDurationMs)} formatSample={value => { const display = formatDurationDisplay(value, locale); return display.title ?? display.text; }} />
     </section>}
+    {requests.length > 0 && <p className="request-metrics-scope">{locale === 'zh-CN' ? '仅统计当前已加载请求；背景图按接收时间展示这些记录的分布，不代表全量流量。' : 'Loaded requests only. Background charts group these records by reception time, not total traffic.'}</p>}
     {loading && requests.length === 0 ? <div className="empty" role="status">{t('common.loading')}</div> : <RequestTable requests={requests} upstreamNames={new Map(upstreams.map((account) => [account.id, account.name]))} onSelect={(request) => void onSelect(request)} onOpenSession={onOpenSession} />}
     {hasOlder && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('traffic.loadOlder')}</button></div>}
   </article>;

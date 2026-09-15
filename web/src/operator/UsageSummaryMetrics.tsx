@@ -18,7 +18,7 @@ export function UsageSummaryMetrics({ stats }: { stats: OperatorUsageAnalysis })
   const currency = summary.costs.length === 1 ? summary.costs[0].currency : undefined;
   return <section className="metrics usage-metrics" aria-label={t('usage.tab.overview')}>
     {numeric(t('usage.requests'), summary.requests, points.map((point) => point.requests))}
-    <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={t('usage.successRate')} value={formatPercent(rate, locale)} ratio={rate} tone="positive" />
+    <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={t('usage.successRate')} value={formatPercent(rate, locale)} ratio={rate} />
     {numeric(t('usage.failures'), summary.failed, points.map((point) => point.failed), 'negative')}
     <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={localSettlementLabel(locale)} labelContent={<LocalSettlementNotice />} value={summary.costs.length ? <span className="usage-cost-lines">{summary.costs.map(({ cost, currency }) => { const display = formatCurrencyDisplay(cost, currency, locale); return <span key={currency} title={display.title}>{display.text}</span>; })}</span> : '—'} formatSample={(_value, index) => { const cost = points[index].costs.find(item => item.currency === currency); return cost ? formatCurrencyDisplay(cost.cost, cost.currency, locale).title ?? '—' : '—'; }} trend={currency ? points.map((point) => point.costs.some(cost => cost.currency === currency) ? Number(point.costs.find(cost => cost.currency === currency)!.cost) : null) : undefined} />
     {numeric(t('usage.totalTokens'), totalTokens(summary), points.map(totalTokens))}

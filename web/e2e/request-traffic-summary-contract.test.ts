@@ -1,10 +1,27 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { summarizeVisibleRequests } from '../src/operator/traffic/requestTraffic.js';
+import { summarizeVisibleRequests, visibleRequestMetricSeries } from '../src/operator/traffic/requestTraffic.js';
 import type { RequestView } from '../src/types.js';
 
 let requestNumber = 0;
+
+test('metric backgrounds retain loaded-record scope and leave unknown latency gaps', () => {
+  const points = visibleRequestMetricSeries([
+    { ...request(200, 100), created_at: 1_000 },
+    { ...request(502, 300), created_at: 1_007 },
+    { ...request(null, null), created_at: 1_003 },
+  ]);
+  assert.equal(points.length, 8);
+  assert.equal(points.reduce((sum, point) => sum + point.requests, 0), 3);
+  assert.equal(points[0].successful, 1);
+  assert.equal(points[7].failed, 1);
+  assert.equal(points[3].running, 1);
+  assert.equal(points[3].averageDurationMs, null);
+  assert.equal(points[2].averageDurationMs, null);
+  assert.deepEqual(visibleRequestMetricSeries([]), []);
+  assert.equal(visibleRequestMetricSeries([request(200, 100), request(200, 200)]).length, 1);
+});
 
 function request(status_code: number | null, duration_ms: number | null): RequestView {
   return {
