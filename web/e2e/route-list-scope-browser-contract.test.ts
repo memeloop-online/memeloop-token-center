@@ -5,6 +5,8 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createIsolatedFixtureServer as createServer } from './support/isolated-vite-server.js';
 
+declare global { interface Window { routeListWrites: number } }
+
 test('route list exposes group-only candidate scope and readable models without changing routing', { timeout: 45_000 }, async () => {
   const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen(); const address = server.httpServer!.address(); assert.ok(address && typeof address !== 'string');
