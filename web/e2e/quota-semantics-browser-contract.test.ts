@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
@@ -74,5 +75,15 @@ test('failed quota refresh labels retained zeroes as historical and hides unobse
     assert.equal(await unobserved.locator('.upstream-quota-window-heading strong').count(), 0);
     assert.deepEqual(forbiddenRequests, []);
     assert.deepEqual(pageErrors, []);
+    const artifacts = fileURLToPath(new URL('../e2e-artifacts/upstream-quota/', import.meta.url));
+    await mkdir(artifacts, { recursive: true });
+    for (const theme of ['light', 'dark']) {
+      await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
+      await summary.locator('[tabindex="0"]').focus();
+      await windows.waitFor();
+      await page.screenshot({ path: `${artifacts}/quota-summary-${theme}.png` });
+      assert.equal(await summary.locator('meter').count(), 0, 'themed Fluent component, not a browser-colored native meter');
+      await page.keyboard.press('Escape');
+    }
   } finally { await browser.close(); await server.close(); }
 });
