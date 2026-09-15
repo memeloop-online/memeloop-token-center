@@ -2,6 +2,7 @@ import { useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { I18nProvider } from '../../src/i18n';
 import { SessionMonitor } from '../../src/operator/SessionMonitor';
+import { MtcFluentProvider } from '../../src/design-system';
 import { enqueueSessionEventIdentity } from '../../src/operator/sessionRefresh';
 import type { LogicalSessionDetail, LogicalSessionSummary, RequestArchiveState, RequestEventKind } from '../../src/types';
 import '../../src/styles.css';
@@ -53,6 +54,18 @@ const sessionRequests: Record<string, LogicalSessionDetail['requests']> = {
     },
   }],
 };
+if (new URLSearchParams(location.search).has('titles')) {
+  session.session_name = null;
+  session.last_activity_at = 2_000;
+  session.requests = 2;
+  const base = sessionRequests[session.session_id]![0]!;
+  sessionRequests[session.session_id] = [
+    { ...base, request_id: 'newer-name', created_at: 2_000, session_context: { ...base.session_context!, session_name: 'Current context name' } },
+    { ...base, request_id: 'older-name', created_at: 1_000, session_context: { ...base.session_context!, session_name: null }, execution: {
+      session_name: 'Older execution name', trace_id: null, span_id: null, parent_span_id: null, agent_id: null, parent_agent_id: null, task_kind: null, labels: {}, source: 'declared',
+    } },
+  ];
+}
 window.fetch = async (input) => {
   const url = String(input);
   if (url.includes('/keys?')) return new Response(JSON.stringify([]));
@@ -92,7 +105,7 @@ function Fixture() {
     queue(keyId, sessionId, requestId, eventKind, archiveState);
     setRevision((value) => value + 1);
   };
-  return <I18nProvider><main className="main">
+  return <I18nProvider><MtcFluentProvider><main className="main">
     <button onClick={() => queue('fixture-key', 'fixture-session', 'queued-before-scope-change')}>Queue stale session event</button>
     <button onClick={() => emit('fixture-key', 'fixture-session')}>Simulate session event</button>
     <button onClick={() => emit('other-key', 'fixture-session')}>Simulate other credential event</button>
@@ -100,6 +113,6 @@ function Fixture() {
     <button onClick={() => emit('fixture-key', 'fixture-session', 'archived-fixture-request', 'archive_bound', 'pending')}>Simulate archive bound event</button>
     <button onClick={() => emit('fixture-key', 'confirmed-session', 'projected-fixture-request', 'projected')}>Simulate confirmed projection</button>
     <SessionMonitor token="fixture-only" tenant="default" revision={revision} eventKeyIds={keys} streamState="live" onSelectRequest={async () => {}} />
-  </main></I18nProvider>;
+  </main></MtcFluentProvider></I18nProvider>;
 }
 createRoot(document.getElementById('root')!).render(<Fixture />);

@@ -31,6 +31,8 @@ test('live refresh is explicitly opt-in, rate-limited and does not interrupt det
   assert.match(source, /if \(!autoRefreshRef\.current \|\| refreshTimer/);
   assert.match(source, /}, 3_000\)/);
   assert.match(source, /checked=\{autoRefresh\}/);
+  assert.match(source, /<Checkbox checked=\{autoRefresh\}/);
+  assert.match(source, /<Button appearance="secondary" disabled=\{loading \|\| refreshing \|\| detailLoading\}/);
   assert.match(source, /if \(!session \|\| detailInFlight\.current\) return/);
   assert.match(source, /sessions\.refreshNow/);
 });

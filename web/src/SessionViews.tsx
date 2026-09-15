@@ -1,10 +1,11 @@
 import { DrawerFrame } from './components.js';
-import { DetailTooltip, Disclosure } from './design-system';
+import { Button, DetailTooltip, Disclosure } from './design-system';
 import type { CSSProperties } from 'react';
 import { formatCurrencyDisplay, formatMetricDisplay, formatDurationDisplay, formatPercent } from './format.js';
 import type { Locale } from './i18n.js';
 import { useI18n } from './i18n.js';
 import { deriveSemanticExecution } from './sessionSemantics.js';
+import { latestDeclaredSessionName, sessionFallback, unnamedSessionName } from './sessionTitles.js';
 import { SessionReplayPanel, type SessionReplayArchiveLoader } from './sessionReplayViews.js';
 import type { ConversationRequest, LogicalSessionDetail, LogicalSessionSummary, RequestView, UsageAnalysisCost } from './types.js';
 
@@ -168,7 +169,7 @@ export function SessionList({ values, loading, showCredential, onSelect, selecte
   if (!values.length) return <div className="empty">{loading ? t('common.loading') : t('sessions.empty')}</div>;
   if (layout === 'sidebar') return <div className="session-list session-list-sidebar" aria-label={t('sessions.recent')}>
     {values.map((session) => {
-      const title = session.unlinked ? t('sessions.unlinkedRequests') : session.session_name || t('sessions.displayNameFallback', { id: session.session_id.slice(-8) });
+      const title = session.unlinked ? t('sessions.unlinkedRequests') : session.session_name?.trim() || unnamedSessionName(t, locale, session.last_activity_at, session.key_alias.trim() || session.key_id);
       const isSelected = selected?.session_id === session.session_id && selected?.key_id === session.key_id;
       return <article className="session-card session-sidebar-card" key={`${session.key_id}:${session.session_id}`}>
         <button type="button" className={`session-sidebar-item${isSelected ? ' selected' : ''}`} onClick={() => onSelect(session)} aria-pressed={isSelected} aria-label={t('sessions.open', { name: title })}>
@@ -182,7 +183,7 @@ export function SessionList({ values, loading, showCredential, onSelect, selecte
   return <div className="session-list">{values.map((session) => {
     const title = session.unlinked
       ? t('sessions.unlinkedRequests')
-      : session.session_name || t('sessions.displayNameFallback', { id: session.session_id.slice(-8) });
+      : session.session_name?.trim() || unnamedSessionName(t, locale, session.last_activity_at, session.key_alias.trim() || session.key_id);
     return <article className="session-card" key={`${session.key_id}:${session.session_id}`}>
       <div className="session-card-heading"><b>{title}</b><span>{session.task_kind && <span className="pill">{session.task_kind}</span>}<span className={`status ${statusTone(session.last_status)}`}>{t(`sessions.status.${session.last_status}`)}</span></span></div>
       {session.unlinked && <span className="session-unlinked-label">{t('sessions.unlinkedReason')}</span>}
@@ -288,11 +289,12 @@ export function SessionDetailSurface({ detail, summary, currency, showDiagnostic
   loadReplayArchive?: SessionReplayArchiveLoader;
 }) {
   const { locale, t } = useI18n();
-  const declaredSessionName = [...detail.requests].reverse().find((request) => request.execution?.session_name)?.execution?.session_name;
+  const declaredSessionName = latestDeclaredSessionName(detail);
   const reportedSessionId = [...detail.requests].reverse().find((request) => request.structure?.session_id)?.structure?.session_id;
+  const fallback = sessionFallback(detail, summary);
   const title = detail.unlinked
     ? t('sessions.unlinkedRequests')
-    : declaredSessionName || summary?.session_name || t('sessions.displayNameFallback', { id: detail.session_id.slice(-8) });
+    : declaredSessionName || summary?.session_name?.trim() || unnamedSessionName(t, locale, fallback.time, fallback.credential);
   const confirmedEdges = detail.edges.filter((edge) => edge.relation !== 'candidate');
   const candidateEdges = detail.edges.filter((edge) => edge.relation === 'candidate');
   const requestPositions = new Map(detail.requests.map((request, index) => [request.request_id, { index: index + 1, createdAt: request.created_at }]));
@@ -302,11 +304,11 @@ export function SessionDetailSurface({ detail, summary, currency, showDiagnostic
     return request ? t('sessions.timelinePoint', { index: request.index, time: new Date(request.createdAt).toLocaleString(locale) }) : t('sessions.timelineRequest');
   };
   return <section className="session-detail" aria-label={title}>
-    <header className="session-detail-heading"><div><span className="eyebrow">{t('sessions.logicalSession')}</span><h2>{title}</h2>{detail.unlinked && <p className="mtc-secondary-text">{t('sessions.unlinkedDetail')}</p>}</div>{onClose && <button type="button" className="secondary" onClick={onClose} aria-label={t('common.close')}>×</button>}</header>
+    <header className="session-detail-heading"><div><span className="eyebrow">{t('sessions.logicalSession')}</span><h2>{title}</h2>{detail.unlinked && <p className="mtc-secondary-text">{t('sessions.unlinkedDetail')}</p>}</div>{onClose && <Button appearance="secondary" onClick={onClose} aria-label={t('common.close')}>×</Button>}</header>
     {showDiagnosticIds && <div className="session-diagnostics"><Disclosure title={t('sessions.diagnostics')}><code className="break-anywhere">{detail.session_id}</code><CopyDiagnostic value={detail.session_id} kind="session" />{reportedSessionId && <><small>{t('sessions.reportedSession')}</small><code className="break-anywhere">{reportedSessionId}</code><CopyDiagnostic value={reportedSessionId} kind="session" /></>}</Disclosure></div>}
     {!(detail.unlinked && detail.session_id.startsWith('unlinked:')) && <SessionReplayPanel detail={detail} scopeKey={summary?.key_id ?? detail.session_id} loadArchiveDetail={loadReplayArchive} onLoadEarlierRequests={onLoadOlder} loadingEarlier={loading} />}
     <Disclosure title={t('sessions.executionTimeline')} defaultOpen={detail.unlinked}><SessionActivity detail={detail} summary={summary} currency={currency} loading={loading} onSelect={onSelect} /></Disclosure>
-    {detail.has_more && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('sessions.loadEarlier')}</button></div>}
+    {detail.has_more && <div className="load-more"><Button appearance="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('sessions.loadEarlier')}</Button></div>}
     {!detail.unlinked && <Disclosure title={t('sessions.semantic')}><SemanticExecutionPanel detail={detail} /></Disclosure>}
     <details className="session-relationships"><summary>{t('sessions.relationships')}</summary>{detail.edges_truncated && <div className="notice warning">{t('sessions.edgesTruncated')}</div>}<div className="edge-list">{confirmedEdges.map((edge) => <div className="edge" key={`${edge.from_request_id ?? 'root'}-${edge.to_request_id}-${edge.relation}`}>
       <span className="status ok">{t(`conversationRelation.${edge.relation}`)}</span>
@@ -328,11 +330,12 @@ export function SessionDrawer({ detail, summary, currency, showDiagnosticIds = f
   onSelect: (request: RequestView) => void;
   onClose: () => void;
 }) {
-  const { t } = useI18n();
-  const declaredSessionName = [...detail.requests].reverse().find((request) => request.execution?.session_name)?.execution?.session_name;
+  const { locale, t } = useI18n();
+  const declaredSessionName = latestDeclaredSessionName(detail);
+  const fallback = sessionFallback(detail, summary);
   const title = detail.unlinked
     ? t('sessions.unlinkedRequests')
-    : declaredSessionName || summary?.session_name || t('sessions.displayNameFallback', { id: detail.session_id.slice(-8) });
+    : declaredSessionName || summary?.session_name?.trim() || unnamedSessionName(t, locale, fallback.time, fallback.credential);
   return <DrawerFrame title={title} eyebrow={t('sessions.logicalSession')} onClose={onClose}>
     <SessionDetailSurface detail={detail} summary={summary} currency={currency} showDiagnosticIds={showDiagnosticIds} loading={loading} onLoadOlder={onLoadOlder} onSelect={onSelect} />
   </DrawerFrame>;
