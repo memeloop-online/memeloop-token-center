@@ -354,16 +354,16 @@ fn finish_reclamation(
     inode_marker: &str,
 ) -> io::Result<()> {
     use rustix::fs::{AtFlags, unlinkat};
+    match unlinkat(parent, quarantine, AtFlags::REMOVEDIR) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+        Err(error) => return Err(error.into()),
+    }
+    rustix::fs::fsync(parent)?;
     for marker in [owner_marker, inode_marker] {
         match unlinkat(parent, marker, AtFlags::empty()) {
             Ok(()) | Err(rustix::io::Errno::NOENT) => {}
             Err(error) => return Err(error.into()),
         }
-    }
-    rustix::fs::fsync(parent)?;
-    match unlinkat(parent, quarantine, AtFlags::REMOVEDIR) {
-        Ok(()) | Err(rustix::io::Errno::NOENT) => {}
-        Err(error) => return Err(error.into()),
     }
     rustix::fs::fsync(parent)?;
     match unlinkat(parent, completion_marker, AtFlags::empty()) {
