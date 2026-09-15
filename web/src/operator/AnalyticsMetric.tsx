@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react';
+import { useId, useState, type ReactNode } from 'react';
 import { Tooltip } from '../design-system';
 import { useI18n } from '../i18n';
 import { formatNumber } from '../format';
@@ -11,6 +11,7 @@ export function AnalyticsMetric({ label, labelContent, value, title, tone = '', 
   timestamps?: readonly number[]; timeZone?: string; formatSample?: (value: number | null, index: number) => string;
 }) {
   const { locale } = useI18n();
+  const summaryId = useId();
   const [index, setIndex] = useState<number>();
   const interactive = Boolean(trend?.length && timestamps?.length === trend.length);
   const selected = index === undefined ? 0 : Math.min(index, (trend?.length ?? 1) - 1);
@@ -23,7 +24,7 @@ export function AnalyticsMetric({ label, labelContent, value, title, tone = '', 
   // Supplemental label details own their focus/tap; do not also activate the trend.
   const isLabelDetail = (target: EventTarget) => labelContent !== undefined && target instanceof Element && Boolean(target.closest('.metric-label'));
   const card = <div className={`metric analytics-metric ${tone}`} tabIndex={interactive ? 0 : undefined}
-    role={interactive ? 'slider' : undefined} aria-label={interactive ? label : undefined}
+    role={interactive ? 'slider' : undefined} aria-label={interactive ? label : undefined} aria-describedby={interactive ? summaryId : undefined}
     aria-valuemin={interactive ? 1 : undefined} aria-valuemax={interactive ? trend!.length : undefined} aria-valuenow={interactive ? selected + 1 : undefined} aria-valuetext={interactive ? detail : undefined}
     onFocus={event => { if (interactive) setIndex(event.target === event.currentTarget ? 0 : undefined); }} onBlur={() => setIndex(undefined)}
     onPointerMove={event => { if (isLabelDetail(event.target)) { setIndex(undefined); return; } if (interactive) { const bounds = event.currentTarget.getBoundingClientRect(); setIndex(Math.max(0, Math.min(trend!.length - 1, Math.round((event.clientX - bounds.left) / bounds.width * (trend!.length - 1))))); } }}
@@ -33,7 +34,7 @@ export function AnalyticsMetric({ label, labelContent, value, title, tone = '', 
     {area ? <svg className="analytics-metric-trend" viewBox="0 0 200 48" preserveAspectRatio="none" aria-hidden="true" data-samples={trend?.length}><path d={area} /></svg>
       : share !== undefined && <span className="analytics-metric-ratio" aria-hidden="true" data-ratio={share} style={{ width: `${share * 100}%` }} />}
     <span className="metric-label">{labelContent ?? label}</span>
-    <strong className="metric-value" title={title}>{value}</strong>
+    <strong id={summaryId} className="metric-value" title={title}>{value}</strong>
     {note && <span className="analytics-metric-note">{note}</span>}
     {interactive && index !== undefined && <span className="analytics-metric-cursor" aria-hidden="true" style={{ left: `${selected / Math.max(1, trend!.length - 1) * 100}%` }} />}
   </div>;
