@@ -52,7 +52,13 @@ test('route account metadata, explicit help and access preview preserve the exac
     for (const [width, theme] of [[390, 'light'], [1440, 'dark']] as const) {
       await page.setViewportSize({ width, height: 1000 }); await page.evaluate(theme => { document.documentElement.dataset.theme = theme; }, theme);
       const help = page.getByRole('button', { name: '协议兼容性说明', exact: true });
-      await help.focus(); await page.getByRole('tooltip').waitFor(); await page.keyboard.press('Escape');
+      // Escape dismisses the detail but retains focus after the previous tap.
+      // Re-enter through keyboard navigation so every viewport gets a real focus event.
+      await help.focus(); await help.press('Shift+Tab'); await page.keyboard.press('Tab');
+      assert.equal(await help.evaluate(element => element === document.activeElement), true);
+      await page.getByRole('tooltip').waitFor();
+      assert.match(await page.getByRole('tooltip').innerText(), /保存时检查候选上游的协议兼容性/);
+      await page.keyboard.press('Escape');
       await help.tap(); const tip = page.getByRole('tooltip'); await tip.waitFor();
       const bounds = await tip.boundingBox(); assert.ok(bounds && bounds.x >= -1 && bounds.x + bounds.width <= width + 1);
       await page.keyboard.press('Escape');
