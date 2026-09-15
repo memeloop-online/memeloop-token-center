@@ -38,19 +38,19 @@ async fn postgres_gc_holds_budget_only_for_one_bounded_batch_then_producer_progr
         .unwrap();
     assert!(fixture.db.begin_response_archive_spool(live).await.unwrap());
 
-    // Freeze GC while it owns the budget and updates the selected spool. This
-    // makes the canonical budget -> spool order observable without relying on
-    // timing from a shared CI PostgreSQL server.
+    // Freeze GC during its final budget decrement. The budget row is already
+    // locked before its BEFORE UPDATE trigger runs, so a producer can finish
+    // request-local work but must queue at its own final budget increment.
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE FUNCTION pause_expired_spool_gc() RETURNS trigger LANGUAGE plpgsql AS $body$ BEGIN
-             IF OLD.request_id = '{}' AND NEW.cipher_bytes < OLD.cipher_bytes THEN
+             IF NEW.cipher_bytes < OLD.cipher_bytes THEN
                  PERFORM pg_advisory_xact_lock({});
              END IF;
              RETURN NEW;
          END $body$;
-         CREATE TRIGGER pause_expired_spool_gc BEFORE UPDATE ON response_archive_spools
+         CREATE TRIGGER pause_expired_spool_gc BEFORE UPDATE ON response_archive_spool_budget
          FOR EACH ROW EXECUTE FUNCTION pause_expired_spool_gc();",
-        fixture.id.request_id, fixture.gate
+        fixture.gate
     )))
     .execute(&fixture.db.pool)
     .await
@@ -66,7 +66,7 @@ async fn postgres_gc_holds_budget_only_for_one_bounded_batch_then_producer_progr
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let waiting: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND UPPER(query) LIKE 'UPDATE RESPONSE_ARCHIVE_SPOOLS%' AND wait_event_type = 'Lock' AND wait_event = 'advisory'",
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND UPPER(query) LIKE 'UPDATE RESPONSE_ARCHIVE_SPOOL_BUDGET SET CIPHER_BYTES = CIPHER_BYTES -%' AND wait_event_type = 'Lock' AND wait_event = 'advisory'",
             )
             .bind(&fixture.schema)
             .fetch_one(&fixture.admin)
@@ -94,7 +94,7 @@ async fn postgres_gc_holds_budget_only_for_one_bounded_batch_then_producer_progr
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let waiting: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND UPPER(query) LIKE 'SELECT CIPHER_BYTES%FROM RESPONSE_ARCHIVE_SPOOL_BUDGET%FOR UPDATE%' AND wait_event_type = 'Lock'",
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND UPPER(query) LIKE 'UPDATE RESPONSE_ARCHIVE_SPOOL_BUDGET SET CIPHER_BYTES = CIPHER_BYTES +%' AND wait_event_type = 'Lock'",
             )
             .bind(&fixture.schema)
             .fetch_one(&fixture.admin)
@@ -232,7 +232,7 @@ async fn postgres_large_tiny_chunk_and_audit_inventory_has_bounded_indexed_gc() 
 }
 
 #[tokio::test]
-async fn postgres_gc_waits_for_budget_before_locking_spool_then_reclaims() {
+async fn postgres_gc_locks_spool_before_waiting_for_budget_then_reclaims() {
     let Some(fixture) = PgFixture::new().await else {
         return;
     };
@@ -269,7 +269,7 @@ async fn postgres_gc_waits_for_budget_before_locking_spool_then_reclaims() {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let waiting: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND UPPER(query) LIKE 'SELECT CIPHER_BYTES%FROM RESPONSE_ARCHIVE_SPOOL_BUDGET%FOR UPDATE%' AND wait_event_type = 'Lock'",
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND UPPER(query) LIKE 'UPDATE RESPONSE_ARCHIVE_SPOOL_BUDGET SET CIPHER_BYTES = CIPHER_BYTES -%' AND wait_event_type = 'Lock'",
             )
             .bind(&fixture.schema)
             .fetch_one(&fixture.admin)
@@ -282,15 +282,19 @@ async fn postgres_gc_waits_for_budget_before_locking_spool_then_reclaims() {
         }
     })
     .await
-    .expect("GC must queue on the canonical budget-first lock");
+    .expect("GC must queue at its final budget decrement");
     let mut spool_probe = fixture.db.pool.begin().await.unwrap();
-    sqlx::query(
+    let spool_error = match sqlx::query(
         "SELECT request_id FROM response_archive_spools WHERE request_id = $1 FOR UPDATE NOWAIT",
     )
     .bind(fixture.id.request_id.to_string())
     .fetch_one(&mut *spool_probe)
     .await
-    .expect("GC waiting for budget must not lock or delete from the spool first");
+    {
+        Ok(_) => panic!("GC must lock its request-local spool before the final budget decrement"),
+        Err(error) => error,
+    };
+    assert!(spool_error.as_database_error().is_some());
     spool_probe.rollback().await.unwrap();
     assert!(
         !gc.is_finished(),
