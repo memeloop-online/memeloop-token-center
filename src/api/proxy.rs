@@ -516,6 +516,7 @@ async fn next_sendable_proxy_route(
 
 struct NonSseProxyResponseInput<'buffered, 'state, 'attempt> {
     buffered_request: &'buffered BufferedRequest<'state>,
+    selected_driver: &'buffered str,
     upstream: UpstreamResponse,
     status: StatusCode,
     content_type: Option<HeaderValue>,
@@ -531,6 +532,7 @@ async fn finish_non_sse_proxy_response(
 ) -> Result<Response, AppError> {
     let NonSseProxyResponseInput {
         buffered_request,
+        selected_driver,
         upstream,
         status,
         content_type,
@@ -586,7 +588,11 @@ async fn finish_non_sse_proxy_response(
         return result;
     }
     let usage = if capture_json_usage {
-        match extract_usage_checked(&response_body) {
+        match response_metadata::extract_buffered_usage_checked(
+            &response_body,
+            selected_driver,
+            protocol,
+        ) {
             ExtractedUsage::Valid(usage) => {
                 (usage, crate::model::RequestUsageBasis::ProviderReported)
             }
@@ -1490,6 +1496,7 @@ pub(in crate::api) async fn proxy_with_identity(
         let selected_output_token_ceiling = buffered_request.output_token_ceiling;
         return finish_non_sse_proxy_response(NonSseProxyResponseInput {
             buffered_request: &buffered_request,
+            selected_driver: active_route.route.driver.as_str(),
             upstream,
             status,
             content_type,

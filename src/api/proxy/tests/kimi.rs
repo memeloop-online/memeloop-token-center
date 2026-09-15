@@ -1,5 +1,7 @@
 use super::*;
 
+mod buffered_usage;
+
 #[tokio::test]
 async fn translated_kimi_clean_eof_and_done_settle_and_archive_once() {
     for with_done in [false, true] {
