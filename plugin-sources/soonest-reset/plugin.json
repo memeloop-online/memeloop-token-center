@@ -1,0 +1,23 @@
+{
+  "id": "mtc-soonest-reset",
+  "version": "1.0.0",
+  "wit_version": "0.2.0",
+  "wasm": "plugin.wasm",
+  "capabilities": [{"kind": "group_routing_quota"}],
+  "contributions": {
+    "group_routing": {
+      "version": "group-routing-v1",
+      "health_policy": "native",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["target_provider", "target_window_id"],
+        "properties": {
+          "target_provider": {"type": "string", "maxLength": 128, "title": "Exact provider driver (empty disables preference)"},
+          "target_window_id": {"type": "string", "maxLength": 512, "title": "Exact quota window ID (empty disables preference)"}
+        }
+      },
+      "default": {"target_provider": "", "target_window_id": ""}
+    }
+  }
+}
