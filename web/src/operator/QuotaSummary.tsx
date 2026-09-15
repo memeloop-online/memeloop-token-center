@@ -29,7 +29,7 @@ export function QuotaSummary({ snapshot, refreshFailed = false, now: suppliedNow
     name: highest && snapshot ? label(snapshot.provider, highest) : '',
     percent: formatPercent(presentation.usedPercent === null ? null : presentation.usedPercent / 100, locale),
   });
-  if (!snapshot || quotaObservationState(snapshot, now, refreshFailed) === 'unobserved' || snapshot.status === 'unsupported' || !snapshot.windows.length) return <span>{text}</span>;
+  if (!snapshot || quotaObservationState(snapshot, now, refreshFailed) === 'unobserved' || snapshot.status === 'unsupported' || !snapshot.windows.length) return <span className="quota-summary-status">{text}</span>;
   const historical = quotaObservationState(snapshot, now, refreshFailed) === 'historical';
   const remainingText = (window: UpstreamQuotaSnapshot['windows'][number]) => {
     const remaining = quotaRemaining(window);

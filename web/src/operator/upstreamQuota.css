@@ -32,6 +32,8 @@
 .quota-summary-tooltip li strong { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .overview-upstream-quota { margin-block: 24px; }
 .overview-upstream-quota > .panel-title { margin-bottom: 16px; }
-.overview-quota-metrics .quota-summary { white-space: normal; font-size: var(--fontSizeBase300, 14px); line-height: var(--lineHeightBase300, 20px); font-weight: var(--fontWeightRegular, 400); }
+.overview-quota-metrics .quota-summary,
+.overview-quota-metrics .quota-summary-status { display: block; white-space: normal; overflow-wrap: anywhere; font-size: var(--fontSizeBase300, 14px); line-height: var(--lineHeightBase300, 20px); font-weight: var(--fontWeightRegular, 400); }
+.overview-quota-metrics .quota-summary { display: grid; }
 .overview-quota-metrics .quota-summary-value { font-size: var(--fontSizeBase600, 24px); line-height: var(--lineHeightBase600, 32px); font-weight: var(--fontWeightSemibold, 600); }
 .quota-summary-provenance { color: var(--colorNeutralForeground2, #a6bac0); font-size: var(--fontSizeBase200, 12px); }

@@ -71,6 +71,7 @@ test('production overview reads each leading account once and preserves unknown 
     for (const theme of ['light', 'dark']) for (const width of [390, 1440]) {
       await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
       await page.setViewportSize({ width, height: 1000 });
+      assert.equal(await section.locator('.metric-value').evaluateAll(elements => elements.some(element => element.scrollWidth > element.clientWidth)), false, 'unknown status text must wrap inside its metric, not be clipped');
       await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'instant' }));
       await page.screenshot({ path: `${artifacts}/overview-${theme}-${width}.png`, fullPage: true });
       const trigger = section.locator('.quota-summary').first();
