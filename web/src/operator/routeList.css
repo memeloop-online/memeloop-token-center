@@ -1,0 +1,4 @@
+.model-route-list .route-model-name { color: var(--colorNeutralForeground1); font-weight: 600; overflow-wrap: anywhere; }
+.route-list-source { display: grid; gap: 4px; min-width: 0; }
+.route-list-source-name { color: var(--colorNeutralForeground1); overflow-wrap: anywhere; }
+.route-list-source-range { color: var(--colorNeutralForeground2); cursor: help; width: fit-content; }
