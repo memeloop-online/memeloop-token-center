@@ -8,8 +8,8 @@ let requestNumber = 0;
 
 test('metric backgrounds retain loaded-record scope and leave unknown latency gaps', () => {
   const points = visibleRequestMetricSeries([
-    { ...request(200, 100), created_at: 1_000 },
-    { ...request(502, 300), created_at: 1_007 },
+    { ...request(200, 100), created_at: 1_000, completed_at: 1_100 },
+    { ...request(502, 300), created_at: 1_007, completed_at: 1_307 },
     { ...request(null, null), created_at: 1_003 },
   ]);
   assert.equal(points.length, 8);
