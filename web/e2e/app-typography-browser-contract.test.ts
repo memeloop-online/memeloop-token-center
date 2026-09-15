@@ -82,6 +82,9 @@ test('production AppShell typography and actions share Fluent tokens in both the
       assert.equal(typography.overflow, false);
       assert.equal(await load.evaluate(element => element === document.activeElement), true);
       assert.equal(await page.locator('.segmented .fui-ToggleButton[aria-pressed="true"]').count(), 1);
+      // Focus below the fold scrolls the viewport. Return to the top before a
+      // full-page capture so fixed shell elements are not painted mid-page.
+      await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'instant' }));
       await page.screenshot({ path: `${artifacts}/requests-${theme}-${width}.png`, fullPage: true });
     }
     assert.deepEqual(unexpected, []);
