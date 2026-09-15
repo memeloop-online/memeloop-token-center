@@ -202,7 +202,13 @@ impl From<sqlx::Error> for AppError {
             error_kind = sqlx_error_kind(&error),
             "database operation failed"
         );
-        Self::Internal
+        match error {
+            // Pool exhaustion is a bounded, retryable capacity failure. Keeping
+            // it distinct from corrupt data and programmer errors prevents a
+            // saturated pool from surfacing as a misleading HTTP 500.
+            sqlx::Error::PoolTimedOut => Self::Overloaded,
+            _ => Self::Internal,
+        }
     }
 }
 
@@ -318,6 +324,20 @@ mod tests {
         assert_eq!(body["error"]["code"], "rate_limit_exceeded");
         assert_eq!(body["error"]["reason"], "rpm_exhausted");
         assert_eq!(body["error"]["retryable"], true);
+    }
+
+    #[tokio::test]
+    async fn database_pool_timeout_is_retryable_overload() {
+        let error = AppError::from(sqlx::Error::PoolTimedOut);
+        assert_eq!(error.diagnostic_category(), "overloaded");
+
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "service_overloaded");
     }
 
     #[tokio::test]
