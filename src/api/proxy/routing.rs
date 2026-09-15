@@ -210,6 +210,13 @@ pub(super) async fn send_proxy_route(
     candidate_rank: usize,
     outbound_attempt: usize,
 ) -> Result<ProxyRouteResponse, ProxySendError> {
+    // Catalog/quota support does not implement Cursor's AgentService Run
+    // conversation protocol. Never send its OAuth token and an OpenAI payload
+    // through the generic HTTP fallback. This is a local, undispatched skip,
+    // not supplier failure or evidence that a retry would consume tokens.
+    if route.route.driver == crate::cursor_native::DRIVER {
+        return Err(ProxySendError::CandidateUnavailable);
+    }
     if route.is_codex() {
         return codex::send_proxy_route(
             state,

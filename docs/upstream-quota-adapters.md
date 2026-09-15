@@ -3,7 +3,8 @@
 The read endpoint is on demand, not a worker poll. Cache freshness is 30 seconds,
 failed reads are backed off 10 seconds, stale evidence expires after 5 minutes.
 At most four accounts refresh concurrently, one refresh per account generation,
-128 cache entries, 8 seconds per refresh, and 1 MiB per response. Cache identity
+128 cache entries, 8 seconds per refresh, and 1 MiB per JSON response (Cursor's
+bounded protobuf transport permits 2 MiB per response). Cache identity
 includes tenant UUID, authorized canonical external tenant ID, account ID,
 credential generation and account update time; renames cannot reuse stale labels.
 Reads do not
@@ -18,6 +19,7 @@ it is not a supplier mutation or a generic assertion that the account is healthy
 | openai-codex | WHAM usage and reset-credit GET endpoints | Supplier plan; workspace null | Percent used only; absolute amounts and unit null | Supplier instant or marked estimate | Per Codex credit status/granted/expiry, source `codex_reset_credits`, with no identifier or secret | Null, capability false |
 | kimi-oauth | Kimi coding v1 usages GET | Null; capability false | Total/used/remaining when supplied or safely derived; unit null because the supplier field has no verified unit contract | Supplier instant or marked relative estimate | Unsupported | Unsupported |
 | google-antigravity | `retrieveUserQuotaSummary` POST, read-only project query | Null; capability false | Percent used from supplier remaining fraction; absolute amounts and unit null | Exact supplier RFC3339 instant; cadence only from explicit window metadata | Unsupported | Unsupported |
+| cursor | Native DashboardService `GetCurrentPeriodUsage` and optional `GetPlanInfo` | Optional supplier plan name; workspace null | Personal included/Auto/API percent only; absolute amounts and unit unknown | Exact supplier epoch-millisecond billing-cycle end, with optional PlanInfo fallback | Unsupported | Unsupported |
 | Other drivers | No network call | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported |
 
 Capabilities describe implemented fields, not current sample availability. Missing
@@ -46,6 +48,33 @@ Integer JSON numbers and integer strings use identical parsing. Window duration
 and units fall back in order from window metadata to item metadata to detail.
 
 ## Reference and differences
+
+### Cursor personal plan projection
+
+See [native protocol provenance and transport](cursor-native-protocol.md).
+The independent parser follows the first-party generated DashboardService wire
+definitions and `1931.index.js`'s `src/usage/usage-data.ts`. It uses only the
+personal `plan_usage` message; missing personal usage reports
+`quota_usage_unavailable`, not zero usage or enterprise/team aggregation.
+Optional `total_percent_used` is authoritative when present and valid; otherwise
+the ratio uses explicitly present `included_spend / limit`, with a positive
+limit. It never substitutes `total_spend`. Auto/API percentages are emitted only
+when their optional double fields are explicitly supplied, including real zero.
+Missing scalars remain unknown even when a generated proto3 object would default
+them to zero. Non-finite/negative percentages cannot establish an observation.
+
+Billing-cycle end is epoch milliseconds, not token expiry or a fixed monthly
+duration. A positive current-usage end wins over the optional PlanInfo fallback;
+no cadence, subscription expiry, remaining money or routing health is inferred.
+The optional plan read has a three-second sub-budget; its failure does not erase
+successful usage evidence. All reads remain under the shared overall deadline,
+tenant/credential-generation cache and bounded stale fallback.
+
+First-party code converts **spend-limit** amounts from cents to dollars, but does
+not prove the unit of `PlanUsage` fields. This minimal adapter therefore exposes
+percentages only and leaves amounts/units unknown. It does not call GetHardLimit,
+infer on-demand limits/unlimited spending, consume reset credits, refresh OAuth,
+or issue model traffic. Reset implementation/preparation remain unavailable.
 
 Reference: [CPA management UI](https://github.com/router-for-me/Cli-Proxy-API-Management-Center),
 revision `f4b304365142bc9dd151e79539a409b9a05bfa70`, specifically

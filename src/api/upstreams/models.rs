@@ -336,6 +336,16 @@ async fn discover_models(
     credential: &UpstreamCredential,
     blocking: Option<&crate::worker::BlockingTasks>,
 ) -> Result<(&'static str, Vec<DiscoveredUpstreamModel>), &'static str> {
+    // Native Cursor credentials never enter a compatibility/plugin catalog.
+    if account.driver == crate::cursor_native::DRIVER {
+        let body = crate::cursor_native::unary(
+            state,
+            credential,
+            crate::cursor_native::Method::UsableModels,
+        )
+        .await?;
+        return crate::cursor_native::models::decode(&body).map(|models| ("cursor_native", models));
+    }
     let plugins = state.plugins.clone();
     let driver = account.driver.clone();
     let config = account.config.clone();

@@ -6,6 +6,7 @@ mod codex_clients;
 pub mod config;
 pub mod conversation;
 pub mod crypto;
+mod cursor_native;
 pub mod db;
 pub mod error;
 pub mod filter_ast;
