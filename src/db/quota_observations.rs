@@ -154,12 +154,22 @@ impl Database {
         while let Some(row) = rows.try_next().await? {
             let json: String = row.try_get("observation_json")?;
             bytes = bytes.saturating_add(json.len());
-            if json.len() > 64 * 1024 || bytes > 1024 * 1024 {
-                return Err(AppError::Internal);
+            if bytes > crate::plugin::routing::MAX_GROUP_ROUTING_JSON_BYTES {
+                tracing::warn!(
+                    stage = "quota_observation_payload_limit",
+                    bytes,
+                    budget = crate::plugin::routing::MAX_GROUP_ROUTING_JSON_BYTES,
+                    account_count = candidates.len(),
+                    "quota observations exceed existing routing input budget; using native routing"
+                );
+                return Err(AppError::BadRequest(
+                    "quota_observation_payload_limit".into(),
+                ));
             }
             let value: RoutingQuotaObservation =
                 serde_json::from_str(&json).map_err(|_| AppError::Internal)?;
-            if value.observed_at <= now
+            if value.observed_at >= 0
+                && value.observed_at <= now
                 && value.valid_until > now
                 && value.windows.len() <= 64
                 && value.windows.iter().all(|window| {

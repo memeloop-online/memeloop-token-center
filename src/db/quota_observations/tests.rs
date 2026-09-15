@@ -79,8 +79,9 @@ async fn verify(config: Config) {
         .await
         .unwrap();
     let group = Uuid::now_v7();
+    let plugin_id = format!("quota-fixture-{group}");
     sqlx::query("INSERT INTO route_groups (id,tenant_id,name,normalized_name,created_at,updated_at,routing_strategy,routing_priority,strategy_version) VALUES ($1,$2,'quota','quota',1,1,$3,0,1)")
-        .bind(group.to_string()).bind(auth.tenant_id.to_string()).bind(json!({"plugin_id":"quota-fixture","config":{}}).to_string()).execute(&db.pool).await.unwrap();
+        .bind(group.to_string()).bind(auth.tenant_id.to_string()).bind(json!({"plugin_id":plugin_id,"config":{}}).to_string()).execute(&db.pool).await.unwrap();
     sqlx::query("INSERT INTO model_route_group_memberships (tenant_id,route_group_id,model_route_id,created_at) VALUES ($1,$2,$3,1)")
         .bind(auth.tenant_id.to_string()).bind(group.to_string()).bind(route.id.to_string()).execute(&db.pool).await.unwrap();
     assert!(
@@ -90,7 +91,7 @@ async fn verify(config: Config) {
             .is_empty()
     );
     let target = db
-        .quota_observation_targets(&["quota-fixture".into()], 100, 4)
+        .quota_observation_targets(&[plugin_id], 100, 4)
         .await
         .unwrap()
         .into_iter()

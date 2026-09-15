@@ -41,7 +41,11 @@ fn project(
     snapshot: &super::QuotaSnapshot,
     now: i64,
 ) -> Option<RoutingQuotaObservation> {
-    if snapshot.error_code.is_some() || snapshot.stale || snapshot.freshness != "fresh" {
+    if snapshot.status != "ready"
+        || snapshot.error_code.is_some()
+        || snapshot.stale
+        || snapshot.freshness != "fresh"
+    {
         return None;
     }
     if snapshot.windows.len() > 64
@@ -219,6 +223,7 @@ mod tests {
             "config":{},"can_refresh":true,"can_rotate":false,"can_reauthorize":true,"route_count":0,"created_at":0,"updated_at":10
         })).unwrap();
         let mut snapshot = super::super::QuotaSnapshot::empty(&account, "tenant", None);
+        snapshot.status = "ready";
         snapshot.observed_at = Some(100);
         snapshot.stale_after = Some(200);
         snapshot.freshness = "fresh";
