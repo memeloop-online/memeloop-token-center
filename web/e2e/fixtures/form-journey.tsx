@@ -46,6 +46,7 @@ window.fetch = async (input, init) => {
         account.credential_generation++;
         proxyUrl = data.proxy_url;
       } else {
+        window.formJourneyLastProviderWrite = structuredClone(data);
         account.name = data.name;
         account.config = data.config;
       }
