@@ -233,7 +233,18 @@ async fn prepare_inner(
         .values()
         .flatten()
         .filter(|member| quota_plugins.contains(&member.2.plugin_id))
-        .map(|member| member.1.clone())
+        .map(|member| {
+            (
+                (
+                    member.1.account_id,
+                    member.1.credential_generation,
+                    member.1.transport_revision,
+                ),
+                member.1.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>()
+        .into_values()
         .collect();
     let quota_observations = if quota_candidates.is_empty() {
         BTreeMap::new()
@@ -250,8 +261,12 @@ async fn prepare_inner(
         .await
         {
             Ok(Ok(observations)) => observations,
-            _ => {
-                tracing::warn!(%request_id, stage="group_routing_quota_fallback", "quota observation unavailable; native order retained");
+            Ok(Err(error)) => {
+                tracing::warn!(%request_id, stage="group_routing_quota_fallback", reason="read_failed", error_category=error.diagnostic_category(), accounts=quota_candidates.len(), "quota observation unavailable; native order retained");
+                BTreeMap::new()
+            }
+            Err(_) => {
+                tracing::warn!(%request_id, stage="group_routing_quota_fallback", reason="deadline", accounts=quota_candidates.len(), "quota observation unavailable; native order retained");
                 BTreeMap::new()
             }
         }
@@ -279,7 +294,10 @@ async fn prepare_inner(
         let quota_context = if state.plugins.group_routing_uses_quota_context(&plugin_id) {
             match quota::context_for_bucket(&members, &quota_observations, quota_now_ms) {
                 Some(context) => Some(context),
-                None => continue, // Missing/expired/old-generation observations retain native slots.
+                None => {
+                    tracing::debug!(%request_id, %group_id, stage="group_routing_quota_fallback", reason="missing_or_stale", "quota evidence incomplete; native group order retained");
+                    continue;
+                }
             }
         } else {
             None

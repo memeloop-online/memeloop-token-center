@@ -12,7 +12,7 @@ mod bindings {
 
 pub const GROUP_ROUTING_VERSION: &str = "group-routing-v1";
 const MAX_CANDIDATES: usize = 1024;
-const MAX_JSON_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_GROUP_ROUTING_JSON_BYTES: usize = 1024 * 1024;
 const MAX_DELAY_MS: u64 = 300_000;
 const EXECUTION_LIMIT: Duration = Duration::from_millis(100);
 pub const GROUP_ROUTING_QUOTA_VERSION: &str = "account-windows-v1";
@@ -456,7 +456,7 @@ impl PluginRuntime {
         observe: bool,
     ) -> Result<String, AppError> {
         let encoded = serde_json::to_string(input).map_err(|_| invalid())?;
-        if encoded.len() > MAX_JSON_BYTES {
+        if encoded.len() > MAX_GROUP_ROUTING_JSON_BYTES {
             return Err(invalid());
         }
         let plugin = self
