@@ -3,6 +3,11 @@ use crate::plugin::application::installation::{
     InstallationRecord, PackageCheckpoint, PluginAuditEntry,
 };
 
+// Every failed attempt may leave a complete unpublished inventory on shared
+// storage. Bound operator retries until a separately audited reclamation path
+// can prove ownership and remove those immutable trees safely.
+const MAX_PLUGIN_INSTALLATION_ATTEMPTS: i64 = 3;
+
 impl Database {
     pub(crate) async fn replay_plugin_installation(
         &self,
@@ -91,6 +96,13 @@ impl Database {
         {
             tx.commit().await?;
             return Ok((record, false));
+        }
+        let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM application_plugin_audit WHERE action='install' AND inventory_id=$1 AND outcome='started'")
+            .bind(inventory_id).fetch_one(&mut *tx).await?;
+        if attempts >= MAX_PLUGIN_INSTALLATION_ATTEMPTS {
+            return Err(AppError::Conflict(
+                "installation retry limit reached; operator storage reclamation is required".into(),
+            ));
         }
         sqlx::query("INSERT INTO application_plugin_install_lock (scope, operation_id, lease_until) VALUES ('global',$1,$2) ON CONFLICT(scope) DO NOTHING")
             .bind(&id).bind(lease_until).execute(&mut *tx).await?;

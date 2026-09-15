@@ -1613,6 +1613,38 @@ mod tests {
             state.db.plugin_installation(&new.id).await.unwrap().status,
             "failed"
         );
+        let (last, run) = state
+            .db
+            .begin_plugin_installation(
+                "retry",
+                &packages,
+                "hash",
+                "key",
+                "bootstrap",
+                crate::db::unix_millis() + 270000,
+            )
+            .await
+            .unwrap();
+        assert!(run);
+        state
+            .db
+            .finish_plugin_installation(&last.id, &last.attempt_id, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            state
+                .db
+                .begin_plugin_installation(
+                    "retry",
+                    &packages,
+                    "hash",
+                    "key",
+                    "bootstrap",
+                    crate::db::unix_millis() + 270000,
+                )
+                .await,
+            Err(AppError::Conflict(message)) if message.contains("retry limit")
+        ));
     }
 
     #[cfg(target_os = "linux")]
