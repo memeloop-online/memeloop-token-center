@@ -25,12 +25,12 @@ test('production overview reads each leading account once and preserves unknown 
       { upstream_account_id: 'unknown', upstream_name: 'No observation yet', model: 'model-a', metrics, health, terminal_outcomes: [] },
     ],
   };
-  const window = { id: 'code:primary_window', label: 'code:primary_window', used_percent: 51, used: null, remaining: null, limit: null, unit: null, reset_at: null, period_seconds: 18_000, source: 'codex_usage', reset_is_estimated: false, allowed: true, limit_reached: false };
+  const quotaWindow = { id: 'code:primary_window', label: 'code:primary_window', used_percent: 51, used: null, remaining: null, limit: null, unit: null, reset_at: null, period_seconds: 18_000, source: 'codex_usage', reset_is_estimated: false, allowed: true, limit_reached: false };
   const quota: UpstreamQuotaSnapshot = {
     contract_version: 'upstream_quota_v1', upstream_account_id: 'known', tenant_external_id: 'default', provider: 'openai-codex', status: 'ready', observed_at: now, stale_after: now + 30_000, stale: false, freshness: 'fresh', plan_type: null, workspace: null,
     capabilities: { read: true, plan: false, workspace: false, window_amounts: false, window_amount_unit: false, window_percent: true, reset_credit_expiry: false, subscription_expiry: false, supplier_read_only: true, refreshes_credentials: false, consumes_reset_credit: false },
     subscription_active_until: null, credits: { balance: null, unlimited: null, has_credits: null, source: null }, reset_credits: [], error_code: null,
-    windows: [window, { ...window, id: 'code:secondary_window', period_seconds: 604_800, used_percent: 20 }, { ...window, id: 'code_review:primary_window', used_percent: null }],
+    windows: [quotaWindow, { ...quotaWindow, id: 'code:secondary_window', period_seconds: 604_800, used_percent: 20 }, { ...quotaWindow, id: 'code_review:primary_window', used_percent: null }],
     reset_capability: { provider_supported: false, implementation_available: false, prepare_available: false, confirmation_required: false, retryable: false, available_credits: null, applicable_credits: null, reason: 'unsupported', credit_error_code: null, evidence: 'server_driver_contract' },
   };
   try {
@@ -52,7 +52,7 @@ test('production overview reads each leading account once and preserves unknown 
         assert.equal(url.searchParams.get('tenant_external_id'), 'default');
         const id = url.pathname.split('/')[4]; reads.push(id);
         if (id === 'known' && failRefresh) return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: { message: 'Synthetic read unavailable' } }) });
-        return json(id === 'known' ? quota : { ...quota, upstream_account_id: 'unknown', status: 'error', observed_at: null, stale_after: null, freshness: 'unobserved', error_code: 'quota_transport_failed', windows: [{ ...window, used_percent: 0 }] });
+        return json(id === 'known' ? quota : { ...quota, upstream_account_id: 'unknown', status: 'error', observed_at: null, stale_after: null, freshness: 'unobserved', error_code: 'quota_transport_failed', windows: [{ ...quotaWindow, used_percent: 0 }] });
       }
       unexpected.push(url.pathname); return route.abort();
     });
