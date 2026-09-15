@@ -103,6 +103,7 @@ test('plugin catalog is usable without unrelated route code or unopened configur
     mkdirSync(artifacts, { recursive: true });
     for (const width of [390, 1440]) {
       await page.setViewportSize({ width, height: width === 390 ? 844 : 900 });
+      await page.evaluate(() => { (document.activeElement as HTMLElement | null)?.blur(); window.scrollTo(0, 0); });
       const geometry = await page.evaluate(() => ({ viewport: innerWidth, scrollWidth: document.documentElement.scrollWidth }));
       assert.ok(geometry.scrollWidth <= geometry.viewport, `${width}px plugin management must not overflow horizontally`);
       await page.screenshot({ path: `${artifacts}/ready-${width}.png`, fullPage: true });
