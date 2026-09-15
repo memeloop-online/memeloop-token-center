@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Menu, MenuItem, MenuList, MenuPopover, MenuTrigger } from '@fluentui/react-components';
 import { ApiError, api } from '../api';
 import { DrawerFrame } from '../components';
+import { Button } from '../design-system';
 import { formatCurrency, formatNumber } from '../format';
 import { useI18n } from '../i18n';
 import { tenantDisplayName } from '../tenantDisplayName';
@@ -37,6 +38,8 @@ export function GenerationWorkspace({ token, tenant, writeTenant = tenant }: { t
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
   const [reviewOpen, setReviewOpen] = useState(false);
+  const reviewTrigger = useRef<HTMLButtonElement>(null);
+  const hadReview = useRef(false);
   const loadSequence = useRef(0);
   const detailSequence = useRef(0);
   const scope = useRef({ token, tenant, writeTenant });
@@ -62,9 +65,15 @@ export function GenerationWorkspace({ token, tenant, writeTenant = tenant }: { t
 
   useEffect(() => {
     loadSequence.current += 1; detailSequence.current += 1;
-    setJobs([]); setDetail(undefined); setBusy(''); setLoading(false); setMessage(''); setError('');
+    setJobs([]); setDetail(undefined); setBusy(''); setLoading(false); setMessage(''); setError(''); setReviewOpen(false);
     void load();
   }, [token, tenant, writeTenant]);
+
+  // Closing the review workspace returns focus to its entry point.
+  useEffect(() => {
+    if (reviewOpen) { hadReview.current = true; return; }
+    if (hadReview.current) { hadReview.current = false; reviewTrigger.current?.focus(); }
+  }, [reviewOpen]);
 
   const select = async (job: OperatorGenerationJob) => {
     const sequence = ++detailSequence.current;
@@ -118,9 +127,9 @@ export function GenerationWorkspace({ token, tenant, writeTenant = tenant }: { t
     {!detail && error && <div className="notice error" role="alert">{error}</div>}
     {!detail && message && <div className="notice success" role="status">{message}</div>}
     <article className="panel operator-generations">
-      <div className="panel-title"><div><h2>{t('generations.title')}</h2><p className="muted">{t('generations.description')}</p></div><div className="row-actions"><span>{formatNumber(jobs.length, locale)}</span><button type="button" className="secondary" disabled={loading || !token.trim()} onClick={() => void load()}>{loading ? t('common.loading') : t('usage.refresh')}</button>
-        <Menu><MenuTrigger disableButtonEnhancement><button type="button" className="secondary">{t('generations.moreActions')}</button></MenuTrigger>
-          <MenuPopover><MenuList><MenuItem disabled={reviewOpen || !tenant || !token.trim()} onClick={() => setReviewOpen(true)}>{t('quarantine.title')}</MenuItem></MenuList></MenuPopover>
+      <div className="panel-title"><div><h2>{t('generations.title')}</h2><p className="muted">{t('generations.description')}</p></div><div className="row-actions"><span>{formatNumber(jobs.length, locale)}</span><Button appearance="secondary" disabled={loading || !token.trim()} onClick={() => void load()}>{loading ? t('common.loading') : t('usage.refresh')}</Button>
+        <Menu><MenuTrigger disableButtonEnhancement><Button ref={reviewTrigger} appearance="secondary">{t('generations.moreActions')}</Button></MenuTrigger>
+          <MenuPopover><MenuList><MenuItem disabled={reviewOpen || !tenant || !token.trim()} onClick={() => setReviewOpen(true)}>{t('quarantine.menuItem')}</MenuItem></MenuList></MenuPopover>
         </Menu></div></div>
       {jobs.length === 0 ? <div className="empty">{loading ? t('common.loading') : t('generations.empty')}</div> : <div className="table-scroll generation-table-scroll"><table className="generation-table">
         <thead><tr><th>{t('request.time')}</th><th>{t('operator.tenant')}</th><th>{t('generations.credential')}</th><th>{t('request.model')}</th><th>{t('generations.driver')}</th><th>{t('request.status')}</th><th>{t('generations.units')}</th><th>{t('request.cost')}</th><th>{t('request.actions')}</th></tr></thead>
@@ -130,11 +139,14 @@ export function GenerationWorkspace({ token, tenant, writeTenant = tenant }: { t
           <td className="generation-model-cell"><code>{job.model}</code></td><td className="generation-driver-cell" data-label={t('generations.driver')}>{job.driver}</td><td className="generation-status-cell" data-label={t('request.status')}><span className={'status ' + statusTone(job.status)}>{t('generations.status.' + job.status)}</span></td>
           <td className="generation-units-cell" data-label={t('generations.units')}>{formatNumber(job.billed_units ?? job.estimated_units, locale)} · {t('billingUnit.' + job.billing_unit)}</td>
           <td className="generation-cost-cell" data-label={t('request.cost')}>{formatCurrency(job.cost, job.currency, locale)}</td>
-          <td className="generation-actions-cell"><div className="row-actions"><button type="button" className="secondary" onClick={() => void select(job)}>{t('generations.details')}</button>{canManage(job) && canCancel(job) && <button type="button" className="danger" disabled={busy === job.job_id} onClick={() => void cancel(job)}>{t('common.cancel')}</button>}</div></td>
+          <td className="generation-actions-cell"><div className="row-actions"><Button appearance="secondary" size="small" onClick={() => void select(job)}>{t('generations.details')}</Button>{canManage(job) && canCancel(job) && <button type="button" className="danger" disabled={busy === job.job_id} onClick={() => void cancel(job)}>{t('common.cancel')}</button>}</div></td>
         </tr>)}</tbody>
       </table></div>}
     </article>
-    {reviewOpen && <ImageGenerationQuarantine token={token} tenant={tenant} writeTenant={writeTenant} />}
+    {reviewOpen && <section className="generation-review" aria-label={t('quarantine.title')}>
+      <div className="row-actions generation-review-actions"><Button appearance="secondary" onClick={() => setReviewOpen(false)}>{t('generations.backToJobs')}</Button></div>
+      <ImageGenerationQuarantine token={token} tenant={tenant} writeTenant={writeTenant} />
+    </section>}
     {detail && <DrawerFrame title={detail.model} eyebrow={t('generations.detailTitle')} onClose={() => setDetail(undefined)}>
       {error && <div className="notice error" role="alert">{error}</div>}
       {message && <div className="notice success" role="status">{message}</div>}
