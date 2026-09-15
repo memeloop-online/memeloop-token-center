@@ -76,20 +76,6 @@ fn verify_owner_at(directory: &rustix::fd::OwnedFd, name: &str, owner: &[u8]) ->
     Ok(())
 }
 
-fn publish_owner_at(directory: &rustix::fd::OwnedFd, name: &str, owner: &[u8]) -> io::Result<()> {
-    use rustix::fs::{Mode, OFlags, openat};
-    let mut file = fs::File::from(openat(
-        directory,
-        name,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_bits_truncate(0o600),
-    )?);
-    file.write_all(owner)?;
-    file.sync_all()?;
-    rustix::fs::fsync(directory)?;
-    Ok(())
-}
-
 fn claim_name(root: &Path, owner: &[u8]) -> io::Result<()> {
     if owner.is_empty() || owner.len() as u64 > OWNER_LIMIT {
         return Err(io::ErrorKind::InvalidInput.into());
@@ -147,7 +133,7 @@ pub(crate) fn bind_existing_directory(
     owner: &[u8],
 ) -> io::Result<rustix::fd::OwnedFd> {
     claim_name(root, owner)?;
-    let parent = root.parent().ok_or(io::ErrorKind::InvalidInput)?;
+    let parent_path = root.parent().ok_or(io::ErrorKind::InvalidInput)?;
     let name = root
         .file_name()
         .and_then(|name| name.to_str())
@@ -158,12 +144,14 @@ pub(crate) fn bind_existing_directory(
     }
     let directory = directory_fd(root)?;
     let stat = rustix::fs::fstat(&directory)?;
-    let identity = format!("{}:{}", stat.st_dev, stat.st_ino);
-    let binding = parent.join(format!(".mtc-publish-inode-{name}"));
+    let identity = stat.st_ino.to_string();
+    let binding = format!(".mtc-publish-inode-{name}");
+    let binding = parent_path.join(binding);
     match fs::symlink_metadata(&binding) {
         Ok(_) => verify_owner(&binding, identity.as_bytes())?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let temporary = parent.join(format!(".mtc-publish-claim-{}", uuid::Uuid::now_v7()));
+            let temporary =
+                parent_path.join(format!(".mtc-publish-claim-{}", uuid::Uuid::now_v7()));
             let mut file = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -182,46 +170,102 @@ pub(crate) fn bind_existing_directory(
         }
         Err(error) => return Err(error),
     }
-    sync_directory(parent)?;
+    sync_directory(parent_path)?;
     Ok(directory)
 }
 
-pub(crate) fn open_claimed_directory(root: &Path, owner: &[u8]) -> io::Result<rustix::fd::OwnedFd> {
-    use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
-    let parent = root.parent().ok_or(io::ErrorKind::InvalidInput)?;
+#[cfg(target_os = "linux")]
+pub(crate) fn clear_claimed_directory(root: &Path, owner: &[u8]) -> io::Result<bool> {
+    use rustix::fs::{
+        AtFlags, Mode, OFlags, RenameFlags, ResolveFlags, mkdirat, openat2, renameat,
+        renameat_with, unlinkat,
+    };
+    let parent_path = root.parent().ok_or(io::ErrorKind::InvalidInput)?;
     let name = root.file_name().ok_or(io::ErrorKind::InvalidInput)?;
     let name_text = name.to_str().ok_or(io::ErrorKind::InvalidInput)?;
-    let parent = directory_fd(parent)?;
+    let parent = directory_fd(parent_path)?;
     let owner_marker = format!(".mtc-publish-owner-{name_text}");
     verify_owner_at(&parent, &owner_marker, owner)?;
-    let directory = openat2(
+    let inode_marker = format!(".mtc-publish-inode-{name_text}");
+    let quarantine = format!(".mtc-reclaim-{name_text}");
+    match mkdirat(
         &parent,
-        name,
+        quarantine.as_str(),
+        Mode::from_bits_truncate(0o700),
+    ) {
+        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let quarantine_directory = openat2(
+        &parent,
+        quarantine.as_str(),
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
         ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
     )?;
-    let stat = rustix::fs::fstat(&directory)?;
-    let identity = format!("{}:{}", stat.st_dev, stat.st_ino);
-    let inode_marker = format!(".mtc-publish-inode-{name_text}");
-    verify_owner_at(&parent, &inode_marker, identity.as_bytes())?;
-    Ok(directory)
-}
-
-pub(crate) fn clear_claimed_directory(root: &Path, owner: &[u8]) -> io::Result<bool> {
-    let directory = open_claimed_directory(root, owner)?;
-    let stat = rustix::fs::fstat(&directory)?;
-    let identity = format!("{}:{}", stat.st_dev, stat.st_ino);
-    match verify_owner_at(&directory, ".mtc-install-reclaimed", identity.as_bytes()) {
-        Ok(()) => return Ok(false),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+    match openat2(
+        &quarantine_directory,
+        "root",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
+    ) {
+        Ok(_) => {}
+        Err(rustix::io::Errno::NOENT) => {
+            match renameat(&parent, name, &quarantine_directory, "root") {
+                Ok(()) => {}
+                Err(rustix::io::Errno::NOENT) => {
+                    let _ = unlinkat(&parent, quarantine.as_str(), AtFlags::REMOVEDIR);
+                    return Ok(false);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(error) => return Err(error.into()),
     }
-    clear_directory_contents(&directory)?;
-    publish_owner_at(&directory, ".mtc-install-reclaimed", identity.as_bytes())?;
-    Ok(true)
+    let result = (|| {
+        let directory = openat2(
+            &quarantine_directory,
+            "root",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
+        )?;
+        let stat = rustix::fs::fstat(&directory)?;
+        let identity = stat.st_ino.to_string();
+        verify_owner_at(&parent, &inode_marker, identity.as_bytes())?;
+        clear_directory_contents(&directory)?;
+        rustix::fs::fsync(&directory)?;
+        unlinkat(&quarantine_directory, "root", AtFlags::REMOVEDIR)?;
+        rustix::fs::fsync(&quarantine_directory)?;
+        unlinkat(&parent, quarantine.as_str(), AtFlags::REMOVEDIR)?;
+        unlinkat(&parent, owner_marker.as_str(), AtFlags::empty())?;
+        unlinkat(&parent, inode_marker.as_str(), AtFlags::empty())?;
+        rustix::fs::fsync(&parent)?;
+        Ok(true)
+    })();
+    if result.is_err() {
+        let _ = renameat_with(
+            &quarantine_directory,
+            "root",
+            &parent,
+            name,
+            RenameFlags::NOREPLACE,
+        );
+        let _ = rustix::fs::fsync(&parent);
+    }
+    result
 }
 
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn clear_claimed_directory(_root: &Path, _owner: &[u8]) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "claimed-directory cleanup requires Linux openat2",
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn clear_directory_contents(directory: &rustix::fd::OwnedFd) -> io::Result<()> {
     use rustix::fs::{AtFlags, Dir, Mode, OFlags, ResolveFlags, openat2, unlinkat};
     let mut entries = Dir::read_from(directory)?;
@@ -241,8 +285,11 @@ fn clear_directory_contents(directory: &rustix::fd::OwnedFd) -> io::Result<()> {
             Ok(child) => {
                 clear_directory_contents(&child)?;
                 rustix::fs::fsync(&child)?;
-                // Keep directory inodes: unlinking a pathname cannot be made
-                // conditional on the inode that was opened and verified.
+                match unlinkat(directory, name, AtFlags::REMOVEDIR) {
+                    Ok(()) => {}
+                    Err(error) if error == rustix::io::Errno::NOENT => {}
+                    Err(error) => return Err(error.into()),
+                }
             }
             Err(rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP) => {
                 match unlinkat(directory, name, AtFlags::empty()) {
@@ -280,7 +327,7 @@ fn claim_directory_inner(
             after_mkdir();
             let directory = fs::File::from(directory_fd(root)?);
             let metadata = directory.metadata()?;
-            let identity = format!("{}:{}", metadata.dev(), metadata.ino());
+            let identity = metadata.ino().to_string();
             let temporary = parent.join(format!(".mtc-publish-claim-{}", uuid::Uuid::now_v7()));
             let mut file = fs::OpenOptions::new()
                 .write(true)
@@ -304,7 +351,7 @@ fn claim_directory_inner(
     }
     let directory = directory_fd(root)?;
     let stat = rustix::fs::fstat(&directory)?;
-    let identity = format!("{}:{}", stat.st_dev, stat.st_ino);
+    let identity = stat.st_ino.to_string();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         match verify_owner(&binding, identity.as_bytes()) {

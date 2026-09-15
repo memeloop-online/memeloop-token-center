@@ -608,14 +608,24 @@ fn reclaim_installation_attempt_roots(
             break;
         }
         let entry = entry.map_err(|_| AppError::Internal)?;
-        let root = entry.path();
-        let Some(attempt_id) = inventory_attempt_id(&entry.file_name()) else {
+        let entry_name = entry.file_name();
+        let (attempt_id, root) = if let Some(attempt_id) = inventory_attempt_id(&entry_name) {
+            (attempt_id, entry.path())
+        } else if let Some(original) = entry_name
+            .to_str()
+            .and_then(|name| name.strip_prefix(".mtc-reclaim-"))
+        {
+            let Some(attempt_id) = inventory_attempt_id(std::ffi::OsStr::new(original)) else {
+                continue;
+            };
+            (attempt_id, plugin_root.join(original))
+        } else {
             continue;
         };
         if referenced_attempts.contains(&attempt_id) || inventory_roots.contains(&root) {
             continue;
         }
-        let metadata = match std::fs::symlink_metadata(&root) {
+        let metadata = match std::fs::symlink_metadata(entry.path()) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => metadata,
             _ => continue,
         };
@@ -1786,16 +1796,15 @@ mod tests {
         );
         assert!(root.exists());
         crate::plugin_publication::clear_claimed_directory(&root, b"owner").unwrap();
-        assert!(root.exists());
-        assert!(root.join(".mtc-install-reclaimed").exists());
+        assert!(!root.exists());
         assert!(
-            directory
+            !directory
                 .path()
                 .join(".mtc-publish-owner-inventory")
                 .exists()
         );
         assert!(
-            directory
+            !directory
                 .path()
                 .join(".mtc-publish-inode-inventory")
                 .exists()
@@ -1828,6 +1837,7 @@ mod tests {
             uuid::Uuid::now_v7().to_string(),
             uuid::Uuid::now_v7().to_string(),
             uuid::Uuid::now_v7().to_string(),
+            uuid::Uuid::now_v7().to_string(),
         ];
         let roots = attempts
             .iter()
@@ -1840,6 +1850,13 @@ mod tests {
                 root
             })
             .collect::<Vec<_>>();
+        std::fs::create_dir_all(roots[3].join("nested/deep")).unwrap();
+        std::fs::write(roots[3].join("nested/deep/payload"), b"immutable").unwrap();
+        let interrupted_quarantine = directory
+            .path()
+            .join(format!(".mtc-reclaim-mtc-attempt-{}", attempts[4]));
+        std::fs::create_dir(&interrupted_quarantine).unwrap();
+        std::fs::rename(&roots[4], interrupted_quarantine.join("root")).unwrap();
         let inventory_roots = BTreeSet::from([roots[0].clone()]);
         let referenced_attempts = BTreeSet::from([attempts[1].clone()]);
         std::fs::remove_file(
@@ -1856,14 +1873,13 @@ mod tests {
                 Duration::ZERO,
             )
             .unwrap(),
-            1
+            2
         );
         assert!(roots[0].exists());
         assert!(roots[1].exists());
         assert!(roots[2].join("payload").exists());
-        assert!(roots[3].exists());
-        assert!(!roots[3].join("payload").exists());
-        assert!(roots[3].join(".mtc-install-reclaimed").exists());
+        assert!(!roots[3].exists());
+        assert!(!interrupted_quarantine.exists());
         assert_eq!(
             reclaim_installation_attempt_roots(
                 directory.path(),
