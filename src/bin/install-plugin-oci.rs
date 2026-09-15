@@ -83,9 +83,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let arguments = Arguments::parse();
     let credentials = credentials(&arguments)?;
     let plugin_root = match &arguments.publication_attempt_id {
-        Some(attempt) => {
-            let attempt = uuid::Uuid::parse_str(attempt)?;
-            if attempt.to_string() != *attempt {
+        Some(attempt_id) => {
+            let attempt = uuid::Uuid::parse_str(attempt_id)?;
+            if attempt.to_string() != *attempt_id {
                 return Err("invalid publication attempt ID".into());
             }
             arguments.plugin_dir.join(format!("mtc-attempt-{attempt}"))
