@@ -43,7 +43,7 @@ test('quota countdown keeps minute, hour and day boundaries without sleeping or 
 });
 
 test('compact quota selects a real named window, preserves ties and ignores unknown usage', () => {
-  const window: UpstreamQuotaSnapshot['windows'][number] = { id: 'code:primary_window', label: 'code:primary_window', used_percent: 51, remaining: null, limit: null, reset_at: null, period_seconds: 18_000, source: 'codex_usage', reset_is_estimated: false, allowed: true, limit_reached: false };
+  const window: UpstreamQuotaSnapshot['windows'][number] = { id: 'code:primary_window', label: 'code:primary_window', used_percent: 51, used: null, unit: null, remaining: null, limit: null, reset_at: null, period_seconds: 18_000, source: 'codex_usage', reset_is_estimated: false, allowed: true, limit_reached: false };
   const weekly = { ...window, id: 'code:secondary_window', used_percent: 20, period_seconds: 604_800 };
   assert.equal(quotaHighestUsageWindow([weekly, window]), window);
   assert.equal(quotaHighestUsageWindow([window, { ...weekly, used_percent: 51 }]), window);
