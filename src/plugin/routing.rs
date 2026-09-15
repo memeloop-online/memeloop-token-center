@@ -508,7 +508,7 @@ impl PluginRuntime {
         }
         .map_err(|error| plugin_failure(plugin_id, error))?
         .map_err(|_| invalid())?;
-        if Instant::now() >= deadline || output.len() > MAX_JSON_BYTES {
+        if Instant::now() >= deadline || output.len() > MAX_GROUP_ROUTING_JSON_BYTES {
             return Err(invalid());
         }
         Ok(output)
