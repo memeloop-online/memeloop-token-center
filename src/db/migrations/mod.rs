@@ -516,6 +516,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "native OAuth single-account source bindings",
         sql: include_str!("../../../migrations/common/0097_native_oauth_source_bindings.sql"),
     },
+    Migration {
+        version: 98,
+        name: "shared account quota observations",
+        sql: include_str!("../../../migrations/common/0098_shared_quota_observations.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1017,6 +1022,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 97,
         name: "native OAuth single-account source bindings",
         sql: include_str!("../../../migrations/common/0097_native_oauth_source_bindings.sql"),
+    },
+    Migration {
+        version: 98,
+        name: "shared account quota observations",
+        sql: include_str!("../../../migrations/common/0098_shared_quota_observations.sql"),
     },
 ];
 
