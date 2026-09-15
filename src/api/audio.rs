@@ -1,4 +1,4 @@
-use axum::extract::{Multipart, multipart::MultipartRejection};
+use axum::extract::{Extension, Multipart, multipart::MultipartRejection};
 use reqwest::multipart::{Form, Part};
 
 use super::*;
@@ -69,6 +69,7 @@ impl Pcm16WavDuration {
 
 pub(super) async fn create_audio_transcription(
     State(state): State<AppState>,
+    Extension(resources): Extension<super::auth::AudioRequestResources>,
     headers: HeaderMap,
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<Response, AppError> {
@@ -177,14 +178,22 @@ pub(super) async fn create_audio_transcription(
             model_route_id: Some(route.route_id),
         })
         .await?;
-    let started = Instant::now();
-    let mut attempt =
-        match crate::generation::group_routing::admit(&state, key.tenant_id, request_id, &route)
+    let deadline = tokio::time::Instant::now() + SYNCHRONOUS_AUDIO_DEADLINE;
+    let worker = tokio::spawn(async move {
+        let _resource_owners = (&resources.lifecycle, &resources.memory);
+        let result = async move {
+            let started = Instant::now();
+            let mut attempt = match crate::generation::group_routing::admit(
+                &state,
+                key.tenant_id,
+                request_id,
+                &route,
+            )
             .await
-        {
-            Ok(attempt) => attempt,
-            Err(error) => {
-                finish_audio_request(
+            {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    finish_audio_request(
                     &state,
                     &reservation,
                     request_id,
@@ -197,24 +206,16 @@ pub(super) async fn create_audio_transcription(
                     json!({"kind":"audio_transcription","media_archived":false,"succeeded":false}),
                 )
                 .await?;
-                return Err(error);
-            }
-        };
-    let _activity = state.metrics.active_upstream(&route.driver, "audio");
-    let upstream_result = tokio::time::timeout(SYNCHRONOUS_AUDIO_DEADLINE, request.send()).await;
-    let upstream = match upstream_result {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => {
-            let terminal = if error.is_connect() {
-                MediaAttemptTerminal::Failed {
-                    kind: crate::db::UpstreamFailureKind::Connection,
-                    reason: crate::metrics::UpstreamHealthReason::Connection,
+                    return Err(error);
                 }
-            } else {
-                MediaAttemptTerminal::Inconclusive
             };
-            attempt.complete(terminal).await;
-            finish_audio_request(
+            let _activity = state.metrics.active_upstream(&route.driver, "audio");
+            let upstream_result = tokio::time::timeout_at(deadline, request.send()).await;
+            let upstream = match upstream_result {
+                Ok(Ok(response)) => response,
+                Ok(Err(_error)) => {
+                    attempt.complete(audio_transport_failure()).await;
+                    finish_audio_request(
                 &state,
                 &reservation,
                 request_id,
@@ -227,11 +228,11 @@ pub(super) async fn create_audio_transcription(
                 json!({"kind":"audio_transcription","media_archived":false,"succeeded":false}),
             )
             .await?;
-            return Err(AppError::Upstream("audio upstream transport failed".into()));
-        }
-        Err(_) => {
-            attempt.complete(MediaAttemptTerminal::Inconclusive).await;
-            finish_audio_request(
+                    return Err(AppError::Upstream("audio upstream transport failed".into()));
+                }
+                Err(_) => {
+                    attempt.complete(audio_transport_failure()).await;
+                    finish_audio_request(
                 &state,
                 &reservation,
                 request_id,
@@ -244,96 +245,42 @@ pub(super) async fn create_audio_transcription(
                 json!({"kind":"audio_transcription","media_archived":false,"succeeded":false}),
             )
             .await?;
-            return Err(AppError::Upstream("audio upstream timed out".into()));
-        }
-    };
-    state.metrics.observe_upstream(
-        &route.driver,
-        "audio",
-        Some(upstream.status()),
-        started.elapsed(),
-    );
-    let upstream_status = upstream.status();
-    if upstream_status == StatusCode::TOO_MANY_REQUESTS {
-        let kind = classify_media_rate_limit(upstream).await;
-        attempt
-            .complete(MediaAttemptTerminal::Failed {
-                kind,
-                reason: crate::metrics::UpstreamHealthReason::RateLimited,
-            })
-            .await;
-        finish_audio_failure(
-            &state,
-            &reservation,
-            request_id,
-            key.tenant_id,
-            audio,
-            started,
-            "audio_upstream_rate_limited",
-        )
-        .await?;
-        return Err(AppError::Upstream("audio upstream rate limited".into()));
-    }
-    if !upstream_status.is_success() {
-        let terminal = if matches!(
-            upstream_status,
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-        ) {
-            MediaAttemptTerminal::Failed {
-                kind: crate::db::UpstreamFailureKind::Authentication,
-                reason: crate::metrics::UpstreamHealthReason::Unavailable,
-            }
-        } else if upstream_status.is_server_error() {
-            MediaAttemptTerminal::Failed {
-                kind: crate::db::UpstreamFailureKind::Unavailable,
-                reason: crate::metrics::UpstreamHealthReason::Unavailable,
-            }
-        } else {
-            MediaAttemptTerminal::Inconclusive
-        };
-        attempt.complete(terminal).await;
-        drop(upstream);
-        finish_audio_failure(
-            &state,
-            &reservation,
-            request_id,
-            key.tenant_id,
-            audio,
-            started,
-            "audio_upstream_rejected",
-        )
-        .await?;
-        return Err(AppError::Upstream(
-            "audio upstream rejected the request".into(),
-        ));
-    }
-    let upstream_body = match read_audio_response_bounded(upstream).await {
-        Ok(body) => body,
-        Err(error) => {
-            attempt
-                .complete(MediaAttemptTerminal::invalid_response())
-                .await;
-            finish_audio_failure(
-                &state,
-                &reservation,
-                request_id,
-                key.tenant_id,
-                audio,
-                started,
-                error,
-            )
-            .await?;
-            return Err(AppError::Upstream(
-                "audio upstream returned an invalid response".into(),
-            ));
-        }
-    };
-    let normalized =
-        match normalize_audio_response(&upstream_body, metadata.response_format, audio.seconds()) {
-            Ok(value) => value,
-            Err(error) => {
+                    return Err(AppError::Upstream("audio upstream timed out".into()));
+                }
+            };
+            state.metrics.observe_upstream(
+                &route.driver,
+                "audio",
+                Some(upstream.status()),
+                started.elapsed(),
+            );
+            let upstream_status = upstream.status();
+            if upstream_status == StatusCode::TOO_MANY_REQUESTS {
+                let kind =
+                    match tokio::time::timeout_at(deadline, classify_media_rate_limit(upstream))
+                        .await
+                    {
+                        Ok(kind) => kind,
+                        Err(_) => {
+                            attempt.complete(audio_transport_failure()).await;
+                            finish_audio_failure(
+                                &state,
+                                &reservation,
+                                request_id,
+                                key.tenant_id,
+                                audio,
+                                started,
+                                "audio_upstream_timeout",
+                            )
+                            .await?;
+                            return Err(AppError::Upstream("audio upstream timed out".into()));
+                        }
+                    };
                 attempt
-                    .complete(MediaAttemptTerminal::invalid_response())
+                    .complete(MediaAttemptTerminal::Failed {
+                        kind,
+                        reason: crate::metrics::UpstreamHealthReason::RateLimited,
+                    })
                     .await;
                 finish_audio_failure(
                     &state,
@@ -342,46 +289,131 @@ pub(super) async fn create_audio_transcription(
                     key.tenant_id,
                     audio,
                     started,
-                    "audio_upstream_invalid_response",
+                    "audio_upstream_rate_limited",
                 )
                 .await?;
-                return Err(error);
+                return Err(AppError::Upstream("audio upstream rate limited".into()));
             }
-        };
-    let segment_count = normalized
-        .get("segments")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
-    finish_audio_request(
-        &state,
-        &reservation,
-        request_id,
-        key.tenant_id,
-        audio,
-        started,
-        StatusCode::OK,
-        audio.billed_seconds,
-        None,
-        json!({
-            "kind":"audio_transcription",
-            "media_archived":false,
-            "succeeded":true,
-            "duration_ms":audio.duration_ms,
-            "segment_count":segment_count,
-        }),
-    )
-    .await?;
-    attempt
-        .complete_committed(MediaAttemptTerminal::Succeeded)
+            if !upstream_status.is_success() {
+                let terminal = if matches!(
+                    upstream_status,
+                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+                ) {
+                    MediaAttemptTerminal::Failed {
+                        kind: crate::db::UpstreamFailureKind::Authentication,
+                        reason: crate::metrics::UpstreamHealthReason::Unavailable,
+                    }
+                } else if upstream_status.is_server_error() {
+                    MediaAttemptTerminal::Failed {
+                        kind: crate::db::UpstreamFailureKind::Unavailable,
+                        reason: crate::metrics::UpstreamHealthReason::Unavailable,
+                    }
+                } else {
+                    MediaAttemptTerminal::Inconclusive
+                };
+                attempt.complete(terminal).await;
+                drop(upstream);
+                finish_audio_failure(
+                    &state,
+                    &reservation,
+                    request_id,
+                    key.tenant_id,
+                    audio,
+                    started,
+                    "audio_upstream_rejected",
+                )
+                .await?;
+                return Err(AppError::Upstream(
+                    "audio upstream rejected the request".into(),
+                ));
+            }
+            let upstream_body = match read_audio_response_bounded(upstream, deadline).await {
+                Ok(body) => body,
+                Err(error) => {
+                    attempt.complete(error.terminal()).await;
+                    finish_audio_failure(
+                        &state,
+                        &reservation,
+                        request_id,
+                        key.tenant_id,
+                        audio,
+                        started,
+                        error.code(),
+                    )
+                    .await?;
+                    return Err(AppError::Upstream(
+                        "audio upstream returned an invalid response".into(),
+                    ));
+                }
+            };
+            let normalized = match normalize_audio_response(
+                &upstream_body,
+                metadata.response_format,
+                audio.seconds(),
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    attempt
+                        .complete(MediaAttemptTerminal::invalid_response())
+                        .await;
+                    finish_audio_failure(
+                        &state,
+                        &reservation,
+                        request_id,
+                        key.tenant_id,
+                        audio,
+                        started,
+                        "audio_upstream_invalid_response",
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
+            let segment_count = normalized
+                .get("segments")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            finish_audio_request(
+                &state,
+                &reservation,
+                request_id,
+                key.tenant_id,
+                audio,
+                started,
+                StatusCode::OK,
+                audio.billed_seconds,
+                None,
+                json!({
+                    "kind":"audio_transcription",
+                    "media_archived":false,
+                    "succeeded":true,
+                    "duration_ms":audio.duration_ms,
+                    "segment_count":segment_count,
+                }),
+            )
+            .await?;
+            attempt
+                .complete_committed(MediaAttemptTerminal::Succeeded)
+                .await;
+            let body = serde_json::to_vec(&normalized).map_err(|_| AppError::Internal)?;
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_LENGTH, body.len())
+                .header(REQUEST_ID_HEADER, request_id.to_string())
+                .body(Body::from(body))
+                .map_err(|_| AppError::Internal)
+        }
         .await;
-    let body = serde_json::to_vec(&normalized).map_err(|_| AppError::Internal)?;
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::CONTENT_LENGTH, body.len())
-        .header(REQUEST_ID_HEADER, request_id.to_string())
-        .body(Body::from(body))
-        .map_err(|_| AppError::Internal)
+        result.map(|response| super::auth::hold_response_body_permit(response, resources))
+    });
+    match worker.await {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(error = %error, "audio lifecycle worker failed");
+            Err(AppError::Internal)
+        }
+    }
 }
 
 async fn parse_audio_transcription_form(
@@ -645,19 +677,69 @@ fn upstream_form(
     Ok(form)
 }
 
-async fn read_audio_response_bounded(response: reqwest::Response) -> Result<Bytes, &'static str> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AudioResponseReadError {
+    Timeout,
+    TooLarge,
+    Transport,
+}
+
+impl AudioResponseReadError {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Timeout => "audio_upstream_timeout",
+            Self::TooLarge => "audio_upstream_response_too_large",
+            Self::Transport => "audio_upstream_response_stream",
+        }
+    }
+
+    fn terminal(self) -> MediaAttemptTerminal {
+        match self {
+            Self::Timeout | Self::Transport => audio_transport_failure(),
+            Self::TooLarge => MediaAttemptTerminal::invalid_response(),
+        }
+    }
+}
+
+fn audio_transport_failure() -> MediaAttemptTerminal {
+    MediaAttemptTerminal::Failed {
+        kind: crate::db::UpstreamFailureKind::Connection,
+        reason: crate::metrics::UpstreamHealthReason::Connection,
+    }
+}
+
+async fn read_audio_response_bounded(
+    response: reqwest::Response,
+    deadline: tokio::time::Instant,
+) -> Result<Bytes, AudioResponseReadError> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_AUDIO_RESPONSE_BODY as u64)
     {
-        return Err("audio_upstream_response_too_large");
+        return Err(AudioResponseReadError::TooLarge);
     }
+    collect_audio_response_stream(response.bytes_stream(), deadline).await
+}
+
+async fn collect_audio_response_stream<S, E>(
+    stream: S,
+    deadline: tokio::time::Instant,
+) -> Result<Bytes, AudioResponseReadError>
+where
+    S: futures_util::Stream<Item = Result<Bytes, E>>,
+{
+    futures_util::pin_mut!(stream);
     let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| "audio_upstream_response_stream")?;
+    loop {
+        let next = tokio::time::timeout_at(deadline, stream.next())
+            .await
+            .map_err(|_| AudioResponseReadError::Timeout)?;
+        let Some(chunk) = next else {
+            break;
+        };
+        let chunk = chunk.map_err(|_| AudioResponseReadError::Transport)?;
         if body.len().saturating_add(chunk.len()) > MAX_AUDIO_RESPONSE_BODY {
-            return Err("audio_upstream_response_too_large");
+            return Err(AudioResponseReadError::TooLarge);
         }
         body.extend_from_slice(&chunk);
     }
@@ -880,6 +962,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upstream_body_reader_enforces_the_original_absolute_deadline() {
+        let stream = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
+        let error = collect_audio_response_stream(
+            stream,
+            tokio::time::Instant::now() + Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, AudioResponseReadError::Timeout);
+        assert!(matches!(
+            error.terminal(),
+            MediaAttemptTerminal::Failed {
+                kind: crate::db::UpstreamFailureKind::Connection,
+                reason: crate::metrics::UpstreamHealthReason::Connection,
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn transcription_routes_bills_measured_wav_seconds_and_archives_only_metadata() {
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1018,6 +1119,210 @@ mod tests {
                 .response_object
                 .unwrap()
                 .contains("sensitive transcript")
+        );
+        let authenticated = state
+            .db
+            .authenticate_key(&issued.key, state.config.key_pepper.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .db
+                .key_view(&authenticated)
+                .await
+                .unwrap()
+                .available_balance,
+            "9.5"
+        );
+        let from = unix_millis().saturating_sub(3_600_000);
+        let to = unix_millis().saturating_add(3_600_000);
+        let analysis = state
+            .db
+            .operator_usage_analysis(
+                tenant,
+                crate::db::UsageAnalysisFilter {
+                    from_created_at: Some(from),
+                    to_created_at: Some(to),
+                    granularity: Some("hour".to_owned()),
+                    protocol: Some(AUDIO_AUDIT_PROTOCOL.to_owned()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(analysis.summary.input_tokens, 0);
+        assert_eq!(analysis.summary.output_tokens, 0);
+        assert_eq!(analysis.summary.generation_units, 2);
+        assert_eq!(analysis.by_session.len(), 1);
+        assert_eq!(analysis.by_session[0].metrics.input_tokens, 0);
+        assert_eq!(analysis.by_session[0].metrics.output_tokens, 0);
+        assert_eq!(analysis.by_session[0].metrics.generation_units, 2);
+        assert_eq!(analysis.generation_units_by_modality.len(), 1);
+        assert_eq!(analysis.generation_units_by_modality[0].modality, "audio");
+        assert_eq!(analysis.generation_units_by_modality[0].units, 2);
+        assert_eq!(analysis.generation_units_by_billing_unit.len(), 1);
+        assert_eq!(
+            analysis.generation_units_by_billing_unit[0].billing_unit,
+            "second"
+        );
+        assert_eq!(analysis.generation_units_by_billing_unit[0].units, 2);
+
+        let stats_filter = crate::db::StatsFilter {
+            from_created_at: Some(from),
+            to_created_at: Some(to),
+            protocol: Some(AUDIO_AUDIT_PROTOCOL.to_owned()),
+            ..Default::default()
+        };
+        let stats = state
+            .db
+            .operator_stats_filtered(tenant, stats_filter.clone())
+            .await
+            .unwrap();
+        assert_eq!(stats.summary.input_tokens, 0);
+        assert_eq!(stats.summary.output_tokens, 0);
+        let pricing = state
+            .db
+            .pricing_model_usage(Some(tenant), stats_filter)
+            .await
+            .unwrap();
+        assert_eq!(pricing, vec![(model.to_owned(), 1, 0, 0)]);
+    }
+
+    #[tokio::test]
+    async fn client_cancellation_does_not_abandon_the_admitted_audio_lifecycle() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(250))
+                    .set_body_json(json!({"text":"completed after disconnect"})),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let (state, _directory) = crate::api::tests::test_state().await;
+        let tenant = "audio-cancellation-test";
+        let model = "local-asr-cancellation";
+        let account = state
+            .db
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: tenant.to_owned(),
+                    name: "local-asr-cancellation".to_owned(),
+                    driver: "http-json".to_owned(),
+                    config: json!({"base_url":upstream.uri(),"network_scope":"private"}),
+                    credential: UpstreamCredential::None,
+                    oauth_session_id: None,
+                    oauth_driver: None,
+                    oauth_refresh_url: None,
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let route = state
+            .db
+            .create_model_route(CreateModelRouteInput {
+                tenant_external_id: tenant.to_owned(),
+                public_model: model.to_owned(),
+                upstream_account_id: account.id,
+                upstream_model: "asr-upstream".to_owned(),
+                protocol: AUDIO_PROTOCOL.to_owned(),
+                priority: 0,
+            })
+            .await
+            .unwrap();
+        let issued = state
+            .db
+            .create_key_with_routing(
+                CreateKeyInput {
+                    tenant_external_id: tenant.to_owned(),
+                    principal_external_id: "member".to_owned(),
+                    alias: "audio-cancel".to_owned(),
+                    currency: "USD".to_owned(),
+                    policy: KeyPolicy {
+                        max_concurrency: 1,
+                        ..KeyPolicy::default()
+                    },
+                    initial_balance: Decimal::TEN,
+                    idempotency_key: None,
+                },
+                &[route.id],
+                &[],
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .upsert_generation_price(model, "USD", "second", Decimal::new(25, 2))
+            .await
+            .unwrap();
+        let (boundary, multipart) = multipart_body(model, &wav(16_000, 1, 24_001));
+        let request = Request::post("/v1/audio/transcriptions")
+            .header(header::AUTHORIZATION, format!("Bearer {}", issued.key))
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(multipart))
+            .unwrap();
+        let task =
+            tokio::spawn(router_for_role(state.clone(), RuntimeRole::Gateway).oneshot(request));
+
+        let mut admitted = false;
+        for _ in 0..100 {
+            if !upstream.received_requests().await.unwrap().is_empty() {
+                admitted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(admitted, "audio request did not reach the delayed upstream");
+        assert_eq!(
+            state
+                .db
+                .key_limit_snapshot(issued.key_id)
+                .await
+                .unwrap()
+                .concurrency
+                .active,
+            1
+        );
+        assert_eq!(state.image_response_permits.available_permits(), 1);
+        assert!(state.proxy_memory_budget.snapshot().0 > 0);
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let mut settled = false;
+        for _ in 0..100 {
+            let snapshot = state.db.key_limit_snapshot(issued.key_id).await.unwrap();
+            if snapshot.concurrency.active == 0 {
+                settled = true;
+                assert_eq!(snapshot.concurrency.remaining, 1);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            settled,
+            "detached audio lifecycle did not settle promptly after cancellation"
+        );
+        let mut resources_released = false;
+        for _ in 0..100 {
+            if state.image_response_permits.available_permits() == 2
+                && state.proxy_memory_budget.snapshot().0 == 0
+            {
+                resources_released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            resources_released,
+            "detached audio lifecycle retained process resources after terminalization"
         );
         let authenticated = state
             .db

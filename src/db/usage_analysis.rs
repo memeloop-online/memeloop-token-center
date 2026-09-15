@@ -843,6 +843,7 @@ fn usage_analysis_request_fact_sql(
                       WHEN f.protocol = 'anthropic' OR f.protocol LIKE 'anthropic-%'
                           THEN 'anthropic'
                       WHEN f.protocol = 'openai-image' THEN 'openai-image'
+                      WHEN f.protocol = 'audio-transcription' THEN 'audio-transcription'
                       ELSE 'openai'
                   END AS protocol,
                   f.status_class, f.error_code, f.upstream_account_id,
@@ -854,7 +855,7 @@ fn usage_analysis_request_fact_sql(
                       ELSE 0
                   END AS input_tokens,
                   f.output_tokens, f.cached_input_tokens, f.cache_write_tokens,
-                  CAST(0 AS BIGINT) AS generation_units,
+                  f.generation_units,
                   CAST(1 AS BIGINT) AS duration_count,
                   f.duration_ms AS duration_sum_ms,
                   CASE WHEN f.duration_ms <= 10 THEN 1 ELSE 0 END AS duration_bucket_0,

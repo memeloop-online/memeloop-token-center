@@ -21,8 +21,11 @@ pub(super) fn session_usage_dimension_sql(
                        AND ({alias}.protocol = 'anthropic'
                             OR {alias}.protocol LIKE 'anthropic-%'))
                    OR ($6 = 'openai-image' AND {alias}.protocol = 'openai-image')
+                   OR ($6 = 'audio-transcription'
+                       AND {alias}.protocol = 'audio-transcription')
                    OR ($6 = 'openai'
                        AND {alias}.protocol <> 'openai-image'
+                       AND {alias}.protocol <> 'audio-transcription'
                        AND {alias}.protocol <> 'anthropic'
                        AND {alias}.protocol NOT LIKE 'anthropic-%'))"#,
             )
@@ -82,6 +85,7 @@ pub(super) fn session_usage_dimension_sql(
                       CASE WHEN fact.protocol = 'anthropic' OR fact.protocol LIKE 'anthropic-%'
                            THEN 'anthropic'
                            WHEN fact.protocol = 'openai-image' THEN 'openai-image'
+                           WHEN fact.protocol = 'audio-transcription' THEN 'audio-transcription'
                            ELSE 'openai' END,
                       fact.status_class, fact.error_code, fact.upstream_account_id,
                       fact.model_route_id, fact.currency, 1,
@@ -89,7 +93,8 @@ pub(super) fn session_usage_dimension_sql(
                            THEN fact.input_tokens - fact.cached_input_tokens - fact.cache_write_tokens
                            ELSE 0 END,
                       fact.output_tokens, fact.cached_input_tokens,
-                      fact.cache_write_tokens, 0, 1, fact.duration_ms, fact.cost_micros
+                      fact.cache_write_tokens, fact.generation_units, 1,
+                      fact.duration_ms, fact.cost_micros
                  FROM request_stats_facts fact
                 WHERE $13 <= $14 AND fact.created_at >= $13 AND fact.created_at <= $14
                   {fact_filters}
@@ -99,6 +104,7 @@ pub(super) fn session_usage_dimension_sql(
                       CASE WHEN fact.protocol = 'anthropic' OR fact.protocol LIKE 'anthropic-%'
                            THEN 'anthropic'
                            WHEN fact.protocol = 'openai-image' THEN 'openai-image'
+                           WHEN fact.protocol = 'audio-transcription' THEN 'audio-transcription'
                            ELSE 'openai' END,
                       fact.status_class, fact.error_code, fact.upstream_account_id,
                       fact.model_route_id, fact.currency, 1,
@@ -106,7 +112,8 @@ pub(super) fn session_usage_dimension_sql(
                            THEN fact.input_tokens - fact.cached_input_tokens - fact.cache_write_tokens
                            ELSE 0 END,
                       fact.output_tokens, fact.cached_input_tokens,
-                      fact.cache_write_tokens, 0, 1, fact.duration_ms, fact.cost_micros
+                      fact.cache_write_tokens, fact.generation_units, 1,
+                      fact.duration_ms, fact.cost_micros
                  FROM request_stats_facts fact
                 WHERE $15 <= $16 AND fact.created_at >= $15 AND fact.created_at <= $16
                   {fact_filters}
