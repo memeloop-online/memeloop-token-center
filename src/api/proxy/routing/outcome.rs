@@ -64,11 +64,16 @@ pub(in crate::api::proxy) fn classify_attempt_failure(
             UpstreamFailureKind::Connection,
             UpstreamHealthReason::Connection,
         )),
+        // Ambiguous delivery forbids replaying this POST, but the transport
+        // failure is still account-health evidence for independent requests.
+        Err(ProxySendError::NonRetryableTransport) => Some((
+            UpstreamFailureKind::Connection,
+            UpstreamHealthReason::Connection,
+        )),
         Err(
             ProxySendError::CodexBadRequest
             | ProxySendError::AmbiguousResponse(_)
             | ProxySendError::CandidateUnavailable
-            | ProxySendError::NonRetryableTransport
             | ProxySendError::OuterDeadline
             | ProxySendError::CredentialUnavailable
             | ProxySendError::Credential,
@@ -157,6 +162,22 @@ mod tests {
                 Some(StatusCode::SERVICE_UNAVAILABLE),
                 Some(&ProxySendError::RetryableConnection("connect"))
             ),
+            FailoverDisposition::Stop
+        );
+    }
+
+    #[test]
+    fn ambiguous_transport_failure_cools_account_without_permitting_replay() {
+        let result = Err(ProxySendError::NonRetryableTransport);
+        assert_eq!(
+            classify_attempt_failure(&result, None),
+            Some((
+                UpstreamFailureKind::Connection,
+                UpstreamHealthReason::Connection
+            ))
+        );
+        assert_eq!(
+            failover_disposition(None, Some(&ProxySendError::NonRetryableTransport)),
             FailoverDisposition::Stop
         );
     }
