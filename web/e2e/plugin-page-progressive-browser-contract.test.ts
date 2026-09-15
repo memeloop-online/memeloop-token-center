@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
@@ -20,7 +20,7 @@ test('plugin catalog is usable without unrelated route code or unopened configur
   const unrelatedRouteGate = new Promise<void>((resolve) => { releaseUnrelatedRoutes = resolve; });
   const configurationFormGate = new Promise<void>((resolve) => { releaseConfigurationForm = resolve; });
   try {
-    const page = await browser.newPage({ viewport: { width: 1024, height: 800 } });
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
     await page.addInitScript(() => {
       localStorage.setItem('mtc-locale', 'en');
       localStorage.setItem('mtc.operator.service-credential.v1', 'operator-test');
@@ -48,11 +48,29 @@ test('plugin catalog is usable without unrelated route code or unopened configur
     });
     let catalogReads = 0;
     let configurationReads = 0;
+    let runtimeReads = 0;
+    let historyReads = 0;
     await page.route('**/internal/v1/**', async (route) => {
       const url = new URL(route.request().url());
       assert.equal(route.request().headers().authorization, 'Bearer operator-test');
+      assert.equal(route.request().method(), 'GET', 'this read-only contract must not mutate plugin state');
       if (url.pathname === '/internal/v1/tenants') return route.fulfill({ json: [{ external_id: 'alpha' }] });
-      if (url.pathname === '/internal/v1/plugins/runtime-access') return route.fulfill({ json: { can_view_runtime: false, can_manage_runtime: false } });
+      if (url.pathname === '/internal/v1/plugins/runtime-access') return route.fulfill({ json: { can_view_runtime: true, can_manage_runtime: true } });
+      if (url.pathname === '/internal/v1/plugin-runtime') {
+        runtimeReads += 1;
+        return route.fulfill({ json: {
+          current: { revision: 2, inventory_id: 'current-1', reason: 'publish', created_at: 1 },
+          candidates: [{ inventory_id: 'candidate-2', staged: true, plugins: { first: ['1.0.0'] } }],
+        } });
+      }
+      if (url.pathname === '/internal/v1/plugin-runtime/history') {
+        historyReads += 1;
+        return route.fulfill({ json: {
+          runtime_enabled: true, installation_enabled: true, installations: [],
+          revisions: [{ revision: 2, inventory_id: 'current-1', reason: 'publish', created_at: 1 }],
+          audit: [{ id: 'audit-1', actor: 'operator-test', action: 'publish', inventory_id: 'current-1', revision: 2, outcome: 'success', created_at: 1 }],
+        } });
+      }
       if (url.pathname === '/internal/v1/plugins') {
         catalogReads += 1;
         return route.fulfill({ json: [{
@@ -67,16 +85,40 @@ test('plugin catalog is usable without unrelated route code or unopened configur
       return route.fulfill({ status: 404, json: { error: { message: 'Unexpected fixture request' } } });
     });
     await page.goto(`http://127.0.0.1:${address.port}/operator?view=plugins`);
-    const plugin = page.locator('.managed-resource').filter({ has: page.getByText('first', { exact: true }) });
+    const plugin = page.locator('.account-list > .managed-resource').filter({ has: page.getByText('first', { exact: true }) });
     await plugin.waitFor();
+    await page.getByText('candidate-2', { exact: true }).waitFor();
     assert.deepEqual(unrelatedRequests, [], 'the selected plugin route must not wait for unrelated management page modules');
     assert.equal(catalogReads, 1, 'shell registration and plugin management share one catalog read');
+    assert.equal(runtimeReads, 1);
+    assert.equal(historyReads, 1);
     assert.equal(configurationModuleRequests, 0, 'an unopened configuration disclosure does not load schema form code');
     assert.equal(configurationReads, 0, 'catalog rendering does not fan out configuration reads');
 
+    const activation = page.getByRole('checkbox', { name: 'Confirm global activation' });
+    await activation.focus();
+    await page.keyboard.press('Space');
+    assert.equal(await activation.isChecked(), true, 'the labelled activation control remains keyboard operable');
+    const compactRecords = page.getByRole('button', { name: 'Tasks and version records' });
+    await compactRecords.focus();
+    await page.keyboard.press('Enter');
+    await page.getByRole('heading', { name: 'Installation tasks' }).waitFor();
+    await compactRecords.press('Enter');
+
+    const artifacts = fileURLToPath(new URL('../e2e-artifacts/ui-system/plugin-management/', import.meta.url));
+    mkdirSync(artifacts, { recursive: true });
+    for (const width of [390, 1440]) {
+      await page.setViewportSize({ width, height: width === 390 ? 844 : 900 });
+      const geometry = await page.evaluate(() => ({ viewport: innerWidth, scrollWidth: document.documentElement.scrollWidth }));
+      assert.ok(geometry.scrollWidth <= geometry.viewport, `${width}px plugin management must not overflow horizontally`);
+      await page.screenshot({ path: `${artifacts}/ready-${width}.png`, fullPage: true });
+    }
+
     const configurationModuleRequested = page.waitForRequest((request) => new URL(request.url()).pathname.endsWith('/src/operator/PluginConfigurationForm.tsx'));
     const configurationReadCompleted = page.waitForResponse((response) => new URL(response.url()).pathname === '/internal/v1/plugins/first/configuration');
-    await plugin.locator('summary').click();
+    const configurationButton = plugin.getByRole('button', { name: 'View and edit configuration' });
+    await configurationButton.focus();
+    await page.keyboard.press('Enter');
     await configurationModuleRequested;
     assert.equal((await configurationReadCompleted).status(), 200);
     assert.equal(configurationReads, 1, 'one disclosure action owns one configuration read while schema code loads in parallel');
@@ -84,6 +126,12 @@ test('plugin catalog is usable without unrelated route code or unopened configur
     await plugin.getByLabel('Mode').waitFor();
     assert.equal(await plugin.getByLabel('Mode').inputValue(), 'ready');
     assert.equal(configurationReads, 1);
+    await configurationButton.press('Space');
+    assert.equal(await plugin.getByLabel('Mode').isHidden(), true);
+    await configurationButton.press('Space');
+    await plugin.getByLabel('Mode').waitFor();
+    assert.equal(configurationModuleRequests, 1, 'reopening the configuration surface reuses loaded form code');
+    assert.equal(configurationReads, 1, 'reopening a loaded configuration does not duplicate the read');
   } finally {
     releaseConfigurationForm();
     releaseUnrelatedRoutes();

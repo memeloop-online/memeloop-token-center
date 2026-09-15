@@ -1,5 +1,6 @@
 import { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import { api } from '../api';
+import { Button, Disclosure } from '../design-system';
 import { formatNumber } from '../format';
 import { useI18n } from '../i18n';
 import type { PluginConfiguration, PluginManifest } from '../types';
@@ -64,8 +65,7 @@ function PluginConfigurationEditor({ token, tenant, writeTenant, plugin }: { tok
   }
 
   if (!contribution) return null;
-  return <details className="inline-editor form-panel" onToggle={(event) => { if (event.currentTarget.open) { setOpened(true); void load(); } }}>
-    <summary>{t('plugins.editConfiguration')}</summary>
+  return <div className="plugin-configuration-editor form-panel"><Disclosure title={t('plugins.editConfiguration')} open={opened} onOpenChange={(open) => { setOpened(open); if (open) void load(); }}>
     {opened && <>
       {loading && <div role="status">{t('common.loading')}</div>}
       {error && <div className="notice error" role="alert">{error}{!configuration && <button type="button" onClick={() => void load()}>{t('common.retry')}</button>}</div>}
@@ -73,14 +73,15 @@ function PluginConfigurationEditor({ token, tenant, writeTenant, plugin }: { tok
       {configuration && <p className="muted">{t('plugins.configurationScope', { source: t(`plugins.source.${configuration.source}`), version: formatNumber(configuration.scope_version, locale) })}</p>}
       <Suspense fallback={loading ? null : <div role="status">{t('common.loading')}</div>}><PluginConfigurationForm plugin={plugin} configuration={configuration} saving={saving} writeTenant={writeTenant} onSubmit={save} /></Suspense>
     </>}
-  </details>;
+  </Disclosure></div>;
 }
 
 /** `tenant` scopes reads; plugin configuration writes use `writeTenant`. */
-export function Plugins({ token, tenant, writeTenant = tenant, values }: { token: string; tenant: string; writeTenant?: string; values: PluginManifest[] }) {
+export function Plugins({ token, tenant, writeTenant = tenant, values, onRefresh, refreshError }: { token: string; tenant: string; writeTenant?: string; values: PluginManifest[]; onRefresh?: () => Promise<void>; refreshError?: string }) {
   const { locale, t } = useI18n();
   return <article className="panel">
-    <div className="panel-title"><div><h2>{t('plugins.title')}</h2><p className="muted">{t('plugins.configurationDescription')}</p></div><span>{t('plugins.runtime')}</span></div>
+    <div className="panel-title"><div><h2>{t('plugins.title')}</h2><p className="muted">{t('plugins.configurationDescription')}</p></div>{onRefresh && <Button appearance="secondary" onClick={() => void onRefresh()}>{t('plugins.refreshCatalog')}</Button>}</div>
+    {refreshError && <div className="notice error" role="alert">{refreshError}</div>}
     <div className="account-list">
       {values.length === 0 && <div className="empty">{t('plugins.empty')}</div>}
       {values.map((plugin) => <div className="managed-resource" key={plugin.id}>
