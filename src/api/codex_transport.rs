@@ -439,7 +439,16 @@ fn translate_chat_request(request: &mut Value) -> Result<ChatRequestControls, Ap
             }
             "user" | "assistant" => {
                 conversation_started = true;
-                input.push(json!({"role": role, "content": content}));
+                let content_type = if role == "assistant" {
+                    "output_text"
+                } else {
+                    "input_text"
+                };
+                input.push(json!({
+                    "type": "message",
+                    "role": role,
+                    "content": [{"type": content_type, "text": content}]
+                }));
             }
             _ => {
                 return Err(AppError::BadRequest(
@@ -1956,6 +1965,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!(existing_image_tool["tools"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn text_chat_uses_typed_responses_message_content() {
+        let mut body = json!({
+            "model": "public",
+            "messages": [{"role": "user", "content": "Translate this sentence."}],
+            "stream": false
+        });
+        let plan = prepare_request_with_id(
+            &mut body,
+            "gpt-5.3-codex-spark",
+            &config("gpt-5.3-codex-spark", 128_000),
+            Uuid::nil(),
+            Protocol::OpenAiChat,
+        )
+        .unwrap();
+
+        assert!(!plan.downstream_stream);
+        assert_eq!(
+            body["input"],
+            json!([{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "Translate this sentence."
+                }]
+            }])
+        );
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["instructions"], "");
+        assert!(body.get("messages").is_none());
     }
 
     #[test]
