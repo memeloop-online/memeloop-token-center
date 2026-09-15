@@ -572,12 +572,10 @@ fn pcm16_wav_duration(bytes: &[u8]) -> Result<Pcm16WavDuration, AppError> {
                 ));
             }
             format = Some((channels, sample_rate_hz, block_align));
-        } else if id == b"data" {
-            if data_bytes.replace(size as u64).is_some() {
-                return Err(AppError::BadRequest(
-                    "WAV must contain exactly one audio data chunk".into(),
-                ));
-            }
+        } else if id == b"data" && data_bytes.replace(size as u64).is_some() {
+            return Err(AppError::BadRequest(
+                "WAV must contain exactly one audio data chunk".into(),
+            ));
         }
         offset = end
             .checked_add(size & 1)
