@@ -10,6 +10,7 @@ use std::{
 };
 
 const OWNER_LIMIT: u64 = 8192;
+const RECLAMATION_COMPLETE_PREFIX: &str = ".mtc-reclaim-complete-";
 
 pub(crate) fn unsupported_rename(error: rustix::io::Errno) -> bool {
     matches!(
@@ -74,6 +75,37 @@ fn verify_owner_at(directory: &rustix::fd::OwnedFd, name: &str, owner: &[u8]) ->
         return Err(io::ErrorKind::AlreadyExists.into());
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn publish_owner_at(directory: &rustix::fd::OwnedFd, name: &str, owner: &[u8]) -> io::Result<()> {
+    use rustix::fs::{AtFlags, Mode, OFlags, linkat, openat, unlinkat};
+    let temporary = format!(".mtc-publish-claim-{}", uuid::Uuid::now_v7());
+    let result = (|| {
+        let mut file = fs::File::from(openat(
+            directory,
+            temporary.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_bits_truncate(0o600),
+        )?);
+        file.write_all(owner)?;
+        file.sync_all()?;
+        match linkat(
+            directory,
+            temporary.as_str(),
+            directory,
+            name,
+            AtFlags::empty(),
+        ) {
+            Ok(()) => {}
+            Err(rustix::io::Errno::EXIST) => verify_owner_at(directory, name, owner)?,
+            Err(error) => return Err(error.into()),
+        }
+        rustix::fs::fsync(directory)?;
+        Ok(())
+    })();
+    let _ = unlinkat(directory, temporary.as_str(), AtFlags::empty());
+    result
 }
 
 fn claim_name(root: &Path, owner: &[u8]) -> io::Result<()> {
@@ -187,6 +219,7 @@ pub(crate) fn clear_claimed_directory(root: &Path, owner: &[u8]) -> io::Result<b
     let owner_marker = format!(".mtc-publish-owner-{name_text}");
     let inode_marker = format!(".mtc-publish-inode-{name_text}");
     let quarantine = format!(".mtc-reclaim-{name_text}");
+    let completion_marker = format!("{RECLAMATION_COMPLETE_PREFIX}{name_text}");
     match mkdirat(
         &parent,
         quarantine.as_str(),
@@ -222,11 +255,13 @@ pub(crate) fn clear_claimed_directory(root: &Path, owner: &[u8]) -> io::Result<b
                         ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
                     ) {
                         Err(rustix::io::Errno::NOENT) => {
-                            finish_reclamation(
+                            let _ = finish_reclamation_if_complete(
                                 &parent,
                                 quarantine.as_str(),
+                                &completion_marker,
                                 &owner_marker,
                                 &inode_marker,
+                                owner,
                             )?;
                             return Ok(false);
                         }
@@ -239,8 +274,27 @@ pub(crate) fn clear_claimed_directory(root: &Path, owner: &[u8]) -> io::Result<b
             match renameat(&parent, name, &quarantine_directory, "root") {
                 Ok(()) => {}
                 Err(rustix::io::Errno::NOENT) => {
-                    finish_reclamation(&parent, quarantine.as_str(), &owner_marker, &inode_marker)?;
-                    return Ok(false);
+                    match openat2(
+                        &quarantine_directory,
+                        "root",
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                        Mode::empty(),
+                        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
+                    ) {
+                        Ok(_) => {}
+                        Err(rustix::io::Errno::NOENT) => {
+                            let _ = finish_reclamation_if_complete(
+                                &parent,
+                                quarantine.as_str(),
+                                &completion_marker,
+                                &owner_marker,
+                                &inode_marker,
+                                owner,
+                            )?;
+                            return Ok(false);
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -263,9 +317,19 @@ pub(crate) fn clear_claimed_directory(root: &Path, owner: &[u8]) -> io::Result<b
         verify_owner_at(&parent, &inode_marker, identity.as_bytes())?;
         clear_directory_contents(&directory)?;
         rustix::fs::fsync(&directory)?;
-        unlinkat(&quarantine_directory, "root", AtFlags::REMOVEDIR)?;
+        publish_owner_at(&parent, &completion_marker, owner)?;
+        match unlinkat(&quarantine_directory, "root", AtFlags::REMOVEDIR) {
+            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+            Err(error) => return Err(error.into()),
+        }
         rustix::fs::fsync(&quarantine_directory)?;
-        finish_reclamation(&parent, quarantine.as_str(), &owner_marker, &inode_marker)?;
+        finish_reclamation(
+            &parent,
+            quarantine.as_str(),
+            &completion_marker,
+            &owner_marker,
+            &inode_marker,
+        )?;
         Ok(true)
     })();
     if result.is_err() {
@@ -285,6 +349,7 @@ pub(crate) fn clear_claimed_directory(root: &Path, owner: &[u8]) -> io::Result<b
 fn finish_reclamation(
     parent: &rustix::fd::OwnedFd,
     quarantine: &str,
+    completion_marker: &str,
     owner_marker: &str,
     inode_marker: &str,
 ) -> io::Result<()> {
@@ -300,7 +365,37 @@ fn finish_reclamation(
         Ok(()) | Err(rustix::io::Errno::NOENT) => {}
         Err(error) => return Err(error.into()),
     }
+    rustix::fs::fsync(parent)?;
+    match unlinkat(parent, completion_marker, AtFlags::empty()) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+        Err(error) => return Err(error.into()),
+    }
     Ok(rustix::fs::fsync(parent)?)
+}
+
+#[cfg(target_os = "linux")]
+fn finish_reclamation_if_complete(
+    parent: &rustix::fd::OwnedFd,
+    quarantine: &str,
+    completion_marker: &str,
+    owner_marker: &str,
+    inode_marker: &str,
+    owner: &[u8],
+) -> io::Result<bool> {
+    match verify_owner_at(parent, completion_marker, owner) {
+        Ok(()) => {
+            finish_reclamation(
+                parent,
+                quarantine,
+                completion_marker,
+                owner_marker,
+                inode_marker,
+            )?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(not(target_os = "linux"))]

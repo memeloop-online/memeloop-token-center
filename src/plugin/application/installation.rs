@@ -609,24 +609,38 @@ fn reclaim_installation_attempt_roots(
         }
         let entry = entry.map_err(|_| AppError::Internal)?;
         let entry_name = entry.file_name();
-        let (attempt_id, root) = if let Some(attempt_id) = inventory_attempt_id(&entry_name) {
-            (attempt_id, entry.path())
-        } else if let Some(original) = entry_name
-            .to_str()
-            .and_then(|name| name.strip_prefix(".mtc-reclaim-"))
-        {
-            let Some(attempt_id) = inventory_attempt_id(std::ffi::OsStr::new(original)) else {
+        let (attempt_id, root, recovery_entry) =
+            if let Some(attempt_id) = inventory_attempt_id(&entry_name) {
+                (attempt_id, entry.path(), false)
+            } else if let Some(original) = entry_name
+                .to_str()
+                .and_then(|name| name.strip_prefix(".mtc-reclaim-complete-"))
+            {
+                let Some(attempt_id) = inventory_attempt_id(std::ffi::OsStr::new(original)) else {
+                    continue;
+                };
+                (attempt_id, plugin_root.join(original), true)
+            } else if let Some(original) = entry_name
+                .to_str()
+                .and_then(|name| name.strip_prefix(".mtc-reclaim-"))
+            {
+                let Some(attempt_id) = inventory_attempt_id(std::ffi::OsStr::new(original)) else {
+                    continue;
+                };
+                (attempt_id, plugin_root.join(original), true)
+            } else {
                 continue;
             };
-            (attempt_id, plugin_root.join(original))
-        } else {
-            continue;
-        };
         if referenced_attempts.contains(&attempt_id) || inventory_roots.contains(&root) {
             continue;
         }
         let metadata = match std::fs::symlink_metadata(entry.path()) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => metadata,
+            Ok(metadata)
+                if !metadata.file_type().is_symlink()
+                    && (metadata.is_dir() || recovery_entry && metadata.is_file()) =>
+            {
+                metadata
+            }
             _ => continue,
         };
         if metadata
@@ -638,11 +652,15 @@ fn reclaim_installation_attempt_roots(
             continue;
         }
         let inode_marker = plugin_root.join(format!(".mtc-publish-inode-mtc-attempt-{attempt_id}"));
-        let result = std::fs::symlink_metadata(&inode_marker)
-            .map(|_| ())
-            .and_then(|()| {
-                crate::plugin_publication::clear_claimed_directory(&root, attempt_id.as_bytes())
-            });
+        let result = if recovery_entry {
+            crate::plugin_publication::clear_claimed_directory(&root, attempt_id.as_bytes())
+        } else {
+            std::fs::symlink_metadata(&inode_marker)
+                .map(|_| ())
+                .and_then(|()| {
+                    crate::plugin_publication::clear_claimed_directory(&root, attempt_id.as_bytes())
+                })
+        };
         match result {
             Ok(true) => reclaimed += 1,
             Ok(false) => {}
@@ -1864,6 +1882,25 @@ mod tests {
         std::fs::create_dir(&terminal_quarantine).unwrap();
         std::fs::rename(&roots[5], terminal_quarantine.join("root")).unwrap();
         std::fs::remove_dir_all(terminal_quarantine.join("root")).unwrap();
+        std::fs::write(
+            directory
+                .path()
+                .join(format!(".mtc-reclaim-complete-mtc-attempt-{}", attempts[5])),
+            attempts[5].as_bytes(),
+        )
+        .unwrap();
+        std::fs::remove_file(
+            directory
+                .path()
+                .join(format!(".mtc-publish-owner-mtc-attempt-{}", attempts[5])),
+        )
+        .unwrap();
+        std::fs::remove_file(
+            directory
+                .path()
+                .join(format!(".mtc-publish-inode-mtc-attempt-{}", attempts[5])),
+        )
+        .unwrap();
         let inventory_roots = BTreeSet::from([roots[0].clone()]);
         let referenced_attempts = BTreeSet::from([attempts[1].clone()]);
         std::fs::remove_file(
@@ -1888,6 +1925,12 @@ mod tests {
         assert!(!roots[3].exists());
         assert!(!interrupted_quarantine.exists());
         assert!(!terminal_quarantine.exists());
+        assert!(
+            !directory
+                .path()
+                .join(format!(".mtc-reclaim-complete-mtc-attempt-{}", attempts[5]))
+                .exists()
+        );
         assert!(
             !directory
                 .path()
