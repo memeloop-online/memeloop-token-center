@@ -175,12 +175,12 @@ pub(crate) async fn admit_gateway_request_body_with_memory(
         .try_acquire_owned()
         .map_err(|_| GatewayBodyAdmissionError::CapacityExhausted)?;
     let reservation = memory_budget
-        .filter(|_| is_text_proxy_path(request.uri().path()))
+        .filter(|_| uses_proxy_memory_budget(request.uri().path()))
         .map(memory::ProxyMemoryBudget::reservation);
     admit_request_body_for_route(request, deadline, maximum, route_class, reservation).await
 }
 
-fn is_text_proxy_path(path: &str) -> bool {
+fn uses_proxy_memory_budget(path: &str) -> bool {
     matches!(
         path,
         "/v1/responses"
@@ -188,6 +188,7 @@ fn is_text_proxy_path(path: &str) -> bool {
             | "/v1/embeddings"
             | "/v1/messages"
             | "/v1/messages/count_tokens"
+            | "/v1/audio/transcriptions"
     )
 }
 

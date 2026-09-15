@@ -459,6 +459,7 @@ impl Config {
             || self.proxy_memory_budget_bytes > 2 * 1024 * 1024 * 1024
             || u64::from(self.proxy_memory_budget_bytes)
                 < u64::from(self.responses_body_max_bytes) * 12 + 1024 * 1024
+            || u64::from(self.proxy_memory_budget_bytes) < u64::from(self.audio_body_max_bytes) * 3
         {
             return Err(ConfigError::InvalidProxyMemoryBudget);
         }
@@ -642,7 +643,7 @@ fn responses_body_read_concurrency(value: u32) -> u32 {
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error(
-        "MTC_PROXY_MEMORY_BUDGET_BYTES must be 256 MiB..2 GiB and at least twelve times MTC_RESPONSES_BODY_MAX_BYTES plus 1 MiB; pod memory must cover this budget plus 256 MiB"
+        "MTC_PROXY_MEMORY_BUDGET_BYTES must be 256 MiB..2 GiB, at least twelve times MTC_RESPONSES_BODY_MAX_BYTES plus 1 MiB, and at least three times MTC_AUDIO_BODY_MAX_BYTES; pod memory must cover this budget plus 256 MiB"
     )]
     InvalidProxyMemoryBudget,
     #[error(
@@ -686,6 +687,8 @@ mod tests {
         assert!(config.validate_proxy_memory_budget().is_err());
         config.proxy_memory_budget_bytes = MAX_RESPONSES_BODY_MAX_BYTES * 12 + 1024 * 1024;
         assert!(config.validate_proxy_memory_budget().is_ok());
+        config.audio_body_max_bytes = config.proxy_memory_budget_bytes / 3 + 1;
+        assert!(config.validate_proxy_memory_budget().is_err());
     }
 
     #[test]
