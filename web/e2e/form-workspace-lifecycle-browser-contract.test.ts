@@ -43,7 +43,7 @@ test('AppShell workspaces retain failed drafts, return after success, and priori
     assert.equal(await page.locator('.notice.success').evaluate(element => document.activeElement === element), true);
     await workspace.locator('[data-workspace-toggle]').click();
     await workspace.getByLabel(/公开模型/).fill('research-created');
-    const account = workspace.getByRole('combobox', { name: '具体提供商', exact: true });
+    const account = workspace.getByRole('combobox', { name: '上游账号', exact: true });
     await account.fill('研发订阅'); await account.press('ArrowDown'); await account.press('Enter'); await account.press('Escape');
     const model = workspace.getByRole('combobox', { name: '上游模型', exact: true });
     await model.fill('fixture-model');

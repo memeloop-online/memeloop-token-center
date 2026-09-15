@@ -421,7 +421,7 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await routeForm.locator('[data-workspace-toggle]').click();
   await routeForm.getByLabel('公开模型').fill(imageModel);
   await routeForm.getByLabel('协议').selectOption('generation');
-  const imageUpstreamPicker = routeForm.getByRole('combobox', { name: '具体提供商', exact: true });
+  const imageUpstreamPicker = routeForm.getByRole('combobox', { name: '上游账号', exact: true });
   await imageUpstreamPicker.fill('Browser UI ComfyUI');
   const imageScopeCatalog = page.waitForResponse((response) => {
     const url = new URL(response.url());
@@ -477,7 +477,7 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   const editConfirmation = imageEditor.getByRole('checkbox', { name: /我确认将.*用于全部明确选择的上游，允许目录未验证的账号参与路由/ });
   await eventually(async () => assert.equal(await editConfirmation.isChecked(), true), 10_000);
   const editSave = imageEditor.getByRole('button', { name: '保存', exact: true });
-  const editCandidates = imageEditor.getByRole('combobox', { name: '具体提供商', exact: true });
+  const editCandidates = imageEditor.getByRole('combobox', { name: '上游账号', exact: true });
   await editCandidates.fill('Browser UI Seedance');
   await editCandidates.press('Enter');
   await eventually(async () => assert.equal(await editConfirmation.isChecked(), false), 10_000);
@@ -497,7 +497,7 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await routeForm.locator('[data-workspace-toggle]').click();
   await routeForm.getByLabel('公开模型').fill(videoModel);
   await routeForm.getByLabel('协议').selectOption('generation');
-  const upstreamPicker = routeForm.getByRole('combobox', { name: '具体提供商', exact: true });
+  const upstreamPicker = routeForm.getByRole('combobox', { name: '上游账号', exact: true });
   await upstreamPicker.fill('Browser UI Seedance');
   const videoScopeCatalog = page.waitForResponse((response) => {
     const url = new URL(response.url());

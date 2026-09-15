@@ -3,7 +3,8 @@ import { api } from '../api';
 import { formatNumber } from '../format';
 import { useI18n } from '../i18n';
 import { ModelPicker, type ModelPickerOption } from '../ModelPicker';
-import type { UpstreamAccount } from '../types';
+import type { ProviderType, UpstreamAccount } from '../types';
+import { providerDisplayName } from './providerDisplayName';
 import { catalogEvidenceVerified, confirmationForScope, modelConfirmationValidity } from './modelConfirmation';
 
 interface CatalogModel {
@@ -47,9 +48,10 @@ interface Props {
   customModelConfirmed: boolean;
   onValidityChange: (valid: boolean, allowCustom: boolean) => void;
   upstreams?: UpstreamAccount[];
+  providers?: ProviderType[];
 }
 
-export function UpstreamModelCombobox({ token, tenant, accountIds, includedProviderGroupIds, excludedProviderGroupIds, syncAccountIds, protocol, value, onChange, customModelConfirmed, onValidityChange, upstreams = [] }: Props) {
+export function UpstreamModelCombobox({ token, tenant, accountIds, includedProviderGroupIds, excludedProviderGroupIds, syncAccountIds, protocol, value, onChange, customModelConfirmed, onValidityChange, upstreams = [], providers = [] }: Props) {
   const { locale, t } = useI18n();
   const sourceKey = JSON.stringify([accountIds, includedProviderGroupIds, excludedProviderGroupIds, syncAccountIds, protocol]);
   const confirmationScope = JSON.stringify([token, tenant, sourceKey, value]);
@@ -177,7 +179,7 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
     const accounts = upstreams.filter((account) => syncAccountIds.includes(account.id) && accountCatalogs.get(account.id)?.models?.some((item) => item.id === model.id && (item.protocol === protocol || item.protocol === 'any')));
     return (accounts.length ? accounts : [undefined]).map((account) => ({
       key: `${account?.id ?? 'unknown'}:${model.protocol}:${model.id}`, value: model.id, label: model.id,
-      provider: account?.driver || t('modelPicker.unknown'), upstream: account?.name || t('modelPicker.unknown'),
+      provider: providerDisplayName(account?.driver, providers, locale), upstream: account?.name || t('modelPicker.unknown'),
       description: [
         model.complete_coverage ? t('routes.catalogVerified') : t('routes.catalogRestricted'),
         model.context_window ? t('routes.contextWindow', { count: formatNumber(model.context_window, locale) }) : '',

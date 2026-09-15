@@ -21,6 +21,8 @@ import { GroupManager, useGroups } from '../GroupManager';
 import { MultiCombobox, type ComboboxOption } from '../MultiCombobox';
 import { ResourceListStatusEmpty, ResourceListStatusFilterControl, useResourceListStatusFilter } from '../ResourceListStatusFilter';
 import { UpstreamModelCombobox } from '../UpstreamModelCombobox';
+import { providerDisplayName } from '../providerDisplayName';
+import '../routeFormScope.css';
 import {
   applyKeyPage, canLoadMoreKeys, canReadCredentialLimits, canWriteCredential,
   credentialListPresentation, keyListPath,
@@ -631,12 +633,13 @@ function selections(ids: string[], options: ComboboxOption[]) {
   return ids.map((id) => options.find((option) => option.value === id) ?? { value: id, label: id });
 }
 
-function ExactCredentialCombobox({ token, tenant, credentials, value, onChange }: {
+function ExactCredentialCombobox({ token, tenant, credentials, value, onChange, onSelectionLabels }: {
   token: string;
   tenant: string;
   credentials: KeyView[];
   value: string[];
   onChange: (ids: string[]) => void;
+  onSelectionLabels?: (labels: Record<string, string>) => void;
 }) {
   const { t } = useI18n();
   const [resolved, setResolved] = useState<KeyView[]>([]);
@@ -703,7 +706,7 @@ function ExactCredentialCombobox({ token, tenant, credentials, value, onChange }
     setResolved((current) => current.filter((credential) => value.includes(credential.key_id) || credential.key_id === search.resultId));
   }, [value, search.resultId]);
 
-  return <MultiCombobox label={t('routes.exactCredentials')} options={credentialOptions} value={selections(value, credentialOptions)} onChange={(selected) => onChange(selected.map((item) => item.value))} placeholder={t('routes.searchCredentials')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('routes.exactCredentialsHint')} onQueryChange={searchCredential} loading={search.loading} loadingText={t('routes.credentialSearchLoading')} error={search.error} retryLabel={t('common.retry')} onRetry={() => searchCredential(search.query)} />;
+  return <MultiCombobox label={t('routes.exactCredentials')} options={credentialOptions} value={selections(value, credentialOptions)} onChange={(selected) => { onSelectionLabels?.(Object.fromEntries(selected.filter(item => credentialOptions.some(option => option.value === item.value)).map(item => [item.value, item.label]))); onChange(selected.map((item) => item.value)); }} placeholder={t('routes.searchCredentials')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('routes.exactCredentialsHint')} onQueryChange={searchCredential} loading={search.loading} loadingText={t('routes.credentialSearchLoading')} error={search.error} retryLabel={t('common.retry')} onRetry={() => searchCredential(search.query)} />;
 }
 
 function routeRequest(draft: RouteDraft, customModelConfirmed: boolean) {
@@ -727,6 +730,10 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
   const knownProtocols = ['openai', 'anthropic', 'generation'];
   const journey = formJourneyCopy(locale);
   const priorityHintId = useId();
+  const protocolId = useId();
+  const labelScope = JSON.stringify([token, tenant]);
+  const [credentialLabels, setCredentialLabels] = useState<{ scope: string; labels: Record<string, string> }>();
+  const zh = locale.startsWith('zh');
   const includedAccountIds = providerGroups.filter((group) => draft.included_provider_group_ids.includes(group.id)).flatMap((group) => group.member_ids);
   const excludedAccountIds = new Set(providerGroups.filter((group) => draft.excluded_provider_group_ids.includes(group.id)).flatMap((group) => group.member_ids));
   const candidateIds = [...new Set([...draft.upstream_account_ids, ...includedAccountIds])].filter((id) => !excludedAccountIds.has(id));
@@ -738,7 +745,7 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
     ? knownProtocols
     : knownProtocols.filter((protocol) => candidateProtocolSets.every((values) => values?.includes(protocol)));
   const protocolCompatible = supportedByAll.includes(draft.protocol);
-  const upstreamOptions = upstreams.map((value) => ({ value: value.id, label: value.name, description: value.driver }));
+  const upstreamOptions = upstreams.map((value) => ({ value: value.id, label: value.name, description: providerDisplayName(value.driver, providers, locale), details: `${t('providers.provider')}: ${providerDisplayName(value.driver, providers, locale)}; ${zh ? '账号 ID' : 'Account ID'}: ${value.id}; Driver: ${value.driver}` }));
   const providerGroupOptions = providerGroups.map((value) => ({ value: value.id, label: value.name, description: t('groups.memberCount', { count: formatNumber(value.member_count, locale) }) }));
   const routeGroupOptions = routeGroups.map((value) => ({ value: value.id, label: value.name, description: t('groups.memberCount', { count: formatNumber(value.member_count, locale) }) }));
   const routeGroupValue = [
@@ -755,30 +762,31 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
       const upstream_account_id = upstream_account_ids[0] ?? '';
       onChange({ ...draft, upstream_account_id, upstream_account_ids });
     }} placeholder={t('routes.searchUpstreams')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('routes.explicitUpstreamsHint')} />
-    <AdvancedFormSection title={journey.candidates} description={journey.candidatesHint}>
+    <AdvancedFormSection action title={journey.candidates} description={journey.candidatesHint}>
     <div className="route-group-grid">
       <MultiCombobox label={t('routes.includeProviderGroups')} options={providerGroupOptions} value={selections(draft.included_provider_group_ids, providerGroupOptions)} onChange={(selected) => onChange({ ...draft, included_provider_group_ids: selected.map((item) => item.value) })} placeholder={t('routes.searchProviderGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} />
       <MultiCombobox label={t('routes.excludeProviderGroups')} options={providerGroupOptions} value={selections(draft.excluded_provider_group_ids, providerGroupOptions)} onChange={(selected) => onChange({ ...draft, excluded_provider_group_ids: selected.map((item) => item.value) })} placeholder={t('routes.searchProviderGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('routes.exclusionWins')} />
     </div>
     </AdvancedFormSection>
-    <label>{t('routes.protocol')}<Select aria-invalid={!protocolCompatible} value={draft.protocol} onChange={(event) => onChange({ ...draft, protocol: event.target.value })}>{knownProtocols.map((protocol) => <option disabled={candidateIds.length > 0 && !supportedByAll.includes(protocol)} key={protocol} value={protocol}>{protocol === 'generation' ? t('routes.generation') : protocol === 'anthropic' ? 'Anthropic' : 'OpenAI'}</option>)}</Select></label>
-    {protocolCompatible ? <DetailTooltip content={t('routes.protocolCompatibilityHint')}><Button appearance="subtle" type="button">{journey.protocolHelp}</Button></DetailTooltip> : <p className="field-error" role="alert">{t('routes.protocolIncompatible')}</p>}
-    <UpstreamModelCombobox token={token} tenant={tenant} upstreams={upstreams} accountIds={draft.upstream_account_ids} includedProviderGroupIds={draft.included_provider_group_ids} excludedProviderGroupIds={draft.excluded_provider_group_ids} syncAccountIds={candidateIds} protocol={draft.protocol} value={draft.upstream_model} onChange={(upstream_model) => onChange({ ...draft, upstream_model, custom_model_confirmed: false })} customModelConfirmed={draft.custom_model_confirmed} onValidityChange={(valid, allowCustom) => onCatalogValidity(valid && protocolCompatible, allowCustom)} />
-    <AdvancedFormSection title={journey.priority} invalid={!priorityValid}>
+    <div className="route-protocol-field"><div className="route-protocol-heading"><label htmlFor={protocolId}>{t('routes.protocol')}</label><DetailTooltip content={t('routes.protocolCompatibilityHint')}><Button appearance="subtle" type="button">{journey.protocolHelp}</Button></DetailTooltip></div><Select id={protocolId} aria-invalid={!protocolCompatible} value={draft.protocol} onChange={(event) => onChange({ ...draft, protocol: event.target.value })}>{knownProtocols.map((protocol) => <option disabled={candidateIds.length > 0 && !supportedByAll.includes(protocol)} key={protocol} value={protocol}>{protocol === 'generation' ? t('routes.generation') : protocol === 'anthropic' ? 'Anthropic' : 'OpenAI'}</option>)}</Select></div>
+    {!protocolCompatible && <p className="field-error" role="alert">{t('routes.protocolIncompatible')}</p>}
+    <UpstreamModelCombobox token={token} tenant={tenant} upstreams={upstreams} providers={providers} accountIds={draft.upstream_account_ids} includedProviderGroupIds={draft.included_provider_group_ids} excludedProviderGroupIds={draft.excluded_provider_group_ids} syncAccountIds={candidateIds} protocol={draft.protocol} value={draft.upstream_model} onChange={(upstream_model) => onChange({ ...draft, upstream_model, custom_model_confirmed: false })} customModelConfirmed={draft.custom_model_confirmed} onValidityChange={(valid, allowCustom) => onCatalogValidity(valid && protocolCompatible, allowCustom)} />
+    <AdvancedFormSection action title={journey.priority} invalid={!priorityValid}>
     <label>{t('routes.priority')}<Input type="number" required step={1} aria-invalid={!priorityValid} aria-describedby={priorityHintId} min={-1000000} max={1000000} value={Number.isNaN(draft.priority) ? '' : String(draft.priority)} onChange={(event) => onChange({ ...draft, priority: event.target.valueAsNumber })} /></label><small id={priorityHintId} className={priorityValid ? 'field-hint' : 'field-error'}>{t('routes.priorityHint')}</small>
     </AdvancedFormSection>
     </FormSection><FormSection title={journey.routeAccess} description={t('routes.accessHint')}>
     <MultiCombobox label={t('routes.routeGroups')} options={routeGroupOptions} value={routeGroupValue} onChange={(selected) => onChange({ ...draft, route_group_ids: selected.filter((item) => !item.created).map((item) => item.value), route_group_names: selected.filter((item) => item.created).map((item) => item.label) })} placeholder={t('routes.searchOrCreateRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} allowCreate createLabel={(name) => t('routes.createRouteGroupNamed', { name })} hint={t('routes.routeGroupsHint')} />
     <AdvancedFormSection action title={t('routes.individualGrants', { count: draft.granted_credential_ids.length })} description={t('routes.individualGrantsHint')}>
-      <ExactCredentialCombobox token={token} tenant={tenant} credentials={credentials} value={draft.granted_credential_ids} onChange={(granted_credential_ids) => onChange({ ...draft, granted_credential_ids })} />
+      <ExactCredentialCombobox token={token} tenant={tenant} credentials={credentials} value={draft.granted_credential_ids} onChange={(granted_credential_ids) => onChange({ ...draft, granted_credential_ids })} onSelectionLabels={labels => setCredentialLabels({ scope: labelScope, labels })} />
     </AdvancedFormSection>
     </FormSection>
     <section className="form-journey-preview" aria-label={journey.preview}>
       <h4>{journey.preview}</h4>
       <dl><div><dt>{t('routes.publicModel')}</dt><dd>{draft.public_model.trim() || journey.noModel}</dd></div>
         <div><dt>{t('routes.upstreamModel')}</dt><dd>{draft.upstream_model.trim() || journey.noModel}</dd></div>
-        <div><dt>{t('routes.upstream')}</dt><dd>{candidateIds.map(id => upstreams.find(value => value.id === id)?.name ?? id).join(' · ') || journey.noUpstream}</dd></div>
-        <div><dt>{journey.access}</dt><dd>{draft.granted_credential_ids.length ? formatNumber(draft.granted_credential_ids.length, locale) : journey.noGrant}</dd></div></dl>
+        <div><dt>{t('routes.upstream')}</dt><dd>{candidateIds.length ? candidateIds.map(id => { const account = upstreams.find(value => value.id === id); return <DetailTooltip key={id} content={`${zh ? '账号 ID' : 'Account ID'}: ${id}`}><span tabIndex={0} className="route-scope-item">{account?.name ?? (zh ? '未知账号' : 'Unknown account')} · {providerDisplayName(account?.driver, providers, locale)}</span></DetailTooltip>; }) : journey.noUpstream}</dd></div>
+        <div><dt>{t('routes.routeGroups')} ({formatNumber(routeGroupValue.length, locale)})</dt><dd>{routeGroupValue.length ? routeGroupValue.map(group => <DetailTooltip key={group.value} content={group.created ? (zh ? '保存时创建此路由组' : 'Create this route group on save') : `${zh ? '路由组 ID' : 'Route group ID'}: ${group.value}`}><span tabIndex={0} className="route-scope-item">{group.created ? `${group.label} (${zh ? '待创建' : 'New'})` : routeGroups.find(value => value.id === group.value)?.name ?? (zh ? '未知路由组' : 'Unknown route group')}</span></DetailTooltip>) : (zh ? '未加入路由组' : 'No route groups selected')}<p className="field-hint">{zh ? '已授权这些组的凭据可使用此路由；组成员变化会影响访问范围。' : 'Credentials granted these groups can use this route; changing group members changes access.'}</p></dd></div>
+        <div><dt>{zh ? '直接授权凭据' : 'Direct credential grants'} ({formatNumber(draft.granted_credential_ids.length, locale)})</dt><dd>{draft.granted_credential_ids.length ? draft.granted_credential_ids.map(id => <DetailTooltip key={id} content={`${zh ? '凭据 ID' : 'Credential ID'}: ${id}`}><span tabIndex={0} className="route-scope-item">{credentials.find(value => value.key_id === id)?.alias ?? (credentialLabels?.scope === labelScope ? credentialLabels.labels[id] : undefined) ?? (zh ? '未取得凭据名称' : 'Credential name unavailable')}</span></DetailTooltip>) : (zh ? '无直接授权；路由组授权单独生效。' : 'No direct grants; route-group grants apply independently.')}</dd></div></dl>
     </section>
   </div>;
 }
