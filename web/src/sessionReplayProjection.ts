@@ -5,7 +5,8 @@ import type { RequestDetail } from './types.js';
 export const SESSION_REPLAY_PROJECTION_PRIORITY = 'P1';
 export const SESSION_REPLAY_MAX_REQUESTS = 100;
 export const SESSION_REPLAY_MAX_ITEMS = 300;
-type ProjectionLimit = { truncated: boolean; itemOffset: number; seen: number; unknownKeys: Set<string> };
+type CallEvidence = { requestId: string; count: number };
+type ProjectionLimit = { truncated: boolean; itemOffset: number; seen: number; unknownKeys: Set<string>; calls: Map<string, CallEvidence>; results: Map<string, CallEvidence> };
 
 export type ReplayBody = 'request' | 'response';
 export type ReplayUnknownReason =
@@ -125,6 +126,11 @@ function textFromContent(value: unknown): { text: string | null; unknown: Replay
 }
 
 function push(items: SessionReplayItem[], item: SessionReplayItem, limit: ProjectionLimit): boolean {
+  if ((item.kind === 'tool_call' || item.kind === 'tool_result') && item.callId) {
+    const evidence = item.kind === 'tool_call' ? limit.calls : limit.results;
+    const previous = evidence.get(item.callId);
+    evidence.set(item.callId, { requestId: item.requestId, count: (previous?.count ?? 0) + 1 });
+  }
   const position = limit.seen++;
   if (position < limit.itemOffset || items.length >= SESSION_REPLAY_MAX_ITEMS) return true;
   items.push(item);
@@ -328,28 +334,17 @@ function projectResponseBody(items: SessionReplayItem[], detail: RequestDetail, 
   unknown(items, detail.request_id, 'response', 'unsupported_body', limit);
 }
 
-function pairToolCalls(items: SessionReplayItem[]) {
-  const calls = new Map<string, ReplayToolCall[]>();
-  const results = new Map<string, ReplayToolResult[]>();
+function pairToolCalls(items: SessionReplayItem[], evidence: ProjectionLimit) {
   for (const item of items) {
-    if (item.kind === 'tool_call' && item.callId) calls.set(item.callId, [...(calls.get(item.callId) ?? []), item]);
-    if (item.kind === 'tool_result' && item.callId) results.set(item.callId, [...(results.get(item.callId) ?? []), item]);
-  }
-  for (const [callId, callEntries] of calls) {
-    const resultEntries = results.get(callId) ?? [];
-    if (callEntries.length !== 1 || resultEntries.length !== 1) {
-      if (callEntries.length > 1 || resultEntries.length > 1) {
-        for (const call of callEntries) call.pairing = 'unknown';
-        for (const result of resultEntries) result.pairing = 'unknown';
-      }
-      continue;
+    if ((item.kind !== 'tool_call' && item.kind !== 'tool_result') || !item.callId) continue;
+    const call = evidence.calls.get(item.callId);
+    const result = evidence.results.get(item.callId);
+    if ((call?.count ?? 0) > 1 || (result?.count ?? 0) > 1) item.pairing = 'unknown';
+    else if (call?.count === 1 && result?.count === 1) {
+      item.pairing = 'paired';
+      if (item.kind === 'tool_call') item.pairedResultRequestId = result.requestId;
+      else item.pairedCallRequestId = call.requestId;
     }
-    const [call] = callEntries;
-    const [result] = resultEntries;
-    call.pairedResultRequestId = result.requestId;
-    call.pairing = 'paired';
-    result.pairedCallRequestId = call.requestId;
-    result.pairing = 'paired';
   }
 }
 
@@ -359,7 +354,7 @@ function pairToolCalls(items: SessionReplayItem[]) {
  */
 export function projectSessionReplay(sessionId: string, details: readonly RequestDetail[], itemOffset = 0): SessionReplayProjection {
   const items: SessionReplayItem[] = [];
-  const limit: ProjectionLimit = { truncated: details.length > SESSION_REPLAY_MAX_REQUESTS, itemOffset: Math.max(0, itemOffset), seen: 0, unknownKeys: new Set() };
+  const limit: ProjectionLimit = { truncated: details.length > SESSION_REPLAY_MAX_REQUESTS, itemOffset: Math.max(0, itemOffset), seen: 0, unknownKeys: new Set(), calls: new Map(), results: new Map() };
   const requests = details.slice(0, SESSION_REPLAY_MAX_REQUESTS)
     .sort((left, right) => left.created_at - right.created_at || left.request_id.localeCompare(right.request_id));
   let previousHistory: string[] = [];
@@ -392,6 +387,6 @@ export function projectSessionReplay(sessionId: string, details: readonly Reques
   if (details.length > SESSION_REPLAY_MAX_REQUESTS) {
     unknown(items, '', 'request', 'input_limit', limit);
   }
-  pairToolCalls(items);
+  pairToolCalls(items, limit);
   return { sessionId, items, truncated: limit.truncated, totalItems: limit.seen, nextItemOffset: limit.seen > limit.itemOffset + items.length ? limit.itemOffset + items.length : null };
 }

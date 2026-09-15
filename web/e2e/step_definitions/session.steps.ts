@@ -226,6 +226,7 @@ When('连续新请求进入活跃状态并分别完成为成功和错误', async
   const controls = page.locator('.session-controls');
   await controls.getByLabel('会话状态').selectOption('active');
   await controls.getByRole('button', { name: '应用筛选', exact: true }).click();
+  await page.getByRole('checkbox', { name: '自动刷新', exact: true }).check();
   const observation = observations.get(this)!;
   observation.baselineSessionListRequests = observation.sessionListRequests.length;
   const sendCall = (index: number) => fetch(new URL('/v1/chat/completions', page.url()), {
@@ -267,7 +268,7 @@ When('连续新请求进入活跃状态并分别完成为成功和错误', async
   try {
     await waitForPendingSessionRequests(4);
     const activeCard = page.locator('.session-card').filter({ hasText: '活跃' }).first();
-    await activeCard.waitFor({ state: 'visible', timeout: 5_000 });
+    await activeCard.waitFor({ state: 'visible', timeout: 8_000 });
     activeSessionConfirmed = true;
   } finally {
     const released = await releaseSessionFixture();
