@@ -59,7 +59,7 @@ pub(crate) fn verify_owner(path: &Path, owner: &[u8]) -> io::Result<()> {
 
 fn verify_owner_at(directory: &rustix::fd::OwnedFd, name: &str, owner: &[u8]) -> io::Result<()> {
     use rustix::fs::{Mode, OFlags, openat};
-    let mut file = fs::File::from(openat(
+    let file = fs::File::from(openat(
         directory,
         name,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
