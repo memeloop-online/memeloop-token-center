@@ -1,16 +1,12 @@
 use futures_util::StreamExt;
 use http::header;
-use regex::Regex;
 use serde_json::Value;
-use std::sync::OnceLock;
 use uuid::Uuid;
 
 use super::super::upstream_response::UpstreamResponse;
 
 const MAX_RETRYABLE_ERROR_BYTES: usize = 16 * 1024;
 const MAX_RETRYABLE_ERROR_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-const MAX_DIAGNOSTIC_FIELD_BYTES: usize = 128;
-const MAX_DIAGNOSTIC_REASON_BYTES: usize = 256;
 
 /// Transport-domain result of inspecting a complete native Codex HTTP 400.
 /// It contains no telemetry representation: routing owns the one-way map to
@@ -73,12 +69,12 @@ pub(in crate::api) async fn classify_bad_request(
     }
 }
 
-#[derive(Debug, Default, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct BadRequestDiagnostic {
-    error_type: Option<String>,
-    error_code: Option<String>,
-    error_param: Option<String>,
-    reason: Option<String>,
+    error_type: Option<&'static str>,
+    error_code: Option<&'static str>,
+    error_param: Option<&'static str>,
+    reason: &'static str,
 }
 
 fn observe_ordinary_bad_request(request_id: Uuid, value: &Value) {
@@ -86,10 +82,10 @@ fn observe_ordinary_bad_request(request_id: Uuid, value: &Value) {
     tracing::warn!(
         %request_id,
         stage = "codex_upstream_bad_request",
-        upstream_error_type = diagnostic.error_type.as_deref(),
-        upstream_error_code = diagnostic.error_code.as_deref(),
-        upstream_error_param = diagnostic.error_param.as_deref(),
-        upstream_error_reason = diagnostic.reason.as_deref(),
+        upstream_error_type = diagnostic.error_type,
+        upstream_error_code = diagnostic.error_code,
+        upstream_error_param = diagnostic.error_param,
+        upstream_error_reason = diagnostic.reason,
         "Codex upstream rejected the request"
     );
 }
@@ -100,85 +96,118 @@ fn bad_request_diagnostic(value: &Value) -> BadRequestDiagnostic {
     let detail_item = detail
         .and_then(Value::as_array)
         .and_then(|items| items.first());
+    let raw_param = error
+        .get("param")
+        .or_else(|| detail_item.and_then(|item| item.get("loc")));
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| detail.and_then(Value::as_str))
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .or_else(|| {
+            detail_item
+                .and_then(|item| item.get("msg"))
+                .and_then(Value::as_str)
+        });
+    let error_param = diagnostic_param(raw_param);
     BadRequestDiagnostic {
-        error_type: diagnostic_scalar(
+        error_type: diagnostic_machine_value(
             error
                 .get("type")
                 .or_else(|| detail_item.and_then(|item| item.get("type"))),
+            &[
+                "invalid_request_error",
+                "invalid_request",
+                "request_error",
+                "invalid_type",
+                "value_error",
+                "missing",
+                "json_invalid",
+            ],
         ),
-        error_code: diagnostic_scalar(error.get("code")),
-        error_param: diagnostic_scalar(error.get("param")).or_else(|| {
-            detail_item
-                .and_then(|item| item.get("loc"))
-                .and_then(diagnostic_location)
-        }),
-        reason: error
-            .get("message")
-            .and_then(Value::as_str)
-            .or_else(|| detail.and_then(Value::as_str))
-            .or_else(|| value.get("message").and_then(Value::as_str))
-            .or_else(|| {
-                detail_item
-                    .and_then(|item| item.get("msg"))
-                    .and_then(Value::as_str)
-            })
-            .and_then(sanitize_diagnostic_reason),
+        error_code: diagnostic_machine_value(
+            error.get("code"),
+            &[
+                "invalid_value",
+                "invalid_type",
+                "missing_required_parameter",
+                "model_not_found",
+                "unsupported_parameter",
+                "invalid_request_error",
+            ],
+        ),
+        error_param,
+        reason: diagnostic_reason(message, error_param),
     }
 }
 
-fn diagnostic_scalar(value: Option<&Value>) -> Option<String> {
-    let value = match value? {
-        Value::String(value) => value.clone(),
-        Value::Number(value) => value.to_string(),
-        _ => return None,
-    };
-    (!value.is_empty()
-        && value.len() <= MAX_DIAGNOSTIC_FIELD_BYTES
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/' | b'[' | b']')
-        }))
-    .then_some(value)
+fn diagnostic_machine_value(
+    value: Option<&Value>,
+    allowed: &[&'static str],
+) -> Option<&'static str> {
+    let value = value?.as_str()?;
+    Some(
+        allowed
+            .iter()
+            .copied()
+            .find(|candidate| *candidate == value)
+            .unwrap_or("unknown"),
+    )
 }
 
-fn diagnostic_location(value: &Value) -> Option<String> {
-    let parts = value.as_array()?;
-    let mut rendered = String::new();
-    for part in parts {
-        let part = diagnostic_scalar(Some(part))?;
-        if !rendered.is_empty() {
-            rendered.push('.');
+fn diagnostic_param(value: Option<&Value>) -> Option<&'static str> {
+    let mut fields = Vec::new();
+    match value? {
+        Value::String(value) => fields.push(value.as_str()),
+        Value::Array(values) => {
+            fields.extend(values.iter().filter_map(Value::as_str));
         }
-        rendered.push_str(&part);
-        if rendered.len() > MAX_DIAGNOSTIC_FIELD_BYTES {
-            return None;
-        }
+        _ => return Some("unknown"),
     }
-    (!rendered.is_empty()).then_some(rendered)
+    if fields.iter().any(|field| field.contains("instruction")) {
+        Some("instructions")
+    } else if fields.iter().any(|field| field.contains("content")) {
+        Some("content")
+    } else if fields.iter().any(|field| field.contains("model")) {
+        Some("model")
+    } else if fields
+        .iter()
+        .any(|field| field.contains("input") || field.contains("message"))
+    {
+        Some("input")
+    } else if fields.iter().any(|field| {
+        ["stream", "store", "include", "parallel", "prompt_cache"]
+            .iter()
+            .any(|known| field.contains(known))
+    }) {
+        Some("request_options")
+    } else {
+        Some("unknown")
+    }
 }
 
-fn sanitize_diagnostic_reason(value: &str) -> Option<String> {
-    static SENSITIVE: OnceLock<Regex> = OnceLock::new();
-    let redacted = SENSITIVE
-        .get_or_init(|| {
-            Regex::new(r#"(?i:bearer)\s+\S+|https?://\S+|"[^"]*"|'[^']*'|[A-Za-z0-9_./+=-]{32,}"#)
-                .expect("static diagnostic redaction regex")
-        })
-        .replace_all(value, "[redacted]");
-    let normalized = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        return None;
-    }
-    let mut bounded = String::new();
-    for character in normalized.chars() {
-        if character.is_control() {
-            continue;
+fn diagnostic_reason(message: Option<&str>, param: Option<&str>) -> &'static str {
+    let lower = message.unwrap_or_default().to_ascii_lowercase();
+    let structural_rejection = ["invalid", "unsupported", "expected", "required", "missing"]
+        .iter()
+        .any(|term| lower.contains(term));
+    if lower.contains("instruction") && structural_rejection {
+        "instructions_invalid"
+    } else if lower.contains("content") && structural_rejection {
+        "content_shape_invalid"
+    } else if lower.contains("model") && structural_rejection {
+        "model_rejected"
+    } else if (lower.contains("input") || lower.contains("message")) && structural_rejection {
+        "input_shape_invalid"
+    } else {
+        match param {
+            Some("instructions") => "instructions_invalid",
+            Some("content") => "content_shape_invalid",
+            Some("model") => "model_rejected",
+            Some("input") => "input_shape_invalid",
+            _ => "unknown",
         }
-        if bounded.len() + character.len_utf8() > MAX_DIAGNOSTIC_REASON_BYTES {
-            break;
-        }
-        bounded.push(character);
     }
-    (!bounded.is_empty()).then_some(bounded)
 }
 
 enum BoundedBadRequestBody {
@@ -281,26 +310,48 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn ordinary_error_diagnostic_keeps_structure_and_redacts_opaque_values() {
+    fn ordinary_error_diagnostic_keeps_only_known_machine_fields_and_fixed_reason() {
         let diagnostic = bad_request_diagnostic(&json!({
             "error": {
                 "type": "invalid_request_error",
                 "code": "invalid_value",
                 "param": "input[0].content",
-                "message": "Invalid \"private user text\" with Bearer secret-token-value and abcdefghijklmnopqrstuvwxyz0123456789"
+                "message": "Invalid content: patient HIV Alice@example.com password=short"
             }
         }));
-        assert_eq!(
-            diagnostic.error_type.as_deref(),
-            Some("invalid_request_error")
-        );
-        assert_eq!(diagnostic.error_code.as_deref(), Some("invalid_value"));
-        assert_eq!(diagnostic.error_param.as_deref(), Some("input[0].content"));
-        let reason = diagnostic.reason.unwrap();
-        assert!(reason.contains("Invalid [redacted]"));
-        assert!(!reason.contains("private user text"));
-        assert!(!reason.contains("secret-token-value"));
-        assert!(!reason.contains("abcdefghijklmnopqrstuvwxyz0123456789"));
+        assert_eq!(diagnostic.error_type, Some("invalid_request_error"));
+        assert_eq!(diagnostic.error_code, Some("invalid_value"));
+        assert_eq!(diagnostic.error_param, Some("content"));
+        assert_eq!(diagnostic.reason, "content_shape_invalid");
+        assert!(!format!("{diagnostic:?}").contains("patient HIV"));
+        assert!(!format!("{diagnostic:?}").contains("Alice@example.com"));
+        assert!(!format!("{diagnostic:?}").contains("password=short"));
+    }
+
+    #[test]
+    fn arbitrary_machine_fields_and_free_text_are_never_logged_verbatim() {
+        let diagnostic = bad_request_diagnostic(&json!({
+            "error": {
+                "type": "privateName",
+                "code": "shortSecret",
+                "param": "patientHIV",
+                "message": "prompt rejected: patient HIV Alice@example.com"
+            }
+        }));
+        assert_eq!(diagnostic.error_type, Some("unknown"));
+        assert_eq!(diagnostic.error_code, Some("unknown"));
+        assert_eq!(diagnostic.error_param, Some("unknown"));
+        assert_eq!(diagnostic.reason, "unknown");
+        let rendered = format!("{diagnostic:?}");
+        for private in [
+            "privateName",
+            "shortSecret",
+            "patientHIV",
+            "patient HIV",
+            "Alice@example.com",
+        ] {
+            assert!(!rendered.contains(private));
+        }
     }
 
     #[test]
@@ -312,11 +363,8 @@ mod tests {
                 "type": "missing"
             }]
         }));
-        assert_eq!(diagnostic.error_type.as_deref(), Some("missing"));
-        assert_eq!(
-            diagnostic.error_param.as_deref(),
-            Some("body.input.0.content")
-        );
-        assert_eq!(diagnostic.reason.as_deref(), Some("Field required"));
+        assert_eq!(diagnostic.error_type, Some("missing"));
+        assert_eq!(diagnostic.error_param, Some("content"));
+        assert_eq!(diagnostic.reason, "content_shape_invalid");
     }
 }
