@@ -1,0 +1,154 @@
+{
+  "input": {
+    "tenant_id": "tenant",
+    "seed": 42,
+    "remaining_deadline_ms": 1000,
+    "config": {
+      "target_provider": "kimi-oauth",
+      "target_window_id": "summary"
+    },
+    "candidates": [
+      {
+        "tenant_id": "tenant",
+        "route_id": "late",
+        "account_id": "a",
+        "generation": 7,
+        "health": "healthy"
+      },
+      {
+        "tenant_id": "tenant",
+        "route_id": "unknown",
+        "account_id": "b",
+        "generation": 7,
+        "health": "healthy"
+      },
+      {
+        "tenant_id": "tenant",
+        "route_id": "early",
+        "account_id": "c",
+        "generation": 7,
+        "health": "healthy"
+      },
+      {
+        "tenant_id": "tenant",
+        "route_id": "tie",
+        "account_id": "d",
+        "generation": 7,
+        "health": "healthy"
+      },
+      {
+        "tenant_id": "tenant",
+        "route_id": "exhausted",
+        "account_id": "e",
+        "generation": 7,
+        "health": "healthy"
+      },
+      {
+        "tenant_id": "tenant",
+        "route_id": "late-second-route",
+        "account_id": "a",
+        "generation": 7,
+        "health": "healthy"
+      }
+    ],
+    "quota_context": {
+      "version": "account-windows-v1",
+      "now_ms": 1000000,
+      "accounts": [
+        {
+          "account_id": "a",
+          "generation": 7,
+          "provider": "kimi-oauth",
+          "observed_at": 999000,
+          "valid_until": 1100000,
+          "windows": [
+            {
+              "id": "summary",
+              "period_seconds": 604800,
+              "reset_at": 1060000,
+              "reset_is_estimated": false,
+              "remaining_fraction": 0.5,
+              "exhausted": null
+            }
+          ]
+        },
+        {
+          "account_id": "b",
+          "generation": 7,
+          "provider": "kimi-oauth",
+          "observed_at": 999000,
+          "valid_until": 1100000,
+          "windows": [
+            {
+              "id": "summary",
+              "period_seconds": 604800,
+              "reset_at": null,
+              "reset_is_estimated": false,
+              "remaining_fraction": null,
+              "exhausted": null
+            }
+          ]
+        },
+        {
+          "account_id": "c",
+          "generation": 7,
+          "provider": "kimi-oauth",
+          "observed_at": 999000,
+          "valid_until": 1100000,
+          "windows": [
+            {
+              "id": "summary",
+              "period_seconds": 604800,
+              "reset_at": 1020000,
+              "reset_is_estimated": false,
+              "remaining_fraction": 0.25,
+              "exhausted": null
+            }
+          ]
+        },
+        {
+          "account_id": "d",
+          "generation": 7,
+          "provider": "kimi-oauth",
+          "observed_at": 999000,
+          "valid_until": 1100000,
+          "windows": [
+            {
+              "id": "summary",
+              "period_seconds": 604800,
+              "reset_at": 1020000,
+              "reset_is_estimated": false,
+              "remaining_fraction": 0.75,
+              "exhausted": null
+            }
+          ]
+        },
+        {
+          "account_id": "e",
+          "generation": 7,
+          "provider": "kimi-oauth",
+          "observed_at": 999000,
+          "valid_until": 1100000,
+          "windows": [
+            {
+              "id": "summary",
+              "period_seconds": 604800,
+              "reset_at": 1010000,
+              "reset_is_estimated": false,
+              "remaining_fraction": 0,
+              "exhausted": null
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "expected_route_ids": [
+    "early",
+    "unknown",
+    "tie",
+    "late",
+    "exhausted",
+    "late-second-route"
+  ]
+}
