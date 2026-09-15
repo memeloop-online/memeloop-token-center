@@ -628,21 +628,11 @@ fn reclaim_installation_attempt_roots(
             continue;
         }
         let inode_marker = plugin_root.join(format!(".mtc-publish-inode-mtc-attempt-{attempt_id}"));
-        let result = match std::fs::symlink_metadata(&inode_marker) {
-            Ok(_) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // A crash after reserving/renaming but before binding the inode
-                // may be adopted only with the matching root-local receipt.
-                crate::plugin_publication::verify_owner(
-                    &root.join(".mtc-install-owner"),
-                    attempt_id.as_bytes(),
-                )
-            }
-            Err(error) => Err(error),
-        }
-        .and_then(|()| {
-            crate::plugin_publication::remove_claimed_directory(&root, attempt_id.as_bytes())
-        });
+        let result = std::fs::symlink_metadata(&inode_marker)
+            .map(|_| ())
+            .and_then(|()| {
+                crate::plugin_publication::clear_claimed_directory(&root, attempt_id.as_bytes())
+            });
         match result {
             Ok(()) => reclaimed += 1,
             Err(error) => tracing::warn!(
@@ -1681,7 +1671,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !state
+            state
                 .db
                 .referenced_plugin_installation_attempts()
                 .await
@@ -1791,22 +1781,20 @@ mod tests {
         std::fs::create_dir(&unrelated).unwrap();
         assert!(claim_inventory_root(&unrelated, "owner").is_err());
         assert!(
-            crate::plugin_publication::remove_claimed_directory(&root, b"another-owner").is_err()
+            crate::plugin_publication::clear_claimed_directory(&root, b"another-owner").is_err()
         );
         assert!(root.exists());
-        // A prior partial remove may already have consumed the root-local
-        // receipt. The durable parent owner + inode binding remains sufficient.
-        std::fs::remove_file(root.join(".mtc-install-owner")).unwrap();
-        crate::plugin_publication::remove_claimed_directory(&root, b"owner").unwrap();
-        assert!(!root.exists());
+        crate::plugin_publication::clear_claimed_directory(&root, b"owner").unwrap();
+        assert!(root.exists());
+        assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
         assert!(
-            !directory
+            directory
                 .path()
                 .join(".mtc-publish-owner-inventory")
                 .exists()
         );
         assert!(
-            !directory
+            directory
                 .path()
                 .join(".mtc-publish-inode-inventory")
                 .exists()
@@ -1835,6 +1823,7 @@ mod tests {
     fn reclamation_removes_only_unreferenced_owned_attempt_roots() {
         let directory = tempfile::tempdir().unwrap();
         let attempts = [
+            uuid::Uuid::now_v7().to_string(),
             uuid::Uuid::now_v7().to_string(),
             uuid::Uuid::now_v7().to_string(),
             uuid::Uuid::now_v7().to_string(),
@@ -1870,7 +1859,9 @@ mod tests {
         );
         assert!(roots[0].exists());
         assert!(roots[1].exists());
-        assert!(!roots[2].exists());
+        assert!(roots[2].join("payload").exists());
+        assert!(roots[3].exists());
+        assert_eq!(std::fs::read_dir(&roots[3]).unwrap().count(), 0);
     }
 
     #[test]

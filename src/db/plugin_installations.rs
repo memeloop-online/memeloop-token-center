@@ -120,9 +120,8 @@ impl Database {
     pub(crate) async fn referenced_plugin_installation_attempts(
         &self,
     ) -> Result<std::collections::BTreeSet<String>, AppError> {
-        let now = unix_millis();
-        Ok(sqlx::query_scalar::<_, String>("SELECT attempt_id FROM application_plugin_installations WHERE status IN ('review','registered') OR (status='installing' AND lease_until > $1)")
-            .bind(now).fetch_all(&self.pool).await?.into_iter().collect())
+        Ok(sqlx::query_scalar::<_, String>("SELECT attempt_id FROM application_plugin_installations WHERE status IN ('installing','review','registered')")
+            .fetch_all(&self.pool).await?.into_iter().collect())
     }
 
     pub(crate) async fn renew_plugin_installation(

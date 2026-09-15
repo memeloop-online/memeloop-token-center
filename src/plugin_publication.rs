@@ -152,28 +152,62 @@ pub(crate) fn bind_existing_directory(
     Ok(directory)
 }
 
-pub(crate) fn remove_claimed_directory(root: &Path, owner: &[u8]) -> io::Result<()> {
+pub(crate) fn open_claimed_directory(root: &Path, owner: &[u8]) -> io::Result<rustix::fd::OwnedFd> {
+    claim_name(root, owner)?;
     let parent = root.parent().ok_or(io::ErrorKind::InvalidInput)?;
     let name = root
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or(io::ErrorKind::InvalidInput)?;
-    let directory = bind_existing_directory(root, owner)?;
+    let directory = directory_fd(root)?;
     let identity = rustix::fs::fstat(&directory)?.st_ino.to_string();
-    drop(directory);
-    fs::remove_dir_all(root)?;
-    match fs::symlink_metadata(root) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Ok(_) => return Err(io::ErrorKind::AlreadyExists.into()),
-        Err(error) => return Err(error),
-    }
-    let owner_marker = parent.join(format!(".mtc-publish-owner-{name}"));
     let inode_marker = parent.join(format!(".mtc-publish-inode-{name}"));
-    verify_owner(&owner_marker, owner)?;
     verify_owner(&inode_marker, identity.as_bytes())?;
-    fs::remove_file(inode_marker)?;
-    fs::remove_file(owner_marker)?;
-    sync_directory(parent)
+    Ok(directory)
+}
+
+pub(crate) fn clear_claimed_directory(root: &Path, owner: &[u8]) -> io::Result<()> {
+    let directory = open_claimed_directory(root, owner)?;
+    clear_directory_contents(&directory)
+}
+
+fn clear_directory_contents(directory: &rustix::fd::OwnedFd) -> io::Result<()> {
+    use rustix::fs::{AtFlags, Dir, Mode, OFlags, openat, unlinkat};
+    let mut entries = Dir::read_from(directory)?;
+    while let Some(entry) = entries.read() {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        match openat(
+            directory,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(child) => {
+                clear_directory_contents(&child)?;
+                rustix::fs::fsync(&child)?;
+                drop(child);
+                match unlinkat(directory, name, AtFlags::REMOVEDIR) {
+                    Ok(()) => {}
+                    Err(error) if error == rustix::io::Errno::NOENT => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) if matches!(error, rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP) => {
+                match unlinkat(directory, name, AtFlags::empty()) {
+                    Ok(()) => {}
+                    Err(error) if error == rustix::io::Errno::NOENT => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) if error == rustix::io::Errno::NOENT => {}
+            Err(error) => return Err(error),
+        }
+    }
+    rustix::fs::fsync(directory)
 }
 
 pub(crate) fn claim_directory(root: &Path, owner: &[u8]) -> io::Result<rustix::fd::OwnedFd> {
