@@ -158,7 +158,7 @@ pub(super) async fn send_proxy_route(
             }
         };
         if response.status() == StatusCode::BAD_REQUEST {
-            let disposition = codex_transport::classify_bad_request(response).await;
+            let disposition = codex_transport::classify_bad_request(response, request_id).await;
             observe_bad_request_disposition(&state.metrics, disposition);
             match retry.after_bad_request(disposition) {
                 AttemptControl::RetrySameAccount => {
