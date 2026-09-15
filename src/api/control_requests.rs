@@ -14,7 +14,8 @@ use uuid::Uuid;
 
 use super::{
     RequestsQuery, StatsQuery, generation_asset_response, management_tenant,
-    request_detail_response, require_global_service, require_service,
+    request_archive_content_response, request_detail_response, require_global_service,
+    require_service,
 };
 use crate::{
     AppState,
@@ -635,6 +636,26 @@ pub(super) async fn internal_request_detail(
         None => state.db.request_archive_refs_global(request_id).await?,
     };
     request_detail_response(&state, refs).await
+}
+
+pub(super) async fn internal_request_archive_content(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((request_id, side)): Path<(Uuid, crate::api::RequestArchiveSide)>,
+    Query(query): Query<ManagementTenantQuery>,
+) -> Result<Response, AppError> {
+    let service = require_service(&headers, &state, "requests:read").await?;
+    let tenant = management_tenant(&service, query.tenant_external_id)?;
+    let refs = match tenant {
+        Some(tenant) => {
+            state
+                .db
+                .request_archive_refs_for_tenant(&tenant, request_id)
+                .await?
+        }
+        None => state.db.request_archive_refs_global(request_id).await?,
+    };
+    request_archive_content_response(&state, &headers, &refs, side).await
 }
 
 pub(super) async fn internal_generation_asset(
