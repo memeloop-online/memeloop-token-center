@@ -1,5 +1,6 @@
 //! Supplier quota projection; mutations live in the explicit durable reset workflow.
 mod antigravity;
+mod cursor;
 mod kimi;
 mod normalize;
 pub(crate) mod reset;
@@ -258,15 +259,15 @@ impl QuotaCapabilities {
         Self {
             read: matches!(
                 provider,
-                "openai-codex" | "kimi-oauth" | "google-antigravity"
+                "openai-codex" | "kimi-oauth" | "google-antigravity" | "cursor"
             ),
-            plan: provider == "openai-codex",
+            plan: matches!(provider, "openai-codex" | "cursor"),
             workspace: false,
             window_amounts: provider == "kimi-oauth",
             window_amount_unit: false,
             window_percent: matches!(
                 provider,
-                "openai-codex" | "kimi-oauth" | "google-antigravity"
+                "openai-codex" | "kimi-oauth" | "google-antigravity" | "cursor"
             ),
             reset_credit_expiry: provider == "openai-codex",
             subscription_expiry: false,
@@ -464,6 +465,7 @@ impl QuotaCache {
                     antigravity::read(state, account, credential, empty(None)).await
                 }
                 "kimi-oauth" => kimi::read(state, account, credential, empty(None)).await,
+                "cursor" => cursor::read(state, credential, empty(None)).await,
                 _ => read_codex(state, account, credential, empty(None)).await,
             }
         })
