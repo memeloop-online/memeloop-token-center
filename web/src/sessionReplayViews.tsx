@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Disclosure } from './design-system';
+import { ArchiveContentReader } from './ArchiveContentReader.js';
+import type { ArchiveRangeLoader } from './archiveRange.js';
 import {
   projectSessionReplay,
   SESSION_REPLAY_MAX_REQUESTS,
@@ -125,10 +127,11 @@ function EntryContent({ entry, t }: { entry: ReplayEntry; t: Translate }) {
  * by the owning surface so this component never handles authentication material or broadens
  * archive authorization.
  */
-export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadArchiveDetail, onLoadEarlierRequests, loadingEarlier = false }: {
+export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadArchiveDetail, loadArchiveRange, onLoadEarlierRequests, loadingEarlier = false }: {
   detail: LogicalSessionDetail;
   scopeKey?: string;
   loadArchiveDetail?: SessionReplayArchiveLoader;
+  loadArchiveRange?: ArchiveRangeLoader;
   onLoadEarlierRequests?: () => void;
   loadingEarlier?: boolean;
 }) {
@@ -348,7 +351,18 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
             if (node) entryRefs.current.set(entry.identity, node);
             else entryRefs.current.delete(entry.identity);
           }}
-        ><EntryContent entry={entry} t={t} /></li>)}
+        ><EntryContent entry={entry} t={t} />
+          {entry.item.kind === 'unknown' && loadArchiveRange && (() => {
+            const request = sourceRequests.find(value => value.request_id === entry.item.requestId);
+            const snapshot = archiveDetails.find(value => value.request_id === entry.item.requestId);
+            if (!request || request.session_context?.session_id !== detail.session_id) return null;
+            const sides: Array<'request' | 'response'> = entry.archiveBodies === 2 ? ['request', 'response'] : [entry.item.body];
+            return sides.filter(side => snapshot?.archive?.[side]?.reason === 'archive_payload_invalid').map(side => <ArchiveContentReader
+              key={`${request.request_id}:${side}`} request={request} sessionId={detail.session_id} side={side} loadRange={loadArchiveRange}
+              renderItem={(item, index) => <EntryContent entry={{ item, index, identity: `${request.request_id}:${side}:${index}` }} t={t} />}
+            />);
+          })()}
+        </li>)}
       </ol>
     </div>
   </section>;

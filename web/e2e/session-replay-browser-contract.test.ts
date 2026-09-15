@@ -8,7 +8,7 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
 
-declare global { interface Window { sessionReplayReads: Record<string, number>; sessionReplayAborts: number } }
+declare global { interface Window { sessionReplayReads: Record<string, number>; sessionReplayAborts: number; archiveRangeReads: number } }
 
 const webRoot = fileURLToPath(new URL('..', import.meta.url));
 const artifactRoot = join(webRoot, 'e2e-artifacts', 'session-replay');
@@ -31,6 +31,53 @@ async function localChromiumExecutable() {
 async function nextPaint(page: import('playwright').Page) {
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
 }
+
+test('large archive content is explicit, paged to its real end, and cleared on version or scope changes', { timeout: 45_000 }, async () => {
+  const executablePath = await localChromiumExecutable();
+  if (!executablePath) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
+    return test.skip('Chromium required');
+  }
+  const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ executablePath, headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-replay.html?full=1`);
+    const open = page.getByRole('button', { name: 'Read full Response content', exact: true });
+    await open.waitFor();
+    assert.equal(await page.evaluate(() => window.archiveRangeReads), 0);
+    await open.click();
+    const reader = page.locator('.archive-content-reader:not(.collapsed)');
+    await reader.locator('.session-replay-entry.message').nth(29).waitFor();
+    const firstReads = await page.evaluate(() => window.archiveRangeReads);
+    await nextPaint(page);
+    assert.equal(await page.evaluate(() => window.archiveRangeReads), firstReads, 'reading stops at the displayed item page');
+    assert.equal(await reader.locator('.session-replay-entry.message').count(), 30);
+    await reader.getByRole('button', { name: 'Next content', exact: true }).click();
+    await reader.getByText(/^Archived step 31:/).first().waitFor();
+    assert.equal(await reader.locator('.session-replay-entry.message').count(), 30);
+    await reader.getByRole('button', { name: 'Previous content', exact: true }).click();
+    await reader.getByText(/^Archived step 1:/).first().waitFor();
+    await page.getByRole('button', { name: 'Change archive version', exact: true }).click();
+    await reader.getByRole('button', { name: 'Next content', exact: true }).click();
+    await reader.getByRole('alert').waitFor();
+    assert.equal(await reader.locator('.session-replay-entry.message').count(), 0, 'version changes discard old structured content');
+    await reader.getByRole('button', { name: 'Retry', exact: true }).click();
+    await reader.getByText(/^Archived step 1:/).first().waitFor();
+    await reader.getByRole('button', { name: 'Next content', exact: true }).click();
+    await reader.getByText(/^Archived step 31:/).first().waitFor();
+    await reader.getByRole('button', { name: 'Next content', exact: true }).click();
+    await reader.getByText(/^Archived step 75:/).first().waitFor();
+    assert.equal(await reader.locator('.session-replay-entry.message').count(), 15);
+    assert.equal(await reader.getByRole('button', { name: 'Next content', exact: true }).isDisabled(), true);
+    await page.getByRole('button', { name: 'Change full scope', exact: true }).click();
+    await open.waitFor();
+    assert.equal(await page.locator('.archive-content-reader .session-replay-entry.message').count(), 0);
+  } finally { await browser.close(); await server.close(); }
+});
 
 test('slow replay reads survive live metadata refresh, publish incrementally and isolate scopes', { timeout: 30_000 }, async () => {
   const executablePath = await localChromiumExecutable();
