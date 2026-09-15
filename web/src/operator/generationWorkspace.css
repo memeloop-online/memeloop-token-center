@@ -1,0 +1,26 @@
+/* Compact screens stack each generation job so the model, status, cost and
+   primary actions stay visible without horizontal scrolling; technical fields
+   (time, tenant, credential, driver, units) remain available below. Mirrors
+   the request-table stacking pattern in styles/request-surfaces.css. */
+@media (width <= 600px) {
+  .generation-table-scroll table.generation-table { display: block; width: 100%; min-width: 0; }
+  .generation-table thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .generation-table tbody { display: grid; gap: 20px; width: 100%; }
+  .generation-table tbody tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 16px; padding: 0 0 20px; border-bottom: 1px solid #33484e; }
+  :root[data-theme='light'] .generation-table tbody tr { border-bottom-color: #d0dfe2; }
+  .generation-table tbody tr td { display: block; width: auto; min-width: 0; max-width: none; padding: 0; border: 0; white-space: normal; overflow-wrap: anywhere; }
+  .generation-table td[data-label]::before { content: attr(data-label); display: block; margin-bottom: 4px; font-size: 12px; line-height: 1.4; color: #a7bbc3; }
+  :root[data-theme='light'] .generation-table td[data-label]::before { color: #526d78; }
+  .generation-table .generation-model-cell { order: 0; grid-column: 1 / -1; }
+  .generation-table .generation-model-cell code { font-size: 16px; line-height: 1.4; }
+  .generation-table .generation-status-cell { order: 1; }
+  .generation-table .generation-cost-cell { order: 2; }
+  .generation-table .generation-actions-cell { order: 3; grid-column: 1 / -1; align-self: end; }
+  .generation-table .generation-time-cell { order: 4; font-size: 11px; }
+  .generation-table .generation-tenant-cell { order: 5; }
+  .generation-table .generation-credential-cell { order: 6; grid-column: 1 / -1; }
+  .generation-table .generation-driver-cell { order: 7; }
+  .generation-table .generation-units-cell { order: 8; }
+  .generation-table .generation-actions-cell .row-actions { flex-direction: column; align-items: stretch; }
+  .generation-table .generation-actions-cell button { min-height: 44px; width: 100%; }
+}
