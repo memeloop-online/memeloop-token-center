@@ -2305,6 +2305,7 @@ paths:
       tags: [Upstream providers]
       operationId: completeProviderAuthorizationCode
       summary: Complete a revision-bound standard OAuth session
+      description: HTTP 409 with error.code oauth_identity_mismatch means the newly authorized Google account or original client binding did not match and this session has been terminated without changing the existing upstream. Other conflict codes do not imply this terminal state.
       security: [{ serviceBearer: [] }]
       x-required-scope: oauth:write
       requestBody:
@@ -2337,6 +2338,7 @@ paths:
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
         '502': { $ref: '#/components/responses/UpstreamError' }
 
   /internal/v1/oauth/claude/start:
@@ -6985,10 +6987,12 @@ components:
     StartProviderAuthorizationCodeRequest:
       type: object
       additionalProperties: false
-      required: [account_name, provider_driver, provider_config]
+      description: In-place reauthorization is supported only for Antigravity accounts with a recorded Google user identity and complete original OAuth client settings. Set upstream_account_id and the matching tenant/provider/account name; omit provider_config to reuse it, or provide identical config. Proxy changes and client/callback/scope changes are rejected. Legacy credentials missing identity or client settings do not support in-place reauthorization. Completion verifies the new Google identity against the original, preserves account name/config/status/grants and returns HTTP 200. New-account creation requires provider_config and completes with HTTP 201.
+      required: [account_name, provider_driver]
       properties:
         tenant_external_id: { type: string, default: default }
         account_name: { type: string, minLength: 1, maxLength: 200 }
+        upstream_account_id: { type: [string, 'null'], format: uuid }
         provider_driver: { type: string }
         provider_config: { type: object }
         proxy_url: { type: string, writeOnly: true }

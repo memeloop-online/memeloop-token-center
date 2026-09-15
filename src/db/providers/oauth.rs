@@ -57,6 +57,19 @@ fn oauth_refresh_lifecycle_from_row(row: &sqlx::any::AnyRow) -> Result<(String, 
 }
 
 impl Database {
+    pub async fn reject_generic_oauth_ready(
+        &self,
+        session_id: Uuid,
+        lease_owner: Uuid,
+        now: i64,
+    ) -> Result<(), AppError> {
+        let changed = sqlx::query("UPDATE oauth_login_sessions SET status = 'failed', ready_ciphertext = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = $1 WHERE id = $2 AND flow_kind = 'generic_authorization_code' AND status = 'finalizing' AND lease_owner = $3")
+            .bind(now).bind(session_id.to_string()).bind(lease_owner.to_string()).execute(&self.pool).await?;
+        if changed.rows_affected() != 1 {
+            return Err(AppError::Conflict("OAuth completion lease changed".into()));
+        }
+        Ok(())
+    }
     /// Reads only the current generation's transport proxy while starting an
     /// interactive reauthorization. A disconnected account deliberately keeps
     /// its revoked current credential as the stable-identity anchor, so this
@@ -492,6 +505,7 @@ impl Database {
                 | "anthropic_claude_manual_pkce"
                 | "github_copilot_device"
                 | "kimi-oauth"
+                | "generic_authorization_code"
         ) {
             return Err(AppError::BadRequest(
                 "unsupported OAuth reauthorization lifecycle".into(),
@@ -576,11 +590,26 @@ impl Database {
             &row.try_get::<String, _>("credential_ciphertext")?,
             key_material,
         )?;
-        let installed_status = if row.try_get::<Option<i64>, _>("revoked_at")?.is_some() {
+        // Generic reauthorization changes credentials, not the operator's
+        // enable/disable decision. Existing native disconnect recovery is kept.
+        let installed_status = if input.oauth_driver != crate::oauth::authorization_code::FLOW
+            && row.try_get::<Option<i64>, _>("revoked_at")?.is_some()
+        {
             "active"
         } else {
             current_status.as_str()
         };
+        if input.oauth_driver == crate::oauth::authorization_code::FLOW
+            && (current_driver != crate::provider::antigravity::DRIVER
+                || !crate::oauth::authorization_code::same_reauthorization_identity(
+                    &current_credential,
+                    &input.credential,
+                ))
+        {
+            return Err(AppError::Conflict(
+                "OAuth reauthorization must retain the proven original account identity".into(),
+            ));
+        }
         let credential = input.credential.preserve_proxy_from(&current_credential);
         if current_driver == crate::oauth::codex_device::PROVIDER_DRIVER
             && let Some((proxy_url, proxy_scope)) = credential.proxy()
@@ -595,6 +624,26 @@ impl Database {
         credential.validate(now)?;
         let ciphertext = seal_credential(&credential, key_material)?;
         let current_generation: i64 = row.try_get("credential_generation")?;
+        if input.oauth_driver == crate::oauth::authorization_code::FLOW {
+            let lease_sql = match self.backend {
+                DatabaseBackend::PostgreSql => {
+                    "SELECT account_id FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND credential_generation = $2 AND lease_expires_at > $3 FOR UPDATE"
+                }
+                DatabaseBackend::Sqlite => {
+                    "SELECT account_id FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND credential_generation = $2 AND lease_expires_at > $3"
+                }
+            };
+            if sqlx::query(lease_sql)
+                .bind(account_id.to_string())
+                .bind(current_generation)
+                .bind(now)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some()
+            {
+                return Err(AppError::Conflict("OAuth refresh is still in progress; retry the staged authorization after it completes".into()));
+            }
+        }
         let generation = current_generation
             .checked_add(1)
             .ok_or(AppError::Internal)?;
@@ -1398,6 +1447,125 @@ mod tests {
         AppState, api,
         config::{Config, RuntimeRole},
     };
+
+    #[tokio::test]
+    async fn generic_reauthorization_preserves_account_and_fences_refresh_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("generic-reauth.db").display()
+        ))
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        let key = b"generic reauthorization fixture key";
+        let credential = UpstreamCredential::OAuth {
+            access_token: "generic-fixture-access".into(),
+            refresh_token: Some("generic-fixture-refresh".into()),
+            expires_at: Some(unix_millis() + 3_600_000),
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            adapter_state: Some(json!({"authorization_code":{
+                "client_id":"fixture-client","client_secret":null,"refresh_url":"https://auth.example.com/token","network_scope":"public",
+                "login_client":{"client_id":"fixture-client","client_secret":null,"redirect_uri":"http://127.0.0.1:51121/oauth-callback","scopes":["profile"]},
+                "identity":{"issuer":"https://accounts.google.com","subject":"fixture-google-account"}
+            }})),
+            proxy_url: Some("socks5h://192.168.1.20:1080".into()),
+            proxy_network_scope: Some(crate::network::OutboundScope::Private),
+        };
+        let account = db
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: "generic-reauth".into(),
+                    name: "Provider OAuth".into(),
+                    driver: crate::provider::antigravity::DRIVER.into(),
+                    config: json!({"base_url":"https://api.example.com","network_scope":"public"}),
+                    credential: credential.clone(),
+                    oauth_session_id: Some(Uuid::now_v7()),
+                    oauth_driver: Some(crate::oauth::authorization_code::FLOW.into()),
+                    oauth_refresh_url: Some("https://auth.example.com/token".into()),
+                },
+                key,
+            )
+            .await
+            .unwrap();
+        assert!(account.can_reauthorize);
+        sqlx::query("UPDATE upstream_accounts SET status = 'disabled' WHERE id = $1")
+            .bind(account.id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let session_id = Uuid::now_v7();
+        let make_input = || ReauthorizeUpstreamAccountInput {
+            tenant_external_id: "generic-reauth".into(),
+            expected_updated_at: account.updated_at,
+            expected_credential_generation: account.credential_generation,
+            driver: crate::provider::antigravity::DRIVER.into(),
+            oauth_session_id: session_id,
+            oauth_driver: crate::oauth::authorization_code::FLOW.into(),
+            oauth_refresh_url: Some("https://auth.example.com/token".into()),
+            provider_config: None,
+            credential: credential.clone(),
+        };
+        let mut wrong_identity = make_input();
+        if let UpstreamCredential::OAuth {
+            adapter_state: Some(state),
+            ..
+        } = &mut wrong_identity.credential
+        {
+            state["authorization_code"]["identity"]["subject"] = json!("different-google-account");
+        }
+        assert!(matches!(
+            db.reauthorize_upstream_account(account.id, wrong_identity, key)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(
+            db.list_upstream_accounts("generic-reauth").await.unwrap()[0].credential_generation,
+            1
+        );
+        sqlx::query("INSERT INTO upstream_oauth_refresh_leases (account_id, credential_generation, idempotency_key, lease_expires_at, created_at) VALUES ($1, 1, $2, $3, $4)")
+            .bind(account.id.to_string()).bind(Uuid::now_v7().to_string()).bind(unix_millis()+60_000).bind(unix_millis()).execute(&db.pool).await.unwrap();
+        assert!(matches!(
+            db.reauthorize_upstream_account(account.id, make_input(), key)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        sqlx::query("DELETE FROM upstream_oauth_refresh_leases WHERE account_id = $1")
+            .bind(account.id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let updated = db
+            .reauthorize_upstream_account(account.id, make_input(), key)
+            .await
+            .unwrap();
+        assert_eq!(updated.id, account.id);
+        assert_eq!(updated.name, account.name);
+        assert_eq!(updated.config, account.config);
+        assert_eq!(updated.status, "disabled");
+        assert!(updated.has_proxy);
+        assert_eq!(updated.credential_generation, 2);
+        let replay = db
+            .reauthorize_upstream_account(account.id, make_input(), key)
+            .await
+            .unwrap();
+        assert_eq!(replay.credential_generation, 2);
+        let mut stale = make_input();
+        stale.oauth_session_id = Uuid::now_v7();
+        assert!(matches!(
+            db.reauthorize_upstream_account(account.id, stale, key)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(
+            db.list_upstream_accounts("generic-reauth")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 
     async fn pause_at_refresh_phase(
         phases: &mut tokio::sync::mpsc::UnboundedReceiver<OAuthRefreshWritePhase>,

@@ -10,7 +10,10 @@ pub(in crate::api) struct StartRequest {
     #[serde(default = "default_tenant")]
     tenant_external_id: String,
     account_name: String,
+    #[serde(default)]
+    upstream_account_id: Option<Uuid>,
     provider_driver: String,
+    #[serde(default)]
     provider_config: Value,
     #[serde(default)]
     client: Option<ClientConfig>,
@@ -23,7 +26,7 @@ pub(in crate::api) struct StartRequest {
 pub(in crate::api) async fn start_authorization_code_oauth(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<StartRequest>,
+    Json(mut body): Json<StartRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
@@ -33,6 +36,49 @@ pub(in crate::api) async fn start_authorization_code_oauth(
     if service.tenant_external_id.is_some() {
         return Err(AppError::Forbidden);
     }
+    let mut current_credential = None;
+    let reauthorize = if let Some(account_id) = body.upstream_account_id {
+        if body.proxy_url.is_some() || body.proxy_network_scope.is_some() {
+            return Err(AppError::BadRequest(
+                "reauthorization cannot change the transport proxy".into(),
+            ));
+        }
+        let (account, credential, _, flow) = state
+            .db
+            .upstream_account_with_current_credential(
+                account_id,
+                state.config.key_pepper.as_bytes(),
+            )
+            .await?;
+        if account.tenant_external_id.as_deref() != Some(body.tenant_external_id.as_str()) {
+            return Err(AppError::Forbidden);
+        }
+        if account.driver != body.provider_driver
+            || account.name != body.account_name.trim()
+            || flow.as_deref() != Some(authorization_code::FLOW)
+            || account.driver != crate::provider::antigravity::DRIVER
+            || !authorization_code::supports_reauthorization(&credential)
+            || (!body.provider_config.is_null() && account.config != body.provider_config)
+        {
+            return Err(AppError::Conflict(
+                "reauthorization must use the existing provider, name and configuration".into(),
+            ));
+        }
+        body.account_name = account.name;
+        body.provider_config = account.config;
+        if let Some((proxy, scope)) = credential.proxy() {
+            body.proxy_url = Some(proxy.to_owned());
+            body.proxy_network_scope = Some(scope);
+        }
+        current_credential = Some(credential);
+        Some(crate::oauth::OAuthReauthorizationTarget {
+            account_id,
+            expected_updated_at: account.updated_at,
+            expected_credential_generation: account.credential_generation,
+        })
+    } else {
+        None
+    };
     if body.proxy_url.is_some() != body.proxy_network_scope.is_some()
         || body
             .proxy_network_scope
@@ -72,14 +118,23 @@ pub(in crate::api) async fn start_authorization_code_oauth(
         .oauth_adapter
         .clone()
         .ok_or_else(|| AppError::BadRequest("provider does not offer OAuth".into()))?;
-    let client = match body.client {
-        Some(client) => client,
-        None => authorization_code::deployment_client_default(&body.provider_driver)?,
+    let client = match current_credential.as_ref() {
+        Some(credential) => authorization_code::reauthorization_client(
+            credential,
+            body.client,
+            &body.provider_driver,
+            &adapter.refresh_url,
+        )?,
+        None => match body.client {
+            Some(client) => client,
+            None => authorization_code::deployment_client_default(&body.provider_driver)?,
+        },
     };
     Ok(Json(
         authorization_code::start(
             &state.db,
             StartInput {
+                reauthorize,
                 application_plugin_revision: state.application_plugin_revision(),
                 tenant_external_id: body.tenant_external_id,
                 account_name: body.account_name,
@@ -144,10 +199,18 @@ pub(in crate::api) async fn complete_authorization_code_oauth(
             tenant_external_id,
         } => {
             require_service_tenant(&service, &tenant_external_id)?;
-            let account = state
+            let (mut account, credential, _, _) = state
                 .db
-                .upstream_account_for_reauthorization(account_id, &tenant_external_id)
+                .upstream_account_with_current_credential(
+                    account_id,
+                    state.config.key_pepper.as_bytes(),
+                )
                 .await?;
+            if account.tenant_external_id.as_deref() != Some(tenant_external_id.as_str()) {
+                return Err(AppError::Forbidden);
+            }
+            account.attach_proxy_metadata(&credential, state.config.key_pepper.as_bytes())?;
+            super::restrict_transport_proxy_capability(&service, &mut account);
             Ok((
                 StatusCode::OK,
                 Json(super::config_secrets::public_account(&state, account)?),
@@ -157,9 +220,39 @@ pub(in crate::api) async fn complete_authorization_code_oauth(
         CompleteResult::Ready { lease_owner, login } => {
             let mut ready = *login;
             require_service_tenant(&service, &ready.tenant_external_id)?;
+            if ready.provider_driver == crate::provider::antigravity::DRIVER {
+                // The token is durably staged already. A transient identity read
+                // can be retried without exchanging the authorization code again.
+                authorization_code::bind_google_identity(&state.http, &mut ready.credential)
+                    .await?;
+            }
+            if let Some(target) = &ready.reauthorize {
+                let (account, current, _, _) = state
+                    .db
+                    .upstream_account_with_current_credential(
+                        target.account_id,
+                        state.config.key_pepper.as_bytes(),
+                    )
+                    .await?;
+                if account.tenant_external_id.as_deref() != Some(ready.tenant_external_id.as_str())
+                    || ready.provider_driver != crate::provider::antigravity::DRIVER
+                    || !authorization_code::same_reauthorization_identity(
+                        &current,
+                        &ready.credential,
+                    )
+                {
+                    state
+                        .db
+                        .reject_generic_oauth_ready(ready.session_id, lease_owner, unix_millis())
+                        .await?;
+                    return Ok(identity_mismatch_response());
+                }
+            }
             // Tokens are already durably staged before this recoverable read.
             // Project discovery failure must never discard a newly issued refresh token.
-            if ready.provider_driver == crate::provider::antigravity::DRIVER {
+            if ready.reauthorize.is_none()
+                && ready.provider_driver == crate::provider::antigravity::DRIVER
+            {
                 let config =
                     crate::provider::antigravity::Config::from_account(&ready.provider_config)?;
                 let native = crate::provider::antigravity::NativeClient {
@@ -184,22 +277,44 @@ pub(in crate::api) async fn complete_authorization_code_oauth(
                 &state,
             )
             .await?;
-            let account = state
-                .db
-                .create_upstream_account(
-                    CreateUpstreamAccountInput {
-                        tenant_external_id: ready.tenant_external_id,
-                        name: ready.account_name,
-                        driver: ready.provider_driver,
-                        config: ready.provider_config,
-                        credential: ready.credential,
-                        oauth_session_id: Some(ready.session_id),
-                        oauth_driver: Some(authorization_code::FLOW.into()),
-                        oauth_refresh_url: Some(ready.refresh_url),
-                    },
-                    state.config.key_pepper.as_bytes(),
-                )
-                .await?;
+            let reauthorizing = ready.reauthorize.is_some();
+            let mut account = if let Some(target) = ready.reauthorize {
+                state
+                    .db
+                    .reauthorize_upstream_account(
+                        target.account_id,
+                        crate::db::ReauthorizeUpstreamAccountInput {
+                            tenant_external_id: ready.tenant_external_id,
+                            expected_updated_at: target.expected_updated_at,
+                            expected_credential_generation: target.expected_credential_generation,
+                            driver: ready.provider_driver,
+                            oauth_session_id: ready.session_id,
+                            oauth_driver: authorization_code::FLOW.into(),
+                            oauth_refresh_url: Some(ready.refresh_url),
+                            provider_config: None,
+                            credential: ready.credential,
+                        },
+                        state.config.key_pepper.as_bytes(),
+                    )
+                    .await?
+            } else {
+                state
+                    .db
+                    .create_upstream_account(
+                        CreateUpstreamAccountInput {
+                            tenant_external_id: ready.tenant_external_id,
+                            name: ready.account_name,
+                            driver: ready.provider_driver,
+                            config: ready.provider_config,
+                            credential: ready.credential,
+                            oauth_session_id: Some(ready.session_id),
+                            oauth_driver: Some(authorization_code::FLOW.into()),
+                            oauth_refresh_url: Some(ready.refresh_url),
+                        },
+                        state.config.key_pepper.as_bytes(),
+                    )
+                    .await?
+            };
             state
                 .db
                 .finish_oauth_login_session(
@@ -209,12 +324,40 @@ pub(in crate::api) async fn complete_authorization_code_oauth(
                     unix_millis(),
                 )
                 .await?;
-            super::trigger_upstream_model_sync(state.clone(), account.id);
+            if account.status == "active" {
+                super::trigger_upstream_model_sync(state.clone(), account.id);
+            }
+            super::restrict_transport_proxy_capability(&service, &mut account);
             Ok((
-                StatusCode::CREATED,
+                if reauthorizing {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CREATED
+                },
                 Json(super::config_secrets::public_account(&state, account)?),
             )
                 .into_response())
         }
+    }
+}
+
+fn identity_mismatch_response() -> Response {
+    (StatusCode::CONFLICT, Json(json!({"error": {
+        "code": "oauth_identity_mismatch",
+        "message": "authorization belongs to a different upstream account; the existing account was not changed"
+    }}))).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn terminated_identity_session_has_a_distinct_machine_code() {
+        let response = super::identity_mismatch_response();
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["code"], "oauth_identity_mismatch");
     }
 }
