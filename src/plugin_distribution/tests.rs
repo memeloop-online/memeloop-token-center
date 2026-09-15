@@ -60,7 +60,7 @@ fn unsupported_rename_publishes_verified_tree_without_replacement_and_resumes() 
             directory.path(),
             &staging,
             "denied",
-            Err(rustix::io::Errno::ACCES)
+            Err(rustix::io::Errno::ACCESS)
         ),
         Err(PluginDistributionError::Storage)
     ));
