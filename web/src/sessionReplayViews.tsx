@@ -124,15 +124,28 @@ function EntryContent({ entry, t }: { entry: ReplayEntry; t: Translate }) {
  * by the owning surface so this component never handles authentication material or broadens
  * archive authorization.
  */
-export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadArchiveDetail }: {
+export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadArchiveDetail, onLoadEarlierRequests, loadingEarlier = false }: {
   detail: LogicalSessionDetail;
   scopeKey?: string;
   loadArchiveDetail?: SessionReplayArchiveLoader;
+  onLoadEarlierRequests?: () => void;
+  loadingEarlier?: boolean;
 }) {
   const { t } = useI18n();
-  const [archiveWindow, setArchiveWindow] = useState({ scopeKey, sessionId: detail.session_id, limit: REPLAY_ARCHIVE_PAGE_SIZE });
-  const archiveLimit = archiveWindow.scopeKey === scopeKey && archiveWindow.sessionId === detail.session_id ? archiveWindow.limit : REPLAY_ARCHIVE_PAGE_SIZE;
-  const orderedRequests = [...detail.requests].sort(requestOrder).slice(-Math.min(archiveLimit, SESSION_REPLAY_MAX_REQUESTS));
+  const [archiveWindow, setArchiveWindow] = useState({ scopeKey, sessionId: detail.session_id, limit: REPLAY_ARCHIVE_PAGE_SIZE, offset: 0 });
+  const sameWindow = archiveWindow.scopeKey === scopeKey && archiveWindow.sessionId === detail.session_id;
+  const archiveLimit = sameWindow ? archiveWindow.limit : REPLAY_ARCHIVE_PAGE_SIZE;
+  const archiveOffset = sameWindow ? archiveWindow.offset : 0;
+  const orderedRequests = [...detail.requests].sort(requestOrder).slice(-archiveOffset - archiveLimit, archiveOffset ? -archiveOffset : undefined);
+  const pendingEarlier = useRef<{ sessionId: string; scopeKey: string; count: number; offset: number }>();
+  useEffect(() => {
+    const pending = pendingEarlier.current;
+    if (!pending) return;
+    if (pending.sessionId !== detail.session_id || pending.scopeKey !== scopeKey) { pendingEarlier.current = undefined; return; }
+    if (detail.requests.length <= pending.count) return;
+    setArchiveWindow({ scopeKey, sessionId: detail.session_id, offset: pending.offset, limit: REPLAY_ARCHIVE_PAGE_SIZE });
+    pendingEarlier.current = undefined;
+  }, [detail.session_id, scopeKey, detail.requests.length]);
   const visibleRevisions = new Map(orderedRequests.map(request => [request.request_id, archiveRevision(request)]));
   const [archivePage, setArchivePage] = useState<{ sessionId: string; scopeKey: string; loader?: SessionReplayArchiveLoader; values: RequestDetail[]; revisions: Map<string, string> }>({ sessionId: '', scopeKey: '', values: [], revisions: new Map() });
   // Scope and per-request freshness are checked during render, before effect cleanup.
@@ -296,8 +309,10 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
         {!archiveLoading && unreadCount > 0 && <button type="button" className="secondary" onClick={retryUnread}>{t('sessionReplay.retryArchives')}</button>}
         {incompleteCount > 0 && <span>{t('sessionReplay.incomplete', { count: incompleteCount })}</span>}
         {projection.truncated && <span>{t('sessionReplay.truncated')}</span>}
-        {detail.requests.length > sourceRequests.length && archiveLimit < SESSION_REPLAY_MAX_REQUESTS && <button type="button" className="secondary" onClick={() => setArchiveWindow({ scopeKey, sessionId: detail.session_id, limit: Math.min(archiveLimit + REPLAY_ARCHIVE_PAGE_SIZE, SESSION_REPLAY_MAX_REQUESTS) })}>{t('sessionReplay.loadEarlierArchives')}</button>}
-        {detail.requests.length > SESSION_REPLAY_MAX_REQUESTS && archiveLimit >= SESSION_REPLAY_MAX_REQUESTS && <span>{t('sessionReplay.truncated')}</span>}
+        <span>{t('sessionReplay.archiveRange', { start: Math.max(1, detail.requests.length - archiveOffset - sourceRequests.length + 1), end: detail.requests.length - archiveOffset, total: detail.requests.length })}</span>
+        {archiveOffset > 0 && <button type="button" className="secondary" onClick={() => setArchiveWindow({ scopeKey, sessionId: detail.session_id, offset: Math.max(0, archiveOffset - SESSION_REPLAY_MAX_REQUESTS), limit: SESSION_REPLAY_MAX_REQUESTS })}>{t('sessionReplay.newerArchives')}</button>}
+        {detail.requests.length > archiveOffset + sourceRequests.length && <button type="button" className="secondary" onClick={() => setArchiveWindow({ scopeKey, sessionId: detail.session_id, offset: archiveLimit >= SESSION_REPLAY_MAX_REQUESTS ? archiveOffset + archiveLimit : archiveOffset, limit: archiveLimit >= SESSION_REPLAY_MAX_REQUESTS ? REPLAY_ARCHIVE_PAGE_SIZE : Math.min(archiveLimit + REPLAY_ARCHIVE_PAGE_SIZE, SESSION_REPLAY_MAX_REQUESTS) })}>{t('sessionReplay.loadEarlierArchives')}</button>}
+        {detail.requests.length <= archiveOffset + sourceRequests.length && detail.has_more && onLoadEarlierRequests && <button type="button" className="secondary" disabled={loadingEarlier} onClick={() => { pendingEarlier.current = { sessionId: detail.session_id, scopeKey, count: detail.requests.length, offset: archiveOffset + sourceRequests.length }; onLoadEarlierRequests(); }}>{loadingEarlier ? t('common.loading') : t('sessionReplay.loadEarlierArchives')}</button>}
       </div>
     </header>
     <div className="session-replay-layout">

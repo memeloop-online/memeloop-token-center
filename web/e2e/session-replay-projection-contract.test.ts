@@ -125,3 +125,14 @@ test('projects archived Codex custom tools and agent messages without opaque-ite
   assert.ok(replay.items.some(item => item.kind === 'message' && item.role === 'assistant' && item.text === 'Done'));
   assert.equal(replay.truncated, false);
 });
+
+test('removes only carried history prefixes and preserves a repeated new user turn', () => {
+  const user = { type: 'message', role: 'user', content: 'Again' };
+  const assistant = { type: 'message', role: 'assistant', content: 'Done' };
+  const first = detail('history-1', 1, { input: [user] }, { output: [assistant] });
+  const second = detail('history-2', 2, { input: [user, assistant, user] }, { output: [] });
+  const replay = projectSessionReplay('session-a', [first, second]);
+  assert.deepEqual(replay.items.filter(item => item.kind === 'message').map(item => [item.role, item.text]), [
+    ['user', 'Again'], ['assistant', 'Done'], ['user', 'Again'],
+  ]);
+});

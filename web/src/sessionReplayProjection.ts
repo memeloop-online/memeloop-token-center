@@ -338,15 +338,32 @@ export function projectSessionReplay(sessionId: string, details: readonly Reques
   const limit = { truncated: details.length > SESSION_REPLAY_MAX_REQUESTS };
   const requests = details.slice(0, SESSION_REPLAY_MAX_REQUESTS)
     .sort((left, right) => left.created_at - right.created_at || left.request_id.localeCompare(right.request_id));
+  let previousHistory: string[] = [];
+  let previousFormat = '';
 
   for (const detail of requests) {
     if (detail.session_context?.session_id !== sessionId) {
       unknown(items, detail.request_id, 'request', 'outside_session', limit);
       unknown(items, detail.request_id, 'response', 'outside_session', limit);
+      previousHistory = [];
       continue;
     }
-    projectRequestBody(items, detail, limit);
+    const body = object(detail.request_body);
+    const format = array(body?.input) ? 'input' : array(body?.messages) ? 'messages' : '';
+    const history = format ? array(body?.[format]) ?? [] : [];
+    const identities = history.map(item => JSON.stringify(item));
+    let repeated = 0;
+    // Only an exact ordered prefix is carried history. Never globally dedupe
+    // equal text, which would erase a user's deliberate repeated turn.
+    if (format && format === previousFormat) {
+      while (repeated < identities.length && repeated < previousHistory.length && identities[repeated] === previousHistory[repeated]) repeated += 1;
+    }
+    projectRequestBody(items, repeated && body ? { ...detail, request_body: { ...body, [format]: history.slice(repeated) } } : detail, limit);
     projectResponseBody(items, detail, limit);
+    const response = object(detail.response_body);
+    const output = format === 'input' ? array(response?.output) : array(response?.choices)?.flatMap(choice => object(choice)?.message ? [object(choice)?.message] : []);
+    previousHistory = [...identities, ...(output ?? []).map(item => JSON.stringify(item))];
+    previousFormat = format;
   }
   if (details.length > SESSION_REPLAY_MAX_REQUESTS) {
     unknown(items, '', 'request', 'input_limit', limit);
