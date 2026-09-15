@@ -12,7 +12,7 @@ import type { ProviderType, UpstreamAccount } from '../types';
 import { ProxyInput } from './UpstreamConnection';
 import { isGenericProxyUrlInput } from './upstreamConnectionPolicy';
 import { authorizationCodeCopy } from './authorizationCodeCopy';
-import { authorizationStartError, validAuthorizationCallback, type AuthorizationCodeSession } from './authorizationCode';
+import { authorizationStartError, canReauthorizeAccount, isAuthorizationIdentityMismatch, validAuthorizationCallback, type AuthorizationCodeSession } from './authorizationCode';
 import { fluentFormWidgets } from './FluentFormWidgets';
 
 /** Key by credential, tenant and provider at the call site; no browser persistence. */
@@ -21,9 +21,9 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
   onChanged: () => Promise<void>; onLock: (locked: boolean) => void;
 }) {
   const { locale, t } = useI18n();
-  const copy = authorizationCodeCopy(locale, provider.id);
+  const copy = authorizationCodeCopy(locale, provider.id, Boolean(existing));
   const { confirm, confirmationDialog } = useConfirmDialog([token, tenant, provider.id]);
-  const [name, setName] = useState(provider.display_name);
+  const [name, setName] = useState(existing?.name ?? provider.display_name);
   const [config, setConfig] = useState<Record<string, unknown>>({});
   const [useProxy, setUseProxy] = useState(false);
   const [proxy, setProxy] = useState('');
@@ -40,7 +40,7 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
   const live = useRef(true);
   useLayoutEffect(() => { live.current = true; return () => { live.current = false; }; }, []);
   useEffect(() => { onLock(busy || Boolean(session)); }, [busy, session, onLock]);
-  if (existing) return <p role="status">{copy.reauthorize}</p>;
+  if (existing && !canReauthorizeAccount(existing, provider)) return <p role="status">{copy.reauthorize}</p>;
 
   async function start(providerConfig: Record<string, unknown>) {
     if (!token || !tenant || !name.trim() || inFlight.current || session || (useProxy && !isGenericProxyUrlInput(proxy.trim()))) return;
@@ -48,8 +48,9 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
     try {
       const result = await api<AuthorizationCodeSession>('/internal/v1/oauth/authorization-code/start', token, {
         method: 'POST', cache: 'no-store', referrerPolicy: 'no-referrer',
-        body: JSON.stringify({ tenant_external_id: tenant, account_name: name.trim(), provider_driver: provider.id,
-          provider_config: providerConfig, ...(useProxy ? { proxy_url: proxy.trim(), proxy_network_scope: 'private' } : {}) }),
+        body: JSON.stringify({ tenant_external_id: tenant, account_name: existing?.name ?? name.trim(), provider_driver: provider.id,
+          ...(existing ? { upstream_account_id: existing.id } : { provider_config: providerConfig,
+            ...(useProxy ? { proxy_url: proxy.trim(), proxy_network_scope: 'private' } : {}) }) }),
       });
       if (!live.current) return;
       setSession(result); setRecoveryDeadline(result.recovery_expires_at); setProxy('');
@@ -71,22 +72,29 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
       });
       if (!live.current) return;
       if ('id' in result) {
-        saved.current = true; setSession(undefined); setNotice(copy.saved);
+        saved.current = true; setSession(undefined); setNotice(existing ? copy.reauthorized : copy.saved);
         // Account persistence succeeded. A list-read failure is not an OAuth failure.
         try { await onChanged(); }
         catch { if (live.current) setError(copy.savedButReadFailed); }
       }
       else setNotice(copy.pending);
-    } catch { if (live.current) setError(continueIssued ? copy.continueFailed : copy.uncertain); }
+    } catch (reason) {
+      if (live.current) {
+        if (existing && isAuthorizationIdentityMismatch(reason)) {
+          setSession(undefined); setRecoveryDeadline(undefined); setError(copy.identityMismatch);
+        } else setError(continueIssued ? copy.continueFailed : copy.uncertain);
+      }
+    }
     finally { inFlight.current = false; if (live.current) setBusy(false); }
   }
 
   return <section className="authorization-form">
-    {confirmationDialog}<p className="field-hint">{copy.help}</p>
+    {confirmationDialog}<p className="field-hint">{existing ? copy.reauthorizeHelp : copy.help}</p>
     <p>{t('providers.provider')}: {provider.display_name} · {t('operator.tenant')}: {tenantDisplayName(tenant, locale)}</p>
-    <label>{t('providers.name')}<Input required maxLength={200} disabled={busy || Boolean(session) || submitted} value={name} onChange={event => setName(event.target.value)} /></label>
-    <p>{copy.network}: {useProxy ? `${copy.proxy} · ${copy.private}` : copy.direct}</p>
-    {!session && !submitted && <>
+    <label>{t('providers.name')}<Input required maxLength={200} disabled={Boolean(existing) || busy || Boolean(session) || submitted} value={name} onChange={event => setName(event.target.value)} /></label>
+    <p>{copy.network}: {existing ? copy.retainedNetwork : useProxy ? `${copy.proxy} · ${copy.private}` : copy.direct}</p>
+    {existing && !session && !submitted && <Button appearance="primary" type="button" disabled={!token || !tenant || busy} onClick={() => void start({})}>{t(busy ? 'common.loading' : 'common.startLogin')}</Button>}
+    {!existing && !session && !submitted && <>
       <Checkbox label={copy.proxy} checked={useProxy} disabled={busy} onChange={(_, data) => setUseProxy(data.checked === true)} />
       {useProxy && <ProxyInput generic value={proxy} onChange={setProxy} disabled={busy} />}
       <h3>{copy.config}</h3>

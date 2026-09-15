@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { Button } from '@fluentui/react-components';
+import { DetailTooltip } from '../../design-system';
 import { api, apiDiagnosticMessage } from '../../api';
 import { DrawerFrame, Metric, NumberMetric, RequestDiagnostics, RequestTable } from '../../components';
 import { formatDurationDisplay, formatPercent } from '../../format';
@@ -337,7 +338,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
       <NumberMetric label={t('traffic.failure')} value={summary.failed} tone="negative" />
       <NumberMetric label={t('common.running')} value={summary.running} tone={summary.running > 0 ? 'pending' : undefined} />
       {summary.unknown > 0 && <NumberMetric label={locale === 'zh-CN' ? '终态未知' : 'Outcome unknown'} value={summary.unknown} />}
-      <Metric label={t('usage.successRate')} value={<span title={locale === 'zh-CN' ? '仅当前已加载记录中终态明确的请求；不包含运行中或终态未知的历史记录。' : 'Only requests with known terminal outcomes in the loaded rows; excludes running and unknown historical outcomes.'}>{formatPercent(summary.successRate, locale)}</span>} tone="positive" />
+      <Metric label={locale === 'zh-CN' ? '已结束请求成功率' : 'Finished request success rate'} labelContent={<DetailTooltip content={locale === 'zh-CN' ? '仅当前已加载记录：成功 ÷（成功 + 非成功）。客户端断开、取消、中断和失败计入非成功；运行中、交付中和终态未知不进入分母。无明确终态时显示 —。' : 'Loaded records only: successful ÷ (successful + unsuccessful). Client disconnection, cancellation, interruption and failure count as unsuccessful. Running, delivering and unknown outcomes are excluded. Shows — when no terminal outcome is known.'}><span tabIndex={0}>{locale === 'zh-CN' ? '已结束请求成功率' : 'Finished request success rate'}</span></DetailTooltip>} value={formatPercent(summary.successRate, locale)} tone="positive" />
       <Metric label={t('usage.average')} value={<span title={averageDuration.title}>{averageDuration.text}</span>} />
     </section>}
     {loading && requests.length === 0 ? <div className="empty" role="status">{t('common.loading')}</div> : <RequestTable requests={requests} upstreamNames={new Map(upstreams.map((account) => [account.id, account.name]))} onSelect={(request) => void onSelect(request)} onOpenSession={onOpenSession} />}

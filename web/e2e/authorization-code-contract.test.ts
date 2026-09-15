@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { ApiError } from '../src/api.js';
-import { authorizationStartError, validAuthorizationCallback } from '../src/operator/authorizationCode.js';
+import { authorizationStartError, canReauthorizeAccount, isAuthorizationIdentityMismatch, validAuthorizationCallback } from '../src/operator/authorizationCode.js';
 import { authorizationCodeCopy } from '../src/operator/authorizationCodeCopy.js';
 
 test('generic OAuth help does not assume Google and continuation uses user-facing wording', () => {
@@ -20,10 +20,24 @@ test('complete callback requires an unambiguous full URL, not a code fragment', 
   }
 });
 
+test('generic reauthorization needs both authoritative capability and the supported account provider', () => {
+  const adapter = { api_version: 'oauth-adapter-v1', flow_kind: 'authorization_code_pkce', login_url: '', poll_url: '', refresh_url: '' } as const;
+  const provider = { id: 'google-antigravity', oauth_adapter: adapter };
+  assert.equal(canReauthorizeAccount({ driver: provider.id, can_reauthorize: true }, provider), true);
+  assert.equal(canReauthorizeAccount({ driver: provider.id, can_reauthorize: false }, provider), false);
+  assert.equal(canReauthorizeAccount({ driver: 'other-plugin', can_reauthorize: true }, { ...provider, id: 'other-plugin' }), false);
+  assert.equal(canReauthorizeAccount({ driver: 'other-plugin', can_reauthorize: true }, provider), false);
+  assert.equal(canReauthorizeAccount({ driver: provider.id, can_reauthorize: true }), false);
+  assert.equal(canReauthorizeAccount({ driver: 'native', can_reauthorize: true }, { id: 'native', oauth_adapter: { ...adapter, flow_kind: 'openai_device' } }), true);
+});
+
 test('missing deployment client and authority errors get actionable safe copy', () => {
   assert.equal(authorizationStartError(new ApiError('default OAuth client configuration is not provisioned for this provider', 409)), 'admin');
   assert.equal(authorizationStartError(new ApiError('Forbidden', 403)), 'forbidden');
   assert.equal(authorizationStartError(new Error('sensitive-callback-and-token')), 'failed');
+  assert.equal(isAuthorizationIdentityMismatch(new ApiError('safe', 409, 'oauth_identity_mismatch')), true);
+  assert.equal(isAuthorizationIdentityMismatch(new ApiError('no issued result yet', 409)), false);
+  assert.equal(isAuthorizationIdentityMismatch(new ApiError('safe', 502, 'oauth_identity_mismatch')), false);
 });
 
 test('host flow is catalog selected and has no replay, storage, or raw error display', () => {
@@ -44,5 +58,5 @@ test('host flow is catalog selected and has no replay, storage, or raw error dis
   assert.match(component, /Date\.now\(\) >= recoveryDeadline/);
   assert.doesNotMatch(component, /proxy_network_scope: 'public'/);
   assert.doesNotMatch(component, /localStorage|sessionStorage|console\.|apiRead|setInterval|setTimeout|reason\.message/);
-  assert.doesNotMatch(component, /google-antigravity|upstream_account_id|provider-adapter/);
+  assert.doesNotMatch(component, /google-antigravity|provider-adapter/);
 });
