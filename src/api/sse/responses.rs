@@ -182,7 +182,9 @@ impl ResponsesStreamingSanitizer {
             self.last_rejection_stage = Some("eof_incomplete");
             return Err("upstream_incomplete_response");
         }
-        Ok(self.terminal_hold.release())
+        let terminal = self.terminal_hold.release();
+        self.progress_heartbeat = None;
+        Ok(terminal)
     }
 
     pub(in crate::api) fn saw_protocol_event(&self) -> bool {
@@ -196,9 +198,9 @@ impl ResponsesStreamingSanitizer {
         self.terminal == Some(StreamTerminal::Failed)
     }
 
-    /// A canonical, non-terminal Responses lifecycle event for an active
-    /// response. The caller sends this directly to the downstream body: it is
-    /// intentionally excluded from capture, archival, usage, and billing.
+    /// A canonical, non-terminal Responses lifecycle event while downstream
+    /// still awaits its terminal. The caller sends this directly to the body:
+    /// it is intentionally excluded from capture, archival, usage, and billing.
     pub(in crate::api) fn progress_heartbeat(&self) -> Option<Bytes> {
         self.progress_heartbeat.clone()
     }
@@ -348,13 +350,17 @@ impl ResponsesStreamingSanitizer {
             None => {}
         }
         self.terminal = terminal;
-        if matches!(payload_name, "response.created" | "response.in_progress")
+        if (matches!(payload_name, "response.created" | "response.in_progress")
             && self.terminal.is_none()
+            || matches!(
+                terminal,
+                Some(StreamTerminal::Completed | StreamTerminal::Incomplete)
+            ))
             && let Some(response_id) = self.identity.response_id.as_deref()
         {
             self.progress_heartbeat = Some(progress_heartbeat_event(response_id));
         }
-        if self.terminal.is_some() {
+        if self.terminal == Some(StreamTerminal::Failed) {
             self.progress_heartbeat = None;
         }
         if matches!(
