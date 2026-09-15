@@ -9,9 +9,10 @@ const AUDIO_CLIENT_PROTOCOL: &str = "openai-audio-transcription";
 const MAX_HOTWORDS: usize = 256;
 const MAX_HOTWORD_BYTES: usize = 200;
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum AudioResponseFormat {
+    #[default]
     Json,
     VerboseJson,
 }
@@ -47,6 +48,7 @@ struct RewrittenAudioMetadata {
     prompt: Option<String>,
     #[serde(default)]
     hotwords: Option<Vec<String>>,
+    #[serde(default)]
     response_format: AudioResponseFormat,
 }
 
