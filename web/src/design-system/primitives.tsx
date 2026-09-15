@@ -6,12 +6,12 @@ export function DataSurface({ children, className = '', ...props }: HTMLAttribut
   return <section {...props} className={`mtc-data-surface ${className}`}>{children}</section>;
 }
 
-/** Supplemental plain text only. Focus and tap expose exactly the same detail as hover. */
+/** Supplemental noninteractive content only. Focus and tap expose the same detail as hover. */
 export function DetailTooltip({ children, content }: {
-  children: ReactElement<HTMLAttributes<HTMLElement>>; content: string;
+  children: ReactElement<HTMLAttributes<HTMLElement>>; content: ReactNode;
 }) {
   const [visible, setVisible] = useState(false);
-  return <Tooltip content={content} relationship="description" withArrow
+  return <Tooltip content={{ children: content }} relationship="description" withArrow
     visible={visible} onVisibleChange={(_, data) => setVisible(data.visible)}>
     {cloneElement(children, {
       onClick: (event) => {

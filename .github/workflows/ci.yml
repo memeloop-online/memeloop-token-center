@@ -296,6 +296,17 @@ jobs:
           "$RUNNER_TEMP/preferred-tools/wasm-tools" validate --features component-model "$RUNNER_TEMP/preferred-package/plugin.wasm"
       - name: Verify default plugin loader compatibility without revision feature
         run: cargo test --locked --no-default-features --test plugin_product loader_feature_boundary
+      - name: Build the fixed soonest-reset guest for real host acceptance
+        # Reuse the pinned tool verified above; no dispatch-selected executables.
+        run: |
+          cargo fmt --manifest-path plugin-sources/soonest-reset/Cargo.toml -- --check
+          cargo test --locked --manifest-path plugin-sources/soonest-reset/Cargo.toml
+          cargo build --locked --release --target wasm32-unknown-unknown --manifest-path plugin-sources/soonest-reset/Cargo.toml
+          mkdir -p "$RUNNER_TEMP/soonest-reset-package"
+          cp plugin-sources/soonest-reset/plugin.json "$RUNNER_TEMP/soonest-reset-package/plugin.json"
+          "$RUNNER_TEMP/preferred-tools/wasm-tools" component new plugin-sources/soonest-reset/target/wasm32-unknown-unknown/release/mtc_soonest_reset.wasm \
+            -o "$RUNNER_TEMP/soonest-reset-package/plugin.wasm"
+          "$RUNNER_TEMP/preferred-tools/wasm-tools" validate --features component-model "$RUNNER_TEMP/soonest-reset-package/plugin.wasm"
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-targets --all-features --no-fail-fast
         env:
@@ -317,6 +328,20 @@ jobs:
         with:
           name: preferred-account-component-${{ github.sha }}
           path: ${{ runner.temp }}/preferred-package/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Verify soonest-reset guest through the real host and gateway
+        env:
+          MTC_SOONEST_RESET_PACKAGE: ${{ runner.temp }}/soonest-reset-package
+        run: |
+          cargo test --locked --all-features --test first_party_soonest_reset -- --ignored
+          cargo test --locked --all-features --lib soonest_reset_real_gateway -- --ignored
+      - name: Retain the tested soonest-reset component
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: soonest-reset-component-${{ github.sha }}
+          path: ${{ runner.temp }}/soonest-reset-package/
           if-no-files-found: error
           retention-days: 14
 

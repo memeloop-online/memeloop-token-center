@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
@@ -17,6 +18,8 @@ test('failed quota refresh labels retained zeroes as historical and hides unobse
   const browser = await chromium.launch({ headless: true });
   try {
     const page = await browser.newPage();
+    page.setDefaultTimeout(5_000);
+    await page.clock.install();
     const forbiddenRequests: string[] = [];
     const pageErrors: string[] = [];
     page.on('pageerror', error => pageErrors.push(error.message));
@@ -29,6 +32,24 @@ test('failed quota refresh labels retained zeroes as historical and hides unobse
     });
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(`${origin}/e2e/fixtures/quota-semantics.html`);
+
+    const summary = page.locator('[data-case="summary"]');
+    assert.match(await summary.innerText(), /Codex usage · 5-hour limit · 51% used/);
+    assert.equal(await summary.getByRole('meter').getAttribute('aria-valuenow'), '51');
+    assert.match(await summary.getByRole('meter').getAttribute('aria-valuetext') ?? '', /51% used/);
+    await summary.locator('[tabindex="0"]').focus();
+    const windows = page.getByRole('tooltip').filter({ hasText: 'Weekly limit' });
+    await windows.waitFor();
+    assert.match(await windows.innerText(), /20%/);
+    assert.match(await windows.innerText(), /Codex code review/);
+    assert.match(await windows.innerText(), /—/);
+    await page.keyboard.press('Escape');
+    assert.match(await page.locator('[data-case="summary-retained"]').innerText(), /Refresh failed · last observed Codex usage · 5-hour limit 0% used/);
+    assert.equal(await page.locator('[data-case="summary-unobserved"]').getByRole('meter').count(), 0);
+    const expiring = page.locator('[data-case="summary-expiring"]');
+    assert.doesNotMatch(await expiring.innerText(), /Last observed/);
+    await page.clock.fastForward(6_000);
+    await page.waitForFunction(() => document.querySelector('[data-case="summary-expiring"]')?.textContent?.includes('Last observed'));
 
     const retained = page.locator('[data-case="retained"]');
     const retainedText = await retained.innerText();
@@ -55,5 +76,15 @@ test('failed quota refresh labels retained zeroes as historical and hides unobse
     assert.equal(await unobserved.locator('.upstream-quota-window-heading strong').count(), 0);
     assert.deepEqual(forbiddenRequests, []);
     assert.deepEqual(pageErrors, []);
+    const artifacts = fileURLToPath(new URL('../e2e-artifacts/upstream-quota/', import.meta.url));
+    await mkdir(artifacts, { recursive: true });
+    for (const theme of ['light', 'dark']) {
+      await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
+      await summary.locator('[tabindex="0"]').click();
+      await windows.waitFor();
+      await page.screenshot({ path: `${artifacts}/quota-summary-${theme}.png` });
+      assert.equal(await summary.locator('meter').count(), 0, 'themed Fluent component, not a browser-colored native meter');
+      await page.keyboard.press('Escape');
+    }
   } finally { await browser.close(); await server.close(); }
 });

@@ -1,10 +1,11 @@
-import { useSyncExternalStore, type ReactNode } from 'react';
-import { FluentProvider, webDarkTheme, webLightTheme, type Theme } from '@fluentui/react-components';
+import { useSyncExternalStore, type CSSProperties, type ReactNode } from 'react';
+import { createDarkTheme, createLightTheme, FluentProvider, type Theme } from '@fluentui/react-components';
 import './foundation.css';
+import { brandRamp, dataThemes } from './dataTheme';
 
 const themes: Record<'light' | 'dark', Theme> = {
-  light: { ...webLightTheme, fontFamilyBase: 'Inter, ui-sans-serif, system-ui, sans-serif' },
-  dark: { ...webDarkTheme, fontFamilyBase: 'Inter, ui-sans-serif, system-ui, sans-serif' },
+  light: { ...createLightTheme(brandRamp), fontFamilyBase: 'Inter, ui-sans-serif, system-ui, sans-serif' },
+  dark: { ...createDarkTheme(brandRamp), fontFamilyBase: 'Inter, ui-sans-serif, system-ui, sans-serif' },
 };
 
 // Subscribe to the existing shell's source of truth, including external preference changes.
@@ -20,7 +21,9 @@ function snapshot() {
 
 export function MtcFluentProvider({ children }: { children: ReactNode }) {
   const theme = useSyncExternalStore<'light' | 'dark'>(subscribe, snapshot, () => 'dark');
-  return <FluentProvider theme={themes[theme]} className="mtc-fluent-root">
+  const colors = dataThemes[theme];
+  const dataTokens = Object.fromEntries(Object.entries(colors).map(([name, value]) => [`--mtc-data-${name}`, value])) as CSSProperties;
+  return <FluentProvider theme={themes[theme]} style={dataTokens} className="mtc-fluent-root">
     {children}
   </FluentProvider>;
 }

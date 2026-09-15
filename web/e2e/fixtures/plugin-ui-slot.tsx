@@ -5,6 +5,7 @@ import { I18nProvider } from '../../src/i18n';
 import { MtcFluentProvider } from '../../src/design-system';
 import '../../src/styles.css';
 import '../../src/theme.css';
+import '../../src/styles/metrics.css';
 import '../../src/plugins/pluginUiSlot.css';
 
 const messages = { loading: 'Loading', unavailable: 'Plugin unavailable', empty: 'No data', states: { ok: 'Healthy', warning: 'Warning', error: 'Error', unknown: 'Unknown' } };

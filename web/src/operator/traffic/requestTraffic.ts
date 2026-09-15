@@ -78,6 +78,19 @@ export function summarizeVisibleRequests(requests: readonly RequestView[]): Visi
   };
 }
 
+/** Loaded records only, grouped by reception time. This is not a global traffic query. */
+export function visibleRequestMetricSeries(requests: readonly RequestView[]) {
+  const valid = requests.filter(request => Number.isFinite(request.created_at));
+  if (!valid.length) return [];
+  const first = Math.min(...valid.map(request => request.created_at));
+  const last = Math.max(...valid.map(request => request.created_at));
+  const width = Math.max(1, Math.ceil((last - first + 1) / 8));
+  const count = Math.min(8, Math.floor((last - first) / width) + 1);
+  const buckets = Array.from({ length: count }, () => [] as RequestView[]);
+  for (const request of valid) buckets[Math.min(count - 1, Math.floor((request.created_at - first) / width))].push(request);
+  return buckets.map((bucket, index) => ({ timestamp: first + index * width, ...summarizeVisibleRequests(bucket) }));
+}
+
 export function typedRequestQueryBody(tenant: string, ast: TypedFilterAst, before?: RequestListCursor) {
   return {
     tenant_external_id: tenant || undefined,

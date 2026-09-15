@@ -33,6 +33,7 @@ mod memory_admission;
 mod memory_metrics;
 mod phase_diagnostics;
 mod recovery_wait;
+mod soonest_reset;
 mod sse_delivery;
 
 fn pinned_request_envelope_changed(

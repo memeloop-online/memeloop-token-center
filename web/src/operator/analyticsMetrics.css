@@ -9,20 +9,22 @@
 .metrics .analytics-metric {
   position: relative; isolation: isolate; overflow: hidden; border: 0;
   border-radius: 8px; min-height: 112px; padding: 18px 20px;
-  background: color-mix(in srgb, #6ab7bc 7%, transparent);
+  background: var(--mtc-data-surface, #12282b);
 }
 .analytics-metric .metric-label, .analytics-metric .metric-value, .analytics-metric-note { position: relative; z-index: 1; }
 .analytics-metric .metric-value { font-family: inherit; font-size: clamp(1.45rem, 2vw, 1.9rem); font-weight: 600; line-height: 1.25; white-space: nowrap; overflow-wrap: normal; }
 .operator-overview-dashboard .analytics-metric .metric-value,
 .usage-page .usage-metrics .analytics-metric .metric-value { font-size: clamp(1.125rem, 8cqw, 1.85rem); line-height: 1.25; }
-.analytics-metric .metric-label { text-transform: none; letter-spacing: 0; font-size: 12px; }
+.metrics .analytics-metric .metric-label { text-transform: none; letter-spacing: 0; font-size: 13px; line-height: 1.5; color: var(--mtc-data-muted, #a6bac0); }
 .analytics-metric-note { display: block; color: #81949c; font-size: 11px; margin-top: 7px; }
-.analytics-metric-trend { position: absolute; inset: auto 0 0; width: 100%; height: 56%; fill: #40a59a; opacity: .15; z-index: 0; }
+.analytics-metric-trend { position: absolute; inset: auto 0 0; width: 100%; height: 56%; fill: var(--mtc-data-primary, #72c7ba); opacity: .15; z-index: 0; }
 .analytics-metric[role='slider'] { cursor: crosshair; touch-action: pan-y; }
 .analytics-metric[role='slider']:focus-visible { outline: 2px solid var(--colorStrokeFocus2, #40a59a); outline-offset: 2px; }
 .analytics-metric-cursor { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--colorBrandForeground1, #40a59a); opacity: .6; pointer-events: none; }
-.analytics-metric-ratio { position: absolute; inset: 0 auto 0 0; background: #40a59a; opacity: .10; z-index: 0; }
-.analytics-metric.negative :is(.analytics-metric-trend, .analytics-metric-ratio) { fill: #d95369; background: #d95369; }
+.analytics-metric-ratio { position: absolute; inset: 0 auto 0 0; background: var(--mtc-data-primary, #72c7ba); opacity: .10; z-index: 0; }
+.analytics-metric.negative :is(.analytics-metric-trend, .analytics-metric-ratio) { fill: var(--mtc-data-negative, #ed9caa); background: var(--mtc-data-negative, #ed9caa); }
+.metrics .analytics-metric.positive .metric-value { color: var(--mtc-data-primary, #72c7ba); }
+.metrics .analytics-metric.negative .metric-value { color: var(--mtc-data-negative, #ed9caa); }
 .operator-monitoring .monitoring-top-list { gap: 20px; }
 .operator-monitoring .monitoring-top-list > li,
 .operator-monitoring .monitoring-top-list > li:first-child { border: 0; background: transparent; padding: 0; border-radius: 0; }
