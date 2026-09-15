@@ -37,7 +37,7 @@ test('failed quota refresh labels retained zeroes as historical and hides unobse
     const windows = page.getByRole('tooltip').filter({ hasText: 'Weekly limit' });
     await windows.waitFor();
     assert.match(await windows.innerText(), /20%/);
-    assert.match(await windows.innerText(), /Codex review/);
+    assert.match(await windows.innerText(), /Codex code review/);
     assert.match(await windows.innerText(), /—/);
     await page.keyboard.press('Escape');
     assert.match(await page.locator('[data-case="summary-retained"]').innerText(), /Refresh failed · last observed Codex usage · 5-hour limit 0% used/);
