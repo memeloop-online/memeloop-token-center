@@ -9,7 +9,7 @@ const AUDIO_CLIENT_PROTOCOL: &str = "openai-audio-transcription";
 const MAX_HOTWORDS: usize = 256;
 const MAX_HOTWORD_BYTES: usize = 200;
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum AudioResponseFormat {
     Json,
@@ -91,7 +91,7 @@ pub(super) async fn create_audio_transcription(
             "model": form.model,
             "prompt": form.prompt,
             "hotwords": form.hotwords,
-            "response_format": form.response_format,
+            "response_format": form.response_format.as_str(),
         }),
     )
     .await?;
