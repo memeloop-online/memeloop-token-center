@@ -16,6 +16,8 @@ fn unsupported_rename_publishes_verified_tree_without_replacement_and_resumes() 
     std::fs::create_dir(&staging).unwrap();
     std::fs::write(staging.join("plugin.json"), b"verified manifest").unwrap();
     std::fs::write(staging.join("guest.wasm"), b"verified wasm").unwrap();
+    std::fs::create_dir(staging.join("assets")).unwrap();
+    std::fs::write(staging.join("assets/panel.js"), b"verified asset").unwrap();
     std::fs::write(
         staging.join(".mtc-oci-install.json"),
         b"signed digest receipt",

@@ -378,5 +378,19 @@ mod tests {
         std::os::unix::fs::symlink(&target, &symlink).unwrap();
         assert!(link_file(&source, &symlink).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"verified");
+        let root = directory.path().join("owned");
+        let owned = claim_directory(&root, b"owner").unwrap();
+        let detached = directory.path().join("detached");
+        fs::rename(&root, &detached).unwrap();
+        fs::create_dir(&root).unwrap();
+        link_file_at(&source, &owned, Path::new("payload")).unwrap();
+        assert!(!root.join("payload").exists());
+        assert_eq!(fs::read(detached.join("payload")).unwrap(), b"verified");
+        assert!(claim_directory(&root, b"owner").is_err());
+        let outside = directory.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, detached.join("assets")).unwrap();
+        assert!(link_file_at(&source, &owned, Path::new("assets/payload")).is_err());
+        assert!(!outside.join("payload").exists());
     }
 }
