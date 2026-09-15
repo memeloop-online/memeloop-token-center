@@ -2641,6 +2641,26 @@ fn assert_codex_wire(request: &wiremock::Request, upstream_model: &str) {
     }
 }
 
+fn expected_codex_chat_input() -> Value {
+    json!([
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Hello"}]
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Bonjour"}]
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Goodbye"}]
+        }
+    ])
+}
+
 fn assert_codex_chat_wire(request: &wiremock::Request, upstream_model: &str) {
     assert_eq!(request.url.path(), codex_transport::RESPONSES_PATH);
     assert_eq!(request.headers[header::ACCEPT], "text/event-stream");
@@ -2658,14 +2678,7 @@ fn assert_codex_chat_wire(request: &wiremock::Request, upstream_model: &str) {
         body["instructions"],
         "Translate faithfully.\n\nPreserve names."
     );
-    assert_eq!(
-        body["input"],
-        json!([
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Bonjour"},
-            {"role": "user", "content": "Goodbye"}
-        ])
-    );
+    assert_eq!(body["input"], expected_codex_chat_input());
     assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     assert_eq!(
         body["prompt_cache_key"],
@@ -2921,6 +2934,9 @@ async fn codex_buffered_chat_translates_request_and_response_and_settles_once() 
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
+        .and(body_partial_json(json!({
+            "input": expected_codex_chat_input()
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_raw(
             completed_codex_sse("Au revoir").into_bytes(),
             "text/event-stream",
@@ -3022,6 +3038,9 @@ async fn codex_streaming_chat_emits_only_chat_chunks_with_terminal_usage() {
     let sse = streaming_codex_sse("Bonjour monde", "Bonjour ", "monde");
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
+        .and(body_partial_json(json!({
+            "input": expected_codex_chat_input()
+        })))
         .respond_with(
             ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream"),
         )
