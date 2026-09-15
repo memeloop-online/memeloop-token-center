@@ -80,6 +80,9 @@ pub struct InstallPluginOptions {
     pub credentials: RegistryCredentials,
     pub cosign_public_keys: Vec<Vec<u8>>,
     pub cosign_keyless: Option<CosignKeylessIdentity>,
+    /// Portable directory publication is safe only inside an unpublished,
+    /// attempt-scoped inventory root. Legacy active roots require atomic rename.
+    pub allow_portable_publication: bool,
 }
 
 pub use crate::plugin::CosignKeylessIdentity;
@@ -606,9 +609,14 @@ async fn install_plugin_oci_with_verifier(
     let publication_root = options.plugin_root.clone();
     let publication_staging = staging_path.clone();
     let publication_id = package.id.clone();
+    let allow_portable_publication = options.allow_portable_publication;
     let (publication, mut staging) = tokio::task::spawn_blocking(move || {
-        let result =
-            atomic_noreplace_rename(&publication_root, &publication_staging, &publication_id);
+        let result = atomic_noreplace_rename(
+            &publication_root,
+            &publication_staging,
+            &publication_id,
+            allow_portable_publication,
+        );
         (result, staging)
     })
     .await
@@ -694,7 +702,13 @@ fn package_fingerprint_at(
                     OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
                     Mode::empty(),
                 )
-                .map_err(|_| PluginDistributionError::TargetExists)?;
+                .map_err(|error| {
+                    if matches!(error, rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) {
+                        PluginDistributionError::TargetExists
+                    } else {
+                        PluginDistributionError::Storage
+                    }
+                })?;
                 if pending.len() >= MAX_FILES * 2 {
                     return Err(PluginDistributionError::TargetExists);
                 }
@@ -793,6 +807,7 @@ fn atomic_noreplace_rename(
     root: &Path,
     staging: &Path,
     plugin_id: &str,
+    allow_portable_publication: bool,
 ) -> Result<bool, PluginDistributionError> {
     use rustix::fs::{Mode, OFlags, RenameFlags, open, renameat_with};
 
@@ -809,6 +824,7 @@ fn atomic_noreplace_rename(
         root,
         staging,
         plugin_id,
+        allow_portable_publication,
         renameat_with(
             &directory,
             staging_name,
@@ -824,11 +840,15 @@ fn finish_package_rename(
     root: &Path,
     staging: &Path,
     plugin_id: &str,
+    allow_portable_publication: bool,
     result: Result<(), rustix::io::Errno>,
 ) -> Result<bool, PluginDistributionError> {
     match result {
         Ok(()) => Ok(true),
-        Err(error) if crate::plugin_publication::unsupported_rename(error) => {
+        Err(error)
+            if allow_portable_publication
+                && crate::plugin_publication::unsupported_rename(error) =>
+        {
             portable_publish(root, staging, plugin_id)
         }
         Err(error) => {
@@ -847,6 +867,7 @@ fn atomic_noreplace_rename(
     _root: &Path,
     _staging: &Path,
     _plugin_id: &str,
+    _allow_portable_publication: bool,
 ) -> Result<bool, PluginDistributionError> {
     // The production target is K8s/Linux. Refuse an emulated check-then-rename
     // on platforms without Linux renameat2 instead of silently permitting a

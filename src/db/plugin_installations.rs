@@ -99,7 +99,9 @@ impl Database {
         if locked != 1 {
             return Err(AppError::Overloaded);
         }
-        sqlx::query("UPDATE application_plugin_installations SET status='installing', failure_category=NULL, lease_until=$1, updated_at=$2, attempt_id=$4 WHERE id=$3")
+        // Each attempt publishes into a distinct physical inventory root. Old
+        // checkpoints belong to the previous root and must never be reused.
+        sqlx::query("UPDATE application_plugin_installations SET status='installing', review_digest=NULL, review_json=NULL, checkpoints_json='{}', failure_category=NULL, lease_until=$1, updated_at=$2, attempt_id=$4 WHERE id=$3")
             .bind(lease_until).bind(now).bind(&record.id).bind(&id).execute(&mut *tx).await?;
         append_audit(
             &mut tx,

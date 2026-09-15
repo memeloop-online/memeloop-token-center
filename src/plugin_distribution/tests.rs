@@ -9,6 +9,7 @@ use wiremock::{
 
 use super::*;
 
+#[cfg(target_os = "linux")]
 #[test]
 fn unsupported_rename_publishes_verified_tree_without_replacement_and_resumes() {
     let directory = TempDir::new().unwrap();
@@ -28,7 +29,9 @@ fn unsupported_rename_publishes_verified_tree_without_replacement_and_resumes() 
         rustix::io::Errno::NOSYS,
         rustix::io::Errno::OPNOTSUPP,
     ] {
-        assert!(!finish_package_rename(directory.path(), &staging, "plugin", Err(errno)).unwrap());
+        assert!(
+            !finish_package_rename(directory.path(), &staging, "plugin", true, Err(errno)).unwrap()
+        );
         assert!(identical_packages(&directory.path().join("plugin"), &staging).unwrap());
         assert!(staging.exists()); // Caller must retain its cleanup guard.
     }
@@ -60,11 +63,23 @@ fn unsupported_rename_publishes_verified_tree_without_replacement_and_resumes() 
             directory.path(),
             &staging,
             "denied",
+            true,
             Err(rustix::io::Errno::ACCESS)
         ),
         Err(PluginDistributionError::Storage)
     ));
     assert!(!directory.path().join("denied").exists());
+    assert!(matches!(
+        finish_package_rename(
+            directory.path(),
+            &staging,
+            "legacy",
+            false,
+            Err(rustix::io::Errno::OPNOTSUPP)
+        ),
+        Err(PluginDistributionError::Storage)
+    ));
+    assert!(!directory.path().join("legacy").exists());
 }
 
 struct AcceptSignature;
@@ -261,6 +276,7 @@ async fn mock_artifact(title: &str, plugin_json: &[u8]) -> (MockServer, TempDir,
                 credentials: RegistryCredentials::Anonymous,
                 cosign_public_keys: vec![],
                 cosign_keyless: None,
+                allow_portable_publication: false,
             },
             plugin_json: plugin_json.to_vec(),
             plugin_root,
@@ -459,6 +475,7 @@ async fn wrong_key_and_tampered_payload_fail_before_registry_or_storage_access()
         credentials: RegistryCredentials::Anonymous,
         cosign_public_keys: vec![b"wrong-key".to_vec()],
         cosign_keyless: None,
+        allow_portable_publication: false,
     };
     // The runner models official Cosign's fail-closed exit status: neither the
     // supplied key nor the digest-bound payload matches the trusted signature.
@@ -659,6 +676,7 @@ async fn signature_policy_rejects_before_registry_or_storage_access() {
         credentials: RegistryCredentials::Anonymous,
         cosign_public_keys: vec![],
         cosign_keyless: None,
+        allow_portable_publication: false,
     };
     assert!(matches!(
         install_plugin_oci_with_verifier(&options, &RejectSignature, true)

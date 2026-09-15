@@ -25,6 +25,11 @@ struct Arguments {
     #[arg(long)]
     inventory_id: Option<String>,
 
+    /// Internal unpublished revision attempt. Enables the NFS-safe portable
+    /// protocol only in a fresh physical root that no runtime can reference.
+    #[arg(long, conflicts_with = "inventory_id", hide = true)]
+    publication_attempt_id: Option<String>,
+
     /// Atomically append the host-reviewed complete inventory after installation.
     /// Requires experimental-plugin-revisions; existing IDs cannot be changed.
     #[cfg(feature = "experimental-plugin-revisions")]
@@ -77,19 +82,28 @@ struct Arguments {
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let arguments = Arguments::parse();
     let credentials = credentials(&arguments)?;
-    let plugin_root = match &arguments.inventory_id {
-        Some(id) => {
-            if id.is_empty()
-                || id.len() > 64
-                || !id
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-            {
-                return Err("invalid inventory ID".into());
+    let plugin_root = match &arguments.publication_attempt_id {
+        Some(attempt) => {
+            let attempt = uuid::Uuid::parse_str(attempt)?;
+            if attempt.to_string() != *attempt {
+                return Err("invalid publication attempt ID".into());
             }
-            arguments.plugin_dir.join(id)
+            arguments.plugin_dir.join(format!("mtc-attempt-{attempt}"))
         }
-        None => arguments.plugin_dir.clone(),
+        None => match &arguments.inventory_id {
+            Some(id) => {
+                if id.is_empty()
+                    || id.len() > 64
+                    || !id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                {
+                    return Err("invalid inventory ID".into());
+                }
+                arguments.plugin_dir.join(id)
+            }
+            None => arguments.plugin_dir.clone(),
+        },
     };
     let public_keys = arguments
         .cosign_public_keys
@@ -109,6 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .cosign_certificate_identity
             .zip(arguments.cosign_certificate_oidc_issuer)
             .map(|(identity, issuer)| CosignKeylessIdentity { issuer, identity }),
+        allow_portable_publication: arguments.publication_attempt_id.is_some(),
     })
     .await.map_err(|error| {
         eprintln!("{}", serde_json::json!({"mtc_plugin_install":1,"stage":"install","category":error.diagnostic_category()}));

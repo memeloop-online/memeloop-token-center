@@ -319,7 +319,9 @@ impl ApplicationPlugins {
         input: &InstallPluginRequest,
         policy: &InstallPolicy,
     ) -> Result<(String, serde_json::Value), AppError> {
-        let inventory_root = policy.plugin_root.join(&input.inventory_id);
+        let inventory_root = policy
+            .plugin_root
+            .join(inventory_attempt_storage_id(attempt_id)?);
         let (trust, mut checkpoints) = bounded_install_phase(STORAGE_DEADLINE, async {
             let trust = trust_digest(policy).await?;
             tokio::fs::create_dir_all(&policy.plugin_root)
@@ -332,7 +334,7 @@ impl ApplicationPlugins {
                 return Err(AppError::Forbidden);
             }
             let claim_root = inventory_root.clone();
-            let owner = operation_id.to_owned();
+            let owner = attempt_id.to_owned();
             let permit = tokio::time::timeout(
                 ADMISSION_WAIT,
                 INSTALL_STORAGE_PERMITS.clone().acquire_owned(),
@@ -362,8 +364,8 @@ impl ApplicationPlugins {
                     .arg(reference)
                     .arg("--plugin-dir")
                     .arg(&policy.plugin_root)
-                    .arg("--inventory-id")
-                    .arg(&input.inventory_id)
+                    .arg("--publication-attempt-id")
+                    .arg(attempt_id)
                     .env_clear()
                     // Only fixed runtime loader/search paths cross the process
                     // boundary; service tokens and unrelated host settings do not.
@@ -431,9 +433,7 @@ impl ApplicationPlugins {
             .await?;
         }
         bounded_install_phase(STORAGE_DEADLINE, async {
-            let runtime = self
-                .review_runtime(policy.plugin_root.join(&input.inventory_id))
-                .await?;
+            let runtime = self.review_runtime(inventory_root).await?;
             let digest = review_digest(&runtime, &trust)?;
             let review = json!({"plugins":runtime.manifests()});
             if serde_json::to_vec(&review)
@@ -505,7 +505,9 @@ impl ApplicationPlugins {
         }) {
             return Err(AppError::Forbidden);
         }
-        let root = policy.plugin_root.join(&record.inventory_id);
+        let root = policy
+            .plugin_root
+            .join(inventory_attempt_storage_id(&record.attempt_id)?);
         let runtime = self.review_runtime(root.clone()).await?;
         let trust = trust_digest(&policy).await?;
         if review_digest(&runtime, &trust)? != digest {
@@ -736,7 +738,11 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
                 };
                 publish().map_err(|error| {
                     crate::plugin_publication::report_io("inventory_claim", &error);
-                    AppError::Internal
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        AppError::Forbidden
+                    } else {
+                        AppError::Internal
+                    }
                 })?;
             }
             Err(error) => {
@@ -752,6 +758,14 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
     let _ = std::fs::remove_file(marker);
     let _ = std::fs::remove_dir(temporary);
     result
+}
+
+fn inventory_attempt_storage_id(attempt_id: &str) -> Result<String, AppError> {
+    let attempt = uuid::Uuid::parse_str(attempt_id).map_err(|_| AppError::Internal)?;
+    if attempt.to_string() != attempt_id {
+        return Err(AppError::Internal);
+    }
+    Ok(format!("mtc-attempt-{attempt}"))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1105,11 +1119,7 @@ mod tests {
         // The existing distribution tests exercise real signature verification
         // and mock-registry installation. This fixture seeds its verified output
         // to exercise the independent review/approval/publication HTTP boundary.
-        let package = root.join("installed/new-plugin");
-        std::fs::create_dir_all(&package).unwrap();
-        std::fs::write(package.join("plugin.json"),serde_json::to_vec(&json!({"id":"new-plugin","version":"1.0.0","wit_version":"0.2.0","wasm":null,"capabilities":[],"contributions":{}})).unwrap()).unwrap();
         let reference = format!("ghcr.io/example/new@sha256:{}", "a".repeat(64));
-        std::fs::write(package.join(".mtc-oci-install.json"),serde_json::to_vec(&json!({"format_version":1,"source":"ghcr.io/example/new","digest":format!("sha256:{}","a".repeat(64)),"signature_policy":"cosign-public-key"})).unwrap()).unwrap();
         let (record, run) = state
             .db
             .begin_plugin_installation(
@@ -1123,10 +1133,12 @@ mod tests {
             .await
             .unwrap();
         assert!(run);
-        let runtime = authority
-            .review_runtime(root.join("installed"))
-            .await
-            .unwrap();
+        let attempt_root = root.join(inventory_attempt_storage_id(&record.attempt_id).unwrap());
+        let package = attempt_root.join("new-plugin");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("plugin.json"),serde_json::to_vec(&json!({"id":"new-plugin","version":"1.0.0","wit_version":"0.2.0","wasm":null,"capabilities":[],"contributions":{}})).unwrap()).unwrap();
+        std::fs::write(package.join(".mtc-oci-install.json"),serde_json::to_vec(&json!({"format_version":1,"source":"ghcr.io/example/new","digest":format!("sha256:{}","a".repeat(64)),"signature_policy":"cosign-public-key"})).unwrap()).unwrap();
+        let runtime = authority.review_runtime(attempt_root).await.unwrap();
         let policy = authority.install_policy().await.unwrap();
         let digest = review_digest(&runtime, &trust_digest(&policy).await.unwrap()).unwrap();
         state
@@ -1706,9 +1718,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_checkpoint_skips_only_exact_bytes_under_unchanged_trust() {
+    async fn checkpoint_verifies_exact_bytes_and_retry_starts_a_new_physical_root() {
         let (directory, state, record, _) = fixture().await;
-        let root = directory.path().join("private-install-root/installed");
+        let root = directory
+            .path()
+            .join("private-install-root")
+            .join(inventory_attempt_storage_id(&record.attempt_id).unwrap());
         let reference = &record.packages[0];
         let checkpoint = package_checkpoint(&root, reference, "trust").await.unwrap();
         assert!(
@@ -1764,11 +1779,8 @@ mod tests {
             .await
             .unwrap();
         assert!(run);
-        assert_eq!(retry.completed_packages, 1);
-        assert_eq!(
-            retry.checkpoints[reference].tree_digest,
-            checkpoints[reference].tree_digest
-        );
+        assert_eq!(retry.completed_packages, 0);
+        assert!(retry.checkpoints.is_empty());
         assert_ne!(active.attempt_id, retry.attempt_id);
     }
 
