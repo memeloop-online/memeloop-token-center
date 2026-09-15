@@ -311,7 +311,7 @@ mod tests {
             let root = &root;
             let first = scope.spawn(move || {
                 claim_directory_inner(
-                    &root,
+                    root,
                     b"owner",
                     || {
                         entered_tx.send(()).unwrap();
@@ -324,7 +324,7 @@ mod tests {
             let second = scope.spawn(move || {
                 let mut notified = false;
                 claim_directory_inner(
-                    &root,
+                    root,
                     b"owner",
                     || {},
                     || {
