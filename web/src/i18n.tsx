@@ -4,6 +4,9 @@ export type Locale = 'zh-CN' | 'en';
 type Variables = Record<string, string | number>;
 
 const zh = {
+  'monitoring.upstreamQuota': '主要上游剩余额度', 'monitoring.upstreamQuotaScope': '当前总览中的账号 · 展示已用比例最高的额度窗口，可查看全部窗口。',
+  'monitoring.unnamedUpstream': '未命名账号',
+  'quota.remainingUnknown': '剩余额度未知', 'quota.remainingWindow': '{{name}} 剩余比例', 'quota.usedPercentValue': '已用 {{percent}}',
   'quarantine.title': '图片发送结果未知 · 人工核对',
   'quarantine.open': '打开人工核对（需要租户服务凭据）',
   'request.id': '原请求 ID',
@@ -606,6 +609,9 @@ const zh = {
 } as const;
 
 const en = {
+  'monitoring.upstreamQuota': 'Remaining quota for leading upstreams', 'monitoring.upstreamQuotaScope': 'Accounts in this overview. Shows the window with the highest used percentage; all windows are available in details.',
+  'monitoring.unnamedUpstream': 'Unnamed account',
+  'quota.remainingUnknown': 'Remaining quota unknown', 'quota.remainingWindow': '{{name}} remaining percentage', 'quota.usedPercentValue': '{{percent}} used',
   'quarantine.title': 'Unknown image delivery · Manual review',
   'quarantine.open': 'Open manual review (tenant service credential required)',
   'request.id': 'Original request ID',

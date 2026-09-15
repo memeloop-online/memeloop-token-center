@@ -1,7 +1,7 @@
 import { DetailTooltip, ProgressBar } from '../design-system';
-import { formatPercent } from '../format';
+import { formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
-import { quotaHighestUsageWindow, quotaObservationState, quotaSummaryPresentation, quotaUsedPercent, quotaWindowPresentation, type UpstreamQuotaSnapshot } from './upstreamQuota';
+import { quotaHighestUsageWindow, quotaObservationState, quotaRemaining, quotaSummaryPresentation, quotaUnitMessage, quotaUsedPercent, quotaWindowPresentation, type UpstreamQuotaSnapshot } from './upstreamQuota';
 import './upstreamQuota.css';
 import { useQuotaClock } from './useQuotaClock';
 
@@ -16,8 +16,8 @@ export function useQuotaWindowLabel() {
   };
 }
 
-export function QuotaSummary({ snapshot, refreshFailed = false, now: suppliedNow }: {
-  snapshot?: UpstreamQuotaSnapshot; refreshFailed?: boolean; now?: number;
+export function QuotaSummary({ snapshot, refreshFailed = false, now: suppliedNow, mode = 'used' }: {
+  snapshot?: UpstreamQuotaSnapshot; refreshFailed?: boolean; now?: number; mode?: 'used' | 'remaining';
 }) {
   const { t, locale } = useI18n();
   const clock = useQuotaClock();
@@ -31,18 +31,30 @@ export function QuotaSummary({ snapshot, refreshFailed = false, now: suppliedNow
   });
   if (!snapshot || quotaObservationState(snapshot, now, refreshFailed) === 'unobserved' || snapshot.status === 'unsupported' || !snapshot.windows.length) return <span>{text}</span>;
   const historical = quotaObservationState(snapshot, now, refreshFailed) === 'historical';
+  const remainingText = (window: UpstreamQuotaSnapshot['windows'][number]) => {
+    const remaining = quotaRemaining(window);
+    if (!remaining) return t('quota.remainingUnknown');
+    if (remaining.kind === 'percent') return t('quota.remainingPercent', { percent: formatPercent(remaining.percent / 100, locale) });
+    const unitKey = quotaUnitMessage(remaining.unit);
+    return t('quota.remainingWithUnit', { amount: formatNumber(remaining.amount, locale), limit: remaining.limit === null ? '—' : formatNumber(remaining.limit, locale), unit: unitKey ? t(unitKey) : remaining.unit });
+  };
   const content = <div className="quota-summary-tooltip">
     <p>{t(historical ? 'quota.lastObservedAt' : 'quota.observedAt', { time: new Date(snapshot.observed_at!).toLocaleString(locale) })}</p>
     {historical && <p>{text}</p>}
     <ul>{snapshot.windows.map(window => <li key={window.id}>
       <span>{label(snapshot.provider, window)}</span>
-      <strong>{formatPercent(quotaUsedPercent(window) === null ? null : quotaUsedPercent(window)! / 100, locale)}</strong>
+      <strong>{mode === 'remaining' ? t('quota.usedPercentValue', { percent: formatPercent(quotaUsedPercent(window) === null ? null : quotaUsedPercent(window)! / 100, locale) }) : formatPercent(quotaUsedPercent(window) === null ? null : quotaUsedPercent(window)! / 100, locale)}</strong>
+      {mode === 'remaining' && <span>{remainingText(window)}</span>}
       {window.limit_reached === true && <span>{t('quota.limitReached')}</span>}
       {window.allowed === false && window.limit_reached !== true && <span>{t('quota.notAllowed')}</span>}
     </li>)}</ul>
   </div>;
   return <DetailTooltip content={content}><span className="quota-summary" tabIndex={0}>
-    <span>{text}</span>
-    {highest && <ProgressBar className="quota-summary-meter" max={100} value={Math.max(0, Math.min(100, presentation.usedPercent!))} role="meter" aria-valuetext={text} aria-label={t(historical ? 'quota.lastObservedUsedPercent' : 'quota.usedPercent', { name: label(snapshot.provider, highest) })} />}
+    {mode === 'remaining' && highest ? <>
+      <span>{label(snapshot.provider, highest)}</span>
+      <span className="quota-summary-value">{remainingText(highest)}</span>
+      {historical && <span className="quota-summary-provenance">{text}</span>}
+    </> : <span>{text}</span>}
+    {highest && (mode === 'used' || quotaRemaining(highest) !== null) && <ProgressBar className="quota-summary-meter" max={100} value={Math.max(0, Math.min(100, mode === 'remaining' ? 100 - presentation.usedPercent! : presentation.usedPercent!))} role="meter" aria-valuetext={mode === 'remaining' ? `${label(snapshot.provider, highest)} ${remainingText(highest)}${historical ? ` · ${text}` : ''}` : text} aria-label={t(mode === 'remaining' ? 'quota.remainingWindow' : historical ? 'quota.lastObservedUsedPercent' : 'quota.usedPercent', { name: label(snapshot.provider, highest) })} />}
   </span></DetailTooltip>;
 }

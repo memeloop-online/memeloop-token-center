@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import { LocalSettlementNotice, localSettlementLabel } from '../LocalSettlementNotice';
 import { displayTimeZone } from '../charts/displayTimeZone';
 import { formatCurrencyDisplay, formatMetricDisplay, formatPercent } from '../format';
@@ -48,7 +49,7 @@ function MonitoringMetricList({ metrics }: { metrics: OperatorMonitoringSnapshot
   </dl>;
 }
 
-export function MonitoringSnapshot({ snapshot, points = [] }: { snapshot: OperatorMonitoringSnapshot; points?: UsageAnalysisTimeBucket[] }) {
+export function MonitoringSnapshot({ snapshot, points = [], quotaSummary }: { snapshot: OperatorMonitoringSnapshot; points?: UsageAnalysisTimeBucket[]; quotaSummary?: ReactNode }) {
   const { locale, t } = useI18n();
   const summary = snapshot.summary;
   const successRate = summary.requests > 0 ? summary.successful_requests / summary.requests : null;
@@ -74,6 +75,7 @@ export function MonitoringSnapshot({ snapshot, points = [] }: { snapshot: Operat
         <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={t('monitoring.freshness')} value={<Freshness snapshot={snapshot} />} />
       </section>
     </article>
+    {quotaSummary}
     <article className="panel monitoring-top-panel">
       <div className="panel-title"><h2>{t('monitoring.topUpstreams')}</h2><span>{t('monitoring.topAccountModelsScope')}</span></div>
       {!snapshot.top_upstream_models.length
