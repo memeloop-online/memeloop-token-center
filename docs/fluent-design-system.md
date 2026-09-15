@@ -92,3 +92,20 @@ touch operation and contrast checks; screenshots alone cannot establish completi
 - [Tooltip content and accessibility](https://fluent2.microsoft.design/components/web/react/core/tooltip/usage)
 - [Microsoft Fluent UI source and MIT license](https://github.com/microsoft/fluentui)
 - [Griffel SSR implementation guidance](https://griffel.js.org/react/guides/ssr-usage/)
+# Overview quota composition
+
+The overview reuses `AnalyticsMetric`, `QuotaSummary`, and the existing scoped
+quota read owner. It selects only accounts already present in the monitoring
+snapshot, deduplicates accounts across models, and performs one bounded batch
+(at most three concurrent reads). It does not periodically poll suppliers or
+invoke reset, OAuth, or generation. Manual refresh uses the same read owner.
+
+The remaining-quota variant names the highest-used known window. Its progress
+bar represents the remaining percentage, while the tooltip explicitly labels
+used percentages and remaining amounts for every window. Unknown observations
+never become zero or a full remaining bar. Retained values keep their historical
+and read-failure provenance, using the existing shared expiration clock.
+
+`overview-quota-browser-contract.test.ts` exercises this composition through the
+production app entry and AppShell with synthetic network responses, including
+multiple models sharing one account, unobserved zeroes, and a failed refresh.
