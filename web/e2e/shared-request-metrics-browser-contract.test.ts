@@ -32,6 +32,12 @@ test('live metrics share real-data backgrounds and neutral rates across themes a
     await cards.first().focus();
     await page.keyboard.press('End');
     assert.match(await cards.first().getAttribute('aria-valuetext') ?? '', /Requests: 1/);
+    const descriptions = await cards.first().evaluate(node => (node.getAttribute('aria-describedby') ?? '').split(/\s+/).map(id => document.getElementById(id)?.textContent ?? ''));
+    assert.ok(descriptions.includes('3'), 'interactive bucket inspection must retain the aggregate in its accessible description');
+    const average = cards.filter({ hasText: 'Average latency' });
+    assert.equal(await average.count(), 1);
+    const averageDescription = await average.evaluate(node => (node.getAttribute('aria-describedby') ?? '').split(/\s+/).map(id => document.getElementById(id)?.textContent ?? '').join(' '));
+    assert.match(averageDescription, /25 s/);
     await page.keyboard.press('Escape');
     const artifacts = fileURLToPath(new URL('../e2e-artifacts/ui-system/', import.meta.url));
     await mkdir(artifacts, { recursive: true });

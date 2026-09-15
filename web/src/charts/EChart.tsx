@@ -53,7 +53,7 @@ function chartTheme(mode: 'light' | 'dark') {
   };
 }
 
-function currentTheme() {
+function currentTheme(): 'light' | 'dark' {
   return document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
 }
 
