@@ -23,6 +23,11 @@ pub mod oauth;
 pub mod plugin;
 #[cfg(feature = "plugin-distribution")]
 pub mod plugin_distribution;
+#[cfg(any(
+    feature = "experimental-plugin-revisions",
+    feature = "plugin-distribution"
+))]
+mod plugin_publication;
 pub mod pricing;
 pub mod provider;
 mod proxy_lifecycle;

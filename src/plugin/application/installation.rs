@@ -371,7 +371,7 @@ impl ApplicationPlugins {
                     .env("PATH", "/usr/local/bin:/usr/bin:/bin")
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
-                    .stderr(Stdio::null())
+                    .stderr(Stdio::piped())
                     .kill_on_drop(true);
                 for source in &policy.allowed_sources {
                     command.arg("--allowed-source").arg(source);
@@ -389,12 +389,36 @@ impl ApplicationPlugins {
                 if let Some(credentials) = policy.credentials_for(reference) {
                     credentials.apply(&mut command);
                 }
-                if !command
-                    .status()
-                    .await
-                    .map_err(|_| AppError::Internal)?
-                    .success()
-                {
+                let mut child = command.spawn().map_err(|_| {
+                    tracing::warn!(stage = "installer_spawn", "plugin installation failed");
+                    AppError::Internal
+                })?;
+                let mut stderr = child.stderr.take().ok_or(AppError::Internal)?;
+                let capture = async {
+                    use tokio::io::AsyncReadExt;
+                    let mut captured = Vec::new();
+                    let mut buffer = [0u8; 4096];
+                    loop {
+                        let count = stderr.read(&mut buffer).await?;
+                        if count == 0 {
+                            break;
+                        }
+                        let retain = count.min((64 * 1024usize).saturating_sub(captured.len()));
+                        captured.extend_from_slice(&buffer[..retain]);
+                    }
+                    Ok::<_, std::io::Error>(captured)
+                };
+                // Drain concurrently (bounded retained bytes) without an orphan
+                // task. Existing phase timeout drops/kills this owned child.
+                let (status, captured) = tokio::join!(child.wait(), capture);
+                let status = status.map_err(|_| AppError::Internal)?;
+                if !status.success() {
+                    log_installer_diagnostics(&captured.unwrap_or_default());
+                    tracing::warn!(
+                        stage = "installer_exit",
+                        exit_code = status.code(),
+                        "plugin installation failed"
+                    );
                     return Err(AppError::Internal);
                 }
                 let checkpoint = package_checkpoint(&inventory_root, reference, &trust).await?;
@@ -596,6 +620,43 @@ impl InstallPolicy {
 // The final name never exists without a complete, durable owner receipt. A
 // killed creator leaves only an unreferenced hidden temporary directory; retries
 // can claim the final name without deleting or adopting arbitrary existing roots.
+fn log_installer_diagnostics(bytes: &[u8]) {
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value
+            .get("mtc_plugin_install")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+        {
+            continue;
+        }
+        let stage = match value.get("stage").and_then(serde_json::Value::as_str) {
+            Some("package_publish") => "package_publish",
+            Some("package_rename") => "package_rename",
+            Some("install") => "install",
+            _ => continue,
+        };
+        let category = match value.get("category").and_then(serde_json::Value::as_str) {
+            Some("digest_pin") => "digest_pin",
+            Some("source_policy") => "source_policy",
+            Some("signature") => "signature",
+            Some("registry") => "registry",
+            Some("artifact") => "artifact",
+            Some("package") => "package",
+            Some("target_exists") => "target_exists",
+            Some("storage") => "storage",
+            _ => continue,
+        };
+        let errno = value
+            .get("errno")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|value| (1..=4095).contains(value));
+        tracing::warn!(stage, category, errno, "plugin installer diagnostic");
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppError> {
     use rustix::fs::{Mode, OFlags, RenameFlags, open, renameat_with};
@@ -652,7 +713,28 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
                     return Err(AppError::Forbidden);
                 }
             }
-            Err(_) => return Err(AppError::Internal),
+            Err(error) if crate::plugin_publication::unsupported_rename(error) => {
+                let publish = || -> std::io::Result<()> {
+                    let directory =
+                        crate::plugin_publication::claim_directory(root, owner.as_bytes())?;
+                    crate::plugin_publication::link_file_at(
+                        &marker,
+                        &directory,
+                        std::path::Path::new(".mtc-install-owner"),
+                    )?;
+                    rustix::fs::fsync(&directory)?;
+                    crate::plugin_publication::claim_directory(root, owner.as_bytes())?;
+                    Ok(())
+                };
+                publish().map_err(|error| {
+                    crate::plugin_publication::report_io("inventory_claim", &error);
+                    AppError::Internal
+                })?;
+            }
+            Err(error) => {
+                crate::plugin_publication::report_io("inventory_rename", &error.into());
+                return Err(AppError::Internal);
+            }
         }
         std::fs::File::open(parent)
             .and_then(|file| file.sync_all())

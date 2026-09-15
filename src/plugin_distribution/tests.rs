@@ -9,6 +9,62 @@ use wiremock::{
 
 use super::*;
 
+#[test]
+fn unsupported_rename_publishes_verified_tree_without_replacement_and_resumes() {
+    let directory = TempDir::new().unwrap();
+    let staging = directory.path().join(".staging");
+    std::fs::create_dir(&staging).unwrap();
+    std::fs::write(staging.join("plugin.json"), b"verified manifest").unwrap();
+    std::fs::write(staging.join("guest.wasm"), b"verified wasm").unwrap();
+    std::fs::write(
+        staging.join(".mtc-oci-install.json"),
+        b"signed digest receipt",
+    )
+    .unwrap();
+    for errno in [
+        rustix::io::Errno::INVAL,
+        rustix::io::Errno::NOSYS,
+        rustix::io::Errno::OPNOTSUPP,
+    ] {
+        assert!(!finish_package_rename(directory.path(), &staging, "plugin", Err(errno)).unwrap());
+        assert!(identical_packages(&directory.path().join("plugin"), &staging).unwrap());
+        assert!(staging.exists()); // Caller must retain its cleanup guard.
+    }
+    // Simulate interruption before the only loader completion marker.
+    std::fs::remove_file(directory.path().join("plugin/plugin.json")).unwrap();
+    assert!(!directory.path().join("plugin/plugin.json").exists());
+    portable_publish(directory.path(), &staging, "plugin").unwrap();
+    assert!(identical_packages(&directory.path().join("plugin"), &staging).unwrap());
+    std::fs::remove_file(staging.join("guest.wasm")).unwrap();
+    std::fs::write(staging.join("guest.wasm"), b"different signed package").unwrap();
+    assert!(matches!(
+        portable_publish(directory.path(), &staging, "plugin"),
+        Err(PluginDistributionError::TargetExists)
+    ));
+    assert_eq!(
+        std::fs::read(directory.path().join("plugin/guest.wasm")).unwrap(),
+        b"verified wasm"
+    );
+    // A foreign target, including an empty directory, is never adopted.
+    let foreign = directory.path().join("foreign");
+    std::fs::create_dir(&foreign).unwrap();
+    assert!(matches!(
+        portable_publish(directory.path(), &staging, "foreign"),
+        Err(PluginDistributionError::TargetExists)
+    ));
+    assert_eq!(std::fs::read_dir(&foreign).unwrap().count(), 0);
+    assert!(matches!(
+        finish_package_rename(
+            directory.path(),
+            &staging,
+            "denied",
+            Err(rustix::io::Errno::ACCES)
+        ),
+        Err(PluginDistributionError::Storage)
+    ));
+    assert!(!directory.path().join("denied").exists());
+}
+
 struct AcceptSignature;
 
 #[async_trait]

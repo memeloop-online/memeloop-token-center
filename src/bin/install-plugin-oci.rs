@@ -110,7 +110,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .zip(arguments.cosign_certificate_oidc_issuer)
             .map(|(identity, issuer)| CosignKeylessIdentity { issuer, identity }),
     })
-    .await?;
+    .await.map_err(|error| {
+        eprintln!("{}", serde_json::json!({"mtc_plugin_install":1,"stage":"install","category":error.diagnostic_category()}));
+        "plugin installation failed (see safe diagnostic category)"
+    })?;
     #[cfg(feature = "experimental-plugin-revisions")]
     if let (Some(path), Some(entry), Some(id)) = (
         &arguments.inventory_file,
