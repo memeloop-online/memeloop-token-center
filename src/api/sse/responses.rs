@@ -407,7 +407,8 @@ fn progress_heartbeat_event(response_id: &str) -> Bytes {
         },
     }))
     .expect("a fixed Responses progress heartbeat is serializable");
-    let mut event = Vec::with_capacity(b"event: response.in_progress\ndata: \n\n".len() + data.len());
+    let mut event =
+        Vec::with_capacity(b"event: response.in_progress\ndata: \n\n".len() + data.len());
     event.extend_from_slice(b"event: response.in_progress\ndata: ");
     event.extend_from_slice(&data);
     event.extend_from_slice(b"\n\n");
