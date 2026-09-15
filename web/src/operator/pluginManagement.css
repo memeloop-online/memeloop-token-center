@@ -7,6 +7,11 @@
   margin-bottom: 0;
 }
 
+.plugin-management-flow > .panel h2 {
+  font-family: var(--fontFamilyBase, sans-serif);
+  font-weight: 600;
+}
+
 .plugin-runtime-disclosures {
   margin-top: var(--spacingVerticalL);
 }

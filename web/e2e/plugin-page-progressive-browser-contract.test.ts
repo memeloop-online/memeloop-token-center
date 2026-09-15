@@ -88,6 +88,17 @@ test('plugin catalog is usable without unrelated route code or unopened configur
     assert.equal(catalogReads, 1, 'shell registration and plugin management share one catalog read');
     assert.equal(configurationModuleRequests, 0, 'an unopened configuration disclosure does not load schema form code');
     assert.equal(configurationReads, 0, 'catalog rendering does not fan out configuration reads');
+    const headingTypography = await page.locator('.plugin-management-flow').evaluate((flow) => {
+      const baseFamily = getComputedStyle(flow).fontFamily;
+      return [...flow.querySelectorAll<HTMLElement>(':scope > .panel h2')].map((heading) => ({
+        family: getComputedStyle(heading).fontFamily,
+        weight: Number(getComputedStyle(heading).fontWeight),
+        baseFamily,
+      }));
+    });
+    assert.equal(headingTypography.length, 2, 'runtime and catalog management headings are both present');
+    assert.ok(headingTypography.every(({ family, baseFamily, weight }) => family === baseFamily && weight >= 600),
+      'plugin management headings use the same base sans typography as other Operator management workspaces');
 
     const activation = page.getByRole('checkbox', { name: 'Confirm global activation' });
     await activation.focus();
