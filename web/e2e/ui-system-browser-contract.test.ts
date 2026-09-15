@@ -136,12 +136,18 @@ test('shared surfaces contain long content and retain keyboard actions across lo
           await page.keyboard.press('ArrowRight');
         }
         assert.equal(await action.evaluate(element => element === document.activeElement), true, `${label}: keyboard focus`);
-        assert.equal(await action.evaluate(element => {
+        const focusAppearance = await action.evaluate(element => {
           // Fluent controls can draw focus on pseudo-elements as well.
           const styles = [getComputedStyle(element), getComputedStyle(element, '::before'), getComputedStyle(element, '::after')];
-          return styles.some(style => (style.outlineStyle !== 'none' && parseFloat(style.outlineWidth) > 0)
-            || (style.content !== 'none' && style.opacity !== '0' && style.borderTopColor !== 'rgba(0, 0, 0, 0)' && style.borderTopStyle === 'solid' && parseFloat(style.borderTopWidth) >= 2));
-        }), true, `${label}: visible focus ring`);
+          return {
+            visible: styles.some(style => (style.outlineStyle !== 'none' && parseFloat(style.outlineWidth) > 0)
+              || (style.content !== 'none' && style.opacity !== '0' && style.borderTopColor !== 'rgba(0, 0, 0, 0)' && style.borderTopStyle === 'solid' && parseFloat(style.borderTopWidth) >= 2)),
+            fuiFocus: element.hasAttribute('data-fui-focus-visible'),
+            focusVisible: element.matches(':focus-visible'),
+            styles: styles.map(style => ({ outline: style.outline, boxShadow: style.boxShadow, content: style.content, border: style.borderTop, opacity: style.opacity })),
+          };
+        });
+        assert.equal(focusAppearance.visible, true, `${label}: visible focus ring ${JSON.stringify(focusAppearance)}`);
         if (width <= 390 && route.name !== 'operator-overview') {
           assert.ok(await action.evaluate(element => element.getBoundingClientRect().height >= 44), `${label}: touch action size`);
         }
