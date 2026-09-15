@@ -6985,7 +6985,7 @@ components:
     StartProviderAuthorizationCodeRequest:
       type: object
       additionalProperties: false
-      description: When upstream_account_id is provided, bind authorization to that existing tenant/provider/account and credential generation. Name must match; omit provider_config to reuse it, or provide the identical config. Proxy changes are rejected. Omit client to reuse the installed OAuth client; old credentials without saved login settings use the deployment default or an explicit matching client. Completion returns the same account with HTTP 200, preserving name/config/status/grants. New-account creation requires provider_config and completes with HTTP 201.
+      description: In-place reauthorization is supported only for Antigravity accounts with a recorded Google user identity and complete original OAuth client settings. Set upstream_account_id and the matching tenant/provider/account name; omit provider_config to reuse it, or provide identical config. Proxy changes and client/callback/scope changes are rejected. Legacy credentials missing identity or client settings do not support in-place reauthorization. Completion verifies the new Google identity against the original, preserves account name/config/status/grants and returns HTTP 200. New-account creation requires provider_config and completes with HTTP 201.
       required: [account_name, provider_driver]
       properties:
         tenant_external_id: { type: string, default: default }

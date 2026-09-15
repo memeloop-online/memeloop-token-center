@@ -57,6 +57,19 @@ fn oauth_refresh_lifecycle_from_row(row: &sqlx::any::AnyRow) -> Result<(String, 
 }
 
 impl Database {
+    pub async fn reject_generic_oauth_ready(
+        &self,
+        session_id: Uuid,
+        lease_owner: Uuid,
+        now: i64,
+    ) -> Result<(), AppError> {
+        let changed = sqlx::query("UPDATE oauth_login_sessions SET status = 'failed', ready_ciphertext = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = $1 WHERE id = $2 AND flow_kind = 'generic_authorization_code' AND status = 'finalizing' AND lease_owner = $3")
+            .bind(now).bind(session_id.to_string()).bind(lease_owner.to_string()).execute(&self.pool).await?;
+        if changed.rows_affected() != 1 {
+            return Err(AppError::Conflict("OAuth completion lease changed".into()));
+        }
+        Ok(())
+    }
     /// Reads only the current generation's transport proxy while starting an
     /// interactive reauthorization. A disconnected account deliberately keeps
     /// its revoked current credential as the stable-identity anchor, so this
@@ -586,6 +599,17 @@ impl Database {
         } else {
             current_status.as_str()
         };
+        if input.oauth_driver == crate::oauth::authorization_code::FLOW
+            && (current_driver != crate::provider::antigravity::DRIVER
+                || !crate::oauth::authorization_code::same_reauthorization_identity(
+                    &current_credential,
+                    &input.credential,
+                ))
+        {
+            return Err(AppError::Conflict(
+                "OAuth reauthorization must retain the proven original account identity".into(),
+            ));
+        }
         let credential = input.credential.preserve_proxy_from(&current_credential);
         if current_driver == crate::oauth::codex_device::PROVIDER_DRIVER
             && let Some((proxy_url, proxy_scope)) = credential.proxy()
@@ -1441,7 +1465,11 @@ mod tests {
             expires_at: Some(unix_millis() + 3_600_000),
             header: "authorization".into(),
             prefix: "Bearer ".into(),
-            adapter_state: None,
+            adapter_state: Some(json!({"authorization_code":{
+                "client_id":"fixture-client","client_secret":null,"refresh_url":"https://auth.example.com/token","network_scope":"public",
+                "login_client":{"client_id":"fixture-client","client_secret":null,"redirect_uri":"http://127.0.0.1:51121/oauth-callback","scopes":["profile"]},
+                "identity":{"issuer":"https://accounts.google.com","subject":"fixture-google-account"}
+            }})),
             proxy_url: Some("socks5h://192.168.1.20:1080".into()),
             proxy_network_scope: Some(crate::network::OutboundScope::Private),
         };
@@ -1450,7 +1478,7 @@ mod tests {
                 CreateUpstreamAccountInput {
                     tenant_external_id: "generic-reauth".into(),
                     name: "Provider OAuth".into(),
-                    driver: "http-json".into(),
+                    driver: crate::provider::antigravity::DRIVER.into(),
                     config: json!({"base_url":"https://api.example.com","network_scope":"public"}),
                     credential: credential.clone(),
                     oauth_session_id: Some(Uuid::now_v7()),
@@ -1472,13 +1500,30 @@ mod tests {
             tenant_external_id: "generic-reauth".into(),
             expected_updated_at: account.updated_at,
             expected_credential_generation: account.credential_generation,
-            driver: "http-json".into(),
+            driver: crate::provider::antigravity::DRIVER.into(),
             oauth_session_id: session_id,
             oauth_driver: crate::oauth::authorization_code::FLOW.into(),
             oauth_refresh_url: Some("https://auth.example.com/token".into()),
             provider_config: None,
             credential: credential.clone(),
         };
+        let mut wrong_identity = make_input();
+        if let UpstreamCredential::OAuth {
+            adapter_state: Some(state),
+            ..
+        } = &mut wrong_identity.credential
+        {
+            state["authorization_code"]["identity"]["subject"] = json!("different-google-account");
+        }
+        assert!(matches!(
+            db.reauthorize_upstream_account(account.id, wrong_identity, key)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(
+            db.list_upstream_accounts("generic-reauth").await.unwrap()[0].credential_generation,
+            1
+        );
         sqlx::query("INSERT INTO upstream_oauth_refresh_leases (account_id, credential_generation, idempotency_key, lease_expires_at, created_at) VALUES ($1, 1, $2, $3, $4)")
             .bind(account.id.to_string()).bind(Uuid::now_v7().to_string()).bind(unix_millis()+60_000).bind(unix_millis()).execute(&db.pool).await.unwrap();
         assert!(matches!(

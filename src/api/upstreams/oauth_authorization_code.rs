@@ -56,7 +56,8 @@ pub(in crate::api) async fn start_authorization_code_oauth(
         if account.driver != body.provider_driver
             || account.name != body.account_name.trim()
             || flow.as_deref() != Some(authorization_code::FLOW)
-            || !account.can_reauthorize
+            || account.driver != crate::provider::antigravity::DRIVER
+            || !authorization_code::supports_reauthorization(&credential)
             || (!body.provider_config.is_null() && account.config != body.provider_config)
         {
             return Err(AppError::Conflict(
@@ -198,10 +199,17 @@ pub(in crate::api) async fn complete_authorization_code_oauth(
             tenant_external_id,
         } => {
             require_service_tenant(&service, &tenant_external_id)?;
-            let mut account = state
+            let (mut account, credential, _, _) = state
                 .db
-                .upstream_account_for_reauthorization(account_id, &tenant_external_id)
+                .upstream_account_with_current_credential(
+                    account_id,
+                    state.config.key_pepper.as_bytes(),
+                )
                 .await?;
+            if account.tenant_external_id.as_deref() != Some(tenant_external_id.as_str()) {
+                return Err(AppError::Forbidden);
+            }
+            account.attach_proxy_metadata(&credential, state.config.key_pepper.as_bytes())?;
             super::restrict_transport_proxy_capability(&service, &mut account);
             Ok((
                 StatusCode::OK,
@@ -212,6 +220,34 @@ pub(in crate::api) async fn complete_authorization_code_oauth(
         CompleteResult::Ready { lease_owner, login } => {
             let mut ready = *login;
             require_service_tenant(&service, &ready.tenant_external_id)?;
+            if ready.provider_driver == crate::provider::antigravity::DRIVER {
+                // The token is durably staged already. A transient identity read
+                // can be retried without exchanging the authorization code again.
+                authorization_code::bind_google_identity(&state.http, &mut ready.credential)
+                    .await?;
+            }
+            if let Some(target) = &ready.reauthorize {
+                let (account, current, _, _) = state
+                    .db
+                    .upstream_account_with_current_credential(
+                        target.account_id,
+                        state.config.key_pepper.as_bytes(),
+                    )
+                    .await?;
+                if account.tenant_external_id.as_deref() != Some(ready.tenant_external_id.as_str())
+                    || ready.provider_driver != crate::provider::antigravity::DRIVER
+                    || !authorization_code::same_reauthorization_identity(
+                        &current,
+                        &ready.credential,
+                    )
+                {
+                    state
+                        .db
+                        .reject_generic_oauth_ready(ready.session_id, lease_owner, unix_millis())
+                        .await?;
+                    return Err(AppError::Conflict("authorization belongs to a different upstream account; the existing account was not changed".into()));
+                }
+            }
             // Tokens are already durably staged before this recoverable read.
             // Project discovery failure must never discard a newly issued refresh token.
             if ready.reauthorize.is_none()

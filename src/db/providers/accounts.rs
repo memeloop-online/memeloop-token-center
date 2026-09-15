@@ -748,12 +748,13 @@ pub(super) fn upstream_account_view(
         && managed_oauth
         && !matches!(driver.as_str(), "cpa-gemini-oauth-legacy");
     let can_rotate = auth_kind != "none";
-    let can_reauthorize = upstream_can_reauthorize(
-        &driver,
-        &auth_kind,
-        oauth_session_id.as_deref(),
-        oauth_driver.as_deref(),
-    );
+    let can_reauthorize = oauth_driver.as_deref() != Some(crate::oauth::authorization_code::FLOW)
+        && upstream_can_reauthorize(
+            &driver,
+            &auth_kind,
+            oauth_session_id.as_deref(),
+            oauth_driver.as_deref(),
+        );
     let can_update_transport_proxy = auth_kind == "oauth";
     Ok(UpstreamAccountView {
         id: parse_uuid(row.try_get("id")?)?,

@@ -48,7 +48,7 @@ const TOKEN_AAD: &[u8] = b"memeloop-token-center/authorization-code/session/v1";
 const STATE_AAD: &[u8] = b"memeloop-token-center/authorization-code/state/v1";
 const READY_AAD: &[u8] = b"memeloop-token-center/authorization-code/ready/v1";
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     pub client_id: String,
@@ -68,6 +68,133 @@ struct RefreshState {
     network_scope: OutboundScope,
     #[serde(default)]
     login_client: Option<ClientConfig>,
+    #[serde(default)]
+    identity: Option<GoogleIdentity>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct GoogleIdentity {
+    issuer: String,
+    subject: String,
+}
+
+const GOOGLE_ISSUER: &str = "https://accounts.google.com";
+const GOOGLE_USERINFO: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
+
+fn installed_state(credential: &UpstreamCredential) -> Result<RefreshState, AppError> {
+    serde_json::from_value(
+        credential
+            .adapter_state()
+            .and_then(|value| value.get("authorization_code"))
+            .cloned()
+            .ok_or_else(|| {
+                AppError::Conflict(
+                    "original OAuth identity and client settings are unavailable".into(),
+                )
+            })?,
+    )
+    .map_err(|_| {
+        AppError::Conflict("original OAuth identity and client settings are invalid".into())
+    })
+}
+
+pub(crate) fn supports_reauthorization(credential: &UpstreamCredential) -> bool {
+    installed_state(credential).is_ok_and(|state| {
+        state.login_client.as_ref().is_some_and(|client| {
+            validate_client(client).is_ok()
+                && client.client_id == state.client_id
+                && client.client_secret == state.client_secret
+        }) && state.identity.as_ref().is_some_and(|identity| {
+            identity.issuer == GOOGLE_ISSUER && valid_google_subject(&identity.subject)
+        })
+    })
+}
+
+fn valid_google_subject(subject: &str) -> bool {
+    !subject.is_empty()
+        && subject.len() <= 512
+        && subject.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+}
+
+/// Google owns both this fixed HTTPS endpoint and the returned account id.
+/// Never use a display email, Cloud project, or decoded/unverified JWT as identity.
+pub(crate) async fn bind_google_identity(
+    http: &reqwest::Client,
+    credential: &mut UpstreamCredential,
+) -> Result<(), AppError> {
+    let identity = read_google_identity(http, credential, GOOGLE_USERINFO, false).await?;
+    let UpstreamCredential::OAuth {
+        adapter_state: Some(state),
+        ..
+    } = credential
+    else {
+        return Err(AppError::Internal);
+    };
+    state["authorization_code"]["identity"] =
+        serde_json::to_value(identity).map_err(|_| AppError::Internal)?;
+    Ok(())
+}
+
+async fn read_google_identity(
+    http: &reqwest::Client,
+    credential: &UpstreamCredential,
+    endpoint: &str,
+    test_loopback: bool,
+) -> Result<GoogleIdentity, AppError> {
+    let http = network::client_for_config_url_no_retry(
+        http,
+        endpoint,
+        &json!({"network_scope":"public"}),
+        credential.proxy(),
+        test_loopback,
+    )
+    .await?;
+    let response = credential
+        .apply(
+            http.get(endpoint)
+                .timeout(std::time::Duration::from_secs(20)),
+            crate::db::unix_millis(),
+        )?
+        .send()
+        .await
+        .map_err(|_| AppError::Upstream("Google account identity request failed".into()))?;
+    let status = response.status();
+    let bytes = super::bounded_body(response).await?;
+    if !status.is_success() {
+        return Err(AppError::Upstream(format!(
+            "Google account identity returned HTTP {}",
+            status.as_u16()
+        )));
+    }
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| AppError::Upstream("Google account identity response is invalid".into()))?;
+    let subject = value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|subject| valid_google_subject(subject))
+        .ok_or_else(|| AppError::Upstream("Google account identity is missing".into()))?;
+    Ok(GoogleIdentity {
+        issuer: GOOGLE_ISSUER.into(),
+        subject: subject.into(),
+    })
+}
+
+pub(crate) fn same_reauthorization_identity(
+    current: &UpstreamCredential,
+    next: &UpstreamCredential,
+) -> bool {
+    supports_reauthorization(current)
+        && supports_reauthorization(next)
+        && installed_state(current)
+            .ok()
+            .and_then(|state| state.login_client)
+            == installed_state(next)
+                .ok()
+                .and_then(|state| state.login_client)
+        && installed_state(current)
+            .ok()
+            .and_then(|state| state.identity)
+            == installed_state(next).ok().and_then(|state| state.identity)
 }
 
 fn refresh_state(input: &StartInput) -> Result<Value, AppError> {
@@ -77,30 +204,27 @@ fn refresh_state(input: &StartInput) -> Result<Value, AppError> {
         refresh_url: input.adapter.refresh_url.clone(),
         network_scope: network::scope_from_config(&input.provider_config),
         login_client: Some(input.client.clone()),
+        identity: None,
     }});
     crate::provider::validate_adapter_state(&state)?;
     Ok(state)
 }
 
-/// Reuse the installed OAuth client, not a newly selected client for the same
-/// provider. Older credentials predate persisted callback/scopes; their explicit
-/// operator choice or deployment default must still match the installed client.
+/// Reuse the proven original identity and complete OAuth client. Legacy
+/// credentials cannot establish missing callbacks/scopes from a new default.
 pub(crate) fn reauthorization_client(
     credential: &UpstreamCredential,
     requested: Option<ClientConfig>,
-    provider_driver: &str,
+    _provider_driver: &str,
     refresh_url: &str,
 ) -> Result<ClientConfig, AppError> {
-    let state: RefreshState = serde_json::from_value(
-        credential
-            .adapter_state()
-            .and_then(|value| value.get("authorization_code"))
-            .cloned()
-            .ok_or_else(|| {
-                AppError::Conflict("installed OAuth client metadata is unavailable".into())
-            })?,
-    )
-    .map_err(|_| AppError::Conflict("installed OAuth client metadata is invalid".into()))?;
+    if !supports_reauthorization(credential) {
+        return Err(AppError::Conflict(
+            "original OAuth account identity and client settings are required for reauthorization"
+                .into(),
+        ));
+    }
+    let state = installed_state(credential)?;
     let client = match (state.login_client, requested) {
         (Some(installed), None) => installed,
         (Some(installed), Some(requested)) => {
@@ -113,8 +237,11 @@ pub(crate) fn reauthorization_client(
             }
             installed
         }
-        (None, Some(requested)) => requested,
-        (None, None) => deployment_client_default(provider_driver)?,
+        (None, _) => {
+            return Err(AppError::Conflict(
+                "original OAuth client settings are unavailable".into(),
+            ));
+        }
     };
     if client.client_id != state.client_id
         || client.client_secret != state.client_secret
@@ -790,6 +917,58 @@ fn callback_code(callback: &str, redirect: &str, state: &str) -> Result<String, 
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn google_userinfo_uses_authenticated_id_not_email_or_project() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/userinfo"))
+            .and(wiremock::matchers::header("authorization", "Bearer fixture-access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"stable-google-id","email":"display@example.test","project":"not-an-account"})))
+            .expect(1).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/missing-id"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"email":"display@example.test","project":"not-an-account"}),
+                ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let input = input("https://tokens.example.com/token".into());
+        let issued = credential(
+            TokenResponse {
+                access_token: "fixture-access".into(),
+                refresh_token: Some("fixture-refresh".into()),
+                expires_in: 3600,
+                token_type: None,
+            },
+            &input,
+            crate::db::unix_millis(),
+            None,
+        )
+        .unwrap();
+        let identity = read_google_identity(
+            &reqwest::Client::new(),
+            &issued,
+            &format!("{}/userinfo", server.uri()),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(identity.issuer, GOOGLE_ISSUER);
+        assert_eq!(identity.subject, "stable-google-id");
+        assert!(
+            read_google_identity(
+                &reqwest::Client::new(),
+                &issued,
+                &format!("{}/missing-id", server.uri()),
+                true
+            )
+            .await
+            .is_err()
+        );
+    }
+
     #[test]
     fn reauthorization_preserves_installed_client_and_encrypted_target() {
         let mut original = input("https://tokens.example.com/token".into());
@@ -799,7 +978,7 @@ mod tests {
             expected_credential_generation: 4,
         };
         original.reauthorize = Some(target.clone());
-        let issued = credential(
+        let mut issued = credential(
             TokenResponse {
                 access_token: "fixture-access".into(),
                 refresh_token: Some("fixture-refresh".into()),
@@ -811,6 +990,14 @@ mod tests {
             None,
         )
         .unwrap();
+        if let UpstreamCredential::OAuth {
+            adapter_state: Some(state),
+            ..
+        } = &mut issued
+        {
+            state["authorization_code"]["identity"] =
+                json!({"issuer":GOOGLE_ISSUER,"subject":"original-google-user"});
+        }
         let reused = reauthorization_client(
             &issued,
             None,
@@ -820,6 +1007,39 @@ mod tests {
         .unwrap();
         assert_eq!(reused.scopes, original.client.scopes);
         assert_eq!(reused.redirect_uri, original.client.redirect_uri);
+        let mut legacy = issued.clone();
+        if let UpstreamCredential::OAuth {
+            adapter_state: Some(state),
+            ..
+        } = &mut legacy
+        {
+            state["authorization_code"]
+                .as_object_mut()
+                .unwrap()
+                .remove("login_client");
+        }
+        let mut changed_redirect = original.client.clone();
+        changed_redirect.redirect_uri = "http://127.0.0.1:59999/other".into();
+        assert!(!supports_reauthorization(&legacy));
+        assert!(
+            reauthorization_client(
+                &legacy,
+                Some(changed_redirect),
+                "fixture-provider",
+                &original.adapter.refresh_url
+            )
+            .is_err()
+        );
+        let mut different = issued.clone();
+        if let UpstreamCredential::OAuth {
+            adapter_state: Some(state),
+            ..
+        } = &mut different
+        {
+            state["authorization_code"]["identity"]["subject"] = json!("another-google-user");
+        }
+        assert!(!same_reauthorization_identity(&issued, &different));
+        assert!(same_reauthorization_identity(&issued, &issued));
         let mut changed = original.client.clone();
         changed.scopes.push("unrequested-scope".into());
         assert!(
@@ -1339,7 +1559,7 @@ mod tests {
             .and(body_string_contains("client_secret=fixture-client-parameter"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token": "new-fixture-access", "expires_in": 3600, "token_type": "Bearer"}))).expect(1).mount(&server).await;
         let input = input(format!("{}/token", server.uri()));
-        let current = credential(
+        let mut current = credential(
             TokenResponse {
                 access_token: "old-fixture-access".into(),
                 refresh_token: Some("fixture-refresh".into()),
@@ -1351,6 +1571,14 @@ mod tests {
             None,
         )
         .unwrap();
+        if let UpstreamCredential::OAuth {
+            adapter_state: Some(state),
+            ..
+        } = &mut current
+        {
+            state["authorization_code"]["identity"] =
+                json!({"issuer":GOOGLE_ISSUER,"subject":"same-refreshed-account"});
+        }
         let http = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -1366,6 +1594,12 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(
+            refreshed.adapter_state(),
+            current.adapter_state(),
+            "refresh preserves identity and complete client context"
+        );
+        assert!(same_reauthorization_identity(&current, &refreshed));
         match refreshed {
             UpstreamCredential::OAuth {
                 access_token,
