@@ -295,7 +295,11 @@ fn empty_json_object() -> Value {
 pub enum PluginCapability {
     Log,
     Kv,
-    Http { allowed_origins: Vec<String> },
+    Http {
+        allowed_origins: Vec<String>,
+    },
+    /// Read-only candidate quota context for native-health group ordering.
+    GroupRoutingQuota,
 }
 
 #[derive(Clone)]

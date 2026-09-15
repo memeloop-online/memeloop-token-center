@@ -65,6 +65,7 @@ fn reversed_plan_retains_exact_generation_and_health_snapshot() {
         remaining_deadline_ms: 1000,
         config: serde_json::json!({}),
         candidates: vec![first.candidate.clone(), second.candidate.clone()],
+        quota_context: None,
     };
     assert_eq!(
         planned_candidate(&input, &second.directive),

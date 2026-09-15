@@ -143,6 +143,7 @@ pub(crate) async fn restore_selected(
             remaining_deadline_ms: total_budget,
             config: policy.config.clone(),
             candidates: vec![policy.candidate.clone()],
+            quota_context: None,
         };
         crate::plugin::routing::validate_group_routing_plan(
             &input,

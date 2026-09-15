@@ -201,7 +201,71 @@ fn input() -> GroupRoutingInput {
         remaining_deadline_ms: 1000,
         config: json!({}),
         candidates: Vec::new(),
+        quota_context: None,
     }
+}
+
+#[tokio::test]
+async fn quota_context_is_manifest_opted_in_without_changing_the_routing_world() {
+    let output = json!({"candidates":[{
+        "tenant_id":"tenant", "route_id":"route", "account_id":"account", "generation":7,
+        "allow_transient_probe":false, "cooldown_ms":0, "recovery_wait_ms":0,
+        "recheck_ms":0, "stickiness":false
+    }]})
+    .to_string();
+    let (directory, legacy) = runtime(&output, false).await;
+    let mut request = input();
+    request.candidates.push(GroupRoutingCandidate {
+        tenant_id: "tenant".into(),
+        route_id: "route".into(),
+        account_id: "account".into(),
+        generation: 7,
+        health: GroupRoutingHealth::Healthy,
+    });
+    assert!(
+        legacy
+            .execute_group_routing_plan("router", &request)
+            .is_ok()
+    );
+    request.quota_context = Some(
+        serde_json::from_value(json!({
+            "version":"account-windows-v1", "now_ms":1000,
+            "accounts":[{"account_id":"account", "generation":7, "provider":"kimi-oauth",
+                "observed_at":900, "valid_until":1100,
+                "windows":[{"id":"summary","period_seconds":604800,"reset_at":2000,
+                    "reset_is_estimated":false,"remaining_fraction":0.5,"exhausted":false}]}]
+        }))
+        .unwrap(),
+    );
+    assert!(
+        legacy
+            .execute_group_routing_plan("router", &request)
+            .is_err()
+    );
+    let manifest_path = directory.path().join("plugins/router/plugin.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["capabilities"] = json!([{"kind":"group_routing_quota"}]);
+    manifest["contributions"]["group_routing"]["health_policy"] = json!("native");
+    fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let db = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("db.sqlite").display()
+    ))
+    .await
+    .unwrap();
+    let enabled = PluginRuntime::load(directory.path().join("plugins").to_str(), db).unwrap();
+    let plan = enabled
+        .execute_group_routing_plan("router", &request)
+        .unwrap();
+    assert_eq!(plan.candidates[0].account_id, "account");
+    assert!(!plan.candidates[0].stickiness);
+    request.quota_context = None;
+    assert!(
+        enabled
+            .execute_group_routing_plan("router", &request)
+            .is_err()
+    );
 }
 
 #[tokio::test]

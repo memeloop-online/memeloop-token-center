@@ -1,5 +1,6 @@
 //! Request-owned group policy. Authorization and health leases stay in core.
 pub(crate) mod durable;
+mod quota;
 #[cfg(test)]
 pub(crate) mod test_observe_gate;
 use crate::{
@@ -225,6 +226,37 @@ async fn prepare_inner(
                 ));
         }
     }
+    // Only selected manifest-opted-in buckets need quota data. One bounded
+    // shared-store batch, never a supplier read on the scheduling path.
+    let quota_plugins = state.plugins.quota_observation_plugin_ids();
+    let quota_candidates: Vec<_> = buckets
+        .values()
+        .flatten()
+        .filter(|member| quota_plugins.contains(&member.2.plugin_id))
+        .map(|member| member.1.clone())
+        .collect();
+    let quota_observations = if quota_candidates.is_empty() {
+        BTreeMap::new()
+    } else {
+        match tokio::time::timeout_at(
+            hook_deadline,
+            crate::upstream_quota::observations::routing_observations(
+                state,
+                tenant_id,
+                &quota_candidates,
+                crate::db::unix_millis(),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(observations)) => observations,
+            _ => {
+                tracing::warn!(%request_id, stage="group_routing_quota_fallback", "quota observation unavailable; native order retained");
+                BTreeMap::new()
+            }
+        }
+    };
+    let quota_now_ms = crate::db::unix_millis();
     let mut policies = BTreeMap::new();
     let mut ranks = BTreeMap::new();
     let mut next_rank = 0usize;
@@ -244,6 +276,14 @@ async fn prepare_inner(
         let config = members[0].2.config.clone();
         let plugin_id = members[0].2.plugin_id.clone();
         let native_health = state.plugins.group_routing_uses_native_health(&plugin_id);
+        let quota_context = if state.plugins.group_routing_uses_quota_context(&plugin_id) {
+            match quota::context_for_bucket(&members, &quota_observations, quota_now_ms) {
+                Some(context) => Some(context),
+                None => continue, // Missing/expired/old-generation observations retain native slots.
+            }
+        } else {
+            None
+        };
         let mut inputs = Vec::new();
         for (_, candidate, _, _) in &members {
             let health = match bindings
@@ -276,6 +316,7 @@ async fn prepare_inner(
                 .saturating_sub(started.elapsed().as_millis() as u64),
             config: config.clone(),
             candidates: inputs,
+            quota_context,
         };
         let runtime = state.plugins.clone();
         let execute_id = plugin_id.clone();

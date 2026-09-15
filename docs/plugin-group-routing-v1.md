@@ -59,6 +59,66 @@ an audited confirmation workflow in the existing generation workspace.
 
 ## ABI
 
+### Optional read-only quota context
+
+A signed manifest can opt in with `capabilities: [{"kind":"group_routing_quota"}]`.
+This capability requires a `group_routing` contribution with `health_policy: "native"`.
+It grants no HTTP or KV access. Existing manifests and strict v1 guests receive
+exactly the previous JSON fields: `quota_context` is omitted, not null. The WIT
+world and plan output contract do not change. Installers must support this
+manifest capability before accepting a new package; already published static
+PreferredAccount packages require no changes.
+
+Opted-in `plan` input adds:
+
+```json
+{
+  "quota_context": {
+    "version": "account-windows-v1",
+    "now_ms": 1000,
+    "accounts": [{
+      "account_id": "authorized-account-id",
+      "generation": 7,
+      "provider": "kimi-oauth",
+      "observed_at": 900,
+      "valid_until": 1100,
+      "windows": [{
+        "id": "summary",
+        "period_seconds": 604800,
+        "reset_at": 2000,
+        "reset_is_estimated": false,
+        "remaining_fraction": 0.5,
+        "exhausted": false
+      }]
+    }]
+  }
+}
+```
+
+Times are Unix milliseconds. Window period/reset/fraction/exhausted can be null;
+unknown is never synthesized as available. An explicit reset instant is not a
+period, and remaining fraction is not a token amount. Consumers must check
+applicability and chosen window evidence rather than infer it from names or
+claim that a predicted reset already restored quota.
+
+The host reads one bounded shared-observation batch only for selected opted-in
+groups, not the entire tenant. No supplier network or credential refresh runs
+on this path. Entries must match the authorized account, current credential
+generation, provider and transport/config revision. Each group receives only its
+own deduplicated accounts; multiple routes can refer to one account. Missing,
+expired, future-dated or generation/config-mismatched evidence, or a passed reset
+without a new observation, preserves that group's native ordering without
+calling the quota guest. The request holds one copied observation snapshot and
+one `now_ms`; a background refresh cannot change its plan halfway through.
+
+The context is advisory ordering evidence, never a health lease or authorization.
+Plans must still retain the exact candidate permutation. Native health, hard
+quota/authentication isolation, admission, recovery and durable media behavior
+remain authoritative; no new cooldown is introduced. A guest needing exact
+reset order must use non-sticky directives so rendezvous ordering does not
+override its result. Native-health policies are not persisted as guest health
+overrides and do not invoke `observe` to mutate health.
+
 This scheduling contract is independent of `traffic-policy.post-auth`. Build
 the `group-routing-plugin` world in `wit/token-center.wit`; export
 `group-routing-v1.plan(input-json)` and `group-routing-v1.observe(input-json)`,

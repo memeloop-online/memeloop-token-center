@@ -35,6 +35,13 @@
             "type": "object",
             "additionalProperties": false,
             "required": ["kind"],
+            "properties": { "kind": { "const": "group_routing_quota" } },
+            "description": "Read-only account-windows-v1 context for group routing with native health; grants no network or KV access."
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind"],
             "properties": { "kind": { "const": "log" } }
           },
           {
