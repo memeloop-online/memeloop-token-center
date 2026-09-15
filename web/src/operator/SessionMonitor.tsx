@@ -421,7 +421,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       <div className="session-detail-region">
         {!visibleDetail && detailLoading && <div className="empty" role="status">{t('common.loading')}</div>}
         {!visibleDetail && !detailLoading && <div className="empty">{selected && visibleError ? <button type="button" className="secondary" onClick={() => void selectSession(selected)}>{t('sessions.retryLoad')}</button> : t('sessions.selectHint')}</div>}
-        {visibleDetail && <SessionDetailSurface detail={visibleDetail} summary={selected} showDiagnosticIds loading={detailLoading} onLoadOlder={() => void loadEarlier()} loadReplayArchive={loadReplayArchive} onSelect={(request) => { void onSelectRequest(request); }} onClose={() => { detailRequests.current.invalidate(); setDetailLoading(false); setDetail(undefined); setDetailScope(''); setSelected(undefined); selectedRef.current = undefined; }} />}
+        {visibleDetail && <SessionDetailSurface detail={visibleDetail} summary={selected} showDiagnosticIds loading={detailLoading} onLoadOlder={() => void loadEarlier()} loadReplayArchive={loadReplayArchive} onSelect={(request) => { void onSelectRequest(request); }} onClose={() => { detailRequests.current.invalidate(); detailInFlight.current = false; setDetailLoading(false); setDetail(undefined); setDetailScope(''); setSelected(undefined); selectedRef.current = undefined; }} />}
       </div>
     </div>
   </>;
