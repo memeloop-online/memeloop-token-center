@@ -7,8 +7,8 @@ mod synchronous_entry;
 mod synchronous_image;
 
 pub(super) use assets::{
-    cancel_self_generation, generation_asset_response, self_generation, self_generation_asset,
-    self_generations, self_request_asset,
+    cancel_self_generation, generation_asset_response, parse_byte_range, self_generation,
+    self_generation_asset, self_generations, self_request_asset,
 };
 pub(super) use jobs::{create_generation, create_video_generation};
 pub(super) use synchronous_entry::{CreateGenerationRequest, create_image_generation};
@@ -22,6 +22,3 @@ pub(super) use synchronous_image::{
 
 #[cfg(test)]
 pub(super) use jobs::normalize_seedance_duration;
-
-#[cfg(test)]
-pub(super) use assets::parse_byte_range;

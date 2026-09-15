@@ -160,6 +160,19 @@ pub(in crate::api) async fn self_request_detail(
     request_detail_response(&state, refs).await
 }
 
+pub(in crate::api) async fn self_request_archive_content(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((request_id, side)): Path<(Uuid, RequestArchiveSide)>,
+) -> Result<Response, AppError> {
+    let key = authenticate_downstream(&headers, &state).await?;
+    let refs = state
+        .db
+        .request_archive_refs(key.key_id, request_id)
+        .await?;
+    request_archive_content_response(&state, &headers, &refs, side).await
+}
+
 pub(in crate::api) async fn request_detail_response(
     state: &AppState,
     refs: crate::model::RequestArchiveRefs,

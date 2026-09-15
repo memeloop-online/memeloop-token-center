@@ -4225,6 +4225,43 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /internal/v1/requests/{request_id}/archive/{side}:
+    get:
+      tags: [Operator traffic]
+      operationId: streamOperatorRequestArchiveContent
+      summary: Stream one request or response archive body with optional byte range
+      description: |
+        Uses the same `requests:read` tenant boundary as request detail. The archive
+        locator is resolved only from the authorized request record and is never
+        accepted or returned. Without `Range`, the complete body is streamed without
+        collecting it in API memory. Exactly one byte range is supported. Clients
+        paging a body should retain the first response ETag and send it in `If-Match`
+        on subsequent ranges; a changed archive binding returns 412.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      x-authorization-contract:
+        identity: service-tenant-boundary
+        ownership-failure: 404
+        object-binding: request-id-and-side
+        archive-locator-exposed: false
+      parameters:
+        - $ref: '#/components/parameters/RequestIdPath'
+        - $ref: '#/components/parameters/RequestArchiveSidePath'
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/OptionalByteRange'
+        - $ref: '#/components/parameters/OptionalIfMatch'
+      responses:
+        '200': { $ref: '#/components/responses/RequestArchiveContentFull' }
+        '206': { $ref: '#/components/responses/RequestArchiveContentPartial' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/RequestArchiveContentUnavailable' }
+        '412': { $ref: '#/components/responses/RequestArchiveContentPreconditionFailed' }
+        '416': { $ref: '#/components/responses/RequestArchiveContentRangeNotSatisfiable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
   /internal/v1/requests/query:
     post:
       tags: [Operator traffic]
@@ -4998,6 +5035,41 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /self/v1/requests/{request_id}/archive/{side}:
+    get:
+      tags: [Self service]
+      operationId: streamOwnRequestArchiveContent
+      summary: Stream one owned request or response archive body with optional byte range
+      description: |
+        The authenticated stable key identity must own the request. The internal archive
+        locator is resolved only from that owned record and is never accepted or returned.
+        Without `Range`, the complete body is streamed without collecting it in API memory.
+        Exactly one byte range is supported. Clients paging a body should retain the first
+        response ETag and send it in `If-Match` on subsequent ranges; a changed archive
+        binding returns 412. Policy-retained metadata is never returned as original body
+        content and instead produces a structured 409 reason.
+      security: [{ clientBearer: [] }]
+      x-authorization-contract:
+        identity: stable-key-id
+        ownership-failure: 404
+        object-binding: request-id-and-side
+        archive-locator-exposed: false
+      parameters:
+        - $ref: '#/components/parameters/RequestIdPath'
+        - $ref: '#/components/parameters/RequestArchiveSidePath'
+        - $ref: '#/components/parameters/OptionalByteRange'
+        - $ref: '#/components/parameters/OptionalIfMatch'
+      responses:
+        '200': { $ref: '#/components/responses/RequestArchiveContentFull' }
+        '206': { $ref: '#/components/responses/RequestArchiveContentPartial' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/RequestArchiveContentUnavailable' }
+        '412': { $ref: '#/components/responses/RequestArchiveContentPreconditionFailed' }
+        '416': { $ref: '#/components/responses/RequestArchiveContentRangeNotSatisfiable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
   /self/v1/requests/{request_id}/assets/{asset_id}:
     get:
       tags: [Self service]
@@ -5664,6 +5736,14 @@ components:
       in: path
       required: true
       schema: { type: string, format: uuid }
+    RequestArchiveSidePath:
+      name: side
+      in: path
+      required: true
+      description: Select the original archived downstream request or upstream response bytes.
+      schema:
+        type: string
+        enum: [request, response]
     JobIdPath:
       name: job_id
       in: path
@@ -5680,6 +5760,12 @@ components:
       required: false
       description: One byte range, for example `bytes=0-1048575`, `bytes=1048576-`, or `bytes=-1048576`.
       schema: { type: string, pattern: '^bytes=([0-9]+-[0-9]*|-[1-9][0-9]*)$' }
+    OptionalIfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: ETag from the first archive-content range; a mismatch returns 412 before any bytes are streamed.
+      schema: { type: string }
     RouteId:
       name: route_id
       in: path
@@ -6023,6 +6109,51 @@ components:
           schema: { type: string, format: binary }
         video/quicktime:
           schema: { type: string, format: binary }
+    RequestArchiveContentFull:
+      description: Complete original archive body, streamed incrementally with no total-size limit.
+      headers:
+        X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+        X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
+        Accept-Ranges: { schema: { const: bytes } }
+        Cache-Control: { schema: { const: 'private, no-store' } }
+        Content-Length: { schema: { type: integer, format: int64, minimum: 0 } }
+        ETag: { schema: { type: string } }
+      content:
+        application/octet-stream:
+          schema: { type: string, format: binary }
+    RequestArchiveContentPartial:
+      description: Requested inclusive byte range from the original archive body.
+      headers:
+        X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+        X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
+        Accept-Ranges: { schema: { const: bytes } }
+        Cache-Control: { schema: { const: 'private, no-store' } }
+        Content-Length: { schema: { type: integer, format: int64, minimum: 0 } }
+        Content-Range: { schema: { type: string, pattern: '^bytes [0-9]+-[0-9]+/[0-9]+$' } }
+        ETag: { schema: { type: string } }
+      content:
+        application/octet-stream:
+          schema: { type: string, format: binary }
+    RequestArchiveContentUnavailable:
+      description: The selected side is pending, unavailable, invalid, or retained only as policy metadata.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ArchiveContentUnavailableErrorResponse' }
+    RequestArchiveContentPreconditionFailed:
+      description: If-Match does not match the currently bound archive representation; no bytes are returned.
+      headers:
+        Accept-Ranges: { schema: { const: bytes } }
+        Cache-Control: { schema: { const: 'private, no-store' } }
+        Content-Length: { schema: { const: 0 } }
+        ETag: { schema: { type: string } }
+    RequestArchiveContentRangeNotSatisfiable:
+      description: The range was malformed, multiple, empty for a zero-size body, or outside the archived object.
+      headers:
+        Accept-Ranges: { schema: { const: bytes } }
+        Cache-Control: { schema: { const: 'private, no-store' } }
+        Content-Length: { schema: { const: 0 } }
+        Content-Range: { schema: { type: string, pattern: '^bytes \*/[0-9]+$' } }
+        ETag: { schema: { type: string } }
     GenerationAssetPartial:
       description: Requested inclusive byte range from the archived asset.
       headers:
@@ -6289,6 +6420,21 @@ components:
               type: string
               enum: [unauthorized, forbidden, unpriced_model, insufficient_quota, rate_limit_exceeded, not_found, conflict, invalid_request, websocket_upgrade_required, upstream_error, internal_error]
             message: { type: string }
+    ArchiveContentUnavailableErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, reason]
+          properties:
+            code: { type: string, const: archive_content_unavailable }
+            message: { type: string }
+            reason:
+              type: string
+              enum: [archive_pending, archive_object_unavailable, archive_payload_invalid, media_body_not_archived_by_policy]
     UsageLimitErrorResponse:
       type: object
       additionalProperties: false

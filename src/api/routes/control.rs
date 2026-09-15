@@ -172,6 +172,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             get(internal_request_detail),
         )
         .route(
+            "/internal/v1/requests/{request_id}/archive/{side}",
+            get(internal_request_archive_content),
+        )
+        .route(
             "/internal/v1/requests/{request_id}/assets/{asset_id}",
             get(internal_request_asset),
         )

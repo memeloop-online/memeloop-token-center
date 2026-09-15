@@ -1,6 +1,12 @@
-use serde_json::Value;
+use axum::{
+    body::{Body, Bytes},
+    http::{HeaderMap, StatusCode, header},
+    response::Response,
+};
+use serde::Deserialize;
+use serde_json::{Value, json};
 
-use crate::AppState;
+use crate::{AppState, error::AppError};
 
 pub(super) const MAX_ARCHIVE_DETAIL_BODY: usize = 1024 * 1024;
 const MAX_ARCHIVE_DETAIL_JSON_DEPTH: usize = 64;
@@ -8,6 +14,18 @@ const MAX_ARCHIVE_DETAIL_JSON_NODES: usize = 16 * 1024;
 const MAX_ARCHIVE_DETAIL_JSON_STRING_BYTES: usize = 256 * 1024;
 const MAX_ARCHIVE_DETAIL_JSON_ARRAY_ITEMS: usize = 8 * 1024;
 const MAX_ARCHIVE_DETAIL_JSON_OBJECT_FIELDS: usize = 4 * 1024;
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::api) enum RequestArchiveSide {
+    Request,
+    Response,
+}
+
+enum ArchiveContentSource<'a> {
+    Inline(Bytes),
+    Object(&'a str),
+}
 
 pub(super) async fn request_detail(
     state: &AppState,
@@ -64,6 +82,285 @@ pub(super) async fn request_detail(
         },
         provenance: refs.provenance,
     }
+}
+
+/// Stream the exact archived bytes independently from the bounded request-detail
+/// JSON projection. Object-backed bodies stay incremental even when the client
+/// requests the entire representation; callers can use a single byte range for
+/// paged viewing without imposing a total archive-size limit.
+pub(in crate::api) async fn request_archive_content_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    refs: &crate::model::RequestArchiveRefs,
+    side: RequestArchiveSide,
+) -> Result<Response, AppError> {
+    let source = match archive_content_source(refs, side) {
+        Ok(source) => source,
+        Err(reason) => return archive_content_unavailable(reason),
+    };
+    match source {
+        ArchiveContentSource::Inline(bytes) => inline_archive_content_response(headers, bytes),
+        ArchiveContentSource::Object(location) => {
+            object_archive_content_response(state, headers, location).await
+        }
+    }
+}
+
+fn archive_content_source(
+    refs: &crate::model::RequestArchiveRefs,
+    side: RequestArchiveSide,
+) -> Result<ArchiveContentSource<'_>, &'static str> {
+    let (state, reason, location) = match side {
+        RequestArchiveSide::Request => (
+            refs.request_archive_state,
+            refs.request_archive_reason.as_deref(),
+            Some(refs.request_object.as_str()),
+        ),
+        RequestArchiveSide::Response => (
+            refs.response_archive_state,
+            refs.response_archive_reason.as_deref(),
+            refs.response_object.as_deref(),
+        ),
+    };
+    if archive_is_pending(state) {
+        return Err("archive_pending");
+    }
+    if let Some(location) = location {
+        if let Some(value) = location.strip_prefix("inline-json:") {
+            return Ok(ArchiveContentSource::Inline(Bytes::copy_from_slice(
+                value.as_bytes(),
+            )));
+        }
+        if location.starts_with("metadata-only-json:") {
+            return Err("media_body_not_archived_by_policy");
+        }
+        if location.starts_with("gap://") {
+            return Err("archive_object_unavailable");
+        }
+        return Ok(ArchiveContentSource::Object(location));
+    }
+    if side == RequestArchiveSide::Response {
+        if let Some(value) = refs.response_json.as_ref() {
+            let bytes = serde_json::to_vec(value).map_err(|_| "archive_payload_invalid")?;
+            return Ok(ArchiveContentSource::Inline(Bytes::from(bytes)));
+        }
+        if state == crate::model::RequestArchiveState::Bound {
+            return Ok(ArchiveContentSource::Inline(Bytes::from_static(b"null")));
+        }
+    }
+    Err(reason
+        .and_then(public_archive_unavailable_reason)
+        .unwrap_or("archive_object_unavailable"))
+}
+
+fn public_archive_unavailable_reason(reason: &str) -> Option<&'static str> {
+    match reason {
+        "archive_pending" => Some("archive_pending"),
+        "archive_object_unavailable" => Some("archive_object_unavailable"),
+        "archive_payload_invalid" => Some("archive_payload_invalid"),
+        "media_body_not_archived_by_policy" => Some("media_body_not_archived_by_policy"),
+        _ => None,
+    }
+}
+
+fn inline_archive_content_response(
+    headers: &HeaderMap,
+    bytes: Bytes,
+) -> Result<Response, AppError> {
+    let size = u64::try_from(bytes.len()).map_err(|_| AppError::Internal)?;
+    let etag = format!("\"{}\"", blake3::hash(&bytes).to_hex());
+    if !if_match_satisfied(headers, &etag) {
+        return precondition_failed(&etag);
+    }
+    let requested_range = match requested_byte_range(headers, size) {
+        Ok(range) => range,
+        Err(()) => return range_not_satisfiable(size, Some(&etag)),
+    };
+    let range = requested_range.clone().unwrap_or(0..size);
+    let start = usize::try_from(range.start).map_err(|_| AppError::Internal)?;
+    let end = usize::try_from(range.end).map_err(|_| AppError::Internal)?;
+    archive_content_success(
+        requested_range.is_some(),
+        size,
+        range,
+        &etag,
+        Body::from(bytes.slice(start..end)),
+    )
+}
+
+async fn object_archive_content_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    location: &str,
+) -> Result<Response, AppError> {
+    let size = match state.archive.head_size(location).await {
+        Ok(size) => size,
+        Err(_) => {
+            tracing::warn!(
+                error_code = "archive_object_unavailable",
+                "archived request content is unavailable"
+            );
+            return archive_content_unavailable("archive_object_unavailable");
+        }
+    };
+    let etag = archive_object_etag(location, size);
+    if !if_match_satisfied(headers, &etag) {
+        return precondition_failed(&etag);
+    }
+    let requested_range = match requested_byte_range(headers, size) {
+        Ok(range) => range,
+        Err(()) => return range_not_satisfiable(size, Some(&etag)),
+    };
+    let download = match state
+        .archive
+        .open_stream(location, requested_range.clone())
+        .await
+    {
+        Ok(download) => download,
+        Err(_) => {
+            tracing::warn!(
+                error_code = "archive_object_unavailable",
+                "archived request content could not be opened"
+            );
+            return archive_content_unavailable("archive_object_unavailable");
+        }
+    };
+    if download.object_size != size {
+        return Err(AppError::Storage(
+            "request archive changed during download".to_owned(),
+        ));
+    }
+    let expected_range = requested_range.clone().unwrap_or(0..size);
+    if download.range != expected_range {
+        return Err(AppError::Storage(
+            "request archive returned an unexpected range".to_owned(),
+        ));
+    }
+    archive_content_success(
+        requested_range.is_some(),
+        size,
+        download.range,
+        &etag,
+        Body::from_stream(download.stream),
+    )
+}
+
+fn archive_object_etag(location: &str, size: u64) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"mtc-request-archive-content-etag-v1\0");
+    hasher.update(location.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(&size.to_be_bytes());
+    format!("\"{}\"", hasher.finalize().to_hex())
+}
+
+fn requested_byte_range(
+    headers: &HeaderMap,
+    size: u64,
+) -> Result<Option<std::ops::Range<u64>>, ()> {
+    let mut values = headers.get_all(header::RANGE).iter();
+    let first = values.next();
+    if values.next().is_some() {
+        return Err(());
+    }
+    let value = first
+        .map(axum::http::HeaderValue::to_str)
+        .transpose()
+        .map_err(|_| ())?;
+    crate::api::generation::parse_byte_range(value, size)
+}
+
+fn if_match_satisfied(headers: &HeaderMap, etag: &str) -> bool {
+    let values = headers.get_all(header::IF_MATCH);
+    if values.iter().next().is_none() {
+        return true;
+    }
+    values.iter().any(|value| {
+        value.to_str().ok().is_some_and(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|candidate| candidate == "*" || candidate == etag)
+        })
+    })
+}
+
+fn archive_content_success(
+    partial: bool,
+    size: u64,
+    range: std::ops::Range<u64>,
+    etag: &str,
+    body: Body,
+) -> Result<Response, AppError> {
+    let mut response = Response::builder()
+        .status(if partial {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        })
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(
+            header::CONTENT_LENGTH,
+            range.end.saturating_sub(range.start),
+        )
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CACHE_CONTROL, "private, no-store")
+        .header(header::ETAG, etag)
+        .header("x-content-type-options", "nosniff");
+    if partial {
+        response = response.header(
+            header::CONTENT_RANGE,
+            format!(
+                "bytes {}-{}/{}",
+                range.start,
+                range.end.saturating_sub(1),
+                size
+            ),
+        );
+    }
+    response.body(body).map_err(|_| AppError::Internal)
+}
+
+fn archive_content_unavailable(reason: &str) -> Result<Response, AppError> {
+    let body = serde_json::to_vec(&json!({
+        "error": {
+            "code": "archive_content_unavailable",
+            "message": "archived request content is unavailable",
+            "reason": reason,
+        }
+    }))
+    .map_err(|_| AppError::Internal)?;
+    Response::builder()
+        .status(StatusCode::CONFLICT)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_LENGTH, body.len())
+        .header(header::CACHE_CONTROL, "private, no-store")
+        .body(Body::from(body))
+        .map_err(|_| AppError::Internal)
+}
+
+fn precondition_failed(etag: &str) -> Result<Response, AppError> {
+    Response::builder()
+        .status(StatusCode::PRECONDITION_FAILED)
+        .header(header::CONTENT_LENGTH, 0)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CACHE_CONTROL, "private, no-store")
+        .header(header::ETAG, etag)
+        .body(Body::empty())
+        .map_err(|_| AppError::Internal)
+}
+
+fn range_not_satisfiable(size: u64, etag: Option<&str>) -> Result<Response, AppError> {
+    let mut response = Response::builder()
+        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+        .header(header::CONTENT_RANGE, format!("bytes */{size}"))
+        .header(header::CONTENT_LENGTH, 0)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CACHE_CONTROL, "private, no-store");
+    if let Some(etag) = etag {
+        response = response.header(header::ETAG, etag);
+    }
+    response.body(Body::empty()).map_err(|_| AppError::Internal)
 }
 
 struct ArchiveValue {

@@ -98,3 +98,125 @@ async fn request_detail_failure_keeps_durable_archive_state_separate() {
         "archive_payload_invalid"
     );
 }
+
+#[tokio::test]
+async fn request_archive_content_streams_ranges_with_stable_etag() {
+    let (state, _directory) = test_state().await;
+    let archived = Bytes::from_static(b"0123456789abcdefghijklmnopqrstuvwxyz");
+    let location = state
+        .archive
+        .put_content(archived.clone())
+        .await
+        .expect("archive request body");
+    let mut refs = request_detail_refs(Uuid::now_v7());
+    refs.request_object = location;
+
+    let mut first_headers = HeaderMap::new();
+    first_headers.insert(header::RANGE, HeaderValue::from_static("bytes=10-19"));
+    let first = request_archive_content_response(
+        &state,
+        &first_headers,
+        &refs,
+        RequestArchiveSide::Request,
+    )
+    .await
+    .expect("first archive range");
+    assert_eq!(first.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(first.headers()[header::CONTENT_RANGE], "bytes 10-19/36");
+    assert_eq!(first.headers()[header::CONTENT_LENGTH], "10");
+    assert_eq!(first.headers()[header::ACCEPT_RANGES], "bytes");
+    let etag = first.headers()[header::ETAG].clone();
+    let first_body = axum::body::to_bytes(first.into_body(), 10)
+        .await
+        .expect("first archive bytes");
+    assert_eq!(&first_body[..], b"abcdefghij");
+
+    let mut next_headers = HeaderMap::new();
+    next_headers.insert(header::RANGE, HeaderValue::from_static("bytes=20-29"));
+    next_headers.insert(header::IF_MATCH, etag.clone());
+    let next =
+        request_archive_content_response(&state, &next_headers, &refs, RequestArchiveSide::Request)
+            .await
+            .expect("next archive range");
+    assert_eq!(next.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(next.headers()[header::ETAG], etag);
+    let next_body = axum::body::to_bytes(next.into_body(), 10)
+        .await
+        .expect("next archive bytes");
+    assert_eq!(&next_body[..], b"klmnopqrst");
+}
+
+#[tokio::test]
+async fn request_archive_content_streams_beyond_detail_snapshot_limit() {
+    let (state, _directory) = test_state().await;
+    let archived = Bytes::from(vec![b'x'; MAX_ARCHIVE_DETAIL_BODY + 17]);
+    let expected_len = archived.len();
+    let location = state
+        .archive
+        .put_content(archived)
+        .await
+        .expect("archive large request body");
+    let mut refs = request_detail_refs(Uuid::now_v7());
+    refs.request_object = location;
+
+    let response = request_archive_content_response(
+        &state,
+        &HeaderMap::new(),
+        &refs,
+        RequestArchiveSide::Request,
+    )
+    .await
+    .expect("large archive response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_LENGTH]
+            .to_str()
+            .expect("ASCII content length"),
+        expected_len.to_string()
+    );
+    let body = axum::body::to_bytes(response.into_body(), expected_len)
+        .await
+        .expect("complete large archive bytes");
+    assert_eq!(body.len(), expected_len);
+}
+
+#[tokio::test]
+async fn request_archive_content_rejects_stale_etag_before_streaming() {
+    let (state, _directory) = test_state().await;
+    let refs = request_detail_refs(Uuid::now_v7());
+    let mut headers = HeaderMap::new();
+    headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-3"));
+    headers.insert(header::IF_MATCH, HeaderValue::from_static("\"stale\""));
+    let response =
+        request_archive_content_response(&state, &headers, &refs, RequestArchiveSide::Request)
+            .await
+            .expect("stale range response");
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(response.headers()[header::CONTENT_LENGTH], "0");
+    assert!(response.headers().contains_key(header::ETAG));
+}
+
+#[tokio::test]
+async fn request_archive_content_does_not_expose_policy_metadata_as_body() {
+    let (state, _directory) = test_state().await;
+    let mut refs = request_detail_refs(Uuid::now_v7());
+    refs.request_object = "metadata-only-json:{\"bytes\":123}".to_owned();
+    let response = request_archive_content_response(
+        &state,
+        &HeaderMap::new(),
+        &refs,
+        RequestArchiveSide::Request,
+    )
+    .await
+    .expect("metadata-only archive response");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .expect("metadata-only error body");
+    let error: Value = serde_json::from_slice(&body).expect("structured archive error");
+    assert_eq!(error["error"]["code"], "archive_content_unavailable");
+    assert_eq!(
+        error["error"]["reason"],
+        "media_body_not_archived_by_policy"
+    );
+}
