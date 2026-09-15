@@ -62,6 +62,16 @@ request-id middleware UUID, a fixed route class/reason, declared content
 length and configured limit to structured logs—never credentials, request
 content, model names or raw paths.
 
+`/v1/audio/transcriptions` has its own multipart ceiling:
+`MTC_AUDIO_BODY_MAX_BYTES` (Helm `config.audioBodyMaxBytes`) defaults to 25 MiB.
+It is the runtime multipart limit for audio transcription uploads; setting it
+to zero disables non-empty uploads. It applies only to this endpoint;
+changing it does not widen `/v1/responses` or the default JSON routes. Phase
+one accepts uncompressed PCM16 WAV so the gateway can verify duration before
+dispatch and reserve the configured per-second price. Audio and transcript
+bodies are deliberately not archived; only bounded format, duration, size,
+route, accounting and terminal-status metadata are retained.
+
 `MTC_PROXY_MEMORY_BUDGET_BYTES` (Helm `config.proxyMemoryBudgetBytes`) adds
 process-wide weighted lifecycle admission, defaulting to 256 MiB in 64 KiB
 units. The complete route maximum times three is reserved before the first

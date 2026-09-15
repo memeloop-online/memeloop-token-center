@@ -48,7 +48,12 @@ pub(super) async fn request_detail(
                     reason: None,
                 },
                 Some(_) => ArchiveValue::gap("archive_payload_invalid"),
-                None if refs.response_archive_state == crate::model::RequestArchiveState::Bound => {
+                None if matches!(
+                    refs.response_archive_state,
+                    crate::model::RequestArchiveState::Bound
+                        | crate::model::RequestArchiveState::MetadataOnly
+                ) =>
+                {
                     ArchiveValue {
                         value: Value::Null,
                         complete: true,
@@ -397,6 +402,12 @@ impl ArchiveValue {
 }
 
 async fn archive_value(state: &AppState, location: &str) -> ArchiveValue {
+    if let Some(value) = location.strip_prefix("metadata-only-json:") {
+        let mut metadata = decode_archive_value(value.as_bytes());
+        metadata.complete = true;
+        metadata.reason = Some("media_body_not_archived_by_policy".to_owned());
+        return metadata;
+    }
     if let Some(value) = location.strip_prefix("inline-json:") {
         return decode_archive_value(value.as_bytes());
     }

@@ -10,6 +10,7 @@ pub(super) const MAX_DEFAULT_REQUEST_BODY: usize = 4 * 1024 * 1024;
 pub(super) const MAX_RESPONSES_REQUEST_BODY: usize =
     crate::config::MAX_RESPONSES_BODY_MAX_BYTES as usize;
 pub(super) const MAX_IMAGE_REQUEST_BODY: usize = 16 * 1024 * 1024;
+pub(super) const MAX_AUDIO_RESPONSE_BODY: usize = 4 * 1024 * 1024;
 pub(super) const MAX_RESPONSES_SSE_EVENT_BYTES: usize = 256 * 1024;
 // Bound decoder products independently of the 64 MiB response budget. This
 // prevents tiny legal events or fields from multiplying frame metadata,
@@ -28,6 +29,7 @@ pub(super) const MAX_SSE_METADATA_ITEMS_PER_NETWORK_CHUNK: usize = 16 * 1024;
 pub(super) const MAX_RESPONSES_SSE_TERMINAL_HOLD_BYTES: usize =
     MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK;
 pub(super) const SYNCHRONOUS_IMAGE_DEADLINE: Duration = Duration::from_secs(12 * 60);
+pub(super) const SYNCHRONOUS_AUDIO_DEADLINE: Duration = Duration::from_secs(10 * 60);
 pub(super) const CLOUD_WEBHOOK_BODY_READ_DEADLINE: Duration = Duration::from_secs(10);
 pub(super) const MAX_CLOUD_WEBHOOK_BODY: usize = 64 * 1024;
 pub(super) const CONTROL_IN_FLIGHT_REQUESTS: usize = 16;

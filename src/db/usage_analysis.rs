@@ -682,11 +682,12 @@ fn validate_usage_analysis_filter(
     if filter.protocol.as_deref().is_some_and(|value| {
         !matches!(
             value,
-            "openai" | "anthropic" | "openai-image" | "generation"
+            "openai" | "anthropic" | "openai-image" | "audio-transcription" | "generation"
         )
     }) {
         return Err(AppError::BadRequest(
-            "protocol must be openai, anthropic, openai-image, or generation".into(),
+            "protocol must be openai, anthropic, openai-image, audio-transcription, or generation"
+                .into(),
         ));
     }
     for (name, value) in [

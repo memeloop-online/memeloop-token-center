@@ -148,7 +148,10 @@ pub(super) async fn authenticate_gateway_before_body(
     if let Some(phase) = authentication {
         phase.finish("completed", None, None);
     }
-    let image_lifecycle_permit = if request.uri().path() == "/v1/images/generations" {
+    let media_lifecycle_permit = if matches!(
+        request.uri().path(),
+        "/v1/images/generations" | "/v1/audio/transcriptions"
+    ) {
         Some(
             state
                 .image_response_permits
@@ -171,6 +174,7 @@ pub(super) async fn authenticate_gateway_before_body(
             state.gateway_body_read_permits.clone(),
             state.responses_body_read_permits.clone(),
             state.config.responses_body_max_bytes as usize,
+            state.config.audio_body_max_bytes as usize,
             Some(&state.proxy_memory_budget),
         )
         .await
@@ -197,7 +201,7 @@ pub(super) async fn authenticate_gateway_before_body(
         Some(permit) => hold_response_body_permit(response, permit),
         None => response,
     };
-    Ok(match image_lifecycle_permit {
+    Ok(match media_lifecycle_permit {
         Some(permit) => hold_response_body_permit(response, permit),
         None => response,
     })

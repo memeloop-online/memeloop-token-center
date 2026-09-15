@@ -127,6 +127,9 @@ config:
   # It is separately capped at four concurrent reads (64 MiB maximum buffered
   # by default) so it cannot turn the 1024 general permits into 16 GiB.
   responsesBodyMaxBytes: 16777216
+  # Independent multipart ceiling for `/v1/audio/transcriptions`; changing it
+  # does not widen `/v1/responses` or other text endpoints.
+  audioBodyMaxBytes: 26214400
   responsesBodyReadConcurrency: 4
   # Shared account-pool circuit breaker. A half-open lease permits exactly one
   # recovery request per account; every duration is in milliseconds.
