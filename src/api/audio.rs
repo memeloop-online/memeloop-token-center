@@ -801,7 +801,7 @@ mod tests {
     use tower::ServiceExt;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{body_string_contains, method, path},
+        matchers::{method, path},
     };
 
     fn wav(sample_rate: u32, channels: u16, frames: u32) -> Vec<u8> {
@@ -884,7 +884,6 @@ mod tests {
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/audio/transcriptions"))
-            .and(body_string_contains("asr-upstream"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "text":"sensitive transcript",
                 "duration":999,
@@ -984,6 +983,13 @@ mod tests {
             json!({
                 "start":0.0,"end":1.4,"text":"sensitive transcript"
             })
+        );
+        let requests = upstream.received_requests().await.unwrap();
+        assert!(
+            requests[0]
+                .body
+                .windows(b"asr-upstream".len())
+                .any(|window| window == b"asr-upstream")
         );
 
         let refs = state
