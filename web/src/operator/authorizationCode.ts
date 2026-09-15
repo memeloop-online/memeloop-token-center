@@ -1,4 +1,14 @@
 import { ApiError } from '../api.js';
+import type { ProviderType, UpstreamAccount } from '../types.js';
+
+export function canReauthorizeAccount(account: Pick<UpstreamAccount, 'driver' | 'can_reauthorize'>, provider?: Pick<ProviderType, 'id' | 'oauth_adapter'>): boolean {
+  if (!account.can_reauthorize || !provider || provider.id !== account.driver) return false;
+  return provider.oauth_adapter?.flow_kind !== 'authorization_code_pkce' || provider.id === 'google-antigravity';
+}
+
+export function isAuthorizationIdentityMismatch(reason: unknown): boolean {
+  return reason instanceof ApiError && reason.status === 409 && reason.code === 'oauth_identity_mismatch';
+}
 
 export interface AuthorizationCodeSession {
   driver: string;

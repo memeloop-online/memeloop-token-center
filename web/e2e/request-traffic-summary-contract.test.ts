@@ -44,3 +44,19 @@ test('visible traffic summary has no fabricated rate or latency without terminal
   assert.equal(unknown.successful, 0);
   assert.equal(unknown.successRate, null);
 });
+
+test('finished-request rate includes disconnected and interrupted outcomes but not delivery or unknown history', () => {
+  const summary = summarizeVisibleRequests([
+    request(200, 100),
+    { ...request(499, 100), error_code: 'client_cancelled' },
+    { ...request(200, 100), error_code: 'upstream_incomplete_response' },
+    { ...request(null, null), error_code: 'delivery_started' },
+    { ...request(200, 100), completed_at: undefined },
+  ]);
+  assert.equal(summary.requests, 5);
+  assert.equal(summary.successful, 1);
+  assert.equal(summary.failed, 2);
+  assert.equal(summary.running, 1);
+  assert.equal(summary.unknown, 1);
+  assert.equal(summary.successRate, 1 / 3);
+});

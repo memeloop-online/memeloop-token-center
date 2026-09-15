@@ -4,7 +4,7 @@ import { I18nProvider } from '../../src/i18n';
 import { MtcFluentProvider } from '../../src/design-system';
 import { AuthorizationCodeConnection } from '../../src/operator/AuthorizationCodeConnection';
 import { ProvidersPage } from '../../src/operator/pages/ManagementPages';
-import type { ProviderType } from '../../src/types';
+import type { ProviderType, UpstreamAccount } from '../../src/types';
 import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/operator/operator.css';
@@ -15,10 +15,19 @@ const provider: ProviderType = {
   oauth_adapter: { api_version: 'oauth-adapter-v1', flow_kind: 'authorization_code_pkce', login_url: 'https://login.example.invalid', poll_url: '', refresh_url: 'https://token.example.invalid' },
 };
 function Fixture() {
+  const mode = new URLSearchParams(location.search).get('reauthorize');
+  const account: UpstreamAccount | undefined = mode ? {
+    id: 'original-account', tenant_id: 'tenant-id', tenant_external_id: 'fixture-a', name: 'Original account',
+    driver: mode === 'other' ? 'fixture-plugin' : 'google-antigravity', auth_kind: 'oauth', connection_method: 'oauth',
+    credential_generation: 4, status: 'active', credential_expires_at: null, can_refresh: true, can_rotate: false,
+    can_reauthorize: mode !== 'legacy', route_count: 2, config: { project_id: 'original-project' }, created_at: 1, updated_at: 2,
+    has_proxy: true, proxy_scheme: 'socks5h',
+  } : undefined;
+  const selectedProvider = account ? { ...provider, id: account.driver, display_name: 'Antigravity' } : provider;
   const [tenant, setTenant] = useState('fixture-a');
   const [, setLocked] = useState(false);
   const [reads, setReads] = useState(0);
-  return <main style={{ maxWidth: 720, margin: 'auto', padding: 16 }}><button onClick={() => setTenant('fixture-b')}>Switch scope</button><output data-testid="account-reads">{reads}</output><AuthorizationCodeConnection key={tenant} token="fixture-token" tenant={tenant} provider={provider} onLock={setLocked} onChanged={async () => {
+  return <main style={{ maxWidth: 720, margin: 'auto', padding: 16 }}><button onClick={() => setTenant('fixture-b')}>Switch scope</button><output data-testid="account-reads">{reads}</output><AuthorizationCodeConnection key={tenant} token="fixture-token" tenant={tenant} provider={selectedProvider} existing={account} onLock={setLocked} onChanged={async () => {
     const response = await fetch('/internal/v1/upstreams');
     setReads(value => value + 1);
     if (!response.ok) throw new Error('fixture list read failed');

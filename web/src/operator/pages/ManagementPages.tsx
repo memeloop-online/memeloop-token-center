@@ -38,6 +38,7 @@ import { connectionSchema, isPrivateProxyUrl, ProxyInput, UpstreamConnection } f
 import { upstreamFormTemplates } from '../UpstreamFormTemplates';
 import { providerEditSchema } from '../providerEditSchema';
 import { AuthorizationCodeConnection } from '../AuthorizationCodeConnection';
+import { canReauthorizeAccount } from '../authorizationCode';
 import { providerConnectionCopy } from '../providerConnectionCopy';
 import { providerFormWidgets } from '../ProviderFormWidgets';
 import { appHref } from '../../app/routes';
@@ -268,7 +269,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
       <span>{editProvider?.display_name ?? t('providerDirectory.other')} · {editing.auth_kind === 'oauth' ? t('providers.oauth') : enumLabel(t, 'auth', editing.connection_method)}</span>
       {editing.credential_expires_at && <p>{t('providers.expires')}: {new Date(editing.credential_expires_at).toLocaleString(locale)}</p>}
       <div className="row-actions">
-        {editing.can_reauthorize && <Button appearance="secondary" type="button" disabled={Boolean(busy) || proxyEditorOpen} onClick={() => void leaveProviderSettings(() => { setReauthorizing(editing); setEditing(undefined); })}>{t('providers.reauthorize')}</Button>}
+        {canReauthorizeAccount(editing, providers.find(provider => provider.id === editing.driver)) && <Button appearance="secondary" type="button" disabled={Boolean(busy) || proxyEditorOpen} onClick={() => void leaveProviderSettings(() => { setReauthorizing(editing); setEditing(undefined); })}>{t('providers.reauthorize')}</Button>}
         {editing.can_rotate && <Button appearance="secondary" type="button" disabled={Boolean(busy) || proxyEditorOpen} onClick={() => void leaveProviderSettings(() => { setRotating(editing); setEditing(undefined); })}>{t('providers.rotateCredential')}</Button>}
       </div>
     </FormSection>,
@@ -335,7 +336,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
               {providerAvailable && <>
                 <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => void checkHealth(value)}>{t('providers.runManualHealthCheck')}</Button>
                 {value.can_refresh && <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => void refreshOAuth(value)}>{t('providers.refreshAuthorization')}</Button>}
-                {value.can_reauthorize && <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => { setProviderDetail(undefined); setReauthorizing(value); }}>{t('providers.reauthorize')}</Button>}
+                {canReauthorizeAccount(value, providers.find(provider => provider.id === value.driver)) && <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => { setProviderDetail(undefined); setReauthorizing(value); }}>{t('providers.reauthorize')}</Button>}
                 {value.can_rotate && <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => { setProviderDetail(undefined); setRotating(value); }}>{t('providers.rotateCredential')}</Button>}
               </>}
             </div></Disclosure>

@@ -1,12 +1,16 @@
-export function authorizationCodeCopy(locale: string, providerId?: string) {
-  return locale.startsWith('zh') ? {
+export function authorizationCodeCopy(locale: string, providerId?: string, reauthorizing = false) {
+  const copy = locale.startsWith('zh') ? {
     help: `使用管理员配置的登录方式。${providerId === 'google-antigravity' ? '无需自行创建 Google OAuth 项目。' : ''}草稿仅保留在当前页面，离开后会清除。`,
     admin: '管理员尚未正确配置此提供商的默认 OAuth 客户端。请在部署 Secret MTC_PROVIDER_OAUTH_CLIENT_DEFAULTS_JSON 中配置后重试。',
     forbidden: '此登录流程目前仅允许全局管理员操作。请联系管理员。',
     failed: '登录请求未完成。草稿已保留；请检查配置后手动重试。',
     uncertain: '尚未确认账号是否创建成功。不会自动重新兑换授权码；请先检查上游账号列表，再决定是否重新登录。',
     pending: '服务器仍在处理登录。不会自动重发；请稍后检查账号列表。',
-    reauthorize: '此流程暂不支持原账号重新授权；请勿用新建登录代替，以免创建重复账号。',
+    reauthorize: '此账号不具备原位重新授权条件；请勿用新建登录代替，以免创建重复账号。',
+    reauthorizeHelp: '请登录此账号原来的 Google 身份。仅更新授权凭据，保留账号、代理、连接配置和路由授权；使用原 OAuth 客户端，不创建新账号。',
+    retainedNetwork: '保留此账号已有的代理或直连配置',
+    reauthorized: '原账号已重新授权；账号和路由授权保持不变。',
+    identityMismatch: '登录身份与原账号不一致，本次登录已终止，原账号未更改。请清除登录草稿后，使用原 Google 身份重新开始；不要再次提交此授权码。',
     network: '登录网络', direct: '直接连接', proxy: '使用代理', proxyScope: '代理网络范围', public: '公网', private: '私网',
     callback: '完整回调地址', callbackHelp: '在新标签页完成登录后，复制地址栏中的完整回调 URL（包含 code 和 state）。即使本机回调页无法打开，也请复制地址栏。不要粘贴到聊天或工单。',
     invalid: '请输入包含 code 和 state 的完整 HTTP 或 HTTPS 回调地址。',
@@ -27,7 +31,11 @@ export function authorizationCodeCopy(locale: string, providerId?: string) {
     failed: 'Login could not start. Your draft is preserved; check the configuration before retrying manually.',
     uncertain: 'Account creation is not confirmed. The authorization code will not be exchanged again automatically. Check the upstream account list before starting another login.',
     pending: 'The server is still processing login. No request will be resent automatically; check the account list shortly.',
-    reauthorize: 'This flow does not yet support reauthorizing an existing account. Starting a new login could create a duplicate account.',
+    reauthorize: 'This account is not eligible for in-place reauthorization. Starting a new login could create a duplicate account.',
+    reauthorizeHelp: 'Sign in with this account’s original Google identity. Only the authorization credential is updated; the account, proxy, connection settings and route grants are preserved. The original OAuth client is reused; no new account is created.',
+    retainedNetwork: 'Preserve this account’s existing proxy or direct connection',
+    reauthorized: 'Existing account reauthorized; the account and route grants are unchanged.',
+    identityMismatch: 'The signed-in identity does not match the original account. This session has ended and the account is unchanged. Clear the login draft and start again with the original Google identity; do not resubmit this authorization code.',
     network: 'Login network', direct: 'Direct connection', proxy: 'Use a proxy', proxyScope: 'Proxy network scope', public: 'Public', private: 'Private',
     callback: 'Complete callback URL', callbackHelp: 'After signing in in the new tab, copy the complete callback URL from its address bar, including code and state. Copy it even if the local callback page cannot open. Do not paste it into chats or support tickets.',
     invalid: 'Enter a complete HTTP or HTTPS callback URL containing code and state.',
@@ -42,4 +50,18 @@ export function authorizationCodeCopy(locale: string, providerId?: string) {
     check: 'Check account list', saved: 'Account created. View its status and proxy settings in the upstream list.',
     savedButReadFailed: 'The account is saved, but the account list could not refresh. Retry reading the list; do not sign in again or resubmit the authorization code.',
   };
+  if (!reauthorizing) return copy;
+  return { ...copy, ...(locale.startsWith('zh') ? {
+    uncertain: '尚未确认原账号是否重新授权成功。不会自动再次兑换授权码；请先检查原账号，再决定是否重新登录。',
+    recoveryHint: '如果登录已完成但重新授权尚未完成，可在此时间前继续；不会重新发送授权码。',
+    continueHelp: '已在提供商页面登录？可继续完成原账号重新授权，无需再次登录或粘贴授权码。',
+    continueSetup: '继续完成重新授权',
+    continueExpired: '此次重新授权已超时。请先检查原账号状态，再决定是否重新登录。',
+  } : {
+    uncertain: 'Reauthorization is not confirmed. The authorization code will not be exchanged again automatically. Check the existing account before starting another login.',
+    recoveryHint: 'If sign-in completed but reauthorization has not, continue before this time without resending the authorization code.',
+    continueHelp: 'Already signed in? Continue reauthorizing the existing account without signing in again or pasting the authorization code.',
+    continueSetup: 'Continue reauthorization',
+    continueExpired: 'This reauthorization session has timed out. Check the original account before signing in again.',
+  }) };
 }
