@@ -23,3 +23,10 @@
 @media (max-width: 600px) { .upstream-quota-skeleton { grid-template-columns: 1fr; } .upstream-quota-heading button { min-height: 44px; } }
 .quota-read-toolbar { flex-wrap: wrap; gap: 12px; margin-block: 12px; }
 .provider-directory-summary [data-reset-credit-expiry] { overflow-wrap: anywhere; font-size: 12px; }
+.quota-summary { display: grid; gap: 5px; min-width: 0; cursor: help; }
+.quota-summary-meter { width: 100%; }
+.quota-summary:focus-visible { outline: 2px solid var(--colorStrokeFocus2, #40a59a); outline-offset: 3px; border-radius: 3px; }
+.quota-summary-tooltip p { margin: 0 0 8px; }
+.quota-summary-tooltip ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.quota-summary-tooltip li { display: flex; flex-wrap: wrap; gap: 6px 12px; justify-content: space-between; }
+.quota-summary-tooltip li strong { white-space: nowrap; font-variant-numeric: tabular-nums; }

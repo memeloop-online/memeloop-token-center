@@ -75,8 +75,16 @@ export function upstreamQuotaPath(accountId: string, tenant: string) {
 
 export function quotaUsedPercent(window: UpstreamQuotaSnapshot['windows'][number]): number | null {
   if (window.used_percent !== null && Number.isFinite(window.used_percent)) return window.used_percent;
-  if (window.remaining !== null && window.limit !== null && window.limit > 0) return (1 - window.remaining / window.limit) * 100;
+  if (window.remaining !== null && Number.isFinite(window.remaining) && window.limit !== null && Number.isFinite(window.limit) && window.limit > 0) return (1 - window.remaining / window.limit) * 100;
   return null;
+}
+
+/** Preserve supplier order for ties; unknown windows must never become zero usage. */
+export function quotaHighestUsageWindow(windows: UpstreamQuotaSnapshot['windows']) {
+  return windows.reduce<UpstreamQuotaSnapshot['windows'][number] | undefined>((highest, window) => {
+    const used = quotaUsedPercent(window);
+    return used !== null && (!highest || used > quotaUsedPercent(highest)!) ? window : highest;
+  }, undefined);
 }
 
 /** Unitless normalized amounts are not evidence of absolute quota units. */

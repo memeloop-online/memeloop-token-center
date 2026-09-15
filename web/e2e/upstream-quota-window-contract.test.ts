@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { formatCountdown } from '../src/format.js';
-import { quotaObservationState, quotaRemaining, quotaResetCreditExpiry, quotaSummaryPresentation, quotaUnitMessage, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaPath, type UpstreamQuotaSnapshot } from '../src/operator/upstreamQuota.js';
+import { quotaHighestUsageWindow, quotaObservationState, quotaRemaining, quotaResetCreditExpiry, quotaSummaryPresentation, quotaUnitMessage, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaPath, type UpstreamQuotaSnapshot } from '../src/operator/upstreamQuota.js';
 
 test('quota URL requires and preserves explicit account and tenant identity', () => {
   const url = new URL(upstreamQuotaPath('account/one', 'tenant & one'), 'https://example.test');
@@ -40,6 +40,19 @@ test('quota countdown keeps minute, hour and day boundaries without sleeping or 
     assert.equal(formatCountdown(resetAt - now, 'en'), en);
   }
   for (const value of [null, undefined, Number.NaN, Infinity, -1]) assert.equal(formatCountdown(value, 'zh-CN'), '—');
+});
+
+test('compact quota selects a real named window, preserves ties and ignores unknown usage', () => {
+  const window: UpstreamQuotaSnapshot['windows'][number] = { id: 'code:primary_window', label: 'code:primary_window', used_percent: 51, used: null, unit: null, remaining: null, limit: null, reset_at: null, period_seconds: 18_000, source: 'codex_usage', reset_is_estimated: false, allowed: true, limit_reached: false };
+  const weekly = { ...window, id: 'code:secondary_window', used_percent: 20, period_seconds: 604_800 };
+  assert.equal(quotaHighestUsageWindow([weekly, window]), window);
+  assert.equal(quotaHighestUsageWindow([window, { ...weekly, used_percent: 51 }]), window);
+  assert.equal(quotaHighestUsageWindow([{ ...window, used_percent: null }]), undefined);
+  assert.equal(quotaHighestUsageWindow([]), undefined);
+  assert.equal(quotaUsedPercent({ ...window, used_percent: null, remaining: Infinity, limit: 100 }), null);
+  assert.equal(quotaUsedPercent({ ...window, used_percent: null, remaining: 1, limit: Infinity }), null);
+  const exceeded = { ...weekly, used_percent: 120.25 };
+  assert.equal(quotaHighestUsageWindow([window, exceeded]), exceeded, 'only meter rendering clamps, never source evidence');
 });
 
 test('Codex window cadence follows supplier duration before internal primary or secondary role', () => {

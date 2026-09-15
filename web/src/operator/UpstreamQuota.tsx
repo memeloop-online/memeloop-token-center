@@ -2,7 +2,9 @@ import { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import { formatCountdown, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
-import { quotaObservationState, quotaReadErrorMessage, quotaRemaining, quotaResetCreditExpiry, quotaSourceLabel, quotaUnitMessage, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaPath, type UpstreamQuotaSnapshot } from './upstreamQuota';
+import { quotaObservationState, quotaReadErrorMessage, quotaRemaining, quotaResetCreditExpiry, quotaSourceLabel, quotaUnitMessage, quotaUsedPercent, upstreamQuotaPath, type UpstreamQuotaSnapshot } from './upstreamQuota';
+import { useQuotaWindowLabel } from './QuotaSummary';
+import { useQuotaClock } from './useQuotaClock';
 import type { QuotaReadState } from './useUpstreamQuotaReads';
 import './upstreamQuota.css';
 import { UpstreamQuotaReset } from './UpstreamQuotaReset';
@@ -10,11 +12,8 @@ import { DetailTooltip } from '../design-system';
 
 export function UpstreamQuotaDetails({ snapshot, refreshError }: { snapshot: UpstreamQuotaSnapshot; refreshError?: 'quota.readFailed' | 'quota.errorPermission' }) {
   const { locale, t } = useI18n();
-  const [now, setNow] = useState(Date.now);
-  useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 30_000);
-    return () => window.clearInterval(timer);
-  }, []);
+  const windowLabel = useQuotaWindowLabel();
+  const now = useQuotaClock();
   const observation = quotaObservationState(snapshot, now, Boolean(refreshError));
   const hasObservation = observation !== 'unobserved';
   const readFailed = Boolean(refreshError) || snapshot.status === 'error' || Boolean(snapshot.error_code);
@@ -36,10 +35,7 @@ export function UpstreamQuotaDetails({ snapshot, refreshError }: { snapshot: Ups
       const used = quotaUsedPercent(window);
       const remaining = quotaRemaining(window);
       const unitMessage = remaining?.kind === 'amount' ? quotaUnitMessage(remaining.unit) : null;
-      const presentation = quotaWindowPresentation(snapshot.provider, window);
-      const baseScope = presentation.supplierLabel ?? t(presentation.scopeKey);
-      const scope = presentation.qualifier ? t('quota.scopeWithQualifier', { scope: baseScope, qualifier: presentation.qualifier }) : baseScope;
-      const name = t('quota.windowLabel', { scope, period: t(presentation.periodKey) });
+      const name = windowLabel(snapshot.provider, window);
       const source = t(quotaSourceLabel(window.source));
       return <section className="upstream-quota-window" key={window.id}>
         <div className="upstream-quota-window-heading"><div><b>{name}</b>{observation === 'historical' && <small>{t('quota.lastObservedValue')}</small>}</div><strong>{formatPercent(used === null ? null : used / 100, locale)}</strong></div>
@@ -59,12 +55,7 @@ export function UpstreamQuotaDetails({ snapshot, refreshError }: { snapshot: Ups
 
 export function QuotaResetCreditExpiry({ snapshot, now }: { snapshot: UpstreamQuotaSnapshot; now?: number }) {
   const { t, locale } = useI18n();
-  const [clock, setClock] = useState(Date.now);
-  useEffect(() => {
-    if (now !== undefined) return;
-    const timer = window.setInterval(() => setClock(Date.now()), 30_000);
-    return () => window.clearInterval(timer);
-  }, [now]);
+  const clock = useQuotaClock();
   const expiry = quotaResetCreditExpiry(snapshot, now ?? clock);
   return <span data-reset-credit-expiry={expiry.state}>{t(expiry.state === 'known' ? 'quota.creditExpiresAt' : expiry.state === 'none' ? 'quota.noUnexpiredCredits' : 'quota.creditExpiryUnknown', { time: expiry.at === undefined ? '—' : new Date(expiry.at).toLocaleString(locale) })}</span>;
 }
