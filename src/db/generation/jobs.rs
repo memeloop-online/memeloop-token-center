@@ -1186,7 +1186,7 @@ impl Database {
         let base_url = validate_config(&config)?;
         let route_id = row
             .try_get::<Option<String>, _>("model_route_id")?
-            .map(|value| parse_uuid(value))
+            .map(parse_uuid)
             .transpose()?
             .unwrap_or_else(Uuid::nil);
         Ok(Some(ResolvedUpstream {

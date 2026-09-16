@@ -1,8 +1,3 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
-
 use futures_util::StreamExt;
 use reqwest::Response;
 use serde_json::{Map, Value};
@@ -35,12 +30,11 @@ use crate::{
         ArchivedGenerationAsset, GenerationJobWork, GenerationStagedAssets, ProviderGenerationAsset,
     },
     network,
-    provider::{ResolvedUpstream, UpstreamCredential},
+    provider::ResolvedUpstream,
 };
 
 const MAX_CONTROL_BODY: usize = 4 * 1024 * 1024;
 const MAX_ASSET_BODY: usize = 512 * 1024 * 1024;
-const ASSET_ARCHIVE_LIMIT_ERROR: &str = "generation asset archive budget exceeded";
 const MAX_COMFY_ASSETS: usize = 16;
 const MAX_SILICONFLOW_VIDEO_ASSETS: usize = 1;
 const MAX_FAILURES: i64 = 20;
@@ -164,51 +158,6 @@ pub(crate) async fn write_generation_staging_segments(
         }
     }
     await_with_staging_heartbeat(state, lease, writer.finish_staged()).await?
-}
-
-/// A request/job-scoped archive budget shared by every provider asset. The
-/// limit is aggregate, rather than per object, so a multi-output manifest
-/// cannot multiply S3 and network use by its result count.
-#[derive(Clone, Debug)]
-pub(crate) struct AssetArchiveBudget {
-    remaining: Arc<AtomicUsize>,
-}
-
-impl Default for AssetArchiveBudget {
-    fn default() -> Self {
-        Self {
-            remaining: Arc::new(AtomicUsize::new(MAX_ASSET_BODY)),
-        }
-    }
-}
-
-impl AssetArchiveBudget {
-    #[cfg(test)]
-    fn for_test(limit: usize) -> Self {
-        Self {
-            remaining: Arc::new(AtomicUsize::new(limit)),
-        }
-    }
-
-    fn can_fit_declared(&self, size_bytes: u64) -> bool {
-        usize::try_from(size_bytes).is_ok_and(|size| size <= self.remaining.load(Ordering::Relaxed))
-    }
-
-    fn try_consume(&self, size_bytes: usize) -> bool {
-        self.remaining
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                remaining.checked_sub(size_bytes)
-            })
-            .is_ok()
-    }
-}
-
-fn asset_archive_limit_error() -> AppError {
-    AppError::Upstream(ASSET_ARCHIVE_LIMIT_ERROR.to_owned())
-}
-
-fn is_asset_archive_limit_error(error: &AppError) -> bool {
-    matches!(error, AppError::Upstream(message) if message == ASSET_ARCHIVE_LIMIT_ERROR)
 }
 
 /// Dispatch durably arms a quarantine before the provider POST. Cancellation
@@ -1158,152 +1107,6 @@ async fn bounded_json(response: Response) -> Result<Value, AppError> {
         .map_err(|_| AppError::Upstream("generation control response is not JSON".into()))
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn archive_asset_staged(
-    state: &AppState,
-    route: &ResolvedUpstream,
-    credential: &UpstreamCredential,
-    archive_budget: &AssetArchiveBudget,
-    staging_lease: &mut ArchiveStagingWriteLease,
-    index: usize,
-    url: &str,
-    filename: Option<&str>,
-) -> Result<ArchivedGenerationAsset, AppError> {
-    archive_asset_to_staging(
-        state,
-        route,
-        credential,
-        archive_budget,
-        staging_lease,
-        index,
-        url,
-        filename,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn archive_asset_to_staging(
-    state: &AppState,
-    route: &ResolvedUpstream,
-    credential: &UpstreamCredential,
-    archive_budget: &AssetArchiveBudget,
-    staging_lease: &mut ArchiveStagingWriteLease,
-    index: usize,
-    url: &str,
-    filename: Option<&str>,
-) -> Result<ArchivedGenerationAsset, AppError> {
-    if staging_lease.key.purpose != ArchiveStagingPurpose::Assets
-        && staging_lease.key.purpose != ArchiveStagingPurpose::Result
-    {
-        return Err(AppError::BadRequest(
-            "generation asset staging purpose is invalid".into(),
-        ));
-    }
-    ensure_asset_origin(route, url)?;
-    let asset = url::Url::parse(url)
-        .map_err(|_| AppError::Upstream("generation asset URL is invalid".into()))?;
-    let base = url::Url::parse(&route.base_url).map_err(|_| AppError::Internal)?;
-    let outbound_http = route_http(state, route, url).await?;
-    let request = outbound_http.get(url);
-    // A provider credential may be needed for same-origin ComfyUI assets. Signed
-    // Seedance result URLs are often hosted on a configured CDN origin, where
-    // forwarding that credential would disclose it to another service.
-    let request = if asset.origin() == base.origin() {
-        credential.apply(request, unix_millis())?
-    } else {
-        request
-    };
-    let _upstream_activity = state
-        .metrics
-        .active_upstream(&route.driver, "generation_asset");
-    let upstream_started = std::time::Instant::now();
-    let response_result =
-        await_with_staging_heartbeat(state, staging_lease, request.send()).await?;
-    state.metrics.observe_upstream(
-        &route.driver,
-        "generation_asset",
-        response_result.as_ref().ok().map(reqwest::Response::status),
-        upstream_started.elapsed(),
-    );
-    let response = response_result
-        .map_err(|error| sanitized_http_error(&error, "generation asset request"))?;
-    if !response.status().is_success() {
-        return Err(AppError::Upstream(format!(
-            "generation asset returned HTTP {}",
-            response.status().as_u16()
-        )));
-    }
-    let declared_mime_type = safe_asset_mime(
-        response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok()),
-    );
-    if response
-        .content_length()
-        .is_some_and(|size| !archive_budget.can_fit_declared(size))
-    {
-        return Err(asset_archive_limit_error());
-    }
-    let staging = format!("{}/asset-{index}", staging_lease.key.canonical_prefix());
-    let mut writer = state.archive.start_writer(&staging).await?;
-    let mut total = 0_usize;
-    let mut signature_prefix = Vec::with_capacity(16);
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) =
-        await_with_staging_heartbeat(state, staging_lease, stream.next()).await?
-    {
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            Err(error) => {
-                let error = sanitized_http_error(&error, "generation asset response");
-                let _ = writer.abort().await;
-                return Err(error);
-            }
-        };
-        if signature_prefix.len() < 16 {
-            let remaining = 16 - signature_prefix.len();
-            signature_prefix.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-        }
-        total = total.saturating_add(chunk.len());
-        if total > MAX_ASSET_BODY || !archive_budget.try_consume(chunk.len()) {
-            writer.abort().await?;
-            return Err(asset_archive_limit_error());
-        }
-        if let Err(error) =
-            await_with_staging_heartbeat(state, staging_lease, writer.write(chunk)).await?
-        {
-            let _ = writer.abort().await;
-            return Err(error);
-        }
-    }
-    if total == 0 {
-        writer.abort().await?;
-        return Err(AppError::Upstream(
-            "generation asset response is empty".into(),
-        ));
-    }
-    let staged =
-        await_with_staging_heartbeat(state, staging_lease, writer.finish_staged()).await??;
-    if staged.size_bytes != u64::try_from(total).map_err(|_| AppError::Internal)? {
-        return Err(AppError::Storage(
-            "generation staged asset size mismatch".into(),
-        ));
-    }
-    let mime_type = resolve_asset_mime(declared_mime_type, &signature_prefix);
-    let filename = safe_asset_filename(filename, index, &mime_type);
-    let object_locator = staged.object_locator;
-    Ok(ArchivedGenerationAsset {
-        asset_id: uuid::Uuid::now_v7(),
-        index: i64::try_from(index).map_err(|_| AppError::Internal)?,
-        object_locator,
-        mime_type,
-        size_bytes: i64::try_from(total).map_err(|_| AppError::Internal)?,
-        filename,
-    })
-}
-
 pub(crate) async fn route_http(
     state: &AppState,
     route: &ResolvedUpstream,
@@ -1489,28 +1292,6 @@ pub(crate) fn provider_expiry_millis(value: &Value, url: &str) -> Option<i64> {
     })
 }
 
-async fn persist_staged_generation_success(
-    state: &AppState,
-    worker_id: &str,
-    job: &GenerationJobWork,
-    staged: GenerationStagedAssets,
-    staging_lease: &ArchiveStagingWriteLease,
-) -> Result<(), AppError> {
-    match state
-        .db
-        .save_generation_staged_assets_staged(job.job_id, worker_id, &staged, staging_lease)
-        .await
-    {
-        Ok(true) => terminal_success(state, worker_id, job, &staged).await,
-        Ok(false) => Err(AppError::NotFound),
-        Err(error) => {
-            // A transport/database error may have happened after the manifest commit. Leave the
-            // unique prefix intact so the next claim can recover without another provider fetch.
-            Err(error)
-        }
-    }
-}
-
 async fn terminal_failure(
     state: &AppState,
     worker_id: &str,
@@ -1615,50 +1396,6 @@ fn valid_generation_staging_prefix(value: &str) -> bool {
         && value
             .split('/')
             .all(|segment| !segment.is_empty() && !matches!(segment, "." | ".."))
-}
-
-fn safe_asset_mime(value: Option<&str>) -> String {
-    let mime = value
-        .and_then(|value| value.split(';').next())
-        .map(str::trim)
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if matches!(
-        mime.as_str(),
-        "image/png"
-            | "image/jpeg"
-            | "image/webp"
-            | "image/gif"
-            | "video/mp4"
-            | "video/webm"
-            | "video/quicktime"
-    ) {
-        mime
-    } else {
-        "application/octet-stream".to_owned()
-    }
-}
-
-fn resolve_asset_mime(declared: String, prefix: &[u8]) -> String {
-    if declared != "application/octet-stream" {
-        return declared;
-    }
-    let detected = if prefix.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("image/png")
-    } else if prefix.starts_with(b"\xff\xd8\xff") {
-        Some("image/jpeg")
-    } else if prefix.starts_with(b"GIF87a") || prefix.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if prefix.len() >= 12 && prefix.starts_with(b"RIFF") && &prefix[8..12] == b"WEBP" {
-        Some("image/webp")
-    } else if prefix.starts_with(b"\x1a\x45\xdf\xa3") {
-        Some("video/webm")
-    } else if prefix.len() >= 12 && &prefix[4..8] == b"ftyp" {
-        Some("video/mp4")
-    } else {
-        None
-    };
-    detected.map(str::to_owned).unwrap_or(declared)
 }
 
 fn safe_asset_filename(value: Option<&str>, index: usize, mime_type: &str) -> String {
@@ -1901,15 +1638,7 @@ mod tests {
     }
 
     #[test]
-    fn generation_asset_metadata_does_not_trust_mime_or_filename_headers() {
-        assert_eq!(
-            safe_asset_mime(Some("image/png; charset=binary")),
-            "image/png"
-        );
-        assert_eq!(
-            safe_asset_mime(Some("text/html")),
-            "application/octet-stream"
-        );
+    fn generation_asset_filename_does_not_trust_provider_input() {
         assert_eq!(
             safe_asset_filename(Some("../../evil\r\n\".png"), 4, "image/png"),
             "evil___.png"
@@ -1920,21 +1649,6 @@ mod tests {
         );
         assert_eq!(safe_asset_filename(None, 0, "image/png"), "asset-0.png");
         assert!(!safe_asset_filename(None, 0, "image/png").contains("SECRET_TOKEN"));
-        assert_eq!(
-            resolve_asset_mime(
-                "application/octet-stream".to_owned(),
-                b"\x89PNG\r\n\x1a\nrest"
-            ),
-            "image/png"
-        );
-        assert_eq!(
-            resolve_asset_mime("application/octet-stream".to_owned(), b"unknown"),
-            "application/octet-stream"
-        );
-        assert_eq!(
-            resolve_asset_mime("image/png".to_owned(), b"not-a-png"),
-            "image/png"
-        );
     }
 
     #[test]
@@ -1956,15 +1670,7 @@ mod tests {
     }
 
     #[test]
-    fn ten_or_sixteen_assets_share_one_aggregate_archive_budget() {
-        let ten_asset_budget = AssetArchiveBudget::for_test(9);
-        assert!((0..9).all(|_| ten_asset_budget.try_consume(1)));
-        assert!(!ten_asset_budget.try_consume(1));
-
-        let sixteen_asset_budget = AssetArchiveBudget::for_test(15);
-        assert!((0..15).all(|_| sixteen_asset_budget.try_consume(1)));
-        assert!(!sixteen_asset_budget.try_consume(1));
-
+    fn historical_staged_assets_remain_bounded_during_recovery() {
         let request_id = uuid::Uuid::now_v7();
         let assets = (0..16)
             .map(|index| ArchivedGenerationAsset {

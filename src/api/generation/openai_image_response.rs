@@ -324,6 +324,7 @@ fn push_segment(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn build_openai_image_segments(
     bytes: Bytes,
     parsed: ParsedOpenAiImageResponse,
@@ -358,6 +359,7 @@ pub(super) fn build_provider_referenced_openai_image_segments(
     )
 }
 
+#[cfg(test)]
 fn build_openai_image_segments_with_limit(
     bytes: Bytes,
     parsed: ParsedOpenAiImageResponse,
