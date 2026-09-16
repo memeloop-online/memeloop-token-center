@@ -33,9 +33,11 @@ pub(crate) async fn run(state: AppState, shutdown: watch::Receiver<bool>) {
             let state = drain_state.clone();
             let shutdown = drain_shutdown.clone();
             async move {
-                drain_batch(&shutdown, || {
-                    process_one_until_shutdown(&state, owner, Some(&shutdown))
-                })
+                drain_batch(
+                    &shutdown,
+                    || claim_one_until_shutdown(&state, owner, Some(&shutdown)),
+                    |claimed| process_claimed(&state, claimed),
+                )
                 .await;
             }
         },
@@ -128,24 +130,58 @@ async fn cleanup_spool_pass(state: &AppState) {
     }
 }
 
-async fn drain_batch<F, Fut>(shutdown: &watch::Receiver<bool>, mut process: F)
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = bool>,
+async fn drain_batch<C, Claim, P, Process, T>(
+    shutdown: &watch::Receiver<bool>,
+    mut claim: C,
+    mut process: P,
+) where
+    C: FnMut() -> Claim,
+    Claim: Future<Output = Option<T>>,
+    P: FnMut(T) -> Process,
+    Process: Future<Output = ()>,
 {
-    // Each future also acquires the shared archive permit before claiming.
-    // Refill free slots so one slow store operation does not stop the other
-    // uploads. Never cancel a claimed transaction/upload on shutdown.
+    // Keep at most one claim transaction in flight while already-claimed
+    // uploads continue to make progress. An empty first claim ends this
+    // scheduler tick instead of launching four workers which each scan both
+    // empty queues and occupy the entire four-connection worker pool. Never
+    // cancel a live claim: it may already own a transaction whose COMMIT
+    // acknowledgement is still in flight.
     let mut active = FuturesUnordered::new();
     let mut started = 0;
-    while active.len() < UPLOAD_CONCURRENCY && !stopping(shutdown) {
-        active.push(process());
-        started += 1;
-    }
-    while let Some(progress) = active.next().await {
-        if progress && started < CLAIMS_PER_DRAIN && !stopping(shutdown) {
-            active.push(process());
-            started += 1;
+    let mut claiming = None;
+    let mut queue_empty = false;
+    loop {
+        if claiming.is_none()
+            && !queue_empty
+            && active.len() < UPLOAD_CONCURRENCY
+            && started < CLAIMS_PER_DRAIN
+            && !stopping(shutdown)
+        {
+            claiming = Some(Box::pin(claim()));
+        }
+
+        let claim_result = match (claiming.as_mut(), active.is_empty()) {
+            (Some(claiming), false) => tokio::select! {
+                result = claiming.as_mut() => Some(result),
+                _ = active.next() => None,
+            },
+            (Some(claiming), true) => Some(claiming.as_mut().await),
+            (None, false) => {
+                active.next().await;
+                None
+            }
+            (None, true) => break,
+        };
+
+        if let Some(result) = claim_result {
+            claiming = None;
+            match result {
+                Some(task) => {
+                    active.push(process(task));
+                    started += 1;
+                }
+                None => queue_empty = true,
+            }
         }
     }
 }
@@ -162,6 +198,7 @@ pub(super) async fn process_one(state: &AppState, owner: Uuid) -> bool {
     process_one_until_shutdown(state, owner, None).await
 }
 
+#[cfg(test)]
 async fn process_one_until_shutdown(
     state: &AppState,
     owner: Uuid,
@@ -170,24 +207,51 @@ async fn process_one_until_shutdown(
     process_one_with_admission(state, owner, shutdown, || !shutdown.is_some_and(stopping)).await
 }
 
+struct ClaimedArchiveUpload {
+    task: ArchiveSpoolTask,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+async fn claim_one_until_shutdown(
+    state: &AppState,
+    owner: Uuid,
+    shutdown: Option<&watch::Receiver<bool>>,
+) -> Option<ClaimedArchiveUpload> {
+    claim_one_with_admission(state, owner, shutdown, || !shutdown.is_some_and(stopping)).await
+}
+
+#[cfg(test)]
 pub(super) async fn process_one_with_admission(
     state: &AppState,
     owner: Uuid,
     shutdown: Option<&watch::Receiver<bool>>,
     admit: impl FnOnce() -> bool,
 ) -> bool {
+    let Some(claimed) = claim_one_with_admission(state, owner, shutdown, admit).await else {
+        return false;
+    };
+    process_claimed(state, claimed).await;
+    true
+}
+
+async fn claim_one_with_admission(
+    state: &AppState,
+    owner: Uuid,
+    shutdown: Option<&watch::Receiver<bool>>,
+    admit: impl FnOnce() -> bool,
+) -> Option<ClaimedArchiveUpload> {
     // Stop at a committed transaction boundary instead of cancelling a live
     // SQL future. The latter can race SQLx's asynchronous rollback with the
     // next pooled BEGIN and generate transaction-state protocol notices.
     if shutdown.is_some_and(stopping) {
-        return false;
+        return None;
     }
-    let Ok(_permit) = state
+    let Ok(permit) = state
         .proxy_archive_stream_permits
         .clone()
         .try_acquire_owned()
     else {
-        return false;
+        return None;
     };
     // Alternate queue priority across drain calls, so a permanently busy
     // response queue cannot starve requests (or vice versa).
@@ -227,8 +291,16 @@ pub(super) async fn process_one_with_admission(
     .await;
     let task = match claimed {
         Ok(Some(task)) => task,
-        Ok(None) | Err(_) => return false,
+        Ok(None) | Err(_) => return None,
     };
+    Some(ClaimedArchiveUpload {
+        task,
+        _permit: permit,
+    })
+}
+
+async fn process_claimed(state: &AppState, claimed: ClaimedArchiveUpload) {
+    let ClaimedArchiveUpload { task, _permit } = claimed;
     // Admission happened inside the claim transaction. Complete this one
     // bounded attempt even if shutdown arrived during COMMIT; never consume a
     // retry merely to abandon a freshly committed claim without object I/O.
@@ -268,7 +340,6 @@ pub(super) async fn process_one_with_admission(
             "durable archive retry pending"
         );
     }
-    true
 }
 
 fn upload_error_code(phase: &str) -> &'static str {
@@ -606,16 +677,29 @@ mod tests {
         let (entered, mut entering) = tokio::sync::mpsc::channel(UPLOAD_CONCURRENCY);
         let release = Arc::new(tokio::sync::Semaphore::new(0));
         let completed = Arc::new(AtomicUsize::new(0));
+        let claims = Arc::new(AtomicUsize::new(0));
         let drain_release = release.clone();
         let drain_completed = completed.clone();
+        let drain_claims = claims.clone();
         let drain = tokio::spawn(async move {
-            drain_batch(&receiver, || async {
-                entered.send(()).await.unwrap();
-                let permit = drain_release.acquire().await.unwrap();
-                permit.forget();
-                drain_completed.fetch_add(1, Ordering::SeqCst);
-                true
-            })
+            drain_batch(
+                &receiver,
+                || {
+                    let index = drain_claims.fetch_add(1, Ordering::SeqCst);
+                    async move { Some(index) }
+                },
+                |_| {
+                    let entered = entered.clone();
+                    let release = drain_release.clone();
+                    let completed = drain_completed.clone();
+                    async move {
+                        entered.send(()).await.unwrap();
+                        let permit = release.acquire().await.unwrap();
+                        permit.forget();
+                        completed.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
+            )
             .await;
         });
         for _ in 0..UPLOAD_CONCURRENCY {
@@ -626,7 +710,102 @@ mod tests {
         release.add_permits(UPLOAD_CONCURRENCY);
         drain.await.unwrap();
         assert_eq!(completed.load(Ordering::SeqCst), UPLOAD_CONCURRENCY);
+        assert_eq!(claims.load(Ordering::SeqCst), UPLOAD_CONCURRENCY);
         assert_eq!(entering.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn empty_queue_uses_one_probe_without_fanout_or_pool_pressure() {
+        let (_shutdown, receiver) = watch::channel(false);
+        let claims = Arc::new(AtomicUsize::new(0));
+        let processes = Arc::new(AtomicUsize::new(0));
+        let claim_count = claims.clone();
+        let process_count = processes.clone();
+        drain_batch(
+            &receiver,
+            || {
+                claim_count.fetch_add(1, Ordering::SeqCst);
+                async { None::<usize> }
+            },
+            |_| {
+                process_count.fetch_add(1, Ordering::SeqCst);
+                async {}
+            },
+        )
+        .await;
+        assert_eq!(claims.load(Ordering::SeqCst), 1);
+        assert_eq!(processes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn slow_refill_claim_does_not_pause_an_already_claimed_upload() {
+        let (_shutdown, receiver) = watch::channel(false);
+        let claim_index = Arc::new(AtomicUsize::new(0));
+        let second_claim_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (upload_started, upload_starting) = tokio::sync::oneshot::channel();
+        let (upload_completed, upload_completing) = tokio::sync::oneshot::channel();
+        let upload_started = Arc::new(std::sync::Mutex::new(Some(upload_started)));
+        let upload_completed = Arc::new(std::sync::Mutex::new(Some(upload_completed)));
+        let claim_counter = claim_index.clone();
+        let claim_release = second_claim_release.clone();
+        let started = upload_started.clone();
+        let completed = upload_completed.clone();
+        let drain = tokio::spawn(async move {
+            drain_batch(
+                &receiver,
+                || {
+                    let index = claim_counter.fetch_add(1, Ordering::SeqCst);
+                    let release = claim_release.clone();
+                    async move {
+                        match index {
+                            0 => Some(0),
+                            1 => {
+                                release.acquire().await.unwrap().forget();
+                                Some(1)
+                            }
+                            _ => None,
+                        }
+                    }
+                },
+                |index| {
+                    let started = started.clone();
+                    let completed = completed.clone();
+                    async move {
+                        if index == 0 {
+                            if let Some(sender) = started
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take()
+                            {
+                                sender.send(()).unwrap();
+                            }
+                            tokio::task::yield_now().await;
+                            if let Some(sender) = completed
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take()
+                            {
+                                sender.send(()).unwrap();
+                            }
+                        }
+                    }
+                },
+            )
+            .await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), upload_starting)
+            .await
+            .expect("first upload must start while the second claim is pending")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), upload_completing)
+            .await
+            .expect("first upload must complete while the second claim is pending")
+            .unwrap();
+        assert_eq!(claim_index.load(Ordering::SeqCst), 2);
+        second_claim_release.add_permits(1);
+        drain.await.unwrap();
+        assert_eq!(claim_index.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
@@ -641,23 +820,28 @@ mod tests {
         let drain_peak = peak.clone();
         let drain_calls = calls.clone();
         let drain = tokio::spawn(async move {
-            drain_batch(&receiver, || {
-                let index = drain_calls.fetch_add(1, Ordering::SeqCst);
-                let release = drain_release.clone();
-                let running = running.clone();
-                let peak = drain_peak.clone();
-                let entered = entered.clone();
-                async move {
-                    let count = running.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(count, Ordering::SeqCst);
-                    entered.send(index).unwrap();
-                    if index < UPLOAD_CONCURRENCY {
-                        release.acquire().await.unwrap().forget();
+            drain_batch(
+                &receiver,
+                || {
+                    let index = drain_calls.fetch_add(1, Ordering::SeqCst);
+                    async move { Some(index) }
+                },
+                |index| {
+                    let release = drain_release.clone();
+                    let running = running.clone();
+                    let peak = drain_peak.clone();
+                    let entered = entered.clone();
+                    async move {
+                        let count = running.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(count, Ordering::SeqCst);
+                        entered.send(index).unwrap();
+                        if index < UPLOAD_CONCURRENCY {
+                            release.acquire().await.unwrap().forget();
+                        }
+                        running.fetch_sub(1, Ordering::SeqCst);
                     }
-                    running.fetch_sub(1, Ordering::SeqCst);
-                    true
-                }
-            })
+                },
+            )
             .await;
         });
         let mut first = Vec::new();
@@ -677,6 +861,41 @@ mod tests {
         drain.await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), CLAIMS_PER_DRAIN);
         assert_eq!(peak.load(Ordering::SeqCst), UPLOAD_CONCURRENCY);
+    }
+
+    #[tokio::test]
+    async fn backlog_dispatches_claim_order_across_tenants_without_serializing_uploads() {
+        let (_shutdown, receiver) = watch::channel(false);
+        let tenants = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+            "tenant-a", "tenant-b", "tenant-a", "tenant-b",
+        ])));
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let queue = tenants.clone();
+        let processed = observed.clone();
+        drain_batch(
+            &receiver,
+            || {
+                let tenant = queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pop_front();
+                async move { tenant }
+            },
+            |tenant| {
+                processed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(tenant);
+                async {}
+            },
+        )
+        .await;
+        let mut dispatched = observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        dispatched.sort_unstable();
+        assert_eq!(dispatched, ["tenant-a", "tenant-a", "tenant-b", "tenant-b"]);
     }
 
     #[tokio::test(start_paused = true)]
