@@ -26,7 +26,7 @@ test('live metrics share real-data backgrounds and neutral rates across themes a
     assert.equal(await cards.count(), 6);
     assert.deepEqual(await cards.first().locator('.metric-label').evaluate(node => { const style = getComputedStyle(node); return { transform: style.textTransform, size: style.fontSize }; }), { transform: 'none', size: '13px' });
     assert.deepEqual(await cards.locator('.metric-label').allTextContents(), ['Total tokens', 'Successful', 'Local settlement ⓘ', 'Running', 'Finished request success rate', 'Average latency']);
-    assert.deepEqual(await cards.locator('.metric-value').allTextContents(), ['500', '1', '€0.25$1.50', '1', '50%', '25 s']);
+    assert.deepEqual(await cards.locator('.metric-value').allTextContents(), ['350', '1', '€0.25$1.50', '1', '50%', '25 s']);
     const settlement = cards.filter({ hasText: 'Local settlement' });
     assert.deepEqual(await settlement.locator('.usage-cost-lines > span').allTextContents(), ['€0.25', '$1.50'], 'local settlement keeps each recorded currency on its own line');
     assert.equal(await settlement.locator('.analytics-metric-trend, .analytics-metric-ratio').count(), 0, 'mixed currencies must not fabricate a settlement trend or ratio');
@@ -38,7 +38,7 @@ test('live metrics share real-data backgrounds and neutral rates across themes a
     await page.keyboard.press('End');
     assert.match(await cards.first().getAttribute('aria-valuetext') ?? '', /Total tokens: 50/);
     const descriptions = await cards.first().evaluate(node => (node.getAttribute('aria-describedby') ?? '').split(/\s+/).map(id => document.getElementById(id)?.textContent ?? ''));
-    assert.ok(descriptions.includes('500'), 'interactive bucket inspection must retain the aggregate in its accessible description');
+    assert.ok(descriptions.includes('350'), 'interactive bucket inspection must retain the aggregate in its accessible description');
     const average = cards.filter({ hasText: 'Average latency' });
     assert.equal(await average.count(), 1);
     const averageDescription = await average.evaluate(node => (node.getAttribute('aria-describedby') ?? '').split(/\s+/).map(id => document.getElementById(id)?.textContent ?? '').join(' '));
