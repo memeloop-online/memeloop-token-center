@@ -178,6 +178,9 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
     const last = requests.at(-1);
     const before = last ? { before_created_at: last.created_at, before_id: last.request_id } : undefined;
     if (older && (!hasOlder || !before)) return;
+    // Freeze insertion before the page fetch, not after it resolves: otherwise
+    // a live batch could move the visible tail while this cursor is in flight.
+    if (older) for (const request of requestsRef.current) loadedHistoryIds.current.add(request.request_id);
     const refreshWasActive = older && (filteredRefresh.current.pending || filteredRefresh.current.inFlight);
     // A foreground page request owns the request list until it settles. Abort
     // any background first-page refresh rather than running two query POSTs.
@@ -279,7 +282,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
     if (liveEvents.size === 0) return;
     if (typedFiltersActive(filters)) {
       const terminalizedVisiblePending = olderFilteredResultsVisible.current
-        && [...liveEventsRef.current.values()].some((event) => event.event_kind === 'finished'
+        && [...liveEventsRef.current.values()].some((event) => (event.event_kind === 'finished' || event.completed_at != null)
           && requestsRef.current.some((request) => request.request_id === event.request_id && request.status_code === null));
       if (terminalizedVisiblePending) setOlderFilteredResultsStale(true);
       scheduleFilteredRefresh();
