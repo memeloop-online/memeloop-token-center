@@ -2778,7 +2778,7 @@ async fn mock_openai_image_generation(world: &mut TokenCenterWorld) {
             "created": 1,
             "data": [{"b64_json": "bW9jay1wbmc="}]
         })))
-        .expect(1)
+        .expect(2)
         .mount(world.mock.as_ref().expect("mock server"))
         .await;
 }

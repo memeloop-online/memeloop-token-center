@@ -229,7 +229,14 @@ async fn provider_generation_asset_response(
         return Ok(provider_asset_unavailable());
     }
     let content_range = upstream.headers().get(header::CONTENT_RANGE).cloned();
-    let accept_ranges = upstream.headers().get(header::ACCEPT_RANGES).cloned();
+    // The authenticated proxy accepts and forwards a single byte range even
+    // when a provider omits the advisory header on its full-body response.
+    // Preserve an explicit upstream value such as `none` when one is present.
+    let accept_ranges = upstream
+        .headers()
+        .get(header::ACCEPT_RANGES)
+        .cloned()
+        .unwrap_or_else(|| HeaderValue::from_static("bytes"));
     let mut response = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, content_type)
@@ -244,7 +251,7 @@ async fn provider_generation_asset_response(
     for (name, value) in [
         (header::CONTENT_LENGTH, content_length),
         (header::CONTENT_RANGE, content_range),
-        (header::ACCEPT_RANGES, accept_ranges),
+        (header::ACCEPT_RANGES, Some(accept_ranges)),
     ] {
         if let Some(value) = value {
             response = response.header(name, value);

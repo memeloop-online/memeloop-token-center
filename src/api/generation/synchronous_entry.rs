@@ -750,6 +750,9 @@ mod tests {
         )
         .await;
         assert_eq!(first.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(first.into_body(), 64 * 1024)
+            .await
+            .expect("first image response");
 
         state
             .db
