@@ -38,6 +38,7 @@ LEFT JOIN (
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn request_rollup_effective_cost_for_bucket_sql(
     rollup_alias: &str,
     fact_alias: &str,
