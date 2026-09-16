@@ -147,7 +147,7 @@ async fn corrupt_frames_lengths_digests_and_trailing_data_fail_closed() {
 }
 
 #[tokio::test]
-async fn empty_objects_and_compressed_content_addressed_finish_round_trip() {
+async fn empty_compressed_staged_object_round_trips() {
     let store = memory_store();
     let writer = store
         .start_compressed_writer("staging/test/empty")
@@ -156,15 +156,46 @@ async fn empty_objects_and_compressed_content_addressed_finish_round_trip() {
     let object = writer.finish_staged().await.unwrap();
     assert_eq!(object.size_bytes, 0);
     assert!(store.get(&object.object_locator).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn compressed_writer_rejects_double_suffix_and_shared_cas_finish() {
+    let store = memory_store();
+    assert!(matches!(
+        store
+            .start_compressed_writer("staging/test/content.mtcz1")
+            .await,
+        Err(crate::error::AppError::BadRequest(_))
+    ));
+    assert!(
+        store
+            .inner
+            .list(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let mut writer = store
         .start_compressed_writer("staging/test/content")
         .await
         .unwrap();
     writer.write(Bytes::from_static(b"content")).await.unwrap();
-    let location = writer.finish().await.unwrap();
-    assert!(location.starts_with("objects/blake3/"));
-    assert!(location.ends_with(compressed::SUFFIX));
-    assert_eq!(store.get(&location).await.unwrap().as_ref(), b"content");
+    assert!(matches!(
+        writer.finish().await,
+        Err(crate::error::AppError::Storage(_))
+    ));
+    // No staged object was committed and no CAS copy was published. This
+    // asserts completed-object state, not timing of the detached abort task.
+    assert!(
+        store
+            .inner
+            .list(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert!(
         store
             .inner

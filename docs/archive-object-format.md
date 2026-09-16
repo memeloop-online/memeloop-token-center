@@ -30,6 +30,8 @@ owned staging lease/abort/reaper path and cannot bind an unfinished object.
   128 KiB, and total plaintext is at most the existing 64-MiB spool limit.
 
 The durable locator remains inside the same request/attempt staging prefix.
+Compressed writers reject an already-suffixed input and support only
+`finish_staged`: shared CAS locators retain their existing exact 64-hex contract.
 `StagedArchiveObject.size_bytes` and its digest describe the original bytes.
 `head_size`, bounded reads, and byte ranges expose logical plaintext lengths.
 Ranges scan and verify the complete compressed object in this first version:

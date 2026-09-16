@@ -58,6 +58,11 @@ impl ArchiveStore {
         &self,
         location: &str,
     ) -> Result<ArchiveWriter, AppError> {
+        if location.ends_with(super::compressed::SUFFIX) {
+            return Err(AppError::BadRequest(
+                "compressed archive staging name already has a format suffix".into(),
+            ));
+        }
         let mut writer = self
             .start_writer(&format!("{location}{}", super::compressed::SUFFIX))
             .await?;
@@ -145,16 +150,21 @@ impl ArchiveWriter {
     }
 
     pub async fn finish(mut self) -> Result<String, AppError> {
+        // Shared CAS locators end in an exact 64-hex digest. Versioned text
+        // objects currently bind only request-owned staged locators; do not
+        // publish a suffix-bearing CAS locator that other readers reject.
+        if self.compressed {
+            return Err(AppError::Storage(
+                "compressed archive writers require staged finish".into(),
+            ));
+        }
         self.finish_multipart().await?;
-        let mut location = content_location(
+        let location = content_location(
             std::mem::replace(&mut self.hasher, blake3::Hasher::new())
                 .finalize()
                 .to_hex()
                 .as_str(),
         );
-        if self.compressed {
-            location.push_str(super::compressed::SUFFIX);
-        }
         let destination = archive_path(&location)?;
         self.store.copy(&self.staging, &destination).await?;
         self.store.delete(&self.staging).await?;
