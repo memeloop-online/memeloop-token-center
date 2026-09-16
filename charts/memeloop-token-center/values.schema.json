@@ -125,7 +125,7 @@
       "additionalProperties": false,
       "required": ["mountPath", "sizeLimit"],
       "properties": {
-        "mountPath": { "type": "string", "pattern": "^/[^\\u0000]*$" },
+        "mountPath": { "type": "string", "pattern": "^/.+$" },
         "sizeLimit": { "$ref": "#/definitions/resourceQuantity" }
       }
     },
