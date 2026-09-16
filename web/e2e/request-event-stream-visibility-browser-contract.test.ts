@@ -5,6 +5,15 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
 
+declare global {
+  interface Window {
+    streamFetches: number;
+    streamAborts: number;
+    streamUrls: string[];
+    emitStreamEvent: (eventId: string, eventAt: number) => void;
+  }
+}
+
 test('the real SSE hook aborts while hidden, resumes from its cursor, and does not replay the cursor event', { timeout: 45_000 }, async () => {
   if (!existsSync(chromium.executablePath())) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
