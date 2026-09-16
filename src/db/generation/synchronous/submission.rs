@@ -65,8 +65,10 @@ impl Database {
         // Staged attachment publishes the request pointer and its bound receipt
         // atomically. A staging-looking path alone is not proof of persistence:
         // require the exact bound locator, request owner, and request purpose.
-        // Retain the legacy content-addressed attachment contract as well.
-        let changed = sqlx::query("UPDATE request_records SET submission_started_at = $1 WHERE id = $2 AND key_id = $3 AND reservation_id = $4 AND completed_at IS NULL AND submission_started_at IS NULL AND submission_uncertain_at IS NULL AND (request_object LIKE 'objects/blake3/%' OR EXISTS (SELECT 1 FROM archive_staging_attempts a WHERE a.owner_kind = 'synchronous_request' AND a.owner_id = request_records.id AND a.purpose = 'request' AND a.state = 'bound' AND a.bound_locator = request_records.request_object)) AND EXISTS (SELECT 1 FROM usage_reservations r WHERE r.id = $4 AND r.key_id = $3 AND r.status = 'reserved')")
+        // Metadata-only image requests are already durable in this row and do
+        // not need an archive receipt. Retain the legacy content-addressed and
+        // bound-staging attachment contracts for historical callers.
+        let changed = sqlx::query("UPDATE request_records SET submission_started_at = $1 WHERE id = $2 AND key_id = $3 AND reservation_id = $4 AND completed_at IS NULL AND submission_started_at IS NULL AND submission_uncertain_at IS NULL AND (request_object LIKE 'metadata-only-json:%' OR request_object LIKE 'objects/blake3/%' OR EXISTS (SELECT 1 FROM archive_staging_attempts a WHERE a.owner_kind = 'synchronous_request' AND a.owner_id = request_records.id AND a.purpose = 'request' AND a.state = 'bound' AND a.bound_locator = request_records.request_object)) AND EXISTS (SELECT 1 FROM usage_reservations r WHERE r.id = $4 AND r.key_id = $3 AND r.status = 'reserved')")
             .bind(now).bind(request_id.to_string()).bind(key_id.to_string()).bind(reservation_id.to_string()).execute(&mut *tx).await?;
         if changed.rows_affected() != 1 {
             return Err(AppError::Conflict(

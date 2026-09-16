@@ -7,7 +7,7 @@ use serde::{
 };
 use serde_json::value::RawValue;
 
-use crate::model::ArchivedGenerationAsset;
+use crate::model::{ArchivedGenerationAsset, ProviderGenerationAsset};
 
 use super::super::MAX_IMAGE_RESPONSE;
 use super::{
@@ -324,6 +324,7 @@ fn push_segment(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn build_openai_image_segments(
     bytes: Bytes,
     parsed: ParsedOpenAiImageResponse,
@@ -341,6 +342,24 @@ pub(super) fn build_openai_image_segments(
     )
 }
 
+pub(super) fn build_provider_referenced_openai_image_segments(
+    bytes: Bytes,
+    parsed: ParsedOpenAiImageResponse,
+    request_id: uuid::Uuid,
+    assets: &[ProviderGenerationAsset],
+    default_created: i64,
+) -> Result<(Vec<Bytes>, usize), OpenAiImageBuildError> {
+    build_openai_image_segments_with_policy(
+        bytes,
+        parsed,
+        None,
+        Some((request_id, assets)),
+        default_created,
+        MAX_IMAGE_RESPONSE,
+    )
+}
+
+#[cfg(test)]
 fn build_openai_image_segments_with_limit(
     bytes: Bytes,
     parsed: ParsedOpenAiImageResponse,
@@ -349,18 +368,44 @@ fn build_openai_image_segments_with_limit(
     default_created: i64,
     limit: usize,
 ) -> Result<(Vec<Bytes>, usize), OpenAiImageBuildError> {
+    build_openai_image_segments_with_policy(
+        bytes,
+        parsed,
+        Some((request_id, assets)),
+        None,
+        default_created,
+        limit,
+    )
+}
+
+fn build_openai_image_segments_with_policy(
+    bytes: Bytes,
+    parsed: ParsedOpenAiImageResponse,
+    archive: Option<(uuid::Uuid, &[ArchivedGenerationAsset])>,
+    provider: Option<(uuid::Uuid, &[ProviderGenerationAsset])>,
+    default_created: i64,
+    limit: usize,
+) -> Result<(Vec<Bytes>, usize), OpenAiImageBuildError> {
     let mut expected_asset_indexes = parsed
         .url_assets()
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    let mut actual_asset_indexes = assets
-        .iter()
-        .map(|asset| usize::try_from(asset.index).ok())
-        .collect::<Option<Vec<_>>>()
-        .ok_or(OpenAiImageBuildError::InvalidAssets)?;
+    let mut actual_asset_indexes = match (archive, provider) {
+        (Some((_, assets)), None) => assets
+            .iter()
+            .map(|asset| usize::try_from(asset.index).ok())
+            .collect::<Option<Vec<_>>>(),
+        (None, Some((_, assets))) => assets
+            .iter()
+            .map(|asset| usize::try_from(asset.index).ok())
+            .collect::<Option<Vec<_>>>(),
+        (None, None) => Some(Vec::new()),
+        (Some(_), Some(_)) => None,
+    }
+    .ok_or(OpenAiImageBuildError::InvalidAssets)?;
     expected_asset_indexes.sort_unstable();
     actual_asset_indexes.sort_unstable();
-    if actual_asset_indexes != expected_asset_indexes {
+    if (archive.is_some() || provider.is_some()) && actual_asset_indexes != expected_asset_indexes {
         return Err(OpenAiImageBuildError::InvalidAssets);
     }
     let mut segments = Vec::with_capacity(parsed.items.len().saturating_mul(3).saturating_add(2));
@@ -401,24 +446,47 @@ fn build_openai_image_segments_with_limit(
                 suffix.push(b'}');
                 push_segment(&mut segments, &mut total, Bytes::from(suffix), limit)?;
             }
-            OpenAiImageItem::Url { revised_prompt, .. } => {
-                let asset = assets
-                    .iter()
-                    .find(|asset| usize::try_from(asset.index).ok() == Some(index))
-                    .ok_or(OpenAiImageBuildError::InvalidAssets)?;
-                let item = SanitizedUrlItem {
-                    url: format!("/self/v1/requests/{request_id}/assets/{}", asset.asset_id),
-                    archived_asset: ArchivedAssetMetadata {
-                        asset_id: asset.asset_id,
-                        index: asset.index,
-                        mime_type: &asset.mime_type,
-                        size_bytes: asset.size_bytes,
-                        filename: &asset.filename,
-                    },
-                    revised_prompt: revised_prompt.as_deref(),
+            OpenAiImageItem::Url {
+                url,
+                revised_prompt,
+            } => {
+                let rendered = if let Some((request_id, assets)) = archive {
+                    let asset = assets
+                        .iter()
+                        .find(|asset| usize::try_from(asset.index).ok() == Some(index))
+                        .ok_or(OpenAiImageBuildError::InvalidAssets)?;
+                    serde_json::to_vec(&SanitizedUrlItem {
+                        url: format!("/self/v1/requests/{request_id}/assets/{}", asset.asset_id),
+                        archived_asset: ArchivedAssetMetadata {
+                            asset_id: asset.asset_id,
+                            index: asset.index,
+                            mime_type: &asset.mime_type,
+                            size_bytes: asset.size_bytes,
+                            filename: &asset.filename,
+                        },
+                        revised_prompt: revised_prompt.as_deref(),
+                    })
+                    .map_err(|_| OpenAiImageBuildError::Internal)?
+                } else if let Some((request_id, assets)) = provider {
+                    let asset = assets
+                        .iter()
+                        .find(|asset| usize::try_from(asset.index).ok() == Some(index))
+                        .ok_or(OpenAiImageBuildError::InvalidAssets)?;
+                    #[derive(Serialize)]
+                    struct ProviderReferenceItem<'a> {
+                        url: String,
+                        #[serde(skip_serializing_if = "Option::is_none")]
+                        revised_prompt: Option<&'a str>,
+                    }
+                    serde_json::to_vec(&ProviderReferenceItem {
+                        url: format!("/self/v1/requests/{request_id}/assets/{}", asset.asset_id),
+                        revised_prompt: revised_prompt.as_deref(),
+                    })
+                    .map_err(|_| OpenAiImageBuildError::Internal)?
+                } else {
+                    let _ = url;
+                    return Err(OpenAiImageBuildError::InvalidAssets);
                 };
-                let rendered =
-                    serde_json::to_vec(&item).map_err(|_| OpenAiImageBuildError::Internal)?;
                 push_segment(&mut segments, &mut total, Bytes::from(rendered), limit)?;
             }
         }
@@ -511,6 +579,44 @@ mod tests {
         assert_eq!(value["data"][1]["revised_prompt"], "quoted \"prompt\"");
         let text = String::from_utf8(rendered).unwrap();
         assert!(!text.contains("provider.invalid"));
+    }
+
+    #[test]
+    fn provider_url_results_use_private_references_without_archive_metadata() {
+        let bytes = body(json!({"data": [{
+            "url": "https://provider.invalid/signed-image?expires=4102444800",
+            "revised_prompt": "bounded"
+        }]}));
+        let parsed = parse_openai_image_response(&bytes, 1).expect("payload parses");
+        let request_id = uuid::Uuid::now_v7();
+        let asset = ProviderGenerationAsset {
+            asset_id: uuid::Uuid::now_v7(),
+            index: 0,
+            url: "https://provider.invalid/signed-image?expires=4102444800".into(),
+            expires_at: Some(4_102_444_800_000),
+            mime_type: "image/png".into(),
+            filename: "asset-0.png".into(),
+        };
+        let (segments, _) = build_provider_referenced_openai_image_segments(
+            bytes,
+            parsed,
+            request_id,
+            std::slice::from_ref(&asset),
+            99,
+        )
+        .expect("provider-referenced response builds");
+        let rendered = segments.concat();
+        let value: Value = serde_json::from_slice(&rendered).unwrap();
+        assert_eq!(
+            value["data"][0]["url"],
+            format!("/self/v1/requests/{request_id}/assets/{}", asset.asset_id)
+        );
+        assert!(value["data"][0].get("archived_asset").is_none());
+        assert!(
+            !String::from_utf8(rendered)
+                .unwrap()
+                .contains("provider.invalid")
+        );
     }
 
     #[test]

@@ -1541,6 +1541,16 @@ pub struct ArchivedGenerationAsset {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProviderGenerationAsset {
+    pub asset_id: Uuid,
+    pub index: i64,
+    pub url: String,
+    pub expires_at: Option<i64>,
+    pub mime_type: String,
+    pub filename: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GenerationStagedAssets {
     pub attempt_nonce: Uuid,
@@ -1549,9 +1559,27 @@ pub struct GenerationStagedAssets {
 }
 
 #[derive(Clone, Debug)]
+pub enum GenerationAssetProviderOwner {
+    Job(Uuid),
+    Request(Uuid),
+}
+
+#[derive(Clone, Debug)]
+pub enum GenerationAssetSource {
+    Archive {
+        object_locator: String,
+    },
+    Provider {
+        owner: GenerationAssetProviderOwner,
+        url: String,
+        expires_at: Option<i64>,
+    },
+}
+
+#[derive(Clone, Debug)]
 pub struct GenerationAssetDownload {
     pub view: GenerationAssetView,
-    pub object_locator: String,
+    pub source: GenerationAssetSource,
 }
 
 #[derive(Clone, Debug, Serialize)]

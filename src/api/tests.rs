@@ -2165,6 +2165,7 @@ async fn plugin_provider_can_contribute_an_oauth_adapter_route() {
                 refresh_url: "http://oauth-adapter.default.svc/refresh".to_owned(),
             }),
             component_adapter: None,
+            generation_adapter: None,
             source: "plugin:test@1.0.0".to_owned(),
         }])
         .unwrap();

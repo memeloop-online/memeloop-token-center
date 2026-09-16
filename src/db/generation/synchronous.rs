@@ -830,6 +830,12 @@ impl Database {
                 ));
             }
         }
+        super::cleanup_archive_staging_purpose_in_transaction(
+            &mut transaction,
+            ArchiveStagingOwner::SynchronousRequest(input.request_id),
+            ArchiveStagingPurpose::Request,
+        )
+        .await?;
         transaction.commit().await?;
         Ok(FinishSynchronousImageResult::Finished { cost_micros })
     }
@@ -914,6 +920,7 @@ impl Database {
     pub async fn synchronous_generation_assets(
         &self,
         request_id: Uuid,
+        key_material: &[u8],
     ) -> Result<Vec<GenerationAssetDownload>, AppError> {
         let rows = sqlx::query(
             "SELECT id, asset_index, object_locator, mime_type, size_bytes, filename FROM generation_assets WHERE request_id = $1 ORDER BY asset_index, id",
@@ -921,7 +928,21 @@ impl Database {
         .bind(request_id.to_string())
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter().map(generation_asset_download).collect()
+        let archived = rows
+            .into_iter()
+            .map(generation_asset_download)
+            .collect::<Result<Vec<_>, _>>()?;
+        if !archived.is_empty() {
+            return Ok(archived);
+        }
+        let row = sqlx::query("SELECT response_object FROM request_records WHERE id = $1")
+            .bind(request_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(Vec::new());
+        };
+        synchronous_provider_assets(row, request_id, key_material)
     }
 
     pub async fn synchronous_generation_asset_for_key(
@@ -929,6 +950,7 @@ impl Database {
         key_id: Uuid,
         request_id: Uuid,
         asset_id: Uuid,
+        key_material: &[u8],
     ) -> Result<GenerationAssetDownload, AppError> {
         let row = sqlx::query(
             "SELECT a.id, a.asset_index, a.object_locator, a.mime_type, a.size_bytes, a.filename FROM generation_assets a JOIN request_record_locators r ON r.id = a.request_id WHERE a.id = $1 AND a.request_id = $2 AND r.key_id = $3",
@@ -937,9 +959,19 @@ impl Database {
         .bind(request_id.to_string())
         .bind(key_id.to_string())
         .fetch_optional(&self.pool)
+        .await?;
+        if let Some(row) = row {
+            return generation_asset_download(row);
+        }
+        let row = sqlx::query(
+            "SELECT response_object FROM request_records WHERE id = $1 AND key_id = $2",
+        )
+        .bind(request_id.to_string())
+        .bind(key_id.to_string())
+        .fetch_optional(&self.pool)
         .await?
         .ok_or(AppError::NotFound)?;
-        generation_asset_download(row)
+        synchronous_provider_asset_download(row, request_id, asset_id, key_material)
     }
 
     pub async fn synchronous_generation_asset_for_tenant(
@@ -947,6 +979,7 @@ impl Database {
         tenant_external_id: &str,
         request_id: Uuid,
         asset_id: Uuid,
+        key_material: &[u8],
     ) -> Result<GenerationAssetDownload, AppError> {
         let row = sqlx::query(
             "SELECT a.id, a.asset_index, a.object_locator, a.mime_type, a.size_bytes, a.filename FROM generation_assets a JOIN request_record_locators r ON r.id = a.request_id JOIN tenants t ON t.id = r.tenant_id WHERE a.id = $1 AND a.request_id = $2 AND t.external_id = $3",
@@ -955,15 +988,26 @@ impl Database {
         .bind(request_id.to_string())
         .bind(tenant_external_id)
         .fetch_optional(&self.pool)
+        .await?;
+        if let Some(row) = row {
+            return generation_asset_download(row);
+        }
+        let row = sqlx::query(
+            "SELECT r.response_object FROM request_records r JOIN tenants t ON t.id = r.tenant_id WHERE r.id = $1 AND t.external_id = $2",
+        )
+        .bind(request_id.to_string())
+        .bind(tenant_external_id)
+        .fetch_optional(&self.pool)
         .await?
         .ok_or(AppError::NotFound)?;
-        generation_asset_download(row)
+        synchronous_provider_asset_download(row, request_id, asset_id, key_material)
     }
 
     pub async fn synchronous_generation_asset_global(
         &self,
         request_id: Uuid,
         asset_id: Uuid,
+        key_material: &[u8],
     ) -> Result<GenerationAssetDownload, AppError> {
         let row = sqlx::query(
             "SELECT a.id, a.asset_index, a.object_locator, a.mime_type, a.size_bytes, a.filename FROM generation_assets a JOIN request_record_locators r ON r.id = a.request_id WHERE a.id = $1 AND a.request_id = $2",
@@ -971,10 +1015,119 @@ impl Database {
         .bind(asset_id.to_string())
         .bind(request_id.to_string())
         .fetch_optional(&self.pool)
-        .await?
-        .ok_or(AppError::NotFound)?;
-        generation_asset_download(row)
+        .await?;
+        if let Some(row) = row {
+            return generation_asset_download(row);
+        }
+        let row = sqlx::query("SELECT response_object FROM request_records WHERE id = $1")
+            .bind(request_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        synchronous_provider_asset_download(row, request_id, asset_id, key_material)
     }
+
+    pub async fn load_synchronous_asset_upstream(
+        &self,
+        request_id: Uuid,
+        key_material: &[u8],
+    ) -> Result<Option<ResolvedUpstream>, AppError> {
+        let row = sqlx::query(
+            "SELECT q.model_route_id, q.upstream_account_id, q.model,
+                    a.updated_at AS transport_revision, a.credential_generation,
+                    a.driver, a.config_json, c.credential_ciphertext
+             FROM request_records q
+             JOIN upstream_accounts a
+               ON a.id = q.upstream_account_id
+              AND a.tenant_id = q.tenant_id
+              AND a.status = 'active'
+             JOIN upstream_credentials c
+               ON c.upstream_account_id = a.id
+              AND c.generation = a.credential_generation
+              AND c.revoked_at IS NULL
+             WHERE q.id = $1",
+        )
+        .bind(request_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let config: serde_json::Value =
+            serde_json::from_str(&row.try_get::<String, _>("config_json")?)
+                .map_err(|_| AppError::Internal)?;
+        let base_url = validate_config(&config)?;
+        let route_id = row
+            .try_get::<Option<String>, _>("model_route_id")?
+            .map(parse_uuid)
+            .transpose()?
+            .unwrap_or_else(Uuid::nil);
+        Ok(Some(ResolvedUpstream {
+            route_id,
+            account_id: parse_uuid(row.try_get("upstream_account_id")?)?,
+            transport_revision: row.try_get("transport_revision")?,
+            credential_generation: row.try_get("credential_generation")?,
+            driver: row.try_get("driver")?,
+            base_url,
+            config,
+            upstream_model: row.try_get("model")?,
+            credential: open_credential(
+                &row.try_get::<String, _>("credential_ciphertext")?,
+                key_material,
+            )?,
+        }))
+    }
+}
+
+fn synchronous_provider_asset_download(
+    row: AnyRow,
+    request_id: Uuid,
+    asset_id: Uuid,
+    key_material: &[u8],
+) -> Result<GenerationAssetDownload, AppError> {
+    let asset = synchronous_provider_assets(row, request_id, key_material)?
+        .into_iter()
+        .find(|asset| asset.view.asset_id == asset_id)
+        .ok_or(AppError::NotFound)?;
+    Ok(asset)
+}
+
+fn synchronous_provider_assets(
+    row: AnyRow,
+    request_id: Uuid,
+    key_material: &[u8],
+) -> Result<Vec<GenerationAssetDownload>, AppError> {
+    let response_object = row
+        .try_get::<Option<String>, _>("response_object")
+        .map_err(|_| AppError::Internal)?;
+    let Some(response_object) = response_object else {
+        return Ok(Vec::new());
+    };
+    if !response_object.starts_with(crate::generation::PROVIDER_REFERENCE_PREFIX) {
+        return Ok(Vec::new());
+    }
+    Ok(crate::generation::open_provider_asset_reference(
+        "request",
+        request_id,
+        &response_object,
+        key_material,
+    )?
+    .into_iter()
+    .map(|asset| GenerationAssetDownload {
+        view: GenerationAssetView {
+            asset_id: asset.asset_id,
+            index: asset.index,
+            mime_type: asset.mime_type,
+            size_bytes: 0,
+            filename: asset.filename,
+        },
+        source: GenerationAssetSource::Provider {
+            owner: GenerationAssetProviderOwner::Request(request_id),
+            url: asset.url,
+            expires_at: asset.expires_at,
+        },
+    })
+    .collect())
 }
 
 fn synchronous_image_claim_from_row(

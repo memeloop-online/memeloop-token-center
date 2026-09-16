@@ -70,6 +70,18 @@ pub struct ComponentAdapterContribution {
     pub max_response_bytes: usize,
 }
 
+/// Versioned generation transport guarantees declared by a provider type.
+/// Unknown and omitted guarantees always fail closed.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationAdapterContribution {
+    pub api_version: String,
+    #[serde(default)]
+    pub provable_submit_idempotency: bool,
+    #[serde(default)]
+    pub provider_asset_reads_repeatable: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderType {
@@ -83,6 +95,8 @@ pub struct ProviderType {
     pub oauth_adapter: Option<OAuthAdapterContribution>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub component_adapter: Option<ComponentAdapterContribution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_adapter: Option<GenerationAdapterContribution>,
     #[serde(default)]
     pub source: String,
 }
@@ -137,6 +151,11 @@ impl ProviderCatalog {
                     "enum": ["images", "responses-tool"],
                     "default": "images",
                     "description": "Use responses-tool when a Codex-compatible upstream exposes image_generation through /v1/responses."
+                },
+                "provider_asset_reads_repeatable": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Whether generated-asset GET URLs remain usable after a bounded validation GET. Set false for one-use URLs."
                 },
                 "image_main_model": {
                     "title": "Image generation model",
@@ -257,6 +276,11 @@ impl ProviderCatalog {
             credential_schema: credential_schema.clone(),
             oauth_adapter: None,
             component_adapter: None,
+            generation_adapter: Some(GenerationAdapterContribution {
+                api_version: "generation-adapter-v1".to_owned(),
+                provable_submit_idempotency: false,
+                provider_asset_reads_repeatable: false,
+            }),
             source: "builtin".to_owned(),
         }];
         types.push(crate::provider::cbcnx::provider_type(
@@ -292,6 +316,11 @@ impl ProviderCatalog {
             credential_schema: credential_schema.clone(),
             oauth_adapter: None,
             component_adapter: None,
+            generation_adapter: Some(GenerationAdapterContribution {
+                api_version: "generation-adapter-v1".to_owned(),
+                provable_submit_idempotency: false,
+                provider_asset_reads_repeatable: true,
+            }),
             source: "builtin".to_owned(),
         });
         types.push(ProviderType {
@@ -328,6 +357,11 @@ impl ProviderCatalog {
             credential_schema,
             oauth_adapter: None,
             component_adapter: None,
+            generation_adapter: Some(GenerationAdapterContribution {
+                api_version: "generation-adapter-v1".to_owned(),
+                provable_submit_idempotency: false,
+                provider_asset_reads_repeatable: true,
+            }),
             source: "builtin".to_owned(),
         });
         types.push(builtin_managed_oauth_provider(
@@ -515,6 +549,15 @@ impl ProviderCatalog {
             }
             crate::schema::validate_definition(&contribution.config_schema)?;
             crate::schema::validate_definition(&contribution.credential_schema)?;
+            if contribution
+                .generation_adapter
+                .as_ref()
+                .is_some_and(|adapter| adapter.api_version != "generation-adapter-v1")
+            {
+                return Err(AppError::BadRequest(
+                    "unsupported provider generation adapter version".into(),
+                ));
+            }
             Arc::make_mut(&mut self.types).push(contribution);
         }
         Ok(())
@@ -614,6 +657,7 @@ fn builtin_managed_oauth_provider(
         }),
         oauth_adapter: None,
         component_adapter: None,
+        generation_adapter: None,
         source: "builtin".to_owned(),
     }
 }
@@ -670,6 +714,7 @@ fn builtin_interactive_oauth_provider(
             refresh_url: oauth.refresh_url.to_owned(),
         }),
         component_adapter: None,
+        generation_adapter: None,
         source: "builtin".to_owned(),
     }
 }
