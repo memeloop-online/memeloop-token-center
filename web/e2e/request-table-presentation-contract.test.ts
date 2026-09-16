@@ -34,12 +34,16 @@ test('generation TPS requires observed output interval and does not relabel tota
 });
 
 test('unreliable failed usage and cost remain unknown without erasing reported settlements', () => {
-  for (const usage_basis of [undefined, null, 'provider_estimated', 'contract_ceiling', 'not_observed'] as const) {
+  for (const usage_basis of [undefined, null, 'provider_estimated', 'contract_ceiling'] as const) {
     const failed = { ...request, status_code: 499, usage_basis, cost: '35' };
     assert.equal(requestUsageIsActual(failed), false);
     assert.equal(requestCostCopy(failed, 'en').unknown, true);
     assert.equal(failed.cost, '35');
   }
+  const unobserved = { ...request, status_code: 499, usage_basis: 'not_observed' as const, cost: '0' };
+  assert.equal(requestUsageIsActual(unobserved), false);
+  assert.equal(requestCostCopy(unobserved, 'en').unknown, false);
+  assert.equal(unobserved.cost, '0');
   const reported = { ...request, status_code: 499, cost: '0.2' };
   assert.equal(requestUsageIsActual(reported), true);
   assert.equal(requestCostCopy(reported, 'en').unknown, false);
@@ -74,11 +78,11 @@ test('average output TPS uses recorded total seconds, distinguishes valid zero f
   assert.equal(averageRequestOutputTps({ ...request, output_tokens: -1 }), null);
 });
 
-test('unobserved local zero is presented as unknown supplier cost', () => {
-  const unknown = requestCostCopy({ ...request, usage_basis: 'not_observed', cost: '0' }, 'en');
-  assert.equal(unknown.unknown, true);
-  assert.equal(unknown.label, 'Cost unknown');
-  assert.match(unknown.hint, /does not prove/);
+test('unobserved local zero is presented as a zero local cost', () => {
+  const unobserved = requestCostCopy({ ...request, usage_basis: 'not_observed', cost: '0' }, 'en');
+  assert.equal(unobserved.unknown, false);
+  assert.equal(unobserved.label, 'Usage not observed');
+  assert.match(unobserved.hint, /settled this request at 0/);
   assert.equal(requestCostCopy(request, 'en').unknown, false);
 });
 

@@ -67,12 +67,12 @@ export function requestCostCopy(request: RequestView, locale: string) {
   /** Recorded local ledger amounts stay visible in details, explicitly labelled as local settlement rather than supplier usage. */
   const ledgerLabel = zh ? '本地账本金额' : 'Local ledger amount';
   if (request.usage_basis === 'not_observed') return {
-    unknown: true,
+    unknown: false,
     ledgerLabel,
-    label: zh ? '费用未知' : 'Cost unknown',
+    label: zh ? '未观测用量' : 'Usage not observed',
     hint: zh
-      ? '本地账本以 0 结算并释放了预留，但未观测到供应商实际用量；0 不是供应商免费或实际费用为零的证明。'
-      : 'The local ledger settled zero and released the reservation, but supplier usage was not observed; zero does not prove the supplier charged nothing.',
+      ? '本地账本已按 0 结算并释放预留；未观测到供应商实际用量。'
+      : 'The local ledger settled this request at 0 and released the reservation; supplier usage was not observed.',
   };
   if (!requestUsageIsActual(request)) return {
     unknown: true, ledgerLabel,
