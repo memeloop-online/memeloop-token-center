@@ -343,7 +343,7 @@ mod tests {
         }
         assert_eq!(admission.snapshot().active_files, 1);
         capture.abort();
-        assert!(capture.await.unwrap_err().is_cancelled());
+        assert!(matches!(capture.await, Err(error) if error.is_cancelled()));
         assert_eq!(admission.snapshot().used_bytes, 0);
         assert_eq!(admission.snapshot().active_files, 0);
         assert_eq!(file_count(directory.path()), 0);

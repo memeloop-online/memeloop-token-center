@@ -157,6 +157,9 @@ pub(crate) async fn admit_gateway_request_body(
     .await
 }
 
+// Keep the independent admission limits explicit at this middleware boundary;
+// grouping them would obscure which process-wide budget each argument controls.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn admit_gateway_request_body_with_memory(
     request: Request,
     deadline: Duration,
