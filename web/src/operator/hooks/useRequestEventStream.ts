@@ -89,18 +89,18 @@ export function useRequestEventStream({
       dispatch({ type: 'idle' });
       return;
     }
-    const controller = new AbortController();
     let connectedOnce = false;
-    const connect = async () => {
-      while (!controller.signal.aborted) {
+    let controller: AbortController | undefined;
+    const connect = async (activeController: AbortController) => {
+      while (!activeController.signal.aborted) {
         dispatch(connectedOnce ? { type: 'reconnecting' } : { type: 'connecting' });
         try {
           await streamSse<RequestEvent>(
             `/internal/v1/request-events${query(tenant, cursor.current)}`,
             token,
-            controller.signal,
+            activeController.signal,
             ({ id, event: eventName, data: event }) => {
-              if (controller.signal.aborted) return;
+              if (activeController.signal.aborted) return;
               if (id !== event.event_id) throw new Error('SSE id does not match request event_id');
               if (eventName !== `request.${event.event_kind}`) throw new Error('SSE event name does not match request event_kind');
               if (!isAfter(event, cursor.current)) return;
@@ -108,25 +108,48 @@ export function useRequestEventStream({
               callback.current(event);
             },
             () => {
-              if (controller.signal.aborted) return;
+              if (activeController.signal.aborted) return;
               connectedOnce = true;
               dispatch({ type: 'live' });
             },
           );
-          if (!controller.signal.aborted) dispatch({ type: 'reconnecting' });
+          if (!activeController.signal.aborted) dispatch({ type: 'reconnecting' });
         } catch (reason) {
-          if (!controller.signal.aborted) {
+          if (!activeController.signal.aborted) {
             dispatch({
               type: 'reconnecting',
               message: apiDiagnosticMessage(reason, disconnectedMessage, { requestId: requestIdLabel, streamInterrupted }),
             });
           }
         }
-        await waitForReconnect(controller.signal, 1000);
+        await waitForReconnect(activeController.signal, 1000);
       }
     };
-    void connect();
-    return () => controller.abort();
+    const start = () => {
+      if (controller || document.hidden) return;
+      controller = new AbortController();
+      const activeController = controller;
+      void connect(activeController).finally(() => {
+        if (controller === activeController) controller = undefined;
+      });
+    };
+    const visibilityChanged = () => {
+      if (document.hidden) {
+        const activeController = controller;
+        controller = undefined;
+        activeController?.abort();
+        return;
+      }
+      start();
+    };
+    document.addEventListener('visibilitychange', visibilityChanged);
+    start();
+    return () => {
+      document.removeEventListener('visibilitychange', visibilityChanged);
+      const activeController = controller;
+      controller = undefined;
+      activeController?.abort();
+    };
   }, [disconnectedMessage, enabled, tenant, token, requestIdLabel, streamInterrupted]);
 
   return {
