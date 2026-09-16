@@ -36,10 +36,11 @@ test('throughput and latency stay in distinct, truthful series', () => {
   assert.deepEqual(latency.series.map((series) => [series.name, series.data]), [['Average', [20]], ['P95 (approx.)', [70]]]);
 });
 
-test('average bucket TPS derives from historical output and total duration only', () => {
-  assert.equal(averageBucketTps(point), 41.66666666666667);
-  assert.equal(averageBucketTps({ ...point, avg_duration_ms: null }), null);
-  assert.equal(averageBucketTps({ ...point, requests: 0 }), null);
+test('average bucket TPS derives from eligible provider-reported samples only', () => {
+  const eligible: UsageAnalysisTimeBucket = { ...point, output_rate: { requests: 4, output_tokens: 5, duration_ms: 120 } };
+  assert.equal(averageBucketTps(eligible), 41.66666666666667);
+  assert.equal(averageBucketTps(point), null, 'legacy totals without output_rate provenance never fall back');
+  assert.equal(averageBucketTps({ ...eligible, output_rate: { requests: 0, output_tokens: 5, duration_ms: 120 } }), null, 'zero eligible samples stay unavailable');
 });
 
 test('cost charts never add unlike currencies', () => {

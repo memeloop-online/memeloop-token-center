@@ -1,7 +1,7 @@
 import { LocalSettlementNotice, localSettlementLabel } from '../LocalSettlementNotice';
 import { displayTimeZone } from '../charts/displayTimeZone';
 import { totalTokens } from '../charts/usageCharts';
-import { formatCurrencyDisplay, formatMetricDisplay, formatPercent } from '../format';
+import { formatCurrencyDisplay, formatMetricDisplay, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
 import { DetailTooltip } from '../design-system';
 import type { OperatorUsageAnalysis } from '../types';
@@ -13,6 +13,7 @@ import {
   finiteP95Points,
   formatTps,
   histogramP95,
+  seriesTpsSamples,
 } from './analyticsPresentation';
 
 export function UsageSummaryMetrics({ stats }: { stats: OperatorUsageAnalysis }) {
@@ -22,7 +23,9 @@ export function UsageSummaryMetrics({ stats }: { stats: OperatorUsageAnalysis })
   const number = (value: number) => formatMetricDisplay(value, locale);
   const exactValue = (text: string, title?: string) => <span className="metric-number"><span className="metric-exact" title={title ?? text}>{text}</span></span>;
   const numeric = (label: string, value: number, trend: number[], tone = '') => <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={label} value={exactValue(number(value).text, number(value).title)} trend={trend} tone={tone} />;
-  const tpsMetric = (label: string, value: ReturnType<typeof formatTps>, trend: Array<number | null>) => <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={label} labelContent={<DetailTooltip content={t('usage.averageTpsHint')}><span tabIndex={0}>{label}</span></DetailTooltip>} value={exactValue(value.text, value.title)} title={value.title} formatSample={(sample) => formatTps(sample, locale).title ?? formatTps(sample, locale).text} trend={trend} />;
+  const summarySamples = summary.output_rate && Number.isFinite(summary.output_rate.requests) && summary.output_rate.requests >= 0 ? summary.output_rate.requests : seriesTpsSamples(points);
+  const tpsHint = <>{t('usage.averageTpsHint')} {summarySamples === null ? t('usage.tpsEligibleSamplesUnknown') : t('usage.tpsEligibleSamples', { count: formatNumber(summarySamples, locale, 0) })}</>;
+  const tpsMetric = (label: string, value: ReturnType<typeof formatTps>, trend: Array<number | null>) => <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={label} labelContent={<DetailTooltip content={tpsHint}><span tabIndex={0}>{label}</span></DetailTooltip>} value={exactValue(value.text, value.title)} title={value.title} formatSample={(sample) => formatTps(sample, locale).title ?? formatTps(sample, locale).text} trend={trend} />;
   const average = analyticsDuration(summary.avg_duration_ms, locale);
   const p95 = histogramP95(summary.p95_duration_ms, summary.p95_is_capped, locale);
   const averageTpsTrend = averageBucketTpsSeries(points);

@@ -59,9 +59,10 @@ test('UsageAnalysis keeps every rendered NumericMetric exact value on one readab
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/usage-analysis.html`);
     await page.locator('.usage-metrics .metric-exact').first().waitFor();
     await page.locator('.usage-metrics .metric-label').getByText('Average TPS', { exact: true }).focus();
-    const tpsDefinition = page.getByRole('tooltip').filter({ hasText: 'Total recorded output tokens divided by total request time' });
+    const tpsDefinition = page.getByRole('tooltip').filter({ hasText: 'Provider-reported output tokens of successful, non-compaction requests' });
     await tpsDefinition.waitFor();
-    assert.match(await tpsDefinition.innerText(), /Includes all requests in the current filter/);
+    assert.match(await tpsDefinition.innerText(), /Archived records without sample provenance are excluded/);
+    assert.match(await tpsDefinition.innerText(), /Eligible samples: 1,000/, 'the card description must expose the eligible sample count');
     await page.keyboard.press('Escape');
 
     for (const theme of ['dark', 'light'] as const) {

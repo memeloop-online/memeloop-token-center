@@ -8,7 +8,7 @@ import { useAnchoredPopover } from './useAnchoredPopover.js';
 import { DetailTooltip } from './design-system';
 import { RequestStatus } from './RequestStatus';
 import { unnamedSessionName } from './sessionTitles.js';
-import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestIsPending, requestUsageCopy } from './requestTablePresentation';
+import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestFailed, requestIsPending, requestUsageCopy, requestUsageIsActual } from './requestTablePresentation';
 import { requestErrorCopy } from './requestStatusPresentation';
 
 export function Shell({ children, operator = false }: { children: ReactNode; operator?: boolean }) {
@@ -124,13 +124,15 @@ function requestTokenDetails(request: RequestView, locale: Parameters<typeof for
 function RequestTokenSummary({ request }: { request: RequestView }) {
   const { locale, t } = useI18n();
   const pending = requestIsPending(request);
+  const obscured = !pending && !requestUsageIsActual(request);
   const tokenDisplay = formatMetricDisplay(request.input_tokens + request.output_tokens, locale);
   const tokenDetails = pending ? t('request.pendingUsage') : requestTokenDetails(request, locale, t);
   const uncachedInput = nonCachedRequestInput(request);
   const basis = requestUsageCopy(request, locale);
-  const prefix = request.usage_basis === 'contract_ceiling' ? '≤ ' : request.usage_basis === 'provider_estimated' ? '≈ ' : '';
-  return <>{!pending && request.usage_basis !== 'provider_reported' && <DetailTooltip content={basis.hint}><small className="request-usage-basis" tabIndex={0}>{basis.label}</small></DetailTooltip>}<DetailTooltip content={`${tokenDetails} ${basis.hint}`}><span className="request-value-info request-token-total" aria-label={pending ? t('request.pendingUsage') : `${t('request.totalTokens')} ${tokenDisplay.text} (${tokenDetails}) ${basis.hint}`} tabIndex={0}>{pending ? t('common.running') : <>{t('request.totalTokens')} <span>{prefix}{tokenDisplay.text}</span></>}</span></DetailTooltip>
-    {pending ? <DetailTooltip content={t('request.pendingUsage')}><span className="request-token-pending" tabIndex={0}>{locale === 'zh-CN' ? '用量待结算' : 'Usage pending settlement'}</span></DetailTooltip> : <span className="request-token-primary"><span>{t('request.uncachedInput')} <b>{uncachedInput === null ? <DetailTooltip content={t('request.cacheMissing')}><span tabIndex={0}>{t('request.usageUnknown')}</span></DetailTooltip> : `${prefix}${formatMetricDisplay(uncachedInput, locale).text}`}</b></span><span>{t('request.outputTokens')} <b>{prefix}{formatMetricDisplay(request.output_tokens, locale).text}</b></span></span>}
+  const prefix = obscured ? '' : request.usage_basis === 'contract_ceiling' ? '≤ ' : request.usage_basis === 'provider_estimated' ? '≈ ' : '';
+  const totalValue = obscured ? '—' : `${prefix}${tokenDisplay.text}`;
+  return <>{!pending && request.usage_basis !== 'provider_reported' && <DetailTooltip content={basis.hint}><small className="request-usage-basis" tabIndex={0}>{basis.label}</small></DetailTooltip>}<DetailTooltip content={`${tokenDetails} ${basis.hint}`}><span className="request-value-info request-token-total" aria-label={pending ? t('request.pendingUsage') : `${t('request.totalTokens')} ${totalValue} (${tokenDetails}) ${basis.hint}`} tabIndex={0}>{pending ? t('common.running') : <>{t('request.totalTokens')} <span>{totalValue}</span></>}</span></DetailTooltip>
+    {pending ? <DetailTooltip content={t('request.pendingUsage')}><span className="request-token-pending" tabIndex={0}>{locale === 'zh-CN' ? '用量待结算' : 'Usage pending settlement'}</span></DetailTooltip> : <span className="request-token-primary"><span>{t('request.uncachedInput')} <b>{obscured ? '—' : uncachedInput === null ? <DetailTooltip content={t('request.cacheMissing')}><span tabIndex={0}>{t('request.usageUnknown')}</span></DetailTooltip> : `${prefix}${formatMetricDisplay(uncachedInput, locale).text}`}</b></span><span>{t('request.outputTokens')} <b>{obscured ? '—' : `${prefix}${formatMetricDisplay(request.output_tokens, locale).text}`}</b></span></span>}
   </>;
 }
 
@@ -181,10 +183,11 @@ function RequestSessionMetadata({ value }: { value: string }) {
  * portal and operator request drawer cannot drift or turn absent telemetry
  * into inferred values.
  */
-function RequestOutputRate({ request }: { request: RequestView }) {
+function RequestOutputRate({ request, details = false }: { request: RequestView; details?: boolean }) {
   const { locale, t } = useI18n();
-  const generation = generationRequestOutputTps(request);
-  const average = averageRequestOutputTps(request);
+  const excludedFailure = !details && requestFailed(request);
+  const generation = excludedFailure ? null : generationRequestOutputTps(request);
+  const average = excludedFailure ? null : averageRequestOutputTps(request);
   const first = request.first_output_ms;
   const wait = typeof first === 'number' && Number.isFinite(first) && first >= 0
     ? `${t('request.firstOutputWait')}: ${formatMilliseconds(first, locale)}` : t('request.firstOutputMissing');
@@ -192,7 +195,8 @@ function RequestOutputRate({ request }: { request: RequestView }) {
     ['generation', generation, t('request.generationTps'), t('request.generationTpsHint')],
     ['average', average, t('request.averageTps'), t('request.averageTpsHint')],
   ] as const).map(([kind, rate, label, explanation]) => {
-    const hint = `${explanation} ${requestUsageCopy(request, locale).hint} ${rate === null ? t(requestIsPending(request) ? 'request.tpsRunning' : 'request.tpsMissing') : ''} ${wait}`;
+    const exclusion = excludedFailure ? (locale === 'zh-CN' ? '失败请求不计入速率统计。' : 'Failed requests are excluded from throughput statistics.') : request.compaction === true ? (locale === 'zh-CN' ? '上下文压缩不计入生成速率。' : 'Context compaction is excluded from generation throughput.') : '';
+    const hint = `${explanation} ${requestUsageCopy(request, locale).hint} ${exclusion || (rate === null ? t(requestIsPending(request) ? 'request.tpsRunning' : 'request.tpsMissing') : '')} ${wait}`;
     return <DetailTooltip key={kind} content={hint}><span className="request-output-rate" data-rate={kind} tabIndex={0} aria-label={`${label}: ${rate === null ? t('request.usageUnknown') : formatNumber(rate, locale, 2)}. ${hint}`}><small>{label}</small> {rate === null ? '—' : formatNumber(rate, locale, 2)}</span></DetailTooltip>;
   })}</span>;
 }
@@ -248,7 +252,7 @@ export function RequestDiagnostics({
       <div className="request-detail-wide"><b>{t('request.model')}</b><RequestMetadata label={request.model} fields={[[t('request.routeId'), request.route_id], [t('request.protocol'), request.protocol]]} /><RequestCompaction request={request} /></div>
       <div className="request-detail-wide"><b>{zh ? '凭据' : 'Credential'}</b><RequestMetadata label={credentialLabel} fields={[[zh ? '凭据 ID' : 'Credential ID', request.credential_identity?.key_id], [zh ? '主体' : 'Principal', request.credential_identity?.principal_external_id], [zh ? '租户' : 'Tenant', request.credential_identity?.tenant_external_id]]} /></div>
       <div className="request-token-cell"><b>{t('request.tokens')}</b><RequestTokenSummary request={request} /></div>
-      <div><b>{t('request.cost')}</b>{pending ? settlement : <DetailTooltip content={costCopy.unknown ? costCopy.hint : `${cost.title ?? missing} ${costCopy.hint}`}><span tabIndex={0}>{costCopy.unknown ? costCopy.label : cost.text}</span></DetailTooltip>}</div>
+      <div><b>{t('request.cost')}</b>{pending ? settlement : <DetailTooltip content={costCopy.unknown ? `${costCopy.hint} ${costCopy.ledgerLabel}: ${cost.title ?? cost.text}` : `${cost.title ?? missing} ${costCopy.hint}`}><span tabIndex={0} aria-label={costCopy.unknown ? costCopy.label : undefined}>{costCopy.unknown ? '—' : cost.text}</span></DetailTooltip>}</div>
     </section>
     <section className="request-detail-group" aria-label={zh ? '交付与性能' : 'Delivery and performance'}>
       <div><b>{zh ? '最终上游' : 'Final upstream'}</b><RequestMetadata label={upstreamName || (request.upstream_account_id ? (zh ? '未命名上游' : 'Unnamed upstream') : missing)} fields={[[t('request.upstreamId'), request.upstream_account_id]]} /></div>
@@ -256,7 +260,7 @@ export function RequestDiagnostics({
       <div><b>{t('request.request')}</b><RequestMetadata label={zh ? '记录标识' : 'Record identifiers'} fields={[[zh ? '请求 ID' : 'Request ID', request.request_id]]} /></div>
       {request.error_code && <div className="request-detail-wide"><b>{t('request.error')}</b><DetailTooltip content={`${t('traffic.errorCode')}: ${request.error_code}`}><span tabIndex={0}>{requestErrorCopy(request.error_code, locale)}</span></DetailTooltip></div>}
       <div><b>{t('request.duration')}</b><DetailTooltip content={timingDetails}><span className="request-detail-timing" tabIndex={0}>{duration.text === '—' ? missing : duration.text}</span></DetailTooltip></div>
-      <div><RequestOutputRate request={request} /></div>
+      <div><RequestOutputRate request={request} details /></div>
     </section>
     {context && <section className="request-detail-group request-detail-session" aria-label={t('request.session')}><div className="request-detail-wide"><b>{t('request.session')}</b>
       {context.association === 'confirmed'
@@ -328,7 +332,7 @@ export function RequestTable({
               <td className="request-credential-cell" data-label={t('self.credential')}><DetailTooltip content={credentialDetails}><strong tabIndex={0}>{credentialLabel}</strong></DetailTooltip></td>
               <td className="request-model-cell"><DetailTooltip content={technicalSummary}><span className="request-routing-info" tabIndex={0}><code>{request.model}</code>{upstreamName && <small className="request-upstream-name">{upstreamName}</small>}</span></DetailTooltip><RequestCompaction request={request} /></td>
               <td className="request-token-cell" data-label={t('request.tokens')}><RequestTokenSummary request={request} /></td>
-              <td className="request-cost-cell" data-label={t('request.cost')}><DetailTooltip content={pending ? copy.pendingUsage : costCopy.unknown ? costCopy.hint : `${cost.title ?? cost.text} ${costCopy.hint}`}><span className="request-value-info" tabIndex={0}>{pending ? cost.text : costCopy.unknown ? costCopy.label : cost.text}</span></DetailTooltip></td>
+              <td className="request-cost-cell" data-label={t('request.cost')}><DetailTooltip content={pending ? copy.pendingUsage : costCopy.unknown ? costCopy.hint : `${cost.title ?? cost.text} ${costCopy.hint}`}><span className="request-value-info" tabIndex={0} aria-label={costCopy.unknown ? costCopy.label : undefined}>{pending ? cost.text : costCopy.unknown ? '—' : cost.text}</span></DetailTooltip></td>
               {showsSession && <td className="request-session-cell" data-label={t('request.session')}>
                 {!context
                   ? '—'

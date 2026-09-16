@@ -14,6 +14,7 @@ declare global {
 
 const largeMetric = 1_250_000_000_000;
 const metrics = {
+  output_rate: { requests: 1_000, output_tokens: 125, duration_ms: 600_000 },
   requests: largeMetric,
   success: largeMetric,
   failed: largeMetric,

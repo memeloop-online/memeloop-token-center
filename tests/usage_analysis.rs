@@ -257,6 +257,152 @@ async fn move_request_fact(database_url: &str, request_id: Uuid, created_at: i64
     pool.close().await;
 }
 
+async fn assert_output_rate_provenance(database_url: String) {
+    let mut config = Config::for_test(database_url.clone());
+    config.key_pepper = String::from_utf8(PEPPER.to_vec()).unwrap();
+    let state = AppState::initialize(config).await.unwrap();
+    let tenant = format!("output-rate-{}", Uuid::now_v7());
+    let key = issue(&state, &tenant, "rate", "rate", "USD").await;
+    let pool = AnyPool::connect(&database_url).await.unwrap();
+    let mut reported = None;
+    for (status, basis, error) in [
+        (200, Some("provider_reported"), None),
+        (499, Some("provider_reported"), Some("client_cancelled")),
+        (200, Some("contract_ceiling"), None),
+        (200, Some("provider_estimated"), None),
+        (200, Some("not_observed"), None),
+        (200, None, None),
+        (
+            200,
+            Some("provider_reported"),
+            Some("upstream_incomplete_response"),
+        ),
+    ] {
+        let id = finish(
+            &state,
+            &key,
+            UsageSample {
+                model: "rate-model",
+                status_code: status,
+                duration_ms: 1000,
+                input_tokens: 100,
+                cached_input_tokens: 0,
+                cache_write_tokens: 0,
+                output_tokens: 20,
+                cost_micros: 10,
+                error_code: error,
+            },
+        )
+        .await;
+        sqlx::query("UPDATE request_records SET usage_basis = $1 WHERE id = $2")
+            .bind(basis)
+            .bind(id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        if status == 200 && basis == Some("provider_reported") && error.is_none() {
+            reported = Some(id);
+        }
+    }
+    let filter = memeloop_token_center::db::UsageAnalysisFilter::default();
+    let initial = state
+        .db
+        .operator_usage_analysis_trends(&tenant, filter.clone())
+        .await
+        .unwrap();
+    let rate = initial.summary.output_rate.unwrap();
+    assert_eq!(
+        (rate.requests, rate.output_tokens, rate.duration_ms),
+        (1, 20, 1000)
+    );
+    assert_eq!(
+        initial.summary.requests, 7,
+        "provenance filtering must not erase usage/accounting activity"
+    );
+    let failed = state
+        .db
+        .operator_usage_analysis_trends(
+            &tenant,
+            memeloop_token_center::db::UsageAnalysisFilter {
+                status: Some("error".into()),
+                ..filter.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed.summary.output_rate.unwrap().requests, 0);
+    let wrong_model = state
+        .db
+        .operator_usage_analysis_trends(
+            &tenant,
+            memeloop_token_center::db::UsageAnalysisFilter {
+                model: Some("different-model".into()),
+                ..filter.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_model.summary.requests, 0);
+
+    // Compaction evidence may arrive after usage projection. The next read must
+    // reflect it without rewriting the ledger or retaining a contaminated rate.
+    let id = reported.unwrap().to_string();
+    sqlx::query(
+        "UPDATE request_records SET conversation_cluster_id = 'rate-cluster' WHERE id = $1",
+    )
+    .bind(&id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, atom_hashes_json, created_at, inference_version, compaction) VALUES ($1, 'rate-cluster', $2, $3, '[]', 1, 1, 1)")
+        .bind(Uuid::now_v7().to_string()).bind(&id).bind(key.key_id.to_string())
+        .execute(&pool).await.unwrap();
+    let late = state
+        .db
+        .operator_usage_analysis_trends(&tenant, filter.clone())
+        .await
+        .unwrap();
+    assert_eq!(late.summary.output_rate.unwrap().requests, 0);
+    assert_eq!(late.summary.requests, 7);
+    assert!(
+        late.time_series
+            .iter()
+            .all(|point| point.metrics.output_rate.as_ref().unwrap().requests == 0)
+    );
+    // An unrelated observation must not change another scope's measurements.
+    sqlx::query(
+        "UPDATE conversation_observations SET cluster_id = 'other-cluster' WHERE request_id = $1",
+    )
+    .bind(&id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let restored = state
+        .db
+        .operator_usage_analysis_trends(&tenant, filter)
+        .await
+        .unwrap();
+    assert_eq!(restored.summary.output_rate.unwrap().requests, 1);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_output_rate_requires_comparable_retained_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    assert_output_rate_provenance(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("output-rate.db").display()
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn postgres_output_rate_requires_comparable_retained_evidence() {
+    if let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") {
+        assert_output_rate_provenance(database_url).await;
+    }
+}
+
 fn assert_exact_boundary_response(body: &Value, bucket_start: i64) {
     assert_eq!(body["summary"]["requests"], 2, "{body}");
     assert_eq!(body["summary"]["input_tokens"], 110, "{body}");
@@ -1589,7 +1735,7 @@ async fn postgres_usage_analysis_grouping_sets_match_currency_safe_contract() {
     let full_analysis_events = full_capture.analysis_events();
     assert_eq!(full_analysis_events.len(), 1);
     assert_eq!(full_analysis_events[0]["projection"], "full");
-    assert_eq!(full_analysis_events[0]["business_statement_count"], 4);
+    assert_eq!(full_analysis_events[0]["business_statement_count"], 5);
     let trends_path = path.replacen(
         "/internal/v1/usage-analysis",
         "/internal/v1/usage-analysis/trends",
@@ -1604,10 +1750,10 @@ async fn postgres_usage_analysis_grouping_sets_match_currency_safe_contract() {
     assert_eq!(
         analysis_events.len(),
         1,
-        "the PostgreSQL trends route executes one business aggregation statement"
+        "the PostgreSQL trends route records one snapshot completion"
     );
     assert_eq!(analysis_events[0]["projection"], "trends");
-    assert_eq!(analysis_events[0]["business_statement_count"], 1);
+    assert_eq!(analysis_events[0]["business_statement_count"], 2);
     drop((full_dispatch, trends_dispatch));
     assert_eq!(body["summary"]["requests"], 2);
     assert_eq!(body["summary"]["input_tokens"], 40);

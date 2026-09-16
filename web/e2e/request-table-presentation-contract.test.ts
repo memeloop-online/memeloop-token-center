@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestIsPending } from '../src/requestTablePresentation.js';
+import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestIsPending, requestUsageIsActual } from '../src/requestTablePresentation.js';
 import { requestViewFromEvent } from '../src/operator/traffic/requestTraffic.js';
 import type { RequestEvent } from '../src/types.js';
 import type { RequestView } from '../src/types.js';
@@ -26,6 +26,24 @@ test('generation TPS requires observed output interval and does not relabel tota
   }
   assert.equal(averageRequestOutputTps({ ...timed, usage_basis: 'contract_ceiling', output_tokens: 100000, duration_ms: 11681 }), null, 'the reported 8560.91 reservation-ceiling ratio must not appear as actual throughput');
   assert.equal(generationRequestOutputTps({ ...timed, first_output_ms: undefined }), null);
+  assert.equal(generationRequestOutputTps({ ...timed, generation_duration_ms: 1500 }), null, 'an interval cannot extend beyond total duration');
+  assert.equal(generationRequestOutputTps({ ...timed, duration_ms: null }), null);
+  assert.equal(generationRequestOutputTps({ ...timed, compaction: true }), null);
+  assert.equal(averageRequestOutputTps({ ...timed, compaction: true }), null);
+  assert.equal(generationRequestOutputTps({ ...timed, generation_duration_ms: 1 }), 32000, 'no arbitrary high-rate threshold masks an otherwise recorded gateway interval');
+});
+
+test('unreliable failed usage and cost remain unknown without erasing reported settlements', () => {
+  for (const usage_basis of [undefined, null, 'provider_estimated', 'contract_ceiling', 'not_observed'] as const) {
+    const failed = { ...request, status_code: 499, usage_basis, cost: '35' };
+    assert.equal(requestUsageIsActual(failed), false);
+    assert.equal(requestCostCopy(failed, 'en').unknown, true);
+    assert.equal(failed.cost, '35');
+  }
+  const reported = { ...request, status_code: 499, cost: '0.2' };
+  assert.equal(requestUsageIsActual(reported), true);
+  assert.equal(requestCostCopy(reported, 'en').unknown, false);
+  assert.equal(requestUsageIsActual({ ...request, usage_basis: 'not_observed' }), false);
 });
 
 test('legacy and archive SSE patches retain recorded timing', () => {

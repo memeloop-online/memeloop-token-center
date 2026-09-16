@@ -1,13 +1,13 @@
 import type { ReactNode } from 'react';
 import { LocalSettlementNotice, localSettlementLabel } from '../LocalSettlementNotice';
 import { displayTimeZone } from '../charts/displayTimeZone';
-import { formatCurrencyDisplay, formatMetricDisplay, formatPercent } from '../format';
+import { formatCurrencyDisplay, formatMetricDisplay, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
 import { DetailTooltip } from '../design-system';
 import type { MonitoringHealth, OperatorMonitoringSnapshot, UsageAnalysisCost, UsageAnalysisTimeBucket } from '../types';
 import { monitoringModelGroups } from './monitoringAccountGroups';
 import { AnalyticsMetric } from './AnalyticsMetric';
-import { analyticsAge, analyticsDuration, averageBucketTpsSeries, averageSeriesTps, formatTps, histogramP95 } from './analyticsPresentation';
+import { analyticsAge, analyticsDuration, averageBucketTpsSeries, averageSeriesTps, formatTps, histogramP95, seriesTpsSamples } from './analyticsPresentation';
 
 function CostLines({ costs }: { costs: UsageAnalysisCost[] }) {
   const { locale } = useI18n();
@@ -59,6 +59,8 @@ export function MonitoringSnapshot({ snapshot, points = [], quotaSummary }: { sn
   const average = analyticsDuration(summary.avg_duration_ms, locale);
   const averageTpsTrend = averageBucketTpsSeries(points);
   const averageTps = formatTps(averageSeriesTps(points), locale);
+  const tpsSamples = seriesTpsSamples(points);
+  const tpsHint = <>{t('usage.averageTpsHint')} {tpsSamples === null ? t('usage.tpsEligibleSamplesUnknown') : t('usage.tpsEligibleSamples', { count: formatNumber(tpsSamples, locale, 0) })}</>;
   const currency = summary.costs.length === 1 ? summary.costs[0].currency : undefined;
   return <section className="operator-monitoring" aria-labelledby="monitoring-heading">
     <article className="panel">
@@ -71,7 +73,7 @@ export function MonitoringSnapshot({ snapshot, points = [], quotaSummary }: { sn
         <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={t('traffic.success')} value={count(summary.successful_requests).text} title={count(summary.successful_requests).title} tone="positive" trend={points.map((point) => point.success)} ratio={successRate} />
         <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={t('traffic.failure')} value={count(summary.failed_requests).text} title={count(summary.failed_requests).title} tone="negative" trend={points.map((point) => point.failed)} ratio={successRate === null ? null : 1 - successRate} />
         <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={t('usage.successRate')} value={formatPercent(successRate, locale)} ratio={successRate} />
-        <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={t('usage.averageTps')} labelContent={<DetailTooltip content={t('usage.averageTpsHint')}><span tabIndex={0}>{t('usage.averageTps')}</span></DetailTooltip>} value={averageTps.text} title={averageTps.title} formatSample={(value) => formatTps(value, locale).title ?? formatTps(value, locale).text} trend={averageTpsTrend} />
+        <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={t('usage.averageTps')} labelContent={<DetailTooltip content={tpsHint}><span tabIndex={0}>{t('usage.averageTps')}</span></DetailTooltip>} value={averageTps.text} title={averageTps.title} formatSample={(value) => formatTps(value, locale).title ?? formatTps(value, locale).text} trend={averageTpsTrend} />
         <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={t('usage.average')} value={average.text} title={average.title} formatSample={value => analyticsDuration(value, locale).title ?? analyticsDuration(value, locale).text} trend={points.map((point) => point.avg_duration_ms)} />
         <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={localSettlementLabel(locale)} labelContent={<LocalSettlementNotice />} value={<CostLines costs={summary.costs} />} formatSample={(_value, index) => { const cost = points[index].costs.find(item => item.currency === currency); return cost ? formatCurrencyDisplay(cost.cost, cost.currency, locale).title ?? '—' : '—'; }} trend={currency ? points.map((point) => point.costs.some(cost => cost.currency === currency) ? Number(point.costs.find(cost => cost.currency === currency)!.cost) : null) : undefined} />
         <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={t('monitoring.freshness')} value={<Freshness snapshot={snapshot} />} />
