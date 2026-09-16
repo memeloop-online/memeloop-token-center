@@ -600,7 +600,11 @@ async fn read_codex(
     let observation_started_at = unix_millis();
     let recovery_fence = match state
         .db
-        .upstream_quota_recovery_fence(account.id, account.credential_generation)
+        .upstream_quota_recovery_fence(
+            account.id,
+            account.credential_generation,
+            account.updated_at,
+        )
         .await
     {
         Ok(fence) => fence,
@@ -705,6 +709,7 @@ async fn read_codex(
             .recover_upstream_quota_from_observation(
                 account.id,
                 account.credential_generation,
+                account.updated_at,
                 recovery_fence,
             )
             .await

@@ -145,13 +145,13 @@ async fn invariants(database: &Database, peer: &Database) {
     assert_eq!(row.get::<i64, _>("cooldown_until"), long);
     assert_eq!(row.get::<String, _>("last_failure_kind"), "quota_exhausted");
     let recovery_fence = database
-        .upstream_quota_recovery_fence(account, 1)
+        .upstream_quota_recovery_fence(account, 1, 0)
         .await
         .unwrap()
         .unwrap();
     assert!(
         database
-            .recover_upstream_quota_from_observation(account, 1, recovery_fence)
+            .recover_upstream_quota_from_observation(account, 1, 0, recovery_fence)
             .await
             .unwrap(),
         "fresh supplier evidence clears the matching exhausted generation"
@@ -174,10 +174,32 @@ async fn invariants(database: &Database, peer: &Database) {
         )
         .await
         .unwrap();
+    let transport_fence = database
+        .upstream_quota_recovery_fence(account, 1, 0)
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE upstream_accounts SET updated_at = 1 WHERE id = $1")
+        .bind(account.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert!(
+        !database
+            .recover_upstream_quota_from_observation(account, 1, 0, transport_fence)
+            .await
+            .unwrap(),
+        "quota evidence from an old transport configuration cannot clear isolation"
+    );
+    sqlx::query("UPDATE upstream_accounts SET updated_at = 0 WHERE id = $1")
+        .bind(account.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
     let stale_fence = recovery_fence;
     assert!(
         !peer
-            .recover_upstream_quota_from_observation(account, 1, stale_fence)
+            .recover_upstream_quota_from_observation(account, 1, 0, stale_fence)
             .await
             .unwrap(),
         "an observation that began before the current failure cannot clear it"
@@ -189,7 +211,7 @@ async fn invariants(database: &Database, peer: &Database) {
         .await
         .unwrap();
     assert!(
-        peer.upstream_quota_recovery_fence(account, 1)
+        peer.upstream_quota_recovery_fence(account, 1, 0)
             .await
             .unwrap()
             .is_some()
@@ -206,7 +228,7 @@ async fn invariants(database: &Database, peer: &Database) {
         .await
         .unwrap();
     assert!(
-        peer.upstream_quota_recovery_fence(account, 1)
+        peer.upstream_quota_recovery_fence(account, 1, 0)
             .await
             .unwrap()
             .is_none(),
@@ -214,7 +236,7 @@ async fn invariants(database: &Database, peer: &Database) {
     );
     assert!(
         !peer
-            .recover_upstream_quota_from_observation(account, 1, stale_fence)
+            .recover_upstream_quota_from_observation(account, 1, 0, stale_fence)
             .await
             .unwrap(),
         "quota evidence cannot erase an unrelated transport failure"
