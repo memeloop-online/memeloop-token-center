@@ -866,7 +866,6 @@ async fn finish_audio_request(
                 output_tokens: billed_seconds,
                 ..TokenUsage::default()
             },
-            charge_contract_ceiling: false,
             error_code,
             response_object: &response_object,
             conversation: None,
