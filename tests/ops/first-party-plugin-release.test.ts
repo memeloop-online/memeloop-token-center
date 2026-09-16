@@ -5,9 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
-import { installerEnvironment } from '../../ops/ci/resolve-first-party-plugin-installer.ts';
-import { checkedCommandOutput } from '../../ops/ci/first-party-plugin-command-output.ts';
-import { firstPartyPackage, packageEnvironment } from '../../ops/ci/first-party-plugin-package.ts';
+import { installerEnvironment } from '../../scripts/ci/resolve-first-party-plugin-installer.ts';
+import { checkedCommandOutput } from '../../scripts/ci/first-party-plugin-command-output.ts';
+import { firstPartyPackage, packageEnvironment } from '../../scripts/ci/first-party-plugin-package.ts';
 
 const root = new URL('../../', import.meta.url).pathname;
 const hash = (bytes: Buffer) => `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
@@ -128,7 +128,7 @@ for (const name of ['model-guard', 'preferred-account']) test(`${name} release e
     writeFileSync(join(directory, 'plugin-installation.json'), JSON.stringify({ id: selected.id, version: '1.0.0', digest, source }));
     writeFileSync(join(directory, 'plugin-install', selected.id, '.mtc-oci-install.json'), JSON.stringify({ signature_policy: 'cosign-keyless', digest, source }));
     writeFileSync(join(directory, 'plugin-signature-verification.json'), JSON.stringify([{ critical: { image: { 'docker-manifest-digest': digest } } }]));
-    const run = () => spawnSync(process.execPath, [join(root, 'ops/ci/first-party-plugin-release.ts'), directory], {
+    const run = () => spawnSync(process.execPath, [join(root, 'scripts/ci/first-party-plugin-release.ts'), directory], {
       encoding: 'utf8', env: { ...process.env, REQUESTED_PLUGIN_PACKAGE: name, PLUGIN_SOURCE: source, PLUGIN_DIGEST: digest },
     });
     assert.equal(run().status, 0);

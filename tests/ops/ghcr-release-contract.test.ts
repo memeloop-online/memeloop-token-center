@@ -71,20 +71,20 @@ test('GHCR evidence binds each tag and OCI subject before sealing the two-image 
     index = 0;
     for (const [scope, name] of Object.entries(names)) {
       index += 1;
-      const result = spawnSync(process.execPath, ['ops/ci/verify-published-image.ts', `ghcr.io/memeloop-online/${name}`, sha(String(index)), scope, runner], {
+      const result = spawnSync(process.execPath, ['scripts/ci/verify-published-image.ts', `ghcr.io/memeloop-online/${name}`, sha(String(index)), scope, runner], {
         cwd: repository, encoding: 'utf8', env: environment, shell: false,
       });
       if (result.status !== 0) {
         const diagnostic = join(temporary, `${scope}-diagnostic`); mkdirSync(diagnostic);
         const direct = spawnSync(process.execPath, [
-          'ops/ci/verify-buildkit-attestations.ts', `ghcr.io/memeloop-online/${name}`, sha(String(index)),
+          'scripts/ci/verify-buildkit-attestations.ts', `ghcr.io/memeloop-online/${name}`, sha(String(index)),
           join(temporary, `${scope}-diagnostic-index.json`), diagnostic,
         ], { cwd: repository, encoding: 'utf8', env: environment, shell: false });
         assert.equal(result.status, 0, `${result.stderr}\nDirect attestation diagnostic:\n${direct.stderr}`);
       }
     }
     const release = join(temporary, 'release-manifest.json');
-    const complete = spawnSync(process.execPath, ['ops/ci/verify-ghcr-release.ts', runner, release], {
+    const complete = spawnSync(process.execPath, ['scripts/ci/verify-ghcr-release.ts', runner, release], {
       cwd: repository, encoding: 'utf8', env: environment, shell: false,
     });
     assert.equal(complete.status, 0, complete.stderr);
@@ -96,14 +96,14 @@ test('GHCR evidence binds each tag and OCI subject before sealing the two-image 
 
     const wrongLabelRunner = join(temporary, 'wrong-label-runner'); mkdirSync(wrongLabelRunner);
     const wrongLabel = spawnSync(process.execPath, [
-      'ops/ci/verify-published-image.ts', 'ghcr.io/memeloop-online/memeloop-token-center', sha('1'), 'service', wrongLabelRunner,
+      'scripts/ci/verify-published-image.ts', 'ghcr.io/memeloop-online/memeloop-token-center', sha('1'), 'service', wrongLabelRunner,
     ], { cwd: repository, encoding: 'utf8', env: { ...environment, FAKE_IMAGE_REVISION: '2'.repeat(40) }, shell: false });
     assert.notEqual(wrongLabel.status, 0);
     assert.match(wrongLabel.stderr, /source or revision label does not match/);
 
     const wrongDigestRunner = join(temporary, 'wrong-digest-runner'); mkdirSync(wrongDigestRunner);
     const wrongDigest = spawnSync(process.execPath, [
-      'ops/ci/verify-published-image.ts', 'ghcr.io/memeloop-online/memeloop-token-center', sha('f'), 'service', wrongDigestRunner,
+      'scripts/ci/verify-published-image.ts', 'ghcr.io/memeloop-online/memeloop-token-center', sha('f'), 'service', wrongDigestRunner,
     ], { cwd: repository, encoding: 'utf8', env: environment, shell: false });
     assert.notEqual(wrongDigest.status, 0);
     assert.match(wrongDigest.stderr, /tag does not resolve to the build digest/);
@@ -112,7 +112,7 @@ test('GHCR evidence binds each tag and OCI subject before sealing the two-image 
     const tampered = JSON.parse(readFileSync(pluginEvidence, 'utf8')) as Record<string, unknown>;
     tampered.revision = '2'.repeat(40);
     writeFileSync(pluginEvidence, JSON.stringify(tampered), { mode: 0o600 });
-    const rejected = spawnSync(process.execPath, ['ops/ci/verify-ghcr-release.ts', runner, join(temporary, 'rejected.json')], {
+    const rejected = spawnSync(process.execPath, ['scripts/ci/verify-ghcr-release.ts', runner, join(temporary, 'rejected.json')], {
       cwd: repository, encoding: 'utf8', env: environment, shell: false,
     });
     assert.notEqual(rejected.status, 0);

@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { allocatorEvidence, inputPlan, memoryVerdict, nativeAllocatorEnvironment, nativeAllocatorEvidence, NATIVE_MMAP_THRESHOLD_BYTES, outputPlan, permitEvidence, planHash, requestPath, responsesInputPlan, responsesOutputPlan } from "../../ops/benchmark-durable-archive-memory.ts";
-import { processMemoryFromProc } from "../../ops/benchmark-memory.ts";
+import { allocatorEvidence, inputPlan, memoryVerdict, nativeAllocatorEnvironment, nativeAllocatorEvidence, NATIVE_MMAP_THRESHOLD_BYTES, outputPlan, permitEvidence, planHash, requestPath, responsesInputPlan, responsesOutputPlan } from "./benchmark-durable-archive-memory.ts";
+import { processMemoryFromProc } from "./benchmark-memory.ts";
 
 test("request and response plans have exact wire sizes and valid JSON", () => {
   for (const plan of [inputPlan(1024), outputPlan(2048), responsesInputPlan(1024), responsesOutputPlan(2048)]) {
@@ -93,8 +93,8 @@ test("native allocator and proc attribution preserve non-jemalloc RSS evidence",
 
 test("CI reuses its exact optimized binary and retains kernel RSS evidence", () => {
   const workflow = readFileSync(new URL("../../.github/workflows/memory-acceptance.yml", import.meta.url), "utf8");
-  const harness = readFileSync(new URL("../../ops/benchmark-durable-archive-memory.ts", import.meta.url), "utf8");
-  assert.match(workflow, /node ops\/benchmark-durable-archive-memory\.ts\s+\\\s+target\/release\/memeloop-token-center/u);
+  const harness = readFileSync(new URL("./benchmark-durable-archive-memory.ts", import.meta.url), "utf8");
+  assert.match(workflow, /node tests\/load\/benchmark-durable-archive-memory\.ts\s+\\\s+target\/release\/memeloop-token-center/u);
   assert.match(workflow, /DURABLE_RSS_EXIT_CODE/u);
   assert.match(harness, /processMemory\(service/u);
   assert.match(harness, /high_water_mib/u);

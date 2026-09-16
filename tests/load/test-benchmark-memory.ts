@@ -6,12 +6,12 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
-import { assetGatewayRssEvidence, chatPayload, createMockServer, HarnessFailure, MockState, seed, smallChat, streamChat, waitForTextRouteRecovery } from "../../ops/benchmark-memory.ts";
-import { StreamStartBarrier } from "../../ops/benchmark-stream-barrier.ts";
+import { assetGatewayRssEvidence, chatPayload, createMockServer, HarnessFailure, MockState, seed, smallChat, streamChat, waitForTextRouteRecovery } from "./benchmark-memory.ts";
+import { StreamStartBarrier } from "./benchmark-stream-barrier.ts";
 import { DatabaseSync } from "node:sqlite";
-import { FirstSoakFailureEvidence, readSoakFailureClassification } from "../../ops/benchmark-soak-diagnostics.ts";
+import { FirstSoakFailureEvidence, readSoakFailureClassification } from "./benchmark-soak-diagnostics.ts";
 
-const benchmarkEntry = resolve(import.meta.dirname, "../../ops/benchmark-memory.ts");
+const benchmarkEntry = resolve(import.meta.dirname, "./benchmark-memory.ts");
 const serviceEntry = resolve(import.meta.dirname, "../../src/lib.rs");
 
 test("memory mock keep-alive lifetime exceeds the gateway idle pool", () => {

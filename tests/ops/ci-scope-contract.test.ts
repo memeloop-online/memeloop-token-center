@@ -18,7 +18,7 @@ function scopes(event: 'pull_request' | 'push', changes: readonly Change[]): Rec
     const output = join(temporary, 'output.txt');
     writeFileSync(changed, encoded(changes));
     writeFileSync(output, '');
-    run(process.execPath, ['ops/ci/detect-expensive-ci-scopes.ts', event, changed, output]);
+    run(process.execPath, ['scripts/ci/detect-expensive-ci-scopes.ts', event, changed, output]);
     return Object.fromEntries(readFileSync(output, 'utf8').trim().split('\n').map((line) => line.split('=', 2)));
   } finally {
     rmSync(temporary, { recursive: true, force: true });
@@ -69,7 +69,7 @@ test('verified merge scope ignores a stale event base and fails closed for an un
     const resolve = (checkout: string, head: string): { scopes: Record<string, string>; evidence: Record<string, unknown> } => {
       const output = join(temporary, 'scope-output.txt');
       writeFileSync(output, '');
-      const result = run(process.execPath, [join(repository, 'ops/ci/detect-expensive-ci-scopes.ts'), 'pull_request', '--verified-merge', output], {
+      const result = run(process.execPath, [join(repository, 'scripts/ci/detect-expensive-ci-scopes.ts'), 'pull_request', '--verified-merge', output], {
         cwd: temporary, env: { ...env, BASE_SHA: eventBase, GITHUB_SHA: checkout, PR_HEAD_SHA: head },
       });
       return {
@@ -111,7 +111,7 @@ test('scope matrix skips expensive service gates only for presentation or static
     ['static contract helper', [['M', 'tests/ops/contract-helpers.ts']], staticContractsOnly],
     ['static contract plus runtime source', [['M', 'tests/ops/source-module-size-contract.test.ts'], ['M', 'src/api/routes/control.rs']], fullPlugin],
     ['web build script', [['M', 'web/scripts/verify-github-workflow-policy.mjs']], webOnly],
-    ['CI scope script', [['M', 'ops/ci/detect-expensive-ci-scopes.ts']], full],
+    ['CI scope script', [['M', 'scripts/ci/detect-expensive-ci-scopes.ts']], full],
     ['production renamed into web', [['R100', 'src/api/routes.rs', 'web/src/routes.ts']], fullPlugin],
     ['web renamed into production', [['R100', 'web/src/routes.ts', 'src/api/routes.rs']], fullPlugin],
     ['documentation renamed into production', [['R100', 'docs/operator.md', 'src/operator.rs']], fullPlugin],
@@ -156,11 +156,11 @@ test('pushes and malformed or empty pull-request diffs fail closed', () => {
     const output = join(temporary, 'output.txt');
     writeFileSync(output, '');
     writeFileSync(changed, '');
-    rejected(process.execPath, ['ops/ci/detect-expensive-ci-scopes.ts', 'pull_request', changed, output]);
+    rejected(process.execPath, ['scripts/ci/detect-expensive-ci-scopes.ts', 'pull_request', changed, output]);
     writeFileSync(changed, 'R100\0web/src/old.tsx\0');
-    rejected(process.execPath, ['ops/ci/detect-expensive-ci-scopes.ts', 'pull_request', changed, output]);
+    rejected(process.execPath, ['scripts/ci/detect-expensive-ci-scopes.ts', 'pull_request', changed, output]);
     writeFileSync(changed, 'X\0web/src/App.tsx\0');
-    rejected(process.execPath, ['ops/ci/detect-expensive-ci-scopes.ts', 'pull_request', changed, output]);
+    rejected(process.execPath, ['scripts/ci/detect-expensive-ci-scopes.ts', 'pull_request', changed, output]);
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }
@@ -176,10 +176,10 @@ test('verified push scopes use the complete before-after range and fail closed w
     writeFileSync(join(temporary, 'web', 'a.tsx'), 'two\n'); git('add', '.'); const middle = git('commit-tree', git('write-tree'), '-p', before, '-m', 'web');
     writeFileSync(join(temporary, 'web', 'b.tsx'), 'three\n'); git('add', '.'); const after = git('commit-tree', git('write-tree'), '-p', middle, '-p', before, '-m', 'web merge'); git('update-ref', 'HEAD', after);
     const output = join(temporary, 'out'); writeFileSync(output, '');
-    run(process.execPath, [join(repository, 'ops/ci/detect-expensive-ci-scopes.ts'), 'push', '--verified-merge', output], { cwd: temporary, env: { ...env, GITHUB_SHA: after, GITHUB_EVENT_BEFORE: before, GITHUB_EVENT_AFTER: after } });
+    run(process.execPath, [join(repository, 'scripts/ci/detect-expensive-ci-scopes.ts'), 'push', '--verified-merge', output], { cwd: temporary, env: { ...env, GITHUB_SHA: after, GITHUB_EVENT_BEFORE: before, GITHUB_EVENT_AFTER: after } });
     const result = Object.fromEntries(readFileSync(output, 'utf8').trim().split('\n').map(line => line.split('=', 2)));
     assert.equal(result.memory, 'true'); assert.equal(result.memory_acceptance, 'false'); assert.equal(result.rust, 'false');
-    writeFileSync(output, ''); run(process.execPath, [join(repository, 'ops/ci/detect-expensive-ci-scopes.ts'), 'push', '--verified-merge', output], { cwd: temporary, env: { ...env, GITHUB_SHA: after, GITHUB_EVENT_BEFORE: '', GITHUB_EVENT_AFTER: after } });
+    writeFileSync(output, ''); run(process.execPath, [join(repository, 'scripts/ci/detect-expensive-ci-scopes.ts'), 'push', '--verified-merge', output], { cwd: temporary, env: { ...env, GITHUB_SHA: after, GITHUB_EVENT_BEFORE: '', GITHUB_EVENT_AFTER: after } });
     assert.equal(Object.fromEntries(readFileSync(output, 'utf8').trim().split('\n').map(line => line.split('=', 2))).memory_acceptance, 'true');
   } finally { rmSync(temporary, { recursive: true, force: true }); }
 });

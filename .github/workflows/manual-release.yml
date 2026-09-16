@@ -45,7 +45,7 @@ jobs:
       - name: Validate shared immutable release inputs
         env:
           RELEASE_REGISTRY: ghcr.io/${{ github.repository_owner }}
-        run: node ops/ci/validate-release-inputs.ts "$RELEASE_REGISTRY" "$GITHUB_SHA" prefixed
+        run: node scripts/ci/validate-release-inputs.ts "$RELEASE_REGISTRY" "$GITHUB_SHA" prefixed
       - name: Install checksum-pinned crane registry client
         run: |
           archive="$RUNNER_TEMP/go-containerregistry_Linux_x86_64.tar.gz"
@@ -109,7 +109,7 @@ jobs:
           IMAGE: ${{ matrix.image }}
           DIGEST: ${{ steps.build.outputs.digest }}
           CACHE_SCOPE: ${{ matrix.cache_scope }}
-        run: node ops/ci/verify-published-image.ts "$IMAGE" "$DIGEST" "$CACHE_SCOPE" "$RUNNER_TEMP"
+        run: node scripts/ci/verify-published-image.ts "$IMAGE" "$DIGEST" "$CACHE_SCOPE" "$RUNNER_TEMP"
       - name: Upload immutable image digest manifest
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
         with:
@@ -149,7 +149,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Verify the complete release set by immutable digest
-        run: node ops/ci/verify-ghcr-release.ts "$RUNNER_TEMP/release-evidence" "$RUNNER_TEMP/release-manifest.json"
+        run: node scripts/ci/verify-ghcr-release.ts "$RUNNER_TEMP/release-evidence" "$RUNNER_TEMP/release-manifest.json"
       - name: Upload the complete immutable release manifest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

@@ -120,7 +120,7 @@ test('release contains only runtime images and no retired migration delivery sur
   const scope = parsed.jobs?.changes?.steps?.find((step) => step.id === 'scope');
   assert.equal(scope?.env?.PR_HEAD_SHA, '${{ github.event.pull_request.head.sha }}');
   assert.ok(scope?.run?.includes('detect-expensive-ci-scopes.ts "$EVENT_NAME" --verified-merge "$GITHUB_OUTPUT"'));
-  assert.ok(read('ops/ci/detect-expensive-ci-scopes.ts').includes('--find-renames=100%'));
+  assert.ok(read('scripts/ci/detect-expensive-ci-scopes.ts').includes('--find-renames=100%'));
 
   const publish = parsed.jobs?.['publish-ghcr'];
   assert.ok(publish, 'publish-ghcr job is missing');

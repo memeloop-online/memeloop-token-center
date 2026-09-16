@@ -44,7 +44,7 @@ test('BuildKit verifier binds OCI index, subject, SPDX, and SLSA evidence', () =
       [`blob|${image}@${slsa}`]: 'file:slsa.json',
     }));
     installExecutableHelper('tests/ops/helpers/fake-crane.ts', bin, 'crane');
-    const invoke = (evidence: string, indexFile: string) => spawnSync(process.execPath, ['ops/ci/verify-buildkit-attestations.ts', image, hash('1'), indexFile, evidence], {
+    const invoke = (evidence: string, indexFile: string) => spawnSync(process.execPath, ['scripts/ci/verify-buildkit-attestations.ts', image, hash('1'), indexFile, evidence], {
       cwd: repository, encoding: 'utf8', shell: false, env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, FAKE_CRANE_FIXTURES: fixtures },
     });
     const evidence = join(temporary, 'evidence'); mkdirSync(evidence);

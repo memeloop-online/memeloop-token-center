@@ -106,7 +106,7 @@ jobs:
           set +e
           if [ -n "$BINARY_ARTIFACT" ]; then
             mkdir -p target/release
-            node ops/ci/install-memory-binary.ts \
+            node scripts/ci/install-memory-binary.ts \
               "$RUNNER_TEMP/memory-binary" \
               "$MTC_BUILD_GIT_SHA" \
               target/release/memeloop-token-center \
@@ -126,7 +126,7 @@ jobs:
         timeout-minutes: 6
         run: |
           set +e
-          node ops/benchmark-durable-archive-memory.ts \
+          node tests/load/benchmark-durable-archive-memory.ts \
             target/release/memeloop-token-center \
             "$EVIDENCE_DIR/durable-archive-rss-${{ steps.revision.outputs.sha }}.json" \
             > "$EVIDENCE_DIR/durable-archive-rss-harness.log" 2>&1
@@ -141,7 +141,7 @@ jobs:
         timeout-minutes: 30
         run: |
           set +e
-          node ops/benchmark-memory.ts \
+          node tests/load/benchmark-memory.ts \
             --profile acceptance \
             --binary target/release/memeloop-token-center \
             --gateway-limit-mib 256 \

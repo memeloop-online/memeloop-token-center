@@ -5,11 +5,11 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { parseArguments, validateUtcDate } from "../../ops/reconcile-postgres-request-stats.ts";
+import { parseArguments, validateUtcDate } from "../../scripts/maintenance/reconcile-postgres-request-stats.ts";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-const driver = resolve(repository, "ops/reconcile-postgres-request-stats.ts");
-const daySql = resolve(repository, "ops/postgres/reconcile-observability-day.sql");
+const driver = resolve(repository, "scripts/maintenance/reconcile-postgres-request-stats.ts");
+const daySql = resolve(repository, "scripts/maintenance/reconcile-observability-day.sql");
 
 test("reconciliation defaults to a bounded read-only inventory", () => {
   assert.deepEqual(parseArguments([], "2026-08-28"), {
