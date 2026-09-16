@@ -75,7 +75,7 @@ fn rewrite_agent_message(item: &mut Value) {
     let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) else {
         return;
     };
-    for part in content {
+    for part in &mut *content {
         if part.get("type").and_then(Value::as_str) != Some("encrypted_content") {
             continue;
         }
