@@ -1720,7 +1720,10 @@ async fn native_codex_ambiguous_transport_after_request_bytes_is_not_replayed() 
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status_code, Some(502));
-    assert_eq!(rows[0].error_code.as_deref(), Some("upstream_transport"));
+    assert_eq!(
+        rows[0].error_code.as_deref(),
+        Some("upstream_transport_connection_reset")
+    );
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let selected_account: String = sqlx::query_scalar(

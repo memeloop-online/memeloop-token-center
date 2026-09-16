@@ -1363,11 +1363,21 @@ pub(in crate::api) async fn proxy_with_identity(
                     .await;
                 return finish_proxy_failure(&buffered_request, error_code).await;
             }
-            Err(ProxySendError::NonRetryableTransport | ProxySendError::OuterDeadline) => {
+            Err(ProxySendError::NonRetryableTransport(kind)) => {
                 upstream_attempt
                     .complete(UpstreamAttemptTerminal::Inconclusive)
                     .await;
-                return finish_proxy_failure(&buffered_request, "upstream_transport").await;
+                return finish_proxy_failure(&buffered_request, kind.error_code()).await;
+            }
+            Err(ProxySendError::OuterDeadline) => {
+                upstream_attempt
+                    .complete(UpstreamAttemptTerminal::Inconclusive)
+                    .await;
+                return finish_proxy_failure(
+                    &buffered_request,
+                    "upstream_transport_outer_deadline",
+                )
+                .await;
             }
         }
     };

@@ -66,13 +66,47 @@ pub(in crate::api::proxy) struct ProxyRoutePlanInput<'a> {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+pub(in crate::api::proxy) enum TransportFailureKind {
+    Timeout,
+    ConnectionReset,
+    Body,
+    Decode,
+    Request,
+    Other,
+}
+
+impl TransportFailureKind {
+    pub(in crate::api::proxy) const fn diagnostic_outcome(&self) -> &'static str {
+        match self {
+            Self::Timeout => "transport_timeout_delivery_unknown",
+            Self::ConnectionReset => "transport_connection_reset_delivery_unknown",
+            Self::Body => "transport_body_delivery_unknown",
+            Self::Decode => "transport_decode_delivery_unknown",
+            Self::Request => "transport_request_delivery_unknown",
+            Self::Other => "transport_other_delivery_unknown",
+        }
+    }
+
+    pub(in crate::api::proxy) const fn error_code(&self) -> &'static str {
+        match self {
+            Self::Timeout => "upstream_transport_timeout",
+            Self::ConnectionReset => "upstream_transport_connection_reset",
+            Self::Body => "upstream_transport_body",
+            Self::Decode => "upstream_transport_decode",
+            Self::Request => "upstream_transport_request",
+            Self::Other => "upstream_transport_other",
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
 pub(in crate::api::proxy) enum ProxySendError {
     RetryableConnection(&'static str),
     RetryableCodexBadRequest,
     CodexBadRequest,
     CandidateUnavailable,
     AmbiguousResponse(&'static str),
-    NonRetryableTransport,
+    NonRetryableTransport(TransportFailureKind),
     OuterDeadline,
     CredentialUnavailable,
     Credential,

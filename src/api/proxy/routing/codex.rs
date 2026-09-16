@@ -407,7 +407,20 @@ fn classify_wreq_send_error(error: wreq::Error) -> ProxySendError {
     } else {
         // A send error after the request leaves the client is ambiguous and is
         // never replayed by this state machine.
-        ProxySendError::NonRetryableTransport
+        let kind = if error.is_timeout() {
+            TransportFailureKind::Timeout
+        } else if error.is_connection_reset() {
+            TransportFailureKind::ConnectionReset
+        } else if error.is_body() {
+            TransportFailureKind::Body
+        } else if error.is_decode() {
+            TransportFailureKind::Decode
+        } else if error.is_request() {
+            TransportFailureKind::Request
+        } else {
+            TransportFailureKind::Other
+        };
+        ProxySendError::NonRetryableTransport(kind)
     }
 }
 

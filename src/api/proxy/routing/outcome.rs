@@ -66,7 +66,7 @@ pub(in crate::api::proxy) fn classify_attempt_failure(
         )),
         // Ambiguous delivery forbids replaying this POST, but the transport
         // failure is still account-health evidence for independent requests.
-        Err(ProxySendError::NonRetryableTransport) => Some((
+        Err(ProxySendError::NonRetryableTransport(_)) => Some((
             UpstreamFailureKind::Connection,
             UpstreamHealthReason::Connection,
         )),
@@ -145,7 +145,7 @@ mod tests {
             );
         }
         for error in [
-            ProxySendError::NonRetryableTransport,
+            ProxySendError::NonRetryableTransport(TransportFailureKind::Other),
             ProxySendError::OuterDeadline,
             ProxySendError::AmbiguousResponse("visible_output"),
             ProxySendError::RetryableCodexBadRequest,
@@ -168,7 +168,9 @@ mod tests {
 
     #[test]
     fn ambiguous_transport_failure_cools_account_without_permitting_replay() {
-        let result = Err(ProxySendError::NonRetryableTransport);
+        let result = Err(ProxySendError::NonRetryableTransport(
+            TransportFailureKind::ConnectionReset,
+        ));
         assert_eq!(
             classify_attempt_failure(&result, None),
             Some((
@@ -177,7 +179,12 @@ mod tests {
             ))
         );
         assert_eq!(
-            failover_disposition(None, Some(&ProxySendError::NonRetryableTransport)),
+            failover_disposition(
+                None,
+                Some(&ProxySendError::NonRetryableTransport(
+                    TransportFailureKind::ConnectionReset,
+                )),
+            ),
             FailoverDisposition::Stop
         );
     }
