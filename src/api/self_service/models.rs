@@ -1,5 +1,10 @@
 use super::super::*;
 
+#[derive(Debug, Deserialize, Default)]
+struct ModelsQuery {
+    client_version: Option<String>,
+}
+
 #[derive(Default)]
 struct ModelCapabilities {
     modalities: std::collections::BTreeSet<String>,
@@ -11,6 +16,7 @@ struct ModelCapabilities {
 pub(in crate::api) async fn list_models(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<ModelsQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
     let state = state.pin_application_plugins().await?;
@@ -18,6 +24,14 @@ pub(in crate::api) async fn list_models(
         .db
         .granted_model_capability_sources(key.key_id, key.tenant_id)
         .await?;
+    if query
+        .client_version
+        .as_deref()
+        .is_some_and(|version| !version.trim().is_empty())
+        && crate::api::request_normalization::is_official_codex_user_agent(&headers)
+    {
+        return Ok(Json(codex_models_response(&state, &sources)));
+    }
     let mut models = std::collections::BTreeMap::<String, ModelCapabilities>::new();
     for source in sources {
         let Some(provider) = state.providers.get(&source.driver) else {
@@ -68,6 +82,91 @@ pub(in crate::api) async fn list_models(
             Value::Object(model)
         }).collect::<Vec<_>>()
     })))
+}
+
+#[derive(Default)]
+struct CodexModelAvailability {
+    openai_source_seen: bool,
+    openai_multi_agent_v2: bool,
+}
+
+fn codex_models_response(
+    state: &AppState,
+    sources: &[crate::db::GrantedModelCapabilitySource],
+) -> Value {
+    let mut models = std::collections::BTreeMap::<String, CodexModelAvailability>::new();
+    for source in sources {
+        let Some(provider) = state.providers.get(&source.driver) else {
+            continue;
+        };
+        let availability = models.entry(source.public_model.clone()).or_default();
+        if source.protocol == "openai" {
+            let compatible = provider
+                .request_compatibility
+                .supports_codex_multi_agent_v2();
+            if availability.openai_source_seen {
+                // Later sources can only make the advertisement more
+                // conservative. This avoids claiming V2 when a public model
+                // can route to an incompatible OpenAI provider.
+                availability.openai_multi_agent_v2 &= compatible;
+            } else {
+                availability.openai_source_seen = true;
+                availability.openai_multi_agent_v2 = compatible;
+            }
+        }
+    }
+    json!({
+        "models": models.into_iter().map(|(model, availability)| {
+            codex_model_info(
+                &model,
+                availability.openai_source_seen && availability.openai_multi_agent_v2,
+            )
+        }).collect::<Vec<_>>()
+    })
+}
+
+fn codex_model_info(model: &str, multi_agent_v2: bool) -> Value {
+    let mut info = json!({
+        "slug": model,
+        "display_name": model,
+        "description": null,
+        "supported_reasoning_levels": [],
+        "shell_type": "disabled",
+        "visibility": "list",
+        "supported_in_api": true,
+        "priority": 0,
+        "additional_speed_tiers": [],
+        "service_tiers": [],
+        "availability_nux": null,
+        "upgrade": null,
+        "model_messages": null,
+        "base_instructions": "",
+        "include_skills_usage_instructions": false,
+        "include_plugin_usage_instructions": false,
+        "include_apps_usage_instructions": false,
+        "supports_reasoning_summary_parameter": false,
+        "default_reasoning_summary": "auto",
+        "support_verbosity": false,
+        "default_verbosity": null,
+        "apply_patch_tool_type": null,
+        "web_search_tool_type": "text",
+        "truncation_policy": {"mode": "bytes", "limit": 10000},
+        "supports_image_detail_original": false,
+        "context_window": null,
+        "auto_compact_token_limit": null,
+        "effective_context_window_percent": 95,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text"],
+        "supports_search_tool": false,
+        "supports_experimental_context": false,
+        "use_responses_lite": false,
+        "node_repl_auto_review_required": false,
+        "node_repl_disabled": true,
+    });
+    if multi_agent_v2 {
+        info["multi_agent_version"] = Value::String("v2".into());
+    }
+    info
 }
 
 fn downstream_modalities<'a>(
@@ -124,6 +223,26 @@ fn generation_parameter_schema(
             Some(crate::generation::siliconflow_video_parameter_schema())
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_model_info_is_conservative_and_marks_only_declared_multi_agent_models() {
+        let compatible = codex_model_info("gpt-5.5", true);
+        assert_eq!(compatible["slug"], "gpt-5.5");
+        assert_eq!(compatible["multi_agent_version"], "v2");
+        assert_eq!(compatible["shell_type"], "disabled");
+        assert_eq!(compatible["input_modalities"], json!(["text"]));
+        assert!(compatible.get("account_id").is_none());
+        assert!(compatible.get("upstream_model").is_none());
+        assert!(compatible.get("credential").is_none());
+
+        let ordinary = codex_model_info("ordinary", false);
+        assert!(ordinary.get("multi_agent_version").is_none());
     }
 }
 
