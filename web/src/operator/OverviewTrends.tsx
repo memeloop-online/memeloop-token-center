@@ -58,7 +58,7 @@ export function OverviewTrends({ state, onDrilldown }: { state: ResourceState<Op
       number: (value) => formatMetricDisplay(value, locale).text,
       percent: (value) => formatPercent(value, locale),
     };
-  }), [locale, stats?.granularity]);
+  }, [locale, stats?.granularity]);
   const throughput = useMemo(() => throughputOption(stats?.time_series ?? [], copy, format), [stats, copy, format]);
   const latency = useMemo(() => latencyOption(finiteP95Points(stats?.time_series ?? []), copy, format), [stats, copy, format]);
   const costs = useMemo(() => costOption(stats?.time_series ?? [], copy, format), [stats, copy, format]);
