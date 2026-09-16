@@ -1,18 +1,17 @@
 use std::{
-    path::PathBuf,
+    io,
+    io::SeekFrom,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
 };
 
-#[cfg(test)]
-use std::path::Path;
-
 use axum::body::Body;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 pub(crate) const REQUEST_SPOOL_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -36,19 +35,19 @@ impl RequestSpoolAdmission {
         maximum: usize,
         declared_content_length: Option<usize>,
     ) -> Result<RequestSpool, RequestSpoolCaptureError> {
-        tokio::fs::create_dir_all(self.directory.as_ref())
-            .await
-            .map_err(|_| RequestSpoolCaptureError::Unavailable)?;
-        let owner = tempfile::Builder::new()
-            .prefix(".request-")
-            .tempfile_in(self.directory.as_ref())
-            .map_err(|_| RequestSpoolCaptureError::Unavailable)?;
-        let writer = owner
-            .reopen()
-            .map(tokio::fs::File::from_std)
-            .map_err(|_| RequestSpoolCaptureError::Unavailable)?;
+        prepare_directory(self.directory.as_ref()).await?;
+        let directory = self.directory.clone();
+        let (owner, writer) = tokio::task::spawn_blocking(move || {
+            let owner = tempfile::tempfile_in(directory.as_ref())?;
+            let writer = owner.try_clone()?;
+            Ok::<_, io::Error>((owner, writer))
+        })
+        .await
+        .map_err(|_| RequestSpoolCaptureError::Unavailable)?
+        .map_err(|_| RequestSpoolCaptureError::Unavailable)?;
+        let writer = tokio::fs::File::from_std(writer);
         let mut capture = RequestSpoolCapture {
-            owner: Some(owner),
+            owner: Some(Arc::new(owner)),
             writer,
             lease: RequestSpoolLease::new(self.budget.clone()),
             length: 0,
@@ -216,7 +215,7 @@ impl Drop for RequestSpoolLease {
 }
 
 struct RequestSpoolCapture {
-    owner: Option<tempfile::NamedTempFile>,
+    owner: Option<Arc<std::fs::File>>,
     writer: tokio::fs::File,
     lease: RequestSpoolLease,
     length: usize,
@@ -224,7 +223,7 @@ struct RequestSpoolCapture {
 }
 
 pub(crate) struct RequestSpool {
-    owner: tempfile::NamedTempFile,
+    owner: Arc<std::fs::File>,
     length: usize,
     digest: [u8; 32],
     _lease: RequestSpoolLease,
@@ -241,8 +240,15 @@ impl RequestSpool {
     }
 
     pub(crate) async fn read_all(&self) -> Result<Bytes, RequestSpoolReadError> {
-        let file = self.owner.reopen().map_err(|_| RequestSpoolReadError)?;
+        let owner = self.owner.clone();
+        let file = tokio::task::spawn_blocking(move || owner.try_clone())
+            .await
+            .map_err(|_| RequestSpoolReadError)?
+            .map_err(|_| RequestSpoolReadError)?;
         let mut file = tokio::fs::File::from_std(file);
+        file.seek(SeekFrom::Start(0))
+            .await
+            .map_err(|_| RequestSpoolReadError)?;
         let mut body = Vec::with_capacity(self.length);
         file.read_to_end(&mut body)
             .await
@@ -252,11 +258,29 @@ impl RequestSpool {
         }
         Ok(Bytes::from(body))
     }
+}
 
-    #[cfg(test)]
-    pub(crate) fn path(&self) -> &Path {
-        self.owner.path()
+async fn prepare_directory(directory: &Path) -> Result<(), RequestSpoolCaptureError> {
+    tokio::fs::create_dir_all(directory)
+        .await
+        .map_err(|_| RequestSpoolCaptureError::Unavailable)?;
+    let mut current = PathBuf::new();
+    for component in directory.components() {
+        current.push(component.as_os_str());
+        let metadata = tokio::fs::symlink_metadata(&current)
+            .await
+            .map_err(|_| RequestSpoolCaptureError::Unavailable)?;
+        if metadata.file_type().is_symlink() {
+            return Err(RequestSpoolCaptureError::Unavailable);
+        }
     }
+    let metadata = tokio::fs::metadata(directory)
+        .await
+        .map_err(|_| RequestSpoolCaptureError::Unavailable)?;
+    if !metadata.is_dir() {
+        return Err(RequestSpoolCaptureError::Unavailable);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -297,8 +321,7 @@ mod tests {
         assert_eq!(spool.len(), body.len());
         assert_eq!(spool.digest(), digest);
         assert_eq!(spool.read_all().await.unwrap(), body);
-        assert!(spool.path().exists());
-        assert_eq!(file_count(directory.path()), 1);
+        assert_eq!(file_count(directory.path()), 0);
         assert_eq!(admission.snapshot().used_bytes, body.len());
         drop(spool);
         assert_eq!(file_count(directory.path()), 0);
@@ -331,21 +354,58 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let admission = RequestSpoolAdmission::new(directory.path().to_owned(), 256 * 1024);
         let active = admission.clone();
-        let body = Body::from_stream(stream::once(async {
-            std::future::pending::<Result<Bytes, Infallible>>().await
-        }));
+        let body = Body::from_stream(
+            stream::once(async {
+                Ok::<_, Infallible>(Bytes::from(vec![b'x'; REQUEST_SPOOL_CHUNK_BYTES]))
+            })
+            .chain(stream::pending::<Result<Bytes, Infallible>>()),
+        );
         let capture = tokio::spawn(async move { active.capture(body, 256 * 1024, None).await });
         for _ in 0..100 {
-            if admission.snapshot().active_files == 1 {
+            if admission.snapshot().used_bytes == REQUEST_SPOOL_CHUNK_BYTES {
                 break;
             }
             tokio::task::yield_now().await;
         }
         assert_eq!(admission.snapshot().active_files, 1);
+        assert_eq!(admission.snapshot().used_bytes, REQUEST_SPOOL_CHUNK_BYTES);
         capture.abort();
         assert!(matches!(capture.await, Err(error) if error.is_cancelled()));
         assert_eq!(admission.snapshot().used_bytes, 0);
         assert_eq!(admission.snapshot().active_files, 0);
         assert_eq!(file_count(directory.path()), 0);
+    }
+
+    #[tokio::test]
+    async fn anonymous_spool_leaves_no_restart_orphan() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("request-spool");
+        let admission = RequestSpoolAdmission::new(path.clone(), 256 * 1024);
+        let spool = admission
+            .capture(Body::from("sensitive"), 1024, None)
+            .await
+            .unwrap();
+        assert_eq!(file_count(&path), 0, "active spool must be anonymous");
+        drop(spool);
+        drop(admission);
+        let restarted = RequestSpoolAdmission::new(path.clone(), 256 * 1024);
+        assert_eq!(restarted.snapshot().used_bytes, 0);
+        assert_eq!(file_count(&path), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_spool_directory_is_rejected() {
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = parent.path().join("request-spool");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let admission = RequestSpoolAdmission::new(link, 1024);
+        assert!(matches!(
+            admission.capture(Body::from("secret"), 1024, None).await,
+            Err(RequestSpoolCaptureError::Unavailable)
+        ));
+        assert_eq!(file_count(&target), 0);
     }
 }

@@ -129,9 +129,8 @@ config:
   # Gateway request bodies are admitted independently of proxy lifecycles.
   # Saturation returns 503 before reading the body; supported range is 1..8192.
   gatewayBodyReadConcurrency: 1024
-  # `/v1/responses` may buffer more than the normal 4 MiB gateway request.
-  # It is separately capped at four concurrent reads (64 MiB maximum buffered
-  # by default) so it cannot turn the 1024 general permits into 16 GiB.
+  # `/v1/responses` may exceed the normal 4 MiB gateway request. Four dedicated
+  # concurrent reads and the separate process disk-byte budget bound admission.
   responsesBodyMaxBytes: 33554432
   # Per-process bytes admitted to request spool files. Capacity saturation is
   # a retryable 503 and remains distinct from the 413 request-size boundary.

@@ -231,12 +231,14 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     for (const values of [
       ['config.responsesRequestSpoolBytes=33554431'],
       ['requestSpool.sizeLimit=127Mi'],
-      ['roles.gateway.resources.limits.ephemeral-storage=159Mi'],
-      ['roles.all.enabled=true', 'roles.gateway.enabled=false', 'roles.control.enabled=false', 'roles.worker.enabled=false', 'roles.all.resources.limits.ephemeral-storage=159Mi'],
+      ['requestSpool.mountPath=/'],
+      ['requestSpool.mountPath=/var/lib/../request-spool'],
+      ['roles.gateway.resources.limits.ephemeral-storage=223Mi'],
+      ['roles.all.enabled=true', 'roles.gateway.enabled=false', 'roles.control.enabled=false', 'roles.worker.enabled=false', 'roles.all.resources.limits.ephemeral-storage=223Mi'],
     ]) {
       const result = spawnSync(helm, ['template', 'invalid-spool-budget', chart, ...values.flatMap((value) => ['--set', value])], { cwd: repository, encoding: 'utf8', shell: false });
       assert.notEqual(result.status, 0, `request spool cross-field gate accepted ${values.join(',')}`);
-      assert.match(result.stderr, /responsesRequestSpoolBytes must cover|requestSpool.sizeLimit must cover|ephemeral-storage must cover/);
+      assert.match(result.stderr, /responsesRequestSpoolBytes must cover|requestSpool.sizeLimit must cover|requestSpool.mountPath must be|ephemeral-storage must cover/);
     }
     assert.notEqual(oldSchema.status, 0, 'release values schema accepted migration.schemaVersion=58');
     for (const budget of ['268435456', '805306368']) {

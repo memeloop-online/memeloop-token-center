@@ -805,8 +805,13 @@ mod tests {
             .clone()
             .try_acquire_owned()
             .expect("responses permit");
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = polls.clone();
         let rejected = Request::post("/v1/responses")
-            .body(Body::empty())
+            .body(Body::from_stream(stream::poll_fn(move |_| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::task::Poll::Ready(Some(Ok::<_, Infallible>(Bytes::from_static(b"x"))))
+            })))
             .expect("responses request");
         assert!(matches!(
             admit_gateway_request_body(
@@ -820,6 +825,7 @@ mod tests {
             Err(GatewayBodyAdmissionError::CapacityExhausted)
         ));
         assert_eq!(standard.available_permits(), 1);
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         let ordinary = Request::post("/v1/chat/completions")
             .body(Body::empty())

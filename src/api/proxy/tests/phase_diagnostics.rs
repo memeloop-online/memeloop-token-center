@@ -1,6 +1,37 @@
 use super::*;
 
 #[tokio::test]
+async fn unauthorized_responses_request_does_not_poll_or_spool_the_body() {
+    let fixture = codex_route_fixture("responses-auth-before-spool").await;
+    let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = polls.clone();
+    let body = Body::from_stream(futures_util::stream::poll_fn(move |_| {
+        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::task::Poll::Ready(Some(Ok::<_, std::convert::Infallible>(Bytes::from_static(
+            b"must-not-be-read",
+        ))))
+    }));
+    let response = router_for_role(fixture.state.clone(), RuntimeRole::Gateway)
+        .oneshot(Request::post("/v1/responses").body(body).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture.state.responses_request_spool.snapshot().used_bytes,
+        0
+    );
+    assert_eq!(
+        fixture
+            .state
+            .responses_request_spool
+            .snapshot()
+            .active_files,
+        0
+    );
+}
+
+#[tokio::test]
 async fn early_rejections_return_server_correlation_without_creating_request_records() {
     let fixture = codex_route_fixture("phase-early-rejections").await;
     let supplied_id = Uuid::new_v4();

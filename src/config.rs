@@ -489,9 +489,18 @@ impl Config {
         {
             return Err(ConfigError::InvalidProxyMemoryBudget);
         }
+        let spool_path = std::path::Path::new(&self.responses_request_spool_path);
+        let valid_spool_path = spool_path.is_absolute()
+            && spool_path != std::path::Path::new("/")
+            && spool_path.components().all(|component| {
+                matches!(
+                    component,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )
+            });
         if self.responses_request_spool_bytes < self.responses_body_max_bytes
             || self.responses_request_spool_bytes > MAX_RESPONSES_REQUEST_SPOOL_BYTES
-            || !std::path::Path::new(&self.responses_request_spool_path).is_absolute()
+            || !valid_spool_path
         {
             return Err(ConfigError::InvalidResponsesRequestSpool);
         }
@@ -692,7 +701,7 @@ pub enum ConfigError {
     )]
     InvalidProxyMemoryBudget,
     #[error(
-        "MTC_RESPONSES_REQUEST_SPOOL_BYTES must cover MTC_RESPONSES_BODY_MAX_BYTES and remain at most 2 GiB; MTC_RESPONSES_REQUEST_SPOOL_PATH must be absolute"
+        "MTC_RESPONSES_REQUEST_SPOOL_BYTES must cover MTC_RESPONSES_BODY_MAX_BYTES and remain at most 2 GiB; MTC_RESPONSES_REQUEST_SPOOL_PATH must be an absolute non-root path without traversal components"
     )]
     InvalidResponsesRequestSpool,
     #[error(
@@ -964,6 +973,16 @@ mod tests {
         ));
         config.responses_request_spool_bytes = DEFAULT_RESPONSES_REQUEST_SPOOL_BYTES;
         config.responses_request_spool_path = "relative/request-spool".to_owned();
+        assert!(matches!(
+            config.validate_proxy_memory_budget(),
+            Err(ConfigError::InvalidResponsesRequestSpool)
+        ));
+        config.responses_request_spool_path = "/var/lib/../request-spool".to_owned();
+        assert!(matches!(
+            config.validate_proxy_memory_budget(),
+            Err(ConfigError::InvalidResponsesRequestSpool)
+        ));
+        config.responses_request_spool_path = "/".to_owned();
         assert!(matches!(
             config.validate_proxy_memory_budget(),
             Err(ConfigError::InvalidResponsesRequestSpool)

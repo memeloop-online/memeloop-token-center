@@ -11,6 +11,9 @@
 {{- if lt (int64 .Values.config.responsesRequestSpoolBytes) (int64 .Values.config.responsesBodyMaxBytes) -}}
 {{- fail "config.responsesRequestSpoolBytes must cover config.responsesBodyMaxBytes" -}}
 {{- end -}}
+{{- if or (eq .Values.requestSpool.mountPath "/") (contains ".." .Values.requestSpool.mountPath) -}}
+{{- fail "requestSpool.mountPath must be a dedicated absolute path without traversal components" -}}
+{{- end -}}
 {{- $requestSpoolSizeBytes := include "memeloop-token-center.memoryBytes" .Values.requestSpool.sizeLimit | int64 -}}
 {{- if lt $requestSpoolSizeBytes (int64 .Values.config.responsesRequestSpoolBytes) -}}
 {{- fail "requestSpool.sizeLimit must cover config.responsesRequestSpoolBytes" -}}
@@ -29,8 +32,9 @@
 {{- end -}}
 {{- $ephemeralStorageLimit := dig "resources" "limits" "ephemeral-storage" "" $roleConfig -}}
 {{- $ephemeralStorageBytes := include "memeloop-token-center.memoryBytes" $ephemeralStorageLimit | int64 -}}
-{{- if lt $ephemeralStorageBytes $requestSpoolSizeBytes -}}
-{{- fail (printf "roles.%s.resources.limits.ephemeral-storage must cover requestSpool.sizeLimit" $role) -}}
+{{- $requiredEphemeralStorage := add $requestSpoolSizeBytes 67108864 -}}
+{{- if lt $ephemeralStorageBytes $requiredEphemeralStorage -}}
+{{- fail (printf "roles.%s.resources.limits.ephemeral-storage must cover requestSpool.sizeLimit plus 64Mi headroom" $role) -}}
 {{- end -}}
 {{- end }}
 ---
