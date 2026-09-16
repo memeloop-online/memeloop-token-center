@@ -497,12 +497,11 @@ impl QuotaCache {
         // it is newer than the evidence visible when this call began.
         {
             let cached = entry.cached.lock().await;
-            if let Some(value) = &cached.value {
-                if cached.refresh_generation != observed_refresh_generation
-                    || (!force_refresh && unix_millis() < cached.refresh_after)
-                {
-                    return value.clone();
-                }
+            if let Some(value) = &cached.value
+                && (cached.refresh_generation != observed_refresh_generation
+                    || (!force_refresh && unix_millis() < cached.refresh_after))
+            {
+                return value.clone();
             }
         }
         let Ok(permit) = tokio::time::timeout(QUOTA_ADMISSION_WAIT, self.permits.acquire()).await
