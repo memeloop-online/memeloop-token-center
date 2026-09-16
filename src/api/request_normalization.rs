@@ -20,13 +20,28 @@ pub(super) fn is_official_codex_user_agent(headers: &HeaderMap) -> bool {
         return false;
     };
     let user_agent = user_agent.trim();
-    user_agent.starts_with("Codex ")
-        || user_agent.starts_with("codex-tui/")
-        || user_agent.starts_with("codex_vscode/")
-        || user_agent.starts_with("codex_atlas/")
-        || user_agent.starts_with("codex_chatgpt_desktop/")
-        || user_agent == "codex_cli_rs"
-        || user_agent.starts_with("codex_cli_rs/")
+    if user_agent == "codex_cli_rs" {
+        return true;
+    }
+    let Some((originator, version_and_details)) = user_agent.split_once('/') else {
+        return false;
+    };
+    let Some(version) = version_and_details.split_whitespace().next() else {
+        return false;
+    };
+    if version.is_empty()
+        || !version
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    (originator.starts_with("Codex ") && originator.len() > "Codex ".len())
+        || matches!(
+            originator,
+            "codex-tui" | "codex_vscode" | "codex_atlas" | "codex_chatgpt_desktop" | "codex_cli_rs"
+        )
 }
 
 /// Normalize the subset of Codex MultiAgentV2 request shapes that a declared
@@ -71,13 +86,10 @@ pub(super) fn prepare_codex_multi_agent_v2_tools(
     }
     if let Some(input) = request.get_mut("input").and_then(Value::as_array_mut) {
         for item in input {
-            match item.get("type").and_then(Value::as_str) {
-                Some("additional_tools") => {
-                    if let Some(tools) = item.get_mut("tools") {
-                        rewrite_tool_list(tools);
-                    }
-                }
-                _ => {}
+            if let Some("additional_tools") = item.get("type").and_then(Value::as_str)
+                && let Some(tools) = item.get_mut("tools")
+            {
+                rewrite_tool_list(tools);
             }
         }
     }
@@ -209,7 +221,7 @@ mod tests {
     fn official_codex_user_agent_boundary_matches_cpa_and_fails_closed() {
         for user_agent in [
             "Codex Desktop/1.2.3",
-            "Codex 0.154.0",
+            "Codex Work/0.154.0 (Linux; x86_64)",
             "codex-tui/0.1.0",
             "codex_vscode/0.154.0",
             "codex_atlas/0.154.0",
@@ -224,6 +236,9 @@ mod tests {
         for user_agent in [
             "Mozilla/5.0",
             "Codex",
+            "Codex /0.154.0",
+            "Codex Work",
+            "Codex Work/not-a-version",
             "codex_cli_rs-other",
             "codex_vscode",
             "codex_vscode-not-versioned",
