@@ -7,7 +7,7 @@ use super::{
     AppError, Database, DatabaseBackend, MAX_STATS_RANGE_MILLIS, micros_to_decimal_string,
     unix_millis,
 };
-use crate::model::{MonitoringMetrics, MonitoringTerminalOutcome, UsageAnalysisCost};
+use crate::model::{MonitoringMetrics, MonitoringTerminalOutcome, TokenUsage, UsageAnalysisCost};
 
 const HOUR_MILLIS: i64 = 3_600_000;
 const DAY_MILLIS: i64 = 86_400_000;
@@ -149,6 +149,10 @@ struct MetricsAccumulator {
     requests: i64,
     successful_requests: i64,
     failed_requests: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    cached_input_tokens: i64,
+    cache_write_tokens: i64,
     duration_count: i64,
     duration_sum_ms: i64,
     duration_buckets: [i64; 12],
@@ -173,6 +177,18 @@ impl MetricsAccumulator {
         self.failed_requests = self
             .failed_requests
             .saturating_add(row.try_get("failed_requests")?);
+        self.input_tokens = self
+            .input_tokens
+            .saturating_add(row.try_get("input_tokens")?);
+        self.output_tokens = self
+            .output_tokens
+            .saturating_add(row.try_get("output_tokens")?);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(row.try_get("cached_input_tokens")?);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(row.try_get("cache_write_tokens")?);
         self.duration_count = self
             .duration_count
             .saturating_add(row.try_get("duration_count")?);
@@ -189,10 +205,19 @@ impl MetricsAccumulator {
     }
 
     fn finish(self) -> MonitoringMetrics {
+        let usage = TokenUsage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cached_input_tokens: self.cached_input_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+            service_tier: None,
+        };
         MonitoringMetrics {
             requests: self.requests,
             successful_requests: self.successful_requests,
             failed_requests: self.failed_requests,
+            total_tokens: usage.total_tokens(),
+            cache_rate: usage.cache_rate(),
             avg_duration_ms: (self.duration_count > 0)
                 .then(|| self.duration_sum_ms as f64 / self.duration_count as f64),
             p95_duration_ms: approximate_quantile(95, self.duration_count, &self.duration_buckets),
@@ -370,7 +395,9 @@ fn window_metrics_sql(granularity: AvailabilityGranularity) -> String {
     };
     let rollup = format!(
         r#"SELECT aggregate.upstream_account_id, aggregate.status_class, aggregate.currency,
-                  aggregate.requests, aggregate.duration_count, aggregate.duration_sum_ms,
+                  aggregate.requests, aggregate.input_tokens, aggregate.output_tokens,
+                  aggregate.cached_input_tokens, aggregate.cache_write_tokens,
+                  aggregate.duration_count, aggregate.duration_sum_ms,
                   aggregate.duration_bucket_0, aggregate.duration_bucket_1, aggregate.duration_bucket_2,
                   aggregate.duration_bucket_3, aggregate.duration_bucket_4, aggregate.duration_bucket_5,
                   aggregate.duration_bucket_6, aggregate.duration_bucket_7, aggregate.duration_bucket_8,
@@ -417,6 +444,10 @@ SELECT account.upstream_account_id, metrics.currency,
        COALESCE(metrics.requests, 0) AS requests,
        COALESCE(metrics.successful_requests, 0) AS successful_requests,
        COALESCE(metrics.failed_requests, 0) AS failed_requests,
+       COALESCE(metrics.input_tokens, 0) AS input_tokens,
+       COALESCE(metrics.output_tokens, 0) AS output_tokens,
+       COALESCE(metrics.cached_input_tokens, 0) AS cached_input_tokens,
+       COALESCE(metrics.cache_write_tokens, 0) AS cache_write_tokens,
        COALESCE(metrics.duration_count, 0) AS duration_count,
        COALESCE(metrics.duration_sum_ms, 0) AS duration_sum_ms,
        COALESCE(metrics.duration_bucket_0, 0) AS duration_bucket_0,
@@ -441,9 +472,26 @@ SELECT account.upstream_account_id, metrics.currency,
 }
 
 fn fact_metrics_sql(table: &str, alias: &str, from_parameter: &str, to_parameter: &str) -> String {
+    let token_projection = if table == "request_stats_facts" {
+        format!(
+            r#"CASE
+                      WHEN {alias}.input_tokens >= {alias}.cached_input_tokens + {alias}.cache_write_tokens
+                          THEN {alias}.input_tokens - {alias}.cached_input_tokens - {alias}.cache_write_tokens
+                      ELSE 0
+                  END AS input_tokens,
+                  {alias}.output_tokens, {alias}.cached_input_tokens, {alias}.cache_write_tokens"#,
+        )
+    } else {
+        r#"CAST(0 AS BIGINT) AS input_tokens,
+                  CAST(0 AS BIGINT) AS output_tokens,
+                  CAST(0 AS BIGINT) AS cached_input_tokens,
+                  CAST(0 AS BIGINT) AS cache_write_tokens"#
+            .to_owned()
+    };
     format!(
         r#"SELECT {alias}.upstream_account_id, {alias}.status_class, {alias}.currency,
                   CAST(1 AS BIGINT) AS requests,
+                  {token_projection},
                   CAST(1 AS BIGINT) AS duration_count, {alias}.duration_ms AS duration_sum_ms,
                   CASE WHEN {alias}.duration_ms <= 10 THEN 1 ELSE 0 END AS duration_bucket_0,
                   CASE WHEN {alias}.duration_ms > 10 AND {alias}.duration_ms <= 50 THEN 1 ELSE 0 END AS duration_bucket_1,
@@ -519,6 +567,10 @@ fn metric_sums() -> &'static str {
     r#"CAST(COALESCE(SUM(requests), 0) AS BIGINT) AS requests,
        CAST(COALESCE(SUM(CASE WHEN status_class = 'success' THEN requests ELSE 0 END), 0) AS BIGINT) AS successful_requests,
        CAST(COALESCE(SUM(CASE WHEN status_class = 'failure' THEN requests ELSE 0 END), 0) AS BIGINT) AS failed_requests,
+       CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT) AS input_tokens,
+       CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT) AS output_tokens,
+       CAST(COALESCE(SUM(cached_input_tokens), 0) AS BIGINT) AS cached_input_tokens,
+       CAST(COALESCE(SUM(cache_write_tokens), 0) AS BIGINT) AS cache_write_tokens,
        CAST(COALESCE(SUM(duration_count), 0) AS BIGINT) AS duration_count,
        CAST(COALESCE(SUM(duration_sum_ms), 0) AS BIGINT) AS duration_sum_ms,
        CAST(COALESCE(SUM(duration_bucket_0), 0) AS BIGINT) AS duration_bucket_0,
@@ -617,6 +669,16 @@ mod tests {
             assert!(sql.contains("usage_analysis_"), "{sql}");
             assert!(sql.contains("request_stats_facts"), "{sql}");
             assert!(sql.contains("generation_stats_facts"), "{sql}");
+            assert!(sql.contains("aggregate.cached_input_tokens"), "{sql}");
+            assert!(sql.contains("SUM(cache_write_tokens)"), "{sql}");
+            assert!(
+                sql.contains("f.input_tokens - f.cached_input_tokens - f.cache_write_tokens"),
+                "{sql}"
+            );
+            assert!(
+                sql.contains("CAST(0 AS BIGINT) AS cached_input_tokens"),
+                "{sql}"
+            );
             assert!(!sql.contains("LIMIT 10"), "{sql}");
             assert!(!sql.contains("request_records"), "{sql}");
             assert!(!sql.contains("generation_jobs"), "{sql}");
@@ -652,6 +714,7 @@ mod tests {
             .expect("database connection");
         database.migrate().await.expect("database migration");
         assert_tenant_window(&database).await;
+        assert_token_metrics_across_rollup_and_edges(&database).await;
     }
 
     #[tokio::test]
@@ -664,6 +727,69 @@ mod tests {
             .expect("PostgreSQL connection");
         database.migrate().await.expect("PostgreSQL migration");
         assert_tenant_window(&database).await;
+        assert_token_metrics_across_rollup_and_edges(&database).await;
+    }
+
+    async fn assert_token_metrics_across_rollup_and_edges(database: &Database) {
+        let tenant_id = Uuid::now_v7().to_string();
+        let tenant_external_id = format!("availability-tokens-{tenant_id}");
+        let account_id = Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO tenants (id, external_id, created_at) VALUES ($1, $2, 1)")
+            .bind(&tenant_id)
+            .bind(&tenant_external_id)
+            .execute(&database.pool)
+            .await
+            .expect("token tenant fixture");
+        sqlx::query(
+            "INSERT INTO upstream_accounts (id, tenant_id, name, driver, auth_kind, config_json, status, credential_generation, created_at, updated_at) VALUES ($1, $2, 'token-account', 'http-json', 'api_key', '{}', 'active', 1, 1, 1)",
+        )
+        .bind(&account_id)
+        .bind(&tenant_id)
+        .execute(&database.pool)
+        .await
+        .expect("token account fixture");
+
+        sqlx::query(
+            "INSERT INTO request_stats_facts (request_id, tenant_id, key_id, created_at, model, protocol, status_class, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, currency, cost_micros) VALUES ($1, $2, 'edge-key', 100, 'edge-model', 'openai', 'success', '', $3, '', 25, 10, 7, 2, 3, 'USD', 10), ($4, $2, 'edge-key', $5, 'edge-model', 'openai', 'success', '', $3, '', 25, 23, 29, 5, 7, 'USD', 10)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&tenant_id)
+        .bind(&account_id)
+        .bind(Uuid::now_v7().to_string())
+        .bind(2 * HOUR_MILLIS)
+        .execute(&database.pool)
+        .await
+        .expect("edge token facts");
+        sqlx::query(
+            "INSERT INTO usage_analysis_hourly (tenant_id, key_id, hour_bucket, source_kind, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency, requests, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, duration_count, duration_sum_ms, duration_bucket_0, duration_bucket_1, duration_bucket_2, duration_bucket_3, duration_bucket_4, duration_bucket_5, duration_bucket_6, duration_bucket_7, duration_bucket_8, duration_bucket_9, duration_bucket_10, duration_bucket_11, cost_micros) VALUES ($1, 'rollup-key', 1, 'request', 'rollup-model', 'openai', 'success', '', $2, '', 'default', 'USD', 1, 11, 19, 13, 17, 0, 1, 25, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10)",
+        )
+        .bind(&tenant_id)
+        .bind(&account_id)
+        .execute(&database.pool)
+        .await
+        .expect("complete hourly token rollup");
+
+        let window = database
+            .upstream_account_availability(
+                &tenant_external_id,
+                UpstreamAccountAvailabilityFilter {
+                    from_created_at: 1,
+                    to_created_at: 2 * HOUR_MILLIS,
+                },
+            )
+            .await
+            .expect("token availability window");
+        let metrics = &window
+            .accounts
+            .first()
+            .expect("token account result")
+            .metrics;
+        assert_eq!(window.accounts.len(), 1);
+        assert_eq!(window.accounts[0].upstream_account_id, account_id);
+        assert_eq!(metrics.requests, 3);
+        assert_eq!(metrics.total_tokens, 129);
+        let cache_rate = metrics.cache_rate.expect("non-zero token denominator");
+        assert!((cache_rate - (20.0 / 74.0)).abs() < 1e-12);
     }
 
     async fn assert_tenant_window(database: &Database) {
@@ -704,7 +830,7 @@ mod tests {
 
         for created_at in 100_i64..=105 {
             sqlx::query(
-                "INSERT INTO request_stats_facts (request_id, tenant_id, key_id, created_at, model, protocol, status_class, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, currency, cost_micros) VALUES ($1, $2, 'key-a', $3, 'model-a', 'openai', 'success', '', $4, 'route-a', 25, 1, 1, 'USD', 10)",
+                "INSERT INTO request_stats_facts (request_id, tenant_id, key_id, created_at, model, protocol, status_class, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, currency, cost_micros) VALUES ($1, $2, 'key-a', $3, 'model-a', 'openai', 'success', '', $4, 'route-a', 25, 10, 5, 4, 2, 'USD', 10)",
             )
             .bind(Uuid::now_v7().to_string())
             .bind(&tenant_id)
@@ -769,6 +895,8 @@ mod tests {
         assert_eq!(first.metrics.requests, 7);
         assert_eq!(first.metrics.successful_requests, 6);
         assert_eq!(first.metrics.failed_requests, 1);
+        assert_eq!(first.metrics.total_tokens, 90);
+        assert_eq!(first.metrics.cache_rate, Some(0.4));
         assert_eq!(first.terminal_outcomes.len(), 5);
         assert_eq!(first.terminal_outcomes[0].created_at, 106);
         assert_eq!(first.terminal_outcomes[0].source, "generation");
@@ -784,6 +912,8 @@ mod tests {
             .find(|account| account.upstream_account_id == account_b)
             .expect("second account is present");
         assert_eq!(second.metrics.requests, 1);
+        assert_eq!(second.metrics.total_tokens, 2);
+        assert_eq!(second.metrics.cache_rate, Some(0.0));
         assert_eq!(second.terminal_outcomes.len(), 1);
         assert_eq!(second.terminal_outcomes[0].id, request_b);
 
@@ -795,6 +925,8 @@ mod tests {
         assert_eq!(zero.metrics.requests, 0);
         assert_eq!(zero.metrics.successful_requests, 0);
         assert_eq!(zero.metrics.failed_requests, 0);
+        assert_eq!(zero.metrics.total_tokens, 0);
+        assert!(zero.metrics.cache_rate.is_none());
         assert!(zero.metrics.avg_duration_ms.is_none());
         assert!(zero.metrics.p95_duration_ms.is_none());
         assert!(zero.metrics.costs.is_empty());
