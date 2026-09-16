@@ -33,7 +33,7 @@ test('live metrics share real-data backgrounds and neutral rates across themes a
     const rate = cards.filter({ hasText: 'Finished request success rate' });
     assert.equal(await rate.locator('.analytics-metric-ratio').getAttribute('data-ratio'), '0.5');
     assert.equal(await rate.evaluate(node => node.classList.contains('positive')), false);
-    assert.ok(await cards.locator('.analytics-metric-trend').count() >= 4);
+    assert.equal(await cards.locator('.analytics-metric-trend').count(), 3, 'total tokens, successful, and running are the only cards with enough loaded records for a real trend');
     await cards.first().focus();
     await page.keyboard.press('End');
     assert.match(await cards.first().getAttribute('aria-valuetext') ?? '', /Total tokens: 50/);
