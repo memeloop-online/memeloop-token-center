@@ -180,6 +180,22 @@
                   }
                 }
               },
+              "request_compatibility": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "third_party": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Explicitly identifies a non-native upstream contract; this is never inferred from a URL or model name."
+                  },
+                  "codex_multi_agent_v2": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Opt in to the host's Codex MultiAgentV2 request normalization for this provider."
+                  }
+                }
+              },
               "source": { "type": "string", "readOnly": true }
             }
           }

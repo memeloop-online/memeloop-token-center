@@ -227,6 +227,7 @@ fn test_provider(id: &str) -> ProviderType {
         oauth_adapter: None,
         component_adapter: None,
         generation_adapter: None,
+        request_compatibility: Default::default(),
         source: "test".into(),
     }
 }
@@ -277,6 +278,14 @@ fn plugin_provider_generation_capabilities_are_versioned_and_extensible() {
         provider_asset_reads_repeatable: true,
     });
     assert!(catalog.extend([invalid]).is_err());
+}
+
+#[test]
+fn multi_agent_compatibility_is_explicit_and_provider_scoped() {
+    let catalog = ProviderCatalog::builtins();
+    assert!(catalog.supports_codex_multi_agent_v2("kimi-oauth"));
+    assert!(!catalog.supports_codex_multi_agent_v2("openai-codex"));
+    assert!(!catalog.supports_codex_multi_agent_v2("http-json"));
 }
 
 #[test]

@@ -82,8 +82,13 @@ pub(super) fn plan_proxy_route(
     if is_codex {
         codex::validate_route(&route, protocol)?;
     }
-    let (mut forwarded_json, kimi_response) =
-        kimi::prepare_forwarded_request(&route, protocol, request_json)?;
+    let (mut forwarded_json, kimi_response) = kimi::prepare_forwarded_request(
+        &route,
+        protocol,
+        request_json,
+        matches!(protocol, Protocol::OpenAiResponses)
+            && state.providers.supports_codex_multi_agent_v2(&route.driver),
+    )?;
     let codex_plan = if is_codex {
         Some(codex_transport::prepare_request_with_id(
             &mut forwarded_json,

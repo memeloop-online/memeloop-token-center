@@ -2166,6 +2166,7 @@ async fn plugin_provider_can_contribute_an_oauth_adapter_route() {
             }),
             component_adapter: None,
             generation_adapter: None,
+            request_compatibility: Default::default(),
             source: "plugin:test@1.0.0".to_owned(),
         }])
         .unwrap();

@@ -92,6 +92,7 @@ pub(super) fn provider_type(credential_schema: Value) -> ProviderType {
             provable_submit_idempotency: false,
             provider_asset_reads_repeatable: false,
         }),
+        request_compatibility: Default::default(),
         source: "builtin".to_owned(),
     }
 }

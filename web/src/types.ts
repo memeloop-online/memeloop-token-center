@@ -689,6 +689,10 @@ export interface ProviderType {
     api_version: 'buffered-v1';
     max_response_bytes: number;
   };
+  request_compatibility?: {
+    third_party: boolean;
+    codex_multi_agent_v2: boolean;
+  };
   source: string;
 }
 

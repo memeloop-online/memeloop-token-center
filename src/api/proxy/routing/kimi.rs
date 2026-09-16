@@ -11,8 +11,13 @@ pub(super) fn prepare_forwarded_request(
     route: &ResolvedUpstream,
     protocol: Protocol,
     request: &Value,
+    normalize_multi_agent: bool,
 ) -> Result<(Value, Option<responses::Context>), AppError> {
     let mut forwarded = request.clone();
+    crate::api::request_normalization::normalize_codex_multi_agent_v2(
+        &mut forwarded,
+        normalize_multi_agent,
+    );
     if route.driver != crate::oauth::managed::kimi::PROVIDER_DRIVER {
         if let Some(model) = forwarded.get_mut("model") {
             *model = Value::String(route.upstream_model.clone());

@@ -7,7 +7,7 @@ mod types;
 
 pub use catalog::{
     ComponentAdapterContribution, GenerationAdapterContribution, OAuthAdapterContribution,
-    OAuthFlowKind, ProviderCatalog, ProviderType,
+    OAuthFlowKind, ProviderCatalog, ProviderType, RequestCompatibility,
 };
 pub(crate) use catalog::{ManagedOAuthAdapterBackend, ResolvedManagedOAuthAdapter};
 pub use cbcnx::{CBCNX_PROVIDER_DRIVER, is_openai_compatible_http_driver};

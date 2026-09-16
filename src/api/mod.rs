@@ -55,6 +55,7 @@ mod proxy;
 pub(crate) use proxy::{MediaAttemptBudget, wait_media_recovery};
 pub(crate) use proxy::{MediaAttemptGuard, MediaAttemptTerminal, classify_media_rate_limit};
 mod proxy_diagnostics;
+mod request_normalization;
 mod request_detail;
 mod router;
 mod routes;

@@ -2383,6 +2383,14 @@ fn validate_provider_contribution(
             "plugin {plugin_id} contributes an invalid provider"
         )));
     }
+    if provider.request_compatibility.codex_multi_agent_v2
+        && !provider.request_compatibility.third_party
+    {
+        return Err(AppError::BadRequest(format!(
+            "plugin {plugin_id} provider {} must declare third_party for Codex MultiAgentV2 compatibility",
+            provider.id
+        )));
+    }
     crate::schema::validate_definition(&provider.config_schema)?;
     crate::schema::validate_definition(&provider.credential_schema)?;
     let supported_credentials = [

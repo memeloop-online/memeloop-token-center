@@ -1,0 +1,79 @@
+{
+  "model": "kimi-k3",
+  "stream": false,
+  "tools": [
+    {
+      "type": "namespace",
+      "name": "collaboration",
+      "tools": [
+        {
+          "type": "function",
+          "name": "send_message",
+          "description": "Send a task to another agent",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string",
+                "encrypted": {
+                  "type": "boolean",
+                  "description": "internal wire marker"
+                },
+                "description": "Message body"
+              },
+              "recipient": {"type": "string"}
+            },
+            "required": ["message", "recipient"]
+          }
+        },
+        {
+          "type": "function",
+          "name": "keep_this_tool",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string",
+                "encrypted": {"type": "boolean"}
+              }
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "input": [
+    {
+      "type": "additional_tools",
+      "tools": [
+        {
+          "type": "function",
+          "name": "followup_task",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string",
+                "encrypted": {"type": "boolean"}
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "type": "agent_message",
+      "author": "/root",
+      "recipient": "/root/worker",
+      "role": "system",
+      "internal_chat_message_metadata_passthrough": {
+        "turn_id": "fixture-turn",
+        "instruction": "never forward this metadata as a prompt"
+      },
+      "content": [
+        {"type": "input_text", "text": "Message Type: NEW_TASK\nPayload:\n"},
+        {"type": "encrypted_content", "encrypted_content": "delegated task fixture"}
+      ]
+    }
+  ]
+}

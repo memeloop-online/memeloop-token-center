@@ -82,6 +82,29 @@ pub struct GenerationAdapterContribution {
     pub provider_asset_reads_repeatable: bool,
 }
 
+/// Explicit request-shape compatibility declarations owned by the provider
+/// catalog.  A capability is never inferred from a model name or URL: a
+/// third-party upstream must opt in before the gateway rewrites Codex
+/// collaboration payloads for it.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RequestCompatibility {
+    #[serde(default)]
+    pub third_party: bool,
+    #[serde(default)]
+    pub codex_multi_agent_v2: bool,
+}
+
+impl RequestCompatibility {
+    pub(crate) fn is_default(&self) -> bool {
+        !self.third_party && !self.codex_multi_agent_v2
+    }
+
+    pub fn supports_codex_multi_agent_v2(&self) -> bool {
+        self.third_party && self.codex_multi_agent_v2
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderType {
@@ -97,6 +120,8 @@ pub struct ProviderType {
     pub component_adapter: Option<ComponentAdapterContribution>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation_adapter: Option<GenerationAdapterContribution>,
+    #[serde(default, skip_serializing_if = "RequestCompatibility::is_default")]
+    pub request_compatibility: RequestCompatibility,
     #[serde(default)]
     pub source: String,
 }
@@ -281,6 +306,7 @@ impl ProviderCatalog {
                 provable_submit_idempotency: false,
                 provider_asset_reads_repeatable: false,
             }),
+            request_compatibility: Default::default(),
             source: "builtin".to_owned(),
         }];
         types.push(crate::provider::cbcnx::provider_type(
@@ -321,6 +347,7 @@ impl ProviderCatalog {
                 provable_submit_idempotency: false,
                 provider_asset_reads_repeatable: true,
             }),
+            request_compatibility: Default::default(),
             source: "builtin".to_owned(),
         });
         types.push(ProviderType {
@@ -362,6 +389,7 @@ impl ProviderCatalog {
                 provable_submit_idempotency: false,
                 provider_asset_reads_repeatable: true,
             }),
+            request_compatibility: Default::default(),
             source: "builtin".to_owned(),
         });
         types.push(builtin_managed_oauth_provider(
@@ -491,6 +519,10 @@ impl ProviderCatalog {
             poll_url: crate::oauth::managed::kimi::TOKEN_ENDPOINT.to_owned(),
             refresh_url: crate::oauth::managed::kimi::TOKEN_ENDPOINT.to_owned(),
         });
+        kimi.request_compatibility = RequestCompatibility {
+            third_party: true,
+            codex_multi_agent_v2: true,
+        };
         kimi.credential_schema["properties"]["expires_at"] = json!({"type": ["integer", "null"], "description": "Unix milliseconds, absent source expiry remains unknown"});
         types.push(kimi);
         Self {
@@ -569,6 +601,14 @@ impl ProviderCatalog {
 
     pub fn get(&self, driver: &str) -> Option<&ProviderType> {
         self.types.iter().find(|provider| provider.id == driver)
+    }
+
+    pub fn supports_codex_multi_agent_v2(&self, driver: &str) -> bool {
+        self.get(driver).is_some_and(|provider| {
+            provider
+                .request_compatibility
+                .supports_codex_multi_agent_v2()
+        })
     }
 
     pub(crate) fn managed_oauth_adapter_for_driver(
@@ -658,6 +698,7 @@ fn builtin_managed_oauth_provider(
         oauth_adapter: None,
         component_adapter: None,
         generation_adapter: None,
+        request_compatibility: Default::default(),
         source: "builtin".to_owned(),
     }
 }
@@ -715,6 +756,7 @@ fn builtin_interactive_oauth_provider(
         }),
         component_adapter: None,
         generation_adapter: None,
+        request_compatibility: Default::default(),
         source: "builtin".to_owned(),
     }
 }

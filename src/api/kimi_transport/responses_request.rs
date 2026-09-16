@@ -114,8 +114,9 @@ fn combine(existing: &mut String, incoming: &str) {
 }
 
 /// Inter-agent messages are user-level input, never privileged instructions.
-/// Provider-encrypted payloads cannot be translated by this gateway: in real
-/// agent requests the readable part can be only an envelope, not the task.
+/// The common request normalizer converts readable string encrypted payloads
+/// before this function runs. Any opaque/non-string payload still fails closed
+/// rather than being guessed at.
 fn agent_message(item: &Value) -> Result<Value, AppError> {
     let parts = item["content"].as_array().ok_or_else(|| {
         AppError::BadRequest("Kimi agent messages require readable content".into())
@@ -127,14 +128,21 @@ fn agent_message(item: &Value) -> Result<Value, AppError> {
     )}));
     for part in parts {
         match part["type"].as_str() {
-            Some("encrypted_content") => return Err(AppError::BadRequest(
-                "Kimi cannot read encrypted agent message content; resend the complete agent task as plaintext input".into(),
-            )),
             Some("input_text" | "output_text" | "text") if part["text"].is_string() => {
-                readable.push(part.clone());
+                readable.push(json!({
+                    "type": "input_text",
+                    "text": part["text"]
+                }));
             }
             Some("input_image") if part["image_url"].is_string() => {
-                readable.push(part.clone());
+                let mut image = json!({
+                    "type": "input_image",
+                    "image_url": part["image_url"]
+                });
+                if let Some(detail) = part.get("detail") {
+                    image["detail"] = detail.clone();
+                }
+                readable.push(image);
             }
             _ => return Err(AppError::BadRequest(
                 "unsupported agent message content for Kimi; resend the complete agent task as readable input".into(),
@@ -385,20 +393,73 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_agent_payload_is_not_silently_replaced_with_its_envelope() {
+    fn normalized_encrypted_agent_payload_preserves_task_text_without_metadata() {
         for content in [
             json!([{"type":"input_text","text":"Message Type: NEW_TASK\nPayload:\n"},
                 {"type":"encrypted_content","encrypted_content":"secret-ciphertext-fixture"}]),
             json!([{"type":"encrypted_content","encrypted_content":"secret-ciphertext-fixture"}]),
         ] {
-            let error = convert(&json!({"input":[{"type":"agent_message","content":content}]}))
-                .unwrap_err();
-            let AppError::BadRequest(message) = error else {
-                panic!("expected input rejection")
-            };
-            assert!(message.contains("resend the complete agent task as plaintext input"));
-            assert!(!message.contains("secret-ciphertext-fixture"));
+            let mut request = json!({"input":[{"type":"agent_message",
+                "author":"/root", "recipient":"/root/worker",
+                "internal_chat_message_metadata_passthrough":{"instruction":"never forward this"},
+                "content":content}]});
+            crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut request, true);
+            assert_eq!(request["input"][0]["content"][0]["type"], "input_text");
+            let output = convert(&request).unwrap();
+            assert_eq!(output["messages"][0]["role"], "user");
+            assert!(output.to_string().contains("secret-ciphertext-fixture"));
+            assert!(!output.to_string().contains("encrypted_content"));
+            assert!(!output.to_string().contains("never forward this"));
         }
+    }
+
+    #[test]
+    fn opaque_encrypted_agent_payload_still_fails_closed() {
+        let mut request = json!({"input":[{"type":"agent_message","content":[
+            {"type":"encrypted_content","encrypted_content":{"ciphertext":"opaque"}}
+        ]}]});
+        crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut request, true);
+        let error = convert(&request).unwrap_err();
+        let AppError::BadRequest(message) = error else {
+            panic!("expected input rejection")
+        };
+        assert!(message.contains("unsupported agent message content"));
+        assert!(message.contains("readable input"));
+    }
+
+    #[test]
+    fn codex_multi_agent_fixture_is_readable_for_kimi_without_internal_metadata() {
+        let mut request: Value =
+            serde_json::from_str(include_str!("fixtures/codex-multi-agent-v2.json"))
+                .expect("valid Codex MultiAgentV2 fixture");
+        crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut request, true);
+
+        assert!(
+            request["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_none()
+        );
+        assert!(
+            request["input"][0]["tools"][0]["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_none()
+        );
+        assert!(
+            request["tools"][0]["tools"][1]["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_some()
+        );
+        assert_eq!(request["input"][1]["content"][1]["type"], "input_text");
+        assert_eq!(
+            request["input"][1]["content"][1]["text"],
+            "delegated task fixture"
+        );
+
+        let output = convert(&request).expect("fixture converts to Kimi Chat");
+        assert_eq!(output["messages"][0]["role"], "user");
+        assert!(output.to_string().contains("delegated task fixture"));
+        assert!(!output.to_string().contains("never forward this metadata"));
+        assert!(!output.to_string().contains("encrypted_content"));
     }
 
     #[test]
