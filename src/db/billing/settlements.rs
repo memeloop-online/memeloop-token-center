@@ -70,6 +70,263 @@ impl Database {
         });
         Ok(AccountSettlementPage { items, next_cursor })
     }
+
+    pub async fn list_settlement_correction_previews(
+        &self,
+        account_id: Uuid,
+        from_completed_at: i64,
+        to_completed_at: i64,
+        limit: i64,
+        after: Option<(i64, Uuid)>,
+    ) -> Result<SettlementCorrectionPreviewPage, AppError> {
+        if from_completed_at < 0
+            || to_completed_at < 0
+            || from_completed_at > to_completed_at
+            || to_completed_at.saturating_sub(from_completed_at) > MAX_STATS_RANGE_MILLIS
+            || !(1..=500).contains(&limit)
+        {
+            return Err(AppError::BadRequest(
+                "invalid settlement correction preview query".into(),
+            ));
+        }
+        if let Some((completed_at, request_id)) = after {
+            let valid_cursor = sqlx::query(
+                "SELECT r.id FROM request_records r JOIN usage_reservations u ON u.id = r.reservation_id WHERE u.account_id = $1 AND r.id = $2 AND r.completed_at = $3 AND r.completed_at >= $4 AND r.completed_at <= $5 AND r.status_code IS NOT NULL AND r.protocol <> 'audio-transcription' AND r.usage_basis = 'contract_ceiling'",
+            )
+            .bind(account_id.to_string())
+            .bind(request_id.to_string())
+            .bind(completed_at)
+            .bind(from_completed_at)
+            .bind(to_completed_at)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some();
+            if !valid_cursor {
+                return Err(AppError::BadRequest(
+                    "after cursor does not identify a settlement correction candidate".into(),
+                ));
+            }
+        }
+        let (after_completed_at, after_request_id) = after
+            .map(|(completed_at, request_id)| (completed_at, request_id.to_string()))
+            .unwrap_or_else(|| (-1, "00000000-0000-0000-0000-000000000000".to_owned()));
+        let rows = sqlx::query(
+            r#"SELECT r.id AS request_id, r.reservation_id, u.account_id, r.key_id,
+                      r.protocol, r.model, r.status_code, r.error_code, r.created_at,
+                      r.completed_at, r.currency, r.cost_micros, r.input_tokens,
+                      r.cached_input_tokens, r.cache_write_tokens, r.output_tokens,
+                      u.status AS reservation_status, u.actual_micros, u.reserved_tokens,
+                      u.enforcement_mode,
+                      COALESCE(spool.state,
+                          CASE WHEN r.response_object IS NULL OR r.response_object LIKE 'gap://%'
+                               THEN 'gap' ELSE 'bound' END) AS archive_state,
+                      CAST(CASE WHEN COALESCE(spool.state, '') = 'bound'
+                                  AND r.response_object IS NOT NULL
+                                  AND r.response_object NOT LIKE 'gap://%'
+                           THEN 1
+                           WHEN spool.state IS NULL
+                                  AND r.response_object IS NOT NULL
+                                  AND r.response_object NOT LIKE 'gap://%'
+                           THEN 1 ELSE 0 END AS BIGINT) AS response_available,
+                      (SELECT COUNT(*) FROM ledger_entries ledger
+                        WHERE ledger.account_id = u.account_id
+                          AND ledger.key_id = u.key_id
+                          AND ledger.kind = 'usage'
+                          AND ledger.source = u.id) AS usage_ledger_count,
+                      (SELECT MIN(ledger.id) FROM ledger_entries ledger
+                        WHERE ledger.account_id = u.account_id
+                          AND ledger.key_id = u.key_id
+                          AND ledger.kind = 'usage'
+                          AND ledger.source = u.id) AS usage_ledger_entry_id,
+                      (SELECT MIN(ledger.amount_micros) FROM ledger_entries ledger
+                        WHERE ledger.account_id = u.account_id
+                          AND ledger.key_id = u.key_id
+                          AND ledger.kind = 'usage'
+                          AND ledger.source = u.id) AS usage_ledger_amount,
+                      (SELECT MIN(ledger.currency) FROM ledger_entries ledger
+                        WHERE ledger.account_id = u.account_id
+                          AND ledger.key_id = u.key_id
+                          AND ledger.kind = 'usage'
+                          AND ledger.source = u.id) AS usage_ledger_currency,
+                      feed.settlement_id AS feed_settlement_id,
+                      feed.account_id AS feed_account_id, feed.key_id AS feed_key_id,
+                      feed.cost_micros AS feed_cost_micros, feed.currency AS feed_currency,
+                      feed.usage_basis AS feed_usage_basis
+                 FROM request_records r
+                 JOIN usage_reservations u ON u.id = r.reservation_id
+                 LEFT JOIN response_archive_spools spool
+                        ON spool.request_id = r.id
+                       AND spool.tenant_id = r.tenant_id
+                       AND spool.reservation_id = r.reservation_id
+                 LEFT JOIN account_settlement_feed feed
+                        ON feed.request_kind = 'text' AND feed.request_id = r.id
+                WHERE u.account_id = $1
+                  AND r.completed_at >= $2 AND r.completed_at <= $3
+                  AND (r.completed_at > $4 OR (r.completed_at = $4 AND r.id > $5))
+                  AND r.status_code IS NOT NULL
+                  AND r.protocol <> 'audio-transcription'
+                  AND r.usage_basis = 'contract_ceiling'
+                ORDER BY r.completed_at ASC, r.id ASC
+                LIMIT $6"#,
+        )
+        .bind(account_id.to_string())
+        .bind(from_completed_at)
+        .bind(to_completed_at)
+        .bind(after_completed_at)
+        .bind(after_request_id)
+        .bind(limit.saturating_add(1))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut items = rows
+            .iter()
+            .map(settlement_correction_preview_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = items.len() > limit as usize;
+        if has_more {
+            items.truncate(limit as usize);
+        }
+        let next_cursor = has_more.then(|| {
+            let last = items.last().expect("a page with more rows is non-empty");
+            SettlementCorrectionPreviewCursor {
+                after_completed_at: last.completed_at,
+                after_request_id: last.request_id,
+            }
+        });
+        Ok(SettlementCorrectionPreviewPage { items, next_cursor })
+    }
+}
+
+fn settlement_correction_preview_from_row(
+    row: &AnyRow,
+) -> Result<SettlementCorrectionPreviewView, AppError> {
+    let request_id = parse_uuid(row.try_get("request_id")?)?;
+    let reservation_id = parse_uuid(row.try_get("reservation_id")?)?;
+    let account_id = parse_uuid(row.try_get("account_id")?)?;
+    let key_id = parse_uuid(row.try_get("key_id")?)?;
+    let cost_micros: i64 = row.try_get("cost_micros")?;
+    if cost_micros < 0 {
+        return Err(AppError::Internal);
+    }
+    let input_tokens: i64 = row.try_get("input_tokens")?;
+    let cached_input_tokens: i64 = row.try_get("cached_input_tokens")?;
+    let cache_write_tokens: i64 = row.try_get("cache_write_tokens")?;
+    let output_tokens: i64 = row.try_get("output_tokens")?;
+    let reserved_tokens: i64 = row.try_get("reserved_tokens")?;
+    let currency: String = row.try_get("currency")?;
+    let usage_ledger_count: i64 = row.try_get("usage_ledger_count")?;
+    let usage_ledger_entry_id = row
+        .try_get::<Option<String>, _>("usage_ledger_entry_id")?
+        .map(parse_uuid)
+        .transpose()?;
+    let usage_ledger_entry_id_string = usage_ledger_entry_id.map(|id| id.to_string());
+    let account_id_string = account_id.to_string();
+    let key_id_string = key_id.to_string();
+    let usage_ledger_amount: Option<i64> = row.try_get("usage_ledger_amount")?;
+    let usage_ledger_currency: Option<String> = row.try_get("usage_ledger_currency")?;
+    let usage_ledger_unique = usage_ledger_count == 1;
+    let usage_ledger_matches_cost = usage_ledger_unique
+        && usage_ledger_amount.and_then(i64::checked_neg) == Some(cost_micros)
+        && usage_ledger_currency.as_deref() == Some(currency.as_str());
+    let reservation_settled = row.try_get::<String, _>("reservation_status")? == "settled";
+    let reservation_actual_matches_cost =
+        row.try_get::<Option<i64>, _>("actual_micros")? == Some(cost_micros);
+    let token_ceiling_matches_reservation = input_tokens.checked_add(output_tokens)
+        == Some(reserved_tokens)
+        && cached_input_tokens == 0
+        && cache_write_tokens == 0;
+    let enforcement_mode: String = row.try_get("enforcement_mode")?;
+    let feed_settlement_id: Option<String> = row.try_get("feed_settlement_id")?;
+    let settlement_feed = if enforcement_mode == "metered_unlimited" {
+        if feed_settlement_id.is_none() {
+            SettlementCorrectionFeedState::NotApplicableMetered
+        } else {
+            SettlementCorrectionFeedState::Mismatch
+        }
+    } else if feed_settlement_id.is_none() {
+        SettlementCorrectionFeedState::Missing
+    } else if usage_ledger_unique
+        && feed_settlement_id.as_deref() == usage_ledger_entry_id_string.as_deref()
+        && row
+            .try_get::<Option<String>, _>("feed_account_id")?
+            .as_deref()
+            == Some(account_id_string.as_str())
+        && row.try_get::<Option<String>, _>("feed_key_id")?.as_deref()
+            == Some(key_id_string.as_str())
+        && row.try_get::<Option<i64>, _>("feed_cost_micros")? == Some(cost_micros)
+        && row
+            .try_get::<Option<String>, _>("feed_currency")?
+            .as_deref()
+            == Some(currency.as_str())
+        && row
+            .try_get::<Option<String>, _>("feed_usage_basis")?
+            .as_deref()
+            == Some("contract_ceiling")
+    {
+        SettlementCorrectionFeedState::Matched
+    } else {
+        SettlementCorrectionFeedState::Mismatch
+    };
+    let review_state = if reservation_settled
+        && reservation_actual_matches_cost
+        && token_ceiling_matches_reservation
+        && usage_ledger_unique
+        && usage_ledger_matches_cost
+        && matches!(
+            settlement_feed,
+            SettlementCorrectionFeedState::Matched
+                | SettlementCorrectionFeedState::NotApplicableMetered
+        ) {
+        SettlementCorrectionReviewState::ReadyForEvidence
+    } else {
+        SettlementCorrectionReviewState::InvariantMismatch
+    };
+    let archive_state_value: String = row.try_get("archive_state")?;
+    let archive_state =
+        RequestArchiveState::from_storage(&archive_state_value).ok_or(AppError::Internal)?;
+    Ok(SettlementCorrectionPreviewView {
+        request_id,
+        reservation_id,
+        usage_ledger_entry_id: usage_ledger_unique
+            .then_some(usage_ledger_entry_id)
+            .flatten(),
+        account_id,
+        key_id,
+        protocol: row.try_get("protocol")?,
+        model: row.try_get("model")?,
+        status_code: row.try_get("status_code")?,
+        error_code: row.try_get("error_code")?,
+        created_at: row.try_get("created_at")?,
+        completed_at: row.try_get("completed_at")?,
+        currency: currency.clone(),
+        original: SettlementCorrectionOriginalView {
+            usage_basis: RequestUsageBasis::ContractCeiling,
+            cost: micros_to_decimal_string(cost_micros),
+            input_tokens,
+            cached_input_tokens,
+            cache_write_tokens,
+            output_tokens,
+        },
+        evidence: SettlementCorrectionEvidenceView {
+            archive_state,
+            response_available: row.try_get::<i64, _>("response_available")? == 1,
+            provider_usage: "not_evaluated".to_owned(),
+        },
+        invariants: SettlementCorrectionInvariantsView {
+            reservation_settled,
+            reservation_actual_matches_cost,
+            token_ceiling_matches_reservation,
+            usage_ledger_unique,
+            usage_ledger_matches_cost,
+            settlement_feed,
+        },
+        review_state,
+        pending_correction: SettlementCorrectionPendingView {
+            corrected_usage_basis: None,
+            corrected_cost: None,
+            maximum_possible_rebate: micros_to_decimal_string(cost_micros),
+            required_confirmation: "provider_reported_usage_or_not_observed".to_owned(),
+        },
+    })
 }
 
 fn settlement_kind_name(kind: AccountSettlementKind) -> &'static str {

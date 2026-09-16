@@ -12,6 +12,17 @@ pub(in crate::api) struct SettlementQuery {
     request_id: Option<Uuid>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct SettlementCorrectionPreviewQuery {
+    from_completed_at: Option<i64>,
+    to_completed_at: Option<i64>,
+    #[serde(default = "default_limit")]
+    limit: i64,
+    after_completed_at: Option<i64>,
+    after_request_id: Option<Uuid>,
+}
+
 pub(in crate::api) async fn list_account_settlements(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -63,6 +74,58 @@ pub(in crate::api) async fn list_account_settlements(
     let page = state
         .db
         .list_account_settlements(account_id, query.limit, after, exact)
+        .await?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(page)))
+}
+
+pub(in crate::api) async fn list_settlement_correction_previews(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Query(query): Query<SettlementCorrectionPreviewQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "settlements:adjust").await?;
+    if let Some(tenant) = service.tenant_external_id.as_deref() {
+        state.db.require_account_tenant(account_id, tenant).await?;
+    } else {
+        state.db.require_account_exists(account_id).await?;
+    }
+    let from_completed_at = query.from_completed_at.ok_or_else(|| {
+        AppError::BadRequest("settlement correction preview requires from_completed_at".into())
+    })?;
+    let to_completed_at = query.to_completed_at.ok_or_else(|| {
+        AppError::BadRequest("settlement correction preview requires to_completed_at".into())
+    })?;
+    if !(1..=500).contains(&query.limit) {
+        return Err(AppError::BadRequest(
+            "limit must be between 1 and 500".into(),
+        ));
+    }
+    let after = match (query.after_completed_at, query.after_request_id) {
+        (None, None) => None,
+        (Some(completed_at), Some(request_id)) if completed_at >= 0 => {
+            Some((completed_at, request_id))
+        }
+        (Some(_), Some(_)) => {
+            return Err(AppError::BadRequest(
+                "after_completed_at must be non-negative".into(),
+            ));
+        }
+        _ => {
+            return Err(AppError::BadRequest(
+                "after_completed_at and after_request_id must be supplied together".into(),
+            ));
+        }
+    };
+    let page = state
+        .db
+        .list_settlement_correction_previews(
+            account_id,
+            from_completed_at,
+            to_completed_at,
+            query.limit,
+            after,
+        )
         .await?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(page)))
 }

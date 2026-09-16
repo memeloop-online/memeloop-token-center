@@ -3832,6 +3832,63 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /internal/v1/accounts/{account_id}/settlement-correction-previews:
+    get:
+      tags: [Credits]
+      operationId: listSettlementCorrectionPreviews
+      summary: Preview historical contract-ceiling settlement corrections
+      description: |
+        Returns only terminal text requests whose persisted `usage_basis` is exactly
+        `contract_ceiling`. Historical null provenance is excluded and cannot be
+        enabled by a query parameter. The response exposes immutable identities,
+        archive availability, and cross-table invariants needed before a later
+        correction decision. It does not read archive content, infer provider usage,
+        calculate a corrected cost, or mutate balances, budgets, settlements, or
+        analytics.
+
+        Requires the dedicated `settlements:adjust` scope because these previews are
+        inputs to the separately authorized correction workflow. Tenant-scoped
+        credentials remain confined to accounts in their own tenant. Results use an
+        exclusive ascending `(completed_at, request_id)` cursor and an inclusive time
+        window no wider than the common 93-day statistics limit.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: settlements:adjust
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - name: from_completed_at
+          in: query
+          required: true
+          description: Inclusive lower completion-time bound in Unix epoch milliseconds.
+          schema: { type: integer, format: int64, minimum: 0 }
+        - name: to_completed_at
+          in: query
+          required: true
+          description: Inclusive upper completion-time bound in Unix epoch milliseconds.
+          schema: { type: integer, format: int64, minimum: 0 }
+        - $ref: '#/components/parameters/SettlementListLimit500'
+        - name: after_completed_at
+          in: query
+          required: false
+          description: Completion timestamp from the final row of the prior page. Must be paired with `after_request_id`.
+          schema: { type: integer, format: int64, minimum: 0 }
+        - name: after_request_id
+          in: query
+          required: false
+          description: Request UUID from the final row of the prior page. Must be paired with `after_completed_at`.
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Read-only correction candidates and evidence readiness.
+          headers:
+            Cache-Control: { schema: { const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SettlementCorrectionPreviewPage' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /internal/v1/accounts/{account_id}/settlements/{settlement_id}/adjustments:
     put:
       tags: [Credits]
@@ -8239,6 +8296,110 @@ components:
         next_cursor:
           oneOf:
             - $ref: '#/components/schemas/AccountSettlementCursor'
+            - type: 'null'
+    SettlementCorrectionOriginal:
+      type: object
+      additionalProperties: false
+      required: [usage_basis, cost, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens]
+      properties:
+        usage_basis: { type: string, const: contract_ceiling }
+        cost: { $ref: '#/components/schemas/NonNegativeMoney' }
+        input_tokens: { type: integer, format: int64, minimum: 0 }
+        cached_input_tokens: { type: integer, format: int64, minimum: 0 }
+        cache_write_tokens: { type: integer, format: int64, minimum: 0 }
+        output_tokens: { type: integer, format: int64, minimum: 0 }
+    SettlementCorrectionEvidence:
+      type: object
+      additionalProperties: false
+      required: [archive_state, response_available, provider_usage]
+      properties:
+        archive_state: { $ref: '#/components/schemas/RequestArchiveState' }
+        response_available:
+          type: boolean
+          description: True only when a non-gap response object is durably bound; response bytes are not read by this preview.
+        provider_usage:
+          type: string
+          const: not_evaluated
+          description: Provider usage remains deliberately unevaluated until a separately reviewed evidence step.
+    SettlementCorrectionInvariants:
+      type: object
+      additionalProperties: false
+      required: [reservation_settled, reservation_actual_matches_cost, token_ceiling_matches_reservation, usage_ledger_unique, usage_ledger_matches_cost, settlement_feed]
+      properties:
+        reservation_settled: { type: boolean }
+        reservation_actual_matches_cost: { type: boolean }
+        token_ceiling_matches_reservation: { type: boolean }
+        usage_ledger_unique: { type: boolean }
+        usage_ledger_matches_cost: { type: boolean }
+        settlement_feed:
+          type: string
+          enum: [matched, not_applicable_metered, missing, mismatch]
+    SettlementCorrectionPending:
+      type: object
+      additionalProperties: false
+      required: [corrected_usage_basis, corrected_cost, maximum_possible_rebate, required_confirmation]
+      properties:
+        corrected_usage_basis:
+          type: [string, 'null']
+          enum: [provider_reported, not_observed, null]
+          description: Always null in the read-only preview; a later evidence decision selects a value.
+        corrected_cost:
+          oneOf:
+            - $ref: '#/components/schemas/NonNegativeMoney'
+            - type: 'null'
+          description: Always null until provider-reported usage or non-observation is confirmed.
+        maximum_possible_rebate:
+          allOf: [{ $ref: '#/components/schemas/NonNegativeMoney' }]
+          description: Upper bound equal to the original local settlement, not a recommended rebate.
+        required_confirmation:
+          type: string
+          const: provider_reported_usage_or_not_observed
+    SettlementCorrectionPreview:
+      type: object
+      additionalProperties: false
+      required: [request_id, reservation_id, usage_ledger_entry_id, account_id, key_id, protocol, model, status_code, error_code, created_at, completed_at, currency, original, evidence, invariants, review_state, pending_correction]
+      properties:
+        request_id: { type: string, format: uuid }
+        reservation_id: { type: string, format: uuid }
+        usage_ledger_entry_id:
+          type: [string, 'null']
+          format: uuid
+          description: Present only when exactly one usage ledger row is bound to the reservation.
+        account_id: { type: string, format: uuid }
+        key_id: { type: string, format: uuid }
+        protocol: { type: string }
+        model: { type: string }
+        status_code: { type: integer, format: int64 }
+        error_code: { type: [string, 'null'] }
+        created_at: { type: integer, format: int64, minimum: 0 }
+        completed_at: { type: integer, format: int64, minimum: 0 }
+        currency: { $ref: '#/components/schemas/Currency' }
+        original: { $ref: '#/components/schemas/SettlementCorrectionOriginal' }
+        evidence: { $ref: '#/components/schemas/SettlementCorrectionEvidence' }
+        invariants: { $ref: '#/components/schemas/SettlementCorrectionInvariants' }
+        review_state:
+          type: string
+          enum: [ready_for_evidence, invariant_mismatch]
+        pending_correction: { $ref: '#/components/schemas/SettlementCorrectionPending' }
+    SettlementCorrectionPreviewCursor:
+      type: object
+      additionalProperties: false
+      required: [after_completed_at, after_request_id]
+      properties:
+        after_completed_at: { type: integer, format: int64, minimum: 0 }
+        after_request_id: { type: string, format: uuid }
+    SettlementCorrectionPreviewPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          maxItems: 500
+          items: { $ref: '#/components/schemas/SettlementCorrectionPreview' }
+        next_cursor:
+          oneOf:
+            - $ref: '#/components/schemas/SettlementCorrectionPreviewCursor'
             - type: 'null'
     SettlementAdjustmentNamespace:
       type: string

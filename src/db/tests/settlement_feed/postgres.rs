@@ -1,5 +1,5 @@
 use super::super::super::*;
-use super::{SettlementFixture, start};
+use super::{SettlementFixture, finish_with_usage_basis, start};
 
 async fn postgres_fixture(database_url: &str) -> SettlementFixture {
     let directory = tempfile::tempdir().unwrap();
@@ -231,4 +231,44 @@ async fn postgres_account_settlement_sequence_follows_commits_without_rollback_g
     assert_eq!(resumed.items.len(), 1);
     assert_eq!(resumed.items[0].request_id, third_request);
     assert_eq!(resumed.items[0].settlement_sequence, 2);
+}
+
+#[tokio::test]
+async fn postgres_contract_ceiling_preview_keeps_financial_decision_pending() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        eprintln!("MTC_TEST_POSTGRES_URL is unset; skipping PostgreSQL correction preview test");
+        return;
+    };
+    let fixture = postgres_fixture(&database_url).await;
+    let request_id = Uuid::now_v7();
+    let reservation = start(&fixture, request_id).await;
+    finish_with_usage_basis(
+        &fixture,
+        request_id,
+        &reservation,
+        RequestUsageBasis::ContractCeiling,
+        10,
+        10,
+    )
+    .await
+    .unwrap();
+    let now = unix_millis();
+    let page = fixture
+        .database
+        .list_settlement_correction_previews(
+            fixture.account_id,
+            now.saturating_sub(10_000),
+            now.saturating_add(10_000),
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].request_id, request_id);
+    assert_eq!(
+        page.items[0].review_state,
+        SettlementCorrectionReviewState::ReadyForEvidence
+    );
+    assert_eq!(page.items[0].pending_correction.corrected_cost, None);
 }

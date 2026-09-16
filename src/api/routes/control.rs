@@ -375,6 +375,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             get(list_account_settlements),
         )
         .route(
+            "/internal/v1/accounts/{account_id}/settlement-correction-previews",
+            get(list_settlement_correction_previews),
+        )
+        .route(
             "/internal/v1/accounts/{account_id}/settlements/{settlement_id}/adjustments",
             put(reconcile_settlement_adjustment),
         )

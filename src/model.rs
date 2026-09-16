@@ -442,6 +442,90 @@ pub struct AccountSettlementPage {
     pub next_cursor: Option<AccountSettlementCursor>,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SettlementCorrectionFeedState {
+    Matched,
+    NotApplicableMetered,
+    Missing,
+    Mismatch,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SettlementCorrectionReviewState {
+    ReadyForEvidence,
+    InvariantMismatch,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct SettlementCorrectionOriginalView {
+    pub usage_basis: RequestUsageBasis,
+    pub cost: String,
+    pub input_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub output_tokens: i64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct SettlementCorrectionEvidenceView {
+    pub archive_state: RequestArchiveState,
+    pub response_available: bool,
+    pub provider_usage: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct SettlementCorrectionInvariantsView {
+    pub reservation_settled: bool,
+    pub reservation_actual_matches_cost: bool,
+    pub token_ceiling_matches_reservation: bool,
+    pub usage_ledger_unique: bool,
+    pub usage_ledger_matches_cost: bool,
+    pub settlement_feed: SettlementCorrectionFeedState,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct SettlementCorrectionPendingView {
+    pub corrected_usage_basis: Option<RequestUsageBasis>,
+    pub corrected_cost: Option<String>,
+    pub maximum_possible_rebate: String,
+    pub required_confirmation: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct SettlementCorrectionPreviewView {
+    pub request_id: Uuid,
+    pub reservation_id: Uuid,
+    pub usage_ledger_entry_id: Option<Uuid>,
+    pub account_id: Uuid,
+    pub key_id: Uuid,
+    pub protocol: String,
+    pub model: String,
+    pub status_code: i64,
+    pub error_code: Option<String>,
+    pub created_at: i64,
+    pub completed_at: i64,
+    pub currency: String,
+    pub original: SettlementCorrectionOriginalView,
+    pub evidence: SettlementCorrectionEvidenceView,
+    pub invariants: SettlementCorrectionInvariantsView,
+    pub review_state: SettlementCorrectionReviewState,
+    pub pending_correction: SettlementCorrectionPendingView,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct SettlementCorrectionPreviewCursor {
+    pub after_completed_at: i64,
+    pub after_request_id: Uuid,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct SettlementCorrectionPreviewPage {
+    pub items: Vec<SettlementCorrectionPreviewView>,
+    pub next_cursor: Option<SettlementCorrectionPreviewCursor>,
+}
+
 /// Desired-state adjustment for one attributed settlement namespace.  Amounts
 /// are stored as integer micros so reconciliation is exact and does not depend
 /// on decimal serialization at the internal boundary.
