@@ -31,7 +31,12 @@ impl Database {
         if value.len() > MAX_VALUE_BYTES {
             return Err(AppError::BadRequest("plugin KV value exceeds 1 MiB".into()));
         }
-        let mut transaction = self.pool.begin().await?;
+        // This path reads the namespace total before it upserts.  On SQLite,
+        // a deferred transaction can take a read snapshot and then fail its
+        // write upgrade immediately when another writer commits.  Claim the
+        // writer slot before that read so the configured busy handler can
+        // serialize concurrent preset and plugin-state writes.
+        let mut transaction = self.begin_write_transaction().await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
             sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 734627102948313))")
                 .bind(plugin_id)
