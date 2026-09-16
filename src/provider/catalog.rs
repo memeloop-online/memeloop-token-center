@@ -88,6 +88,23 @@ pub struct GenerationAdapterContribution {
 /// collaboration payloads for it.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct CodexModelMetadata {
+    /// Codex's model-directory value for the shell tool.  Keep this an
+    /// explicit provider declaration rather than inferring it from a model
+    /// slug or upstream URL.
+    pub shell_type: String,
+    #[serde(default)]
+    pub apply_patch_tool_type: Option<String>,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub input_modalities: Vec<String>,
+    #[serde(default)]
+    pub supports_image_detail_original: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RequestCompatibility {
     #[serde(default)]
     pub third_party: bool,
@@ -98,11 +115,19 @@ pub struct RequestCompatibility {
     pub responses_via_chat_v1: bool,
     #[serde(default)]
     pub codex_multi_agent_v2: bool,
+    /// Optional fixed model-directory capabilities for providers that opt in
+    /// to Codex MultiAgentV2.  This contains no account, route, or upstream
+    /// identity and is intentionally absent for unknown providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_model_metadata: Option<CodexModelMetadata>,
 }
 
 impl RequestCompatibility {
     pub(crate) fn is_default(&self) -> bool {
-        !self.third_party && !self.responses_via_chat_v1 && !self.codex_multi_agent_v2
+        !self.third_party
+            && !self.responses_via_chat_v1
+            && !self.codex_multi_agent_v2
+            && self.codex_model_metadata.is_none()
     }
 
     pub fn supports_codex_multi_agent_v2(&self) -> bool {
@@ -528,6 +553,13 @@ impl ProviderCatalog {
             third_party: true,
             responses_via_chat_v1: true,
             codex_multi_agent_v2: true,
+            codex_model_metadata: Some(CodexModelMetadata {
+                shell_type: "shell_command".to_owned(),
+                apply_patch_tool_type: Some("freeform".to_owned()),
+                context_window: Some(256 * 1024),
+                input_modalities: vec!["text".to_owned(), "image".to_owned()],
+                supports_image_detail_original: false,
+            }),
         };
         kimi.credential_schema["properties"]["expires_at"] = json!({"type": ["integer", "null"], "description": "Unix milliseconds, absent source expiry remains unknown"});
         types.push(kimi);
@@ -629,6 +661,28 @@ impl ProviderCatalog {
     pub fn supports_codex_multi_agent_v2_model_catalog(&self, driver: &str) -> bool {
         driver == crate::oauth::codex_device::PROVIDER_DRIVER
             || self.supports_codex_multi_agent_v2(driver)
+    }
+
+    pub(crate) fn codex_model_metadata_for_catalog(
+        &self,
+        driver: &str,
+    ) -> Option<CodexModelMetadata> {
+        if driver == crate::oauth::codex_device::PROVIDER_DRIVER {
+            return Some(CodexModelMetadata {
+                shell_type: "shell_command".to_owned(),
+                apply_patch_tool_type: Some("freeform".to_owned()),
+                context_window: None,
+                input_modalities: vec!["text".to_owned(), "image".to_owned()],
+                supports_image_detail_original: false,
+            });
+        }
+        self.get(driver)
+            .filter(|provider| {
+                provider
+                    .request_compatibility
+                    .supports_codex_multi_agent_v2()
+            })
+            .and_then(|provider| provider.request_compatibility.codex_model_metadata.clone())
     }
 
     pub(crate) fn managed_oauth_adapter_for_driver(

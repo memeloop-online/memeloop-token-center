@@ -292,6 +292,23 @@ fn multi_agent_compatibility_is_explicit_and_provider_scoped() {
             .request_compatibility
             .responses_via_chat_v1
     );
+    let kimi_metadata = catalog
+        .get("kimi-oauth")
+        .expect("Kimi provider")
+        .request_compatibility
+        .codex_model_metadata
+        .as_ref()
+        .expect("Kimi Codex model metadata");
+    assert_eq!(kimi_metadata.shell_type, "shell_command");
+    assert_eq!(
+        kimi_metadata.apply_patch_tool_type.as_deref(),
+        Some("freeform")
+    );
+    assert_eq!(kimi_metadata.context_window, Some(256 * 1024));
+    assert_eq!(
+        kimi_metadata.input_modalities,
+        vec!["text".to_owned(), "image".to_owned()]
+    );
     assert!(!catalog.supports_codex_multi_agent_v2("openai-codex"));
     assert!(!catalog.supports_responses_via_chat_v1("openai-codex"));
     assert!(!catalog.supports_codex_multi_agent_v2("http-json"));

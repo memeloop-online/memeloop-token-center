@@ -693,6 +693,13 @@ export interface ProviderType {
     third_party: boolean;
     responses_via_chat_v1: boolean;
     codex_multi_agent_v2: boolean;
+    codex_model_metadata?: {
+      shell_type: 'disabled' | 'shell_command';
+      apply_patch_tool_type?: 'freeform' | null;
+      context_window?: number | null;
+      input_modalities: Array<'text' | 'image'>;
+      supports_image_detail_original?: boolean;
+    };
   };
   source: string;
 }

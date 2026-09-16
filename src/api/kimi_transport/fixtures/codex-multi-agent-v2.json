@@ -1,5 +1,5 @@
 {
-  "model": "gpt-5.5",
+  "model": "kimi-k3-256k",
   "stream": false,
   "tools": [
     {
@@ -100,7 +100,7 @@
       "namespace": "collaboration",
       "name": "spawn_agent",
       "call_id": "spawn-call",
-      "arguments": "{\"message\":\"spawn task for kimi route\",\"model\":\"gpt-5.5\"}"
+      "arguments": "{\"message\":\"spawn task for kimi route\",\"model\":\"kimi-k3-256k\"}"
     },
     {
       "type": "function_call_output",

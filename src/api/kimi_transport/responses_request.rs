@@ -479,17 +479,17 @@ mod tests {
         assert!(!output.to_string().contains("never forward this metadata"));
         assert!(!output.to_string().contains("encrypted_content"));
         let messages = output["messages"].as_array().expect("converted messages");
-        let assistant = messages
+        let calls = messages
             .iter()
-            .find(|message| message["role"] == "assistant")
-            .expect("spawn/followup assistant tool calls");
-        let calls = assistant["tool_calls"].as_array().expect("tool calls");
+            .filter(|message| message["role"] == "assistant")
+            .flat_map(|message| message["tool_calls"].as_array().into_iter().flatten())
+            .collect::<Vec<_>>();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0]["function"]["name"], "collaboration__spawn_agent");
         assert!(
             calls[0]["function"]["arguments"]
                 .as_str()
-                .is_some_and(|arguments| arguments.contains("gpt-5.5"))
+                .is_some_and(|arguments| arguments.contains("kimi-k3-256k"))
         );
         assert_eq!(calls[1]["function"]["name"], "collaboration__followup_task");
         assert!(messages.iter().any(|message| {

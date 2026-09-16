@@ -88,6 +88,7 @@ pub(in crate::api) async fn list_models(
 struct CodexModelAvailability {
     openai_source_seen: bool,
     openai_multi_agent_v2: bool,
+    codex_model_metadata: Option<crate::provider::CodexModelMetadata>,
 }
 
 fn codex_models_response(
@@ -100,6 +101,7 @@ fn codex_models_response(
             codex_model_info(
                 &model,
                 availability.openai_source_seen && availability.openai_multi_agent_v2,
+                availability.codex_model_metadata.as_ref(),
             )
         }).collect::<Vec<_>>()
     })
@@ -119,26 +121,79 @@ fn codex_model_availability(
         }
         let availability = models.entry(source.public_model.clone()).or_default();
         let compatible = providers.supports_codex_multi_agent_v2_model_catalog(&source.driver);
+        let metadata = if compatible {
+            providers.codex_model_metadata_for_catalog(&source.driver)
+        } else {
+            None
+        };
         if availability.openai_source_seen {
             // Later sources can only make the advertisement more
             // conservative. This avoids claiming V2 when a public model
             // can route to an incompatible OpenAI provider.
             availability.openai_multi_agent_v2 &= compatible;
+            availability.codex_model_metadata = if availability.openai_multi_agent_v2 {
+                match (availability.codex_model_metadata.take(), metadata) {
+                    (Some(left), Some(right)) => Some(merge_codex_model_metadata(left, right)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
         } else {
             availability.openai_source_seen = true;
             availability.openai_multi_agent_v2 = compatible;
+            availability.codex_model_metadata = metadata;
         }
     }
     models
 }
 
-fn codex_model_info(model: &str, multi_agent_v2: bool) -> Value {
+fn merge_codex_model_metadata(
+    left: crate::provider::CodexModelMetadata,
+    right: crate::provider::CodexModelMetadata,
+) -> crate::provider::CodexModelMetadata {
+    let shell_type = if left.shell_type == right.shell_type {
+        left.shell_type
+    } else {
+        "disabled".to_owned()
+    };
+    let apply_patch_tool_type = if left.apply_patch_tool_type == right.apply_patch_tool_type {
+        left.apply_patch_tool_type
+    } else {
+        None
+    };
+    let context_window = if left.context_window == right.context_window {
+        left.context_window
+    } else {
+        None
+    };
+    let input_modalities = left
+        .input_modalities
+        .into_iter()
+        .filter(|modality| right.input_modalities.iter().any(|value| value == modality))
+        .collect();
+    crate::provider::CodexModelMetadata {
+        shell_type,
+        apply_patch_tool_type,
+        context_window,
+        input_modalities,
+        supports_image_detail_original: left.supports_image_detail_original
+            && right.supports_image_detail_original,
+    }
+}
+
+fn codex_model_info(
+    model: &str,
+    multi_agent_v2: bool,
+    metadata: Option<&crate::provider::CodexModelMetadata>,
+) -> Value {
+    let metadata = metadata.filter(|_| multi_agent_v2);
     let mut info = json!({
         "slug": model,
         "display_name": model,
         "description": null,
         "supported_reasoning_levels": [],
-        "shell_type": "disabled",
+        "shell_type": metadata.map_or("disabled", |metadata| metadata.shell_type.as_str()),
         "visibility": "list",
         "supported_in_api": true,
         "priority": 0,
@@ -155,15 +210,19 @@ fn codex_model_info(model: &str, multi_agent_v2: bool) -> Value {
         "default_reasoning_summary": "auto",
         "support_verbosity": false,
         "default_verbosity": null,
-        "apply_patch_tool_type": null,
+        "apply_patch_tool_type": metadata.and_then(|metadata| metadata.apply_patch_tool_type.as_deref()),
         "web_search_tool_type": "text",
         "truncation_policy": {"mode": "bytes", "limit": 10000},
-        "supports_image_detail_original": false,
-        "context_window": null,
+        "supports_image_detail_original": metadata
+            .is_some_and(|metadata| metadata.supports_image_detail_original),
+        "context_window": metadata.and_then(|metadata| metadata.context_window),
         "auto_compact_token_limit": null,
         "effective_context_window_percent": 95,
         "experimental_supported_tools": [],
-        "input_modalities": ["text"],
+        "input_modalities": metadata.map_or_else(
+            || vec!["text".to_owned()],
+            |metadata| metadata.input_modalities.clone(),
+        ),
         "supports_search_tool": false,
         "supports_experimental_context": false,
         "use_responses_lite": false,
@@ -240,17 +299,29 @@ mod tests {
 
     #[test]
     fn codex_model_info_is_conservative_and_marks_only_declared_multi_agent_models() {
-        let compatible = codex_model_info("gpt-5.5", true);
-        assert_eq!(compatible["slug"], "gpt-5.5");
+        let providers = crate::provider::ProviderCatalog::builtins();
+        let kimi_metadata = providers
+            .get("kimi-oauth")
+            .and_then(|provider| provider.request_compatibility.codex_model_metadata.as_ref())
+            .expect("Kimi declares Codex model capabilities");
+        let compatible = codex_model_info("kimi-k3-256k", true, Some(kimi_metadata));
+        assert_eq!(compatible["slug"], "kimi-k3-256k");
         assert_eq!(compatible["multi_agent_version"], "v2");
-        assert_eq!(compatible["shell_type"], "disabled");
-        assert_eq!(compatible["input_modalities"], json!(["text"]));
+        assert_eq!(compatible["shell_type"], "shell_command");
+        assert_eq!(compatible["apply_patch_tool_type"], "freeform");
+        assert_eq!(compatible["context_window"], 262144);
+        assert_eq!(compatible["input_modalities"], json!(["text", "image"]));
         assert!(compatible.get("account_id").is_none());
         assert!(compatible.get("upstream_model").is_none());
         assert!(compatible.get("credential").is_none());
 
-        let ordinary = codex_model_info("ordinary", false);
+        let unknown = codex_model_info("unknown-compatible", true, None);
+        assert_eq!(unknown["shell_type"], "disabled");
+        assert_eq!(unknown["input_modalities"], json!(["text"]));
+
+        let ordinary = codex_model_info("ordinary", false, Some(kimi_metadata));
         assert_eq!(ordinary["multi_agent_version"], "disabled");
+        assert_eq!(ordinary["shell_type"], "disabled");
     }
 
     #[test]
@@ -268,9 +339,26 @@ mod tests {
         let providers = crate::provider::ProviderCatalog::builtins();
         let native = codex_model_availability(&providers, &[source("native-only", "openai-codex")]);
         assert!(native["native-only"].openai_multi_agent_v2);
+        assert_eq!(
+            native["native-only"]
+                .codex_model_metadata
+                .as_ref()
+                .expect("native Codex metadata")
+                .shell_type,
+            "shell_command"
+        );
 
         let kimi = codex_model_availability(&providers, &[source("kimi-only", "kimi-oauth")]);
         assert!(kimi["kimi-only"].openai_multi_agent_v2);
+        let kimi_info = codex_model_info(
+            "kimi-only",
+            true,
+            kimi["kimi-only"].codex_model_metadata.as_ref(),
+        );
+        assert_eq!(kimi_info["shell_type"], "shell_command");
+        assert_eq!(kimi_info["apply_patch_tool_type"], "freeform");
+        assert_eq!(kimi_info["context_window"], 262144);
+        assert_eq!(kimi_info["input_modalities"], json!(["text", "image"]));
 
         let mixed = codex_model_availability(
             &providers,
@@ -280,6 +368,14 @@ mod tests {
             ],
         );
         assert!(mixed["mixed"].openai_multi_agent_v2);
+        assert_eq!(
+            mixed["mixed"]
+                .codex_model_metadata
+                .as_ref()
+                .expect("compatible mixed metadata")
+                .shell_type,
+            "shell_command"
+        );
 
         let incompatible = codex_model_availability(
             &providers,
@@ -289,6 +385,11 @@ mod tests {
             ],
         );
         assert!(!incompatible["mixed-incompatible"].openai_multi_agent_v2);
+        assert!(
+            incompatible["mixed-incompatible"]
+                .codex_model_metadata
+                .is_none()
+        );
     }
 
     #[test]
