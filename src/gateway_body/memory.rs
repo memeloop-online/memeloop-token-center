@@ -2,6 +2,7 @@ use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+use std::task::Poll;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -149,25 +150,36 @@ impl ProxyMemoryReservation {
         deadline: tokio::time::Instant,
         stage: crate::metrics::memory_admission::Stage,
     ) -> Option<OwnedSemaphorePermit> {
-        // try_acquire respects existing FIFO waiters. Immediate admissions do
-        // not count as queued requests.
-        if let Ok(permit) = semaphore.clone().try_acquire_many_owned(units) {
-            return Some(permit);
-        }
         let wait = self.admission.get().map(|(wait, _)| *wait).unwrap_or(
             std::time::Duration::from_millis(
                 crate::provider::CodexTransportPolicy::default().memory_admission_wait_millis,
             ),
         );
         let deadline = deadline.min(tokio::time::Instant::now() + wait);
-        let observation = self
-            .admission
-            .get()
-            .map(|(_, metrics)| metrics.proxy_memory_wait(stage));
-        let permit = tokio::time::timeout_at(deadline, semaphore.clone().acquire_many_owned(units))
+        // All admissions use Tokio's fair asynchronous queue. A try-acquire
+        // fast path can overtake an already queued multi-permit waiter.
+        let mut observation = None;
+        let permit = {
+            let mut acquire = Box::pin(semaphore.clone().acquire_many_owned(units));
+            tokio::time::timeout_at(
+                deadline,
+                std::future::poll_fn(|context| match acquire.as_mut().poll(context) {
+                    Poll::Ready(permit) => Poll::Ready(permit),
+                    Poll::Pending => {
+                        if observation.is_none() {
+                            observation = self
+                                .admission
+                                .get()
+                                .map(|(_, metrics)| metrics.proxy_memory_wait(stage));
+                        }
+                        Poll::Pending
+                    }
+                }),
+            )
             .await
             .ok()
-            .and_then(Result::ok);
+            .and_then(Result::ok)
+        };
         if let Some(observation) = observation {
             observation.finish(permit.is_some());
         }

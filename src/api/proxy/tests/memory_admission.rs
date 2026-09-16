@@ -10,7 +10,8 @@ async fn concurrent_large_streams_dispatch_while_buffered_partition_is_busy() {
         .await
         .unwrap();
     let held = fixture.state.proxy_memory_budget.reservation();
-    assert!(held.try_grow(48 * 1024 * 1024, 1));
+    let retained_partition = fixture.state.config.proxy_memory_budget_bytes as usize / 4;
+    assert!(held.try_grow(retained_partition, 1));
     assert!(
         held.finalize_request(tokio::time::Instant::now() + Duration::from_secs(1))
             .await
@@ -40,7 +41,7 @@ async fn concurrent_large_streams_dispatch_while_buffered_partition_is_busy() {
                 "/v1/responses",
                 json!({
                     "model": fixture.model,
-                    "input": "x".repeat(16 * 1024 * 1024 - 1024),
+                    "input": "x".repeat(8 * 1024 * 1024),
                     "stream": true
                 }),
             )
@@ -56,7 +57,7 @@ async fn concurrent_large_streams_dispatch_while_buffered_partition_is_busy() {
     }
     assert_eq!(
         fixture.state.proxy_memory_budget.snapshot().2,
-        48 * 1024 * 1024
+        retained_partition
     );
     for request in requests {
         assert!(!request.is_finished());
@@ -65,7 +66,7 @@ async fn concurrent_large_streams_dispatch_while_buffered_partition_is_busy() {
     }
     assert_eq!(
         fixture.state.proxy_memory_budget.snapshot().0,
-        48 * 1024 * 1024
+        retained_partition
     );
     drop(held);
     assert_eq!(fixture.state.proxy_memory_budget.snapshot().0, 0);

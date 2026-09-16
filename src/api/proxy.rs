@@ -1083,7 +1083,7 @@ pub(in crate::api) async fn proxy_with_identity(
             .finalize_request(recovery_wait_deadline)
             .await
     {
-        retained_admission.finish("timeout", Some(503), None);
+        retained_admission.finish("rejected", Some(503), None);
         state
             .metrics
             .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Retained);
