@@ -264,3 +264,49 @@ test('cancellation retains current-scope SSE work, while a scope transition drop
       'the queued old-projection event cannot run after the new scope snapshot');
   } finally { await browser.close(); await server.close(); }
 });
+
+test('a successful manual refresh confirms a cancelled selected-detail batch before later unrelated SSE work', { timeout: 45_000 }, async () => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
+    return test.skip('Chromium required');
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.clock.install({ time: new Date('2026-01-01T00:00:00Z') });
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-loading.html?controlled-detail=1`);
+    await page.waitForFunction(() => window.sessionListReads === 1);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await page.waitForFunction(() => window.sessionDetailReads === 1);
+    await page.evaluate(() => window.resolveSessionDetail(true));
+    await page.getByRole('checkbox', { name: 'Auto-refresh', exact: true }).check();
+
+    await page.getByRole('button', { name: 'Simulate session event', exact: true }).click();
+    await page.clock.fastForward(500);
+    await page.waitForFunction(() => window.sessionListReads === 2);
+    await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await page.waitForFunction(() => window.sessionListAborts === 1);
+
+    // The user explicitly observes both lanes.  That confirmation must
+    // consume the cancelled batch rather than merely suppress its timer.
+    await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+    await page.waitForFunction(() => window.sessionListReads === 3);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await page.waitForFunction(() => window.sessionDetailReads === 2);
+    await page.evaluate(() => window.resolveSessionDetail(true));
+    await settleRenderedRefresh(page, 3);
+
+    await page.getByRole('button', { name: 'Simulate other credential event', exact: true }).click();
+    await page.clock.fastForward(500);
+    await page.waitForFunction(() => window.sessionListReads === 4);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await settleRenderedRefresh(page, 4);
+    assert.equal(await page.evaluate(() => window.sessionDetailReads), 2,
+      'the unrelated event refreshes its tenant list only; it cannot replay the selected detail already confirmed manually');
+  } finally { await browser.close(); await server.close(); }
+});

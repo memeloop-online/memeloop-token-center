@@ -110,6 +110,10 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
   const refreshDirty = useRef(false);
   const refreshInFlight = useRef(false);
   const refreshCancelled = useRef(false);
+  // A user-requested refresh owns a point-in-time snapshot of the pending
+  // stream work.  Do not let the automatic lane start another list read
+  // between its list and detail confirmations.
+  const manualRefreshInFlight = useRef(false);
   const dirtyEventIdentities = useRef(new Set<string>());
   const dirtyDetailEvents = useRef(new Set<string>());
   const detailRefreshDirty = useRef(false);
@@ -194,7 +198,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
         listInFlight.current = false;
         setLoading(false);
         setRefreshing(false);
-        if (!background && refreshDirty.current) scheduleRefresh();
+        if (!background && refreshDirty.current && !manualRefreshInFlight.current) scheduleRefresh();
       }
     }
   }
@@ -304,7 +308,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
   function scheduleRefresh() {
     // Do not launch a second full list read while its initial/manual page is
     // still loading. The dirty set is drained once that read has settled.
-    if (!autoRefreshRef.current || refreshTimer.current !== undefined || refreshInFlight.current || listInFlight.current) return;
+    if (!autoRefreshRef.current || manualRefreshInFlight.current || refreshTimer.current !== undefined || refreshInFlight.current || listInFlight.current) return;
     const generation = scopeGeneration.current;
     setRefreshing(true);
     refreshTimer.current = window.setTimeout(() => {
@@ -450,6 +454,39 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     setRefreshing(false);
   }
 
+  async function refreshNow() {
+    const generation = scopeGeneration.current;
+    const selectedAtStart = selectedRef.current;
+    const selectedIdentity = selectedAtStart ? sessionIdentityKey(selectedAtStart) : undefined;
+    // Snapshot only work that was already dirty when the user pressed
+    // Refresh.  A new stream event arriving while this work is in flight
+    // stays dirty and is handled by the normal 500ms lane afterwards.
+    const observedListEvents = new Set(dirtyEventIdentities.current);
+    const observedDetailEvents = new Set(dirtyDetailEvents.current);
+    manualRefreshInFlight.current = true;
+    refreshCancelled.current = false;
+    try {
+      const listLoaded = await loadSessions(false, filtersRef.current, listScope === scopeKey && sessions.length > 0);
+      if (!listLoaded || generation !== scopeGeneration.current) return;
+      for (const identity of observedListEvents) dirtyEventIdentities.current.delete(identity);
+
+      const latestSelection = selectedRef.current;
+      if (!selectedAtStart || !latestSelection || sessionIdentityKey(latestSelection) !== selectedIdentity) return;
+      if (!await refreshSelected(selectedAtStart) || generation !== scopeGeneration.current) return;
+      const settledSelection = selectedRef.current;
+      if (!settledSelection || sessionIdentityKey(settledSelection) !== selectedIdentity) return;
+      for (const identity of observedDetailEvents) dirtyDetailEvents.current.delete(identity);
+      if (!dirtyEventIdentities.current.size && !dirtyDetailEvents.current.size) refreshDirty.current = false;
+    } finally {
+      manualRefreshInFlight.current = false;
+      if (generation === scopeGeneration.current
+        && (refreshDirty.current || dirtyEventIdentities.current.size > 0 || dirtyDetailEvents.current.size > 0)) {
+        refreshDirty.current = true;
+        scheduleRefresh();
+      }
+    }
+  }
+
   const hasScope = Boolean(token.trim());
   const status = !hasScope ? 'idle' : refreshing ? 'refreshing' : streamState;
   const visibleSessions = listScope === scopeKey ? sessions : [];
@@ -460,7 +497,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     <div className="session-refresh-controls">
       <Checkbox checked={autoRefresh} onChange={(_, data) => toggleAutoRefresh(data.checked === true)} label={t('sessions.autoRefresh')} />
       <span className={`session-live-state ${status}`} role="status">{autoRefresh ? t(`sessions.live.${status}`) : t('sessions.paused')}</span>
-      <Button appearance="secondary" disabled={loading || refreshing || detailLoading} onClick={() => { void loadSessions(false, filters, visibleSessions.length > 0); if (selected) void refreshSelected(selected); }}>{t('sessions.refreshNow')}</Button>
+      <Button appearance="secondary" disabled={loading || refreshing || detailLoading} onClick={() => { void refreshNow(); }}>{t('sessions.refreshNow')}</Button>
       {(loading || refreshing) && <Button appearance="secondary" onClick={cancelListLoad}>{t('common.cancel')}</Button>}
     </div>
     <form className="session-controls" onSubmit={(event) => { event.preventDefault(); setFilters({ ...draft }); }}>
