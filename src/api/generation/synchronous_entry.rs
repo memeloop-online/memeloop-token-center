@@ -411,7 +411,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn antigravity_image_uses_shared_submission_and_idempotent_archive() {
+    async fn antigravity_image_uses_shared_submission_without_retained_replay() {
         let upstream = MockServer::start().await;
         Mock::given(method("POST")).and(path("/v1internal:generateContent"))
             .and(wiremock::matchers::header("authorization", "Bearer fixture-access"))
@@ -507,12 +507,15 @@ mod tests {
         assert_eq!(payload["data"][0]["b64_json"], "bW9jay1wbmc=");
         let replay =
             post_openai_image(&state, &granted.key, "native-stable-replay", "draw a fox").await;
-        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
         assert_eq!(
-            axum::body::to_bytes(replay.into_body(), 64 * 1024)
-                .await
-                .unwrap(),
-            first
+            serde_json::from_slice::<Value>(
+                &axum::body::to_bytes(replay.into_body(), 64 * 1024)
+                    .await
+                    .unwrap()
+            )
+            .unwrap()["error"]["code"],
+            "image_result_not_retained"
         );
         let requests = upstream.received_requests().await.unwrap();
         let request: Value = requests[0].body_json().unwrap();
@@ -652,7 +655,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_image_replay_precedes_route_state_but_not_key_authentication() {
+    async fn completed_image_replay_is_unretained_before_route_lookup() {
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/images/generations"))
@@ -747,9 +750,6 @@ mod tests {
         )
         .await;
         assert_eq!(first.status(), StatusCode::OK);
-        let first_body = axum::body::to_bytes(first.into_body(), 64 * 1024)
-            .await
-            .expect("first image response");
 
         state
             .db
@@ -763,12 +763,15 @@ mod tests {
             "draw a compact fox",
         )
         .await;
-        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
         assert_eq!(
-            axum::body::to_bytes(replay.into_body(), 64 * 1024)
-                .await
-                .expect("replayed image response"),
-            first_body
+            serde_json::from_slice::<Value>(
+                &axum::body::to_bytes(replay.into_body(), 64 * 1024)
+                    .await
+                    .expect("unretained image replay response")
+            )
+            .expect("unretained image replay JSON")["error"]["code"],
+            "image_result_not_retained"
         );
 
         let mismatch = post_openai_image(

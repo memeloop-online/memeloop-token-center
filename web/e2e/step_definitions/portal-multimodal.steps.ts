@@ -702,7 +702,7 @@ Then('用户通过真实下载控件取得代理图片和视频', async function
   const page = this.requirePage();
   const observation = requireMultimodalObservation(this);
   await assertGenerationDownload(page, observation.imageModel, 'browser-result.png', 'browser-png-asset');
-  await assertGenerationDownload(page, observation.videoModel, 'asset-0.mp4', 'browser-video-asset');
+  await assertGenerationDownload(page, observation.videoModel, 'video.mp4', 'browser-video-asset');
   this.assertNoBrowserFailures();
 });
 

@@ -638,9 +638,9 @@ async fn create_and_replay_siliconflow_video(world: &mut TokenCenterWorld) {
         .send()
         .await
         .expect("replay SiliconFlow video");
-    assert_eq!(replay.status(), StatusCode::CONFLICT);
+    assert_eq!(replay.status(), StatusCode::OK);
     let replay: Value = replay.json().await.expect("SiliconFlow replay JSON");
-    assert_eq!(replay["job_id"], world.response["job_id"]);
+    assert_eq!(replay, world.response);
 }
 
 #[then("the SiliconFlow video is proxied with safe metadata and job billing")]
@@ -1430,7 +1430,7 @@ async fn mock_comfyui_megapixel_generation(world: &mut TokenCenterWorld) {
                 .insert_header("content-type", "image/png")
                 .set_body_bytes(b"mock-megapixel-png"),
         )
-        .expect(2)
+        .expect(0)
         .mount(server)
         .await;
 }
@@ -2778,7 +2778,7 @@ async fn mock_openai_image_generation(world: &mut TokenCenterWorld) {
             "created": 1,
             "data": [{"b64_json": "bW9jay1wbmc="}]
         })))
-        .expect(2)
+        .expect(1)
         .mount(world.mock.as_ref().expect("mock server"))
         .await;
 }

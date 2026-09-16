@@ -1085,7 +1085,13 @@ async fn non_connect_image_send_timeout_keeps_health_unchanged_and_reservation_u
         .unwrap()
         .reservation_price()
         .unwrap();
-    let placeholder = format!("pending://synchronous/{request_id}/request");
+    let placeholder = crate::api::generation::synchronous_image::image_metadata_locator(json!({
+        "kind": "synchronous_image",
+        "media_archived": false,
+        "model": "image-replay-model",
+        "expected_image_count": 1
+    }))
+    .unwrap();
     let reservation = match fixture
         .state
         .db
@@ -1125,7 +1131,7 @@ async fn non_connect_image_send_timeout_keeps_health_unchanged_and_reservation_u
     };
     // Per-request timeout is intentional: network policy may construct a fresh
     // no-retry client, so changing AppState.http does not control its deadline.
-    // Keep real staging, durable arm, health admission and the single POST.
+    // Keep the durable metadata-only arm, health admission and the single POST.
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let request = route
         .credential
