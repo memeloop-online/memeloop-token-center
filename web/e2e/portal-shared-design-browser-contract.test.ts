@@ -36,7 +36,11 @@ test('Portal shares Fluent controls, surfaces and metric styling across themes',
       assert.equal(await page.locator('.self-overview > .mtc-data-surface').count(), 3);
       assert.equal(await page.locator('.self-overview > .panel').count(), 0, 'surface is reused, not nested in a second panel');
       assert.equal(await page.locator('.self-overview-metrics .metric').count(), 5);
-      assert.equal(await page.locator('.self-overview-metrics .metric').first().evaluate(el => getComputedStyle(el).borderTopStyle), 'solid', 'Portal must not erase shared card styling');
+      const metric = page.locator('.self-overview-metrics .metric').first();
+      assert.equal(await metric.evaluate(el => el.classList.contains('analytics-metric')), true, 'Portal metrics reuse the shared analytics metric primitive');
+      assert.equal(await metric.evaluate(el => getComputedStyle(el).borderTopWidth), '0px', 'Analytics metrics use the shared borderless surface');
+      assert.equal(await metric.evaluate(el => getComputedStyle(el).borderTopLeftRadius), '8px', 'Analytics metrics retain the shared surface radius');
+      assert.equal(await metric.evaluate(el => getComputedStyle(el).backgroundColor), theme === 'light' ? 'rgb(243, 247, 248)' : 'rgb(18, 40, 43)', 'Analytics metric surface follows the selected theme');
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
       assert.equal(await page.getByText('fixture-only-client-token', { exact: true }).count(), 0);
       await page.screenshot({ path: `${shots}/${theme}-${width}.png`, fullPage: true });
