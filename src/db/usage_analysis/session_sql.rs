@@ -96,7 +96,7 @@ pub(super) fn session_usage_dimension_sql(
                       rollup.cached_input_tokens, rollup.cache_write_tokens,
                       rollup.generation_units,
                       rollup.duration_count, rollup.duration_sum_ms,
-                      {effective_rollup_cost}
+                      {effective_rollup_cost} AS cost_micros
                  FROM {table} rollup
                 WHERE rollup.{bucket_column} >= $3 AND rollup.{bucket_column} < $4
                   {rollup_filters}
@@ -115,7 +115,7 @@ pub(super) fn session_usage_dimension_sql(
                            ELSE 0 END,
                       fact.output_tokens, fact.cached_input_tokens,
                       fact.cache_write_tokens, fact.generation_units, 1,
-                      fact.duration_ms, {effective_fact_cost}
+                      fact.duration_ms, {effective_fact_cost} AS cost_micros
                  FROM request_stats_facts fact
                  LEFT JOIN request_records billing_request
                    ON billing_request.id = fact.request_id
@@ -138,7 +138,7 @@ pub(super) fn session_usage_dimension_sql(
                            ELSE 0 END,
                       fact.output_tokens, fact.cached_input_tokens,
                       fact.cache_write_tokens, fact.generation_units, 1,
-                      fact.duration_ms, {effective_fact_cost}
+                      fact.duration_ms, {effective_fact_cost} AS cost_micros
                  FROM request_stats_facts fact
                  LEFT JOIN request_records billing_request
                    ON billing_request.id = fact.request_id

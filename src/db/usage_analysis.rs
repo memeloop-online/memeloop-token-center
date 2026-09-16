@@ -798,7 +798,7 @@ fn usage_analysis_source_sql(granularity: UsageAnalysisGranularity, tenant_scope
                   a.duration_bucket_3, a.duration_bucket_4, a.duration_bucket_5,
                   a.duration_bucket_6, a.duration_bucket_7, a.duration_bucket_8,
                   a.duration_bucket_9, a.duration_bucket_10, a.duration_bucket_11,
-                  {effective_rollup_cost}
+                  {effective_rollup_cost} AS cost_micros
              FROM {table} a
             WHERE a.{bucket_column} >= $3 AND a.{bucket_column} < $4
                   {rollup_filters}"#,
@@ -898,7 +898,7 @@ fn usage_analysis_request_fact_sql(
                   CASE WHEN f.duration_ms > 10000 AND f.duration_ms <= 30000 THEN 1 ELSE 0 END AS duration_bucket_9,
                   CASE WHEN f.duration_ms > 30000 AND f.duration_ms <= 60000 THEN 1 ELSE 0 END AS duration_bucket_10,
                   CASE WHEN f.duration_ms > 60000 THEN 1 ELSE 0 END AS duration_bucket_11,
-                  {effective_cost}
+                  {effective_cost} AS cost_micros
             FROM request_stats_facts f
             LEFT JOIN request_records billing_request
               ON billing_request.id = f.request_id

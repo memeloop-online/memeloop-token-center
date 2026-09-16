@@ -62,7 +62,7 @@ SELECT f.created_at,
        CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.input_tokens END AS input_tokens,
        CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.output_tokens END AS output_tokens,
        f.currency,
-       __MTC_REQUEST_EFFECTIVE_COST__,
+       __MTC_REQUEST_EFFECTIVE_COST__ AS cost_micros,
        CAST(1 AS BIGINT) AS requests
 FROM request_stats_facts f
 LEFT JOIN request_records billing_request
@@ -158,7 +158,7 @@ SELECT f.created_at,
        CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.input_tokens END AS input_tokens,
        CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.output_tokens END AS output_tokens,
        f.currency,
-       __MTC_REQUEST_EFFECTIVE_COST__,
+       __MTC_REQUEST_EFFECTIVE_COST__ AS cost_micros,
        CAST(1 AS BIGINT) AS requests
 FROM request_stats_facts f
 LEFT JOIN request_records billing_request

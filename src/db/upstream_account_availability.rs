@@ -416,7 +416,7 @@ fn window_metrics_sql(granularity: AvailabilityGranularity) -> String {
                   aggregate.duration_bucket_3, aggregate.duration_bucket_4, aggregate.duration_bucket_5,
                   aggregate.duration_bucket_6, aggregate.duration_bucket_7, aggregate.duration_bucket_8,
                   aggregate.duration_bucket_9, aggregate.duration_bucket_10, aggregate.duration_bucket_11,
-                  {effective_rollup_cost}
+                  {effective_rollup_cost} AS cost_micros
             FROM {table} aggregate
              JOIN accounts account
                ON account.upstream_account_id = aggregate.upstream_account_id
@@ -535,7 +535,7 @@ fn fact_metrics_sql(table: &str, alias: &str, from_parameter: &str, to_parameter
                   CASE WHEN {alias}.duration_ms > 10000 AND {alias}.duration_ms <= 30000 THEN 1 ELSE 0 END AS duration_bucket_9,
                   CASE WHEN {alias}.duration_ms > 30000 AND {alias}.duration_ms <= 60000 THEN 1 ELSE 0 END AS duration_bucket_10,
                   CASE WHEN {alias}.duration_ms > 60000 THEN 1 ELSE 0 END AS duration_bucket_11,
-                  {effective_cost}
+                  {effective_cost} AS cost_micros
              FROM {table} {alias}
              JOIN accounts account
                ON account.upstream_account_id = {alias}.upstream_account_id
