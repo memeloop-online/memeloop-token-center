@@ -809,6 +809,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_does_not_cancel_a_pending_claim_or_its_claimed_upload() {
+        let (shutdown, receiver) = watch::channel(false);
+        let (claim_entered, claim_entering) = tokio::sync::oneshot::channel();
+        let mut claim_entered = Some(claim_entered);
+        let claim_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let claims = Arc::new(AtomicUsize::new(0));
+        let uploads = Arc::new(AtomicUsize::new(0));
+        let drain_release = claim_release.clone();
+        let drain_claims = claims.clone();
+        let drain_uploads = uploads.clone();
+        let drain = tokio::spawn(async move {
+            drain_batch(
+                &receiver,
+                || {
+                    let entered = claim_entered.take();
+                    let release = drain_release.clone();
+                    drain_claims.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        entered.unwrap().send(()).unwrap();
+                        release.acquire().await.unwrap().forget();
+                        Some(0)
+                    }
+                },
+                |_| {
+                    drain_uploads.fetch_add(1, Ordering::SeqCst);
+                    async {}
+                },
+            )
+            .await;
+        });
+
+        claim_entering.await.unwrap();
+        shutdown.send(true).unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !drain.is_finished(),
+            "shutdown must not cancel a claim that may own a transaction"
+        );
+        claim_release.add_permits(1);
+        drain.await.unwrap();
+        assert_eq!(claims.load(Ordering::SeqCst), 1);
+        assert_eq!(uploads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn bounded_drain_refills_around_a_slow_upload_and_stops_at_32() {
         let (_shutdown, receiver) = watch::channel(false);
         let release = Arc::new(tokio::sync::Semaphore::new(0));
@@ -864,38 +909,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backlog_dispatches_claim_order_across_tenants_without_serializing_uploads() {
+    async fn backlog_preserves_claim_order_and_runs_tenants_concurrently() {
         let (_shutdown, receiver) = watch::channel(false);
         let tenants = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
             "tenant-a", "tenant-b", "tenant-a", "tenant-b",
         ])));
-        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let claimed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (entered, mut entering) = tokio::sync::mpsc::unbounded_channel();
         let queue = tenants.clone();
-        let processed = observed.clone();
-        drain_batch(
-            &receiver,
-            || {
-                let tenant = queue
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .pop_front();
-                async move { tenant }
-            },
-            |tenant| {
-                processed
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(tenant);
-                async {}
-            },
-        )
-        .await;
-        let mut dispatched = observed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        dispatched.sort_unstable();
-        assert_eq!(dispatched, ["tenant-a", "tenant-a", "tenant-b", "tenant-b"]);
+        let claim_order = claimed.clone();
+        let drain_release = release.clone();
+        let drain = tokio::spawn(async move {
+            drain_batch(
+                &receiver,
+                || {
+                    let tenant = queue
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .pop_front();
+                    if let Some(tenant) = tenant {
+                        claim_order
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(tenant);
+                    }
+                    async move { tenant }
+                },
+                |tenant| {
+                    let entered = entered.clone();
+                    let release = drain_release.clone();
+                    async move {
+                        entered.send(tenant).unwrap();
+                        release.acquire().await.unwrap().forget();
+                    }
+                },
+            )
+            .await;
+        });
+
+        let mut active_tenants = Vec::new();
+        for _ in 0..UPLOAD_CONCURRENCY {
+            active_tenants.push(entering.recv().await.unwrap());
+        }
+        active_tenants.sort_unstable();
+        assert_eq!(
+            active_tenants,
+            ["tenant-a", "tenant-a", "tenant-b", "tenant-b"],
+            "all tenants must be active before any upload is released"
+        );
+        assert_eq!(
+            claimed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            ["tenant-a", "tenant-b", "tenant-a", "tenant-b"]
+        );
+        release.add_permits(UPLOAD_CONCURRENCY);
+        drain.await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
