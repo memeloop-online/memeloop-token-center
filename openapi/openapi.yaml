@@ -1818,7 +1818,8 @@ paths:
         a fresh lower available-credit count records settlement and releases the
         old account lock because the prepared balance no longer applies. This may
         also reflect credit expiry and is not proof of reset completion. Unknown
-        and submitted operations stay locked.
+        and submitted operations stay locked. The observation must use the same
+        credential generation and transport revision recorded by preparation.
       parameters:
         - $ref: '#/components/parameters/AccountId'
         - name: operation_id

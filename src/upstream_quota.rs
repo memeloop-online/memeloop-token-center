@@ -499,7 +499,7 @@ impl QuotaCache {
                     && let Err(error) = state
                         .db
                         .settle_accepted_quota_reset_from_observation(
-                            account.id,
+                            account,
                             available,
                             applicable,
                             observed_at,

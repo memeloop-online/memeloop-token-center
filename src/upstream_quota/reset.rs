@@ -139,7 +139,7 @@ pub(crate) async fn prepare(
     state
         .db
         .settle_accepted_quota_reset_from_observation(
-            account.id,
+            account,
             available,
             applicable,
             snapshot.observed_at.ok_or_else(blocked)?,
@@ -375,6 +375,8 @@ pub(crate) async fn reconcile(
             &account_id,
             operation,
             actor,
+            account.credential_generation,
+            account.updated_at,
             snapshot
                 .reset_capability
                 .available_credits
