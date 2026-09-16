@@ -108,6 +108,38 @@ async fn verify(config: Config) {
     assert_eq!(recovery_targets.len(), 1);
     assert_eq!(recovery_targets[0].account_id, recovering.id);
     assert!(recovery_targets[0].recovering_quota);
+    let health_updated_at: i64 = sqlx::query_scalar(
+        "SELECT updated_at FROM upstream_account_health WHERE upstream_account_id=$1",
+    )
+    .bind(recovering.id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let prior_attempt = health_updated_at + 1;
+    sqlx::query("INSERT INTO upstream_quota_observations (upstream_account_id,tenant_id,credential_generation,config_revision,last_attempt_at,next_refresh_at) VALUES ($1,$2,$3,$4,$5,$6)")
+        .bind(recovering.id.to_string()).bind(recovering.tenant_id.to_string())
+        .bind(recovering.credential_generation).bind(recovering.updated_at)
+        .bind(prior_attempt).bind(prior_attempt + 300_000)
+        .execute(&db.pool).await.unwrap();
+    assert!(
+        db.quota_observation_targets(&[], prior_attempt + 1, 4)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an existing recovery episode respects its persisted retry backoff"
+    );
+    sqlx::query("UPDATE upstream_account_health SET updated_at=$1 WHERE upstream_account_id=$2")
+        .bind(prior_attempt + 2)
+        .bind(recovering.id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let renewed_recovery = db
+        .quota_observation_targets(&[], prior_attempt + 3, 4)
+        .await
+        .unwrap();
+    assert_eq!(renewed_recovery.len(), 1);
+    assert_eq!(renewed_recovery[0].account_id, recovering.id);
 
     // Fixture only: no credential is used and no supplier request is made.
     sqlx::query("UPDATE upstream_accounts SET driver='kimi-oauth' WHERE id=$1")

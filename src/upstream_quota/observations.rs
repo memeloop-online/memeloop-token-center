@@ -61,6 +61,23 @@ fn next_refresh_at(
     now.saturating_add(delay)
 }
 
+fn observation_timeout_millis(
+    configured: u32,
+    target: &QuotaObservationTarget,
+    account: &crate::provider::UpstreamAccountView,
+) -> i64 {
+    let configured = i64::from(configured);
+    if !target.recovering_quota || account.driver != "openai-codex" {
+        return configured;
+    }
+    let account_budget = super::codex_quota_budget(&account.config)
+        .ok()
+        .and_then(|budget| i64::try_from(budget.total.as_millis()).ok())
+        .unwrap_or(configured)
+        .clamp(1_000, 30_000);
+    configured.max(account_budget)
+}
+
 fn project(
     account: &crate::provider::UpstreamAccountView,
     snapshot: &super::QuotaSnapshot,
@@ -164,8 +181,19 @@ pub(crate) async fn run(state: AppState, mut shutdown: tokio::sync::watch::Recei
 }
 
 async fn refresh_batch(state: &AppState) -> Result<(), AppError> {
-    let pinned = state.clone().pin_application_plugins().await?;
-    let plugins = pinned.plugins.quota_observation_plugin_ids();
+    // Core Codex recovery must remain available even when an optional
+    // application-plugin snapshot cannot be pinned. In that case only the
+    // plugin-owned observation targets are skipped for this batch.
+    let plugins = match state.clone().pin_application_plugins().await {
+        Ok(pinned) => pinned.plugins.quota_observation_plugin_ids(),
+        Err(error) => {
+            tracing::warn!(
+                error_category = error.diagnostic_category(),
+                "quota observation plugin snapshot unavailable; continuing core Codex recovery"
+            );
+            Vec::new()
+        }
+    };
     let targets = state
         .db
         .quota_observation_targets(
@@ -176,9 +204,30 @@ async fn refresh_batch(state: &AppState) -> Result<(), AppError> {
         .await?;
     let results = stream::iter(targets)
         .map(|target| async move {
+            let Ok((account, credential)) = state
+                .db
+                .upstream_account_with_credential(
+                    target.account_id,
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await
+            else {
+                return Ok(());
+            };
+            if account.tenant_id != target.tenant_id
+                || account.credential_generation != target.generation
+                || account.updated_at != target.config_revision
+                || account.status != "active"
+            {
+                return Ok(());
+            }
             let lease = Uuid::now_v7();
             let now = crate::db::unix_millis();
-            let timeout_ms = i64::from(state.config.quota_observation_timeout_millis);
+            let timeout_ms = observation_timeout_millis(
+                state.config.quota_observation_timeout_millis,
+                &target,
+                &account,
+            );
             if !state
                 .db
                 .claim_quota_observation(&target, lease, now, now + timeout_ms + 5_000)
@@ -188,21 +237,6 @@ async fn refresh_batch(state: &AppState) -> Result<(), AppError> {
             }
             let observation =
                 tokio::time::timeout(Duration::from_millis(timeout_ms as u64), async {
-                    let (account, credential) = state
-                        .db
-                        .upstream_account_with_credential(
-                            target.account_id,
-                            state.config.key_pepper.as_bytes(),
-                        )
-                        .await
-                        .ok()?;
-                    if account.tenant_id != target.tenant_id
-                        || account.credential_generation != target.generation
-                        || account.updated_at != target.config_revision
-                        || account.status != "active"
-                    {
-                        return None;
-                    }
                     let snapshot = if target.recovering_quota {
                         state
                             .upstream_quota
@@ -319,6 +353,33 @@ mod tests {
         target.previous_next_refresh_at = 300_100;
         assert_eq!(next_refresh_at(&target, false, 300, 10_000), 60_300);
         assert_eq!(next_refresh_at(&target, true, 400, 10_000), 10_400);
+    }
+
+    #[test]
+    fn recovery_timeout_honors_bounded_account_quota_budget() {
+        let target = QuotaObservationTarget {
+            account_id: Uuid::from_u128(1),
+            tenant_id: Uuid::from_u128(2),
+            tenant_external_id: "tenant".into(),
+            generation: 1,
+            config_revision: 10,
+            recovering_quota: true,
+            previous_attempt_at: 0,
+            previous_next_refresh_at: 0,
+        };
+        let account: crate::provider::UpstreamAccountView = serde_json::from_value(json!({
+            "id":Uuid::from_u128(1),"tenant_id":Uuid::from_u128(2),"name":"fixture","driver":"openai-codex",
+            "auth_kind":"oauth","connection_method":"native_oauth","credential_generation":1,"status":"active",
+            "config":{"transport_policy":{"request_timeout_millis":20000}},"can_refresh":true,"can_rotate":false,
+            "can_reauthorize":true,"route_count":0,"created_at":0,"updated_at":10
+        })).unwrap();
+        assert_eq!(
+            observation_timeout_millis(10_000, &target, &account),
+            20_000
+        );
+        let mut long = account;
+        long.config = json!({"transport_policy":{"request_timeout_millis":1260000}});
+        assert_eq!(observation_timeout_millis(10_000, &target, &long), 30_000);
     }
 
     #[tokio::test]
