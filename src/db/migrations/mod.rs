@@ -526,6 +526,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "request generation usage units",
         sql: include_str!("../../../migrations/common/0099_request_generation_units.sql"),
     },
+    Migration {
+        version: 100,
+        name: "quota reset accepted settlement",
+        sql: include_str!("../../../migrations/common/0100_quota_reset_settlement.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1037,6 +1042,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 99,
         name: "request generation usage units",
         sql: include_str!("../../../migrations/common/0099_request_generation_units.sql"),
+    },
+    Migration {
+        version: 100,
+        name: "quota reset accepted settlement",
+        sql: include_str!("../../../migrations/common/0100_quota_reset_settlement.sql"),
     },
 ];
 

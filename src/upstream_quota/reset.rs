@@ -39,21 +39,47 @@ async fn fresh_snapshot(
         .permits
         .try_acquire()
         .map_err(|_| temporarily_unavailable())?;
-    let timeout = codex_quota_budget(&account.config)
-        .map_err(|_| temporarily_unavailable())?
-        .total;
-    tokio::time::timeout(
-        timeout,
-        read_codex(
-            state,
-            account,
-            credential,
-            QuotaSnapshot::empty(account, tenant, None),
+    let budget = codex_quota_budget(&account.config).map_err(|_| temporarily_unavailable())?;
+    let observed_started_at = unix_millis();
+    let account_header =
+        crate::oauth::managed::codex::account_header_value(credential).map_err(|_| blocked())?;
+    let http = state
+        .codex_clients
+        .account_snapshot(account, credential)
+        .map_err(|_| temporarily_unavailable())?;
+    let (credential_header, credential_value) = credential
+        .request_header(observed_started_at)
+        .map_err(|_| blocked())?
+        .ok_or_else(blocked)?;
+    let auth = CodexQuotaAuth {
+        credential_header,
+        credential_value,
+        account: account_header,
+        proxy_url: credential.proxy().map(|(url, _)| url),
+    };
+    let reset = tokio::time::timeout(
+        budget.total,
+        get_codex_json(
+            &http,
+            auth,
+            CREDITS_URL,
+            QuotaRequestContext::for_account(account, "credits"),
+            budget,
         ),
     )
     .await
     .map_err(|_| temporarily_unavailable())?
-    .map_err(|_| temporarily_unavailable())
+    .map_err(|_| temporarily_unavailable())?;
+    let observed_at = unix_millis();
+    let mut snapshot = QuotaSnapshot::empty(account, tenant, None);
+    normalize::reset_credits(&mut snapshot, &reset, observed_at)
+        .map_err(|_| temporarily_unavailable())?;
+    snapshot.status = "ready";
+    snapshot.freshness = "fresh";
+    snapshot.observed_at = Some(observed_at);
+    snapshot.stale_after = Some(observed_at + FRESH_MS);
+    snapshot.finalize_reset_capability();
+    Ok(snapshot)
 }
 
 async fn fresh(
@@ -63,9 +89,11 @@ async fn fresh(
     tenant: &str,
 ) -> Result<QuotaSnapshot, AppError> {
     let snapshot = fresh_snapshot(state, account, credential, tenant).await?;
+    let available = snapshot.reset_capability.available_credits;
+    let applicable = snapshot.reset_capability.applicable_credits;
     if snapshot.reset_capability.credit_error_code.is_some()
-        || snapshot.reset_capability.available_credits.is_none()
-        || snapshot.reset_capability.applicable_credits.is_none()
+        || available.is_none_or(|value| value < 0)
+        || applicable.is_none_or(|value| value < 0)
     {
         return Err(temporarily_unavailable());
     }
@@ -108,6 +136,15 @@ pub(crate) async fn prepare(
         .reset_capability
         .applicable_credits
         .ok_or_else(blocked)?;
+    state
+        .db
+        .settle_accepted_quota_reset_from_observation(
+            account,
+            available,
+            applicable,
+            snapshot.observed_at.ok_or_else(blocked)?,
+        )
+        .await?;
     if available < 1 || applicable < 1 {
         return Err(blocked());
     }
@@ -338,6 +375,8 @@ pub(crate) async fn reconcile(
             &account_id,
             operation,
             actor,
+            account.credential_generation,
+            account.updated_at,
             snapshot
                 .reset_capability
                 .available_credits

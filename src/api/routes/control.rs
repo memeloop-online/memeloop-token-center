@@ -143,6 +143,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(prepare_quota_reset),
         )
         .route(
+            "/internal/v1/upstreams/{account_id}/quota-reset/current",
+            get(current_quota_reset),
+        )
+        .route(
             "/internal/v1/upstreams/{account_id}/quota-reset/{operation_id}",
             get(get_quota_reset),
         )

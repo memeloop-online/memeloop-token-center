@@ -1690,6 +1690,36 @@ paths:
           headers:
             Retry-After: { schema: { type: integer, minimum: 1 } }
 
+  /internal/v1/upstreams/{account_id}/quota-reset/current:
+    get:
+      tags: [Upstream providers]
+      operationId: getCurrentUpstreamQuotaReset
+      summary: Recover the current unresolved reset operation after a client reload
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      description: |
+        Reads only durable local state and does not require a live supplier
+        credential. Returns null when no prepared, submitted, accepted or unknown
+        operation still locks the account.
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - name: tenant_external_id
+          in: query
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 200 }
+      responses:
+        '200':
+          description: Current unresolved operation or null. Cache-Control no-store.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - { $ref: '#/components/schemas/UpstreamQuotaResetOperation' }
+                  - { type: 'null' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /internal/v1/upstreams/{account_id}/quota-reset/{operation_id}:
     get:
       tags: [Upstream providers]
@@ -1731,8 +1761,10 @@ paths:
         POST; redirects and HTTP retries are disabled. Uncertain outcomes become
         unknown and must never be retried under the same or a new operation.
         Accepted means HTTP 2xx only, not proven consumption or window recovery.
-        Submitted, accepted and unknown all block another operation pending
-        separately reviewed manual handling. No automated unlock is provided.
+        Submitted and unknown remain locked. Accepted remains locked until a
+        later fresh supplier credit read proves that its exact old credit balance
+        no longer applies; this releases the lock without attributing the balance
+        change to this operation or claiming quota-window recovery.
         Transient local capacity, DNS, proxy, or client-construction failures
         before the durable claim return 503 and are safe to retry with the same key.
       parameters:
@@ -1782,7 +1814,12 @@ paths:
       description: |
         Only dispatched operations can be reconciled. Preserves the original
         confirmation baseline and state; never infers that a changed credit
-        balance proves this operation succeeded. Does not unlock another reset.
+        balance proves this operation succeeded. For accepted operations only,
+        a fresh lower available-credit count records settlement and releases the
+        old account lock because the prepared balance no longer applies. This may
+        also reflect credit expiry and is not proof of reset completion. Unknown
+        and submitted operations stay locked. The observation must use the same
+        credential generation and transport revision recorded by preparation.
       parameters:
         - $ref: '#/components/parameters/AccountId'
         - name: operation_id
@@ -6407,7 +6444,7 @@ components:
         reason: { type: string, enum: [initial, reload, rollback] }
     UpstreamQuotaResetOperation:
       type: object
-      required: [id, upstream_account_id, state, credential_generation, available_credits, applicable_credits, observed_at, expires_at, prepared_by_service_id, confirmed_by_service_id, confirmed_at, created_at, updated_at, last_reconciled_at, reconciled_available_credits, reconciled_applicable_credits, error_code, audit, effect, consumes_credits]
+      required: [id, upstream_account_id, state, credential_generation, available_credits, applicable_credits, observed_at, expires_at, prepared_by_service_id, confirmed_by_service_id, confirmed_at, created_at, updated_at, last_reconciled_at, reconciled_available_credits, reconciled_applicable_credits, settled_at, error_code, audit, effect, consumes_credits]
       properties:
         id: { type: string, format: uuid }
         upstream_account_id: { type: string, format: uuid }
@@ -6425,6 +6462,7 @@ components:
         last_reconciled_at: { type: [integer, 'null'], format: int64 }
         reconciled_available_credits: { type: [integer, 'null'], format: int64 }
         reconciled_applicable_credits: { type: [integer, 'null'], format: int64 }
+        settled_at: { type: [integer, 'null'], format: int64, description: Fresh observation time when an accepted operation's exact old available-credit balance no longer applied; not proof that this operation caused the change or reset a quota window. }
         error_code: { type: [string, 'null'] }
         audit:
           type: array

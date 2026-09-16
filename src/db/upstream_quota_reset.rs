@@ -27,6 +27,7 @@ pub(crate) struct QuotaResetOperation {
     pub last_reconciled_at: Option<i64>,
     pub reconciled_available_credits: Option<i64>,
     pub reconciled_applicable_credits: Option<i64>,
+    pub settled_at: Option<i64>,
     pub error_code: Option<String>,
     pub audit: Vec<QuotaResetAuditEvent>,
     /// The supplier decides which Codex rate limits a credit resets.
@@ -127,6 +128,58 @@ impl Database {
             .ok_or(AppError::NotFound)?;
         let tenant: String = row.try_get("id")?;
         self.quota_reset_operation(&tenant, account, id).await
+    }
+
+    pub(crate) async fn current_quota_reset_operation(
+        &self,
+        tenant: &str,
+        account: &str,
+    ) -> Result<Option<QuotaResetOperation>, AppError> {
+        let now = unix_millis();
+        sqlx::query(
+            "UPDATE upstream_quota_reset_operations
+             SET state = 'expired', updated_at = $1
+             WHERE tenant_id = $2 AND upstream_account_id = $3
+               AND state = 'prepared' AND expires_at <= $1",
+        )
+        .bind(now)
+        .bind(tenant)
+        .bind(account)
+        .execute(&self.pool)
+        .await?;
+        let id = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM upstream_quota_reset_operations
+             WHERE tenant_id = $1 AND upstream_account_id = $2
+               AND state IN ('prepared', 'submitted', 'accepted', 'unknown')
+               AND settled_at IS NULL
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+        )
+        .bind(tenant)
+        .bind(account)
+        .fetch_optional(&self.pool)
+        .await?;
+        match id {
+            Some(id) => self
+                .quota_reset_operation(tenant, account, &id)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn current_quota_reset_operation_for_tenant(
+        &self,
+        tenant_external: &str,
+        account: &str,
+    ) -> Result<Option<QuotaResetOperation>, AppError> {
+        let row = sqlx::query("SELECT id FROM tenants WHERE external_id = $1")
+            .bind(tenant_external)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        let tenant: String = row.try_get("id")?;
+        self.current_quota_reset_operation(&tenant, account).await
     }
 
     pub(crate) async fn prepare_quota_reset(
@@ -242,7 +295,7 @@ impl Database {
                     actor_service_id, confirmed_by_service_id, confirmed_at,
                     created_at, updated_at, last_reconciled_at,
                     reconciled_available_credits, reconciled_applicable_credits,
-                    error_code
+                    settled_at, error_code
              FROM upstream_quota_reset_operations
              WHERE tenant_id = $1 AND upstream_account_id = $2 AND id = $3",
         )
@@ -292,6 +345,7 @@ impl Database {
             last_reconciled_at: row.try_get("last_reconciled_at")?,
             reconciled_available_credits: row.try_get("reconciled_available_credits")?,
             reconciled_applicable_credits: row.try_get("reconciled_applicable_credits")?,
+            settled_at: row.try_get("settled_at")?,
             error_code: row.try_get("error_code")?,
             audit,
             effect: "supplier_defined_codex_rate_limits",
@@ -444,20 +498,36 @@ impl Database {
         account: &str,
         id: &str,
         actor: &str,
+        credential_generation: i64,
+        transport_updated_at: i64,
         available: i64,
         applicable: i64,
         observed_at: i64,
     ) -> Result<(), AppError> {
         // Read evidence alone cannot attribute a changed balance to this
-        // operation. In particular, unknown never becomes accepted here.
+        // operation. In particular, unknown never becomes accepted here. A
+        // supplier-accepted operation may release its account lock once the
+        // exact old available balance no longer applies; this does not claim
+        // which event consumed or expired that credit.
         let mut tx = self.pool.begin().await?;
         let changed = sqlx::query(
             "UPDATE upstream_quota_reset_operations
              SET reconciled_available_credits = $1,
                  reconciled_applicable_credits = $2,
-                 last_reconciled_at = $3, updated_at = $3
+                 last_reconciled_at = $3,
+                 settled_at = CASE
+                     WHEN state = 'accepted' AND $1 < available_credits THEN $3
+                     ELSE settled_at
+                 END,
+                 updated_at = $3
              WHERE tenant_id = $4 AND upstream_account_id = $5 AND id = $6
-               AND state IN ('submitted', 'accepted', 'unknown')",
+               AND state IN ('submitted', 'accepted', 'unknown')
+               AND credential_generation = $7 AND transport_updated_at = $8
+               AND EXISTS (
+                 SELECT 1 FROM upstream_accounts account
+                 WHERE account.id = upstream_account_id AND account.tenant_id = $4
+                   AND account.credential_generation = $7 AND account.updated_at = $8
+               )",
         )
         .bind(available)
         .bind(applicable)
@@ -465,11 +535,13 @@ impl Database {
         .bind(tenant)
         .bind(account)
         .bind(id)
+        .bind(credential_generation)
+        .bind(transport_updated_at)
         .execute(&mut *tx)
         .await?;
         if changed.rows_affected() != 1 {
             return Err(AppError::Conflict(
-                "only dispatched resets can be reconciled".into(),
+                "only dispatched resets under their original credential and transport can be reconciled".into(),
             ));
         }
         insert_audit(
@@ -485,6 +557,85 @@ impl Database {
         .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    pub(crate) async fn settle_accepted_quota_reset_from_observation(
+        &self,
+        account: &UpstreamAccountView,
+        available: i64,
+        applicable: i64,
+        observed_at: i64,
+    ) -> Result<bool, AppError> {
+        let account_id = account.id.to_string();
+        let tenant = account.tenant_id.to_string();
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT id
+             FROM upstream_quota_reset_operations
+             WHERE tenant_id = $1 AND upstream_account_id = $2
+               AND state = 'accepted' AND settled_at IS NULL
+               AND available_credits > $3
+               AND credential_generation = $4 AND transport_updated_at = $5
+               AND EXISTS (
+                 SELECT 1 FROM upstream_accounts account
+                 WHERE account.id = upstream_account_id AND account.tenant_id = $1
+                   AND account.credential_generation = $4 AND account.updated_at = $5
+               )
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+        )
+        .bind(&tenant)
+        .bind(&account_id)
+        .bind(available)
+        .bind(account.credential_generation)
+        .bind(account.updated_at)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+        let id: String = row.try_get("id")?;
+        let changed = sqlx::query(
+            "UPDATE upstream_quota_reset_operations
+             SET reconciled_available_credits = $1,
+                 reconciled_applicable_credits = $2,
+                 last_reconciled_at = $3, settled_at = $3, updated_at = $3
+             WHERE id = $4 AND tenant_id = $5 AND upstream_account_id = $6
+               AND state = 'accepted' AND settled_at IS NULL
+               AND available_credits > $1
+               AND credential_generation = $7 AND transport_updated_at = $8
+               AND EXISTS (
+                 SELECT 1 FROM upstream_accounts account
+                 WHERE account.id = upstream_account_id AND account.tenant_id = $5
+                   AND account.credential_generation = $7 AND account.updated_at = $8
+               )",
+        )
+        .bind(available)
+        .bind(applicable)
+        .bind(observed_at)
+        .bind(&id)
+        .bind(&tenant)
+        .bind(&account_id)
+        .bind(account.credential_generation)
+        .bind(account.updated_at)
+        .execute(&mut *tx)
+        .await?;
+        if changed.rows_affected() == 1 {
+            insert_audit(
+                &mut tx,
+                &id,
+                &tenant,
+                &account_id,
+                "reconciled",
+                None,
+                None,
+                observed_at,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(changed.rows_affected() == 1)
     }
 }
 
@@ -619,6 +770,8 @@ mod tests {
                 &account.id.to_string(),
                 &operation.id,
                 "actor",
+                account.credential_generation,
+                account.updated_at,
                 99,
                 99,
                 now + 1
@@ -675,6 +828,8 @@ mod tests {
             &account.id.to_string(),
             &operation.id,
             "actor",
+            account.credential_generation,
+            account.updated_at,
             1,
             0,
             now + 2,
@@ -686,6 +841,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unknown.state, "unknown");
+        assert_eq!(unknown.settled_at, None);
         assert_eq!(unknown.available_credits, 2);
         assert_eq!(unknown.applicable_credits, 1);
         assert_eq!(unknown.reconciled_available_credits, Some(1));
@@ -718,6 +874,145 @@ mod tests {
             )
             .await
             .is_err()
+        );
+        assert!(
+            !db.settle_accepted_quota_reset_from_observation(&account, 0, 0, now + 3)
+                .await
+                .unwrap(),
+            "fresh counts cannot release an unknown dispatch"
+        );
+
+        let mut accepted_account = account.clone();
+        accepted_account.id = Uuid::now_v7();
+        accepted_account.name = "accepted quota fixture".into();
+        sqlx::query("INSERT INTO upstream_accounts (id, tenant_id, name, driver, auth_kind, config_json, status, credential_generation, created_at, updated_at) VALUES ($1, $2, 'accepted quota fixture', 'openai-codex', 'oauth', '{}', 'active', 1, $3, $3)")
+            .bind(accepted_account.id.to_string()).bind(tenant.to_string()).bind(now).execute(&db.pool).await.unwrap();
+        let accepted_input = |idempotency: &str| PrepareQuotaReset {
+            id: Uuid::now_v7(),
+            account: accepted_account.clone(),
+            actor: "actor".into(),
+            confirmation_hash: "accepted-confirmation-hash".into(),
+            prepare_idempotency_hash: idempotency.into(),
+            available: 2,
+            applicable: 2,
+            observed_at: now,
+        };
+        let accepted = db
+            .prepare_quota_reset(accepted_input("accepted-prepare"))
+            .await
+            .unwrap()
+            .operation;
+        assert!(matches!(
+            db.claim_quota_reset(
+                &accepted_account,
+                &accepted.id,
+                "actor",
+                "accepted-confirmation-hash",
+                "accepted-confirm"
+            )
+            .await
+            .unwrap(),
+            QuotaResetClaim::Claimed { .. }
+        ));
+        db.finish_quota_reset(&accepted.id, true, None)
+            .await
+            .unwrap();
+        assert!(
+            db.current_quota_reset_operation_for_tenant(
+                accepted_account.tenant_external_id.as_ref().unwrap(),
+                &accepted_account.id.to_string()
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            db.reconcile_quota_reset(
+                &tenant.to_string(),
+                &accepted_account.id.to_string(),
+                &accepted.id,
+                "actor",
+                accepted_account.credential_generation + 1,
+                accepted_account.updated_at,
+                1,
+                1,
+                now + 3,
+            )
+            .await
+            .is_err(),
+            "manual reconciliation cannot cross the credential fence"
+        );
+        assert!(
+            !db.settle_accepted_quota_reset_from_observation(&accepted_account, 2, 1, now + 3)
+                .await
+                .unwrap(),
+            "an unchanged available-credit count cannot release the accepted lock"
+        );
+        let mut changed_generation = accepted_account.clone();
+        changed_generation.credential_generation += 1;
+        assert!(
+            !db.settle_accepted_quota_reset_from_observation(&changed_generation, 1, 1, now + 4)
+                .await
+                .unwrap(),
+            "new-credential evidence cannot settle an old accepted operation"
+        );
+        sqlx::query(
+            "UPDATE upstream_accounts SET updated_at = $1 WHERE id = $2 AND tenant_id = $3",
+        )
+        .bind(now + 1)
+        .bind(accepted_account.id.to_string())
+        .bind(tenant.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            !db.settle_accepted_quota_reset_from_observation(&accepted_account, 1, 1, now + 4)
+                .await
+                .unwrap(),
+            "a concurrent transport revision change keeps the old operation locked"
+        );
+        sqlx::query(
+            "UPDATE upstream_accounts SET updated_at = $1 WHERE id = $2 AND tenant_id = $3",
+        )
+        .bind(now)
+        .bind(accepted_account.id.to_string())
+        .bind(tenant.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            db.settle_accepted_quota_reset_from_observation(&accepted_account, 1, 1, now + 5)
+                .await
+                .unwrap(),
+            "a lower fresh count makes the exact old accepted balance inapplicable"
+        );
+        let settled = db
+            .quota_reset_operation(
+                &tenant.to_string(),
+                &accepted_account.id.to_string(),
+                &accepted.id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(settled.state, "accepted");
+        assert_eq!(settled.settled_at, Some(now + 5));
+        assert_eq!(settled.reconciled_available_credits, Some(1));
+        assert!(
+            db.current_quota_reset_operation_for_tenant(
+                accepted_account.tenant_external_id.as_ref().unwrap(),
+                &accepted_account.id.to_string()
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "settlement hides the old accepted operation from current recovery"
+        );
+        assert!(
+            !db.prepare_quota_reset(accepted_input("after-accepted-settlement"))
+                .await
+                .unwrap()
+                .replayed,
+            "settlement releases the unique slot for a fresh preparation"
         );
     }
 }
