@@ -34,6 +34,15 @@ impl RequestSpoolAdmission {
         maximum: usize,
         declared_content_length: Option<usize>,
     ) -> Result<RequestSpool, RequestSpoolCaptureError> {
+        let mut lease = RequestSpoolLease::new(self.budget.clone());
+        if let Some(length) = declared_content_length {
+            if length > maximum {
+                return Err(RequestSpoolCaptureError::TooLarge);
+            }
+            lease
+                .try_grow(length)
+                .ok_or(RequestSpoolCaptureError::CapacityExhausted)?;
+        }
         prepare_directory(self.directory.as_ref()).await?;
         let directory = self.directory.clone();
         let (owner, writer) = tokio::task::spawn_blocking(move || {
@@ -48,19 +57,10 @@ impl RequestSpoolAdmission {
         let mut capture = RequestSpoolCapture {
             owner: Some(Arc::new(owner)),
             writer,
-            lease: RequestSpoolLease::new(self.budget.clone()),
+            lease,
             length: 0,
             hasher: blake3::Hasher::new(),
         };
-        if let Some(length) = declared_content_length {
-            if length > maximum {
-                return Err(RequestSpoolCaptureError::TooLarge);
-            }
-            capture
-                .lease
-                .try_grow(length)
-                .ok_or(RequestSpoolCaptureError::CapacityExhausted)?;
-        }
 
         let mut stream = body.into_data_stream();
         while let Some(chunk) = stream.next().await {
