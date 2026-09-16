@@ -335,6 +335,22 @@ Feature: Stable key identity and read-only self-service statistics
     Then the response status is 409
     And the expired URL image is quarantined without exposing or charging the signed URL
 
+  Scenario: A one-use URL-backed OpenAI image is not consumed by settlement validation
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI Images upstream returns a one-use signed URL asset
+    When the service creates a metered OpenAI Images route and key
+    And the client creates an OpenAI-compatible image
+    Then the response status is 409
+    And the one-use URL image is rejected without consuming or charging the signed URL
+
+  Scenario: Provider range responses must match the requested interval and body length
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI Images asset returns malformed range contracts
+    When the service creates a metered OpenAI Images route and key
+    And the client creates an OpenAI-compatible image
+    Then the response status is 200
+    And malformed provider range responses are rejected
+
   Scenario: A provider asset deleted after settlement is reported unavailable
     Given a token center backed by SQLite and memory object storage
     And the mock OpenAI Images asset is deleted after successful validation

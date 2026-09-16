@@ -423,7 +423,7 @@ async fn process_claimed(
         return terminal_failure(state, worker_id, job, "generation_timeout").await;
     }
     if job.status == "submitting"
-        && !generation_driver_capabilities(&job.driver).provable_submit_idempotency
+        && !generation_driver_capabilities(state, &job.driver).provable_submit_idempotency
     {
         return terminal_failure(state, worker_id, job, "submission_outcome_unknown").await;
     }
@@ -584,7 +584,7 @@ async fn submit_attempt(
     route: &ResolvedUpstream,
     attempt: &mut attempt::Attempt<'_>,
 ) -> Result<(), AppError> {
-    let capabilities = generation_driver_capabilities(&route.driver);
+    let capabilities = generation_driver_capabilities(state, &route.driver);
     let submission_nonce = if job.status == "submitting" {
         if !capabilities.provable_submit_idempotency {
             return terminal_failure(state, worker_id, job, "submission_outcome_unknown").await;
@@ -725,16 +725,33 @@ struct GenerationDriverCapabilities {
     provable_submit_idempotency: bool,
 }
 
-fn generation_driver_capabilities(driver: &str) -> GenerationDriverCapabilities {
-    // Neither current provider contract proves that a repeated submit with the same downstream
-    // header resolves to the original upstream job. Unknown providers therefore fail closed too.
-    let provable_submit_idempotency = match driver {
-        "volcengine-seedance" | "comfyui" => false,
-        _ => false,
-    };
+fn generation_driver_capabilities(state: &AppState, driver: &str) -> GenerationDriverCapabilities {
+    // Provider types, including plugin contributions, must explicitly declare
+    // generation guarantees. Unknown versions and omitted capabilities fail closed.
+    let provable_submit_idempotency = state
+        .providers
+        .get(driver)
+        .and_then(|provider| provider.generation_adapter.as_ref())
+        .filter(|adapter| adapter.api_version == "generation-adapter-v1")
+        .is_some_and(|adapter| adapter.provable_submit_idempotency);
     GenerationDriverCapabilities {
         provable_submit_idempotency,
     }
+}
+
+fn provider_asset_reads_repeatable(state: &AppState, route: &ResolvedUpstream) -> bool {
+    let provider_default = state
+        .providers
+        .get(&route.driver)
+        .and_then(|provider| provider.generation_adapter.as_ref())
+        .filter(|adapter| adapter.api_version == "generation-adapter-v1")
+        .is_some_and(|adapter| adapter.provider_asset_reads_repeatable);
+    provider_default
+        && route
+            .config
+            .get("provider_asset_reads_repeatable")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
 }
 
 fn apply_workflow_parameters(
@@ -1204,6 +1221,11 @@ pub(crate) async fn provider_asset_is_obtainable(
     {
         return Ok(false);
     }
+    // A validation GET must never consume the only deliverable copy. Providers
+    // without an explicit repeatable-read guarantee fail settlement uncharged.
+    if !provider_asset_reads_repeatable(state, route) {
+        return Ok(false);
+    }
     let request = provider_asset_get(state, route, &asset.url)
         .await?
         .header(reqwest::header::RANGE, "bytes=0-0");
@@ -1228,28 +1250,63 @@ pub(crate) async fn provider_asset_is_obtainable(
     ) {
         return Ok(false);
     }
-    if !matches!(
-        response.status(),
-        reqwest::StatusCode::OK | reqwest::StatusCode::PARTIAL_CONTENT
-    ) {
-        return Err(AppError::Upstream(format!(
-            "generation asset validation returned HTTP {}",
-            response.status().as_u16()
-        )));
+    if response.status() == reqwest::StatusCode::OK {
+        return Ok(false);
     }
-    if response.content_length() == Some(0) {
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(AppError::Upstream(
+            "generation asset validation did not honor the bounded byte range".into(),
+        ));
+    }
+    let content_range = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_satisfied_content_range);
+    if !content_range.is_some_and(|range| range.start == 0 && range.end == 0 && range.total > 0)
+        || response.content_length() != Some(1)
+    {
         return Ok(false);
     }
     let mut body = response.bytes_stream();
+    let mut bytes = 0_u64;
     while let Some(chunk) = body.next().await {
         let chunk = chunk.map_err(|error| {
             sanitized_http_error(&error, "generation asset validation response")
         })?;
-        if !chunk.is_empty() {
-            return Ok(true);
+        bytes = bytes
+            .checked_add(u64::try_from(chunk.len()).map_err(|_| AppError::Internal)?)
+            .ok_or(AppError::Internal)?;
+        if bytes > 1 {
+            return Ok(false);
         }
     }
-    Ok(false)
+    Ok(bytes == 1)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SatisfiedContentRange {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+    pub(crate) total: u64,
+}
+
+pub(crate) fn parse_satisfied_content_range(value: &str) -> Option<SatisfiedContentRange> {
+    let value = value.strip_prefix("bytes ")?;
+    let (range, total) = value.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse::<u64>().ok()?;
+    let end = end.parse::<u64>().ok()?;
+    let total = total.parse::<u64>().ok()?;
+    (total > 0 && start <= end && end < total).then_some(SatisfiedContentRange {
+        start,
+        end,
+        total,
+    })
+}
+
+pub(crate) fn parse_unsatisfied_content_range(value: &str) -> Option<u64> {
+    value.strip_prefix("bytes */")?.parse::<u64>().ok()
 }
 
 fn sanitized_http_error(error: &reqwest::Error, operation: &'static str) -> AppError {
@@ -1786,6 +1843,29 @@ mod tests {
         );
         assert_eq!(safe_asset_filename(None, 0, "image/png"), "asset-0.png");
         assert!(!safe_asset_filename(None, 0, "image/png").contains("SECRET_TOKEN"));
+    }
+
+    #[test]
+    fn provider_content_ranges_are_strict_and_numeric() {
+        assert_eq!(
+            parse_satisfied_content_range("bytes 2-5/13"),
+            Some(SatisfiedContentRange {
+                start: 2,
+                end: 5,
+                total: 13,
+            })
+        );
+        for invalid in [
+            "bytes 5-2/13",
+            "bytes 2-13/13",
+            "bytes 2-5/*",
+            "bytes */13",
+            "items 2-5/13",
+        ] {
+            assert_eq!(parse_satisfied_content_range(invalid), None, "{invalid}");
+        }
+        assert_eq!(parse_unsatisfied_content_range("bytes */13"), Some(13));
+        assert_eq!(parse_unsatisfied_content_range("bytes 0-0/13"), None);
     }
 
     #[test]

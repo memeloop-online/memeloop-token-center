@@ -187,7 +187,7 @@ async fn provider_generation_asset_response(
         Err(()) => return Ok(range_not_satisfiable(0)),
     };
     if let Some(range) = range {
-        request = request.header(header::RANGE, range);
+        request = request.header(header::RANGE, range.raw);
     }
     let _upstream_activity = state
         .metrics
@@ -206,14 +206,30 @@ async fn provider_generation_asset_response(
         return Ok(provider_asset_unavailable());
     }
     if upstream.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+        let Some(requested_range) = range else {
+            return Err(AppError::Upstream(
+                "generation asset provider returned 416 without a range request".into(),
+            ));
+        };
         let content_range = upstream
             .headers()
             .get(header::CONTENT_RANGE)
-            .cloned()
-            .unwrap_or_else(|| HeaderValue::from_static("bytes */0"));
+            .and_then(|value| value.to_str().ok())
+            .and_then(crate::generation::parse_unsatisfied_content_range)
+            .filter(|total| requested_range.spec.is_unsatisfied(*total))
+            .ok_or_else(|| {
+                AppError::Upstream(
+                    "generation asset provider returned an invalid unsatisfied range".into(),
+                )
+            })?;
+        if upstream.content_length() != Some(0) {
+            return Err(AppError::Upstream(
+                "generation asset provider returned a non-empty 416 response".into(),
+            ));
+        }
         return Response::builder()
             .status(StatusCode::RANGE_NOT_SATISFIABLE)
-            .header(header::CONTENT_RANGE, content_range)
+            .header(header::CONTENT_RANGE, format!("bytes */{content_range}"))
             .header(header::CONTENT_LENGTH, 0)
             .header(header::ACCEPT_RANGES, "bytes")
             .header(header::CACHE_CONTROL, "private, no-store")
@@ -235,6 +251,38 @@ async fn provider_generation_asset_response(
             "generation asset provider ignored the requested byte range".into(),
         ));
     }
+    if range.is_none() && status == StatusCode::PARTIAL_CONTENT {
+        return Err(AppError::Upstream(
+            "generation asset provider returned a partial response without a range request".into(),
+        ));
+    }
+    let validated_partial = if status == StatusCode::PARTIAL_CONTENT {
+        let requested = range.ok_or(AppError::Internal)?;
+        let content_range = upstream
+            .headers()
+            .get(header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(crate::generation::parse_satisfied_content_range)
+            .filter(|content_range| requested.spec.matches(*content_range))
+            .ok_or_else(|| {
+                AppError::Upstream(
+                    "generation asset provider returned an invalid content range".into(),
+                )
+            })?;
+        let expected_length = content_range
+            .end
+            .checked_sub(content_range.start)
+            .and_then(|length| length.checked_add(1))
+            .ok_or(AppError::Internal)?;
+        if upstream.content_length() != Some(expected_length) {
+            return Err(AppError::Upstream(
+                "generation asset provider returned an invalid range content length".into(),
+            ));
+        }
+        Some((content_range, expected_length))
+    } else {
+        None
+    };
     let content_type = upstream
         .headers()
         .get(header::CONTENT_TYPE)
@@ -242,15 +290,20 @@ async fn provider_generation_asset_response(
         .map(safe_download_mime)
         .unwrap_or_else(|| safe_download_mime(&view.mime_type));
     let content_length = upstream.headers().get(header::CONTENT_LENGTH).cloned();
-    if content_length
+    let declared_content_length = content_length
         .as_ref()
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        == Some(0)
-    {
+        .and_then(|value| value.parse::<u64>().ok());
+    if declared_content_length == Some(0) {
         return Ok(provider_asset_unavailable());
     }
-    let content_range = upstream.headers().get(header::CONTENT_RANGE).cloned();
+    let content_range = validated_partial.map(|(content_range, _)| {
+        HeaderValue::from_str(&format!(
+            "bytes {}-{}/{}",
+            content_range.start, content_range.end, content_range.total
+        ))
+        .expect("validated byte content range is an HTTP header")
+    });
     // The authenticated proxy accepts and forwards a single byte range even
     // when a provider omits the advisory header on its full-body response.
     // Preserve an explicit upstream value such as `none` when one is present.
@@ -267,6 +320,11 @@ async fn provider_generation_asset_response(
             Some(Err(_)) => {
                 return Err(AppError::Upstream(
                     "generation asset response stream failed".into(),
+                ));
+            }
+            None if validated_partial.is_some() => {
+                return Err(AppError::Upstream(
+                    "generation asset provider returned a short range body".into(),
                 ));
             }
             None => return Ok(provider_asset_unavailable()),
@@ -292,13 +350,102 @@ async fn provider_generation_asset_response(
             response = response.header(name, value);
         }
     }
-    let body = futures_util::stream::iter([Ok::<_, reqwest::Error>(first)]).chain(body);
-    response
-        .body(Body::from_stream(body))
-        .map_err(|_| AppError::Internal)
+    let expected_body_length = validated_partial
+        .map(|(_, expected_length)| expected_length)
+        .or(declared_content_length);
+    let body = if let Some(expected_length) = expected_body_length {
+        let first_length = u64::try_from(first.len()).map_err(|_| AppError::Internal)?;
+        if first_length > expected_length {
+            return Err(AppError::Upstream(
+                "generation asset provider returned a body larger than its content length".into(),
+            ));
+        }
+        Body::from_stream(futures_util::stream::try_unfold(
+            (Some(first), body, expected_length),
+            |(mut first, mut body, mut remaining)| async move {
+                loop {
+                    let next = match first.take() {
+                        Some(chunk) => Some(Ok(chunk)),
+                        None => body.next().await,
+                    };
+                    match next {
+                        Some(Ok(chunk)) if chunk.is_empty() => continue,
+                        Some(Ok(chunk)) => {
+                            let length = u64::try_from(chunk.len()).map_err(|_| {
+                                std::io::Error::other("provider range chunk is too large")
+                            })?;
+                            if length > remaining {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "provider asset body exceeded its declared length",
+                                ));
+                            }
+                            remaining -= length;
+                            return Ok(Some((chunk, (first, body, remaining))));
+                        }
+                        Some(Err(_)) => {
+                            return Err(std::io::Error::other(
+                                "provider range response stream failed",
+                            ));
+                        }
+                        None if remaining == 0 => return Ok(None),
+                        None => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "provider asset body ended before its declared length",
+                            ));
+                        }
+                    }
+                }
+            },
+        ))
+    } else {
+        Body::from_stream(futures_util::stream::iter([Ok::<_, reqwest::Error>(first)]).chain(body))
+    };
+    response.body(body).map_err(|_| AppError::Internal)
 }
 
-fn single_provider_range_header(headers: &HeaderMap) -> Result<Option<&str>, ()> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderRangeSpec {
+    Bounded { start: u64, end: u64 },
+    From { start: u64 },
+    Suffix { length: u64 },
+}
+
+impl ProviderRangeSpec {
+    fn matches(self, content: crate::generation::SatisfiedContentRange) -> bool {
+        match self {
+            Self::Bounded { start, end } => {
+                content.start == start && content.end == end.min(content.total.saturating_sub(1))
+            }
+            Self::From { start } => {
+                content.start == start && content.end == content.total.saturating_sub(1)
+            }
+            Self::Suffix { length } => {
+                let expected_length = length.min(content.total);
+                content.start == content.total.saturating_sub(expected_length)
+                    && content.end == content.total.saturating_sub(1)
+            }
+        }
+    }
+
+    fn is_unsatisfied(self, total: u64) -> bool {
+        match self {
+            Self::Bounded { start, .. } | Self::From { start } => start >= total,
+            Self::Suffix { .. } => total == 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProviderRangeRequest<'a> {
+    raw: &'a str,
+    spec: ProviderRangeSpec,
+}
+
+fn single_provider_range_header(
+    headers: &HeaderMap,
+) -> Result<Option<ProviderRangeRequest<'_>>, ()> {
     let mut values = headers.get_all(header::RANGE).iter();
     let first = values.next();
     if values.next().is_some() {
@@ -313,25 +460,28 @@ fn single_provider_range_header(headers: &HeaderMap) -> Result<Option<&str>, ()>
     }
     let range = value.strip_prefix("bytes=").ok_or(())?;
     let (start, end) = range.split_once('-').ok_or(())?;
-    match (start.is_empty(), end.is_empty()) {
+    let spec = match (start.is_empty(), end.is_empty()) {
         (true, true) => return Err(()),
         (true, false) => {
-            if end.parse::<u64>().map_err(|_| ())? == 0 {
+            let length = end.parse::<u64>().map_err(|_| ())?;
+            if length == 0 {
                 return Err(());
             }
+            ProviderRangeSpec::Suffix { length }
         }
-        (false, true) => {
-            start.parse::<u64>().map_err(|_| ())?;
-        }
+        (false, true) => ProviderRangeSpec::From {
+            start: start.parse::<u64>().map_err(|_| ())?,
+        },
         (false, false) => {
             let start = start.parse::<u64>().map_err(|_| ())?;
             let end = end.parse::<u64>().map_err(|_| ())?;
             if end < start {
                 return Err(());
             }
+            ProviderRangeSpec::Bounded { start, end }
         }
-    }
-    Ok(Some(value))
+    };
+    Ok(Some(ProviderRangeRequest { raw: value, spec }))
 }
 
 fn provider_asset_unavailable() -> Response {
@@ -488,7 +638,10 @@ mod tests {
         for value in ["bytes=1-2", "bytes=1-", "bytes=-2"] {
             let mut headers = HeaderMap::new();
             headers.insert(header::RANGE, HeaderValue::from_static(value));
-            assert_eq!(single_provider_range_header(&headers), Ok(Some(value)));
+            assert!(
+                single_provider_range_header(&headers)
+                    .is_ok_and(|range| range.is_some_and(|range| range.raw == value))
+            );
         }
         for value in [
             "items=1-2",
@@ -506,5 +659,39 @@ mod tests {
             );
             assert_eq!(single_provider_range_header(&headers), Err(()));
         }
+    }
+
+    #[test]
+    fn provider_ranges_require_exact_satisfied_content_ranges() {
+        let content = crate::generation::SatisfiedContentRange {
+            start: 2,
+            end: 5,
+            total: 13,
+        };
+        assert!(ProviderRangeSpec::Bounded { start: 2, end: 5 }.matches(content));
+        assert!(!ProviderRangeSpec::Bounded { start: 1, end: 5 }.matches(content));
+        assert!(ProviderRangeSpec::Bounded { start: 2, end: 99 }.matches(
+            crate::generation::SatisfiedContentRange {
+                start: 2,
+                end: 12,
+                total: 13,
+            }
+        ));
+        assert!(ProviderRangeSpec::From { start: 2 }.matches(
+            crate::generation::SatisfiedContentRange {
+                start: 2,
+                end: 12,
+                total: 13,
+            }
+        ));
+        assert!(ProviderRangeSpec::Suffix { length: 4 }.matches(
+            crate::generation::SatisfiedContentRange {
+                start: 9,
+                end: 12,
+                total: 13,
+            }
+        ));
+        assert!(ProviderRangeSpec::From { start: 13 }.is_unsatisfied(13));
+        assert!(!ProviderRangeSpec::Suffix { length: 4 }.is_unsatisfied(13));
     }
 }

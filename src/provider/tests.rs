@@ -226,6 +226,7 @@ fn test_provider(id: &str) -> ProviderType {
         credential_schema: json!({"type": "object"}),
         oauth_adapter: None,
         component_adapter: None,
+        generation_adapter: None,
         source: "test".into(),
     }
 }
@@ -250,6 +251,32 @@ fn cloned_provider_catalog_shares_frozen_schemas_and_extends_copy_on_write() {
     assert_eq!(cloned.list().len(), builtin_count);
     assert!(catalog.contains("copy-on-write"));
     assert!(!cloned.contains("copy-on-write"));
+}
+
+#[test]
+fn plugin_provider_generation_capabilities_are_versioned_and_extensible() {
+    let mut catalog = ProviderCatalog::builtins();
+    let mut provider = test_provider("generation-plugin");
+    provider.generation_adapter = Some(GenerationAdapterContribution {
+        api_version: "generation-adapter-v1".into(),
+        provable_submit_idempotency: true,
+        provider_asset_reads_repeatable: true,
+    });
+    catalog.extend([provider]).unwrap();
+    let adapter = catalog
+        .get("generation-plugin")
+        .and_then(|provider| provider.generation_adapter.as_ref())
+        .unwrap();
+    assert!(adapter.provable_submit_idempotency);
+    assert!(adapter.provider_asset_reads_repeatable);
+
+    let mut invalid = test_provider("future-generation-plugin");
+    invalid.generation_adapter = Some(GenerationAdapterContribution {
+        api_version: "generation-adapter-v2".into(),
+        provable_submit_idempotency: true,
+        provider_asset_reads_repeatable: true,
+    });
+    assert!(catalog.extend([invalid]).is_err());
 }
 
 #[test]

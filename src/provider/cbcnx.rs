@@ -87,6 +87,11 @@ pub(super) fn provider_type(credential_schema: Value) -> ProviderType {
         credential_schema,
         oauth_adapter: None,
         component_adapter: None,
+        generation_adapter: Some(super::catalog::GenerationAdapterContribution {
+            api_version: "generation-adapter-v1".to_owned(),
+            provable_submit_idempotency: false,
+            provider_asset_reads_repeatable: true,
+        }),
         source: "builtin".to_owned(),
     }
 }

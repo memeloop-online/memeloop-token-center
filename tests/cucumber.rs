@@ -91,6 +91,7 @@ struct TokenCenterWorld {
     response: Value,
     synchronous_response_body: Vec<u8>,
     synchronous_response_content_length: Option<usize>,
+    provider_asset_reads_repeatable: bool,
 }
 
 impl Default for TokenCenterWorld {
@@ -141,6 +142,7 @@ impl Default for TokenCenterWorld {
             response: Value::Null,
             synchronous_response_body: Vec::new(),
             synchronous_response_content_length: None,
+            provider_asset_reads_repeatable: true,
         }
     }
 }
@@ -478,11 +480,25 @@ async fn mock_siliconflow_video_generation(world: &mut TokenCenterWorld) {
     let asset_server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/sf-result.mp4"))
+        .and(header("range", "bytes=0-0"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "video/mp4")
+                .insert_header("content-range", "bytes 0-0/25")
+                .set_body_bytes(b"s"),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(&asset_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/sf-result.mp4"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "video/mp4")
                 .set_body_bytes(b"siliconflow-video-content"),
         )
+        .with_priority(10)
         .expect(1)
         .mount(&asset_server)
         .await;
@@ -788,11 +804,24 @@ async fn mock_seedance_generation(world: &mut TokenCenterWorld) {
         .await;
     Mock::given(method("GET"))
         .and(path("/assets/video.mp4"))
+        .and(header("range", "bytes=0-0"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "video/mp4")
+                .insert_header("content-range", "bytes 0-0/18")
+                .set_body_bytes(b"m"),
+        )
+        .with_priority(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/assets/video.mp4"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "video/mp4")
                 .set_body_bytes(b"mock-video-content"),
         )
+        .with_priority(10)
         .mount(world.mock.as_ref().expect("mock server"))
         .await;
 }
@@ -1375,11 +1404,24 @@ async fn mock_comfyui_generation(world: &mut TokenCenterWorld) {
         .await;
     Mock::given(method("GET"))
         .and(path("/view"))
+        .and(header("range", "bytes=0-0"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "image/png")
+                .insert_header("content-range", "bytes 0-0/16")
+                .set_body_bytes(b"m"),
+        )
+        .with_priority(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/view"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "image/png")
                 .set_body_bytes(b"mock-png-content"),
         )
+        .with_priority(10)
         .mount(world.mock.as_ref().expect("mock server"))
         .await;
 }
@@ -2545,11 +2587,28 @@ async fn mock_comfyui_video_generation(world: &mut TokenCenterWorld) {
         .and(query_param("filename", "result.mp4"))
         .and(query_param("subfolder", "videos"))
         .and(query_param("type", "output"))
+        .and(header("range", "bytes=0-0"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "video/mp4")
+                .insert_header("content-range", "bytes 0-0/24")
+                .set_body_bytes(b"m"),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/view"))
+        .and(query_param("filename", "result.mp4"))
+        .and(query_param("subfolder", "videos"))
+        .and(query_param("type", "output"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "video/mp4")
                 .set_body_bytes(b"mock-comfy-video-content"),
         )
+        .with_priority(10)
         .mount(server)
         .await;
 }
@@ -2899,6 +2958,78 @@ async fn mock_openai_image_url_generation(world: &mut TokenCenterWorld) {
         .await;
 }
 
+#[given("the mock OpenAI Images asset returns malformed range contracts")]
+async fn mock_malformed_openai_image_ranges(world: &mut TokenCenterWorld) {
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .and(header("authorization", "Bearer image-secret"))
+        .and(header_exists("idempotency-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "created": 1,
+            "data": [{"url": format!("{mock_url}/generated/malformed-range.png?token=must-not-leak")}]
+        })))
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/generated/malformed-range.png"))
+        .and(header("range", "bytes=0-0"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-range", "bytes 0-0/13")
+                .set_body_bytes(b"e"),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/generated/malformed-range.png"))
+        .and(header("range", "bytes=1-1"))
+        .respond_with(ResponseTemplate::new(206).set_body_bytes(b"x"))
+        .with_priority(1)
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/generated/malformed-range.png"))
+        .and(header("range", "bytes=2-2"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-range", "bytes 3-3/13")
+                .set_body_bytes(b"x"),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/generated/malformed-range.png"))
+        .and(header("range", "bytes=4-6"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-range", "bytes 4-6/13")
+                .insert_header("content-length", "3")
+                .set_body_bytes(b"xy"),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/generated/malformed-range.png"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-range", "bytes 0-12/13")
+                .set_body_bytes(b"exact-url-png"),
+        )
+        .with_priority(10)
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
 #[given("the mock OpenAI Images upstream returns an empty signed URL asset")]
 async fn mock_empty_openai_image_url_generation(world: &mut TokenCenterWorld) {
     let mock_url = world.mock.as_ref().expect("mock server").uri();
@@ -2963,6 +3094,33 @@ async fn mock_expired_openai_image_url_generation(world: &mut TokenCenterWorld) 
             "data": [{"url": format!("{mock_url}/generated/expired.png?expires=1&token=must-not-leak")}]
         })))
         .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
+#[given("the mock OpenAI Images upstream returns a one-use signed URL asset")]
+async fn mock_one_use_openai_image_url_generation(world: &mut TokenCenterWorld) {
+    world.provider_asset_reads_repeatable = false;
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .and(header("authorization", "Bearer image-secret"))
+        .and(header_exists("idempotency-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "created": 1,
+            "data": [{"url": format!("{mock_url}/generated/one-use.png?token=must-not-leak")}]
+        })))
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/generated/one-use.png"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "image/png")
+                .set_body_bytes(b"one-use-image"),
+        )
+        .expect(0)
         .mount(world.mock.as_ref().expect("mock server"))
         .await;
 }
@@ -3162,7 +3320,11 @@ async fn create_openai_image_route_and_key(world: &mut TokenCenterWorld) {
         .json(&json!({
             "name": "openai-images",
             "driver": "http-json",
-            "config": {"base_url": mock_url, "network_scope": "private"},
+            "config": {
+                "base_url": mock_url,
+                "network_scope": "private",
+                "provider_asset_reads_repeatable": world.provider_asset_reads_repeatable
+            },
             "credential": {"type": "api_key", "value": "image-secret"}
         }))
         .send()
@@ -3800,6 +3962,47 @@ async fn openai_url_image_is_archived(world: &mut TokenCenterWorld) {
     assert_eq!(stats["summary"]["total_cost"], "0.3");
 }
 
+#[then("malformed provider range responses are rejected")]
+async fn malformed_provider_ranges_are_rejected(world: &mut TokenCenterWorld) {
+    let request_id = world
+        .synchronous_request_id
+        .expect("malformed range request id");
+    let state = world.state.clone().expect("test application state");
+    let assets = state
+        .db
+        .synchronous_generation_assets(request_id, state.config.key_pepper.as_bytes())
+        .await
+        .expect("malformed range provider asset");
+    let asset_url = format!(
+        "{}/self/v1/requests/{request_id}/assets/{}",
+        world.service_url, assets[0].view.asset_id
+    );
+    for range in [None, Some("bytes=1-1"), Some("bytes=2-2")] {
+        let mut request = world.client.get(&asset_url).bearer_auth(&world.current_key);
+        if let Some(range) = range {
+            request = request.header("range", range);
+        }
+        let response = request.send().await.expect("malformed range response");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+    let short = world
+        .client
+        .get(&asset_url)
+        .bearer_auth(&world.current_key)
+        .header("range", "bytes=4-6")
+        .send()
+        .await
+        .expect("short provider range response");
+    if short.status() == StatusCode::PARTIAL_CONTENT {
+        assert!(
+            short.bytes().await.is_err(),
+            "short provider body must fail closed"
+        );
+    } else {
+        assert_eq!(short.status(), StatusCode::BAD_GATEWAY);
+    }
+}
+
 /// A malformed successful POST cannot prove that the provider did not charge.
 /// Exercise the operator API, durable receipt, and same-key non-replay before
 /// retaining the scenario-specific privacy/archive assertions below.
@@ -4026,6 +4229,11 @@ async fn missing_openai_url_image_is_rejected(world: &mut TokenCenterWorld) {
 #[then("the expired URL image is quarantined without exposing or charging the signed URL")]
 async fn expired_openai_url_image_is_rejected(world: &mut TokenCenterWorld) {
     assert_unavailable_openai_url_image(world, "/generated/expired.png", 0).await;
+}
+
+#[then("the one-use URL image is rejected without consuming or charging the signed URL")]
+async fn one_use_openai_url_image_is_rejected(world: &mut TokenCenterWorld) {
+    assert_unavailable_openai_url_image(world, "/generated/one-use.png", 0).await;
 }
 
 async fn assert_unavailable_openai_url_image(
