@@ -29,7 +29,7 @@ harness = false
 [features]
 experimental-plugin-revisions = []
 default = []
-plugin-distribution = ["dep:oci-client", "dep:tempfile"]
+plugin-distribution = ["dep:oci-client"]
 
 [dependencies]
 async-trait = "0.1"
@@ -63,7 +63,7 @@ sha2 = "0.10"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "any", "postgres", "sqlite"] }
 subtle = "2"
 thiserror = "2"
-tempfile = { version = "3", optional = true }
+tempfile = "3"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
 tower = { version = "0.5", features = ["limit"] }

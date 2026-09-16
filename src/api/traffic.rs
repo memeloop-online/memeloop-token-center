@@ -56,9 +56,28 @@ pub(super) async fn proxy_openai_responses(
     axum::Extension(memory): axum::Extension<
         std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     >,
+    axum::Extension(spool): axum::Extension<
+        std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
+    >,
     headers: HeaderMap,
-    body: Bytes,
 ) -> Result<Response, AppError> {
+    if !memory.try_grow(
+        spool.len(),
+        crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT,
+    ) {
+        state
+            .metrics
+            .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Ingress);
+        return Err(AppError::Overloaded);
+    }
+    let body = spool.read_all().await.map_err(|_| {
+        tracing::error!(
+            stage = "request_spool_read",
+            bytes = spool.len(),
+            "authenticated Responses request spool could not be replayed"
+        );
+        AppError::Overloaded
+    })?;
     super::proxy::proxy(state, headers, body, Protocol::OpenAiResponses, memory).await
 }
 
