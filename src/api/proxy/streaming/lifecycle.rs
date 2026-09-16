@@ -19,6 +19,7 @@ pub(super) struct StreamingFinalizationInput<'a> {
     pub(super) requested_service_tier: Option<String>,
     pub(super) conversation: Option<ProxyConversation>,
     pub(super) memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    pub(super) lifecycle_deadline: tokio::time::Instant,
     pub(super) tenant_id: Uuid,
     pub(super) transport_error: Option<&'static str>,
     pub(super) delivered_billable: bool,
@@ -103,6 +104,7 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
         requested_service_tier,
         conversation,
         memory,
+        lifecycle_deadline,
         tenant_id,
         transport_error,
         delivered_billable,
@@ -262,16 +264,17 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
     } else {
         CodexRetryTerminal::Failed
     };
-    let conversation =
-        conversation
-            .as_ref()
-            .and_then(|conversation| match conversation.project(&memory) {
-                Ok(projection) => Some(projection),
-                Err(error) => {
-                    ProxyConversation::log_projection_error(request_id, &error);
-                    None
-                }
-            });
+    let conversation = if let Some(conversation) = conversation.as_ref() {
+        match conversation.project(&memory, lifecycle_deadline).await {
+            Ok(projection) => Some(projection),
+            Err(error) => {
+                ProxyConversation::log_projection_error(request_id, &error);
+                None
+            }
+        }
+    } else {
+        None
+    };
     let (first_output_ms, generation_duration_ms) = output_timing.finish(
         error_code.is_none()
             && sse_summary.as_ref().is_some_and(|summary| {

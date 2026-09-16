@@ -73,6 +73,29 @@ async fn large_conversation_stream_retains_raw_bytes_until_terminal_projection()
     const RETAINED_BYTES: usize = 8 * 1024 * 1024;
 
     let fixture = codex_route_fixture("large-conversation-stream").await;
+    fixture
+        .state
+        .db
+        .update_key_policy(
+            fixture.key_id,
+            KeyPolicy {
+                tokens_per_minute: 32 * 1024 * 1024,
+                ..KeyPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    fixture
+        .state
+        .db
+        .grant(
+            fixture.credit_account_id,
+            Decimal::from(32),
+            "large conversation projection fixture",
+            "large-conversation-projection-balance",
+        )
+        .await
+        .unwrap();
     let (endpoint, release_body, upstream) =
         gated_sse_upstream(completed_codex_sse("projected after EOF").into_bytes()).await;
     let response = send_codex_route_to_endpoint(

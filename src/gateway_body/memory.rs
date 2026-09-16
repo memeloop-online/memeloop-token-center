@@ -50,6 +50,8 @@ pub(crate) struct ProxyMemoryBudget {
     retained_wait_started: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     response_wait_started: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    projection_wait_started: Arc<tokio::sync::Notify>,
 }
 
 impl ProxyMemoryBudget {
@@ -62,6 +64,8 @@ impl ProxyMemoryBudget {
             retained_wait_started: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             response_wait_started: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            projection_wait_started: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -80,6 +84,8 @@ impl ProxyMemoryBudget {
             retained_wait_started: self.retained_wait_started.clone(),
             #[cfg(test)]
             response_wait_started: self.response_wait_started.clone(),
+            #[cfg(test)]
+            projection_wait_started: self.projection_wait_started.clone(),
         })
     }
 
@@ -114,6 +120,11 @@ impl ProxyMemoryBudget {
     pub(crate) async fn wait_for_response_reservation_for_test(&self) {
         self.response_wait_started.notified().await;
     }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_projection_reservation_for_test(&self) {
+        self.projection_wait_started.notified().await;
+    }
 }
 
 pub(crate) struct ProxyMemoryReservation {
@@ -130,6 +141,12 @@ pub(crate) struct ProxyMemoryReservation {
     retained_wait_started: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     response_wait_started: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    projection_wait_started: Arc<tokio::sync::Notify>,
+}
+
+pub(crate) struct ConversationProjectionPermit {
+    _permit: OwnedSemaphorePermit,
 }
 
 impl ProxyMemoryReservation {
@@ -159,6 +176,8 @@ impl ProxyMemoryReservation {
         // All admissions use Tokio's fair asynchronous queue. A try-acquire
         // fast path can overtake an already queued multi-permit waiter.
         let mut observation = None;
+        #[cfg(test)]
+        let mut async_wait_observed = false;
         let permit = {
             let mut acquire = Box::pin(semaphore.clone().acquire_many_owned(units));
             tokio::time::timeout_at(
@@ -166,6 +185,19 @@ impl ProxyMemoryReservation {
                 std::future::poll_fn(|context| match acquire.as_mut().poll(context) {
                     Poll::Ready(permit) => Poll::Ready(permit),
                     Poll::Pending => {
+                        #[cfg(test)]
+                        if !async_wait_observed {
+                            async_wait_observed = true;
+                            match stage {
+                                crate::metrics::memory_admission::Stage::Response => {
+                                    self.response_wait_started.notify_one();
+                                }
+                                crate::metrics::memory_admission::Stage::Projection => {
+                                    self.projection_wait_started.notify_one();
+                                }
+                                crate::metrics::memory_admission::Stage::Retained => {}
+                            }
+                        }
                         if observation.is_none() {
                             observation = self
                                 .admission
@@ -249,8 +281,6 @@ impl ProxyMemoryReservation {
             .saturating_mul(CAPTURE_MEMORY_WEIGHT)
             .max(UNIT_BYTES);
         let units = bytes.div_ceil(UNIT_BYTES) as u32;
-        #[cfg(test)]
-        self.response_wait_started.notify_one();
         let Some(permit) = self
             .acquire(
                 &self.permits,
@@ -304,24 +334,32 @@ impl ProxyMemoryReservation {
         }
     }
 
-    /// Keep one raw request-body copy charged while a text conversation waits
-    /// for a streaming terminal. The two JSON-tree/working copies can be
-    /// released after request admission; terminal projection reacquires them
-    /// briefly before parsing the retained bytes.
-    pub(crate) fn release_request_tree_copies(&self, bytes: usize) {
+    /// Keep one raw request-body copy charged after the routed request JSON and
+    /// provider working buffers have both been dropped. Terminal projection
+    /// reacquires the two transient copies before reparsing the retained body.
+    pub(crate) fn release_conversation_working_copies(&self, bytes: usize) {
         self.release(bytes, REQUEST_MEMORY_WEIGHT.saturating_sub(1));
     }
 
-    /// Reserve the transient JSON-tree copies required to project a retained
-    /// raw conversation body. Its scanner allowance remains held from ingress
-    /// through the request lifecycle, so only the two released body copies are
-    /// reacquired here.
-    pub(crate) fn try_reserve_conversation_projection(&self, body: &[u8]) -> bool {
-        self.try_grow(body.len(), REQUEST_MEMORY_WEIGHT.saturating_sub(1))
-    }
-
-    pub(crate) fn release_conversation_projection(&self, body: &[u8]) {
-        self.release(body.len(), REQUEST_MEMORY_WEIGHT.saturating_sub(1));
+    /// Fairly reserve the transient JSON-tree copies required to project a
+    /// retained raw conversation body. The returned permit is independent of
+    /// the long-lived request reservation and never occupies the buffered
+    /// retained-request partition.
+    pub(crate) async fn reserve_conversation_projection(
+        &self,
+        bytes: usize,
+        deadline: tokio::time::Instant,
+    ) -> Option<ConversationProjectionPermit> {
+        let weighted = bytes.checked_mul(REQUEST_MEMORY_WEIGHT.saturating_sub(1))?;
+        let units = u32::try_from(weighted.div_ceil(UNIT_BYTES)).ok()?;
+        self.acquire(
+            &self.permits,
+            units,
+            deadline,
+            crate::metrics::memory_admission::Stage::Projection,
+        )
+        .await
+        .map(|permit| ConversationProjectionPermit { _permit: permit })
     }
 
     pub(crate) fn try_reserve_json(&self, body: &[u8]) -> bool {
@@ -640,6 +678,99 @@ mod tests {
                 .contains("proxy_memory_waits_total{stage=\"response\",outcome=\"admitted\"} 1")
         );
         assert!(rendered.contains("proxy_memory_waiting{stage=\"response\"} 0"));
+    }
+
+    #[tokio::test]
+    async fn projection_waits_behind_buffered_response_and_releases_transient_permits() {
+        let budget = ProxyMemoryBudget::new(1024 * 1024);
+        let held = budget.reservation();
+        assert!(held.try_grow(1024 * 1024, 1));
+        let metrics = crate::metrics::Metrics::default();
+
+        let response = budget.reservation();
+        response.configure_admission(std::time::Duration::from_secs(5), metrics.clone());
+        let response_task = tokio::spawn(async move {
+            assert!(
+                response
+                    .reserve_buffered_response(
+                        320 * 1024,
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                    )
+                    .await
+            );
+            response
+        });
+        budget.wait_for_response_reservation_for_test().await;
+
+        let projection = budget.reservation();
+        projection.configure_admission(std::time::Duration::from_secs(5), metrics.clone());
+        let projection_task = tokio::spawn(async move {
+            let permit = projection
+                .reserve_conversation_projection(
+                    64 * 1024,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                )
+                .await
+                .expect("projection enters the fair lifecycle queue");
+            (projection, permit)
+        });
+        budget.wait_for_projection_reservation_for_test().await;
+        assert!(!response_task.is_finished());
+        assert!(!projection_task.is_finished());
+
+        drop(held);
+        let response = response_task.await.unwrap();
+        assert!(
+            !projection_task.is_finished(),
+            "the later projection cannot overtake the buffered response"
+        );
+        drop(response);
+        let (projection, permit) = projection_task.await.unwrap();
+        assert_eq!(budget.snapshot().0, 2 * 64 * 1024);
+        drop(permit);
+        drop(projection);
+        assert_eq!(budget.snapshot().0, 0);
+
+        let rendered = metrics.render(&crate::metrics::RuntimeMetrics::default());
+        assert!(
+            rendered
+                .contains("proxy_memory_waits_total{stage=\"response\",outcome=\"admitted\"} 1")
+        );
+        assert!(
+            rendered
+                .contains("proxy_memory_waits_total{stage=\"projection\",outcome=\"admitted\"} 1")
+        );
+        assert!(rendered.contains("proxy_memory_waiting{stage=\"projection\"} 0"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn projection_wait_is_bounded_by_the_lifecycle_deadline() {
+        let budget = ProxyMemoryBudget::new(1024 * 1024);
+        let held = budget.reservation();
+        assert!(held.try_grow(1024 * 1024, 1));
+        let metrics = crate::metrics::Metrics::default();
+        let projection = budget.reservation();
+        projection.configure_admission(std::time::Duration::from_secs(1), metrics.clone());
+        let started = tokio::time::Instant::now();
+        assert!(
+            projection
+                .reserve_conversation_projection(
+                    64 * 1024,
+                    started + std::time::Duration::from_millis(50),
+                )
+                .await
+                .is_none()
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::from_millis(50));
+        let rendered = metrics.render(&crate::metrics::RuntimeMetrics::default());
+        assert!(
+            rendered
+                .contains("proxy_memory_waits_total{stage=\"projection\",outcome=\"timeout\"} 1")
+        );
+        assert!(rendered.contains("proxy_memory_waiting{stage=\"projection\"} 0"));
+        drop(held);
+        drop(projection);
+        assert_eq!(budget.snapshot().0, 0);
     }
 
     #[tokio::test]

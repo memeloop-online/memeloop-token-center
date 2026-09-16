@@ -845,6 +845,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 requested_service_tier,
                 conversation,
                 memory: request_memory,
+                lifecycle_deadline,
                 tenant_id,
                 transport_error,
                 delivered_billable,
