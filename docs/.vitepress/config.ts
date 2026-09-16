@@ -82,7 +82,9 @@ function sidebarItems(dir: string, linkPrefix: string): DefaultTheme.SidebarItem
 
 function sidebarFor(locale: Locale): DefaultTheme.SidebarItem[] {
   const root = path.join(docsDir, locale)
-  return existsSync(root) ? sidebarItems(root, `/${locale}/`) : []
+  return existsSync(root)
+    ? sidebarItems(root, `/${locale}/`).filter((item) => item.link !== `/${locale}/`)
+    : []
 }
 
 // Tentative top-level navigation. Entries are emitted only when the target
