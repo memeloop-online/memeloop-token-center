@@ -34,7 +34,7 @@ async fn provider_incomplete_settles_reported_usage_through_the_codex_pipeline()
         let text = String::from_utf8_lossy(&body);
         assert_eq!(status, StatusCode::OK, "{text}");
         assert_eq!(text.matches("event: response.incomplete").count(), 1);
-        assert!(!text.contains("event: error"));
+        assert!(!text.contains("event: response.failed"));
         assert!(text.contains(reason));
         wait_for_request_settlement(&fixture, 1).await;
         let rows = fixture

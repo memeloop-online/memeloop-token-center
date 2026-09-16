@@ -3911,7 +3911,7 @@ async fn codex_streaming_natural_failure_then_truncation_emits_one_error_termina
         .await
         .expect("a post-terminal upstream error must still close the body cleanly");
     let rendered = String::from_utf8(body.to_vec()).unwrap();
-    assert_eq!(rendered.matches("event: error").count(), 1);
+    assert_eq!(rendered.matches("event: response.failed").count(), 1);
     assert_eq!(rendered.matches("upstream request failed").count(), 1);
     assert!(!rendered.contains("provider-secret"));
 
@@ -3943,7 +3943,7 @@ async fn codex_streaming_completed_then_truncation_replaces_held_success_with_er
     let rendered = String::from_utf8(body.to_vec()).unwrap();
     assert!(rendered.contains("resp-held"));
     assert!(!rendered.contains("response.completed"));
-    assert_eq!(rendered.matches("event: error").count(), 1);
+    assert_eq!(rendered.matches("event: response.failed").count(), 1);
     assert_eq!(rendered.matches("upstream request failed").count(), 1);
 
     accepted.await.unwrap();
