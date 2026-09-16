@@ -64,6 +64,23 @@ test('quota reads share ownership, bounded batches, partial failures and credit 
     assert.equal(await page.locator('[data-summary]').filter({ hasText: 'Waiting to refresh' }).count(), 0);
 
     await page.goto(url);
+    await page.getByRole('button', { name: 'Refresh all upstream quotas', exact: true }).click();
+    await page.waitForFunction(() => window.quotaReadCalls.length === 1);
+    await page.getByRole('button', { name: 'Disable first', exact: true }).click();
+    await page.evaluate(() => window.releaseQuota(0));
+    await page.waitForFunction(() => window.quotaReadCalls.length === 2);
+    assert.equal(await page.locator('[data-account="account-0"] [data-summary]').innerText(), 'Not checked', 'a disabled in-flight account clears its busy state without publishing the response');
+    await page.evaluate(() => window.releaseQuota(1));
+    await page.waitForFunction(() => window.quotaReadCalls.length === 3);
+    await page.evaluate(() => window.releaseQuota(2));
+    await page.waitForFunction(() => window.quotaReadCalls.length === 4);
+    await page.evaluate(() => window.releaseQuota(3));
+    await page.waitForFunction(() => window.quotaReadCalls.length === 5);
+    await page.evaluate(() => window.releaseQuota(4));
+    await page.getByText('5/5', { exact: true }).waitFor();
+    assert.equal(await page.locator('[data-summary]').filter({ hasText: 'Refreshing quota' }).count(), 0);
+
+    await page.goto(url);
     await page.getByRole('button', { name: 'Duplicate read', exact: true }).click();
     await page.waitForFunction(() => window.quotaReadCalls.length === 1);
     await page.getByRole('button', { name: 'Change generation', exact: true }).click();
