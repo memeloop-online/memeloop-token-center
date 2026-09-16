@@ -403,6 +403,34 @@ impl QuotaCache {
         credential: &UpstreamCredential,
         tenant: &str,
     ) -> QuotaSnapshot {
+        self.read_inner(state, account, credential, tenant, false)
+            .await
+    }
+
+    /// Performs a supplier read even when the account has a recent cached
+    /// snapshot. The per-account flight lock and global permits still bound
+    /// concurrency. This is reserved for accounts already isolated by a hard
+    /// quota-exhaustion decision, where cached evidence cannot reveal an
+    /// external reset.
+    pub(crate) async fn read_fresh(
+        &self,
+        state: &AppState,
+        account: &UpstreamAccountView,
+        credential: &UpstreamCredential,
+        tenant: &str,
+    ) -> QuotaSnapshot {
+        self.read_inner(state, account, credential, tenant, true)
+            .await
+    }
+
+    async fn read_inner(
+        &self,
+        state: &AppState,
+        account: &UpstreamAccountView,
+        credential: &UpstreamCredential,
+        tenant: &str,
+        force_refresh: bool,
+    ) -> QuotaSnapshot {
         let empty = |error| QuotaSnapshot::empty(account, tenant, error);
         if !QuotaCapabilities::for_provider(&account.driver).read {
             return empty(None);
@@ -428,7 +456,8 @@ impl QuotaCache {
         let now = unix_millis();
         let previous = {
             let cached = entry.cached.lock().await;
-            if now < cached.refresh_after
+            if !force_refresh
+                && now < cached.refresh_after
                 && let Some(value) = &cached.value
             {
                 return value.clone();
@@ -442,7 +471,8 @@ impl QuotaCache {
         // A task can finish between our first read and acquiring flight.
         {
             let cached = entry.cached.lock().await;
-            if unix_millis() < cached.refresh_after
+            if !force_refresh
+                && unix_millis() < cached.refresh_after
                 && let Some(value) = &cached.value
             {
                 return value.clone();
@@ -570,7 +600,11 @@ async fn read_codex(
     let observation_started_at = unix_millis();
     let recovery_fence = match state
         .db
-        .upstream_quota_recovery_fence(account.id, account.credential_generation)
+        .upstream_quota_recovery_fence(
+            account.id,
+            account.credential_generation,
+            account.updated_at,
+        )
         .await
     {
         Ok(fence) => fence,
@@ -675,6 +709,7 @@ async fn read_codex(
             .recover_upstream_quota_from_observation(
                 account.id,
                 account.credential_generation,
+                account.updated_at,
                 recovery_fence,
             )
             .await

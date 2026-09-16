@@ -132,6 +132,7 @@ impl Database {
         &self,
         upstream_account_id: Uuid,
         credential_generation: i64,
+        transport_revision: i64,
     ) -> Result<Option<QuotaRecoveryFence>, AppError> {
         let now = unix_millis();
         let row = sqlx::query(
@@ -143,11 +144,13 @@ impl Database {
               WHERE account.id = $1
                 AND account.status = 'active'
                 AND account.credential_generation = $2
+                AND account.updated_at = $3
                 AND health.last_failure_kind = 'quota_exhausted'
-                AND health.probe_lease_until <= $3",
+                AND health.probe_lease_until <= $4",
         )
         .bind(upstream_account_id.to_string())
         .bind(credential_generation)
+        .bind(transport_revision)
         .bind(now)
         .fetch_optional(&self.pool)
         .await?;
@@ -167,6 +170,7 @@ impl Database {
         &self,
         upstream_account_id: Uuid,
         credential_generation: i64,
+        transport_revision: i64,
         fence: QuotaRecoveryFence,
     ) -> Result<bool, AppError> {
         let result = sqlx::query(
@@ -174,18 +178,20 @@ impl Database {
              WHERE upstream_account_id = $1
                AND credential_generation = $2
                AND last_failure_kind = 'quota_exhausted'
-               AND consecutive_failures = $3
-               AND updated_at = $4
-               AND probe_lease_until <= $5
+               AND consecutive_failures = $4
+               AND updated_at = $5
+               AND probe_lease_until <= $6
                AND EXISTS (
                  SELECT 1 FROM upstream_accounts account
                  WHERE account.id = upstream_account_health.upstream_account_id
                    AND account.status = 'active'
                    AND account.credential_generation = $2
+                   AND account.updated_at = $3
                )",
         )
         .bind(upstream_account_id.to_string())
         .bind(credential_generation)
+        .bind(transport_revision)
         .bind(fence.consecutive_failures)
         .bind(fence.updated_at)
         .bind(unix_millis())
