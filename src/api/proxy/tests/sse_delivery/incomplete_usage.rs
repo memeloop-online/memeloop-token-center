@@ -130,10 +130,19 @@ async fn incomplete_error_invalid_usage_and_out_of_budget_usage_remain_unobserve
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(health.get::<i64, _>("consecutive_failures"), 1, "{defect}");
+        let expected_failures = i64::from(defect != "error");
+        assert_eq!(
+            health.get::<i64, _>("consecutive_failures"),
+            expected_failures,
+            "{defect}"
+        );
         assert_eq!(
             health.get::<String, _>("last_failure_kind"),
-            "invalid_response",
+            if defect == "error" {
+                ""
+            } else {
+                "invalid_response"
+            },
             "{defect}"
         );
         pool.close().await;

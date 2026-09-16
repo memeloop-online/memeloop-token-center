@@ -346,7 +346,11 @@ async fn next_sendable_proxy_route(
                 });
             }
             // Retain at most one small route snapshot, never another request body.
-            if outbound_attempts == 0 && transient_wait_eligible && transient_candidate.is_none() {
+            if outbound_attempts == 0
+                && transient_wait_eligible
+                && !shared_probe_eligible
+                && transient_candidate.is_none()
+            {
                 transient_candidate = Some((planned.route.clone(), rank));
             }
             state.metrics.observe_upstream_health(

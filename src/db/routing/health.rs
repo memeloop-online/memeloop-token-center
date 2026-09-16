@@ -386,12 +386,9 @@ impl Database {
             let cooldown_until: i64 = row.try_get("cooldown_until")?;
             let probe_lease_until: i64 = row.try_get("probe_lease_until")?;
             let last_failure_kind: String = row.try_get("last_failure_kind")?;
-            let transient = matches!(
-                last_failure_kind.as_str(),
-                "connection" | "unavailable" | "invalid_response"
-            );
             let wait_eligible = matches!(last_failure_kind.as_str(), "connection" | "unavailable");
-            if cooldown_until > now || probe_lease_until > now || (transient_only && !transient) {
+            if cooldown_until > now || probe_lease_until > now || (transient_only && !wait_eligible)
+            {
                 return Ok(UpstreamAttemptAdmission::Unavailable {
                     cooldown_until,
                     probe_lease_until,
@@ -410,7 +407,7 @@ impl Database {
                    AND credential_generation = $5
                    AND cooldown_until <= $3
                    AND probe_lease_until <= $3
-                   AND ($6 = 0 OR last_failure_kind IN ('connection', 'unavailable', 'invalid_response'))
+                   AND ($6 = 0 OR last_failure_kind IN ('connection', 'unavailable'))
                    AND EXISTS (
                      SELECT 1 FROM upstream_accounts account
                      WHERE account.id = upstream_account_health.upstream_account_id

@@ -119,7 +119,7 @@ impl Database {
         if cooldown > now
             || snapshot.probe_lease_until > now
             || (transient && !allow_transient_probe)
-            || (transient_only && !transient)
+            || (transient_only && !wait_eligible)
         {
             return Ok(unavailable(
                 cooldown,
