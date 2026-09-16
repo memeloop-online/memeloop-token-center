@@ -10,7 +10,8 @@ declare global {
     sessionDetailReads: number;
     sessionListReads: number;
     sessionListAborts: number;
-    resolveSessionList: (ok: boolean) => void;
+    resolveSessionList: (status: boolean | number) => void;
+    resolveSessionDetail: (status: boolean | number) => void;
   }
 }
 
@@ -149,5 +150,114 @@ test('session events refresh only the exact selected credential and session deta
     await page.waitForFunction(() => window.sessionDetailReads === 6);
     assert.equal(await page.evaluate(() => window.sessionDetailReads), 6,
       'a confirmed projection refreshes the old same-credential unlinked detail');
+  } finally { await browser.close(); await server.close(); }
+});
+
+test('a failed SSE list batch is retained and retried on the next session cadence', { timeout: 45_000 }, async () => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
+    return test.skip('Chromium required');
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.clock.install({ time: new Date('2026-01-01T00:00:00Z') });
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-loading.html`);
+    await page.waitForFunction(() => window.sessionListReads === 1);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await page.waitForFunction(() => window.sessionDetailReads === 1);
+    await page.getByRole('checkbox', { name: 'Auto-refresh', exact: true }).check();
+    await page.getByRole('button', { name: 'Simulate session event', exact: true }).click();
+    await page.clock.fastForward(500);
+    await page.waitForFunction(() => window.sessionListReads === 2);
+    // 400 is deliberately non-retryable inside apiRead. The only way read 3
+    // can occur is if SessionMonitor restores this drained SSE batch.
+    await page.evaluate(() => window.resolveSessionList(400));
+    await page.getByRole('alert').waitFor();
+    await page.clock.fastForward(500);
+    await page.waitForFunction(() => window.sessionListReads === 3);
+    await page.evaluate(() => window.resolveSessionList(true));
+  } finally { await browser.close(); await server.close(); }
+});
+
+test('a failed SSE detail batch is retained after the detail lane settles', { timeout: 45_000 }, async () => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
+    return test.skip('Chromium required');
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.clock.install({ time: new Date('2026-01-01T00:00:00Z') });
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-loading.html?controlled-detail=1`);
+    await page.waitForFunction(() => window.sessionListReads === 1);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await page.waitForFunction(() => window.sessionDetailReads === 1);
+    await page.evaluate(() => window.resolveSessionDetail(true));
+    await page.getByRole('checkbox', { name: 'Auto-refresh', exact: true }).check();
+    await page.getByRole('button', { name: 'Simulate session event', exact: true }).click();
+    await page.clock.fastForward(500);
+    await page.waitForFunction(() => window.sessionListReads === 2);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await page.waitForFunction(() => window.sessionDetailReads === 2);
+    // As above, the non-retryable detail failure forces the re-arm to be
+    // owned by SessionMonitor rather than apiRead's retry policy.
+    await page.evaluate(() => window.resolveSessionDetail(400));
+    await page.getByRole('alert').waitFor();
+    await page.clock.fastForward(500);
+    await page.waitForFunction(() => window.sessionListReads === 3);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await page.waitForFunction(() => window.sessionDetailReads === 3);
+    await page.evaluate(() => window.resolveSessionDetail(true));
+  } finally { await browser.close(); await server.close(); }
+});
+
+test('cancellation retains current-scope SSE work, while a scope transition drops stale work', { timeout: 45_000 }, async () => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
+    return test.skip('Chromium required');
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.clock.install({ time: new Date('2026-01-01T00:00:00Z') });
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-loading.html`);
+    await page.waitForFunction(() => window.sessionListReads === 1);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await page.waitForFunction(() => window.sessionDetailReads === 1);
+    await page.getByRole('checkbox', { name: 'Auto-refresh', exact: true }).check();
+    await page.getByRole('button', { name: 'Simulate session event', exact: true }).click();
+    await page.clock.fastForward(500);
+    await page.waitForFunction(() => window.sessionListReads === 2);
+    await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await page.waitForFunction(() => window.sessionListAborts === 1);
+    // The event was observed before cancel, so it is retried in this scope.
+    await page.clock.fastForward(500);
+    await page.waitForFunction(() => window.sessionListReads === 3);
+    await page.evaluate(() => window.resolveSessionList(true));
+
+    await page.getByRole('button', { name: 'Queue stale session event', exact: true }).click();
+    await page.locator('.session-controls').getByLabel('Model', { exact: true }).fill('new-projection');
+    await page.getByRole('button', { name: 'Apply filters', exact: true }).click();
+    await page.waitForFunction(() => window.sessionListReads === 4);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await page.clock.fastForward(1_000);
+    assert.equal(await page.evaluate(() => window.sessionListReads), 4,
+      'the queued old-projection event cannot run after the new scope snapshot');
   } finally { await browser.close(); await server.close(); }
 });

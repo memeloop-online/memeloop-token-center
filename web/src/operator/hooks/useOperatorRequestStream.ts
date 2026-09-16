@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { RequestEvent } from '../../types';
-import { enqueueSessionEventIdentity } from '../sessionRefresh';
-import { useRequestEventStream } from './useRequestEventStream';
+import type { RequestEvent } from '../../types.js';
+import { enqueueSessionEventIdentity } from '../sessionRefresh.js';
+import { useRequestEventStream } from './useRequestEventStream.js';
 import { coalesceRequestEvent, RequestRefreshBatch } from '../traffic/requestRefresh.js';
 
 export class SessionEventChannel {

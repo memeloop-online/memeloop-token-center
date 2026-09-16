@@ -36,7 +36,8 @@ test('initial list work and SSE refreshes do not overlap and amplify slow databa
   assert.match(list, /listInFlight\.current = true/);
   assert.match(list, /listInFlight\.current = false/);
   assert.match(list, /if \(!background && refreshDirty\.current\) scheduleRefresh\(\)/);
-  assert.match(source, /const listLoaded = await loadSessions\(false, filtersRef\.current, true\);\s*if \(!listLoaded \|\| generation !== scopeGeneration\.current \|\| !autoRefreshRef\.current\) return/);
+  assert.match(source, /const listLoaded = await loadSessions\(false, filtersRef\.current, true\);\s*if \(generation !== scopeGeneration\.current \|\| !autoRefreshRef\.current\) return;\s*if \(!listLoaded\) \{ restoreBatch\(\); return; \}/,
+    'a failed drained list batch is restored before the next session cadence');
 });
 
 test('live refresh is explicitly opt-in, while session invalidation stays below the traffic render cadence', async () => {
