@@ -1,5 +1,7 @@
 # Upstream accounts
 
+![Upstream accounts with routes, availability, and quota refresh controls. Identity details are replaced; the interface is shown in Chinese.](/images/providers.png)
+
 An upstream account is the connection unit between MTC and an AI provider. It has a stable `account_id`, a provider driver `driver`, connection configuration `config`, and a current encrypted credential generation.
 
 ## Account model

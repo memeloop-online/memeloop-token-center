@@ -1,5 +1,7 @@
 # 上游账户
 
+![上游服务列表中的账号、路由、可用性与额度刷新入口；身份信息已替换。](/images/providers.png)
+
 上游账户（upstream account）是 MTC 与 AI 供应商之间的连接单元。它有稳定的 `account_id`、供应商驱动 `driver`、连接配置 `config` 和一份当前加密的凭证代。
 
 ## 账户模型

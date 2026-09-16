@@ -1,5 +1,7 @@
 # Requests and usage
 
+![Live request list showing models, client credentials, usage, costs, and response performance. Identity details are replaced; the interface is shown in Chinese.](/images/requests.png)
+
 MTC preserves stable tenant, credential, route, account, and price-snapshot ownership for every request. This page explains how to query history, attach session metadata to requests, and understand usage and cost semantics.
 
 ## Query interfaces
