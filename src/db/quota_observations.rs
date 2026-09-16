@@ -13,9 +13,6 @@ impl Database {
         now: i64,
         limit: i64,
     ) -> Result<Vec<QuotaObservationTarget>, AppError> {
-        if plugins.is_empty() {
-            return Ok(Vec::new());
-        }
         let plugin_id = match self.backend {
             DatabaseBackend::PostgreSql => "CAST(g.routing_strategy AS jsonb)->>'plugin_id'",
             DatabaseBackend::Sqlite => "json_extract(g.routing_strategy,'$.plugin_id')",
@@ -24,8 +21,11 @@ impl Database {
             DatabaseBackend::PostgreSql => "SELECT jsonb_array_elements_text(CAST($1 AS jsonb))",
             DatabaseBackend::Sqlite => "SELECT value FROM json_each($1)",
         };
-        // Membership is drawn only from existing enabled route candidates and
-        // their attached opt-in provider/route strategy groups, never all accounts.
+        // Normal quota observations are drawn only from enabled route candidates
+        // attached to opt-in strategy groups. Exhausted Codex accounts are also
+        // observed independently so an external quota reset can restore routing
+        // without an operator opening the account page. Both paths share the same
+        // persisted lease and refresh cadence below.
         let statement = format!("WITH bound AS (
             SELECT e.upstream_account_id AS id, e.tenant_id FROM model_route_eligible_upstream_accounts e
             JOIN model_routes r ON r.id=e.model_route_id AND r.tenant_id=e.tenant_id AND r.enabled=1 AND r.archived_at IS NULL
@@ -39,14 +39,29 @@ impl Database {
             JOIN model_route_group_memberships m ON m.model_route_id=r.id AND m.tenant_id=r.tenant_id
             JOIN route_groups g ON g.id=m.route_group_id AND g.tenant_id=r.tenant_id
             WHERE {plugin_id} IN ({plugin_list})
-        ) SELECT a.id,a.tenant_id,t.external_id,a.credential_generation,a.updated_at
-            FROM bound b JOIN upstream_accounts a ON a.id=b.id AND a.tenant_id=b.tenant_id
+        ), targets AS (
+            SELECT id,tenant_id,1 AS recovery_priority FROM bound
+            UNION ALL
+            SELECT h.upstream_account_id AS id,a.tenant_id,0 AS recovery_priority
+            FROM upstream_account_health h
+            JOIN upstream_accounts a ON a.id=h.upstream_account_id
+                AND a.credential_generation=h.credential_generation
+            WHERE a.status='active' AND a.driver='openai-codex'
+                AND h.last_failure_kind='quota_exhausted' AND h.probe_lease_until<=$2
+        ), prioritized AS (
+            SELECT id,tenant_id,MIN(recovery_priority) AS recovery_priority
+            FROM targets GROUP BY id,tenant_id
+        ) SELECT a.id,a.tenant_id,t.external_id,a.credential_generation,a.updated_at,
+                CASE WHEN p.recovery_priority=0 THEN 1 ELSE 0 END AS recovering_quota,
+                COALESCE(q.last_attempt_at,0) AS previous_attempt_at,
+                COALESCE(q.next_refresh_at,0) AS previous_next_refresh_at
+            FROM prioritized p JOIN upstream_accounts a ON a.id=p.id AND a.tenant_id=p.tenant_id
             JOIN tenants t ON t.id=a.tenant_id AND t.status='active'
             LEFT JOIN upstream_quota_observations q ON q.upstream_account_id=a.id
             WHERE a.status='active' AND a.driver IN ('openai-codex','kimi-oauth','google-antigravity')
                 AND COALESCE(q.lease_until,0)<=$2
                 AND (q.upstream_account_id IS NULL OR q.next_refresh_at<=$2 OR q.config_revision<>a.updated_at OR q.credential_generation<>a.credential_generation)
-            ORDER BY COALESCE(q.last_attempt_at,0),a.id LIMIT $3");
+            ORDER BY p.recovery_priority,COALESCE(q.last_attempt_at,0),a.id LIMIT $3");
         sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(serde_json::to_string(plugins).map_err(|_| AppError::Internal)?)
             .bind(now)
@@ -63,6 +78,9 @@ impl Database {
                     tenant_external_id: row.try_get("external_id")?,
                     generation: row.try_get("credential_generation")?,
                     config_revision: row.try_get("updated_at")?,
+                    recovering_quota: row.try_get::<i64, _>("recovering_quota")? == 1,
+                    previous_attempt_at: row.try_get("previous_attempt_at")?,
+                    previous_next_refresh_at: row.try_get("previous_next_refresh_at")?,
                 })
             })
             .collect()
