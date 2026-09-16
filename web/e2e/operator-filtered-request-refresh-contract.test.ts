@@ -46,14 +46,14 @@ test('the Requests page coalesces filtered events into one abortable scope-check
   const source = await readFile(new URL('../src/operator/pages/RequestsPage.tsx', import.meta.url), 'utf8');
 
   assert.match(source, /if \(typedFiltersActive\(filters\)\) \{[^]*?scheduleFilteredRefresh\(\);\s*return;/);
-  assert.match(source, /state\.pending = true;\s*if \(state\.inFlight \|\| loadingRef\.current\) return;/s);
+  assert.match(source, /state\.pending = true;\s*if \(state\.inFlight \|\| loadingRef\.current \|\| paused\.current\) return;/s);
   assert.match(source, /state\.timer !== undefined\) window\.clearTimeout\(state\.timer\)/);
   assert.match(source, /state\.controller\?\.abort\(\)/);
   assert.match(source, /loadAbort\.current\?\.abort\(\)/);
   assert.match(source, /signal: controller\.signal/);
   assert.match(source, /state\.scopeSequence \+= 1;/);
   assert.match(source, /controller\.signal\.aborted \|\| state\.requestSequence !== requestSequence \|\| state\.scopeSequence !== scopeSequence/);
-  assert.match(source, /setRequests\(\(current\) => mergeRefreshedRequestPage\(current, next, olderFilteredResultsVisible\.current\)\)/);
+  assert.match(source, /setRequests\(\(current\) => typedFiltersActive\(currentScope\.filters\)\s*\? mergeRefreshedRequestPage\(current, next, olderFilteredResultsVisible\.current\)/);
   assert.match(source, /const terminalizedVisiblePending = olderFilteredResultsVisible\.current/);
   assert.match(source, /event\.event_kind === 'finished'/);
   assert.match(source, /setOlderFilteredResultsStale\(true\)/);
