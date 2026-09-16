@@ -147,6 +147,7 @@ pub(crate) struct UpstreamAttemptGuard {
     route_id: Uuid,
     upstream_account_id: Uuid,
     credential_generation: i64,
+    failure_epoch: Option<Uuid>,
     lease_token: Option<Uuid>,
     owns_probe_lease: bool,
     heartbeat_stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -161,6 +162,7 @@ struct UpstreamAttemptRecord {
     route_id: Uuid,
     upstream_account_id: Uuid,
     credential_generation: i64,
+    failure_epoch: Option<Uuid>,
     lease_token: Option<Uuid>,
     owns_probe_lease: bool,
     recovered_on_delivery: bool,
@@ -177,13 +179,13 @@ impl UpstreamAttemptGuard {
         admission: UpstreamAttemptAdmission,
         shared_probe_permit: Option<SharedProbePermit>,
     ) -> Self {
-        let lease_token = match admission {
+        let (lease_token, failure_epoch) = match admission {
             UpstreamAttemptAdmission::Probe { lease_token }
-            | UpstreamAttemptAdmission::SharedProbe { lease_token } => Some(lease_token),
-            UpstreamAttemptAdmission::Healthy => None,
+            | UpstreamAttemptAdmission::SharedProbe { lease_token } => (Some(lease_token), None),
+            UpstreamAttemptAdmission::Healthy { failure_epoch } => (None, Some(failure_epoch)),
             UpstreamAttemptAdmission::Unavailable { .. } => {
                 debug_assert!(false, "unavailable upstream attempt cannot own a guard");
-                None
+                (None, None)
             }
         };
         let owns_probe_lease = matches!(admission, UpstreamAttemptAdmission::Probe { .. });
@@ -232,6 +234,7 @@ impl UpstreamAttemptGuard {
             route_id,
             upstream_account_id,
             credential_generation,
+            failure_epoch,
             lease_token,
             owns_probe_lease,
             heartbeat_stop,
@@ -249,11 +252,13 @@ impl UpstreamAttemptGuard {
             return;
         }
         self.delivery_recovery_attempted = true;
-        let (Some(state), Some(token)) = (self.state.as_ref(), self.lease_token) else {
+        let Some(state) = self.state.as_ref() else {
             return;
         };
         let recovery = async {
-            if self.owns_probe_lease {
+            if let Some(token) = self.lease_token
+                && self.owns_probe_lease
+            {
                 state
                     .db
                     .record_upstream_account_probe_delivery(
@@ -262,11 +267,11 @@ impl UpstreamAttemptGuard {
                         token,
                     )
                     .await
-            } else {
+            } else if let Some(token) = self.lease_token {
                 // A shared recovery request is independent evidence, not the
-                // owner of the long-running probe epoch. Delete the health
-                // row on its first validated delivery so a later owner failure
-                // cannot overwrite this separate request's proven success.
+                // owner of the long-running probe epoch. Rotate the lease into
+                // a healthy admission epoch on its first validated delivery so
+                // a later owner failure cannot overwrite this proven success.
                 state
                     .db
                     .record_upstream_account_probe_success(
@@ -275,10 +280,22 @@ impl UpstreamAttemptGuard {
                         token,
                     )
                     .await
+            } else {
+                let Some(failure_epoch) = self.failure_epoch else {
+                    return Ok(false);
+                };
+                state
+                    .db
+                    .record_upstream_account_success(
+                        self.upstream_account_id,
+                        self.credential_generation,
+                        failure_epoch,
+                    )
+                    .await
             }
         };
         match tokio::time::timeout(std::time::Duration::from_millis(250), recovery).await {
-            Ok(Ok(true)) => {
+            Ok(Ok(true)) if self.lease_token.is_some() => {
                 self.recovered_on_delivery = true;
                 state.metrics.observe_upstream_health(
                     UpstreamHealthEvent::Recovered,
@@ -286,6 +303,7 @@ impl UpstreamAttemptGuard {
                 );
                 self.stop_heartbeat();
             }
+            Ok(Ok(true)) => {}
             Ok(Ok(false)) => {}
             _ => tracing::warn!(
                 request_id = %self.request_id,
@@ -310,6 +328,7 @@ impl UpstreamAttemptGuard {
                 route_id: self.route_id,
                 upstream_account_id: self.upstream_account_id,
                 credential_generation: self.credential_generation,
+                failure_epoch: self.failure_epoch,
                 lease_token: self.lease_token,
                 owns_probe_lease: self.owns_probe_lease,
                 recovered_on_delivery: self.recovered_on_delivery,
@@ -372,6 +391,7 @@ impl Drop for UpstreamAttemptGuard {
         let route_id = self.route_id;
         let upstream_account_id = self.upstream_account_id;
         let credential_generation = self.credential_generation;
+        let failure_epoch = self.failure_epoch;
         let lease_token = self.lease_token;
         let owns_probe_lease = self.owns_probe_lease;
         let recovered_on_delivery = self.recovered_on_delivery;
@@ -387,6 +407,7 @@ impl Drop for UpstreamAttemptGuard {
                     route_id,
                     upstream_account_id,
                     credential_generation,
+                    failure_epoch,
                     lease_token,
                     owns_probe_lease,
                     recovered_on_delivery,
@@ -405,6 +426,7 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
         route_id,
         upstream_account_id,
         credential_generation,
+        failure_epoch,
         lease_token,
         owns_probe_lease,
         recovered_on_delivery,
@@ -453,22 +475,40 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
     }
     match terminal {
         UpstreamAttemptTerminal::Succeeded => {
-            let Some(lease_token) = lease_token else {
-                return;
+            let recovery = async {
+                match lease_token {
+                    Some(lease_token) => {
+                        state
+                            .db
+                            .record_upstream_account_probe_success(
+                                upstream_account_id,
+                                credential_generation,
+                                lease_token,
+                            )
+                            .await
+                    }
+                    _ => {
+                        let Some(failure_epoch) = failure_epoch else {
+                            return Ok(false);
+                        };
+                        state
+                            .db
+                            .record_upstream_account_success(
+                                upstream_account_id,
+                                credential_generation,
+                                failure_epoch,
+                            )
+                            .await
+                    }
+                }
             };
-            match state
-                .db
-                .record_upstream_account_probe_success(
-                    upstream_account_id,
-                    credential_generation,
-                    lease_token,
-                )
-                .await
-            {
-                Ok(true) if !recovered_on_delivery => state.metrics.observe_upstream_health(
-                    UpstreamHealthEvent::Recovered,
-                    UpstreamHealthReason::Success,
-                ),
+            match recovery.await {
+                Ok(true) if lease_token.is_some() && !recovered_on_delivery => {
+                    state.metrics.observe_upstream_health(
+                        UpstreamHealthEvent::Recovered,
+                        UpstreamHealthReason::Success,
+                    )
+                }
                 Ok(_) => {}
                 Err(error) => tracing::warn!(
                     %request_id,
@@ -526,17 +566,38 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                         )
                         .await
                 }
-                None => {
-                    state
-                        .db
-                        .record_upstream_account_failure_with_health_config(
-                            upstream_account_id,
-                            credential_generation,
+                None => match failure_epoch {
+                    Some(failure_epoch)
+                        if matches!(
                             kind,
-                            health,
-                        )
-                        .await
-                }
+                            UpstreamFailureKind::Connection
+                                | UpstreamFailureKind::Unavailable
+                                | UpstreamFailureKind::InvalidResponse
+                        ) =>
+                    {
+                        state
+                            .db
+                            .record_admitted_upstream_account_failure(
+                                upstream_account_id,
+                                credential_generation,
+                                kind,
+                                health,
+                                failure_epoch,
+                            )
+                            .await
+                    }
+                    _ => {
+                        state
+                            .db
+                            .record_upstream_account_failure_with_health_config(
+                                upstream_account_id,
+                                credential_generation,
+                                kind,
+                                health,
+                            )
+                            .await
+                    }
+                },
             };
             match persisted {
                 Ok(true) => state

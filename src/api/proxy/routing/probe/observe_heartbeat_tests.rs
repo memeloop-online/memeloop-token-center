@@ -127,15 +127,15 @@ async fn terminal_observe_keeps_half_open_lease_alive_until_fenced_settlement() 
         matches!(competing, UpstreamAttemptAdmission::Unavailable { .. }),
         "a slow terminal hook must not surrender the live probe lease"
     );
-    assert_eq!(
+    assert!(
         peer.claim_upstream_account_attempt_with_health_config(
             account,
             1,
             state.config.upstream_health
         )
         .await
-        .unwrap(),
-        UpstreamAttemptAdmission::Healthy
+        .unwrap()
+        .is_healthy()
     );
     pool.close().await;
 }

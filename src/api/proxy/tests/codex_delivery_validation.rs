@@ -49,7 +49,8 @@ async fn codex_2xx_non_sse_is_ambiguous_and_never_crosses_accounts() {
     .unwrap();
     assert_eq!(actual, fixture.upstream_account_id.to_string());
     let health_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+        "SELECT COUNT(*) FROM upstream_account_health
+         WHERE upstream_account_id = $1 AND consecutive_failures > 0",
     )
     .bind(fixture.upstream_account_id.to_string())
     .fetch_one(&pool)

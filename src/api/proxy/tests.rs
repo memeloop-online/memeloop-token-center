@@ -1651,7 +1651,8 @@ async fn codex_retryable_then_ordinary_400_returns_fixed_400_without_cooldown_or
     assert_response_archives_omit(&fixture, "private ordinary rejection").await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let health_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+        "SELECT COUNT(*) FROM upstream_account_health
+         WHERE upstream_account_id = $1 AND consecutive_failures > 0",
     )
     .bind(fixture.upstream_account_id.to_string())
     .fetch_one(&pool)
@@ -1797,7 +1798,8 @@ async fn codex_ordinary_json_400_is_returned_once_without_failover_or_cooldown()
         }
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
         let health_rows: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+            "SELECT COUNT(*) FROM upstream_account_health
+             WHERE upstream_account_id = $1 AND consecutive_failures > 0",
         )
         .bind(fixture.upstream_account_id.to_string())
         .fetch_one(&pool)
@@ -1876,7 +1878,8 @@ async fn codex_unclassifiable_400_bodies_fail_closed_without_leaking() {
         );
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
         let health_rows: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+            "SELECT COUNT(*) FROM upstream_account_health
+             WHERE upstream_account_id = $1 AND consecutive_failures > 0",
         )
         .bind(fixture.upstream_account_id.to_string())
         .fetch_one(&pool)
@@ -4284,7 +4287,8 @@ async fn codex_retry_streaming_failure_is_redacted_and_records_failed_terminal()
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let health_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+        "SELECT COUNT(*) FROM upstream_account_health
+         WHERE upstream_account_id = $1 AND consecutive_failures > 0",
     )
     .bind(fixture.upstream_account_id.to_string())
     .fetch_one(&pool)

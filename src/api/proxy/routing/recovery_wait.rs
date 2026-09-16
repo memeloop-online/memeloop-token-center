@@ -10,9 +10,11 @@ use tokio::{
     time::Instant,
 };
 
-// The request retains its existing byte reservation while waiting. This adds
-// a separate, fail-fast count bound; it never allocates or copies body bytes.
-static WAITERS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(4)));
+// The request retains its existing byte reservation while waiting. Bound the
+// total retained cohort separately from the smaller fair DB polling cohort.
+// A poll permit covers one check only and is released before the recheck sleep.
+static WAITERS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(64)));
+static POLLERS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(4)));
 const RECHECK: Duration = Duration::from_millis(250);
 
 #[cfg(test)]
@@ -74,6 +76,7 @@ where
     bounded_wait_with_recheck(
         deadline,
         RECHECK,
+        Arc::new(Semaphore::new(64)),
         permits,
         metrics,
         crate::api::proxy_diagnostics::Context::current().request_id,
@@ -85,7 +88,8 @@ where
 async fn bounded_wait_with_recheck<T, F, Fut>(
     deadline: Instant,
     recheck: Duration,
-    permits: Arc<Semaphore>,
+    waiters: Arc<Semaphore>,
+    pollers: Arc<Semaphore>,
     metrics: Option<&crate::metrics::Metrics>,
     request_id: Uuid,
     mut check: F,
@@ -102,7 +106,7 @@ where
         sleep_ms: 0,
         outcome: "not_completed",
     };
-    let Ok(permit) = permits.try_acquire_owned() else {
+    let Ok(_waiter) = waiters.try_acquire_owned() else {
         observation.outcome = "capacity_rejected";
         if let Some(metrics) = metrics {
             metrics.observe_upstream_health(
@@ -112,7 +116,6 @@ where
         }
         return Ok(None);
     };
-    let permit = Arc::new(permit);
     loop {
         if Instant::now() >= deadline {
             observation.outcome = "deadline";
@@ -120,9 +123,21 @@ where
         }
         // DB queries/transactions finish before the timer; no DB transaction
         // spans a sleep. Cancellation drops a Ready value's attempt guard.
+        let permit = match tokio::time::timeout_at(deadline, pollers.clone().acquire_owned()).await
+        {
+            Ok(Ok(permit)) => Arc::new(permit),
+            Ok(Err(_)) => {
+                observation.outcome = "capacity_closed";
+                return Ok(None);
+            }
+            Err(_) => {
+                observation.outcome = "deadline";
+                return Ok(None);
+            }
+        };
         observation.checks += 1;
         let started = Instant::now();
-        let checked = tokio::time::timeout_at(deadline, check(permit.clone())).await;
+        let checked = tokio::time::timeout_at(deadline, check(permit)).await;
         observation.check_ms += started.elapsed().as_millis() as u64;
         let checked = match checked {
             Ok(Ok(checked)) => checked,
@@ -182,6 +197,7 @@ pub(crate) async fn wait(
         deadline,
         recheck,
         WAITERS.clone(),
+        POLLERS.clone(),
         Some(&state.metrics),
         request_id,
         |permit| {
@@ -238,7 +254,8 @@ pub(crate) async fn wait(
                         Ok(Check::Retry)
                     }
                     UpstreamAttemptAdmission::Unavailable { .. } => Ok(Check::Stop),
-                    UpstreamAttemptAdmission::Healthy | UpstreamAttemptAdmission::Probe { .. } => {
+                    UpstreamAttemptAdmission::Healthy { .. }
+                    | UpstreamAttemptAdmission::Probe { .. } => {
                         let guard = UpstreamAttemptGuard::new(
                             &state,
                             request_id,
@@ -292,6 +309,7 @@ mod tests {
         let result = bounded_wait_with_recheck(
             Instant::now() + Duration::from_secs(5),
             RECHECK,
+            Arc::new(Semaphore::new(1)),
             Arc::new(Semaphore::new(1)),
             None,
             request_id,
@@ -382,8 +400,9 @@ mod tests {
         assert!(denied.is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         drop(held);
+        let retry_deadline = Instant::now() + Duration::from_secs(1);
         assert!(
-            bounded_wait::<(), _, _>(deadline, permits.clone(), None, |_| async {
+            bounded_wait::<(), _, _>(retry_deadline, permits.clone(), None, |_| async {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Ok(Check::Retry)
             })
@@ -391,9 +410,65 @@ mod tests {
             .unwrap()
             .is_none()
         );
-        assert_eq!(Instant::now(), deadline);
+        assert_eq!(Instant::now(), retry_deadline);
         assert_eq!(calls.load(Ordering::SeqCst), 4);
         assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn polling_capacity_queues_unsent_request_until_health_can_be_rechecked() {
+        let permits = Arc::new(Semaphore::new(1));
+        let held = permits.clone().acquire_owned().await.unwrap();
+        let semaphore = permits.clone();
+        let queued = tokio::spawn(async move {
+            bounded_wait::<u8, _, _>(
+                Instant::now() + Duration::from_secs(5),
+                semaphore,
+                None,
+                |_| async { Ok(Check::Ready(9)) },
+            )
+            .await
+            .unwrap()
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !queued.is_finished(),
+            "capacity queues instead of rejecting"
+        );
+        drop(held);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), queued)
+                .await
+                .unwrap()
+                .unwrap(),
+            Some(9)
+        );
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn retained_waiter_capacity_remains_bounded_before_any_poll_or_dispatch() {
+        let waiters = Arc::new(Semaphore::new(1));
+        let held = waiters.clone().acquire_owned().await.unwrap();
+        let calls = AtomicUsize::new(0);
+        let result = bounded_wait_with_recheck::<(), _, _>(
+            Instant::now() + Duration::from_secs(5),
+            RECHECK,
+            waiters.clone(),
+            Arc::new(Semaphore::new(1)),
+            None,
+            Uuid::now_v7(),
+            |_| async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Check::Ready(()))
+            },
+        )
+        .await
+        .unwrap();
+        assert!(result.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        drop(held);
+        assert_eq!(waiters.available_permits(), 1);
     }
 
     #[tokio::test]

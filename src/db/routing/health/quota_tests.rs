@@ -156,12 +156,12 @@ async fn invariants(database: &Database, peer: &Database) {
             .unwrap(),
         "fresh supplier evidence clears the matching exhausted generation"
     );
-    assert_eq!(
+    assert!(
         database
             .claim_upstream_account_attempt(account, 1)
             .await
-            .unwrap(),
-        UpstreamAttemptAdmission::Healthy
+            .unwrap()
+            .is_healthy()
     );
     database
         .record_upstream_account_failure(
@@ -259,12 +259,12 @@ async fn invariants(database: &Database, peer: &Database) {
             .await
             .unwrap()
     );
-    assert_eq!(
+    assert!(
         database
             .claim_upstream_account_attempt(account, 2)
             .await
-            .unwrap(),
-        UpstreamAttemptAdmission::Healthy
+            .unwrap()
+            .is_healthy()
     );
 }
 
