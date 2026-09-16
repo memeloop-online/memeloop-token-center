@@ -114,7 +114,8 @@ test('Overview keeps current sections visible through independent endpoint failu
     assert.equal(await page.locator('.overview-trends details, .overview-trends summary').count(), 0);
     await firstChart.getByRole('tab', { name: 'Data', exact: true }).click();
     await trendData.locator('tbody tr').nth(2).waitFor();
-    assert.match(await trendData.locator('thead').textContent() ?? '', /UTC/);
+    const localTimeZone = await page.evaluate(() => Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC');
+    assert.ok((await trendData.locator('thead').textContent() ?? '').includes(localTimeZone));
     assert.equal(await trendData.getByRole('columnheader', { name: 'Total cost', exact: true }).count(), 1);
     assert.equal(await trendData.locator('tbody tr').count(), 3, 'the data view exposes the exact returned points, not derived rows');
     assert.deepEqual(await endpointCounts(page, 'tenant-beta'), { '/internal/v1/monitoring-snapshot': 1, '/internal/v1/requests': 1, '/internal/v1/usage-analysis/trends': 1 }, 'view switching does not re-fetch data');
