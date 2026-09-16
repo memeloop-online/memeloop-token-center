@@ -109,6 +109,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
   const refreshTimer = useRef<number | undefined>(undefined);
   const refreshDirty = useRef(false);
   const refreshInFlight = useRef(false);
+  const refreshCancelled = useRef(false);
   const dirtyEventIdentities = useRef(new Set<string>());
   const dirtyDetailEvents = useRef(new Set<string>());
   const detailRefreshDirty = useRef(false);
@@ -342,7 +343,8 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       void refresh().finally(() => {
         if (generation !== scopeGeneration.current) return;
         refreshInFlight.current = false;
-        if (!detailInFlight.current && (refreshDirty.current || dirtyEventIdentities.current.size > 0)) scheduleRefresh();
+        if (!refreshCancelled.current && !detailInFlight.current
+          && (refreshDirty.current || dirtyEventIdentities.current.size > 0)) scheduleRefresh();
       });
     }, sessionEventRefreshDelayMs);
   }
@@ -367,6 +369,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     refreshTimer.current = undefined;
     refreshDirty.current = false;
     refreshInFlight.current = false;
+    refreshCancelled.current = false;
     dirtyEventIdentities.current.clear();
     dirtyDetailEvents.current.clear();
     detailRefreshDirty.current = false;
@@ -392,6 +395,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       refreshTimer.current = undefined;
       refreshDirty.current = false;
       refreshInFlight.current = false;
+      refreshCancelled.current = false;
       dirtyEventIdentities.current.clear();
       dirtyDetailEvents.current.clear();
       detailRefreshDirty.current = false;
@@ -404,6 +408,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
 
   useEffect(() => {
     if (!token.trim() || revision === 0) return;
+    refreshCancelled.current = false;
     const eventIdentities = drainSessionEventIdentities(eventKeyIds.current);
     if (!autoRefreshRef.current) return;
     for (const identity of eventIdentities) dirtyEventIdentities.current.add(identity);
@@ -418,7 +423,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
   function toggleAutoRefresh(enabled: boolean) {
     autoRefreshRef.current = enabled;
     setAutoRefresh(enabled);
-    if (enabled) { refreshDirty.current = true; scheduleRefresh(); }
+    if (enabled) { refreshCancelled.current = false; refreshDirty.current = true; scheduleRefresh(); }
     else {
       if (refreshTimer.current !== undefined) window.clearTimeout(refreshTimer.current);
       refreshTimer.current = undefined;
@@ -440,6 +445,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     // only the scheduling latch so refresh().finally cannot immediately
     // replace a user-cancelled request with another one.
     refreshDirty.current = false;
+    refreshCancelled.current = true;
     setLoading(false);
     setRefreshing(false);
   }
