@@ -1503,7 +1503,7 @@ fn request_event_views(rows: Vec<AnyRow>) -> Result<Vec<RequestEventView>, AppEr
 fn request_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, AppError> {
     let request_object: String = row.try_get("request_object")?;
     let response_object: Option<String> = row.try_get("response_object")?;
-    let view = request_view_from_row(&row)?;
+    let mut view = request_view_from_row(&row)?;
     let completed_at: Option<i64> = row.try_get("completed_at")?;
     let projection = |prefix: &str, locator: Option<&str>| -> Result<_, AppError> {
         let spool_state: Option<String> = row.try_get(format!("{prefix}_spool_state").as_str())?;
@@ -1526,6 +1526,7 @@ fn request_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, AppE
         projection("request", Some(&request_object))?;
     let (response_archive_state, response_archive_reason) =
         projection("response", response_object.as_deref())?;
+    view.archive_state = combined_archive_state(request_archive_state, response_archive_state);
     Ok(RequestArchiveRefs {
         view,
         request_object,
@@ -1633,7 +1634,10 @@ fn session_archive_unlinked_refs_from_row(row: AnyRow) -> Result<RequestArchiveR
 }
 
 fn locator_archive_projection(location: Option<&str>) -> (RequestArchiveState, Option<String>) {
-    if location.is_some_and(|location| location.starts_with("metadata-only-json:")) {
+    if location.is_some_and(|location| {
+        location.starts_with("metadata-only-json:")
+            || location.starts_with("provider-reference-json:")
+    }) {
         (
             RequestArchiveState::MetadataOnly,
             Some("media_body_not_archived_by_policy".to_owned()),
@@ -1653,6 +1657,21 @@ fn generation_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, A
     let completed_at: Option<i64> = row.try_get("completed_at")?;
     let status: String = row.try_get("status")?;
     let result_json: Option<String> = row.try_get("result_json")?;
+    let (response_json, provider_metadata_only) = result_json
+        .as_deref()
+        .map(|value| {
+            let mut value =
+                serde_json::from_str::<serde_json::Value>(value).map_err(|_| AppError::Internal)?;
+            let provider_metadata_only = value
+                .as_object_mut()
+                .and_then(|value| value.remove("provider_assets"))
+                .is_some();
+            Ok((value, provider_metadata_only))
+        })
+        .transpose()?
+        .map_or((None, false), |(value, metadata_only)| {
+            (Some(value), metadata_only)
+        });
     let (lifecycle_state, status_code) = request_lifecycle_projection(Some(&status), None)?;
     let billed_units: Option<i64> = row.try_get("facts_billed_units")?;
     let billing_unit: Option<String> = row.try_get("facts_billing_unit")?;
@@ -1665,25 +1684,18 @@ fn generation_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, A
     let (response_archive_state, response_archive_reason) = match status.as_str() {
         "preparing" | "queued" => (RequestArchiveState::Pending, None),
         "submitting" | "running" | "cancelling" => (RequestArchiveState::Uploading, None),
-        "succeeded" if result_json.is_none() => (
+        "succeeded" if response_json.is_none() => (
             RequestArchiveState::Gap,
             Some("archive_object_unavailable".to_owned()),
+        ),
+        "succeeded" if provider_metadata_only => (
+            RequestArchiveState::MetadataOnly,
+            Some("media_body_not_archived_by_policy".to_owned()),
         ),
         "succeeded" | "failed" | "cancelled" => (RequestArchiveState::Bound, None),
         _ => return Err(AppError::Internal),
     };
-    let archive_state = if request_archive_state == RequestArchiveState::Gap
-        || response_archive_state == RequestArchiveState::Gap
-    {
-        RequestArchiveState::Gap
-    } else if matches!(
-        response_archive_state,
-        RequestArchiveState::Pending | RequestArchiveState::Uploading
-    ) {
-        response_archive_state
-    } else {
-        RequestArchiveState::Bound
-    };
+    let archive_state = combined_archive_state(request_archive_state, response_archive_state);
     Ok(RequestArchiveRefs {
         view: RequestView {
             usage_basis: None,
@@ -1732,15 +1744,38 @@ fn generation_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, A
         },
         request_object,
         response_object: None,
-        response_json: result_json
-            .map(|value| serde_json::from_str(&value).map_err(|_| AppError::Internal))
-            .transpose()?,
+        response_json,
         provenance: None,
         request_archive_state,
         request_archive_reason,
         response_archive_state,
         response_archive_reason,
     })
+}
+
+fn combined_archive_state(
+    request: RequestArchiveState,
+    response: RequestArchiveState,
+) -> RequestArchiveState {
+    if request == RequestArchiveState::Gap || response == RequestArchiveState::Gap {
+        RequestArchiveState::Gap
+    } else if request == RequestArchiveState::Uploading
+        || response == RequestArchiveState::Uploading
+    {
+        RequestArchiveState::Uploading
+    } else if request == RequestArchiveState::Pending || response == RequestArchiveState::Pending {
+        RequestArchiveState::Pending
+    } else if request == RequestArchiveState::Capturing
+        || response == RequestArchiveState::Capturing
+    {
+        RequestArchiveState::Capturing
+    } else if request == RequestArchiveState::MetadataOnly
+        && response == RequestArchiveState::MetadataOnly
+    {
+        RequestArchiveState::MetadataOnly
+    } else {
+        RequestArchiveState::Bound
+    }
 }
 
 fn validate_request_filter(filter: &RequestListFilter) -> Result<(), AppError> {

@@ -7,7 +7,17 @@ impl Database {
         &self,
         input: FinishGenerationJobInput<'_>,
     ) -> Result<i64, AppError> {
-        self.finish_generation_job_inner(input, ready(())).await
+        self.finish_generation_job_inner(input, None, ready(()))
+            .await
+    }
+
+    pub async fn finish_generation_job_with_provider_assets(
+        &self,
+        input: FinishGenerationJobInput<'_>,
+        provider_assets: &[ProviderGenerationAsset],
+    ) -> Result<i64, AppError> {
+        self.finish_generation_job_inner(input, Some(provider_assets), ready(()))
+            .await
     }
 
     #[cfg(test)]
@@ -19,12 +29,14 @@ impl Database {
     where
         F: Future<Output = ()>,
     {
-        self.finish_generation_job_inner(input, before_write).await
+        self.finish_generation_job_inner(input, None, before_write)
+            .await
     }
 
     async fn finish_generation_job_inner<F>(
         &self,
         input: FinishGenerationJobInput<'_>,
+        provider_assets: Option<&[ProviderGenerationAsset]>,
         before_write: F,
     ) -> Result<i64, AppError>
     where
@@ -36,9 +48,17 @@ impl Database {
             ));
         }
         if input.status == "succeeded" {
-            if input.billed_units <= 0 || input.error_code.is_some() || input.assets.is_empty() {
+            let provider_delivery = provider_assets.is_some();
+            if input.billed_units <= 0
+                || input.error_code.is_some()
+                || (!provider_delivery && input.assets.is_empty())
+                || (provider_delivery
+                    && (!input.assets.is_empty()
+                        || input.staged_assets.is_some()
+                        || provider_assets.is_some_and(|assets| assets.is_empty())))
+            {
                 return Err(AppError::BadRequest(
-                    "a successful generation requires billed units and archived assets".into(),
+                    "a successful generation requires billed units and one delivery source".into(),
                 ));
             }
             if input.assets.iter().any(|asset| {
@@ -66,6 +86,26 @@ impl Database {
             }) {
                 return Err(AppError::BadRequest(
                     "a successful generation must match its staged asset manifest".into(),
+                ));
+            }
+            if provider_assets.is_some_and(|assets| {
+                assets.iter().any(|asset| {
+                    asset.index < 0
+                        || asset.url.trim().is_empty()
+                        || asset.url.len() > 16 * 1024
+                        || asset.mime_type.trim().is_empty()
+                        || asset.mime_type.len() > 255
+                        || asset.filename.trim().is_empty()
+                        || asset.filename.len() > 255
+                        || asset.expires_at.is_some_and(|expires_at| expires_at <= 0)
+                }) || assets.iter().enumerate().any(|(index, asset)| {
+                    assets[index + 1..]
+                        .iter()
+                        .any(|other| other.asset_id == asset.asset_id || other.index == asset.index)
+                })
+            }) {
+                return Err(AppError::BadRequest(
+                    "a successful generation contains an invalid provider asset reference".into(),
                 ));
             }
         } else {
@@ -112,14 +152,20 @@ impl Database {
                 "generation billed units exceed the reserved estimate".into(),
             ));
         }
+        let delivered_asset_count =
+            provider_assets.map_or(input.assets.len(), |assets| assets.len());
         if input.status == "succeeded"
             && match driver.as_str() {
                 "volcengine-seedance" => {
-                    input.assets.len() != 1 || !input.assets[0].mime_type.starts_with("video/")
+                    delivered_asset_count != 1
+                        || (provider_assets.is_none()
+                            && !input.assets[0].mime_type.starts_with("video/"))
                 }
-                "comfyui" => !(1..=16).contains(&input.assets.len()),
+                "comfyui" => !(1..=16).contains(&delivered_asset_count),
                 "http-json" => {
-                    input.assets.len() != 1 || !input.assets[0].mime_type.starts_with("video/")
+                    delivered_asset_count != 1
+                        || (provider_assets.is_none()
+                            && !input.assets[0].mime_type.starts_with("video/"))
                 }
                 _ => true,
             }
@@ -158,8 +204,9 @@ impl Database {
             ..TokenUsage::default()
         };
         let expected_cost_micros = price_token_usage(&reservation, &usage)?;
-        let result = (input.status == "succeeded")
-            .then(|| safe_generation_result(&driver, input.billed_units, input.assets));
+        let result = (input.status == "succeeded").then(|| {
+            safe_generation_result(&driver, input.billed_units, input.assets, provider_assets)
+        });
         let result_json = result
             .as_ref()
             .map(serde_json::to_string)
@@ -252,6 +299,17 @@ impl Database {
         if updated.rows_affected() != 1 {
             return Err(AppError::NotFound);
         }
+        let metadata_only = sqlx::query(
+            "UPDATE generation_jobs SET request_object = $1 WHERE id = $2 AND status = $3",
+        )
+        .bind(super::GENERATION_REQUEST_METADATA)
+        .bind(input.job_id.to_string())
+        .bind(input.status)
+        .execute(&mut *transaction)
+        .await?;
+        if metadata_only.rows_affected() != 1 {
+            return Err(AppError::Internal);
+        }
         if input.status == "succeeded" {
             insert_generation_assets_in_transaction(
                 &mut transaction,
@@ -260,6 +318,14 @@ impl Database {
                 now,
             )
             .await?;
+            if provider_assets.is_some() {
+                super::super::cleanup_archive_staging_purpose_in_transaction(
+                    &mut transaction,
+                    ArchiveStagingOwner::GenerationJob(input.job_id),
+                    ArchiveStagingPurpose::Assets,
+                )
+                .await?;
+            }
         } else {
             sqlx::query("DELETE FROM generation_assets WHERE job_id = $1")
                 .bind(input.job_id.to_string())
@@ -282,6 +348,12 @@ impl Database {
                 .await?;
             }
         }
+        super::super::cleanup_archive_staging_purpose_in_transaction(
+            &mut transaction,
+            ArchiveStagingOwner::GenerationJob(input.job_id),
+            ArchiveStagingPurpose::Request,
+        )
+        .await?;
         publish_generation_terminal_effects(&mut transaction, &input.job_id.to_string(), now)
             .await?;
         let tenant_id: String = job.try_get("tenant_id")?;
@@ -336,6 +408,7 @@ fn safe_generation_result(
     driver: &str,
     billed_units: i64,
     assets: &[ArchivedGenerationAsset],
+    provider_assets: Option<&[ProviderGenerationAsset]>,
 ) -> serde_json::Value {
     let provider = match driver {
         "volcengine-seedance" => {
@@ -355,7 +428,37 @@ fn safe_generation_result(
             filename: asset.filename.clone(),
         })
         .collect::<Vec<_>>();
-    serde_json::json!({"provider": provider, "assets": assets})
+    match provider_assets {
+        Some(provider_assets) => {
+            let assets = provider_assets
+                .iter()
+                .map(|asset| GenerationAssetView {
+                    asset_id: asset.asset_id,
+                    index: asset.index,
+                    mime_type: asset.mime_type.clone(),
+                    size_bytes: 0,
+                    filename: asset.filename.clone(),
+                })
+                .collect::<Vec<_>>();
+            let asset_expirations = provider_assets
+                .iter()
+                .map(|asset| {
+                    serde_json::json!({
+                        "asset_id": asset.asset_id,
+                        "expires_at": asset.expires_at
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "provider": provider,
+                "assets": assets,
+                "asset_expirations": asset_expirations,
+                "provider_assets": provider_assets,
+                "media_archived": false
+            })
+        }
+        None => serde_json::json!({"provider": provider, "assets": assets}),
+    }
 }
 
 pub(super) async fn insert_generation_assets_in_transaction(

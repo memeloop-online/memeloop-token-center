@@ -46,6 +46,31 @@ fn replayed_image_failure(request_id: Uuid, _error_code: &str) -> Response {
         .expect("static image failure response headers are valid")
 }
 
+fn unretained_image_replay(request_id: Uuid) -> Response {
+    let body = serde_json::to_vec(&json!({
+        "error": {
+            "code": "image_result_not_retained",
+            "message": "The original image result is no longer retained and cannot be replayed. The upstream request was not resubmitted.",
+            "retryable": false
+        }
+    }))
+    .expect("static image replay response is JSON");
+    Response::builder()
+        .status(StatusCode::CONFLICT)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_LENGTH, body.len())
+        .header(REQUEST_ID_HEADER, request_id.to_string())
+        .body(Body::from(body))
+        .expect("static image replay response headers are valid")
+}
+
+pub(super) fn image_metadata_locator(metadata: Value) -> Result<String, AppError> {
+    Ok(format!(
+        "metadata-only-json:{}",
+        serde_json::to_string(&metadata).map_err(|_| AppError::Internal)?
+    ))
+}
+
 pub(super) async fn image_idempotency_replay_response(
     state: &AppState,
     replay: SynchronousImageIdempotencyClaim,
@@ -56,6 +81,11 @@ pub(super) async fn image_idempotency_replay_response(
             response_status,
             response_object,
         } => {
+            if response_object.starts_with("metadata-only-json:")
+                || response_object.starts_with("provider-reference-json:")
+            {
+                return Ok(unretained_image_replay(request_id));
+            }
             let response = state
                 .archive
                 .get_bounded(&response_object, MAX_IMAGE_RESPONSE)
@@ -211,8 +241,8 @@ async fn quarantine_image_request(context: &SyncImageRequest<'_>) -> Response {
 
 pub(super) async fn execute_synchronous_image_request(
     context: &SyncImageRequest<'_>,
-    request_body: Bytes,
-    staged_request_object: &str,
+    _request_body: Bytes,
+    _staged_request_object: &str,
     route: &crate::provider::ResolvedUpstream,
     request: reqwest::RequestBuilder,
     response_format: ImageResponseFormat,
@@ -222,54 +252,6 @@ pub(super) async fn execute_synchronous_image_request(
     if !renew_image_request_claim(context).await? {
         return Ok(replayed_image_failure(request_id, "idempotency_claim_lost"));
     }
-    let request_attempt = Uuid::now_v7();
-    let mut request_lease = crate::generation::begin_generation_staging_attempt(
-        state,
-        crate::archive_staging::ArchiveStagingOwner::SynchronousRequest(request_id),
-        crate::archive_staging::ArchiveStagingPurpose::Request,
-        request_attempt,
-    )
-    .await?;
-    let request_object = match crate::generation::write_generation_staging_bytes(
-        state,
-        &mut request_lease,
-        "request.json",
-        request_body,
-    )
-    .await
-    {
-        Ok(staged) => staged.object_locator,
-        Err(_) => {
-            state
-                .db
-                .abandon_archive_staging_attempt(&request_lease)
-                .await?;
-            return fail_image_request(context, "archive_write").await;
-        }
-    };
-    if let Err(error) = state
-        .db
-        .attach_synchronous_image_request_object_staged(
-            AttachSynchronousImageRequestObject {
-                key_id: context.key_id,
-                idempotency_key: context.idempotency_key,
-                request_id,
-                reservation_id: context.reservation.id,
-                expected_staging_object: staged_request_object,
-                request_object: &request_object,
-            },
-            &request_lease,
-        )
-        .await
-    {
-        tracing::warn!(
-            request_id = %request_id,
-            owner_lost = matches!(error, AppError::NotFound),
-            "synchronous image request archive could not be attached"
-        );
-        return fail_image_request(context, "archive_metadata").await;
-    }
-
     // The route lifecycle permit was acquired before the request body was read
     // and remains held by the authentication middleware through this handler.
     if !renew_image_request_claim(context).await? {
@@ -643,90 +625,58 @@ async fn finish_openai_image_response(
             return fail_image_request(context, "upstream_image_invalid_payload").await;
         }
     };
-    let mut archived_assets = Vec::new();
-    let mut result_lease = crate::generation::begin_generation_staging_attempt(
-        state,
-        crate::archive_staging::ArchiveStagingOwner::SynchronousRequest(request_id),
-        crate::archive_staging::ArchiveStagingPurpose::Result,
-        Uuid::now_v7(),
-    )
-    .await?;
-    let archive_budget = crate::generation::AssetArchiveBudget::default();
+    let mut provider_assets = Vec::new();
     for (index, url) in parsed.url_assets() {
-        if !renew_image_request_claim(context).await? {
-            return Ok(replayed_image_failure(request_id, "idempotency_claim_lost"));
+        if crate::generation::ensure_asset_origin(route, url).is_err() {
+            return fail_image_request(context, "upstream_image_asset").await;
         }
-        let asset = match crate::generation::archive_asset_staged(
-            state,
-            route,
-            &route.credential,
-            &archive_budget,
-            &mut result_lease,
+        provider_assets.push(crate::generation::provider_generation_asset(
+            request_id,
             index,
             url,
+            crate::generation::provider_expiry_millis(&Value::Null, url),
             None,
-        )
-        .await
-        {
-            Ok(asset) => asset,
-            Err(_) => {
-                tracing::warn!(
-                    request_id = %request_id,
-                    asset_index = index,
-                    "synchronous image URL asset archival failed"
-                );
-                return fail_image_request_with_staging(
-                    context,
-                    "upstream_image_asset",
-                    Some(&result_lease),
-                )
-                .await;
-            }
-        };
-        archived_assets.push(asset);
+        )?);
     }
     let (response_segments, response_len) =
-        match super::openai_image_response::build_openai_image_segments(
+        match super::openai_image_response::build_provider_referenced_openai_image_segments(
             response_bytes,
             parsed,
             request_id,
-            &archived_assets,
+            &provider_assets,
             unix_millis() / 1_000,
         ) {
             Ok(response) => response,
             Err(super::openai_image_response::OpenAiImageBuildError::TooLarge) => {
-                return fail_image_request_with_staging(
-                    context,
-                    "upstream_image_response_too_large",
-                    Some(&result_lease),
-                )
-                .await;
+                return fail_image_request(context, "upstream_image_response_too_large").await;
             }
             Err(super::openai_image_response::OpenAiImageBuildError::InvalidAssets) => {
-                return fail_image_request_with_staging(
-                    context,
-                    "upstream_image_invalid_payload",
-                    Some(&result_lease),
-                )
-                .await;
+                return fail_image_request(context, "upstream_image_invalid_payload").await;
             }
             Err(super::openai_image_response::OpenAiImageBuildError::Internal) => {
                 return Err(AppError::Internal);
             }
         };
-    let response_object = match crate::generation::write_generation_staging_segments(
-        state,
-        &mut result_lease,
-        "response.json",
-        response_segments.clone(),
-    )
-    .await
-    {
-        Ok(staged) => staged.object_locator,
-        Err(_) => {
-            return fail_image_request_with_staging(context, "archive_write", Some(&result_lease))
-                .await;
-        }
+    let response_object = if provider_assets.is_empty() {
+        image_metadata_locator(json!({
+            "kind": "synchronous_image",
+            "media_archived": false,
+            "replay_available": false,
+            "result_count": context.expected_image_count,
+            "billed_units": billed_units
+        }))?
+    } else {
+        format!(
+            "provider-reference-json:{}",
+            serde_json::to_string(&json!({
+                "kind": "synchronous_image",
+                "media_archived": false,
+                "replay_available": false,
+                "provider_assets": provider_assets,
+                "billed_units": billed_units
+            }))
+            .map_err(|_| AppError::Internal)?
+        )
     };
     match commit_synchronous_image_terminal(
         context,
@@ -735,8 +685,8 @@ async fn finish_openai_image_response(
         billed_units,
         None,
         &response_object,
-        &archived_assets,
-        Some(&result_lease),
+        &[],
+        None,
     )
     .await?
     {
@@ -995,27 +945,13 @@ async fn finish_responses_tool_image(
                 return fail_image_request(context, "upstream_image_response_too_large").await;
             }
         };
-    let mut result_lease = crate::generation::begin_generation_staging_attempt(
-        state,
-        crate::archive_staging::ArchiveStagingOwner::SynchronousRequest(request_id),
-        crate::archive_staging::ArchiveStagingPurpose::Result,
-        Uuid::now_v7(),
-    )
-    .await?;
-    let response_object = match crate::generation::write_generation_staging_segments(
-        state,
-        &mut result_lease,
-        "response.json",
-        response_segments.clone(),
-    )
-    .await
-    {
-        Ok(staged) => staged.object_locator,
-        Err(_) => {
-            return fail_image_request_with_staging(context, "archive_write", Some(&result_lease))
-                .await;
-        }
-    };
+    let response_object = image_metadata_locator(json!({
+        "kind": "synchronous_image",
+        "media_archived": false,
+        "replay_available": false,
+        "result_count": 1,
+        "billed_units": billed_units
+    }))?;
     match commit_synchronous_image_terminal(
         context,
         200,
@@ -1024,7 +960,7 @@ async fn finish_responses_tool_image(
         None,
         &response_object,
         &[],
-        Some(&result_lease),
+        None,
     )
     .await?
     {

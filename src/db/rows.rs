@@ -3,7 +3,7 @@ use sqlx::{Row, any::AnyRow};
 use super::parse_uuid;
 use crate::{
     error::AppError,
-    model::{GenerationAssetDownload, GenerationAssetView},
+    model::{GenerationAssetDownload, GenerationAssetSource, GenerationAssetView},
 };
 
 pub(super) fn generation_asset_download(row: AnyRow) -> Result<GenerationAssetDownload, AppError> {
@@ -15,6 +15,8 @@ pub(super) fn generation_asset_download(row: AnyRow) -> Result<GenerationAssetDo
             size_bytes: row.try_get("size_bytes")?,
             filename: row.try_get("filename")?,
         },
-        object_locator: row.try_get("object_locator")?,
+        source: GenerationAssetSource::Archive {
+            object_locator: row.try_get("object_locator")?,
+        },
     })
 }

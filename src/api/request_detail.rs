@@ -130,13 +130,18 @@ fn archive_content_source(
     if archive_is_pending(state) {
         return Err("archive_pending");
     }
+    if state == crate::model::RequestArchiveState::MetadataOnly {
+        return Err("media_body_not_archived_by_policy");
+    }
     if let Some(location) = location {
         if let Some(value) = location.strip_prefix("inline-json:") {
             return Ok(ArchiveContentSource::Inline(Bytes::copy_from_slice(
                 value.as_bytes(),
             )));
         }
-        if location.starts_with("metadata-only-json:") {
+        if location.starts_with("metadata-only-json:")
+            || location.starts_with("provider-reference-json:")
+        {
             return Err("media_body_not_archived_by_policy");
         }
         if location.starts_with("gap://") {
@@ -402,6 +407,13 @@ impl ArchiveValue {
 }
 
 async fn archive_value(state: &AppState, location: &str) -> ArchiveValue {
+    if location.starts_with("provider-reference-json:") {
+        return ArchiveValue {
+            value: serde_json::json!({"media_archived": false}),
+            complete: true,
+            reason: Some("media_body_not_archived_by_policy".to_owned()),
+        };
+    }
     if let Some(value) = location.strip_prefix("metadata-only-json:") {
         let mut metadata = decode_archive_value(value.as_bytes());
         metadata.complete = true;

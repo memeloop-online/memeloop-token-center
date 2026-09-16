@@ -8,6 +8,9 @@ mod finish;
 
 use finish::{generation_assets_match, insert_generation_assets_in_transaction};
 
+const GENERATION_REQUEST_METADATA: &str =
+    "metadata-only-json:{\"kind\":\"generation\",\"media_archived\":false}";
+
 pub struct CreateGenerationJobInput {
     pub job_id: Uuid,
     pub key: AuthenticatedKey,
@@ -763,9 +766,18 @@ impl Database {
         .bind(job_id.to_string())
         .bind(key_id.to_string())
         .fetch_optional(&self.pool)
-        .await?
-        .ok_or(AppError::NotFound)?;
-        generation_asset_download(row)
+        .await?;
+        if let Some(row) = row {
+            return generation_asset_download(row);
+        }
+        let row =
+            sqlx::query("SELECT result_json FROM generation_jobs WHERE id = $1 AND key_id = $2")
+                .bind(job_id.to_string())
+                .bind(key_id.to_string())
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or(AppError::NotFound)?;
+        provider_generation_asset_download(row, job_id, asset_id)
     }
 
     pub async fn generation_asset_for_tenant(
@@ -781,9 +793,19 @@ impl Database {
         .bind(job_id.to_string())
         .bind(tenant_external_id)
         .fetch_optional(&self.pool)
+        .await?;
+        if let Some(row) = row {
+            return generation_asset_download(row);
+        }
+        let row = sqlx::query(
+            "SELECT j.result_json FROM generation_jobs j JOIN tenants t ON t.id = j.tenant_id WHERE j.id = $1 AND t.external_id = $2",
+        )
+        .bind(job_id.to_string())
+        .bind(tenant_external_id)
+        .fetch_optional(&self.pool)
         .await?
         .ok_or(AppError::NotFound)?;
-        generation_asset_download(row)
+        provider_generation_asset_download(row, job_id, asset_id)
     }
 
     pub async fn generation_asset_global(
@@ -797,9 +819,16 @@ impl Database {
         .bind(asset_id.to_string())
         .bind(job_id.to_string())
         .fetch_optional(&self.pool)
-        .await?
-        .ok_or(AppError::NotFound)?;
-        generation_asset_download(row)
+        .await?;
+        if let Some(row) = row {
+            return generation_asset_download(row);
+        }
+        let row = sqlx::query("SELECT result_json FROM generation_jobs WHERE id = $1")
+            .bind(job_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        provider_generation_asset_download(row, job_id, asset_id)
     }
 
     /// Atomically cancels a queued job, or fences a running job for the
@@ -910,10 +939,11 @@ impl Database {
         }
 
         let cancelled = sqlx::query(
-            "UPDATE generation_jobs SET status = 'cancelled', billed_units = 0, cost_micros = 0, error_code = 'cancelled_by_user', completed_at = $1, updated_at = $2, lease_owner = NULL, lease_expires_at = NULL WHERE id = $3 AND key_id = $4 AND status = 'queued' AND (lease_expires_at IS NULL OR lease_expires_at < $5)",
+            "UPDATE generation_jobs SET status = 'cancelled', billed_units = 0, cost_micros = 0, error_code = 'cancelled_by_user', completed_at = $1, updated_at = $2, lease_owner = NULL, lease_expires_at = NULL, request_object = $3 WHERE id = $4 AND key_id = $5 AND status = 'queued' AND (lease_expires_at IS NULL OR lease_expires_at < $6)",
         )
         .bind(now)
         .bind(now)
+        .bind(GENERATION_REQUEST_METADATA)
         .bind(job_id.to_string())
         .bind(key_id.to_string())
         .bind(now)
@@ -924,6 +954,12 @@ impl Database {
                 "generation job is currently being submitted upstream".into(),
             ));
         }
+        super::cleanup_archive_staging_purpose_in_transaction(
+            &mut transaction,
+            ArchiveStagingOwner::GenerationJob(job_id),
+            ArchiveStagingPurpose::Request,
+        )
+        .await?;
         publish_generation_terminal_effects(&mut transaction, &job_id.to_string(), now).await?;
         let key_id_string = key_id.to_string();
         let request_id = job_id.to_string();
@@ -1107,6 +1143,65 @@ impl Database {
             config,
             upstream_model: job.upstream_model.clone(),
             credential: open_credential(&ciphertext, key_material)?,
+        }))
+    }
+
+    /// Loads the exact account selected for an already-settled provider asset.
+    /// This never reruns routing or generation and is used only to proxy bytes
+    /// from the retained provider reference to an authorized caller.
+    pub async fn load_generation_asset_upstream(
+        &self,
+        job_id: Uuid,
+        key_material: &[u8],
+    ) -> Result<Option<ResolvedUpstream>, AppError> {
+        let row = sqlx::query(
+            "SELECT j.model_route_id, j.upstream_account_id, j.upstream_model,
+                    j.driver AS job_driver, a.updated_at AS transport_revision,
+                    a.credential_generation, a.driver, a.config_json,
+                    c.credential_ciphertext
+             FROM generation_jobs j
+             JOIN upstream_accounts a
+               ON a.id = j.upstream_account_id
+              AND a.tenant_id = j.tenant_id
+              AND a.status = 'active'
+             JOIN upstream_credentials c
+               ON c.upstream_account_id = a.id
+              AND c.generation = a.credential_generation
+              AND c.revoked_at IS NULL
+             WHERE j.id = $1",
+        )
+        .bind(job_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let driver: String = row.try_get("job_driver")?;
+        if row.try_get::<String, _>("driver")? != driver {
+            return Ok(None);
+        }
+        let config: serde_json::Value =
+            serde_json::from_str(&row.try_get::<String, _>("config_json")?)
+                .map_err(|_| AppError::Internal)?;
+        let base_url = validate_config(&config)?;
+        let route_id = row
+            .try_get::<Option<String>, _>("model_route_id")?
+            .map(|value| parse_uuid(value))
+            .transpose()?
+            .unwrap_or_else(Uuid::nil);
+        Ok(Some(ResolvedUpstream {
+            route_id,
+            account_id: parse_uuid(row.try_get("upstream_account_id")?)?,
+            transport_revision: row.try_get("transport_revision")?,
+            credential_generation: row.try_get("credential_generation")?,
+            driver,
+            base_url,
+            config,
+            upstream_model: row.try_get("upstream_model")?,
+            credential: open_credential(
+                &row.try_get::<String, _>("credential_ciphertext")?,
+                key_material,
+            )?,
         }))
     }
 
@@ -1401,11 +1496,12 @@ async fn fail_preparing_generation_in_transaction(
         return Err(AppError::Internal);
     }
     let failed = sqlx::query(
-        "UPDATE generation_jobs SET status = 'failed', billed_units = 0, cost_micros = 0, error_code = $1, completed_at = $2, updated_at = $3, lease_owner = NULL, lease_expires_at = NULL WHERE id = $4 AND status = 'preparing'",
+        "UPDATE generation_jobs SET status = 'failed', billed_units = 0, cost_micros = 0, error_code = $1, completed_at = $2, updated_at = $3, lease_owner = NULL, lease_expires_at = NULL, request_object = $4 WHERE id = $5 AND status = 'preparing'",
     )
     .bind(error_code)
     .bind(now)
     .bind(now)
+    .bind(GENERATION_REQUEST_METADATA)
     .bind(job_id.to_string())
     .execute(&mut **tx)
     .await?;
@@ -1437,11 +1533,14 @@ async fn fail_preparing_generation_in_transaction(
 
 pub(super) fn generation_job_view(row: AnyRow) -> Result<GenerationJobView, AppError> {
     let result_json: Option<String> = row.try_get("result_json")?;
-    let result = result_json
+    let mut result = result_json
         .map(|value| {
             serde_json::from_str::<serde_json::Value>(&value).map_err(|_| AppError::Internal)
         })
         .transpose()?;
+    if let Some(result) = result.as_mut().and_then(serde_json::Value::as_object_mut) {
+        result.remove("provider_assets");
+    }
     let assets = result
         .as_ref()
         .and_then(|value| value.get("assets"))
@@ -1466,6 +1565,38 @@ pub(super) fn generation_job_view(row: AnyRow) -> Result<GenerationJobView, AppE
         error_code: row.try_get("error_code")?,
         result,
         assets,
+    })
+}
+
+fn provider_generation_asset_download(
+    row: AnyRow,
+    job_id: Uuid,
+    asset_id: Uuid,
+) -> Result<GenerationAssetDownload, AppError> {
+    let result_json: Option<String> = row.try_get("result_json")?;
+    let assets = result_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .and_then(|value| value.get("provider_assets").cloned())
+        .and_then(|value| serde_json::from_value::<Vec<ProviderGenerationAsset>>(value).ok())
+        .ok_or(AppError::NotFound)?;
+    let asset = assets
+        .into_iter()
+        .find(|asset| asset.asset_id == asset_id)
+        .ok_or(AppError::NotFound)?;
+    Ok(GenerationAssetDownload {
+        view: GenerationAssetView {
+            asset_id: asset.asset_id,
+            index: asset.index,
+            mime_type: asset.mime_type,
+            size_bytes: 0,
+            filename: asset.filename,
+        },
+        source: GenerationAssetSource::Provider {
+            owner: GenerationAssetProviderOwner::Job(job_id),
+            url: asset.url,
+            expires_at: asset.expires_at,
+        },
     })
 }
 

@@ -13,8 +13,8 @@ use memeloop_token_center::{
     error::AppError,
     generation::generation_request_hash,
     model::{
-        ArchivedGenerationAsset, AuthenticatedKey, GenerationPrice, GenerationStagedAssets,
-        KeyPolicy, UsageReservation,
+        ArchivedGenerationAsset, AuthenticatedKey, GenerationAssetSource, GenerationPrice,
+        GenerationStagedAssets, KeyPolicy, ProviderGenerationAsset, UsageReservation,
     },
     provider::UpstreamCredential,
 };
@@ -194,6 +194,119 @@ async fn generation_terminal_settlement_preserves_the_keys_non_usd_currency() {
         .expect("CNY usage ledger entry");
     assert_eq!(usage.currency, "CNY");
     assert_eq!(usage.amount, "-1.23");
+}
+
+#[tokio::test]
+async fn provider_asset_success_keeps_delivery_and_metering_without_archiving_media() {
+    let (directory, database, key, upstream_id, price) = fixture().await;
+    let inspection = AnyPool::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("generation.db").display()
+    ))
+    .await
+    .unwrap();
+    let reservation = reserve(&database, &key, &price).await;
+    let job = database
+        .create_generation_job(input(&key, upstream_id, reservation, &price))
+        .await
+        .unwrap();
+    database
+        .claim_generation_job("provider-reference-worker")
+        .await
+        .unwrap()
+        .expect("queued generation");
+    let request_attempt = Uuid::now_v7();
+    let request_lease = generation_staging_lease(
+        &database,
+        job.job_id,
+        ArchiveStagingPurpose::Request,
+        request_attempt,
+    )
+    .await;
+    let asset = ProviderGenerationAsset {
+        asset_id: Uuid::now_v7(),
+        index: 0,
+        url: "http://127.0.0.1:8188/view?filename=result.png".to_owned(),
+        expires_at: Some(unix_millis() + 60_000),
+        mime_type: "image/png".to_owned(),
+        filename: "result.png".to_owned(),
+    };
+
+    database
+        .finish_generation_job_with_provider_assets(
+            FinishGenerationJobInput {
+                job_id: job.job_id,
+                worker_id: "provider-reference-worker",
+                status: "succeeded",
+                billed_units: 1,
+                error_code: None,
+                assets: &[],
+                staged_assets: None,
+            },
+            std::slice::from_ref(&asset),
+        )
+        .await
+        .unwrap();
+
+    let finished = database
+        .generation_job(key.key_id, job.job_id)
+        .await
+        .unwrap();
+    assert_eq!(finished.status, "succeeded");
+    assert_eq!(finished.billed_units, Some(1));
+    assert_eq!(finished.assets.len(), 1);
+    assert_eq!(finished.assets[0].asset_id, asset.asset_id);
+    assert!(!finished.result.unwrap().to_string().contains(&asset.url));
+    let archive_refs = database
+        .request_archive_refs(key.key_id, job.job_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        archive_refs.view.archive_state,
+        memeloop_token_center::model::RequestArchiveState::MetadataOnly
+    );
+    assert_eq!(
+        archive_refs.response_archive_state,
+        memeloop_token_center::model::RequestArchiveState::MetadataOnly
+    );
+    let public_response = archive_refs.response_json.unwrap();
+    assert!(!public_response.to_string().contains(&asset.url));
+    assert!(public_response.get("provider_assets").is_none());
+    let download = database
+        .generation_asset_for_key(key.key_id, job.job_id, asset.asset_id)
+        .await
+        .unwrap();
+    assert!(matches!(
+        download.source,
+        GenerationAssetSource::Provider {
+            owner: memeloop_token_center::model::GenerationAssetProviderOwner::Job(job_id),
+            url,
+            ..
+        } if job_id == job.job_id && url == asset.url
+    ));
+    assert_eq!(
+        database
+            .archive_staging_attempt(request_attempt)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        ArchiveStagingState::CleanupPending
+    );
+    let archived_assets: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM generation_assets WHERE job_id = $1")
+            .bind(job.job_id.to_string())
+            .fetch_one(&inspection)
+            .await
+            .unwrap();
+    assert_eq!(archived_assets, 0);
+    let request_object: String =
+        sqlx::query_scalar("SELECT request_object FROM generation_jobs WHERE id = $1")
+            .bind(job.job_id.to_string())
+            .fetch_one(&inspection)
+            .await
+            .unwrap();
+    assert!(request_object.starts_with("metadata-only-json:"));
 }
 
 async fn reserve(

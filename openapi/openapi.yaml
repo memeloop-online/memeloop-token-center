@@ -4653,13 +4653,14 @@ paths:
     get:
       tags: [Operator traffic]
       operationId: downloadOperatorRequestAsset
-      summary: Stream one archived synchronous-generation asset with optional byte range
+      summary: Stream one synchronous-generation asset
       description: |
-        Resolves the asset only through its request and asset UUIDs; the internal archive
-        locator is never accepted or returned. Global service credentials may select a
+        Resolves the asset only through its request and asset UUIDs. New URL results are
+        streamed from a protected trusted-origin provider reference without media retention;
+        historical archived assets remain readable. Provider URLs, credentials, and internal
+        archive locators are never returned. Global service credentials may select a
         tenant. A tenant-scoped credential is fixed to its tenant, and a cross-tenant or
-        otherwise invisible request/asset pair returns 404. Exactly one byte range is
-        supported; multiple, malformed, or unsatisfiable ranges return 416.
+        otherwise invisible request/asset pair returns 404. Provider expiry returns 410.
       security: [{ serviceBearer: [] }]
       x-required-scope: requests:read
       x-authorization-contract:
@@ -4678,6 +4679,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '410': { $ref: '#/components/responses/GenerationAssetUnavailable' }
         '416': { $ref: '#/components/responses/RangeNotSatisfiable' }
         '500': { $ref: '#/components/responses/InternalError' }
 
@@ -4750,13 +4752,14 @@ paths:
     get:
       tags: [Operator traffic]
       operationId: downloadOperatorGenerationAsset
-      summary: Stream one archived generation asset with optional byte range
+      summary: Stream one generation asset with optional byte range
       description: |
-        Resolves the asset only through its job and asset UUIDs; the internal archive
-        locator is never accepted or returned. Global service credentials may select a
+        Resolves the asset only through its job and asset UUIDs. New assets are streamed
+        from a protected, trusted-origin provider reference without retaining the media;
+        historical archived assets remain readable. The internal archive locator, provider URL,
+        and credential are never returned. Global service credentials may select a
         tenant. A tenant-scoped credential is fixed to its tenant, and a cross-tenant or
-        otherwise invisible asset returns 404. Exactly one RFC 7233 byte range is
-        supported; multiple or unsatisfiable ranges return 416.
+        otherwise invisible asset returns 404. Provider expiry or deletion returns 410.
       security: [{ serviceBearer: [] }]
       x-required-scope: requests:read
       parameters:
@@ -4770,6 +4773,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '410': { $ref: '#/components/responses/GenerationAssetUnavailable' }
         '416': { $ref: '#/components/responses/RangeNotSatisfiable' }
         '500': { $ref: '#/components/responses/InternalError' }
 
@@ -5170,13 +5174,14 @@ paths:
     get:
       tags: [Self service]
       operationId: downloadOwnRequestAsset
-      summary: Stream one owned synchronous-generation asset with optional byte range
+      summary: Stream one owned synchronous-generation asset
       description: |
         The authenticated stable key identity must own both the request and asset. A
         mismatched request/asset pair, an asset owned by another identity, or a missing
-        database record returns 404. The internal archive locator is never accepted or
-        returned. Exactly one byte range is supported; multiple, malformed, or
-        unsatisfiable ranges return 416.
+        database record returns 404. New URL results are streamed from a protected
+        trusted-origin provider reference without media retention; historical archived assets
+        remain readable. Provider URLs, credentials, and internal locators are never returned.
+        Provider expiry returns 410.
       security: [{ clientBearer: [] }]
       x-authorization-contract:
         identity: stable-key-id
@@ -5192,6 +5197,7 @@ paths:
         '206': { $ref: '#/components/responses/GenerationAssetPartial' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '410': { $ref: '#/components/responses/GenerationAssetUnavailable' }
         '416': { $ref: '#/components/responses/RangeNotSatisfiable' }
         '500': { $ref: '#/components/responses/InternalError' }
 
@@ -5345,12 +5351,14 @@ paths:
     get:
       tags: [Self service]
       operationId: downloadOwnGenerationAsset
-      summary: Stream one owned archived generation asset with optional byte range
+      summary: Stream one owned generation asset with optional byte range
       description: |
         The authenticated stable key identity must own the job and asset; an asset owned
-        by another identity returns 404. The internal archive locator is never accepted or
-        returned. Exactly one RFC 7233 byte range is supported; multiple or unsatisfiable
-        ranges return 416.
+        by another identity returns 404. New jobs retain only a protected provider reference;
+        this endpoint validates its trusted origin, applies server-side credentials only to the
+        provider origin, and streams without retaining media bytes. Historical archived assets
+        remain readable. Provider expiry or deletion returns 410. Internal archive locators,
+        provider URLs, and credentials are never returned.
       security: [{ clientBearer: [] }]
       parameters:
         - $ref: '#/components/parameters/JobIdPath'
@@ -5361,6 +5369,7 @@ paths:
         '206': { $ref: '#/components/responses/GenerationAssetPartial' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '410': { $ref: '#/components/responses/GenerationAssetUnavailable' }
         '416': { $ref: '#/components/responses/RangeNotSatisfiable' }
         '500': { $ref: '#/components/responses/InternalError' }
 
@@ -5753,21 +5762,21 @@ paths:
         the canonical post-policy model/request payload. Authentication and traffic-policy
         evaluation precede the replay lookup, while route/price resolution and outbound
         client validation run only for a newly claimed execution. A completed same-payload
-        replay therefore remains available after its route or price changes and returns the
-        exact archived status, sanitized JSON body, and original request ID; it creates no
+        replay never resubmits upstream: because media bodies are not retained, it returns
+        409 `image_result_not_retained` with the original request ID. It creates no new
         request record, makes no upstream call, and consumes no additional quota/billing
         reservation, per-key rate-limit window, or image execution permit. Reusing the key
         with a different payload returns 400. An identical active request returns 409; an
         expired pending lease is atomically reclaimed for a fresh execution. For URL-mode
-        results, Token Center downloads the object before success and persists, returns,
-        and replays only a relative
-        `/self/v1/requests/{request_id}/assets/{asset_id}` reference plus sanitized asset
-        metadata—never the provider URL or internal archive locator.
+        results, Token Center retains only a protected provider reference and returns a relative
+        `/self/v1/requests/{request_id}/assets/{asset_id}` URL. Authorized downloads stream
+        from the validated provider origin with server-side credentials; media bytes, provider
+        URLs, and internal references are not returned in request history or retained as assets.
       security: [{ clientBearer: [] }]
       x-idempotency-contract:
         namespace: stable-key-id
         fingerprint: post-policy-canonical-model-and-request
-        completed-replay: exact-status-body-and-request-id
+        completed-replay: conflict-without-upstream-resubmission
         different-payload-status: 400
         in-progress-status: 409
         replay-preconditions:
@@ -5785,7 +5794,7 @@ paths:
           - no-usage-settlement
           - no-key-rate-limit-window-consumption
           - no-image-execution-permit
-        persisted-url-results: mtc-request-asset-reference-only
+        persisted-url-results: protected-provider-reference-only
       parameters: [{ $ref: '#/components/parameters/OptionalIdempotencyKey' }]
       requestBody:
         required: true
@@ -6221,8 +6230,13 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorResponse' }
+    GenerationAssetUnavailable:
+      description: The protected provider asset reference expired or the provider deleted the asset.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
     GenerationAssetFull:
-      description: Complete archived asset. Content-Type is reduced to the service allowlist and Content-Disposition uses a sanitized attachment filename.
+      description: Complete historical archived or provider-proxied asset. Content-Type is reduced to the service allowlist and Content-Disposition uses a sanitized attachment filename.
       headers:
         X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
         X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
@@ -6293,7 +6307,7 @@ components:
         Content-Range: { schema: { type: string, pattern: '^bytes \*/[0-9]+$' } }
         ETag: { schema: { type: string } }
     GenerationAssetPartial:
-      description: Requested inclusive byte range from the archived asset.
+      description: Requested inclusive byte range when the backing archive or provider honors it.
       headers:
         X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
         X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
@@ -9620,7 +9634,7 @@ components:
         asset_id: { type: string, format: uuid }
         index: { type: integer, format: int64, minimum: 0 }
         mime_type: { type: string, minLength: 1 }
-        size_bytes: { type: integer, format: int64, minimum: 0 }
+        size_bytes: { type: integer, format: int64, minimum: 0, description: Zero when a provider-backed asset has not been fetched yet. }
         filename: { type: string, minLength: 1 }
     ConversationCluster:
       type: object

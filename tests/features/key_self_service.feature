@@ -154,13 +154,13 @@ Feature: Stable key identity and read-only self-service statistics
     Then the old service token is rejected
     And the rotated service token retains its stable service id
 
-  Scenario: Seedance generation is permissioned, metered, polled and archived
+  Scenario: Seedance generation is permissioned, metered, polled and proxied
     Given a token center backed by SQLite and memory object storage
     And the mock Seedance upstream completes a five second video
     When the service creates a metered Seedance route and key
     And the client creates a five second Seedance generation
     Then the response status is 202
-    And the generation eventually succeeds with an archived video costing 0.5
+    And the generation succeeds with a proxied video costing 0.5
 
   Scenario: SiliconFlow text to video reuses the shared HTTP JSON account safely
     Given a token center backed by SQLite and memory object storage
@@ -168,7 +168,7 @@ Feature: Stable key identity and read-only self-service statistics
     When the service creates a job-priced SiliconFlow video route and key
     And the client creates and replays a SiliconFlow text to video generation
     Then the response status is 202
-    And the SiliconFlow video is archived once with safe metadata and job billing
+    And the SiliconFlow video is proxied with safe metadata and job billing
 
   Scenario: A running Seedance job is cancelled upstream and refunded exactly once
     Given a token center backed by SQLite and memory object storage
@@ -217,13 +217,13 @@ Feature: Stable key identity and read-only self-service statistics
     Then the response status is 202
     And the over-contract Seedance usage charges the reservation ceiling without an asset
 
-  Scenario: ComfyUI generation is permissioned, metered and archived
+  Scenario: ComfyUI generation is permissioned, metered and proxied
     Given a token center backed by SQLite and memory object storage
     And the mock ComfyUI upstream completes an image workflow
     When the service creates a metered ComfyUI route and key
     And the client creates a ComfyUI image generation
     Then the response status is 202
-    And the ComfyUI generation eventually succeeds with an archived image costing 0.2
+    And the ComfyUI generation succeeds with a proxied image costing 0.2
 
   Scenario: A running ComfyUI job is fenced, cancelled upstream and refunded exactly once
     Given a token center backed by SQLite and memory object storage
@@ -271,13 +271,13 @@ Feature: Stable key identity and read-only self-service statistics
     Then the response status is 202
     And the oversized ComfyUI manifest fails before downloads and refunds its reservation
 
-  Scenario: ComfyUI video generation uses the video endpoint, job billing and job-scoped durable archive
+  Scenario: ComfyUI video generation uses the video endpoint, job billing and protected proxy
     Given a token center backed by SQLite and memory object storage
     And the mock ComfyUI upstream completes an MP4 video workflow
     When the service creates a metered ComfyUI video route and key
     And the client creates a ComfyUI video generation
     Then the response status is 202
-    And the ComfyUI video is available through self service with exact archived content and cost 0.2
+    And the ComfyUI video is available through self service with proxied content and cost 0.2
 
   Scenario: OpenAI-compatible image generation is forwarded and metered
     Given a token center backed by SQLite and memory object storage
@@ -285,7 +285,7 @@ Feature: Stable key identity and read-only self-service statistics
     When the service creates a metered OpenAI Images route and key
     And the client creates an OpenAI-compatible image
     Then the response status is 200
-    And the OpenAI image response is archived and costs 0.3
+    And the OpenAI image response is delivered without retention and costs 0.3
 
   Scenario: OpenAI-compatible image generation is atomic without an idempotency key
     Given a token center backed by SQLite and memory object storage
@@ -293,31 +293,31 @@ Feature: Stable key identity and read-only self-service statistics
     When the service creates a metered OpenAI Images route and key
     And the client creates an OpenAI-compatible image without an idempotency key
     Then the response status is 200
-    And the non-idempotent OpenAI image is atomically archived and costs 0.3
+    And the non-idempotent OpenAI image is delivered and costs 0.3
 
-  Scenario: URL-backed OpenAI image results are durably archived
+  Scenario: URL-backed OpenAI image results use protected provider references
     Given a token center backed by SQLite and memory object storage
     And the mock OpenAI Images upstream returns an exact-origin signed URL
     When the service creates a metered OpenAI Images route and key
     And the client creates an OpenAI-compatible image
     Then the response status is 200
-    And the signed URL image is stored in CAS without exposing its secret URL
+    And the signed URL image is proxied without exposing its secret URL
 
-  Scenario: Ten OpenAI image results share one aggregate archive budget
+  Scenario: Ten OpenAI image results avoid media downloads and retention
     Given a token center backed by SQLite and memory object storage
     And the mock OpenAI Images upstream returns ten assets over the aggregate budget
     When the service creates a metered OpenAI Images route and key
     And the client creates ten OpenAI-compatible images in one request
-    Then the response status is 409
-    And the ten image request is quarantined until audited confirmation and leaves no published assets
+    Then the response status is 200
+    And the ten image request publishes protected references without downloading media
 
-  Scenario: Empty URL-backed OpenAI image results require audited confirmation before refund
+  Scenario: An expired or empty URL-backed OpenAI image is reported unavailable at download
     Given a token center backed by SQLite and memory object storage
     And the mock OpenAI Images upstream returns an empty signed URL asset
     When the service creates a metered OpenAI Images route and key
     And the client creates an OpenAI-compatible image
-    Then the response status is 409
-    And the empty URL image is quarantined and reconciled without exposing the signed URL
+    Then the response status is 200
+    And the empty URL image remains metered but downloads as unavailable without exposing the signed URL
 
   Scenario: Oversized OpenAI image responses require audited confirmation before refund
     Given a token center backed by SQLite and memory object storage
@@ -341,7 +341,7 @@ Feature: Stable key identity and read-only self-service statistics
     When the service creates a metered Codex Responses image route and key
     And the client creates a Codex-backed OpenAI-compatible image
     Then the response status is 200
-    And the Codex-backed image response is archived and costs 0.4
+    And the Codex-backed image response is delivered without retention and costs 0.4
 
   Scenario: Invalid Codex Responses image payloads never expose or archive provider details
     Given a token center backed by SQLite and memory object storage

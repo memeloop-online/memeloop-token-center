@@ -220,10 +220,14 @@ async fn proxy_openai_image_generation(
             return Err(error);
         }
     };
-    // Hashing is local and bounded by MAX_IMAGE_REQUEST_BODY. The relational
-    // admission transaction is deliberately completed before the first object
-    // store write, so rejected/replayed requests cannot consume archive space.
-    let staged_request_object = format!("pending://synchronous/{request_id}/request");
+    // Media bodies are intentionally not retained. Keep only bounded audit
+    // metadata while preserving the normalized request hash for idempotency.
+    let staged_request_object = super::synchronous_image::image_metadata_locator(json!({
+        "kind": "synchronous_image",
+        "media_archived": false,
+        "model": &model,
+        "expected_image_count": image_count
+    }))?;
     let routing_snapshot = crate::generation::group_routing::snapshot(&state)?;
     let started = state
         .db
