@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect, useRef, useState, type FormEvent, type React
 import { api } from '../api';
 import { CopyButton } from '../CopyButton.js';
 import { Shell } from '../components';
+import { Button, Field, Input } from '../design-system';
 import { clearRememberedCredential, readRememberedCredential, rememberCredential } from '../credentialStorage';
 import { useI18n } from '../i18n';
 import type { KeyView, RequestDetail, RequestView } from '../types';
@@ -175,8 +176,16 @@ export function SelfPortal({ route, onRouteChange, showNavigation = true, embedd
     : `signed-out:${credentialScopeGeneration}`;
 
   const content = <div className="self-portal" data-self-route={activeRoute}>
-    {!credentialView ? <header className="hero self-sign-in"><div><h1>{t('self.title')}</h1></div><form className="credential" onSubmit={submitCredential}><label><span>{t('self.credential')}</span><span className="credential-input"><input autoComplete="off" type={credentialVisible ? 'text' : 'password'} value={credentialInput} onChange={(event) => setCredentialInput(event.target.value)} placeholder={t('self.placeholder')} /><button type="button" className="secondary credential-visibility" aria-pressed={credentialVisible} onClick={() => setCredentialVisible((visible) => !visible)}>{t(credentialVisible ? 'common.hide' : 'common.show')}</button></span></label><button type="submit" disabled={authenticating || !credentialInput.trim()}>{authenticating ? t('common.loading') : t('common.load')}</button>{credentialInput.trim() && <CopyButton value={credentialInput} label={t('common.copySecret')} />}{credential && <><CopyButton value={credential} label={t('common.copySecret')} /><button type="button" className="secondary clear-credential" onClick={clearCredential}>{t('common.clearCredential')}</button></>}</form></header> : <>
-      <div className="console-context self-account-status"><div><b>{credentialView.alias}</b><span>{t('common.savedCredentialInUse')}</span></div><div className="button-row"><CopyButton value={credential} label={t('common.copySecret')} /><button type="button" className="secondary clear-credential" onClick={clearCredential}>{t('common.clearCredential')}</button></div></div>
+    {!credentialView ? <header className="hero self-sign-in">
+      <div><h1>{t('self.title')}</h1></div>
+      <form className="credential" onSubmit={submitCredential}>
+        <Field label={t('self.credential')}><Input autoComplete="off" type={credentialVisible ? 'text' : 'password'} value={credentialInput} onChange={(event) => setCredentialInput(event.target.value)} placeholder={t('self.placeholder')} contentAfter={<Button type="button" appearance="subtle" className="credential-visibility" aria-pressed={credentialVisible} onClick={() => setCredentialVisible((visible) => !visible)}>{t(credentialVisible ? 'common.hide' : 'common.show')}</Button>} /></Field>
+        <Button appearance="primary" type="submit" disabled={authenticating || !credentialInput.trim()}>{authenticating ? t('common.loading') : t('common.load')}</Button>
+        {credentialInput.trim() && <CopyButton value={credentialInput} label={t('common.copySecret')} />}
+        {credential && <><CopyButton value={credential} label={t('common.copySecret')} /><Button type="button" appearance="secondary" className="clear-credential" onClick={clearCredential}>{t('common.clearCredential')}</Button></>}
+      </form>
+    </header> : <>
+      <div className="console-context self-account-status"><div><b>{credentialView.alias}</b><span>{t('common.savedCredentialInUse')}</span></div><div className="button-row"><CopyButton value={credential} label={t('common.copySecret')} /><Button type="button" appearance="secondary" className="clear-credential" onClick={clearCredential}>{t('common.clearCredential')}</Button></div></div>
       {showNavigation && <SelfPortalNavigation activeRoute={activeRoute} onNavigate={navigate} />}
     </>}
     {error && <div className="notice error" role="alert">{error}</div>}

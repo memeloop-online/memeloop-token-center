@@ -6,6 +6,7 @@ import { ChartDataView } from '../charts/ChartDataView';
 import { HeatmapDataTable } from '../charts/HeatmapDataTable';
 import { costOption, heatmapOption, latencyOption, throughputOption, totalTokens, type UsageChartCopy, type UsageChartFormatters } from '../charts/usageCharts';
 import { Metric, NumberMetric } from '../components';
+import { Button } from '../design-system';
 import { formatCurrency, formatMetricDisplay, formatMilliseconds, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
 import type { KeyView, SelfUsageAnalysis, UsageAnalysisBucket, UsageAnalysisCost, UsageAnalysisTimeBucket } from '../types';
@@ -102,11 +103,11 @@ export function UsagePage({ credential, credentialView, onError }: {
   const heatmap = useMemo(() => heatmapOption(stats?.heatmap ?? [], 'requests', credentialView.currency, weekdays, t('usage.heatmapLabel'), formatters), [stats?.heatmap, credentialView.currency, weekdays, t, formatters]);
 
   if (scopedRemote.status === 'loading') return <div className="self-page usage-page"><div className="usage-heading"><div><h2>{t('usage.title')}</h2><p className="muted">{t('self.usageDescription')}</p></div></div><div className="boot" role="status">{t('common.loading')}</div></div>;
-  if (scopedRemote.status === 'error') return <div className="self-page usage-page"><div className="usage-heading"><div><h2>{t('usage.title')}</h2><p className="muted">{t('self.usageDescription')}</p></div><button type="button" className="secondary" onClick={() => setRefresh((value) => value + 1)}>{t('usage.refresh')}</button></div><div className="notice error" role="alert">{scopedRemote.message}</div></div>;
+  if (scopedRemote.status === 'error') return <div className="self-page usage-page"><div className="usage-heading"><div><h2>{t('usage.title')}</h2><p className="muted">{t('self.usageDescription')}</p></div><Button type="button" appearance="secondary" onClick={() => setRefresh((value) => value + 1)}>{t('usage.refresh')}</Button></div><div className="notice error" role="alert">{scopedRemote.message}</div></div>;
   if (!stats) return <div className="empty">{t('common.noData')}</div>;
   const successRate = stats.summary.requests ? stats.summary.success / stats.summary.requests : null;
   return <div className="self-page self-usage-page usage-page" data-self-page="usage">
-    <div className="usage-heading"><div><h2>{t('usage.title')}</h2><p className="muted">{t('self.usageDescription')}</p><span className="usage-time-zone">{bucketTimeZoneNote(locale, stats.time_zone)}</span></div><div className="usage-presets" role="group" aria-label={t('usage.timeRange')}>{(['24h', '7d', '30d'] as UsageRange[]).map((value) => <button type="button" key={value} className={range === value ? 'active' : 'secondary'} aria-pressed={range === value} onClick={() => setRange(value)}>{t(`usage.preset.${value}`)}</button>)}</div></div>
+    <div className="usage-heading"><div><h2>{t('usage.title')}</h2><p className="muted">{t('self.usageDescription')}</p><span className="usage-time-zone">{bucketTimeZoneNote(locale, stats.time_zone)}</span></div><div className="usage-presets" role="group" aria-label={t('usage.timeRange')}>{(['24h', '7d', '30d'] as UsageRange[]).map((value) => <Button type="button" key={value} appearance={range === value ? 'primary' : 'secondary'} aria-pressed={range === value} onClick={() => setRange(value)}>{t(`usage.preset.${value}`)}</Button>)}</div></div>
     <section className="metrics self-usage-metrics">
       <NumberMetric label={t('usage.requests')} value={stats.summary.requests} />
       <Metric label={t('usage.successRate')} value={formatPercent(successRate, locale)} tone="positive" />

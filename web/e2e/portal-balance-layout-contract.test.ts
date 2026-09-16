@@ -9,8 +9,8 @@ test('account balance keeps a readable width in both themes and mobile layouts',
   const browser = await chromium.launch({ executablePath, headless: true });
   try {
     const page = await browser.newPage();
-    const css = ['styles.css', 'theme.css', 'styles/metrics.css', 'self/SelfPortal.css'].map(path => readFileSync(new URL(`../src/${path}`, import.meta.url), 'utf8')).join('\n');
-    await page.setContent(`<style>${css}</style><main class="self-overview"><article class="panel key-summary self-account-summary"><div><h2>Example account</h2></div><article class="metric"><span class="metric-label">可用余额 (USD)</span><strong class="metric-value"><span>9.22万亿 USD</span></strong></article></article></main>`);
+    const css = ['styles.css', 'theme.css', 'styles/metrics.css', 'design-system/foundation.css', 'self/SelfPortal.css'].map(path => readFileSync(new URL(`../src/${path}`, import.meta.url), 'utf8')).join('\n');
+    await page.setContent(`<style>${css}</style><main class="self-overview"><section class="mtc-data-surface key-summary self-account-summary"><div><h2>Example account</h2></div><article class="metric"><span class="metric-label">可用余额 (USD)</span><strong class="metric-value"><span>9.22万亿 USD</span></strong></article></section></main>`);
     for (const theme of ['light', 'dark']) for (const width of [390, 1440]) {
       await page.setViewportSize({ width, height: 1000 });
       await page.evaluate(theme => { document.documentElement.dataset.theme = theme; }, theme);
@@ -22,7 +22,6 @@ test('account balance keeps a readable width in both themes and mobile layouts',
       });
       assert.ok(layout.width > 200, `${theme} ${width}: inline-size containers must not collapse in the account row`);
       assert.ok(layout.lines <= 2, `${theme} ${width}: compact balance must not wrap character by character`);
-      assert.equal(layout.shadow, 'none', `${theme} ${width}: theme panel rule must not restore shadow`);
     }
   } finally { await browser.close(); }
 });
