@@ -1,0 +1,11 @@
+/* Portal overview metric cards reuse the shared analytics-metric surface
+   (imported globally via styles/metrics.css). Align value sizing with the
+   operator overview dashboard, which scales per-card via container queries. */
+.self-overview .self-overview-metrics .analytics-metric .metric-value {
+  font-size: clamp(1.125rem, 8cqw, 1.85rem);
+  line-height: 1.25;
+}
+
+@media (width <= 480px) {
+  .self-overview .self-overview-metrics { grid-template-columns: minmax(0, 1fr); }
+}
