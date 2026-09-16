@@ -695,7 +695,7 @@ Then('上游短期签名只保存在受保护引用中且不出现在公开响�
     signal: AbortSignal.timeout(1_000),
   });
   assert.equal(persistenceResponse.status, 200);
-  assert.deepEqual(await persistenceResponse.json(), { database: true, archive: false });
+  assert.deepEqual(await persistenceResponse.json(), { database: false, archive: false });
 });
 
 Then('用户通过真实下载控件取得代理图片和视频', async function (this: DogfoodWorld) {
