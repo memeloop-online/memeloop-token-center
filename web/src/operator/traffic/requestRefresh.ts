@@ -1,5 +1,5 @@
-import type { RequestEvent } from '../../types.js';
-import { requestViewFromEvent } from './requestTraffic.js';
+import type { RequestEvent, RequestView } from '../../types.js';
+import { mergeLiveRequestEvents, requestViewFromEvent } from './requestTraffic.js';
 
 export const requestRefreshIntervals = [0, 5_000, 30_000, 60_000, 300_000] as const;
 export const defaultRequestRefreshInterval = 5_000;
@@ -7,6 +7,19 @@ export const requestRefreshPreferenceKey = 'mtc.operator.request-refresh-ms.v1';
 export function requestRefreshPreference(value: string | null): number {
   const number = value === null || !value.trim() ? NaN : Number(value);
   return requestRefreshIntervals.some(interval => interval === number) ? number : defaultRequestRefreshInterval;
+}
+
+/** Automatic traffic never grows the rendered window; explicit history pages still do. */
+export function mergeBatchedRequestPage(snapshot: RequestView[], events: Map<string, RequestEvent>, hasOlder: boolean, historyIds: ReadonlySet<string> = new Set()) {
+  if (historyIds.size) {
+    // A history cursor describes a contiguous retained window. Prepending and
+    // evicting rows above it would leave gaps unreachable through Load older.
+    const visible = new Set(snapshot.map(request => request.request_id));
+    return { requests: mergeLiveRequestEvents(snapshot, new Map([...events].filter(([id]) => visible.has(id))), true), hasOlder };
+  }
+  const merged = mergeLiveRequestEvents(snapshot, events, true);
+  const requests = merged.slice(0, 100);
+  return { requests, hasOlder: hasOlder || merged.length > requests.length };
 }
 
 /** Merge partial archive/projection updates without losing a terminal already observed. */

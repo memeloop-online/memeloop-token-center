@@ -53,14 +53,14 @@ test('the Requests page coalesces filtered events into one abortable scope-check
   assert.match(source, /signal: controller\.signal/);
   assert.match(source, /state\.scopeSequence \+= 1;/);
   assert.match(source, /controller\.signal\.aborted \|\| state\.requestSequence !== requestSequence \|\| state\.scopeSequence !== scopeSequence/);
-  assert.match(source, /setRequests\(\(current\) => typedFiltersActive\(currentScope\.filters\)\s*\? mergeRefreshedRequestPage\(current, next, olderFilteredResultsVisible\.current\)/);
+  assert.match(source, /setRequests\(\(current\) => mergeRefreshedRequestPage\(current, next, olderFilteredResultsVisible\.current\)\)/);
   assert.match(source, /const terminalizedVisiblePending = olderFilteredResultsVisible\.current/);
   assert.match(source, /event\.event_kind === 'finished'/);
   assert.match(source, /setOlderFilteredResultsStale\(true\)/);
   assert.match(source, /onRefreshFilteredResults=\{\(\) => void load\(filters\)\}/);
   assert.match(source, /if \(errorSource\.current === 'refresh'\) \{\s*errorSource\.current = undefined;\s*setError\(''\);/s);
   const refresh = source.slice(source.indexOf('async function refreshFilteredRequests'), source.indexOf('async function load'));
-  assert.match(refresh, /if \(!olderFilteredResultsVisible\.current \|\| next\.next_cursor === null\) \{\s*setHasOlder\(next\.next_cursor !== null\);\s*\}/);
+  assert.match(refresh, /if \(typedFiltersActive\(currentScope\.filters\) && \(!olderFilteredResultsVisible\.current \|\| next\.next_cursor === null\)\) \{\s*setHasOlder\(next\.next_cursor !== null\);\s*\}/);
   assert.doesNotMatch(refresh, /setRequests\(\[\]\)|setDetail\(/);
 });
 

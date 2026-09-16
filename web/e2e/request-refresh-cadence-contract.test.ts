@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import type { RequestEvent } from '../src/types.js';
-import { coalesceRequestEvent, defaultRequestRefreshInterval, RequestRefreshBatch, requestRefreshIntervals, requestRefreshPreference } from '../src/operator/traffic/requestRefresh.js';
+import { coalesceRequestEvent, defaultRequestRefreshInterval, mergeBatchedRequestPage, RequestRefreshBatch, requestRefreshIntervals, requestRefreshPreference } from '../src/operator/traffic/requestRefresh.js';
+import { requestViewFromEvent } from '../src/operator/traffic/requestTraffic.js';
 
 function clock() {
   let now = 0; let id = 0;
@@ -70,6 +71,19 @@ test('bounded overflow protects visible terminal records and requests authoritat
   for (let i = 2; i < 100; i++) batch.enqueue(event(String(i), i));
   time.advance(5000); assert.equal(received.size, 3); assert.equal(overflow, true);
   assert.equal(received.get('visible')?.status_code, 200);
+});
+
+test('automatic live traffic stays bounded and restores history navigation after displacement', () => {
+  const snapshot = [requestViewFromEvent(event('oldest', 1, 'finished'))!];
+  const events = new Map(Array.from({ length: 500 }, (_, i) => [`live-${i}`, { ...event(`live-${i}`, i + 2, 'finished'), created_at: i + 2 }]));
+  const page = mergeBatchedRequestPage(snapshot, events, false);
+  assert.equal(page.requests.length, 100); assert.equal(page.hasOlder, true);
+  const loaded = Array.from({ length: 250 }, (_, i) => requestViewFromEvent({ ...event(`history-${i}`, 1, 'finished'), created_at: -i })!);
+  const historyIds = new Set(loaded.slice(100).map(request => request.request_id));
+  const retained = mergeBatchedRequestPage(loaded, events, true, historyIds);
+  assert.equal(retained.requests.length, 250);
+  assert.deepEqual(retained.requests.map(request => request.request_id), loaded.map(request => request.request_id));
+  for (const id of historyIds) assert.ok(retained.requests.some(request => request.request_id === id));
 });
 
 test('React wiring batches SSE revisions and publishes list and metrics from the same request snapshot', async () => {
