@@ -3849,32 +3849,34 @@ paths:
         Requires the dedicated `settlements:adjust` scope because these previews are
         inputs to the separately authorized correction workflow. Tenant-scoped
         credentials remain confined to accounts in their own tenant. Results use an
-        exclusive ascending `(completed_at, request_id)` cursor and an inclusive time
-        window no wider than the common 93-day statistics limit.
+        exclusive ascending `(created_at, request_id)` cursor and an inclusive request
+        creation window no wider than the common 93-day statistics limit. The creation
+        dimension matches the statistics buckets being corrected and keeps PostgreSQL
+        access bounded to the corresponding request-record partitions.
       security: [{ serviceBearer: [] }]
       x-required-scope: settlements:adjust
       parameters:
         - $ref: '#/components/parameters/AccountId'
-        - name: from_completed_at
+        - name: from_created_at
           in: query
           required: true
-          description: Inclusive lower completion-time bound in Unix epoch milliseconds.
+          description: Inclusive lower request-creation bound in Unix epoch milliseconds.
           schema: { type: integer, format: int64, minimum: 0 }
-        - name: to_completed_at
+        - name: to_created_at
           in: query
           required: true
-          description: Inclusive upper completion-time bound in Unix epoch milliseconds.
+          description: Inclusive upper request-creation bound in Unix epoch milliseconds.
           schema: { type: integer, format: int64, minimum: 0 }
         - $ref: '#/components/parameters/SettlementListLimit500'
-        - name: after_completed_at
+        - name: after_created_at
           in: query
           required: false
-          description: Completion timestamp from the final row of the prior page. Must be paired with `after_request_id`.
+          description: Request creation timestamp from the final row of the prior page. Must be paired with `after_request_id`.
           schema: { type: integer, format: int64, minimum: 0 }
         - name: after_request_id
           in: query
           required: false
-          description: Request UUID from the final row of the prior page. Must be paired with `after_completed_at`.
+          description: Request UUID from the final row of the prior page. Must be paired with `after_created_at`.
           schema: { type: string, format: uuid }
       responses:
         '200':
@@ -8300,14 +8302,15 @@ components:
     SettlementCorrectionOriginal:
       type: object
       additionalProperties: false
+      description: Raw persisted settlement inputs. Historical corrupt token counts are preserved verbatim, including negative values, and make the non-negative/token-ceiling invariants false.
       required: [usage_basis, cost, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens]
       properties:
         usage_basis: { type: string, const: contract_ceiling }
         cost: { $ref: '#/components/schemas/NonNegativeMoney' }
-        input_tokens: { type: integer, format: int64, minimum: 0 }
-        cached_input_tokens: { type: integer, format: int64, minimum: 0 }
-        cache_write_tokens: { type: integer, format: int64, minimum: 0 }
-        output_tokens: { type: integer, format: int64, minimum: 0 }
+        input_tokens: { type: integer, format: int64 }
+        cached_input_tokens: { type: integer, format: int64 }
+        cache_write_tokens: { type: integer, format: int64 }
+        output_tokens: { type: integer, format: int64 }
     SettlementCorrectionEvidence:
       type: object
       additionalProperties: false
@@ -8324,11 +8327,16 @@ components:
     SettlementCorrectionInvariants:
       type: object
       additionalProperties: false
-      required: [reservation_settled, reservation_actual_matches_cost, token_ceiling_matches_reservation, usage_ledger_unique, usage_ledger_matches_cost, settlement_feed]
+      required: [reservation_settled, reservation_actual_matches_cost, token_counts_non_negative, token_ceiling_matches_reservation, usage_ledger_unique, usage_ledger_matches_cost, settlement_feed]
       properties:
         reservation_settled: { type: boolean }
         reservation_actual_matches_cost: { type: boolean }
-        token_ceiling_matches_reservation: { type: boolean }
+        token_counts_non_negative:
+          type: boolean
+          description: True only when all persisted request token counts and the reservation token ceiling are non-negative.
+        token_ceiling_matches_reservation:
+          type: boolean
+          description: True only when token counts are non-negative, cache counts are zero, and input plus output equals the reservation ceiling.
         usage_ledger_unique: { type: boolean }
         usage_ledger_matches_cost: { type: boolean }
         settlement_feed:
@@ -8384,9 +8392,9 @@ components:
     SettlementCorrectionPreviewCursor:
       type: object
       additionalProperties: false
-      required: [after_completed_at, after_request_id]
+      required: [after_created_at, after_request_id]
       properties:
-        after_completed_at: { type: integer, format: int64, minimum: 0 }
+        after_created_at: { type: integer, format: int64, minimum: 0 }
         after_request_id: { type: string, format: uuid }
     SettlementCorrectionPreviewPage:
       type: object

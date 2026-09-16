@@ -15,11 +15,11 @@ pub(in crate::api) struct SettlementQuery {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(in crate::api) struct SettlementCorrectionPreviewQuery {
-    from_completed_at: Option<i64>,
-    to_completed_at: Option<i64>,
+    from_created_at: Option<i64>,
+    to_created_at: Option<i64>,
     #[serde(default = "default_limit")]
     limit: i64,
-    after_completed_at: Option<i64>,
+    after_created_at: Option<i64>,
     after_request_id: Option<Uuid>,
 }
 
@@ -90,30 +90,28 @@ pub(in crate::api) async fn list_settlement_correction_previews(
     } else {
         state.db.require_account_exists(account_id).await?;
     }
-    let from_completed_at = query.from_completed_at.ok_or_else(|| {
-        AppError::BadRequest("settlement correction preview requires from_completed_at".into())
+    let from_created_at = query.from_created_at.ok_or_else(|| {
+        AppError::BadRequest("settlement correction preview requires from_created_at".into())
     })?;
-    let to_completed_at = query.to_completed_at.ok_or_else(|| {
-        AppError::BadRequest("settlement correction preview requires to_completed_at".into())
+    let to_created_at = query.to_created_at.ok_or_else(|| {
+        AppError::BadRequest("settlement correction preview requires to_created_at".into())
     })?;
     if !(1..=500).contains(&query.limit) {
         return Err(AppError::BadRequest(
             "limit must be between 1 and 500".into(),
         ));
     }
-    let after = match (query.after_completed_at, query.after_request_id) {
+    let after = match (query.after_created_at, query.after_request_id) {
         (None, None) => None,
-        (Some(completed_at), Some(request_id)) if completed_at >= 0 => {
-            Some((completed_at, request_id))
-        }
+        (Some(created_at), Some(request_id)) if created_at >= 0 => Some((created_at, request_id)),
         (Some(_), Some(_)) => {
             return Err(AppError::BadRequest(
-                "after_completed_at must be non-negative".into(),
+                "after_created_at must be non-negative".into(),
             ));
         }
         _ => {
             return Err(AppError::BadRequest(
-                "after_completed_at and after_request_id must be supplied together".into(),
+                "after_created_at and after_request_id must be supplied together".into(),
             ));
         }
     };
@@ -121,8 +119,8 @@ pub(in crate::api) async fn list_settlement_correction_previews(
         .db
         .list_settlement_correction_previews(
             account_id,
-            from_completed_at,
-            to_completed_at,
+            from_created_at,
+            to_created_at,
             query.limit,
             after,
         )

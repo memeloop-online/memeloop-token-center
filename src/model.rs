@@ -479,6 +479,7 @@ pub struct SettlementCorrectionEvidenceView {
 pub struct SettlementCorrectionInvariantsView {
     pub reservation_settled: bool,
     pub reservation_actual_matches_cost: bool,
+    pub token_counts_non_negative: bool,
     pub token_ceiling_matches_reservation: bool,
     pub usage_ledger_unique: bool,
     pub usage_ledger_matches_cost: bool,
@@ -516,7 +517,7 @@ pub struct SettlementCorrectionPreviewView {
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct SettlementCorrectionPreviewCursor {
-    pub after_completed_at: i64,
+    pub after_created_at: i64,
     pub after_request_id: Uuid,
 }
 

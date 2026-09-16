@@ -532,7 +532,7 @@ async fn correction_preview_only_returns_contract_ceiling_with_stable_cursor() {
             now.saturating_sub(10_000),
             now.saturating_add(10_000),
             1,
-            Some((cursor.after_completed_at, cursor.after_request_id)),
+            Some((cursor.after_created_at, cursor.after_request_id)),
         )
         .await
         .unwrap();
@@ -548,7 +548,7 @@ async fn correction_preview_only_returns_contract_ceiling_with_stable_cursor() {
                 now.saturating_sub(10_000),
                 now.saturating_add(10_000),
                 1,
-                Some((cursor.after_completed_at, null_request)),
+                Some((cursor.after_created_at, null_request)),
             )
             .await,
         Err(AppError::BadRequest(_))
@@ -630,5 +630,54 @@ async fn correction_preview_distinguishes_metered_and_invariant_mismatch() {
     assert_eq!(
         mismatch_page.items[0].review_state,
         SettlementCorrectionReviewState::InvariantMismatch
+    );
+}
+
+#[tokio::test]
+async fn correction_preview_preserves_negative_tokens_but_never_marks_them_ready() {
+    let fixture = fixture(EnforcementMode::Prepaid).await;
+    let request_id = Uuid::now_v7();
+    let reservation = start(&fixture, request_id).await;
+    finish_with_usage_basis(
+        &fixture,
+        request_id,
+        &reservation,
+        RequestUsageBasis::ContractCeiling,
+        10,
+        10,
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE request_records SET input_tokens = -1, output_tokens = 21 WHERE id = $1")
+        .bind(request_id.to_string())
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
+
+    let now = unix_millis();
+    let page = fixture
+        .database
+        .list_settlement_correction_previews(
+            fixture.account_id,
+            now.saturating_sub(10_000),
+            now.saturating_add(10_000),
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    let preview = &page.items[0];
+    assert_eq!(preview.original.input_tokens, -1);
+    assert_eq!(preview.original.output_tokens, 21);
+    assert!(!preview.invariants.token_counts_non_negative);
+    assert!(!preview.invariants.token_ceiling_matches_reservation);
+    assert_eq!(
+        preview.review_state,
+        SettlementCorrectionReviewState::InvariantMismatch
+    );
+    assert_eq!(
+        serde_json::to_value(preview).unwrap()["original"]["input_tokens"],
+        -1
     );
 }

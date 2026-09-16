@@ -272,4 +272,61 @@ async fn postgres_contract_ceiling_preview_keeps_financial_decision_pending() {
         SettlementCorrectionReviewState::ReadyForEvidence
     );
     assert_eq!(page.items[0].pending_correction.corrected_cost, None);
+
+    let created_at = page.items[0].created_at;
+    let mut transaction = fixture.database.pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL enable_seqscan = off")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    let plan_rows = sqlx::query(
+        r#"EXPLAIN (COSTS OFF)
+           SELECT r.id
+             FROM request_records r
+             JOIN usage_reservations u ON u.id = r.reservation_id
+            WHERE u.account_id = $1
+              AND r.created_at >= $2 AND r.created_at <= $3
+              AND (r.created_at > $4 OR (r.created_at = $4 AND r.id > $5))
+              AND r.status_code IS NOT NULL
+              AND r.protocol <> 'audio-transcription'
+              AND r.usage_basis = 'contract_ceiling'
+            ORDER BY r.created_at ASC, r.id ASC
+            LIMIT $6"#,
+    )
+    .bind(fixture.account_id.to_string())
+    .bind(created_at)
+    .bind(created_at)
+    .bind(-1_i64)
+    .bind("00000000-0000-0000-0000-000000000000")
+    .bind(11_i64)
+    .fetch_all(&mut *transaction)
+    .await
+    .unwrap();
+    let plan = plan_rows
+        .iter()
+        .map(|row| row.get::<String, _>("QUERY PLAN"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let partition = format!(
+        "request_records_{}",
+        chrono::DateTime::from_timestamp_millis(created_at)
+            .unwrap()
+            .format("%Y%m%d")
+    );
+    assert!(
+        plan.contains(&partition),
+        "plan did not use {partition}:\n{plan}"
+    );
+    assert!(
+        !plan.contains("request_records_default"),
+        "created_at equality did not prune the default partition:\n{plan}"
+    );
+    assert!(
+        plan.lines().any(|line| {
+            line.contains(&partition)
+                && (line.contains("Index Scan") || line.contains("Bitmap Heap Scan"))
+        }),
+        "bounded preview did not use the existing partition index:\n{plan}"
+    );
+    transaction.rollback().await.unwrap();
 }

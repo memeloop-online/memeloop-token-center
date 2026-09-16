@@ -74,30 +74,30 @@ impl Database {
     pub async fn list_settlement_correction_previews(
         &self,
         account_id: Uuid,
-        from_completed_at: i64,
-        to_completed_at: i64,
+        from_created_at: i64,
+        to_created_at: i64,
         limit: i64,
         after: Option<(i64, Uuid)>,
     ) -> Result<SettlementCorrectionPreviewPage, AppError> {
-        if from_completed_at < 0
-            || to_completed_at < 0
-            || from_completed_at > to_completed_at
-            || to_completed_at.saturating_sub(from_completed_at) > MAX_STATS_RANGE_MILLIS
+        if from_created_at < 0
+            || to_created_at < 0
+            || from_created_at > to_created_at
+            || to_created_at.saturating_sub(from_created_at) > MAX_STATS_RANGE_MILLIS
             || !(1..=500).contains(&limit)
         {
             return Err(AppError::BadRequest(
                 "invalid settlement correction preview query".into(),
             ));
         }
-        if let Some((completed_at, request_id)) = after {
+        if let Some((created_at, request_id)) = after {
             let valid_cursor = sqlx::query(
-                "SELECT r.id FROM request_records r JOIN usage_reservations u ON u.id = r.reservation_id WHERE u.account_id = $1 AND r.id = $2 AND r.completed_at = $3 AND r.completed_at >= $4 AND r.completed_at <= $5 AND r.status_code IS NOT NULL AND r.protocol <> 'audio-transcription' AND r.usage_basis = 'contract_ceiling'",
+                "SELECT r.id FROM request_records r JOIN usage_reservations u ON u.id = r.reservation_id WHERE u.account_id = $1 AND r.id = $2 AND r.created_at = $3 AND r.created_at >= $4 AND r.created_at <= $5 AND r.status_code IS NOT NULL AND r.protocol <> 'audio-transcription' AND r.usage_basis = 'contract_ceiling'",
             )
             .bind(account_id.to_string())
             .bind(request_id.to_string())
-            .bind(completed_at)
-            .bind(from_completed_at)
-            .bind(to_completed_at)
+            .bind(created_at)
+            .bind(from_created_at)
+            .bind(to_created_at)
             .fetch_optional(&self.pool)
             .await?
             .is_some();
@@ -107,8 +107,8 @@ impl Database {
                 ));
             }
         }
-        let (after_completed_at, after_request_id) = after
-            .map(|(completed_at, request_id)| (completed_at, request_id.to_string()))
+        let (after_created_at, after_request_id) = after
+            .map(|(created_at, request_id)| (created_at, request_id.to_string()))
             .unwrap_or_else(|| (-1, "00000000-0000-0000-0000-000000000000".to_owned()));
         let rows = sqlx::query(
             r#"SELECT r.id AS request_id, r.reservation_id, u.account_id, r.key_id,
@@ -161,18 +161,18 @@ impl Database {
                  LEFT JOIN account_settlement_feed feed
                         ON feed.request_kind = 'text' AND feed.request_id = r.id
                 WHERE u.account_id = $1
-                  AND r.completed_at >= $2 AND r.completed_at <= $3
-                  AND (r.completed_at > $4 OR (r.completed_at = $4 AND r.id > $5))
+                  AND r.created_at >= $2 AND r.created_at <= $3
+                  AND (r.created_at > $4 OR (r.created_at = $4 AND r.id > $5))
                   AND r.status_code IS NOT NULL
                   AND r.protocol <> 'audio-transcription'
                   AND r.usage_basis = 'contract_ceiling'
-                ORDER BY r.completed_at ASC, r.id ASC
+                ORDER BY r.created_at ASC, r.id ASC
                 LIMIT $6"#,
         )
         .bind(account_id.to_string())
-        .bind(from_completed_at)
-        .bind(to_completed_at)
-        .bind(after_completed_at)
+        .bind(from_created_at)
+        .bind(to_created_at)
+        .bind(after_created_at)
         .bind(after_request_id)
         .bind(limit.saturating_add(1))
         .fetch_all(&self.pool)
@@ -188,7 +188,7 @@ impl Database {
         let next_cursor = has_more.then(|| {
             let last = items.last().expect("a page with more rows is non-empty");
             SettlementCorrectionPreviewCursor {
-                after_completed_at: last.completed_at,
+                after_created_at: last.created_at,
                 after_request_id: last.request_id,
             }
         });
@@ -230,8 +230,13 @@ fn settlement_correction_preview_from_row(
     let reservation_settled = row.try_get::<String, _>("reservation_status")? == "settled";
     let reservation_actual_matches_cost =
         row.try_get::<Option<i64>, _>("actual_micros")? == Some(cost_micros);
-    let token_ceiling_matches_reservation = input_tokens.checked_add(output_tokens)
-        == Some(reserved_tokens)
+    let token_counts_non_negative = input_tokens >= 0
+        && cached_input_tokens >= 0
+        && cache_write_tokens >= 0
+        && output_tokens >= 0
+        && reserved_tokens >= 0;
+    let token_ceiling_matches_reservation = token_counts_non_negative
+        && input_tokens.checked_add(output_tokens) == Some(reserved_tokens)
         && cached_input_tokens == 0
         && cache_write_tokens == 0;
     let enforcement_mode: String = row.try_get("enforcement_mode")?;
@@ -268,6 +273,7 @@ fn settlement_correction_preview_from_row(
     };
     let review_state = if reservation_settled
         && reservation_actual_matches_cost
+        && token_counts_non_negative
         && token_ceiling_matches_reservation
         && usage_ledger_unique
         && usage_ledger_matches_cost
@@ -314,6 +320,7 @@ fn settlement_correction_preview_from_row(
         invariants: SettlementCorrectionInvariantsView {
             reservation_settled,
             reservation_actual_matches_cost,
+            token_counts_non_negative,
             token_ceiling_matches_reservation,
             usage_ledger_unique,
             usage_ledger_matches_cost,
