@@ -670,7 +670,7 @@ Then('门户自动轮询到图片和视频成功并显示准确计费', async fu
   await assertAttribute(page.locator('html'), 'data-theme', 'light');
 });
 
-Then('上游短期签名不出现在响应、页面、详情或持久化存储中', async function (this: DogfoodWorld) {
+Then('上游短期签名只保存在受保护引用中且不出现在公开响应或媒体归档中', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   const observation = requireMultimodalObservation(this);
   const canary = 'never-persist';
@@ -695,10 +695,10 @@ Then('上游短期签名不出现在响应、页面、详情或持久化存储�
     signal: AbortSignal.timeout(1_000),
   });
   assert.equal(persistenceResponse.status, 200);
-  assert.deepEqual(await persistenceResponse.json(), { database: false, archive: false });
+  assert.deepEqual(await persistenceResponse.json(), { database: true, archive: false });
 });
 
-Then('用户通过真实下载控件取得归档图片和视频', async function (this: DogfoodWorld) {
+Then('用户通过真实下载控件取得代理图片和视频', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   const observation = requireMultimodalObservation(this);
   await assertGenerationDownload(page, observation.imageModel, 'browser-result.png', 'browser-png-asset');

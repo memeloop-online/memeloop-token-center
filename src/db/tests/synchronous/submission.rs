@@ -11,6 +11,11 @@ async fn durable_send_blocks_duplicate_owner_takeover_and_generic_refund() {
             request_hash: "a".repeat(64),
         };
         let idempotency = with_idempotency.then_some(&idempotency);
+        let request_object = if with_idempotency {
+            "objects/blake3/sent-request"
+        } else {
+            "metadata-only-json:{\"kind\":\"synchronous_image\",\"media_archived\":false}"
+        };
         let snapshot = serde_json::json!({"fixture":"pinned strategy"});
         let reservation = match database
             .start_synchronous_image_request(StartSynchronousImageRequest {
@@ -23,7 +28,7 @@ async fn durable_send_blocks_duplicate_owner_takeover_and_generic_refund() {
                 idempotency,
                 protocol: "openai-image",
                 model: "atomic-image",
-                request_object: "objects/blake3/sent-request",
+                request_object,
                 upstream_account_id: None,
                 model_route_id: None,
             })
@@ -215,10 +220,7 @@ async fn durable_send_blocks_duplicate_owner_takeover_and_generic_refund() {
             row.get::<String, _>("error_code"),
             "image_submission_uncertain"
         );
-        assert_eq!(
-            row.get::<String, _>("request_object"),
-            "objects/blake3/sent-request"
-        );
+        assert_eq!(row.get::<String, _>("request_object"), request_object);
     }
 }
 
