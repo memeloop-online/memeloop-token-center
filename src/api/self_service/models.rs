@@ -96,23 +96,24 @@ fn codex_models_response(
 ) -> Value {
     let mut models = std::collections::BTreeMap::<String, CodexModelAvailability>::new();
     for source in sources {
+        if source.protocol != "openai" {
+            continue;
+        }
         let Some(provider) = state.providers.get(&source.driver) else {
             continue;
         };
         let availability = models.entry(source.public_model.clone()).or_default();
-        if source.protocol == "openai" {
-            let compatible = provider
-                .request_compatibility
-                .supports_codex_multi_agent_v2();
-            if availability.openai_source_seen {
-                // Later sources can only make the advertisement more
-                // conservative. This avoids claiming V2 when a public model
-                // can route to an incompatible OpenAI provider.
-                availability.openai_multi_agent_v2 &= compatible;
-            } else {
-                availability.openai_source_seen = true;
-                availability.openai_multi_agent_v2 = compatible;
-            }
+        let compatible = provider
+            .request_compatibility
+            .supports_codex_multi_agent_v2();
+        if availability.openai_source_seen {
+            // Later sources can only make the advertisement more
+            // conservative. This avoids claiming V2 when a public model
+            // can route to an incompatible OpenAI provider.
+            availability.openai_multi_agent_v2 &= compatible;
+        } else {
+            availability.openai_source_seen = true;
+            availability.openai_multi_agent_v2 = compatible;
         }
     }
     json!({
