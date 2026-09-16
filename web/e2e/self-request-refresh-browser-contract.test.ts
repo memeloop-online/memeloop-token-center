@@ -52,7 +52,7 @@ test('self request polling is accessible, identity-safe, visibility-aware, and h
     await page.getByRole('button', { name: 'Clear credential', exact: true }).click();
     await credential.fill('second');
     await page.getByRole('button', { name: 'Continue', exact: true }).click();
-    await page.locator('.request-id-control.compact code').filter({ hasText: /^second-00$/ }).waitFor();
+    await page.locator('.request-model-cell code').filter({ hasText: /^second-00$/ }).waitFor();
     if (heldFirstRequest) await heldFirstRequest.fulfill({ json: [request('old-first-response', 3_000)] }).catch(() => undefined);
     assert.equal(await page.getByText('old-first-response', { exact: true }).count(), 0, 'an aborted first credential response cannot populate the second credential page');
 
