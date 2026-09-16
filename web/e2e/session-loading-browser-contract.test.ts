@@ -9,6 +9,7 @@ declare global {
   interface Window {
     sessionDetailReads: number;
     sessionListReads: number;
+    sessionListAborts: number;
     resolveSessionList: (ok: boolean) => void;
   }
 }
@@ -22,7 +23,7 @@ async function settleRenderedRefresh(page: import('playwright').Page, expectedLi
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
 }
 
-test('session initial spinner, retry failure and background retry preserve the right visible page', { timeout: 45_000 }, async () => {
+test('session reads retry a transient failure inside one deadline and remain cancellable', { timeout: 45_000 }, async () => {
   if (!existsSync(chromium.executablePath())) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
     return test.skip('Chromium required');
@@ -40,11 +41,9 @@ test('session initial spinner, retry failure and background retry preserve the r
     await page.locator('.session-browser').getByText('Loading…', { exact: true }).waitFor();
     assert.equal(await page.getByText('Retained session', { exact: true }).count(), 0);
     await page.evaluate(() => window.resolveSessionList(false));
-    const retry = page.getByRole('button', { name: 'Retry loading sessions', exact: true });
-    await retry.waitFor();
-    assert.equal(await page.locator('.session-browser').getByText('Loading…', { exact: true }).count(), 0);
-    await retry.click();
     await page.waitForFunction(() => window.sessionListReads === 2);
+    assert.equal(await page.getByRole('button', { name: 'Retry loading sessions', exact: true }).count(), 0,
+      'an early 503 is retried before surfacing an error');
     await page.locator('.session-browser').getByText('Loading…', { exact: true }).waitFor();
     await page.evaluate(() => window.resolveSessionList(true));
     await page.getByText('Retained session', { exact: true }).first().waitFor();
@@ -54,20 +53,20 @@ test('session initial spinner, retry failure and background retry preserve the r
     await page.waitForFunction(() => window.sessionListReads === 3);
     assert.ok(await page.getByText('Retained session', { exact: true }).count() > 0);
     await page.evaluate(() => window.resolveSessionList(false));
-    await retry.waitFor();
-    await retry.click();
     await page.waitForFunction(() => window.sessionListReads === 4);
-    assert.ok(await page.getByText('Retained session', { exact: true }).count() > 0, 'manual retry retains the loaded page while pending');
-    await page.evaluate(() => window.resolveSessionList(false));
-    await retry.waitFor();
-    assert.ok(await page.getByText('Retained session', { exact: true }).count() > 0, 'failed retry does not blank the page');
-    assert.equal(await page.locator('.session-browser').getByText('Loading…', { exact: true }).count(), 0);
+    assert.ok(await page.getByText('Retained session', { exact: true }).count() > 0, 'automatic retry retains the loaded page while pending');
+    await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await page.waitForFunction(() => window.sessionListAborts === 1);
+    assert.ok(await page.getByText('Retained session', { exact: true }).count() > 0, 'cancelling a retry does not blank the loaded page');
+    await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+    await page.waitForFunction(() => window.sessionListReads === 5);
+    await page.evaluate(() => window.resolveSessionList(true));
     const credential = page.locator('.session-controls input[role="combobox"]');
     const credentialId = '019f4b00-1111-7111-8111-111111111111';
     await credential.fill(credentialId);
     assert.equal(await credential.inputValue(), credentialId, 'a pasted real-shaped credential ID stays editable');
     await page.getByRole('button', { name: 'Apply filters', exact: true }).click();
-    await page.waitForFunction(() => window.sessionListReads === 5);
+    await page.waitForFunction(() => window.sessionListReads === 6);
     await page.evaluate(() => window.resolveSessionList(true));
     await page.getByText('Retained session', { exact: true }).first().waitFor();
     await credential.fill('alias-that-has-not-been-selected');

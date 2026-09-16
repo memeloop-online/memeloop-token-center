@@ -74,6 +74,8 @@ function waitForReadRetry(milliseconds: number, signal?: AbortSignal): Promise<v
 interface ApiReadOptions {
   attempts?: number;
   attemptTimeoutMilliseconds?: number;
+  /** Bounds all attempts and retry backoff as one user-visible operation. */
+  totalTimeoutMilliseconds?: number;
   signal?: AbortSignal;
 }
 
@@ -84,23 +86,29 @@ interface ApiReadOptions {
 export async function apiRead<T>(
   path: string,
   credential: string,
-  { attempts = 4, attemptTimeoutMilliseconds = 3_000, signal }: ApiReadOptions = {},
+  { attempts = 4, attemptTimeoutMilliseconds = 3_000, totalTimeoutMilliseconds, signal }: ApiReadOptions = {},
 ): Promise<T> {
+  const deadline = totalTimeoutMilliseconds === undefined
+    ? undefined
+    : AbortSignal.timeout(totalTimeoutMilliseconds);
+  const operationSignal = signal && deadline
+    ? AbortSignal.any([signal, deadline])
+    : signal ?? deadline;
   let lastError: unknown;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const attemptSignal = signal
-      ? AbortSignal.any([signal, AbortSignal.timeout(attemptTimeoutMilliseconds)])
+    const attemptSignal = operationSignal
+      ? AbortSignal.any([operationSignal, AbortSignal.timeout(attemptTimeoutMilliseconds)])
       : AbortSignal.timeout(attemptTimeoutMilliseconds);
     try {
       return await api<T>(path, credential, { signal: attemptSignal });
     } catch (reason) {
-      if (signal?.aborted) throw reason;
+      if (operationSignal?.aborted) throw reason;
       lastError = reason;
       const retryable = reason instanceof TypeError
         || (reason instanceof DOMException && reason.name === 'TimeoutError')
         || (reason instanceof ApiError && retryableReadStatuses.has(reason.status));
       if (!retryable || attempt + 1 >= attempts) throw reason;
-      await waitForReadRetry(150 * (2 ** attempt), signal);
+      await waitForReadRetry(150 * (2 ** attempt), operationSignal);
     }
   }
   throw lastError;
