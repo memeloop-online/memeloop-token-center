@@ -7,7 +7,7 @@ impl Database {
         &self,
         input: FinishGenerationJobInput<'_>,
     ) -> Result<i64, AppError> {
-        self.finish_generation_job_inner(input, None, ready(()))
+        self.finish_generation_job_inner(input, None, None, ready(()))
             .await
     }
 
@@ -15,9 +15,15 @@ impl Database {
         &self,
         input: FinishGenerationJobInput<'_>,
         provider_assets: &[ProviderGenerationAsset],
+        key_material: &[u8],
     ) -> Result<i64, AppError> {
-        self.finish_generation_job_inner(input, Some(provider_assets), ready(()))
-            .await
+        self.finish_generation_job_inner(
+            input,
+            Some(provider_assets),
+            Some(key_material),
+            ready(()),
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -29,7 +35,7 @@ impl Database {
     where
         F: Future<Output = ()>,
     {
-        self.finish_generation_job_inner(input, None, before_write)
+        self.finish_generation_job_inner(input, None, None, before_write)
             .await
     }
 
@@ -37,6 +43,7 @@ impl Database {
         &self,
         input: FinishGenerationJobInput<'_>,
         provider_assets: Option<&[ProviderGenerationAsset]>,
+        provider_key_material: Option<&[u8]>,
         before_write: F,
     ) -> Result<i64, AppError>
     where
@@ -204,9 +211,18 @@ impl Database {
             ..TokenUsage::default()
         };
         let expected_cost_micros = price_token_usage(&reservation, &usage)?;
-        let result = (input.status == "succeeded").then(|| {
-            safe_generation_result(&driver, input.billed_units, input.assets, provider_assets)
-        });
+        let result = if input.status == "succeeded" {
+            Some(safe_generation_result(
+                input.job_id,
+                &driver,
+                input.billed_units,
+                input.assets,
+                provider_assets,
+                provider_key_material,
+            )?)
+        } else {
+            None
+        };
         let result_json = result
             .as_ref()
             .map(serde_json::to_string)
@@ -233,10 +249,20 @@ impl Database {
             } else {
                 persisted_staged_assets.is_none()
             };
+            let exact_result = match provider_assets {
+                Some(provider_assets) => provider_generation_result_matches(
+                    existing_result.as_ref(),
+                    result.as_ref(),
+                    input.job_id,
+                    provider_assets,
+                    provider_key_material.ok_or(AppError::Internal)?,
+                )?,
+                None => existing_result == result,
+            };
             let exact_terminal = current_status == input.status
                 && existing_billed_units == Some(input.billed_units)
                 && existing_cost_micros == expected_cost_micros
-                && existing_result == result
+                && exact_result
                 && existing_error_code.as_deref() == input.error_code
                 && staged_replay_matches
                 && reservation_status == "settled"
@@ -388,6 +414,7 @@ fn is_allowed_generation_error_code(error_code: &str) -> bool {
             | "submission_outcome_unknown"
             | "generation_staging_lost"
             | "generation_asset_bytes_exceeded"
+            | "generation_asset_unavailable"
             | "upstream_usage_exceeds_contract"
             | "seedance_generation_failed"
             | "seedance_missing_asset"
@@ -405,11 +432,13 @@ fn is_allowed_generation_error_code(error_code: &str) -> bool {
 }
 
 fn safe_generation_result(
+    job_id: Uuid,
     driver: &str,
     billed_units: i64,
     assets: &[ArchivedGenerationAsset],
     provider_assets: Option<&[ProviderGenerationAsset]>,
-) -> serde_json::Value {
+    provider_key_material: Option<&[u8]>,
+) -> Result<serde_json::Value, AppError> {
     let provider = match driver {
         "volcengine-seedance" => {
             serde_json::json!({"status": "succeeded", "duration": billed_units})
@@ -449,16 +478,50 @@ fn safe_generation_result(
                     })
                 })
                 .collect::<Vec<_>>();
-            serde_json::json!({
+            let provider_reference = crate::generation::seal_provider_asset_reference(
+                "job",
+                job_id,
+                provider_assets,
+                provider_key_material.ok_or(AppError::Internal)?,
+            )?;
+            Ok(serde_json::json!({
                 "provider": provider,
                 "assets": assets,
                 "asset_expirations": asset_expirations,
-                "provider_assets": provider_assets,
+                "provider_reference": provider_reference,
                 "media_archived": false
-            })
+            }))
         }
-        None => serde_json::json!({"provider": provider, "assets": assets}),
+        None => Ok(serde_json::json!({"provider": provider, "assets": assets})),
     }
+}
+
+fn provider_generation_result_matches(
+    existing: Option<&serde_json::Value>,
+    expected: Option<&serde_json::Value>,
+    job_id: Uuid,
+    provider_assets: &[ProviderGenerationAsset],
+    key_material: &[u8],
+) -> Result<bool, AppError> {
+    let (Some(mut existing), Some(mut expected)) = (existing.cloned(), expected.cloned()) else {
+        return Ok(false);
+    };
+    let existing_reference = existing
+        .as_object_mut()
+        .and_then(|value| value.remove("provider_reference"))
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or(AppError::Internal)?;
+    expected
+        .as_object_mut()
+        .and_then(|value| value.remove("provider_reference"))
+        .ok_or(AppError::Internal)?;
+    let existing_assets = crate::generation::open_provider_asset_reference(
+        "job",
+        job_id,
+        &existing_reference,
+        key_material,
+    )?;
+    Ok(existing == expected && existing_assets == provider_assets)
 }
 
 pub(super) async fn insert_generation_assets_in_transaction(

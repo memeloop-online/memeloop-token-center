@@ -920,6 +920,7 @@ impl Database {
     pub async fn synchronous_generation_assets(
         &self,
         request_id: Uuid,
+        key_material: &[u8],
     ) -> Result<Vec<GenerationAssetDownload>, AppError> {
         let rows = sqlx::query(
             "SELECT id, asset_index, object_locator, mime_type, size_bytes, filename FROM generation_assets WHERE request_id = $1 ORDER BY asset_index, id",
@@ -941,7 +942,7 @@ impl Database {
         let Some(row) = row else {
             return Ok(Vec::new());
         };
-        Ok(synchronous_provider_assets(row, request_id))
+        synchronous_provider_assets(row, request_id, key_material)
     }
 
     pub async fn synchronous_generation_asset_for_key(
@@ -949,6 +950,7 @@ impl Database {
         key_id: Uuid,
         request_id: Uuid,
         asset_id: Uuid,
+        key_material: &[u8],
     ) -> Result<GenerationAssetDownload, AppError> {
         let row = sqlx::query(
             "SELECT a.id, a.asset_index, a.object_locator, a.mime_type, a.size_bytes, a.filename FROM generation_assets a JOIN request_record_locators r ON r.id = a.request_id WHERE a.id = $1 AND a.request_id = $2 AND r.key_id = $3",
@@ -969,7 +971,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?
         .ok_or(AppError::NotFound)?;
-        synchronous_provider_asset_download(row, request_id, asset_id)
+        synchronous_provider_asset_download(row, request_id, asset_id, key_material)
     }
 
     pub async fn synchronous_generation_asset_for_tenant(
@@ -977,6 +979,7 @@ impl Database {
         tenant_external_id: &str,
         request_id: Uuid,
         asset_id: Uuid,
+        key_material: &[u8],
     ) -> Result<GenerationAssetDownload, AppError> {
         let row = sqlx::query(
             "SELECT a.id, a.asset_index, a.object_locator, a.mime_type, a.size_bytes, a.filename FROM generation_assets a JOIN request_record_locators r ON r.id = a.request_id JOIN tenants t ON t.id = r.tenant_id WHERE a.id = $1 AND a.request_id = $2 AND t.external_id = $3",
@@ -997,13 +1000,14 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?
         .ok_or(AppError::NotFound)?;
-        synchronous_provider_asset_download(row, request_id, asset_id)
+        synchronous_provider_asset_download(row, request_id, asset_id, key_material)
     }
 
     pub async fn synchronous_generation_asset_global(
         &self,
         request_id: Uuid,
         asset_id: Uuid,
+        key_material: &[u8],
     ) -> Result<GenerationAssetDownload, AppError> {
         let row = sqlx::query(
             "SELECT a.id, a.asset_index, a.object_locator, a.mime_type, a.size_bytes, a.filename FROM generation_assets a JOIN request_record_locators r ON r.id = a.request_id WHERE a.id = $1 AND a.request_id = $2",
@@ -1020,7 +1024,7 @@ impl Database {
             .fetch_optional(&self.pool)
             .await?
             .ok_or(AppError::NotFound)?;
-        synchronous_provider_asset_download(row, request_id, asset_id)
+        synchronous_provider_asset_download(row, request_id, asset_id, key_material)
     }
 
     pub async fn load_synchronous_asset_upstream(
@@ -1079,42 +1083,51 @@ fn synchronous_provider_asset_download(
     row: AnyRow,
     request_id: Uuid,
     asset_id: Uuid,
+    key_material: &[u8],
 ) -> Result<GenerationAssetDownload, AppError> {
-    let asset = synchronous_provider_assets(row, request_id)
+    let asset = synchronous_provider_assets(row, request_id, key_material)?
         .into_iter()
         .find(|asset| asset.view.asset_id == asset_id)
         .ok_or(AppError::NotFound)?;
     Ok(asset)
 }
 
-fn synchronous_provider_assets(row: AnyRow, request_id: Uuid) -> Vec<GenerationAssetDownload> {
+fn synchronous_provider_assets(
+    row: AnyRow,
+    request_id: Uuid,
+    key_material: &[u8],
+) -> Result<Vec<GenerationAssetDownload>, AppError> {
     let response_object = row
         .try_get::<Option<String>, _>("response_object")
-        .ok()
-        .flatten();
-    response_object
-        .as_deref()
-        .and_then(|value| value.strip_prefix("provider-reference-json:"))
-        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
-        .and_then(|value| value.get("provider_assets").cloned())
-        .and_then(|value| serde_json::from_value::<Vec<ProviderGenerationAsset>>(value).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|asset| GenerationAssetDownload {
-            view: GenerationAssetView {
-                asset_id: asset.asset_id,
-                index: asset.index,
-                mime_type: asset.mime_type,
-                size_bytes: 0,
-                filename: asset.filename,
-            },
-            source: GenerationAssetSource::Provider {
-                owner: GenerationAssetProviderOwner::Request(request_id),
-                url: asset.url,
-                expires_at: asset.expires_at,
-            },
-        })
-        .collect()
+        .map_err(|_| AppError::Internal)?;
+    let Some(response_object) = response_object else {
+        return Ok(Vec::new());
+    };
+    if !response_object.starts_with(crate::generation::PROVIDER_REFERENCE_PREFIX) {
+        return Ok(Vec::new());
+    }
+    Ok(crate::generation::open_provider_asset_reference(
+        "request",
+        request_id,
+        &response_object,
+        key_material,
+    )?
+    .into_iter()
+    .map(|asset| GenerationAssetDownload {
+        view: GenerationAssetView {
+            asset_id: asset.asset_id,
+            index: asset.index,
+            mime_type: asset.mime_type,
+            size_bytes: 0,
+            filename: asset.filename,
+        },
+        source: GenerationAssetSource::Provider {
+            owner: GenerationAssetProviderOwner::Request(request_id),
+            url: asset.url,
+            expires_at: asset.expires_at,
+        },
+    })
+    .collect())
 }
 
 fn synchronous_image_claim_from_row(

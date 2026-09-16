@@ -758,6 +758,7 @@ impl Database {
         key_id: Uuid,
         job_id: Uuid,
         asset_id: Uuid,
+        key_material: &[u8],
     ) -> Result<GenerationAssetDownload, AppError> {
         let row = sqlx::query(
             "SELECT a.id, a.asset_index, a.object_locator, a.mime_type, a.size_bytes, a.filename FROM generation_assets a JOIN generation_jobs j ON j.id = a.job_id WHERE a.id = $1 AND a.job_id = $2 AND j.key_id = $3",
@@ -777,7 +778,7 @@ impl Database {
                 .fetch_optional(&self.pool)
                 .await?
                 .ok_or(AppError::NotFound)?;
-        provider_generation_asset_download(row, job_id, asset_id)
+        provider_generation_asset_download(row, job_id, asset_id, key_material)
     }
 
     pub async fn generation_asset_for_tenant(
@@ -785,6 +786,7 @@ impl Database {
         tenant_external_id: &str,
         job_id: Uuid,
         asset_id: Uuid,
+        key_material: &[u8],
     ) -> Result<GenerationAssetDownload, AppError> {
         let row = sqlx::query(
             "SELECT a.id, a.asset_index, a.object_locator, a.mime_type, a.size_bytes, a.filename FROM generation_assets a JOIN generation_jobs j ON j.id = a.job_id JOIN tenants t ON t.id = j.tenant_id WHERE a.id = $1 AND a.job_id = $2 AND t.external_id = $3",
@@ -805,13 +807,14 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?
         .ok_or(AppError::NotFound)?;
-        provider_generation_asset_download(row, job_id, asset_id)
+        provider_generation_asset_download(row, job_id, asset_id, key_material)
     }
 
     pub async fn generation_asset_global(
         &self,
         job_id: Uuid,
         asset_id: Uuid,
+        key_material: &[u8],
     ) -> Result<GenerationAssetDownload, AppError> {
         let row = sqlx::query(
             "SELECT a.id, a.asset_index, a.object_locator, a.mime_type, a.size_bytes, a.filename FROM generation_assets a JOIN generation_jobs j ON j.id = a.job_id WHERE a.id = $1 AND a.job_id = $2",
@@ -828,7 +831,7 @@ impl Database {
             .fetch_optional(&self.pool)
             .await?
             .ok_or(AppError::NotFound)?;
-        provider_generation_asset_download(row, job_id, asset_id)
+        provider_generation_asset_download(row, job_id, asset_id, key_material)
     }
 
     /// Atomically cancels a queued job, or fences a running job for the
@@ -1539,7 +1542,7 @@ pub(super) fn generation_job_view(row: AnyRow) -> Result<GenerationJobView, AppE
         })
         .transpose()?;
     if let Some(result) = result.as_mut().and_then(serde_json::Value::as_object_mut) {
-        result.remove("provider_assets");
+        result.remove("provider_reference");
     }
     let assets = result
         .as_ref()
@@ -1572,14 +1575,21 @@ fn provider_generation_asset_download(
     row: AnyRow,
     job_id: Uuid,
     asset_id: Uuid,
+    key_material: &[u8],
 ) -> Result<GenerationAssetDownload, AppError> {
     let result_json: Option<String> = row.try_get("result_json")?;
-    let assets = result_json
+    let reference = result_json
         .as_deref()
         .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
-        .and_then(|value| value.get("provider_assets").cloned())
-        .and_then(|value| serde_json::from_value::<Vec<ProviderGenerationAsset>>(value).ok())
+        .and_then(|value| {
+            value
+                .get("provider_reference")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
         .ok_or(AppError::NotFound)?;
+    let assets =
+        crate::generation::open_provider_asset_reference("job", job_id, &reference, key_material)?;
     let asset = assets
         .into_iter()
         .find(|asset| asset.asset_id == asset_id)

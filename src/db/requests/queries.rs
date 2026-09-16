@@ -1664,7 +1664,7 @@ fn generation_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, A
                 serde_json::from_str::<serde_json::Value>(value).map_err(|_| AppError::Internal)?;
             let provider_metadata_only = value
                 .as_object_mut()
-                .and_then(|value| value.remove("provider_assets"))
+                .and_then(|value| value.remove("provider_reference"))
                 .is_some();
             Ok::<_, AppError>((value, provider_metadata_only))
         })

@@ -226,7 +226,7 @@ async fn provider_asset_success_keeps_delivery_and_metering_without_archiving_me
     let asset = ProviderGenerationAsset {
         asset_id: Uuid::now_v7(),
         index: 0,
-        url: "http://127.0.0.1:8188/view?filename=result.png".to_owned(),
+        url: "http://127.0.0.1:8188/view?filename=result.png&token=must-not-persist".to_owned(),
         expires_at: Some(unix_millis() + 60_000),
         mime_type: "image/png".to_owned(),
         filename: "result.png".to_owned(),
@@ -244,6 +244,7 @@ async fn provider_asset_success_keeps_delivery_and_metering_without_archiving_me
                 staged_assets: None,
             },
             std::slice::from_ref(&asset),
+            PEPPER,
         )
         .await
         .unwrap();
@@ -257,6 +258,15 @@ async fn provider_asset_success_keeps_delivery_and_metering_without_archiving_me
     assert_eq!(finished.assets.len(), 1);
     assert_eq!(finished.assets[0].asset_id, asset.asset_id);
     assert!(!finished.result.unwrap().to_string().contains(&asset.url));
+    let stored_result: String =
+        sqlx::query_scalar("SELECT result_json FROM generation_jobs WHERE id = $1")
+            .bind(job.job_id.to_string())
+            .fetch_one(&inspection)
+            .await
+            .unwrap();
+    assert!(!stored_result.contains(&asset.url));
+    assert!(!stored_result.contains("token="));
+    assert!(stored_result.contains("provider-reference-json:"));
     let archive_refs = database
         .request_archive_refs(key.key_id, job.job_id)
         .await
@@ -272,8 +282,9 @@ async fn provider_asset_success_keeps_delivery_and_metering_without_archiving_me
     let public_response = archive_refs.response_json.unwrap();
     assert!(!public_response.to_string().contains(&asset.url));
     assert!(public_response.get("provider_assets").is_none());
+    assert!(public_response.get("provider_reference").is_none());
     let download = database
-        .generation_asset_for_key(key.key_id, job.job_id, asset.asset_id)
+        .generation_asset_for_key(key.key_id, job.job_id, asset.asset_id, PEPPER)
         .await
         .unwrap();
     assert!(matches!(
@@ -2235,7 +2246,8 @@ async fn generation_staging_takeover_rejects_a_late_writer_and_replays_the_exact
             .generation_asset_for_key(
                 key.key_id,
                 job.job_id,
-                replacement_manifest.assets[0].asset_id
+                replacement_manifest.assets[0].asset_id,
+                PEPPER,
             )
             .await
             .unwrap()

@@ -75,6 +75,7 @@ struct TokenCenterWorld {
     stable_service_id: Option<Uuid>,
     generation_job_id: Option<Uuid>,
     synchronous_request_id: Option<Uuid>,
+    provider_asset_expires_at: Option<i64>,
     image_route_id: Option<Uuid>,
     image_route_updated_at: i64,
     matrix_global_service_token: String,
@@ -124,6 +125,7 @@ impl Default for TokenCenterWorld {
             stable_service_id: None,
             generation_job_id: None,
             synchronous_request_id: None,
+            provider_asset_expires_at: None,
             image_route_id: None,
             image_route_updated_at: 0,
             matrix_global_service_token: String::new(),
@@ -731,11 +733,20 @@ async fn siliconflow_video_succeeds(world: &mut TokenCenterWorld) {
                 .received_requests()
                 .await
                 .expect("asset mock request recording");
-            assert_eq!(asset_requests.len(), 1);
+            assert_eq!(asset_requests.len(), 2);
             assert!(
-                asset_requests[0].headers.get("authorization").is_none(),
+                asset_requests
+                    .iter()
+                    .all(|request| request.headers.get("authorization").is_none()),
                 "the API credential must not cross from the API origin to the result CDN"
             );
+            assert!(asset_requests.iter().any(|request| {
+                request
+                    .headers
+                    .get("range")
+                    .and_then(|value| value.to_str().ok())
+                    == Some("bytes=0-0")
+            }));
             assert_generation_stats(world, "siliconflow-video-public", "0.2").await;
             world.response = value;
             return;
@@ -2712,7 +2723,12 @@ async fn comfyui_video_generation_succeeds(world: &mut TokenCenterWorld) {
                 .expect("authenticate ComfyUI video key");
             let stored = state
                 .db
-                .generation_asset_for_key(key.key_id, job_id, asset_id)
+                .generation_asset_for_key(
+                    key.key_id,
+                    job_id,
+                    asset_id,
+                    state.config.key_pepper.as_bytes(),
+                )
                 .await
                 .expect("stored ComfyUI video asset");
             assert_eq!(stored.view.mime_type, "video/mp4");
@@ -2824,11 +2840,61 @@ async fn mock_openai_image_url_generation(world: &mut TokenCenterWorld) {
     Mock::given(method("GET"))
         .and(path("/generated/SECRET_TOKEN.png"))
         .and(query_param("token", "must-not-leak"))
+        .and(header("authorization", "Bearer image-secret"))
+        .and(header("range", "bytes=0-0"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "image/png")
+                .insert_header("content-range", "bytes 0-0/13")
+                .insert_header("accept-ranges", "bytes")
+                .set_body_bytes(b"e"),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/generated/SECRET_TOKEN.png"))
+        .and(query_param("token", "must-not-leak"))
+        .and(header("authorization", "Bearer image-secret"))
+        .and(header("range", "bytes=999-1000"))
+        .respond_with(
+            ResponseTemplate::new(416)
+                .insert_header("content-range", "bytes */13")
+                .insert_header("accept-ranges", "bytes"),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/generated/SECRET_TOKEN.png"))
+        .and(query_param("token", "must-not-leak"))
+        .and(header("authorization", "Bearer image-secret"))
+        .and(header("range", "bytes=2-5"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "image/png")
+                .insert_header("content-range", "bytes 2-5/13")
+                .insert_header("accept-ranges", "bytes")
+                .set_body_bytes(b"act-"),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/generated/SECRET_TOKEN.png"))
+        .and(query_param("token", "must-not-leak"))
+        .and(header("authorization", "Bearer image-secret"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "image/png")
+                .insert_header("accept-ranges", "bytes")
                 .set_body_bytes(b"exact-url-png"),
         )
+        .with_priority(10)
+        .expect(2)
         .mount(world.mock.as_ref().expect("mock server"))
         .await;
 }
@@ -2860,6 +2926,158 @@ async fn mock_empty_openai_image_url_generation(world: &mut TokenCenterWorld) {
         .await;
 }
 
+#[given("the mock OpenAI Images upstream returns a missing signed URL asset")]
+async fn mock_missing_openai_image_url_generation(world: &mut TokenCenterWorld) {
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .and(header("authorization", "Bearer image-secret"))
+        .and(header_exists("idempotency-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "created": 1,
+            "data": [{"url": format!("{mock_url}/generated/missing.png?token=must-not-leak")}]
+        })))
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/generated/missing.png"))
+        .and(query_param("token", "must-not-leak"))
+        .and(header("authorization", "Bearer image-secret"))
+        .and(header("range", "bytes=0-0"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
+#[given("the mock OpenAI Images upstream returns an expired signed URL asset")]
+async fn mock_expired_openai_image_url_generation(world: &mut TokenCenterWorld) {
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .and(header("authorization", "Bearer image-secret"))
+        .and(header_exists("idempotency-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "created": 1,
+            "data": [{"url": format!("{mock_url}/generated/expired.png?expires=1&token=must-not-leak")}]
+        })))
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
+#[given("the mock OpenAI Images asset is deleted after successful validation")]
+async fn mock_deleted_after_validation_image(world: &mut TokenCenterWorld) {
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .and(header("authorization", "Bearer image-secret"))
+        .and(header_exists("idempotency-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "created": 1,
+            "data": [{"url": format!("{mock_url}/generated/deleted-later.png?token=must-not-leak")}]
+        })))
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/generated/deleted-later.png"))
+        .and(header("authorization", "Bearer image-secret"))
+        .and(header("range", "bytes=0-0"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "image/png")
+                .insert_header("content-range", "bytes 0-0/1")
+                .set_body_bytes(b"x"),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/generated/deleted-later.png"))
+        .and(header("authorization", "Bearer image-secret"))
+        .respond_with(ResponseTemplate::new(404))
+        .with_priority(10)
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
+#[given("the mock OpenAI Images asset becomes empty after successful validation")]
+async fn mock_empty_after_validation_image(world: &mut TokenCenterWorld) {
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .and(header("authorization", "Bearer image-secret"))
+        .and(header_exists("idempotency-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "created": 1,
+            "data": [{"url": format!("{mock_url}/generated/empty-later.png?token=must-not-leak")}]
+        })))
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/generated/empty-later.png"))
+        .and(header("authorization", "Bearer image-secret"))
+        .and(header("range", "bytes=0-0"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "image/png")
+                .insert_header("content-range", "bytes 0-0/1")
+                .set_body_bytes(b"x"),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/generated/empty-later.png"))
+        .and(header("authorization", "Bearer image-secret"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "image/png")
+                .set_body_bytes(Vec::<u8>::new()),
+        )
+        .with_priority(10)
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
+#[given("the mock OpenAI Images asset expires shortly after successful validation")]
+async fn mock_expires_after_validation_image(world: &mut TokenCenterWorld) {
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    let expires_at = memeloop_token_center::db::unix_millis().saturating_add(5_000);
+    world.provider_asset_expires_at = Some(expires_at);
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .and(header("authorization", "Bearer image-secret"))
+        .and(header_exists("idempotency-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "created": 1,
+            "data": [{"url": format!("{mock_url}/generated/expires-later.png?expires={expires_at}&token=must-not-leak")}]
+        })))
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/generated/expires-later.png"))
+        .and(header("authorization", "Bearer image-secret"))
+        .and(header("range", "bytes=0-0"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "image/png")
+                .insert_header("content-range", "bytes 0-0/1")
+                .set_body_bytes(b"x"),
+        )
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
 #[given("the mock OpenAI Images upstream returns ten assets over the aggregate budget")]
 async fn mock_openai_image_aggregate_limit(world: &mut TokenCenterWorld) {
     // This scenario inspects the durable pre-reaper boundary. The worker's
@@ -2884,6 +3102,21 @@ async fn mock_openai_image_aggregate_limit(world: &mut TokenCenterWorld) {
         .expect(1)
         .mount(world.mock.as_ref().expect("mock server"))
         .await;
+    for index in 0..10 {
+        Mock::given(method("GET"))
+            .and(path(format!("/generated/aggregate-{index}.png")))
+            .and(header("authorization", "Bearer image-secret"))
+            .and(header("range", "bytes=0-0"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("content-type", "image/png")
+                    .insert_header("content-range", "bytes 0-0/1")
+                    .set_body_bytes(b"x"),
+            )
+            .expect(1)
+            .mount(world.mock.as_ref().expect("mock server"))
+            .await;
+    }
 }
 
 #[given("the mock OpenAI Images upstream exceeds the response limit by one byte")]
@@ -3390,7 +3623,7 @@ async fn openai_url_image_is_archived(world: &mut TokenCenterWorld) {
     let state = world.state.clone().expect("test application state");
     let assets = state
         .db
-        .synchronous_generation_assets(request_id)
+        .synchronous_generation_assets(request_id, state.config.key_pepper.as_bytes())
         .await
         .expect("synchronous image assets");
     assert_eq!(assets.len(), 1);
@@ -3417,6 +3650,12 @@ async fn openai_url_image_is_archived(world: &mut TokenCenterWorld) {
             .as_deref()
             .is_some_and(|value| value.starts_with("provider-reference-json:"))
     );
+    let stored_reference = response_refs
+        .response_object
+        .as_deref()
+        .expect("encrypted provider reference");
+    assert!(!stored_reference.contains("must-not-leak"));
+    assert!(!stored_reference.contains("SECRET_TOKEN"));
     let detail = world
         .client
         .get(format!(
@@ -3436,6 +3675,52 @@ async fn openai_url_image_is_archived(world: &mut TokenCenterWorld) {
     let asset_url = format!(
         "{}/self/v1/requests/{request_id}/assets/{}",
         world.service_url, assets[0].view.asset_id
+    );
+    let ranged = world
+        .client
+        .get(&asset_url)
+        .bearer_auth(&world.current_key)
+        .header("range", "bytes=2-5")
+        .send()
+        .await
+        .expect("ranged synchronous image asset download");
+    assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(ranged.headers()["content-range"], "bytes 2-5/13");
+    assert_eq!(ranged.headers()["accept-ranges"], "bytes");
+    assert_eq!(
+        ranged.bytes().await.expect("ranged image bytes"),
+        bytes::Bytes::from_static(b"act-")
+    );
+    let invalid_range = world
+        .client
+        .get(&asset_url)
+        .bearer_auth(&world.current_key)
+        .header("range", "bytes=5-2")
+        .send()
+        .await
+        .expect("invalid synchronous image asset range");
+    assert_eq!(invalid_range.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(invalid_range.headers()["content-range"], "bytes */0");
+    assert_eq!(
+        invalid_range.headers()["cache-control"],
+        "private, no-store"
+    );
+    let unsatisfiable_range = world
+        .client
+        .get(&asset_url)
+        .bearer_auth(&world.current_key)
+        .header("range", "bytes=999-1000")
+        .send()
+        .await
+        .expect("provider-unsatisfiable synchronous image asset range");
+    assert_eq!(
+        unsatisfiable_range.status(),
+        StatusCode::RANGE_NOT_SATISFIABLE
+    );
+    assert_eq!(unsatisfiable_range.headers()["content-range"], "bytes */13");
+    assert_eq!(
+        unsatisfiable_range.headers()["cache-control"],
+        "private, no-store"
     );
     let download = world
         .client
@@ -3583,7 +3868,7 @@ async fn confirm_unknown_image_not_delivered(world: &TokenCenterWorld, kind: &st
     assert!(
         state
             .db
-            .synchronous_generation_assets(request_id)
+            .synchronous_generation_assets(request_id, state.config.key_pepper.as_bytes())
             .await
             .unwrap()
             .is_empty(),
@@ -3728,54 +4013,109 @@ async fn confirm_unknown_image_not_delivered(world: &TokenCenterWorld, kind: &st
     pool.close().await;
 }
 
-#[then(
-    "the empty URL image remains metered but downloads as unavailable without exposing the signed URL"
-)]
+#[then("the empty URL image is quarantined without exposing or charging the signed URL")]
 async fn empty_openai_url_image_is_rejected(world: &mut TokenCenterWorld) {
-    assert!(!world.response.to_string().contains("must-not-leak"));
-    let request_id = world
-        .synchronous_request_id
-        .expect("empty URL image request id");
-    let replay = replay_openai_compatible_image(world).await;
-    assert_eq!(replay.status(), StatusCode::CONFLICT);
-    let detail = world
-        .client
-        .get(format!(
-            "{}/self/v1/requests/{request_id}",
-            world.service_url
-        ))
-        .bearer_auth(&world.current_key)
-        .send()
-        .await
-        .expect("empty URL image detail")
-        .json::<Value>()
-        .await
-        .expect("empty URL image detail JSON");
-    assert_eq!(detail["status_code"], 200);
-    assert_eq!(detail["cost"], "0.3");
-    assert_eq!(detail["response_body"]["media_archived"], false);
-    assert!(!detail.to_string().contains("must-not-leak"));
-    let state = world.state.clone().expect("test application state");
-    let assets = state
-        .db
-        .synchronous_generation_assets(request_id)
-        .await
-        .expect("empty URL image assets");
-    assert_eq!(assets.len(), 1);
-    let download = world
-        .client
-        .get(format!(
-            "{}/self/v1/requests/{request_id}/assets/{}",
-            world.service_url, assets[0].view.asset_id
-        ))
-        .bearer_auth(&world.current_key)
-        .send()
-        .await
-        .expect("empty provider asset download");
-    assert_eq!(download.status(), StatusCode::GONE);
+    assert_unavailable_openai_url_image(world, "/generated/empty.png", 1).await;
 }
 
-#[then("the ten image request publishes protected references without downloading media")]
+#[then("the missing URL image is quarantined without exposing or charging the signed URL")]
+async fn missing_openai_url_image_is_rejected(world: &mut TokenCenterWorld) {
+    assert_unavailable_openai_url_image(world, "/generated/missing.png", 1).await;
+}
+
+#[then("the expired URL image is quarantined without exposing or charging the signed URL")]
+async fn expired_openai_url_image_is_rejected(world: &mut TokenCenterWorld) {
+    assert_unavailable_openai_url_image(world, "/generated/expired.png", 0).await;
+}
+
+async fn assert_unavailable_openai_url_image(
+    world: &mut TokenCenterWorld,
+    path: &str,
+    expected_asset_requests: usize,
+) {
+    assert!(!world.response.to_string().contains("must-not-leak"));
+    confirm_unknown_image_not_delivered(world, "openai").await;
+    let asset_requests = world
+        .mock
+        .as_ref()
+        .expect("mock server")
+        .received_requests()
+        .await
+        .expect("empty asset validation requests")
+        .into_iter()
+        .filter(|request| request.url.path() == path)
+        .collect::<Vec<_>>();
+    assert_eq!(asset_requests.len(), expected_asset_requests);
+    if expected_asset_requests == 0 {
+        return;
+    }
+    assert_eq!(
+        asset_requests[0]
+            .headers
+            .get("authorization")
+            .and_then(|values| values.to_str().ok()),
+        Some("Bearer image-secret")
+    );
+    assert_eq!(
+        asset_requests[0]
+            .headers
+            .get("range")
+            .and_then(|values| values.to_str().ok()),
+        Some("bytes=0-0")
+    );
+}
+
+#[then("the deleted provider image downloads as unavailable")]
+async fn deleted_provider_image_is_unavailable(world: &mut TokenCenterWorld) {
+    assert_provider_image_download_unavailable(world, false).await;
+}
+
+#[then("the emptied provider image downloads as unavailable")]
+async fn emptied_provider_image_is_unavailable(world: &mut TokenCenterWorld) {
+    assert_provider_image_download_unavailable(world, false).await;
+}
+
+#[then("the expired provider image downloads as unavailable")]
+async fn expired_provider_image_is_unavailable(world: &mut TokenCenterWorld) {
+    assert_provider_image_download_unavailable(world, true).await;
+}
+
+async fn assert_provider_image_download_unavailable(
+    world: &TokenCenterWorld,
+    wait_for_expiry: bool,
+) {
+    if wait_for_expiry {
+        let expires_at = world
+            .provider_asset_expires_at
+            .expect("provider asset expiry fixture");
+        let wait = expires_at
+            .saturating_sub(memeloop_token_center::db::unix_millis())
+            .saturating_add(50);
+        if wait > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(wait as u64)).await;
+        }
+    }
+    let public_url = world.response["data"][0]["url"]
+        .as_str()
+        .expect("protected provider asset URL");
+    let response = world
+        .client
+        .get(format!("{}{public_url}", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("unavailable provider asset response");
+    assert_eq!(response.status(), StatusCode::GONE);
+    assert_eq!(response.headers()["cache-control"], "private, no-store");
+    let body: Value = response
+        .json()
+        .await
+        .expect("unavailable provider asset JSON");
+    assert_eq!(body["error"]["code"], "generation_asset_unavailable");
+    assert!(!body.to_string().contains("must-not-leak"));
+}
+
+#[then("the ten image request publishes protected references after bounded validation")]
 async fn aggregate_openai_images_are_refunded_and_cleaned(world: &mut TokenCenterWorld) {
     let request_id = world
         .synchronous_request_id
@@ -3783,7 +4123,7 @@ async fn aggregate_openai_images_are_refunded_and_cleaned(world: &mut TokenCente
     let state = world.state.clone().expect("test application state");
     let assets = state
         .db
-        .synchronous_generation_assets(request_id)
+        .synchronous_generation_assets(request_id, state.config.key_pepper.as_bytes())
         .await
         .expect("aggregate image DB assets");
     assert_eq!(assets.len(), 10);

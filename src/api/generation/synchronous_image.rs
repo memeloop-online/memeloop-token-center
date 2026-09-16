@@ -638,6 +638,28 @@ async fn finish_openai_image_response(
             None,
         )?);
     }
+    for asset in &provider_assets {
+        match crate::generation::provider_asset_is_obtainable(state, route, asset).await {
+            Ok(true) => {}
+            Ok(false) => {
+                context
+                    .invalid_response
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return fail_image_request(context, "upstream_image_asset_unavailable").await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    request_id = %request_id,
+                    error_category = error.diagnostic_category(),
+                    "synchronous image provider asset could not be validated"
+                );
+                context
+                    .invalid_response
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return fail_image_request(context, "upstream_image_asset_unavailable").await;
+            }
+        }
+    }
     let (response_segments, response_len) =
         match super::openai_image_response::build_provider_referenced_openai_image_segments(
             response_bytes,
@@ -666,17 +688,12 @@ async fn finish_openai_image_response(
             "billed_units": billed_units
         }))?
     } else {
-        format!(
-            "provider-reference-json:{}",
-            serde_json::to_string(&json!({
-                "kind": "synchronous_image",
-                "media_archived": false,
-                "replay_available": false,
-                "provider_assets": provider_assets,
-                "billed_units": billed_units
-            }))
-            .map_err(|_| AppError::Internal)?
-        )
+        crate::generation::seal_provider_asset_reference(
+            "request",
+            request_id,
+            &provider_assets,
+            state.config.key_pepper.as_bytes(),
+        )?
     };
     match commit_synchronous_image_terminal(
         context,

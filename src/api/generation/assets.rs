@@ -31,7 +31,12 @@ pub(in crate::api) async fn self_generation_asset(
     let key = authenticate_downstream(&headers, &state).await?;
     let asset = state
         .db
-        .generation_asset_for_key(key.key_id, job_id, asset_id)
+        .generation_asset_for_key(
+            key.key_id,
+            job_id,
+            asset_id,
+            state.config.key_pepper.as_bytes(),
+        )
         .await?;
     generation_asset_response(&state, &headers, asset).await
 }
@@ -44,7 +49,12 @@ pub(in crate::api) async fn self_request_asset(
     let key = authenticate_downstream(&headers, &state).await?;
     let asset = state
         .db
-        .synchronous_generation_asset_for_key(key.key_id, request_id, asset_id)
+        .synchronous_generation_asset_for_key(
+            key.key_id,
+            request_id,
+            asset_id,
+            state.config.key_pepper.as_bytes(),
+        )
         .await?;
     generation_asset_response(&state, &headers, asset).await
 }
@@ -171,15 +181,7 @@ async fn provider_generation_asset_response(
         }
     }
     .ok_or_else(|| AppError::Upstream("generation asset upstream is unavailable".into()))?;
-    crate::generation::ensure_asset_origin(&route, url)?;
-    let client = crate::generation::route_http(state, &route, url).await?;
-    let mut request = client.get(url);
-    let asset_url = url::Url::parse(url)
-        .map_err(|_| AppError::Upstream("generation asset URL is invalid".into()))?;
-    let base_url = url::Url::parse(&route.base_url).map_err(|_| AppError::Internal)?;
-    if asset_url.origin() == base_url.origin() {
-        request = route.credential.apply(request, unix_millis())?;
-    }
+    let mut request = crate::generation::provider_asset_get(state, &route, url).await?;
     let range = match single_provider_range_header(headers) {
         Ok(range) => range,
         Err(()) => return Ok(range_not_satisfiable(0)),
@@ -202,6 +204,21 @@ async fn provider_generation_asset_response(
         response_result.map_err(|_| AppError::Upstream("generation asset fetch failed".into()))?;
     if matches!(upstream.status(), StatusCode::NOT_FOUND | StatusCode::GONE) {
         return Ok(provider_asset_unavailable());
+    }
+    if upstream.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+        let content_range = upstream
+            .headers()
+            .get(header::CONTENT_RANGE)
+            .cloned()
+            .unwrap_or_else(|| HeaderValue::from_static("bytes */0"));
+        return Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::CONTENT_RANGE, content_range)
+            .header(header::CONTENT_LENGTH, 0)
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(header::CACHE_CONTROL, "private, no-store")
+            .body(Body::empty())
+            .map_err(|_| AppError::Internal);
     }
     if !matches!(
         upstream.status(),
@@ -242,6 +259,19 @@ async fn provider_generation_asset_response(
         .get(header::ACCEPT_RANGES)
         .cloned()
         .unwrap_or_else(|| HeaderValue::from_static("bytes"));
+    let mut body = upstream.bytes_stream();
+    let first = loop {
+        match body.next().await {
+            Some(Ok(chunk)) if !chunk.is_empty() => break chunk,
+            Some(Ok(_)) => {}
+            Some(Err(_)) => {
+                return Err(AppError::Upstream(
+                    "generation asset response stream failed".into(),
+                ));
+            }
+            None => return Ok(provider_asset_unavailable()),
+        }
+    };
     let mut response = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, content_type)
@@ -262,8 +292,9 @@ async fn provider_generation_asset_response(
             response = response.header(name, value);
         }
     }
+    let body = futures_util::stream::iter([Ok::<_, reqwest::Error>(first)]).chain(body);
     response
-        .body(Body::from_stream(upstream.bytes_stream()))
+        .body(Body::from_stream(body))
         .map_err(|_| AppError::Internal)
 }
 

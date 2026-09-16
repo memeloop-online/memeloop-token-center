@@ -677,10 +677,20 @@ pub(super) async fn internal_generation_asset(
         Some(tenant) => {
             state
                 .db
-                .generation_asset_for_tenant(tenant, job_id, asset_id)
+                .generation_asset_for_tenant(
+                    tenant,
+                    job_id,
+                    asset_id,
+                    state.config.key_pepper.as_bytes(),
+                )
                 .await?
         }
-        None => state.db.generation_asset_global(job_id, asset_id).await?,
+        None => {
+            state
+                .db
+                .generation_asset_global(job_id, asset_id, state.config.key_pepper.as_bytes())
+                .await?
+        }
     };
     generation_asset_response(&state, &headers, asset).await
 }
@@ -769,13 +779,22 @@ pub(super) async fn internal_request_asset(
         Some(tenant) => {
             state
                 .db
-                .synchronous_generation_asset_for_tenant(tenant, request_id, asset_id)
+                .synchronous_generation_asset_for_tenant(
+                    tenant,
+                    request_id,
+                    asset_id,
+                    state.config.key_pepper.as_bytes(),
+                )
                 .await?
         }
         None => {
             state
                 .db
-                .synchronous_generation_asset_global(request_id, asset_id)
+                .synchronous_generation_asset_global(
+                    request_id,
+                    asset_id,
+                    state.config.key_pepper.as_bytes(),
+                )
                 .await?
         }
     };

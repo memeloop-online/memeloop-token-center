@@ -303,21 +303,61 @@ Feature: Stable key identity and read-only self-service statistics
     Then the response status is 200
     And the signed URL image is proxied without exposing its secret URL
 
-  Scenario: Ten OpenAI image results avoid media downloads and retention
+  Scenario: Ten OpenAI image results are validated without media retention
     Given a token center backed by SQLite and memory object storage
     And the mock OpenAI Images upstream returns ten assets over the aggregate budget
     When the service creates a metered OpenAI Images route and key
     And the client creates ten OpenAI-compatible images in one request
     Then the response status is 200
-    And the ten image request publishes protected references without downloading media
+    And the ten image request publishes protected references after bounded validation
 
-  Scenario: An expired or empty URL-backed OpenAI image is reported unavailable at download
+  Scenario: An empty URL-backed OpenAI image cannot settle successfully
     Given a token center backed by SQLite and memory object storage
     And the mock OpenAI Images upstream returns an empty signed URL asset
     When the service creates a metered OpenAI Images route and key
     And the client creates an OpenAI-compatible image
+    Then the response status is 409
+    And the empty URL image is quarantined without exposing or charging the signed URL
+
+  Scenario: A missing URL-backed OpenAI image cannot settle successfully
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI Images upstream returns a missing signed URL asset
+    When the service creates a metered OpenAI Images route and key
+    And the client creates an OpenAI-compatible image
+    Then the response status is 409
+    And the missing URL image is quarantined without exposing or charging the signed URL
+
+  Scenario: An already expired URL-backed OpenAI image cannot settle successfully
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI Images upstream returns an expired signed URL asset
+    When the service creates a metered OpenAI Images route and key
+    And the client creates an OpenAI-compatible image
+    Then the response status is 409
+    And the expired URL image is quarantined without exposing or charging the signed URL
+
+  Scenario: A provider asset deleted after settlement is reported unavailable
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI Images asset is deleted after successful validation
+    When the service creates a metered OpenAI Images route and key
+    And the client creates an OpenAI-compatible image
     Then the response status is 200
-    And the empty URL image remains metered but downloads as unavailable without exposing the signed URL
+    And the deleted provider image downloads as unavailable
+
+  Scenario: A provider asset emptied after settlement is reported unavailable
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI Images asset becomes empty after successful validation
+    When the service creates a metered OpenAI Images route and key
+    And the client creates an OpenAI-compatible image
+    Then the response status is 200
+    And the emptied provider image downloads as unavailable
+
+  Scenario: A provider asset expired after settlement is reported unavailable
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI Images asset expires shortly after successful validation
+    When the service creates a metered OpenAI Images route and key
+    And the client creates an OpenAI-compatible image
+    Then the response status is 200
+    And the expired provider image downloads as unavailable
 
   Scenario: Oversized OpenAI image responses require audited confirmation before refund
     Given a token center backed by SQLite and memory object storage

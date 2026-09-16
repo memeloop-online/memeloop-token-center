@@ -2018,7 +2018,7 @@ async fn postgres_synchronous_image_terminal_ack_recovery_is_exactly_once_withou
     );
     assert_eq!(
         database
-            .synchronous_generation_assets(request_id)
+            .synchronous_generation_assets(request_id, pepper)
             .await
             .unwrap()
             .len(),

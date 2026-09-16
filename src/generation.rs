@@ -1,5 +1,6 @@
 use futures_util::StreamExt;
 use reqwest::Response;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 mod attempt;
@@ -30,7 +31,7 @@ use crate::{
         ArchivedGenerationAsset, GenerationJobWork, GenerationStagedAssets, ProviderGenerationAsset,
     },
     network,
-    provider::ResolvedUpstream,
+    provider::{ResolvedUpstream, open_private_json, seal_private_json},
 };
 
 const MAX_CONTROL_BODY: usize = 4 * 1024 * 1024;
@@ -39,6 +40,56 @@ const MAX_COMFY_ASSETS: usize = 16;
 const MAX_SILICONFLOW_VIDEO_ASSETS: usize = 1;
 const MAX_FAILURES: i64 = 20;
 const MAX_JOB_AGE_MILLIS: i64 = 24 * 60 * 60 * 1_000;
+pub(crate) const PROVIDER_REFERENCE_PREFIX: &str = "provider-reference-json:";
+const PROVIDER_REFERENCE_AAD: &[u8] = b"memeloop-token-center/generation-provider-reference/v1";
+
+#[derive(Deserialize, Serialize)]
+struct ProviderAssetReference {
+    assets: Vec<ProviderGenerationAsset>,
+}
+
+pub(crate) fn seal_provider_asset_reference(
+    owner_kind: &str,
+    owner_id: uuid::Uuid,
+    assets: &[ProviderGenerationAsset],
+    key_material: &[u8],
+) -> Result<String, AppError> {
+    let aad = provider_reference_aad(owner_kind, owner_id);
+    let envelope = seal_private_json(
+        &ProviderAssetReference {
+            assets: assets.to_vec(),
+        },
+        key_material,
+        &aad,
+    )?;
+    Ok(format!("{PROVIDER_REFERENCE_PREFIX}{envelope}"))
+}
+
+pub(crate) fn open_provider_asset_reference(
+    owner_kind: &str,
+    owner_id: uuid::Uuid,
+    reference: &str,
+    key_material: &[u8],
+) -> Result<Vec<ProviderGenerationAsset>, AppError> {
+    let envelope = reference
+        .strip_prefix(PROVIDER_REFERENCE_PREFIX)
+        .ok_or(AppError::Internal)?;
+    let aad = provider_reference_aad(owner_kind, owner_id);
+    let reference: ProviderAssetReference = open_private_json(envelope, key_material, &aad)?;
+    Ok(reference.assets)
+}
+
+fn provider_reference_aad(owner_kind: &str, owner_id: uuid::Uuid) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(
+        PROVIDER_REFERENCE_AAD.len() + owner_kind.len() + owner_id.as_bytes().len() + 2,
+    );
+    aad.extend_from_slice(PROVIDER_REFERENCE_AAD);
+    aad.push(0);
+    aad.extend_from_slice(owner_kind.as_bytes());
+    aad.push(0);
+    aad.extend_from_slice(owner_id.as_bytes());
+    aad
+}
 
 pub(crate) fn is_siliconflow_video_profile(config: &Value, upstream_model: &str) -> bool {
     config.get("video_api").and_then(Value::as_str) == Some("siliconflow-v1")
@@ -824,6 +875,7 @@ async fn poll_siliconflow_video(
                 state,
                 worker_id,
                 job,
+                route,
                 1,
                 vec![provider_generation_asset(
                     job.job_id,
@@ -936,6 +988,7 @@ async fn poll_seedance(
                 state,
                 worker_id,
                 job,
+                route,
                 billed_units,
                 vec![provider_generation_asset(
                     job.job_id,
@@ -1049,7 +1102,7 @@ async fn poll_comfy(
         )?);
     }
     attempt.valid = true;
-    terminal_provider_success(state, worker_id, job, billed_units, provider_assets).await
+    terminal_provider_success(state, worker_id, job, route, billed_units, provider_assets).await
 }
 
 async fn authenticated_json(
@@ -1122,6 +1175,83 @@ pub(crate) async fn route_http(
     .await
 }
 
+pub(crate) async fn provider_asset_get(
+    state: &AppState,
+    route: &ResolvedUpstream,
+    url: &str,
+) -> Result<reqwest::RequestBuilder, AppError> {
+    ensure_asset_origin(route, url)?;
+    let client = route_http(state, route, url).await?;
+    let asset_url = url::Url::parse(url)
+        .map_err(|_| AppError::Upstream("generation asset URL is invalid".into()))?;
+    let base_url = url::Url::parse(&route.base_url).map_err(|_| AppError::Internal)?;
+    let request = client.get(url);
+    if asset_url.origin() == base_url.origin() {
+        route.credential.apply(request, unix_millis())
+    } else {
+        Ok(request)
+    }
+}
+
+pub(crate) async fn provider_asset_is_obtainable(
+    state: &AppState,
+    route: &ResolvedUpstream,
+    asset: &ProviderGenerationAsset,
+) -> Result<bool, AppError> {
+    if asset
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= unix_millis())
+    {
+        return Ok(false);
+    }
+    let request = provider_asset_get(state, route, &asset.url)
+        .await?
+        .header(reqwest::header::RANGE, "bytes=0-0");
+    let _upstream_activity = state
+        .metrics
+        .active_upstream(&route.driver, "generation_asset_probe");
+    let started = std::time::Instant::now();
+    let response_result = request.send().await;
+    state.metrics.observe_upstream(
+        &route.driver,
+        "generation_asset_probe",
+        response_result.as_ref().ok().map(reqwest::Response::status),
+        started.elapsed(),
+    );
+    let response = response_result
+        .map_err(|error| sanitized_http_error(&error, "generation asset validation request"))?;
+    if matches!(
+        response.status(),
+        reqwest::StatusCode::NOT_FOUND
+            | reqwest::StatusCode::GONE
+            | reqwest::StatusCode::RANGE_NOT_SATISFIABLE
+    ) {
+        return Ok(false);
+    }
+    if !matches!(
+        response.status(),
+        reqwest::StatusCode::OK | reqwest::StatusCode::PARTIAL_CONTENT
+    ) {
+        return Err(AppError::Upstream(format!(
+            "generation asset validation returned HTTP {}",
+            response.status().as_u16()
+        )));
+    }
+    if response.content_length() == Some(0) {
+        return Ok(false);
+    }
+    let mut body = response.bytes_stream();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|error| {
+            sanitized_http_error(&error, "generation asset validation response")
+        })?;
+        if !chunk.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn sanitized_http_error(error: &reqwest::Error, operation: &'static str) -> AppError {
     // reqwest error displays may contain the complete URL. Generation asset
     // URLs are commonly signed, so log only non-secret classifications and
@@ -1182,9 +1312,15 @@ async fn terminal_provider_success(
     state: &AppState,
     worker_id: &str,
     job: &GenerationJobWork,
+    route: &ResolvedUpstream,
     billed_units: i64,
     assets: Vec<ProviderGenerationAsset>,
 ) -> Result<(), AppError> {
+    for asset in &assets {
+        if !provider_asset_is_obtainable(state, route, asset).await? {
+            return terminal_failure(state, worker_id, job, "generation_asset_unavailable").await;
+        }
+    }
     state
         .db
         .finish_generation_job_with_provider_assets(
@@ -1198,6 +1334,7 @@ async fn terminal_provider_success(
                 staged_assets: None,
             },
             &assets,
+            state.config.key_pepper.as_bytes(),
         )
         .await
         .map(|_| ())
