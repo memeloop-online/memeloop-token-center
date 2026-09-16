@@ -108,7 +108,6 @@ async fn buffered_conversation_content_wait_does_not_hold_archive_budget() {
                     status_code: 200,
                     duration_ms: 1,
                     usage: TokenUsage::default(),
-                    charge_contract_ceiling: false,
                     error_code: None,
                     response_object: "objects/blake3/buffered-conversation-response",
                     conversation: Some(ProxyConversationInput {
@@ -335,8 +334,8 @@ async fn lifecycle_deadline_converges_pending_proxy_request_idempotently() {
         delivered_terminal.get::<String, _>("error_code"),
         "request_lifecycle_timeout"
     );
-    assert_eq!(delivered_terminal.get::<i64, _>("input_tokens"), 7);
-    assert_eq!(delivered_terminal.get::<i64, _>("output_tokens"), 11);
+    assert_eq!(delivered_terminal.get::<i64, _>("input_tokens"), 0);
+    assert_eq!(delivered_terminal.get::<i64, _>("output_tokens"), 0);
 }
 
 #[tokio::test]
@@ -588,7 +587,6 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
         status_code: 200,
         duration_ms: 12,
         usage: usage.clone(),
-        charge_contract_ceiling: false,
         error_code: None,
         response_object: "objects/blake3/atomic-response",
         conversation: Some(ProxyConversationInput {
@@ -754,7 +752,6 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
                     output_tokens: 1,
                     ..TokenUsage::default()
                 },
-                charge_contract_ceiling: false,
                 error_code: None,
                 response_object: "objects/blake3/untrusted-invalid-usage-response",
                 conversation: None,
@@ -818,7 +815,7 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
         .unwrap();
     let delivered = database
         .finish_proxy_request(FinishProxyRequest {
-            usage_basis: None,
+            usage_basis: Some(crate::model::RequestUsageBasis::NotObserved),
             first_output_ms: None,
             generation_duration_ms: None,
             request_id: delivered_request_id,
@@ -829,12 +826,7 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
             requested_service_tier: None,
             status_code: 502,
             duration_ms: 1,
-            usage: TokenUsage {
-                input_tokens: 10,
-                output_tokens: 2,
-                ..TokenUsage::default()
-            },
-            charge_contract_ceiling: true,
+            usage: TokenUsage::default(),
             error_code: Some("upstream_incomplete_response"),
             response_object: "objects/blake3/delivered-failure-response",
             conversation: None,
@@ -846,7 +838,7 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
         FinishProxyRequestResult::Finished {
             cost_micros,
             usage_invalid: false
-        } if cost_micros == delivered_reservation.reserved_micros
+        } if cost_micros == 0
     ));
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT actual_micros FROM usage_reservations WHERE id = $1")
@@ -854,8 +846,8 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
             .fetch_one(&database.pool)
             .await
             .unwrap(),
-        delivered_reservation.reserved_micros,
-        "delivered failures must not release a higher cache-write reservation"
+        0,
+        "an unobserved delivery failure must not promote its reservation to actual cost"
     );
 
     database
@@ -917,7 +909,7 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
     assert!(matches!(
         database
             .finish_proxy_request(FinishProxyRequest {
-                usage_basis: None,
+                usage_basis: Some(crate::model::RequestUsageBasis::NotObserved),
                 first_output_ms: None,
                 generation_duration_ms: None,
                 request_id: flex_request_id,
@@ -928,12 +920,7 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
                 requested_service_tier: Some("flex"),
                 status_code: 502,
                 duration_ms: 1,
-                usage: TokenUsage {
-                    input_tokens: 10,
-                    output_tokens: 2,
-                    ..TokenUsage::default()
-                },
-                charge_contract_ceiling: true,
+                usage: TokenUsage::default(),
                 error_code: Some("upstream_incomplete_response"),
                 response_object: "objects/blake3/flex-delivered-response",
                 conversation: None,
@@ -941,7 +928,7 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
             .await
             .unwrap(),
         FinishProxyRequestResult::Finished {
-            cost_micros: 24,
+            cost_micros: 0,
             usage_invalid: false,
         }
     ));
@@ -1032,7 +1019,6 @@ async fn concurrent_proxy_terminal_owners_settle_and_link_once() {
                         output_tokens: 3,
                         ..TokenUsage::default()
                     },
-                    charge_contract_ceiling: false,
                     error_code: None,
                     response_object: "objects/blake3/race-response",
                     conversation: Some(ProxyConversationInput {
@@ -1143,7 +1129,6 @@ async fn terminal_upstream_attribution_uses_only_dispatched_candidates() {
                 status_code: 503,
                 duration_ms: 1,
                 usage: TokenUsage::default(),
-                charge_contract_ceiling: false,
                 error_code: Some("upstream_unavailable"),
                 response_object: "gap://proxy-attribution/no-dispatch-response",
                 conversation: None,
@@ -1199,7 +1184,6 @@ async fn terminal_upstream_attribution_uses_only_dispatched_candidates() {
                 status_code: 503,
                 duration_ms: 1,
                 usage: TokenUsage::default(),
-                charge_contract_ceiling: false,
                 error_code: Some("upstream_connection"),
                 response_object: "gap://proxy-attribution/failover-response",
                 conversation: None,

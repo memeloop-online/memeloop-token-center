@@ -224,7 +224,6 @@ async fn sqlite_proxy_locators_and_staging_bindings_are_one_atomic_commit() {
             output_tokens: 7,
             ..TokenUsage::default()
         },
-        charge_contract_ceiling: false,
         error_code: None,
         response_object: &response_locator,
         conversation: None,
