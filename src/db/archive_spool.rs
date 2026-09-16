@@ -1324,6 +1324,7 @@ fn reason_code(reason: &str) -> &'static str {
         "capacity" => "capacity",
         "capture_timeout" => "capture_timeout",
         "capture_failed" => "capture_failed",
+        "upload_timeout" => "upload_timeout",
         "upload_failed" => "upload_failed",
         "decrypt_failed" => "decrypt_failed",
         "lease_lost" => "lease_lost",

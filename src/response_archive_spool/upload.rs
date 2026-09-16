@@ -234,16 +234,12 @@ pub(super) async fn process_one_with_admission(
     // retry merely to abandon a freshly committed claim without object I/O.
     let started = tokio::time::Instant::now();
     let mut phase = "staging_begin";
-    let success = matches!(
-        tokio::time::timeout(UPLOAD_TIMEOUT, upload(state, &task, &mut phase)).await,
-        Ok(Ok(()))
-    );
-    if !success {
-        let error_code = match phase {
-            "decrypt" => "decrypt_failed",
-            "lease" => "lease_lost",
-            "chunk_validation" => "invalid_chunk",
-            _ => "upload_failed",
+    let outcome = tokio::time::timeout(UPLOAD_TIMEOUT, upload(state, &task, &mut phase)).await;
+    if !matches!(&outcome, Ok(Ok(()))) {
+        let (error_code, error_category) = match &outcome {
+            Err(_) => ("upload_timeout", "timeout"),
+            Ok(Err(error)) => (upload_error_code(phase), error.diagnostic_category()),
+            Ok(Ok(())) => unreachable!("successful uploads return before retry diagnostics"),
         };
         // An upload/commit ACK may have been lost. Leave staged object cleanup
         // to the existing fenced reaper, which proves it unreferenced first.
@@ -261,9 +257,27 @@ pub(super) async fn process_one_with_admission(
             "response_spool_retry",
         )
         .await;
-        tracing::warn!(request_id = %task.identity.request_id, purpose = task.purpose.as_str(), phase, error_code, elapsed_ms = started.elapsed().as_millis() as u64, "durable archive retry pending");
+        tracing::warn!(
+            request_id = %task.identity.request_id,
+            purpose = task.purpose.as_str(),
+            phase,
+            error_code,
+            error_category,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            deadline_ms = UPLOAD_TIMEOUT.as_millis() as u64,
+            "durable archive retry pending"
+        );
     }
     true
+}
+
+fn upload_error_code(phase: &str) -> &'static str {
+    match phase {
+        "decrypt" => "decrypt_failed",
+        "lease" => "lease_lost",
+        "chunk_validation" => "invalid_chunk",
+        _ => "upload_failed",
+    }
 }
 
 pub(super) async fn observe_claim<T>(
@@ -563,6 +577,15 @@ mod tests {
             observe_claim(async { Err::<Option<()>, _>(AppError::Internal) }).await,
             Err(AppError::Internal)
         ));
+    }
+
+    #[test]
+    fn upload_error_codes_are_bounded_and_phase_specific() {
+        assert_eq!(upload_error_code("decrypt"), "decrypt_failed");
+        assert_eq!(upload_error_code("lease"), "lease_lost");
+        assert_eq!(upload_error_code("chunk_validation"), "invalid_chunk");
+        assert_eq!(upload_error_code("object_start"), "upload_failed");
+        assert_eq!(upload_error_code("payload-bearing-phase"), "upload_failed");
     }
 
     #[tokio::test]
