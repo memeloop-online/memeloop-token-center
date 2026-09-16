@@ -59,9 +59,9 @@ test('UsageAnalysis keeps every rendered NumericMetric exact value on one readab
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/usage-analysis.html`);
     await page.locator('.usage-metrics .metric-exact').first().waitFor();
     await page.locator('.usage-metrics .metric-label').getByText('Average TPS', { exact: true }).focus();
-    const tpsDefinition = page.getByRole('tooltip').filter({ hasText: 'Recorded output tokens divided by cumulative request seconds' });
+    const tpsDefinition = page.getByRole('tooltip').filter({ hasText: 'Total recorded output tokens divided by total request time' });
     await tpsDefinition.waitFor();
-    assert.match(await tpsDefinition.innerText(), /including failed requests, generation jobs/);
+    assert.match(await tpsDefinition.innerText(), /Includes all requests in the current filter/);
     await page.keyboard.press('Escape');
 
     for (const theme of ['dark', 'light'] as const) {
