@@ -9,31 +9,14 @@ export function averageBucketTps(point: Pick<UsageAnalysisTimeBucket, 'avg_durat
   return point.output_tokens / (point.avg_duration_ms * point.requests / 1_000);
 }
 
-export function numericQuantile(values: readonly number[], percentile: number): number | null {
-  if (!Number.isFinite(percentile) || percentile < 0 || percentile > 1) return null;
-  if (!values.length) return null;
-  const sorted = [...values].sort((left, right) => left - right);
-  if (sorted.length === 1) return sorted[0];
-  const index = (sorted.length - 1) * percentile;
-  const lower = Math.floor(index);
-  const upper = Math.ceil(index);
-  if (lower === upper) return sorted[lower];
-  const weight = index - lower;
-  return sorted[lower] + (sorted[upper] - sorted[lower]) * weight;
-}
-
 export function averageBucketTpsSeries(points: readonly Pick<UsageAnalysisTimeBucket, 'avg_duration_ms' | 'output_tokens' | 'requests'>[]): Array<number | null> {
   return points.map((point) => averageBucketTps(point));
 }
 
-export function cumulativeQuantileSeries(values: readonly (number | null)[], percentile: number): Array<number | null> {
-  const seen: number[] = [];
-  return values.map((value) => {
-    if (value !== null && Number.isFinite(value)) seen.push(value);
-    return numericQuantile(seen, percentile);
-  });
-}
-
+// Usage facts and their rollups increment requests and duration_count together
+// (including failed requests and generation jobs). avg_duration_ms therefore
+// reconstructs total recorded duration, not a mean of per-request TPS values.
+// The API has no per-request TPS distribution: bucket averages cannot supply P95.
 export function averageSeriesTps(points: readonly Pick<UsageAnalysisTimeBucket, 'avg_duration_ms' | 'output_tokens' | 'requests'>[]): number | null {
   let outputTokens = 0;
   let durationMillis = 0;
@@ -46,15 +29,6 @@ export function averageSeriesTps(points: readonly Pick<UsageAnalysisTimeBucket, 
   }
   if (durationMillis <= 0) return null;
   return outputTokens / (durationMillis / 1_000);
-}
-
-export function p95BucketTps(points: readonly Pick<UsageAnalysisTimeBucket, 'avg_duration_ms' | 'output_tokens' | 'requests'>[]): number | null {
-  const series = averageBucketTpsSeries(points).filter((value): value is number => value !== null);
-  return numericQuantile(series, 0.95);
-}
-
-export function p95BucketTpsSeries(points: readonly Pick<UsageAnalysisTimeBucket, 'avg_duration_ms' | 'output_tokens' | 'requests'>[]): Array<number | null> {
-  return cumulativeQuantileSeries(averageBucketTpsSeries(points), 0.95);
 }
 
 export function formatTps(value: number | null | undefined, locale: Locale): FormattedValue {

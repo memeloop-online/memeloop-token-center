@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { averageBucketTps, averageSeriesTps, analyticsAge, analyticsDuration, cumulativeQuantileSeries, finiteP95Points, formatTps, histogramP95, metricArea, p95BucketTps, p95BucketTpsSeries } from '../src/operator/analyticsPresentation.js';
+import { averageBucketTps, averageBucketTpsSeries, averageSeriesTps, analyticsAge, analyticsDuration, finiteP95Points, formatTps, histogramP95, metricArea } from '../src/operator/analyticsPresentation.js';
 import { formatCurrencyDisplay, formatMetricDisplay } from '../src/format.js';
 import type { UsageAnalysisTimeBucket } from '../src/types.js';
 
@@ -40,8 +40,7 @@ test('TPS summaries and background series are derived from historical buckets', 
   ];
   assert.deepEqual(points.map((point) => averageBucketTps(point)), [500, 60, 60]);
   assert.equal(averageSeriesTps(points), 111.76470588235294);
-  assert.ok(Math.abs((p95BucketTps(points) ?? 0) - 456) < 1e-9);
-  assert.deepEqual(p95BucketTpsSeries(points).map((value) => value == null ? value : Number(value.toFixed(6))), [500, 478, 456]);
-  assert.deepEqual(cumulativeQuantileSeries([500, 60, 60], 0.95).map((value) => value == null ? value : Number(value.toFixed(6))), [500, 478, 456]);
+  assert.deepEqual(averageBucketTpsSeries([...points, { requests: 1, output_tokens: 10, avg_duration_ms: null } as UsageAnalysisTimeBucket]), [500, 60, 60, null]);
+  assert.equal(averageBucketTps({ requests: 2, output_tokens: 100, avg_duration_ms: 500 }), 100, 'one 1-second request plus a zero-duration failure: the backend counts both in the duration average');
   assert.deepEqual(formatTps(111.76470588235294, 'en'), { text: '111.76', title: '111.764706 TPS' });
 });

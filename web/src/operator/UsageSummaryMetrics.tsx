@@ -3,6 +3,7 @@ import { displayTimeZone } from '../charts/displayTimeZone';
 import { totalTokens } from '../charts/usageCharts';
 import { formatCurrencyDisplay, formatMetricDisplay, formatPercent } from '../format';
 import { useI18n } from '../i18n';
+import { DetailTooltip } from '../design-system';
 import type { OperatorUsageAnalysis } from '../types';
 import { AnalyticsMetric } from './AnalyticsMetric';
 import {
@@ -12,8 +13,6 @@ import {
   finiteP95Points,
   formatTps,
   histogramP95,
-  p95BucketTps,
-  p95BucketTpsSeries,
 } from './analyticsPresentation';
 
 export function UsageSummaryMetrics({ stats }: { stats: OperatorUsageAnalysis }) {
@@ -23,13 +22,11 @@ export function UsageSummaryMetrics({ stats }: { stats: OperatorUsageAnalysis })
   const number = (value: number) => formatMetricDisplay(value, locale);
   const exactValue = (text: string, title?: string) => <span className="metric-number"><span className="metric-exact" title={title ?? text}>{text}</span></span>;
   const numeric = (label: string, value: number, trend: number[], tone = '') => <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={label} value={exactValue(number(value).text, number(value).title)} trend={trend} tone={tone} />;
-  const tpsMetric = (label: string, value: ReturnType<typeof formatTps>, trend: Array<number | null>) => <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={label} value={exactValue(value.text, value.title)} title={value.title} formatSample={(sample) => formatTps(sample, locale).title ?? formatTps(sample, locale).text} trend={trend} />;
+  const tpsMetric = (label: string, value: ReturnType<typeof formatTps>, trend: Array<number | null>) => <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={label} labelContent={<DetailTooltip content={t('usage.averageTpsHint')}><span tabIndex={0}>{label}</span></DetailTooltip>} value={exactValue(value.text, value.title)} title={value.title} formatSample={(sample) => formatTps(sample, locale).title ?? formatTps(sample, locale).text} trend={trend} />;
   const average = analyticsDuration(summary.avg_duration_ms, locale);
   const p95 = histogramP95(summary.p95_duration_ms, summary.p95_is_capped, locale);
   const averageTpsTrend = averageBucketTpsSeries(points);
-  const p95TpsTrend = p95BucketTpsSeries(points);
   const averageTps = formatTps(averageSeriesTps(points), locale);
-  const p95Tps = formatTps(p95BucketTps(points), locale);
   const currency = summary.costs.length === 1 ? summary.costs[0].currency : undefined;
   return <section className="metrics usage-metrics" aria-label={t('usage.tab.overview')}>
     {numeric(t('usage.requests'), summary.requests, points.map((point) => point.requests))}
@@ -41,7 +38,6 @@ export function UsageSummaryMetrics({ stats }: { stats: OperatorUsageAnalysis })
     {numeric(t('usage.cachedTokens'), summary.cached_input_tokens, points.map((point) => point.cached_input_tokens))}
     {numeric(t('usage.cacheWriteTokens'), summary.cache_write_tokens, points.map((point) => point.cache_write_tokens))}
     {tpsMetric(t('usage.averageTps'), averageTps, averageTpsTrend)}
-    {tpsMetric(t('usage.p95Tps'), p95Tps, p95TpsTrend)}
     <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={t('usage.average')} value={average.text} title={average.title} formatSample={value => analyticsDuration(value, locale).title ?? analyticsDuration(value, locale).text} trend={points.map((point) => point.avg_duration_ms)} />
     <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={t('usage.p95Approx')} value={p95.text} title={p95.title} formatSample={(_value, index) => { const point = points[index]; const display = histogramP95(point.p95_duration_ms, point.p95_is_capped, locale); return `${display.text} ${display.title ?? ''}`; }} trend={finiteP95Points(points).map((point) => point.p95_duration_ms)} />
   </section>;
