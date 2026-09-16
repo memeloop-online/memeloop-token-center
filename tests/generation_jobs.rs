@@ -216,7 +216,7 @@ async fn provider_asset_success_keeps_delivery_and_metering_without_archiving_me
         .unwrap()
         .expect("queued generation");
     let request_attempt = Uuid::now_v7();
-    let request_lease = generation_staging_lease(
+    let _request_lease = generation_staging_lease(
         &database,
         job.job_id,
         ArchiveStagingPurpose::Request,
@@ -2230,7 +2230,7 @@ async fn generation_staging_takeover_rejects_a_late_writer_and_replays_the_exact
             .await,
         Err(AppError::Conflict(_))
     ));
-    assert_eq!(
+    assert!(matches!(
         database
             .generation_asset_for_key(
                 key.key_id,
@@ -2239,9 +2239,10 @@ async fn generation_staging_takeover_rejects_a_late_writer_and_replays_the_exact
             )
             .await
             .unwrap()
-            .object_locator,
-        replacement_manifest.assets[0].object_locator
-    );
+            .source,
+        GenerationAssetSource::Archive { object_locator }
+            if object_locator == replacement_manifest.assets[0].object_locator
+    ));
     assert_eq!(
         database
             .list_account_ledger(key.account_id, 100)
