@@ -392,6 +392,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
   const [nextPollAt, setNextPollAt] = useState(0);
   const [now, setNow] = useState(Date.now);
   const [listRetry, setListRetry] = useState(false);
+  const [listLoading, setListLoading] = useState(false);
   const scopeVersion = useRef(0);
   useEffect(() => () => { scopeVersion.current += 1; }, [token, tenant]);
   const isKimi = isKimiDeviceProvider(selectedProvider);
@@ -405,10 +406,10 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
   }, [isKimi, session]);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
-  const reset = () => { setSession(undefined); setManualCode(''); setProxyUrl(''); setUseProxy(false); setMessage(''); setError(''); setNextPollAt(0); setListRetry(false); setAuthorizing(false); setPolling(false); };
+  const reset = () => { setSession(undefined); setManualCode(''); setProxyUrl(''); setUseProxy(false); setMessage(''); setError(''); setNextPollAt(0); setListRetry(false); setListLoading(false); setAuthorizing(false); setPolling(false); };
   useEffect(() => { reset(); }, [token, tenant]);
   const start = async (providerConfig?: unknown) => {
-    if (!tenant || !selectedProvider || !name.trim() || authorizing || polling || listRetry || session || !proxyValid) return;
+    if (!tenant || !selectedProvider || !name.trim() || authorizing || polling || listLoading || listRetry || session || !proxyValid) return;
     if (selectedProvider.oauth_adapter?.flow_kind === 'openai_device') {
       if (!existing && !isPrivateProxyUrl(proxyUrl.trim())) return;
       if (existing && (existing.has_proxy === false || (existing.has_proxy === true && existing.proxy_scheme !== 'socks5h'))) { setError(t('connection.reauthorizationProxy')); return; }
@@ -446,9 +447,12 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
     finally { if (scopeVersion.current === attempt) setAuthorizing(false); }
   };
   const reloadList = async () => {
+    if (listLoading) return;
+    setListLoading(true);
     const attempt = scopeVersion.current;
     try { await onChanged(); if (scopeVersion.current === attempt) { setListRetry(false); setError(''); } }
     catch { if (scopeVersion.current === attempt) { setListRetry(true); setError(t('providers.savedListUnavailable')); } }
+    finally { if (scopeVersion.current === attempt) setListLoading(false); }
   };
   const poll = async () => {
     if (!session || polling || expired || (isKimi && (Date.now() < nextPollAt || (session.expires_at !== undefined && Date.now() >= session.expires_at)))) return;
@@ -483,9 +487,9 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
   return <div className="authorization-form"><p className="muted">{t('providers.oauthSecurity')}</p>
     {error && <div className="notice error" role="alert">{error}</div>}
     {oauthProviders.length === 0 ? <div className="empty">{t('providers.noAdapter')}</div> : <>
-    <ModelPicker label={t('providers.provider')} disabled={Boolean(existing) || authorizing || Boolean(session) || nativeLocked} value={providerChoice} onChange={(next) => { setProviderChoice(next); setName(oauthProviders.find(value => value.id === next)?.display_name ?? ''); reset(); }} options={oauthProviders.map(value => ({ key: value.id, value: value.id, label: value.display_name, provider: value.display_name, upstream: '', capabilities: value.protocols }))} />
+    <ModelPicker label={t('providers.provider')} disabled={Boolean(existing) || authorizing || polling || listLoading || Boolean(session) || nativeLocked} value={providerChoice} onChange={(next) => { setProviderChoice(next); setName(oauthProviders.find(value => value.id === next)?.display_name ?? ''); reset(); }} options={oauthProviders.map(value => ({ key: value.id, value: value.id, label: value.display_name, provider: value.display_name, upstream: '', capabilities: value.protocols }))} />
     {selectedProvider?.oauth_adapter?.flow_kind === 'authorization_code_pkce' ? <AuthorizationCodeConnection key={`${token}\0${tenant}\0${selectedProvider.id}`} token={token} tenant={tenant} provider={selectedProvider} existing={existing} onChanged={onChanged} onLock={setNativeLocked} /> : <>
-    <label>{t('providers.name')} · {t('connection.required')}<Input required maxLength={200} readOnly={Boolean(existing)} disabled={authorizing || Boolean(session)} value={name} onChange={(event) => setName(event.target.value)} /></label>
+    <label>{t('providers.name')} · {t('connection.required')}<Input required maxLength={200} readOnly={Boolean(existing)} disabled={authorizing || polling || listLoading || Boolean(session)} value={name} onChange={(event) => setName(event.target.value)} /></label>
     {proxyMode !== 'none' && !session && <section className="upstream-connection">
       <h3>{t('connection.title')}</h3>
       {proxyMode === 'required' && <p className="field-hint">{formJourneyCopy(locale).codexProxy}</p>}
@@ -496,13 +500,13 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
       {proxyMode === 'required' && <><p><b>{t('connection.baseUrl')}</b> · {t('connection.fixed')}</p><code>https://chatgpt.com/backend-api/codex</code></>}
     </section>}
     {selectedProvider && selectedProvider.source !== 'builtin' && !session ? <Form key={`${selectedProvider.id}-${locale}`} schema={localizeSchema(selectedProvider.config_schema as RJSFSchema, locale)} formData={existing?.config} readonly={Boolean(existing)} validator={validator} templates={schemaFormTemplates} widgets={fluentFormWidgets} onSubmit={({ formData }) => void start(formData)}><button type="submit" disabled={!tenant || authorizing || !proxyValid}>{t('common.startLogin')}</button></Form> : <div className="button-row">
-      <Button appearance="primary" type="button" onClick={() => void start()} disabled={!tenant || !name.trim() || authorizing || polling || Boolean(session) || listRetry || !proxyValid}>{t(authorizing ? 'common.loading' : 'common.startLogin')}</Button>
+      <Button appearance="primary" type="button" onClick={() => void start()} disabled={!tenant || !name.trim() || authorizing || polling || listLoading || Boolean(session) || listRetry || !proxyValid}>{t(authorizing ? 'common.loading' : 'common.startLogin')}</Button>
       {session && !expired && <>
         <a className="button secondary" href={session.verification_url ?? session.login_url} target="_blank" rel="noopener noreferrer">{t('common.openAuthorization')}</a>
         {selectedProvider?.oauth_adapter?.flow_kind !== 'claude_manual_pkce' && <Button appearance="secondary" type="button" disabled={polling || waitSeconds > 0} onClick={() => void poll()}>{polling ? t('common.loading') : waitSeconds > 0 ? t('common.checkAuthorizationIn', { seconds: waitSeconds }) : t('common.checkAuthorization')}</Button>}
       </>}
       {expired && <Button appearance="secondary" type="button" disabled={polling} onClick={reset}>{t('providers.backToLoginSetup')}</Button>}
-      {listRetry && <Button appearance="secondary" type="button" onClick={() => void reloadList()}>{t('providers.reloadAccountList')}</Button>}
+      {listRetry && <Button appearance="secondary" type="button" disabled={listLoading} onClick={() => void reloadList()}>{t('providers.reloadAccountList')}</Button>}
     </div>}
     {session && selectedProvider?.oauth_adapter?.flow_kind === 'claude_manual_pkce' && <div className="manual-authorization"><label>{t('providers.manualCode')}<input value={manualCode} onChange={(event) => setManualCode(event.target.value)} placeholder={t('providers.manualCodeHint')} /></label><button type="button" disabled={!manualCode.includes('#')} onClick={() => void complete()}>{t('providers.completeAuthorization')}</button></div>}
     {existing && selectedProvider?.oauth_adapter?.flow_kind === 'openai_device' && !session && <p>{t('connection.reauthorizationProxy')}</p>}

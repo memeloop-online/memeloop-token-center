@@ -40,8 +40,9 @@ test('Kimi device login is explicit, respects poll intervals and expiry, and pre
     await page.clock.install({ time: initialTime });
     await page.addInitScript((value) => localStorage.setItem('mtc-locale', value), locale);
     const writes: { path: string; body: Record<string, unknown> }[] = [];
-    const state = { saved: false, failList: false, polls: 0, holdStart: false };
+    const state = { saved: false, failList: false, polls: 0, holdStart: false, holdList: false, listReads: 0 };
     let releaseStart: (() => void) | undefined;
+    let releaseList: (() => void) | undefined;
     await page.route('**/internal/v1/**', async route => {
       const request = route.request(), path = new URL(request.url()).pathname;
       if (request.method() !== 'GET') {
@@ -59,7 +60,11 @@ test('Kimi device login is explicit, respects poll intervals and expiry, and pre
         return route.fulfill({ status: options.reauthorize ? 200 : 201, json: account });
       }
       if (path === '/internal/v1/provider-types') return route.fulfill({ json: [provider] });
-      if (path === '/internal/v1/upstreams') return route.fulfill(state.saved && state.failList ? { status: 503, json: { error: { message: 'mock list read unavailable' } } } : { json: options.reauthorize || state.saved ? [account] : [] });
+      if (path === '/internal/v1/upstreams') {
+        state.listReads += 1;
+        if (state.saved && state.holdList) await new Promise<void>(resolve => { releaseList = resolve; });
+        return route.fulfill(state.saved && state.failList ? { status: 503, json: { error: { message: 'mock list read unavailable' } } } : { json: options.reauthorize || state.saved ? [account] : [] });
+      }
       return route.fulfill({ json: [] });
     });
     await page.goto(url);
@@ -70,11 +75,11 @@ test('Kimi device login is explicit, respects poll intervals and expiry, and pre
       await page.locator('.create-journey [data-workspace-toggle]').click();
       await page.getByRole('button', { name: text.method, exact: true }).click();
     }
-    return { page, writes, state, text, releaseStart: () => { assert.ok(releaseStart); releaseStart(); } };
+    return { page, writes, state, text, releaseStart: () => { assert.ok(releaseStart); releaseStart(); }, releaseList: () => { assert.ok(releaseList); releaseList(); } };
   }
   try {
     for (const reauthorize of [false, true]) {
-      const { page, writes, state, text } = await open({ reauthorize });
+      const { page, writes, state, text, releaseList } = await open({ reauthorize });
       assert.equal(await page.getByRole('button', { name: text.start, exact: true }).isEnabled(), true, 'Kimi permits direct login without a proxy');
       assert.equal(await page.getByRole('checkbox', { name: '使用账号网络代理' }).count(), reauthorize ? 0 : 1, 'reauthorization reuses the stored transport and never offers a proxy change');
       await page.getByRole('button', { name: text.start, exact: true }).click();
@@ -102,7 +107,18 @@ test('Kimi device login is explicit, respects poll intervals and expiry, and pre
       await page.getByText(text.savedListUnavailable, { exact: true }).waitFor();
       assert.equal(state.polls, 2); assert.equal(writes.filter(write => write.path.endsWith('/start')).length, 1);
       state.failList = false;
+      state.holdList = true;
+      const readsBeforeRetry = state.listReads;
+      const retryRead = page.waitForRequest(request => new URL(request.url()).pathname === '/internal/v1/upstreams');
       await page.getByRole('button', { name: text.reload, exact: true }).click();
+      await retryRead;
+      assert.equal(await page.getByRole('button', { name: text.reload, exact: true }).isDisabled(), true, 'retry cannot queue duplicate reads');
+      assert.equal(await page.locator('.authorization-form .model-picker-trigger').isDisabled(), true, 'provider stays locked while the saved account list is loading');
+      assert.equal(await page.locator('.authorization-form input[maxlength="200"]').isDisabled(), true);
+      assert.equal(await page.getByRole('button', { name: text.start, exact: true }).isDisabled(), true);
+      assert.equal(state.listReads, readsBeforeRetry + 1);
+      state.holdList = false;
+      releaseList();
       await page.getByRole('button', { name: text.reload, exact: true }).waitFor({ state: 'hidden' });
       assert.equal(state.polls, 2, 'list retry never exchanges credentials again');
       await page.close();
