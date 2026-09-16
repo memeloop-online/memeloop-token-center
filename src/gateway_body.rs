@@ -515,6 +515,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_responses_captures_share_disk_budget_and_recover() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let spool = test_request_spool(64 * 1024);
+        let winner = Request::post("/v1/responses")
+            .header(header::CONTENT_LENGTH, 48 * 1024)
+            .body(Body::from(vec![b'w'; 48 * 1024]))
+            .unwrap();
+        let winner = admit_gateway_request_body_with_memory(
+            winner,
+            Duration::from_secs(1),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            16 * 1024 * 1024,
+            crate::config::DEFAULT_AUDIO_BODY_MAX_BYTES as usize,
+            None,
+            &spool,
+        )
+        .await
+        .unwrap();
+        assert_eq!(spool.snapshot().used_bytes, 48 * 1024);
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = polls.clone();
+        let loser = Request::post("/v1/responses")
+            .header(header::CONTENT_LENGTH, 32 * 1024)
+            .body(Body::from_stream(stream::poll_fn(move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                std::task::Poll::Ready(Some(Ok::<_, Infallible>(Bytes::from_static(b"x"))))
+            })))
+            .unwrap();
+        assert!(matches!(
+            admit_gateway_request_body_with_memory(
+                loser,
+                Duration::from_secs(1),
+                Arc::new(tokio::sync::Semaphore::new(1)),
+                Arc::new(tokio::sync::Semaphore::new(1)),
+                16 * 1024 * 1024,
+                crate::config::DEFAULT_AUDIO_BODY_MAX_BYTES as usize,
+                None,
+                &spool,
+            )
+            .await,
+            Err(GatewayBodyAdmissionError::RequestSpoolCapacityExhausted)
+        ));
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        assert_eq!(spool.snapshot().used_bytes, 48 * 1024);
+
+        drop(winner);
+        let recovered = Request::post("/v1/responses")
+            .header(header::CONTENT_LENGTH, 32 * 1024)
+            .body(Body::from(vec![b'r'; 32 * 1024]))
+            .unwrap();
+        let recovered = admit_gateway_request_body_with_memory(
+            recovered,
+            Duration::from_secs(1),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            16 * 1024 * 1024,
+            crate::config::DEFAULT_AUDIO_BODY_MAX_BYTES as usize,
+            None,
+            &spool,
+        )
+        .await
+        .unwrap();
+        assert_eq!(spool.snapshot().used_bytes, 32 * 1024);
+        drop(recovered);
+        assert_eq!(spool.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
     async fn absolute_deadline_rejects_a_drip_body() {
         let drip = stream::unfold(0_u64, |index| async move {
             tokio::time::sleep(Duration::from_millis(10)).await;

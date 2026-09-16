@@ -353,19 +353,20 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let admission = RequestSpoolAdmission::new(directory.path().to_owned(), 256 * 1024);
         let active = admission.clone();
+        let (second_chunk_polled, second_chunk_poll) = tokio::sync::oneshot::channel();
         let body = Body::from_stream(
             stream::once(async {
                 Ok::<_, Infallible>(Bytes::from(vec![b'x'; REQUEST_SPOOL_CHUNK_BYTES]))
             })
-            .chain(stream::pending::<Result<Bytes, Infallible>>()),
+            .chain(stream::once(async move {
+                let _ = second_chunk_polled.send(());
+                std::future::pending::<Result<Bytes, Infallible>>().await
+            })),
         );
         let capture = tokio::spawn(async move { active.capture(body, 256 * 1024, None).await });
-        for _ in 0..100 {
-            if admission.snapshot().used_bytes == REQUEST_SPOOL_CHUNK_BYTES {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        second_chunk_poll
+            .await
+            .expect("capture polls the next chunk only after writing the first");
         assert_eq!(admission.snapshot().active_files, 1);
         assert_eq!(admission.snapshot().used_bytes, REQUEST_SPOOL_CHUNK_BYTES);
         capture.abort();
