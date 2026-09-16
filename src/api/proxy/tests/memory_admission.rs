@@ -3,6 +3,21 @@ use super::*;
 #[tokio::test]
 async fn concurrent_large_streams_dispatch_while_buffered_partition_is_busy() {
     let fixture = std::sync::Arc::new(codex_route_fixture("large-stream-admission").await);
+    // The gateway conservatively reserves input bytes as tokens. Admit both
+    // 8 MiB requests through the credential's real TPM and prepaid balance so
+    // this test reaches the memory partition behavior it intends to exercise.
+    fixture
+        .state
+        .db
+        .update_key_policy(
+            fixture.key_id,
+            KeyPolicy {
+                tokens_per_minute: 32 * 1024 * 1024,
+                ..KeyPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
     fixture
         .state
         .db
