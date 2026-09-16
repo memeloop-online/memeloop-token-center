@@ -282,7 +282,9 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     const failedUnobservedDiagnostics = page.locator('[data-fixture-request="recorded"] .request-diagnostics');
     await failedUnobservedDiagnostics.waitFor();
     assert.equal(await failedUnobservedRow.locator('.request-cost-cell').innerText(), '$0.00');
-    assert.equal(await failedUnobservedDiagnostics.locator('.request-detail-primary > div').last().innerText(), 'Cost$0.00');
+    const failedUnobservedCost = failedUnobservedDiagnostics.locator('.request-detail-primary > div').last();
+    assert.equal(await failedUnobservedCost.locator('b').innerText(), 'Cost');
+    assert.equal(await failedUnobservedCost.locator('span[tabindex="0"]').innerText(), '$0.00');
     assert.doesNotMatch(await failedUnobservedRow.locator('.request-cost-cell').innerText(), /35/);
     assert.match(await failedUnobservedRow.locator('.request-cost-cell').getAttribute('title') ?? '', /defaults to 0/);
   } catch (reason) {
