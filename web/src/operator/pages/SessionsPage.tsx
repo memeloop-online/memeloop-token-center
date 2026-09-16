@@ -6,7 +6,7 @@ import type { RequestDetail, RequestView } from '../../types.js';
 import { LatestRequestGate, SessionMonitor, type SessionFocus } from '../SessionMonitor.js';
 import { messageOf, queryForTenant } from '../scope/operatorShared.js';
 import type { SessionStreamState } from '../SessionMonitor.js';
-import type { SessionEventChannel } from '../hooks/useOperatorRequestStream.js';
+import type { SessionEventChannel } from '../sessionEventChannel.js';
 
 export function SessionsPage({ token, tenant, focus, sessionEvents, streamState, streamError, onOpenRequests }: {
   token: string;

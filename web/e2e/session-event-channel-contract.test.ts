@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { RequestEvent } from '../src/types.js';
-import { SessionEventChannel } from '../src/operator/hooks/useOperatorRequestStream.js';
+import { SessionEventChannel } from '../src/operator/sessionEventChannel.js';
 import { RequestRefreshBatch } from '../src/operator/traffic/requestRefresh.js';
 
 function event(requestId: string): RequestEvent {

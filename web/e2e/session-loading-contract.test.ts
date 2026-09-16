@@ -42,14 +42,15 @@ test('initial list work and SSE refreshes do not overlap and amplify slow databa
 
 test('live refresh is explicitly opt-in, while session invalidation stays below the traffic render cadence', async () => {
   const operator = await readFile(new URL('../src/operator/hooks/useOperatorRequestStream.ts', import.meta.url), 'utf8');
+  const channel = await readFile(new URL('../src/operator/sessionEventChannel.ts', import.meta.url), 'utf8');
   const operatorPage = await readFile(new URL('../src/operator/Operator.tsx', import.meta.url), 'utf8');
   assert.match(source, /\[autoRefresh, setAutoRefresh\] = useState\(false\)/);
   assert.match(source, /if \(!autoRefreshRef\.current \|\| refreshTimer/);
   assert.ok(sessionEventRefreshDelayMs <= 500, 'terminal session invalidation must settle within 500ms');
   assert.equal(defaultRequestRefreshInterval, 5_000, 'request-table rendering retains its default 5-second cadence');
   assert.match(source, /}, sessionEventRefreshDelayMs\)/);
-  assert.match(operator, /if \(this\.listeners\.size === 0\) return;/, 'unmounted Sessions never accumulates raw events');
-  assert.match(operator, /enqueueSessionEventIdentity\(this\.eventKeyIds\.current, event\);\s*this\.revision \+= 1;/);
+  assert.match(channel, /if \(this\.listeners\.size === 0\) return;/, 'unmounted Sessions never accumulates raw events');
+  assert.match(channel, /enqueueSessionEventIdentity\(this\.eventKeyIds\.current, event\);\s*this\.revision \+= 1;/);
   assert.match(operator, /batch\.current\?\.enqueue\(event\)/, 'traffic events remain on the bounded request batch');
   assert.match(operatorPage, /sessionEvents=\{stream\.sessionEvents\}/, 'Sessions owns the prompt event subscription');
   assert.match(source, /checked=\{autoRefresh\}/);

@@ -1,8 +1,8 @@
 import { useEffect, useReducer, useRef } from 'react';
-import { apiDiagnosticMessage, streamSse } from '../../api.js';
-import { useI18n } from '../../i18n.js';
-import type { RequestEvent } from '../../types.js';
-import type { SessionStreamState } from '../SessionMonitor.js';
+import { apiDiagnosticMessage, streamSse } from '../../api';
+import { useI18n } from '../../i18n';
+import type { RequestEvent } from '../../types';
+import type { SessionStreamState } from '../SessionMonitor';
 
 interface EventCursor {
   eventAt: number;
