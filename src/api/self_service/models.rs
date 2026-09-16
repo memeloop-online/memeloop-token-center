@@ -244,11 +244,6 @@ mod tests {
         let ordinary = codex_model_info("ordinary", false);
         assert!(ordinary.get("multi_agent_version").is_none());
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     #[test]
     fn comfyui_parameter_schema_is_bounded_and_parameters_only() {
