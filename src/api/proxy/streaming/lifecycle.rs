@@ -142,12 +142,6 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
             None => (status_code, None),
         },
     };
-    let full_contract_usage = || TokenUsage {
-        input_tokens: input_token_ceiling,
-        output_tokens: output_token_ceiling,
-        ..TokenUsage::default()
-    };
-    let mut charge_contract_ceiling = delivered_billable && error_code.is_some();
     let mut usage_basis = crate::model::RequestUsageBasis::NotObserved;
     // A downstream loss after the complete terminal was captured must not
     // erase trustworthy provider usage. A validated provider-declared incomplete
@@ -172,11 +166,10 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
     let mut usage = if error_code.is_some() {
         if delivered_billable {
             if let Some(usage) = terminal_usage {
-                charge_contract_ceiling = false;
                 usage_basis = crate::model::RequestUsageBasis::ProviderReported;
                 usage
             } else {
-                full_contract_usage()
+                TokenUsage::default()
             }
         } else {
             TokenUsage::default()
@@ -201,23 +194,11 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
                 usage_basis = crate::model::RequestUsageBasis::ProviderReported;
                 usage
             }
-            ExtractedUsage::Missing => {
-                charge_contract_ceiling = delivered_billable;
-                if delivered_billable {
-                    full_contract_usage()
-                } else {
-                    TokenUsage::default()
-                }
-            }
+            ExtractedUsage::Missing => TokenUsage::default(),
             ExtractedUsage::Invalid => {
                 terminal_status = 502;
                 error_code = Some("upstream_invalid_usage");
-                charge_contract_ceiling = delivered_billable;
-                if delivered_billable {
-                    full_contract_usage()
-                } else {
-                    TokenUsage::default()
-                }
+                TokenUsage::default()
             }
         }
     };
@@ -232,27 +213,14 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
             usage_basis = crate::model::RequestUsageBasis::NotObserved;
             terminal_status = 502;
             error_code = Some("upstream_invalid_usage");
-            charge_contract_ceiling = delivered_billable;
-            usage = if delivered_billable {
-                full_contract_usage()
-            } else {
-                TokenUsage::default()
-            };
+            usage = TokenUsage::default();
         }
         Err(_) => {
             usage_basis = crate::model::RequestUsageBasis::NotObserved;
             terminal_status = 502;
             error_code = Some("upstream_invalid_usage");
-            charge_contract_ceiling = delivered_billable;
-            usage = if delivered_billable {
-                full_contract_usage()
-            } else {
-                TokenUsage::default()
-            };
+            usage = TokenUsage::default();
         }
-    }
-    if charge_contract_ceiling {
-        usage_basis = crate::model::RequestUsageBasis::ContractCeiling;
     }
     let response_id =
         if (200..400).contains(&terminal_status) && matches!(protocol, Protocol::OpenAiResponses) {
@@ -302,7 +270,6 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
         });
     let (first_output_ms, generation_duration_ms) = output_timing.finish(
         error_code.is_none()
-            && !charge_contract_ceiling
             && sse_summary.as_ref().is_some_and(|summary| {
                 matches!(summary.outcome, ResponsesSseOutcome::Completed { .. })
                     || mapped_chat_incomplete
@@ -323,7 +290,6 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
             status_code: terminal_status,
             duration_ms: started.elapsed().as_millis() as i64,
             usage,
-            charge_contract_ceiling,
             error_code,
             response_object: &stored_response,
             conversation: conversation_input,

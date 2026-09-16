@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { I18nProvider, useI18n } from '../../src/i18n';
-import { QuotaResetCreditExpiry, UpstreamQuota } from '../../src/operator/UpstreamQuota';
+import { QuotaResetCreditExpiry, UpstreamQuota } from '../../src/operator/UpstreamQuotaPanel';
 import { useUpstreamQuotaReads } from '../../src/operator/useUpstreamQuotaReads';
 import { quotaSummaryPresentation, type UpstreamQuotaSnapshot } from '../../src/operator/upstreamQuota';
 import '../../src/styles.css';

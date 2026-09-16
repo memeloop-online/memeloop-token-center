@@ -7645,8 +7645,9 @@ async fn failed_responses_id_is_not_a_parent(world: &mut TokenCenterWorld) {
         .find(|request| request["error_code"] == "upstream_failed_response")
         .expect("HTTP 200 response.failed terminal record");
     assert_eq!(failed["status_code"], 502, "{failed}");
-    assert_ne!(failed["cost"], "0", "delivered failed streams are billed");
-    assert_eq!(failed["output_tokens"], 4096, "{failed}");
+    assert_eq!(failed["usage_basis"], "not_observed", "{failed}");
+    assert_eq!(failed["cost"], "0", "{failed}");
+    assert_eq!(failed["output_tokens"], 0, "{failed}");
 
     let stats = world
         .client
@@ -7669,8 +7670,8 @@ async fn failed_responses_id_is_not_a_parent(world: &mut TokenCenterWorld) {
     );
 }
 
-#[then("the delivered invalid stream is a fully billed failure without response lineage")]
-async fn invalid_stream_is_billed_failure(world: &mut TokenCenterWorld) {
+#[then("the delivered invalid stream is an unobserved failure without response lineage")]
+async fn invalid_stream_is_unobserved_failure(world: &mut TokenCenterWorld) {
     assert_eq!(world.status, Some(StatusCode::OK));
     let requests = wait_for_invalid_stream_terminal_request(world).await;
     assert_eq!(requests.as_array().map(Vec::len), Some(1), "{requests}");
@@ -7679,8 +7680,9 @@ async fn invalid_stream_is_billed_failure(world: &mut TokenCenterWorld) {
         requests[0]["error_code"], "upstream_invalid_usage",
         "{requests}"
     );
-    assert_eq!(requests[0]["output_tokens"], 2, "{requests}");
-    assert_ne!(requests[0]["cost"], "0", "{requests}");
+    assert_eq!(requests[0]["usage_basis"], "not_observed", "{requests}");
+    assert_eq!(requests[0]["output_tokens"], 0, "{requests}");
+    assert_eq!(requests[0]["cost"], "0", "{requests}");
 
     let detail = own_conversation_detail(world).await;
     assert_eq!(detail["cluster"]["request_count"], 1, "{detail}");
@@ -7700,7 +7702,7 @@ async fn invalid_stream_is_billed_failure(world: &mut TokenCenterWorld) {
         .await
         .expect("invalid stream stats JSON");
     assert_eq!(stats["summary"]["failed_requests"], 1, "{stats}");
-    assert_eq!(stats["summary"]["output_tokens"], 2, "{stats}");
+    assert_eq!(stats["summary"]["output_tokens"], 0, "{stats}");
 }
 
 async fn wait_for_invalid_stream_terminal_request(world: &TokenCenterWorld) -> Value {

@@ -28,9 +28,8 @@ pub use queries::RequestListFilter;
 pub(crate) use queries::{request_detail_accounting_projection, search_prefix};
 pub use settlement::normalize_proxy_usage;
 pub(crate) use settlement::{
-    price_token_usage, proxy_contract_ceiling_micros, reserve_usage_in_transaction,
-    settle_confirmed_image_charge_in_transaction, settle_token_usage_in_transaction,
-    settle_token_usage_in_transaction_with_charge,
+    price_token_usage, reserve_usage_in_transaction, settle_confirmed_image_charge_in_transaction,
+    settle_token_usage_in_transaction,
 };
 pub use stats::StatsFilter;
 #[cfg(test)]

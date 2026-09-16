@@ -182,7 +182,7 @@ async fn ambiguous_codex_response_does_not_open_the_shared_account_breaker() {
         .await
         .unwrap();
     let rendered = String::from_utf8(body.to_vec()).unwrap();
-    assert_eq!(rendered.matches("event: error").count(), 1);
+    assert_eq!(rendered.matches("event: response.failed").count(), 1);
     assert_eq!(rendered.matches("upstream request failed").count(), 1);
     assert!(!rendered.contains("private-secret"));
     wait_for_request_settlement(&fixture, 1).await;
@@ -246,7 +246,7 @@ async fn failed_codex_protocol_mismatch_opens_the_invalid_response_breaker() {
         .await
         .unwrap();
     let rendered = String::from_utf8(body.to_vec()).unwrap();
-    assert_eq!(rendered.matches("event: error").count(), 1);
+    assert_eq!(rendered.matches("event: response.failed").count(), 1);
     assert_eq!(rendered.matches("upstream request failed").count(), 1);
     wait_for_request_settlement(&fixture, 1).await;
     let rows = fixture

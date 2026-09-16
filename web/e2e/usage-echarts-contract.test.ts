@@ -12,6 +12,7 @@ import {
   type UsageChartCopy,
   type UsageChartFormatters,
 } from '../src/charts/usageCharts.js';
+import { averageBucketTps } from '../src/operator/analyticsPresentation.js';
 
 const copy: UsageChartCopy = {
   requests: 'Requests', success: 'Success', failures: 'Failed', averageLatency: 'Average',
@@ -30,9 +31,15 @@ const point: UsageAnalysisTimeBucket = {
 test('throughput and latency stay in distinct, truthful series', () => {
   const throughput = throughputOption([point], copy, format) as { series: Array<{ name: string; data: number[]; stack?: string }> };
   assert.deepEqual(throughput.series.map((series) => [series.name, series.data]), [['Success', [4]], ['Failed', [2]]]);
-  assert.ok(throughput.series.every((series) => series.stack === 'requests'));
+  assert.ok(throughput.series.every((series) => series.stack === undefined));
   const latency = latencyOption([point], copy, format) as { series: Array<{ name: string; data: Array<number | null> }> };
   assert.deepEqual(latency.series.map((series) => [series.name, series.data]), [['Average', [20]], ['P95 (approx.)', [70]]]);
+});
+
+test('average bucket TPS derives from historical output and total duration only', () => {
+  assert.equal(averageBucketTps(point), 41.66666666666667);
+  assert.equal(averageBucketTps({ ...point, avg_duration_ms: null }), null);
+  assert.equal(averageBucketTps({ ...point, requests: 0 }), null);
 });
 
 test('cost charts never add unlike currencies', () => {

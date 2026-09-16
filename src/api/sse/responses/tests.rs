@@ -99,6 +99,25 @@ fn sanitizer_redacts_failures_and_rejects_terminal_conflicts() {
 }
 
 #[test]
+fn safe_failure_is_an_explicit_failed_terminal_without_a_fabricated_identity() {
+    let mut framer = BoundedSseFramer::default();
+    let batch = framer.push(&safe_failure_event());
+    assert!(batch.rejection.is_none());
+    assert_eq!(batch.events.len(), 1);
+    let (event_name, data) = parse_sse_event(&batch.events[0]).unwrap();
+    assert_eq!(event_name.as_deref(), Some("response.failed"));
+    let payload: Value = serde_json::from_slice(&data.unwrap()).unwrap();
+    assert_eq!(payload["type"], "response.failed");
+    assert_eq!(payload["response"]["status"], "failed");
+    assert_eq!(payload["response"]["error"]["code"], "server_error");
+    assert_eq!(
+        payload["response"]["error"]["message"],
+        "upstream request failed"
+    );
+    assert!(payload.pointer("/response/id").is_none());
+}
+
+#[test]
 fn sanitizer_mints_progress_heartbeats_until_downstream_terminal_release() {
     let mut sanitizer = ResponsesStreamingSanitizer::default();
     assert!(sanitizer.progress_heartbeat().is_none());

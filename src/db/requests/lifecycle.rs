@@ -89,7 +89,6 @@ pub struct FinishProxyRequest<'a> {
     pub status_code: i64,
     pub duration_ms: i64,
     pub usage: TokenUsage,
-    pub charge_contract_ceiling: bool,
     pub error_code: Option<&'a str>,
     pub response_object: &'a str,
     pub conversation: Option<ProxyConversationInput<'a>>,
@@ -619,10 +618,13 @@ impl Database {
     /// Converges an admitted stream after its in-process lifecycle deadline.
     ///
     /// The durable delivery marker, rather than the cancelled task's local
-    /// state, decides whether the reserved contract was delivered and must be
-    /// charged. The terminal write below is still the normal request-owner
-    /// CAS, so a late normal finalizer is returned as `AlreadyFinished` and an
-    /// unavailable database leaves the record pending for the orphan reaper.
+    /// state, selects the persisted ceiling split used to validate the
+    /// reservation. With no trustworthy terminal usage, the reservation is
+    /// released rather than promoted to actual cost; its immutable estimate
+    /// remains in `usage_reservations`. The terminal write below is still the
+    /// normal request-owner CAS, so a late normal finalizer is returned as
+    /// `AlreadyFinished` and an unavailable database leaves the record pending
+    /// for the orphan reaper.
     pub async fn expire_proxy_lifecycle_deadline(
         &self,
         request_id: Uuid,
@@ -692,16 +694,7 @@ impl Database {
             requested_service_tier: requested_service_tier.as_deref(),
             status_code: 504,
             duration_ms: duration_ms.max(0),
-            usage: if delivery_started {
-                TokenUsage {
-                    input_tokens: input_token_ceiling,
-                    output_tokens: output_token_ceiling,
-                    ..TokenUsage::default()
-                }
-            } else {
-                TokenUsage::default()
-            },
-            charge_contract_ceiling: delivery_started,
+            usage: TokenUsage::default(),
             error_code: Some("request_lifecycle_timeout"),
             response_object: &response_object,
             conversation: None,
@@ -1178,22 +1171,11 @@ impl Database {
         let reservation_status: String = reservation_row.try_get("status")?;
         let cost_micros = match reservation_status.as_str() {
             "reserved" => {
-                settle_token_usage_in_transaction_with_charge(
+                settle_token_usage_in_transaction(
                     &mut transaction,
                     &trusted_reservation,
                     &usage,
                     now,
-                    input
-                        .charge_contract_ceiling
-                        .then(|| {
-                            proxy_contract_ceiling_micros(
-                                &trusted_reservation,
-                                input.input_token_ceiling,
-                                input.output_token_ceiling,
-                                input.requested_service_tier,
-                            )
-                        })
-                        .transpose()?,
                 )
                 .await?
             }
@@ -1208,9 +1190,7 @@ impl Database {
                 ));
             }
         };
-        let usage_basis = if input.charge_contract_ceiling {
-            Some(crate::model::RequestUsageBasis::ContractCeiling)
-        } else if usage_invalid {
+        let usage_basis = if usage_invalid {
             Some(crate::model::RequestUsageBasis::NotObserved)
         } else {
             input.usage_basis

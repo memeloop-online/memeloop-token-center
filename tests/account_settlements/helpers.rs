@@ -101,7 +101,6 @@ pub(super) async fn create_text_settlement_with_id(
                 output_tokens: 1,
                 ..TokenUsage::default()
             },
-            charge_contract_ceiling: false,
             error_code: None,
             response_object,
             conversation: None,

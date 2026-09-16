@@ -119,6 +119,17 @@ test('independent proxy save updates concurrency metadata without dropping the p
     await page.goto(`${origin}/e2e/fixtures/form-journey.html?workflows&proxy-workflow&quota-generation`);
     await row.getByRole('button', { name: '刷新额度', exact: true }).click();
     await page.waitForFunction(() => window.formJourneyReads.filter(path => path.endsWith('/quota')).length === 1);
+    assert.match(await row.innerText(), /重置于/);
+    assert.doesNotMatch(await row.innerText(), /重置机会最近到期/);
+    const quotaSummary = row.locator('.quota-summary');
+    await quotaSummary.focus();
+    const quotaTooltip = page.getByRole('tooltip');
+    await quotaTooltip.waitFor();
+    assert.match(await quotaTooltip.innerText(), /重置机会最近到期/);
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.evaluate(() => { document.documentElement.dataset.theme = 'light'; });
+    await page.screenshot({ path: `${artifacts}/quota-summary-tooltip-light-1440.png`, fullPage: true });
+    await page.keyboard.press('Escape');
     assert.equal(await page.locator('.provider-detail-workspace').count(), 0, 'list quota refresh does not require opening account details');
     await row.getByRole('button', { name: '查看详情', exact: true }).click();
     await page.locator('.upstream-quota-windows').getByText('Codex 附加用量（代次 1 额度） · 供应商窗口', { exact: true }).waitFor();

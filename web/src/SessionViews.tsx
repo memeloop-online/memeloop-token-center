@@ -4,9 +4,11 @@ import type { CSSProperties } from 'react';
 import { formatCurrencyDisplay, formatMetricDisplay, formatDurationDisplay, formatPercent } from './format.js';
 import type { Locale } from './i18n.js';
 import { useI18n } from './i18n.js';
+import { requestCostCopy } from './requestTablePresentation.js';
 import { deriveSemanticExecution } from './sessionSemantics.js';
 import { latestDeclaredSessionName, sessionFallback, unnamedSessionName } from './sessionTitles.js';
 import { SessionReplayPanel, type SessionReplayArchiveLoader } from './sessionReplayViews.js';
+import type { ArchiveRangeLoader } from './archiveRange.js';
 import type { ConversationRequest, LogicalSessionDetail, LogicalSessionSummary, RequestView, UsageAnalysisCost } from './types.js';
 
 const semanticPalette = ['#6859d9', '#18a999', '#e68a2e', '#d74f70', '#4078c0', '#8a63b8'];
@@ -238,7 +240,7 @@ function SessionActivity({ detail, summary, currency, loading, onSelect }: {
   const eventMetrics = (request: ConversationRequest) => [
     `${formatMetricNumber(request.input_tokens + request.output_tokens, locale).text} ${t('request.tokenUnit')}`,
     request.duration_ms === null ? '—' : formatMilliseconds(request.duration_ms, locale),
-    request.currency || currency || summaryCurrency ? formatCurrency(request.cost, request.currency ?? currency ?? summaryCurrency ?? '', locale) : '—',
+    requestCostCopy(request, locale).unknown ? requestCostCopy(request, locale).label : request.currency || currency || summaryCurrency ? formatCurrency(request.cost, request.currency ?? currency ?? summaryCurrency ?? '', locale) : '—',
   ];
   const parentLabel = (request: ConversationRequest) => {
     const node = nodes.get(request.request_id);
@@ -268,7 +270,7 @@ function SessionActivity({ detail, summary, currency, loading, onSelect }: {
             <header><div><DetailTooltip content={`${t('sessions.client')}: ${request.structure?.client_name || actor}\n${t('sessions.diagnostics')}: ${request.request_id}\n${request.protocol}`}><b className="session-event-model" tabIndex={0}>{request.model}</b></DetailTooltip><span className={`status ${status}`}>{request.status_code ?? t('common.running')}</span>{task && <span className="pill">{task}</span>}{relations.map((relation) => <span className="session-relation" key={`${relation.from_request_id ?? 'root'}-${relation.relation}`}>{t(`conversationRelation.${relation.relation}`)}</span>)}</div><time dateTime={new Date(request.created_at).toISOString()}>{new Date(request.created_at).toLocaleString(locale)}</time></header>
             <div className="session-event-request"><span>{actor}</span></div>
             {parent && <p className="session-event-parent">← {parent}</p>}
-            <footer><DetailTooltip content={`${t('sessions.tokens')}: ${request.input_tokens + request.output_tokens}\n${t('sessions.averageLatency')}: ${request.duration_ms == null ? '—' : `${request.duration_ms} ms`}\n${t('sessions.cost')}: ${request.cost} ${request.currency ?? currency ?? summaryCurrency ?? ''}`.trim()}><span tabIndex={0}>{eventMetrics(request).join(' · ')}</span></DetailTooltip>{request.error_code && <code className="error-code">{request.error_code}</code>}<button type="button" className="secondary session-event-open" disabled={loading} onClick={() => onSelect(request)}>{t('request.inspect')}</button></footer>
+            <footer><DetailTooltip content={`${t('sessions.tokens')}: ${request.input_tokens + request.output_tokens}\n${t('sessions.averageLatency')}: ${request.duration_ms == null ? '—' : `${request.duration_ms} ms`}\n${t('sessions.cost')}: ${requestCostCopy(request, locale).unknown ? requestCostCopy(request, locale).hint : `${request.cost} ${request.currency ?? currency ?? summaryCurrency ?? ''}`}`.trim()}><span tabIndex={0}>{eventMetrics(request).join(' · ')}</span></DetailTooltip>{request.error_code && <code className="error-code">{request.error_code}</code>}<button type="button" className="secondary session-event-open" disabled={loading} onClick={() => onSelect(request)}>{t('request.inspect')}</button></footer>
           </article>
         </li>;
       })}</ol>
@@ -276,7 +278,7 @@ function SessionActivity({ detail, summary, currency, loading, onSelect }: {
   </div>;
 }
 
-export function SessionDetailSurface({ detail, summary, currency, showDiagnosticIds = false, loading, onLoadOlder, onSelect, onClose, loadReplayArchive }: {
+export function SessionDetailSurface({ detail, summary, currency, showDiagnosticIds = false, loading, onLoadOlder, onSelect, onClose, loadReplayArchive, loadArchiveRange }: {
   detail: LogicalSessionDetail;
   summary?: LogicalSessionSummary;
   currency?: string;
@@ -287,6 +289,7 @@ export function SessionDetailSurface({ detail, summary, currency, showDiagnostic
   onClose?: () => void;
   /** Optional owner-scoped archive reader; the shared view never receives a credential. */
   loadReplayArchive?: SessionReplayArchiveLoader;
+  loadArchiveRange?: ArchiveRangeLoader;
 }) {
   const { locale, t } = useI18n();
   const declaredSessionName = latestDeclaredSessionName(detail);
@@ -306,7 +309,7 @@ export function SessionDetailSurface({ detail, summary, currency, showDiagnostic
   return <section className="session-detail" aria-label={title}>
     <header className="session-detail-heading"><div><span className="eyebrow">{t('sessions.logicalSession')}</span><h2>{title}</h2>{detail.unlinked && <p className="mtc-secondary-text">{t('sessions.unlinkedDetail')}</p>}</div>{onClose && <Button appearance="secondary" onClick={onClose} aria-label={t('common.close')}>×</Button>}</header>
     {showDiagnosticIds && <div className="session-diagnostics"><Disclosure title={t('sessions.diagnostics')}><code className="break-anywhere">{detail.session_id}</code><CopyDiagnostic value={detail.session_id} kind="session" />{reportedSessionId && <><small>{t('sessions.reportedSession')}</small><code className="break-anywhere">{reportedSessionId}</code><CopyDiagnostic value={reportedSessionId} kind="session" /></>}</Disclosure></div>}
-    {!(detail.unlinked && detail.session_id.startsWith('unlinked:')) && <SessionReplayPanel detail={detail} scopeKey={summary?.key_id ?? detail.session_id} loadArchiveDetail={loadReplayArchive} onLoadEarlierRequests={onLoadOlder} loadingEarlier={loading} />}
+    {!(detail.unlinked && detail.session_id.startsWith('unlinked:')) && <SessionReplayPanel detail={detail} scopeKey={summary?.key_id ?? detail.session_id} loadArchiveDetail={loadReplayArchive} loadArchiveRange={loadArchiveRange} onLoadEarlierRequests={onLoadOlder} loadingEarlier={loading} />}
     <Disclosure title={t('sessions.executionTimeline')} defaultOpen={detail.unlinked}><SessionActivity detail={detail} summary={summary} currency={currency} loading={loading} onSelect={onSelect} /></Disclosure>
     {detail.has_more && <div className="load-more"><Button appearance="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('sessions.loadEarlier')}</Button></div>}
     {!detail.unlinked && <Disclosure title={t('sessions.semantic')}><SemanticExecutionPanel detail={detail} /></Disclosure>}

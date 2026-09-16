@@ -269,7 +269,6 @@ async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_wi
                         output_tokens: 1,
                         ..TokenUsage::default()
                     },
-                    charge_contract_ceiling: false,
                     error_code: None,
                     response_object: "objects/blake3/metered-unlimited-response",
                     conversation: None,
@@ -518,7 +517,6 @@ async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_
                 output_tokens: 1,
                 ..TokenUsage::default()
             },
-            charge_contract_ceiling: false,
             error_code: None,
             response_object: "objects/blake3/metered-conversation-root-response",
             conversation: Some(ProxyConversationInput {
@@ -618,7 +616,6 @@ async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_
                         output_tokens: 1,
                         ..TokenUsage::default()
                     },
-                    charge_contract_ceiling: false,
                     error_code: None,
                     response_object: "objects/blake3/metered-conversation-child-response",
                     conversation: Some(ProxyConversationInput {
@@ -814,7 +811,6 @@ async fn postgres_metered_unlimited_terminal_replay_is_exactly_once() {
                         output_tokens: 1,
                         ..TokenUsage::default()
                     },
-                    charge_contract_ceiling: false,
                     error_code: None,
                     response_object: "objects/blake3/metered-unlimited-replay-response",
                     conversation: None,
@@ -957,7 +953,6 @@ async fn postgres_prepaid_boundary_remains_fail_closed_under_parallel_admission(
                         output_tokens: 1,
                         ..TokenUsage::default()
                     },
-                    charge_contract_ceiling: false,
                     error_code: None,
                     response_object: "objects/blake3/prepaid-boundary-response",
                     conversation: None,
@@ -1072,7 +1067,6 @@ async fn postgres_conversation_projection_prematerializes_before_the_session_loc
                 output_tokens: 1,
                 ..TokenUsage::default()
             },
-            charge_contract_ceiling: false,
             error_code: None,
             response_object: "objects/blake3/projection-prematerialize-response",
             conversation: Some(ProxyConversationInput {
@@ -1352,7 +1346,6 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
                     output_tokens: 7,
                     ..TokenUsage::default()
                 },
-                charge_contract_ceiling: false,
                 error_code: None,
                 response_object: "objects/blake3/postgres-admission-lock-response-a",
                 conversation: Some(ProxyConversationInput {
@@ -1450,7 +1443,6 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
                         output_tokens: 3,
                         ..TokenUsage::default()
                     },
-                    charge_contract_ceiling: false,
                     error_code: None,
                     response_object: "objects/blake3/postgres-admission-lock-response-b",
                     conversation: Some(ProxyConversationInput {
@@ -1533,7 +1525,6 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
                 output_tokens: 3,
                 ..TokenUsage::default()
             },
-            charge_contract_ceiling: false,
             error_code: None,
             response_object: "objects/blake3/postgres-admission-lock-response-b",
             conversation: Some(ProxyConversationInput {
@@ -1733,7 +1724,6 @@ async fn postgres_proxy_terminal_owner_is_exactly_once() {
                         output_tokens: 7,
                         ..TokenUsage::default()
                     },
-                    charge_contract_ceiling: false,
                     error_code: None,
                     response_object: &fault_locator,
                     conversation: None,
@@ -1823,7 +1813,6 @@ async fn postgres_proxy_terminal_owner_is_exactly_once() {
                             output_tokens: 7,
                             ..TokenUsage::default()
                         },
-                        charge_contract_ceiling: false,
                         error_code: None,
                         response_object: &response_object,
                         conversation: None,

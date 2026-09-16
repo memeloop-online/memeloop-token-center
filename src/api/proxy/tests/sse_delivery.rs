@@ -195,7 +195,7 @@ async fn assert_codex_terminal_rejection(
         .await
         .expect("a rejected Responses stream must end with a safe SSE error");
     let delivered = String::from_utf8(delivered.to_vec()).unwrap();
-    assert_eq!(delivered.matches("event: error").count(), 1);
+    assert_eq!(delivered.matches("event: response.failed").count(), 1);
     assert_eq!(delivered.matches("upstream request failed").count(), 1);
     assert!(!delivered.contains("response.completed"));
     assert!(!delivered.contains("[DONE]"));

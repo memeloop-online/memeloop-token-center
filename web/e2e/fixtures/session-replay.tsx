@@ -3,6 +3,8 @@ import { useEffect, useState } from 'react';
 
 import { I18nProvider } from '../../src/i18n';
 import { SessionReplayPanel } from '../../src/sessionReplayViews';
+import { ArchiveChangedError, ArchiveUnavailableError, type ArchiveRangeLoader } from '../../src/archiveRange';
+import { MtcFluentProvider } from '../../src/design-system';
 import type { ConversationRequest, LogicalSessionDetail, RequestDetail } from '../../src/types';
 import '../../src/styles.css';
 import '../../src/theme.css';
@@ -67,6 +69,24 @@ const archives = new Map<string, RequestDetail>([
 ]);
 
 const liveFixture = new URLSearchParams(location.search).has('live');
+const fullFixture = new URLSearchParams(location.search).has('full');
+const fullInvalid = new URLSearchParams(location.search).has('invalid');
+const fullGap = new URLSearchParams(location.search).has('gap');
+const fullMissing = new URLSearchParams(location.search).has('missing');
+const fullBytes = fullFixture ? new TextEncoder().encode(JSON.stringify({ output: Array.from({ length: 75 }, (_, index) => ({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: `Archived step ${index + 1}: ${'保留完整工作内容。'.repeat(2500)}` }] })) })) : new Uint8Array();
+let fullVersion = '"fixture-v1"';
+declare global { interface Window { archiveRangeReads: number } }
+window.archiveRangeReads = 0;
+const loadFullArchive: ArchiveRangeLoader = async (_id, _side, offset, length, etag, signal) => {
+  window.archiveRangeReads += 1;
+  await new Promise<void>((resolve, reject) => {
+    const timer = window.setTimeout(resolve, 5);
+    signal.addEventListener('abort', () => { window.clearTimeout(timer); reject(signal.reason); }, { once: true });
+  });
+  if (etag && etag !== fullVersion) throw new ArchiveChangedError();
+  if (fullMissing) throw new ArchiveUnavailableError('archive_object_unavailable');
+  return { bytes: fullBytes.slice(offset, offset + length), offset, totalBytes: fullBytes.length, etag: fullVersion };
+};
 declare global { interface Window { sessionReplayReads: Record<string, number>; sessionReplayAborts: number } }
 window.sessionReplayReads = {};
 window.sessionReplayAborts = 0;
@@ -85,6 +105,10 @@ function waitForRelease(waiters: Set<() => void>, signal: AbortSignal) {
 }
 function releaseAll(waiters: Set<() => void>) { for (const release of [...waiters]) release(); }
 async function loadArchive(requestView: ConversationRequest, signal: AbortSignal) {
+  if (fullFixture) return { ...archive(requestView, { input: [] }, null, false), archive: {
+    request: { state: 'bound' as const, complete: true, reason: null },
+    response: { state: fullGap ? 'gap' as const : 'bound' as const, complete: false, reason: fullInvalid ? 'archive_payload_invalid' : 'archive_object_unavailable' },
+  } };
   window.sessionReplayReads[requestView.request_id] = (window.sessionReplayReads[requestView.request_id] ?? 0) + 1;
   if (liveFixture && scopePaused) await waitForRelease(scopeWaiters, signal);
   if (liveFixture && requestView.request_id === 'replay-r2' && !slowReleased) await waitForRelease(slowWaiters, signal);
@@ -106,7 +130,7 @@ async function loadArchive(requestView: ConversationRequest, signal: AbortSignal
 }
 
 function Fixture() {
-  const [current, setCurrent] = useState(detail);
+  const [current, setCurrent] = useState(fullFixture ? { ...detail, requests: [requests[0]!], has_more: false, next_cursor: null } : detail);
   const [scope, setScope] = useState('scope-a');
   useEffect(() => {
     if (!liveFixture) return;
@@ -124,7 +148,11 @@ function Fixture() {
       <button onClick={() => setCurrent(value => ({ ...value, requests: value.requests.map(request => request.request_id === 'replay-r3' ? { ...request, archive_state: 'bound' } : request) }))}>Finish late archive</button>
     </>}
     {liveFixture && <button onClick={() => setCurrent(value => ({ ...value, requests: value.requests.map(request => request.request_id === 'replay-r1' ? { ...request, archive_state: 'gap' } : request) }))}>Invalidate complete archive</button>}
-    <SessionReplayPanel detail={current} scopeKey={scope} loadArchiveDetail={loadArchive} />
+    {fullFixture ? <MtcFluentProvider>
+      <button onClick={() => { fullVersion = '"fixture-v2"'; }}>Change archive version</button>
+      <button onClick={() => setScope(value => `${value}-next`)}>Change full scope</button>
+      <SessionReplayPanel detail={current} scopeKey={scope} loadArchiveDetail={loadArchive} loadArchiveRange={loadFullArchive} />
+    </MtcFluentProvider> : <SessionReplayPanel detail={current} scopeKey={scope} loadArchiveDetail={loadArchive} />}
   </main></I18nProvider>;
 }
 createRoot(document.getElementById('root')!).render(<Fixture />);

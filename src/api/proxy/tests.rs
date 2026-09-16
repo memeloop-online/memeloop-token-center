@@ -3911,7 +3911,7 @@ async fn codex_streaming_natural_failure_then_truncation_emits_one_error_termina
         .await
         .expect("a post-terminal upstream error must still close the body cleanly");
     let rendered = String::from_utf8(body.to_vec()).unwrap();
-    assert_eq!(rendered.matches("event: error").count(), 1);
+    assert_eq!(rendered.matches("event: response.failed").count(), 1);
     assert_eq!(rendered.matches("upstream request failed").count(), 1);
     assert!(!rendered.contains("provider-secret"));
 
@@ -3943,7 +3943,7 @@ async fn codex_streaming_completed_then_truncation_replaces_held_success_with_er
     let rendered = String::from_utf8(body.to_vec()).unwrap();
     assert!(rendered.contains("resp-held"));
     assert!(!rendered.contains("response.completed"));
-    assert_eq!(rendered.matches("event: error").count(), 1);
+    assert_eq!(rendered.matches("event: response.failed").count(), 1);
     assert_eq!(rendered.matches("upstream request failed").count(), 1);
 
     accepted.await.unwrap();
@@ -4330,7 +4330,7 @@ async fn codex_retry_streaming_failure_is_redacted_and_records_failed_terminal()
 }
 
 #[tokio::test]
-async fn codex_streaming_output_then_failure_charges_the_contract_ceiling_once() {
+async fn codex_streaming_output_then_failure_keeps_unobserved_usage_out_of_actual_cost() {
     let fixture = codex_route_fixture("stream-output-failure").await;
     let upstream = MockServer::start().await;
     let failed = concat!(
@@ -4370,13 +4370,12 @@ async fn codex_streaming_output_then_failure_charges_the_contract_ceiling_once()
         .await
         .unwrap();
     assert_eq!(rows[0].status_code, Some(502));
-    assert!(rows[0].input_tokens > 0);
-    assert_eq!(rows[0].output_tokens, 64);
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
     assert_eq!(
         rows[0].usage_basis,
-        Some(crate::model::RequestUsageBasis::ContractCeiling)
+        Some(crate::model::RequestUsageBasis::NotObserved)
     );
-    assert_ne!(rows[0].cost, "0");
+    assert_eq!(rows[0].cost, "0");
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
 }
 
@@ -4520,11 +4519,12 @@ async fn downstream_disconnect_settles_without_waiting_for_stalled_upstream() {
         .unwrap();
     assert_eq!(rows[0].status_code, Some(499));
     assert_eq!(rows[0].error_code.as_deref(), Some("client_cancelled"));
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
     assert_eq!(
         rows[0].usage_basis,
-        Some(crate::model::RequestUsageBasis::ContractCeiling)
+        Some(crate::model::RequestUsageBasis::NotObserved)
     );
-    assert_ne!(rows[0].cost, "0");
+    assert_eq!(rows[0].cost, "0");
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
 
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
@@ -4879,8 +4879,12 @@ async fn streaming_response_error_null_completes_and_non_null_error_fails() {
             )
             .await;
         } else {
-            assert_ne!(rows[0].cost, "0", "delivered failed streams are billed");
-            assert_eq!(rows[0].output_tokens, 16);
+            assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
+            assert_eq!(
+                rows[0].usage_basis,
+                Some(crate::model::RequestUsageBasis::NotObserved)
+            );
+            assert_eq!(rows[0].cost, "0");
         }
     }
 }

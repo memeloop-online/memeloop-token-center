@@ -7,7 +7,7 @@ import { formatCurrency, formatCurrencyDisplay, formatDurationDisplay, formatMet
 import { useAnchoredPopover } from './useAnchoredPopover.js';
 import { DetailTooltip } from './design-system';
 import { RequestStatus } from './RequestStatus';
-import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCredentialLabel, requestIsPending, requestUsageCopy } from './requestTablePresentation';
+import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestIsPending, requestUsageCopy } from './requestTablePresentation';
 
 export function Shell({ children, operator = false }: { children: ReactNode; operator?: boolean }) {
   const { locale, setLocale, t } = useI18n();
@@ -147,10 +147,6 @@ function recordedCurrency(request: RequestView, fallbackCurrency?: string) {
   return request.currency === undefined ? fallbackCurrency : request.currency;
 }
 
-function settlementCostHint(locale: string) {
-  return locale === 'zh-CN' ? '本地已结算金额，可能包含保守上限结算；不是上游实际消耗账单。' : 'Locally settled amount, which may include conservative ceiling settlement; not the provider’s actual usage invoice.';
-}
-
 function RequestSessionMetadata({ value }: { value: string }) {
   const { t } = useI18n();
   const id = useId();
@@ -242,6 +238,7 @@ export function RequestDiagnostics({
   const duration = formatDurationDisplay(request.duration_ms, locale);
   const timingDetails = `${t('request.receivedAt')}: ${new Date(request.created_at).toLocaleString(locale)} · ${t('request.completedAt')}: ${request.completed_at == null ? (pending ? (zh ? '尚未结束' : 'Still running') : missing) : new Date(request.completed_at).toLocaleString(locale)} · ${t('request.duration')}: ${duration.title ?? missing}`;
   const cost = currencyForRequest ? formatCurrencyDisplay(request.cost, currencyForRequest, locale) : { text: missing };
+  const costCopy = requestCostCopy(request, locale);
   const settlement = <DetailTooltip content={t('request.pendingUsage')}><span tabIndex={0}>{zh ? '待结算' : 'Awaiting settlement'}</span></DetailTooltip>;
 
   return <div className="request-diagnostics request-detail-surface request-detail-summary">
@@ -249,7 +246,7 @@ export function RequestDiagnostics({
       <div className="request-detail-wide"><b>{t('request.model')}</b><RequestMetadata label={request.model} fields={[[t('request.routeId'), request.route_id], [t('request.protocol'), request.protocol]]} /><RequestCompaction request={request} /></div>
       <div className="request-detail-wide"><b>{zh ? '凭据' : 'Credential'}</b><RequestMetadata label={credentialLabel} fields={[[zh ? '凭据 ID' : 'Credential ID', request.credential_identity?.key_id], [zh ? '主体' : 'Principal', request.credential_identity?.principal_external_id], [zh ? '租户' : 'Tenant', request.credential_identity?.tenant_external_id]]} /></div>
       <div className="request-token-cell"><b>{t('request.tokens')}</b><RequestTokenSummary request={request} /></div>
-      <div><b>{t('request.cost')}</b>{pending ? settlement : <DetailTooltip content={`${cost.title ?? missing} ${settlementCostHint(locale)}`}><span tabIndex={0}>{cost.text}</span></DetailTooltip>}</div>
+      <div><b>{t('request.cost')}</b>{pending ? settlement : <DetailTooltip content={costCopy.unknown ? costCopy.hint : `${cost.title ?? missing} ${costCopy.hint}`}><span tabIndex={0}>{costCopy.unknown ? costCopy.label : cost.text}</span></DetailTooltip>}</div>
     </section>
     <section className="request-detail-group" aria-label={zh ? '交付与性能' : 'Delivery and performance'}>
       <div><b>{zh ? '最终上游' : 'Final upstream'}</b><RequestMetadata label={upstreamName || (request.upstream_account_id ? (zh ? '未命名上游' : 'Unnamed upstream') : missing)} fields={[[t('request.upstreamId'), request.upstream_account_id]]} /></div>
@@ -315,6 +312,7 @@ export function RequestTable({
               : '';
             const pending = requestIsPending(request);
             const cost = pending ? { text: '—', title: copy.pendingUsage } : currencyForRequest ? formatCurrencyDisplay(request.cost, currencyForRequest, locale) : { text: '—' };
+            const costCopy = requestCostCopy(request, locale);
             const duration = formatDurationDisplay(request.duration_ms, locale);
             const credential = requestCredentialLabel(request, credentialAlias);
             const credentialLabel = 'label' in credential ? credential.label : t(credential.key);
@@ -325,7 +323,7 @@ export function RequestTable({
               <td className="request-credential-cell" data-label={t('self.credential')}><DetailTooltip content={credentialDetails}><strong tabIndex={0}>{credentialLabel}</strong></DetailTooltip></td>
               <td className="request-model-cell"><DetailTooltip content={technicalSummary}><span className="request-routing-info" tabIndex={0}><code>{request.model}</code>{upstreamName && <small className="request-upstream-name">{upstreamName}</small>}</span></DetailTooltip><RequestCompaction request={request} /></td>
               <td className="request-token-cell" data-label={t('request.tokens')}><RequestTokenSummary request={request} /></td>
-              <td className="request-cost-cell" data-label={t('request.cost')}><DetailTooltip content={`${cost.title ?? cost.text} ${settlementCostHint(locale)}`}><span className="request-value-info" tabIndex={0}>{cost.text}</span></DetailTooltip></td>
+              <td className="request-cost-cell" data-label={t('request.cost')}><DetailTooltip content={pending ? copy.pendingUsage : costCopy.unknown ? costCopy.hint : `${cost.title ?? cost.text} ${costCopy.hint}`}><span className="request-value-info" tabIndex={0}>{pending ? cost.text : costCopy.unknown ? costCopy.label : cost.text}</span></DetailTooltip></td>
               {showsSession && <td className="request-session-cell" data-label={t('request.session')}>
                 {!context
                   ? '—'

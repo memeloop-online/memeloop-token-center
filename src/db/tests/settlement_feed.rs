@@ -99,7 +99,6 @@ async fn finish(
                 output_tokens: 3,
                 ..TokenUsage::default()
             },
-            charge_contract_ceiling: false,
             error_code: None,
             response_object: &response_object,
             conversation: None,
