@@ -101,6 +101,7 @@ fn downstream_modalities<'a>(
     let allowed: &[&str] = match protocol {
         "openai" => &["text", "embedding"],
         "anthropic" => &["text"],
+        "audio" => &["audio"],
         "generation" => &["image", "video"],
         _ => &[],
     };

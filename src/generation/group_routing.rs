@@ -28,13 +28,25 @@ pub(crate) async fn prepare_route(
     seed: Uuid,
     request_id: Uuid,
 ) -> Result<ResolvedUpstream, AppError> {
+    prepare_route_for_protocol(state, key, model, "generation", hint, seed, request_id).await
+}
+
+pub(crate) async fn prepare_route_for_protocol(
+    state: &mut AppState,
+    key: &AuthenticatedKey,
+    model: &str,
+    protocol: &str,
+    hint: Option<Uuid>,
+    seed: Uuid,
+    request_id: Uuid,
+) -> Result<ResolvedUpstream, AppError> {
     let mut candidates = state
         .db
         .list_authorized_upstream_candidates_with_hint(
             key.key_id,
             key.tenant_id,
             model,
-            "generation",
+            protocol,
             RouteSelectionOptions {
                 upstream_account_hint: hint,
                 selection_seed: seed,
@@ -56,7 +68,7 @@ pub(crate) async fn prepare_route(
         }
     }
     let native =
-        native.ok_or_else(|| AppError::Upstream("generation route is not configured".into()))?;
+        native.ok_or_else(|| AppError::Upstream(format!("{protocol} route is not configured")))?;
     if !state.plugins.has_group_routing_hooks() {
         return Ok(native);
     }
@@ -88,9 +100,9 @@ pub(crate) async fn prepare_route(
             return Ok(route);
         }
     }
-    Err(AppError::Upstream(
-        "generation candidates are unavailable".into(),
-    ))
+    Err(AppError::Upstream(format!(
+        "{protocol} candidates are unavailable"
+    )))
 }
 
 pub(crate) async fn admit(

@@ -1,6 +1,7 @@
 use super::super::*;
 
 pub(in crate::api) fn gateway_router(state: AppState) -> Router<AppState> {
+    let audio_body_max_bytes = state.config.audio_body_max_bytes as usize;
     let authenticated = Router::new()
         .route("/self/v1/key", get(self_key))
         .route("/self/v1/key/limits", get(self_key_limits))
@@ -45,6 +46,10 @@ pub(in crate::api) fn gateway_router(state: AppState) -> Router<AppState> {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(proxy_openai_chat))
         .route("/v1/embeddings", post(proxy_openai_embeddings))
+        .route(
+            "/v1/audio/transcriptions",
+            post(create_audio_transcription).layer(DefaultBodyLimit::max(audio_body_max_bytes)),
+        )
         .route("/v1/generations", post(create_generation))
         .route("/v1/videos/generations", post(create_video_generation))
         .route(

@@ -257,7 +257,7 @@ When('浏览器提供严格且权重可区分的请求统计维度 fixture', asy
     const keyId = requestUrl.searchParams.get('key_id');
     if ((status && !['success', 'error'].includes(status))
       || (upstream && upstream !== 'unassigned' && !uuidPattern.test(upstream))
-      || (protocol && !['openai', 'anthropic', 'openai-image', 'generation'].includes(protocol))
+      || (protocol && !['openai', 'anthropic', 'openai-image', 'audio-transcription', 'generation'].includes(protocol))
       || (keyId && !uuidPattern.test(keyId))) {
       await route.fulfill({
         status: 400,

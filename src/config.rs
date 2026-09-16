@@ -14,6 +14,7 @@ pub const MAX_RESPONSES_BODY_MAX_BYTES: u32 = 64 * 1024 * 1024;
 pub const DEFAULT_RESPONSES_BODY_READ_CONCURRENCY: u32 = 4;
 pub const DEFAULT_PROXY_MEMORY_BUDGET_BYTES: u32 = 256 * 1024 * 1024;
 pub const MAX_RESPONSES_BODY_READ_CONCURRENCY: u32 = 8;
+pub const DEFAULT_AUDIO_BODY_MAX_BYTES: u32 = 25 * 1024 * 1024;
 pub const DEFAULT_UPSTREAM_SHARED_PROBE_ATTEMPTS: u32 = 1;
 pub const MAX_UPSTREAM_SHARED_PROBE_ATTEMPTS: u32 = 4;
 pub const DEFAULT_ARCHIVE_SPOOL_COMPRESSION_ENABLED: bool = false;
@@ -145,6 +146,10 @@ pub struct Config {
     /// Maximum `/v1/responses` request body size. It is separately admitted so
     /// its 16 MiB default cannot consume all general body-read capacity.
     pub responses_body_max_bytes: u32,
+    /// Maximum `/v1/audio/transcriptions` multipart body size. This is kept
+    /// independent from Responses so audio uploads cannot widen text ingress.
+    #[serde(default = "default_audio_body_max_bytes")]
+    pub audio_body_max_bytes: u32,
     /// Maximum concurrent `/v1/responses` body reads per gateway process.
     pub responses_body_read_concurrency: u32,
     /// Shared per-upstream-account circuit-breaker and half-open probe timings.
@@ -213,6 +218,7 @@ impl std::fmt::Debug for Config {
                 &self.gateway_body_read_concurrency,
             )
             .field("responses_body_max_bytes", &self.responses_body_max_bytes)
+            .field("audio_body_max_bytes", &self.audio_body_max_bytes)
             .field(
                 "responses_body_read_concurrency",
                 &self.responses_body_read_concurrency,
@@ -392,6 +398,10 @@ impl Config {
                 "MTC_RESPONSES_BODY_MAX_BYTES",
                 DEFAULT_RESPONSES_BODY_MAX_BYTES,
             )?),
+            audio_body_max_bytes: env_u32(
+                "MTC_AUDIO_BODY_MAX_BYTES",
+                DEFAULT_AUDIO_BODY_MAX_BYTES,
+            )?,
             responses_body_read_concurrency: responses_body_read_concurrency(env_u32(
                 "MTC_RESPONSES_BODY_READ_CONCURRENCY",
                 DEFAULT_RESPONSES_BODY_READ_CONCURRENCY,
@@ -449,6 +459,7 @@ impl Config {
             || self.proxy_memory_budget_bytes > 2 * 1024 * 1024 * 1024
             || u64::from(self.proxy_memory_budget_bytes)
                 < u64::from(self.responses_body_max_bytes) * 12 + 1024 * 1024
+            || u64::from(self.proxy_memory_budget_bytes) < u64::from(self.audio_body_max_bytes) * 3
         {
             return Err(ConfigError::InvalidProxyMemoryBudget);
         }
@@ -464,6 +475,7 @@ impl Config {
             proxy_memory_budget_bytes: DEFAULT_PROXY_MEMORY_BUDGET_BYTES,
             gateway_body_read_concurrency: DEFAULT_GATEWAY_BODY_READ_CONCURRENCY,
             responses_body_max_bytes: DEFAULT_RESPONSES_BODY_MAX_BYTES,
+            audio_body_max_bytes: DEFAULT_AUDIO_BODY_MAX_BYTES,
             responses_body_read_concurrency: DEFAULT_RESPONSES_BODY_READ_CONCURRENCY,
             upstream_health: UpstreamHealthConfig::DEFAULT,
             quota_observation_interval_millis: 10_000,
@@ -620,6 +632,10 @@ fn responses_body_max_bytes(value: u32) -> u32 {
     value.clamp(MIN_RESPONSES_BODY_MAX_BYTES, MAX_RESPONSES_BODY_MAX_BYTES)
 }
 
+const fn default_audio_body_max_bytes() -> u32 {
+    DEFAULT_AUDIO_BODY_MAX_BYTES
+}
+
 fn responses_body_read_concurrency(value: u32) -> u32 {
     value.clamp(1, MAX_RESPONSES_BODY_READ_CONCURRENCY)
 }
@@ -627,7 +643,7 @@ fn responses_body_read_concurrency(value: u32) -> u32 {
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error(
-        "MTC_PROXY_MEMORY_BUDGET_BYTES must be 256 MiB..2 GiB and at least twelve times MTC_RESPONSES_BODY_MAX_BYTES plus 1 MiB; pod memory must cover this budget plus 256 MiB"
+        "MTC_PROXY_MEMORY_BUDGET_BYTES must be 256 MiB..2 GiB, at least twelve times MTC_RESPONSES_BODY_MAX_BYTES plus 1 MiB, and at least three times MTC_AUDIO_BODY_MAX_BYTES; pod memory must cover this budget plus 256 MiB"
     )]
     InvalidProxyMemoryBudget,
     #[error(
@@ -671,6 +687,8 @@ mod tests {
         assert!(config.validate_proxy_memory_budget().is_err());
         config.proxy_memory_budget_bytes = MAX_RESPONSES_BODY_MAX_BYTES * 12 + 1024 * 1024;
         assert!(config.validate_proxy_memory_budget().is_ok());
+        config.audio_body_max_bytes = config.proxy_memory_budget_bytes / 3 + 1;
+        assert!(config.validate_proxy_memory_budget().is_err());
     }
 
     #[test]
@@ -875,6 +893,7 @@ mod tests {
             responses_body_read_concurrency(MAX_RESPONSES_BODY_READ_CONCURRENCY + 1),
             MAX_RESPONSES_BODY_READ_CONCURRENCY
         );
+        assert_eq!(DEFAULT_AUDIO_BODY_MAX_BYTES, 25 * 1024 * 1024);
         let config = Config::for_test("sqlite::memory:".to_owned());
         assert_eq!(
             config.responses_body_max_bytes,

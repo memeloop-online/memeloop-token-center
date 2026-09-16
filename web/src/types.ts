@@ -58,7 +58,7 @@ export type TypedFilterOperator = 'equals' | 'not_equals' | 'contains' | 'greate
 export type TypedFilterValue =
   | { type: 'text'; value: string }
   | { type: 'model'; value: string }
-  | { type: 'protocol'; value: 'openai' | 'anthropic' | 'openai-image' | 'generation' }
+  | { type: 'protocol'; value: 'openai' | 'anthropic' | 'openai-image' | 'audio-transcription' | 'generation' }
   | { type: 'status'; value: 'success' | 'error' | 'pending' }
   | { type: 'uuid'; value: string }
   | { type: 'integer'; value: number }
@@ -103,7 +103,7 @@ export interface RequestDetail extends RequestView {
 }
 
 export type RequestEventKind = 'started' | 'finished' | 'projected' | 'archive_bound' | 'archive_gap';
-export type RequestArchiveState = 'capturing' | 'pending' | 'uploading' | 'bound' | 'gap';
+export type RequestArchiveState = 'capturing' | 'pending' | 'uploading' | 'metadata_only' | 'bound' | 'gap';
 
 export interface RequestEvent {
   usage_basis?: RequestView['usage_basis'];

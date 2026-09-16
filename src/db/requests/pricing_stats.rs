@@ -26,8 +26,8 @@ SELECT a.model,
    AND a.day_bucket < $4 / 86400000
 UNION ALL
 SELECT f.model,
-       f.input_tokens,
-       f.output_tokens,
+       CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.input_tokens END AS input_tokens,
+       CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.output_tokens END AS output_tokens,
        CAST(1 AS BIGINT) AS requests
   FROM request_stats_facts f
   JOIN pricing_visible_keys k ON k.id = f.key_id AND k.tenant_id = f.tenant_id
@@ -35,8 +35,8 @@ SELECT f.model,
    AND f.created_at < $3
 UNION ALL
 SELECT f.model,
-       f.input_tokens,
-       f.output_tokens,
+       CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.input_tokens END AS input_tokens,
+       CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.output_tokens END AS output_tokens,
        CAST(1 AS BIGINT) AS requests
   FROM request_stats_facts f
   JOIN pricing_visible_keys k ON k.id = f.key_id AND k.tenant_id = f.tenant_id

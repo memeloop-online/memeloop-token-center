@@ -15,7 +15,7 @@ migration:
   enabled: true
   # Must equal the greatest migration registered by the release binary.
   # The packaging contract rejects drift between this value and migrations/.
-  schemaVersion: 98
+  schemaVersion: 99
   # The hook is the only component that applies schema migrations. Application
   # Deployments always set MTC_RUN_MIGRATIONS_ON_START=false.
   backoffLimit: 4
@@ -127,6 +127,9 @@ config:
   # It is separately capped at four concurrent reads (64 MiB maximum buffered
   # by default) so it cannot turn the 1024 general permits into 16 GiB.
   responsesBodyMaxBytes: 16777216
+  # Independent multipart ceiling for `/v1/audio/transcriptions`; changing it
+  # does not widen `/v1/responses` or other text endpoints.
+  audioBodyMaxBytes: 26214400
   responsesBodyReadConcurrency: 4
   # Shared account-pool circuit breaker. A half-open lease permits exactly one
   # recovery request per account; every duration is in milliseconds.

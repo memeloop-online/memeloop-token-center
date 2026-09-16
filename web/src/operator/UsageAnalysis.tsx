@@ -65,7 +65,7 @@ function typedUsageCondition(filter: keyof UsageFilters, bucket: UsageAnalysisBu
   // the reusable typed-filter AST.  Its drilldown still uses the documented
   // usage API query parameter below.
   if (filter === 'upstreamId') return bucket.id === 'unassigned' ? undefined : { field: 'upstream_account_id', operator: 'equals', value: { type: 'uuid', value: bucket.id } };
-  if (filter === 'protocol') return { field: 'protocol', operator: 'equals', value: { type: 'protocol', value: bucket.id as 'openai' | 'anthropic' | 'openai-image' | 'generation' } };
+  if (filter === 'protocol') return { field: 'protocol', operator: 'equals', value: { type: 'protocol', value: bucket.id as 'openai' | 'anthropic' | 'openai-image' | 'audio-transcription' | 'generation' } };
   if (filter === 'status') return { field: 'status', operator: 'equals', value: { type: 'status', value: bucket.id as 'success' | 'error' | 'pending' } };
   return { field: 'error_code', operator: 'equals', value: { type: 'text', value: bucket.id } };
 }

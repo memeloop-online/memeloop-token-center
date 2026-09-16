@@ -1641,7 +1641,7 @@ async fn record_request_finished_with_basis_in_transaction(
     super::super::billing::publish_text_settlement_in_transaction(tx, request.request_id).await?;
     if project_aggregates {
         sqlx::query(
-            "INSERT INTO usage_daily_aggregates (key_id, day_bucket, model, status_class, error_code, requests, input_tokens, output_tokens, cost_micros) SELECT key_id, created_at / 86400000, model, CASE WHEN status_code >= 200 AND status_code < 400 THEN 'success' ELSE 'failure' END, COALESCE(error_code, ''), 1, input_tokens, output_tokens, cost_micros FROM request_records WHERE id = $1 AND created_at = $2 ON CONFLICT(key_id, day_bucket, model, status_class, error_code) DO UPDATE SET requests = usage_daily_aggregates.requests + 1, input_tokens = usage_daily_aggregates.input_tokens + excluded.input_tokens, output_tokens = usage_daily_aggregates.output_tokens + excluded.output_tokens, cost_micros = usage_daily_aggregates.cost_micros + excluded.cost_micros",
+            "INSERT INTO usage_daily_aggregates (key_id, day_bucket, model, status_class, error_code, requests, input_tokens, output_tokens, cost_micros) SELECT key_id, created_at / 86400000, model, CASE WHEN status_code >= 200 AND status_code < 400 THEN 'success' ELSE 'failure' END, COALESCE(error_code, ''), 1, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE input_tokens END, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE output_tokens END, cost_micros FROM request_records WHERE id = $1 AND created_at = $2 ON CONFLICT(key_id, day_bucket, model, status_class, error_code) DO UPDATE SET requests = usage_daily_aggregates.requests + 1, input_tokens = usage_daily_aggregates.input_tokens + excluded.input_tokens, output_tokens = usage_daily_aggregates.output_tokens + excluded.output_tokens, cost_micros = usage_daily_aggregates.cost_micros + excluded.cost_micros",
         )
         .bind(&request_id)
         .bind(created_at)
@@ -1649,7 +1649,7 @@ async fn record_request_finished_with_basis_in_transaction(
         .await?;
     }
     let fact_inserted = sqlx::query(
-        "INSERT INTO request_stats_facts (request_id, tenant_id, key_id, created_at, model, protocol, status_class, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, service_tier, currency, cost_micros, session_id) SELECT id, tenant_id, key_id, created_at, model, protocol, CASE WHEN status_code BETWEEN 200 AND 399 THEN 'success' ELSE 'failure' END, COALESCE(error_code, ''), COALESCE(upstream_account_id, ''), COALESCE(model_route_id, ''), COALESCE(duration_ms, 0), input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, service_tier, currency, cost_micros, COALESCE(conversation_cluster_id, 'unlinked:' || key_id) FROM request_records WHERE id = $1 AND created_at = $2 AND completed_at IS NOT NULL AND status_code IS NOT NULL ON CONFLICT(request_id) DO NOTHING",
+        "INSERT INTO request_stats_facts (request_id, tenant_id, key_id, created_at, model, protocol, status_class, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, service_tier, currency, cost_micros, session_id) SELECT id, tenant_id, key_id, created_at, model, protocol, CASE WHEN status_code BETWEEN 200 AND 399 THEN 'success' ELSE 'failure' END, COALESCE(error_code, ''), COALESCE(upstream_account_id, ''), COALESCE(model_route_id, ''), COALESCE(duration_ms, 0), CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE input_tokens END, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE output_tokens END, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE cached_input_tokens END, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE cache_write_tokens END, CASE WHEN protocol = 'audio-transcription' THEN output_tokens ELSE 0 END, service_tier, currency, cost_micros, COALESCE(conversation_cluster_id, 'unlinked:' || key_id) FROM request_records WHERE id = $1 AND created_at = $2 AND completed_at IS NOT NULL AND status_code IS NOT NULL ON CONFLICT(request_id) DO NOTHING",
     )
     .bind(&request_id)
     .bind(created_at)
@@ -1659,7 +1659,7 @@ async fn record_request_finished_with_basis_in_transaction(
         == 1;
     if fact_inserted && project_aggregates {
         sqlx::query(
-            "INSERT INTO request_daily_aggregates (tenant_id, key_id, day_bucket, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency, requests, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, duration_count, duration_sum_ms, cost_micros) SELECT tenant_id, key_id, created_at / 86400000, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency, 1, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, 1, duration_ms, cost_micros FROM request_stats_facts WHERE request_id = $1 ON CONFLICT(tenant_id, key_id, day_bucket, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency) DO UPDATE SET requests = request_daily_aggregates.requests + 1, input_tokens = request_daily_aggregates.input_tokens + excluded.input_tokens, output_tokens = request_daily_aggregates.output_tokens + excluded.output_tokens, cached_input_tokens = request_daily_aggregates.cached_input_tokens + excluded.cached_input_tokens, cache_write_tokens = request_daily_aggregates.cache_write_tokens + excluded.cache_write_tokens, duration_count = request_daily_aggregates.duration_count + excluded.duration_count, duration_sum_ms = request_daily_aggregates.duration_sum_ms + excluded.duration_sum_ms, cost_micros = request_daily_aggregates.cost_micros + excluded.cost_micros",
+            "INSERT INTO request_daily_aggregates (tenant_id, key_id, day_bucket, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency, requests, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, duration_count, duration_sum_ms, cost_micros) SELECT tenant_id, key_id, created_at / 86400000, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency, 1, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE input_tokens END, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE output_tokens END, cached_input_tokens, cache_write_tokens, 1, duration_ms, cost_micros FROM request_stats_facts WHERE request_id = $1 ON CONFLICT(tenant_id, key_id, day_bucket, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency) DO UPDATE SET requests = request_daily_aggregates.requests + 1, input_tokens = request_daily_aggregates.input_tokens + excluded.input_tokens, output_tokens = request_daily_aggregates.output_tokens + excluded.output_tokens, cached_input_tokens = request_daily_aggregates.cached_input_tokens + excluded.cached_input_tokens, cache_write_tokens = request_daily_aggregates.cache_write_tokens + excluded.cache_write_tokens, duration_count = request_daily_aggregates.duration_count + excluded.duration_count, duration_sum_ms = request_daily_aggregates.duration_sum_ms + excluded.duration_sum_ms, cost_micros = request_daily_aggregates.cost_micros + excluded.cost_micros",
         )
         .bind(&request_id)
         .execute(&mut **tx)
@@ -1675,15 +1675,19 @@ async fn record_request_finished_with_basis_in_transaction(
                    duration_bucket_4, duration_bucket_5, duration_bucket_6, duration_bucket_7,
                    duration_bucket_8, duration_bucket_9, duration_bucket_10,
                    duration_bucket_11, cost_micros)
-               SELECT tenant_id, key_id, created_at / 3600000, 'request', model,
+               SELECT tenant_id, key_id, created_at / 3600000,
+                      CASE WHEN protocol = 'audio-transcription' THEN 'generation' ELSE 'request' END,
+                      model,
                       CASE WHEN protocol = 'anthropic' OR protocol LIKE 'anthropic-%'
                            THEN 'anthropic' WHEN protocol = 'openai-image' THEN 'openai-image'
+                           WHEN protocol = 'audio-transcription' THEN 'audio-transcription'
                            ELSE 'openai' END,
                       status_class, error_code, upstream_account_id, model_route_id,
                       service_tier, currency, 1,
                       CASE WHEN input_tokens >= cached_input_tokens + cache_write_tokens
                            THEN input_tokens - cached_input_tokens - cache_write_tokens ELSE 0 END,
-                      output_tokens, cached_input_tokens, cache_write_tokens, 0, 1, duration_ms,
+                      output_tokens, cached_input_tokens, cache_write_tokens, generation_units,
+                      1, duration_ms,
                       CASE WHEN duration_ms <= 10 THEN 1 ELSE 0 END,
                       CASE WHEN duration_ms > 10 AND duration_ms <= 50 THEN 1 ELSE 0 END,
                       CASE WHEN duration_ms > 50 AND duration_ms <= 100 THEN 1 ELSE 0 END,
@@ -1736,15 +1740,19 @@ async fn record_request_finished_with_basis_in_transaction(
                    duration_bucket_4, duration_bucket_5, duration_bucket_6, duration_bucket_7,
                    duration_bucket_8, duration_bucket_9, duration_bucket_10,
                    duration_bucket_11, cost_micros)
-               SELECT tenant_id, key_id, created_at / 86400000, 'request', model,
+               SELECT tenant_id, key_id, created_at / 86400000,
+                      CASE WHEN protocol = 'audio-transcription' THEN 'generation' ELSE 'request' END,
+                      model,
                       CASE WHEN protocol = 'anthropic' OR protocol LIKE 'anthropic-%'
                            THEN 'anthropic' WHEN protocol = 'openai-image' THEN 'openai-image'
+                           WHEN protocol = 'audio-transcription' THEN 'audio-transcription'
                            ELSE 'openai' END,
                       status_class, error_code, upstream_account_id, model_route_id,
                       service_tier, currency, 1,
                       CASE WHEN input_tokens >= cached_input_tokens + cache_write_tokens
                            THEN input_tokens - cached_input_tokens - cache_write_tokens ELSE 0 END,
-                      output_tokens, cached_input_tokens, cache_write_tokens, 0, 1, duration_ms,
+                      output_tokens, cached_input_tokens, cache_write_tokens, generation_units,
+                      1, duration_ms,
                       CASE WHEN duration_ms <= 10 THEN 1 ELSE 0 END,
                       CASE WHEN duration_ms > 10 AND duration_ms <= 50 THEN 1 ELSE 0 END,
                       CASE WHEN duration_ms > 50 AND duration_ms <= 100 THEN 1 ELSE 0 END,
@@ -1787,6 +1795,38 @@ async fn record_request_finished_with_basis_in_transaction(
         .bind(&request_id)
         .execute(&mut **tx)
         .await?;
+        for (table, bucket_column, divisor) in [
+            (
+                "generation_usage_dimensions_hourly",
+                "hour_bucket",
+                3_600_000_i64,
+            ),
+            (
+                "generation_usage_dimensions_daily",
+                "day_bucket",
+                86_400_000_i64,
+            ),
+        ] {
+            let statement = format!(
+                r#"INSERT INTO {table} (
+                       tenant_id, key_id, {bucket_column}, model, status_class, error_code,
+                       upstream_account_id, model_route_id, modality, billing_unit,
+                       currency, units)
+                   SELECT tenant_id, key_id, created_at / {divisor}, model, status_class,
+                          error_code, upstream_account_id, model_route_id, 'audio', 'second',
+                          currency, generation_units
+                     FROM request_stats_facts
+                    WHERE request_id = $1 AND protocol = 'audio-transcription'
+                   ON CONFLICT (
+                       tenant_id, key_id, {bucket_column}, model, status_class, error_code,
+                       upstream_account_id, model_route_id, modality, billing_unit, currency)
+                   DO UPDATE SET units = {table}.units + excluded.units"#,
+            );
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .bind(&request_id)
+                .execute(&mut **tx)
+                .await?;
+        }
     }
     let event =
         allocate_request_event_cursor(tx, completed_at, &tenant_id, &key_id, &request_id).await?;

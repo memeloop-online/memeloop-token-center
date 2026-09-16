@@ -33,7 +33,7 @@ plugin-distribution = ["dep:oci-client", "dep:tempfile"]
 
 [dependencies]
 async-trait = "0.1"
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "multipart"] }
 base64 = "0.22"
 blake3 = "1"
 bytes = "1"
@@ -52,7 +52,7 @@ jsonwebtoken = { version = "10.4.0", default-features = false, features = ["aws_
 mime_guess = "2"
 object_store = { version = "0.14.1", features = ["aws"] }
 oci-client = { version = "0.17", optional = true, default-features = false, features = ["rustls-tls"] }
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "socks", "stream"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "multipart", "rustls", "socks", "stream"] }
 regex = "1"
 rust_decimal = { version = "=1.42.1", default-features = false, features = ["serde-with-str", "std"] }
 rustix = { version = "1", features = ["fs", "time", "process"] }
