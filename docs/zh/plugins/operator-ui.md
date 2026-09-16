@@ -55,17 +55,7 @@
 
 浏览器从不直接访问插件 URL，而是调用核心代理端点：
 
-```mermaid
-sequenceDiagram
-    participant B as Operator 浏览器
-    participant C as MTC 控制面
-    participant P as 插件 HTTPS 端点
-    B->>C: GET /internal/v1/plugins/{plugin_id}/data/{endpoint_id}?tenant_external_id=…
-    Note over C: 校验 plugins:read + required_scope + 租户
-    C->>P: 仅 GET，固定 origin，禁重定向，有界超时/大小
-    P-->>C: JSON（按 response_schema 校验）
-    C-->>B: 核心信封（见下）
-```
+![浏览器向 MTC 控制面读取插件数据；控制面校验权限与租户，向固定插件端点发起受限 GET，校验 JSON 后返回核心信封。](/diagrams/plugin-ui.svg)
 
 MTC 不会把服务凭证、浏览器 token 或租户值转发给插件端点。响应始终是核心拥有的信封：
 

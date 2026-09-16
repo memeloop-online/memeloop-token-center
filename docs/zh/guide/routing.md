@@ -4,15 +4,7 @@
 
 ## 授权链
 
-```mermaid
-flowchart LR
-    K[客户端凭证 key_id] -->|route_ids / route_group_ids| R[已启用的模型路由]
-    R -->|upstream_account_ids| A[上游账户候选]
-    R -->|included_provider_group_ids| G[Provider Group 成员]
-    R -.->|excluded_provider_group_ids 永远优先| X[排除]
-    G --> A
-    A -->|健康准入 + 目录兼容| D[可派发候选]
-```
+![凭据通过路由或路由组获得授权；路由选取账户和上游组，经排除规则、健康与模型兼容检查后形成可派发候选。](/diagrams/routing.svg)
 
 - 路由组（Route Group）是授权的集合：把一组路由整体授予凭证。
 - Provider Group 是上游账户的集合：只有被路由显式 include 时才参与候选；exclusion 永远优先于直接账户和 include。

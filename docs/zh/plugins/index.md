@@ -25,13 +25,7 @@ MTC 插件是**版本化的 WebAssembly 组件**（Component Model），不是�
 
 插件包以签名 OCI 制品分发（打包方法见[插件开发](development.md)）。运营者在 Operator 控制台的 **Plugins** 页完成完整工作流，安装与激活始终需要全局 `plugins:write`：
 
-```mermaid
-flowchart LR
-    I[安装<br/>拉取并验签] --> R[审查<br/>核对清单]
-    R --> A[批准<br/>登记精确制品]
-    A --> P[发布<br/>全局生效]
-    P --> B[回滚<br/>产生新修订]
-```
+![插件从安装验签、清单审查、制品批准到正式发布；回滚通过新修订恢复先前内容。](/diagrams/plugin-publication.svg)
 
 - 安装只是拉取、验签并暂存，**不会激活代码**；批准后制品进入候选清单，发布才全局生效。
 - 发布与回滚都使用修订 CAS + 幂等键；回滚总是产生一个单调递增的新修订，不会倒回计数器。
