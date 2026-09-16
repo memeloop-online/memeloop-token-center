@@ -19,6 +19,14 @@
   white-space: nowrap;
 }
 
+.request-session-cell > .request-session-context {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
 .request-session-cell small {
   display: block;
   margin-top: 0.2rem;

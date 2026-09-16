@@ -24,6 +24,9 @@ test('whitespace declarations use retained credential and receipt time without i
   assert.equal('  Real session title  '.trim() || fallback, 'Real session title');
   assert.equal('   '.trim() || fallback, JSON.stringify({ key: 'sessions.unnamedSession', variables: { time: new Date(time).toLocaleString('zh-CN'), credential: 'Operator credential' } }));
   assert.equal(unnamedSessionName(translate, 'en', time), JSON.stringify({ key: 'sessions.unnamedSessionNoCredential', variables: { time: new Date(time).toLocaleString('en') } }));
+  assert.equal(unnamedSessionName(translate, 'zh-CN', time, 'Operator credential', true), JSON.stringify({ key: 'sessions.compactContextSession', variables: { time: new Date(time).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }), credential: 'Operator credential' } }));
+  assert.match(components, /const sessionDisplay = contextualSession \? unnamedSessionName\([^\n]+, true\) : sessionLabel/);
+  assert.match(components, /DetailTooltip content=\{sessionLabel\}/);
 });
 
 test('session titles use reported names and shared activity plus credential context when absent', () => {

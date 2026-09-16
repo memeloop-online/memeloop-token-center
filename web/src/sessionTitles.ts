@@ -37,10 +37,10 @@ export function sessionFallback(detail: TitleInput, summary?: Pick<LogicalSessio
 }
 
 /** Activity time is context, not a claimed session creation time or real name. */
-export function unnamedSessionName(t: Translate, locale: Locale, time: number | undefined, credential?: string) {
+export function unnamedSessionName(t: Translate, locale: Locale, time: number | undefined, credential?: string, compact = false) {
   if (time === undefined || !Number.isFinite(time)) return credential ? t('sessions.contextSession', { credential }) : t('sessions.logicalSession');
-  const when = new Date(time).toLocaleString(locale);
+  const when = compact ? new Date(time).toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }) : new Date(time).toLocaleString(locale);
   return credential
-    ? t('sessions.unnamedSession', { time: when, credential })
+    ? t(compact ? 'sessions.compactContextSession' : 'sessions.unnamedSession', { time: when, credential })
     : t('sessions.unnamedSessionNoCredential', { time: when });
 }

@@ -300,6 +300,8 @@ export function RequestTable({
             const sessionLabel = context?.association === 'confirmed'
               ? context.session_name?.trim() || unnamedSessionName(t, locale, request.created_at, request.credential_identity?.key_alias?.trim() || request.credential_identity?.key_id)
               : t('sessions.unlinkedRequests');
+            const contextualSession = context?.association === 'confirmed' && !context.session_name?.trim();
+            const sessionDisplay = contextualSession ? unnamedSessionName(t, locale, request.created_at, request.credential_identity?.key_alias?.trim() || request.credential_identity?.key_id, true) : sessionLabel;
             const sessionMeta = [context?.task_kind, context?.agent_id].filter(Boolean).join(' · ');
             const currencyForRequest = recordedCurrency(request, currency);
             const technicalSummary = [
@@ -331,8 +333,8 @@ export function RequestTable({
                   ? '—'
                   : context.association === 'confirmed'
                     ? context.session_id && onOpenSession
-                      ? <button type="button" className="table-link" onClick={() => onOpenSession(context.session_id!)}>{sessionLabel}</button>
-                      : <span className="request-session-name">{sessionLabel}</span>
+                      ? <DetailTooltip content={sessionLabel}><button type="button" className={`table-link${contextualSession ? ' request-session-context' : ''}`} onClick={() => onOpenSession(context.session_id!)}>{sessionDisplay}</button></DetailTooltip>
+                      : <DetailTooltip content={sessionLabel}><span className={`request-session-name${contextualSession ? ' request-session-context' : ''}`} tabIndex={0}>{sessionDisplay}</span></DetailTooltip>
                     : <span className="request-session-unlinked">{t('sessions.unlinkedRequests')}</span>}
                 {sessionMeta && <RequestSessionMetadata value={sessionMeta} />}
               </td>}
