@@ -1,0 +1,8 @@
+.request-refresh-control { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin: 8px 0 18px; color: var(--muted); font-size: 13px; }
+.request-refresh-control label { display: flex; gap: 10px; align-items: baseline; }
+.request-refresh-control strong { color: var(--text); font-weight: 600; min-width: 3em; }
+.request-refresh-slider { width: 240px; max-width: 100%; }
+.request-refresh-slider > :first-child { width: 100%; min-width: 0; }
+.request-refresh-ticks { display: flex; justify-content: space-between; padding: 0 8px; font-size: 11px; }
+.request-refresh-hint { font-size: 12px; }
+@media (max-width: 480px) { .request-refresh-control { gap: 8px 14px; } .request-refresh-slider { flex: 1 1 180px; } }

@@ -46,7 +46,7 @@ test('the Requests page coalesces filtered events into one abortable scope-check
   const source = await readFile(new URL('../src/operator/pages/RequestsPage.tsx', import.meta.url), 'utf8');
 
   assert.match(source, /if \(typedFiltersActive\(filters\)\) \{[^]*?scheduleFilteredRefresh\(\);\s*return;/);
-  assert.match(source, /state\.pending = true;\s*if \(state\.inFlight \|\| loadingRef\.current\) return;/s);
+  assert.match(source, /state\.pending = true;\s*if \(state\.inFlight \|\| loadingRef\.current \|\| paused\.current\) return;/s);
   assert.match(source, /state\.timer !== undefined\) window\.clearTimeout\(state\.timer\)/);
   assert.match(source, /state\.controller\?\.abort\(\)/);
   assert.match(source, /loadAbort\.current\?\.abort\(\)/);
@@ -60,7 +60,7 @@ test('the Requests page coalesces filtered events into one abortable scope-check
   assert.match(source, /onRefreshFilteredResults=\{\(\) => void load\(filters\)\}/);
   assert.match(source, /if \(errorSource\.current === 'refresh'\) \{\s*errorSource\.current = undefined;\s*setError\(''\);/s);
   const refresh = source.slice(source.indexOf('async function refreshFilteredRequests'), source.indexOf('async function load'));
-  assert.match(refresh, /if \(!olderFilteredResultsVisible\.current \|\| next\.next_cursor === null\) \{\s*setHasOlder\(next\.next_cursor !== null\);\s*\}/);
+  assert.match(refresh, /if \(typedFiltersActive\(currentScope\.filters\) && \(!olderFilteredResultsVisible\.current \|\| next\.next_cursor === null\)\) \{\s*setHasOlder\(next\.next_cursor !== null\);\s*\}/);
   assert.doesNotMatch(refresh, /setRequests\(\[\]\)|setDetail\(/);
 });
 
