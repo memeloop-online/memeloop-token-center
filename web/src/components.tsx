@@ -7,6 +7,7 @@ import { formatCurrency, formatCurrencyDisplay, formatDurationDisplay, formatMet
 import { useAnchoredPopover } from './useAnchoredPopover.js';
 import { DetailTooltip } from './design-system';
 import { RequestStatus } from './RequestStatus';
+import { unnamedSessionName } from './sessionTitles.js';
 import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestIsPending, requestUsageCopy } from './requestTablePresentation';
 
 export function Shell({ children, operator = false }: { children: ReactNode; operator?: boolean }) {
@@ -230,7 +231,7 @@ export function RequestDiagnostics({
   const pending = requestIsPending(request);
   const currencyForRequest = recordedCurrency(request, currency);
   const context = request.session_context;
-  const sessionLabel = context?.session_name ?? t('sessions.reportedNameMissing');
+  const sessionLabel = context?.session_name?.trim() || unnamedSessionName(t, locale, request.created_at, request.credential_identity?.key_alias?.trim() || request.credential_identity?.key_id);
   const zh = locale === 'zh-CN';
   const missing = zh ? '未记录' : 'Not recorded';
   const credential = requestCredentialLabel(request, undefined);
@@ -296,8 +297,11 @@ export function RequestTable({
         <tbody>
           {requests.map((request) => {
             const context = request.session_context;
-            const sessionLabel = context?.session_name
-              ?? (context?.association === 'confirmed' ? t('sessions.reportedNameMissing') : t('sessions.unlinkedRequests'));
+            const sessionLabel = context?.association === 'confirmed'
+              ? context.session_name?.trim() || unnamedSessionName(t, locale, request.created_at, request.credential_identity?.key_alias?.trim() || request.credential_identity?.key_id)
+              : t('sessions.unlinkedRequests');
+            const contextualSession = context?.association === 'confirmed' && !context.session_name?.trim();
+            const sessionDisplay = contextualSession ? unnamedSessionName(t, locale, request.created_at, request.credential_identity?.key_alias?.trim() || request.credential_identity?.key_id, true) : sessionLabel;
             const sessionMeta = [context?.task_kind, context?.agent_id].filter(Boolean).join(' · ');
             const currencyForRequest = recordedCurrency(request, currency);
             const technicalSummary = [
@@ -329,8 +333,8 @@ export function RequestTable({
                   ? '—'
                   : context.association === 'confirmed'
                     ? context.session_id && onOpenSession
-                      ? <button type="button" className="table-link" onClick={() => onOpenSession(context.session_id!)}>{sessionLabel}</button>
-                      : <span className="request-session-name">{sessionLabel}</span>
+                      ? <DetailTooltip content={sessionLabel}><button type="button" className={`table-link${contextualSession ? ' request-session-context' : ''}`} onClick={() => onOpenSession(context.session_id!)}>{sessionDisplay}</button></DetailTooltip>
+                      : <DetailTooltip content={sessionLabel}><span className={`request-session-name${contextualSession ? ' request-session-context' : ''}`} tabIndex={0}>{sessionDisplay}</span></DetailTooltip>
                     : <span className="request-session-unlinked">{t('sessions.unlinkedRequests')}</span>}
                 {sessionMeta && <RequestSessionMetadata value={sessionMeta} />}
               </td>}
