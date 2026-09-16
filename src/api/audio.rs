@@ -1111,6 +1111,54 @@ mod tests {
             refs.view.archive_state,
             crate::model::RequestArchiveState::MetadataOnly
         );
+        let authenticated = state
+            .db
+            .authenticate_key(&issued.key, state.config.key_pepper.as_bytes())
+            .await
+            .unwrap();
+        let session = state
+            .db
+            .logical_session_detail(
+                authenticated.tenant_id,
+                issued.key_id,
+                &format!("unlinked:{}", issued.key_id),
+                crate::db::ConversationDetailFilter {
+                    limit: 10,
+                    before_created_at: None,
+                    before_request_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let session_request = session
+            .requests
+            .iter()
+            .find(|entry| entry.request.request_id == request_id)
+            .unwrap();
+        assert_eq!(session_request.request.input_tokens, 0);
+        assert_eq!(session_request.request.output_tokens, 0);
+        assert!(session_request.request.usage.tokens.is_none());
+        assert_eq!(
+            session_request
+                .request
+                .usage
+                .generation
+                .as_ref()
+                .unwrap()
+                .billed_units,
+            Some(2)
+        );
+        assert_eq!(
+            session_request
+                .request
+                .usage
+                .generation
+                .as_ref()
+                .unwrap()
+                .billing_unit
+                .as_deref(),
+            Some("second")
+        );
         assert!(refs.request_object.starts_with("metadata-only-json:"));
         assert!(!refs.request_object.contains("sensitive prompt"));
         assert!(!refs.request_object.contains("private-name"));
@@ -1120,11 +1168,6 @@ mod tests {
                 .unwrap()
                 .contains("sensitive transcript")
         );
-        let authenticated = state
-            .db
-            .authenticate_key(&issued.key, state.config.key_pepper.as_bytes())
-            .await
-            .unwrap();
         assert_eq!(
             state
                 .db

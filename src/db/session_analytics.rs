@@ -5,8 +5,8 @@ use uuid::Uuid;
 
 use super::*;
 use crate::model::{
-    ConversationRequestView, LogicalSessionDetail, LogicalSessionSummary, RequestSessionContext,
-    RequestView, UsageAnalysisCost,
+    ConversationRequestView, LogicalSessionDetail, LogicalSessionSummary,
+    RequestGenerationUsageView, RequestSessionContext, RequestView, UsageAnalysisCost,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -898,13 +898,15 @@ impl Database {
             .map(|row| {
                 let source: String = row.try_get("source_kind")?;
                 let billable = source == "live";
+                let protocol: String = row.try_get("protocol")?;
+                let audio_transcription = protocol == "audio-transcription";
                 let raw_input_tokens: i64 = row.try_get("input_tokens")?;
                 let raw_cached_input_tokens: i64 = row.try_get("cached_input_tokens")?;
                 let raw_cache_write_tokens: i64 = row.try_get("cache_write_tokens")?;
                 let raw_output_tokens: i64 = row.try_get("output_tokens")?;
                 let cost_micros: i64 = row.try_get("cost_micros")?;
                 let completed_at = row.try_get("completed_at")?;
-                let (usage, billing, currency) =
+                let (mut usage, billing, currency) =
                     super::requests::request_detail_accounting_projection(
                         billable,
                         completed_at,
@@ -917,6 +919,17 @@ impl Database {
                         cost_micros,
                         row.try_get("currency")?,
                     );
+                if audio_transcription {
+                    let billed_units = usage
+                        .tokens
+                        .as_ref()
+                        .and_then(|tokens| tokens.output_tokens);
+                    usage.tokens = None;
+                    usage.generation = Some(RequestGenerationUsageView {
+                        billed_units,
+                        billing_unit: Some("second".to_owned()),
+                    });
+                }
                 Ok(ConversationRequestView {
                     request: RequestView {
                         usage_basis: None,
@@ -935,16 +948,32 @@ impl Database {
                             }
                             Some(_) => crate::model::RequestLifecycleState::Failed,
                         },
-                        protocol: row.try_get("protocol")?,
+                        protocol,
                         model: row.try_get("model")?,
                         upstream_account_id: None,
                         route_id: None,
                         status_code: row.try_get("status_code")?,
                         duration_ms: row.try_get("duration_ms")?,
-                        input_tokens: raw_input_tokens,
-                        cached_input_tokens: raw_cached_input_tokens,
-                        cache_write_tokens: raw_cache_write_tokens,
-                        output_tokens: raw_output_tokens,
+                        input_tokens: if audio_transcription {
+                            0
+                        } else {
+                            raw_input_tokens
+                        },
+                        cached_input_tokens: if audio_transcription {
+                            0
+                        } else {
+                            raw_cached_input_tokens
+                        },
+                        cache_write_tokens: if audio_transcription {
+                            0
+                        } else {
+                            raw_cache_write_tokens
+                        },
+                        output_tokens: if audio_transcription {
+                            0
+                        } else {
+                            raw_output_tokens
+                        },
                         cost: micros_to_decimal_string(cost_micros),
                         currency: currency.clone(),
                         usage,
