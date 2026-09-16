@@ -14,10 +14,12 @@ declare global {
   interface Window {
     sessionDetailReads: number;
     sessionListReads: number;
+    sessionListAborts: number;
     resolveSessionList: (ok: boolean) => void;
   }
 }
 window.sessionListReads = 0;
+window.sessionListAborts = 0;
 window.sessionDetailReads = 0;
 const session: LogicalSessionSummary = {
   session_id: 'fixture-session', session_name: 'Retained session', task_kind: null,
@@ -66,15 +68,24 @@ if (new URLSearchParams(location.search).has('titles')) {
     } },
   ];
 }
-window.fetch = async (input) => {
+window.fetch = async (input, init) => {
   const url = String(input);
   if (url.includes('/keys?')) return new Response(JSON.stringify([]));
   if (url.includes('/sessions?')) {
     window.sessionListReads += 1;
-    return new Promise<Response>((resolve) => {
-      window.resolveSessionList = (ok) => resolve(new Response(JSON.stringify(ok
-        ? { generated_at: Date.now(), sessions: [session, unlinkedSession], next_cursor: null }
-        : { error: { message: 'Fixture list unavailable' } }), { status: ok ? 200 : 503 }));
+    return new Promise<Response>((resolve, reject) => {
+      const signal = init?.signal;
+      const abort = () => {
+        window.sessionListAborts += 1;
+        reject(new DOMException('The operation was aborted', 'AbortError'));
+      };
+      signal?.addEventListener('abort', abort, { once: true });
+      window.resolveSessionList = (ok) => {
+        signal?.removeEventListener('abort', abort);
+        resolve(new Response(JSON.stringify(ok
+          ? { generated_at: Date.now(), sessions: [session, unlinkedSession], next_cursor: null }
+          : { error: { message: 'Fixture list unavailable' } }), { status: ok ? 200 : 503 }));
+      };
     });
   }
   const detailSession = url.includes('/sessions/')

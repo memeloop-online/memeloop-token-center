@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from 'react';
-import { api } from '../api.js';
+import { api, apiRead } from '../api.js';
 import { readArchiveRange, type ArchiveRangeLoader } from '../archiveRange.js';
 import { useI18n } from '../i18n.js';
 import { Button, Checkbox } from '../design-system';
@@ -132,19 +132,22 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     const credential = token.trim();
     if (!credential) {
       setSessions([]); setNextCursor(null); setGeneratedAt(0);
-      return;
+      return false;
     }
     if (!background) setLoading(true);
     else setRefreshing(true);
     listInFlight.current = true;
     setError('');
     try {
-      const response = await api<LogicalSessionListResponse>(
+      // A list read is idempotent. Retry early transient failures inside the
+      // existing 15-second user-visible budget; scope/filter cancellation still
+      // immediately aborts every attempt and its backoff.
+      const response = await apiRead<LogicalSessionListResponse>(
         sessionsPath(tenant, selectedFilters, older ? nextCursor ?? undefined : undefined),
         credential,
-        { signal: AbortSignal.any([request.signal, AbortSignal.timeout(15_000)]) },
+        { attempts: 3, attemptTimeoutMilliseconds: 15_000, totalTimeoutMilliseconds: 15_000, signal: request.signal },
       );
-      if (!request.isCurrent() || sequence !== listSequence.current) return;
+      if (!request.isCurrent() || sequence !== listSequence.current) return false;
       const page = response.sessions;
       const resetActiveTail = background && loadedOlderList.current && selectedFilters.state === 'active';
       setSessions((current) => {
@@ -174,14 +177,16 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
         if (focused && pendingFocus) handledFocus.current = pendingFocus.revision;
         if (target) void selectSession(target);
       }
+      return true;
     } catch (reason) {
-      if (!request.isCurrent() || sequence !== listSequence.current) return;
+      if (!request.isCurrent() || sequence !== listSequence.current) return false;
       setError(messageOf(reason, t('sessions.loadFailed')));
       setErrorScope(requestScope);
       // A failed live refresh is not an empty result set. Keep the current
       // scoped page (including older pages) and report the refresh failure.
       // Keep an already rendered page while a same-scope manual retry fails.
       // Scope/filter transitions clear their own state before starting a read.
+      return false;
     } finally {
       if (request.isCurrent() && sequence === listSequence.current) {
         listInFlight.current = false;
@@ -200,7 +205,9 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     loadedOlderDetail.current = false;
     setSelected(session); setDetail(undefined); setDetailScope(''); setDetailLoading(true); setError(''); setErrorScope('');
     try {
-      const next = await api<LogicalSessionDetail>(detailPath(tenant, session), token.trim(), { signal: AbortSignal.any([request.signal, AbortSignal.timeout(15_000)]) });
+      const next = await apiRead<LogicalSessionDetail>(detailPath(tenant, session), token.trim(), {
+        attempts: 3, attemptTimeoutMilliseconds: 15_000, totalTimeoutMilliseconds: 15_000, signal: request.signal,
+      });
       if (request.isCurrent()) {
         setDetail(next);
         setDetailScope(requestScope);
@@ -221,7 +228,9 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     detailInFlight.current = true;
     const requestScope = scopeKey;
     try {
-      const page = await api<LogicalSessionDetail>(detailPath(tenant, session), token.trim(), { signal: AbortSignal.any([request.signal, AbortSignal.timeout(15_000)]) });
+      const page = await apiRead<LogicalSessionDetail>(detailPath(tenant, session), token.trim(), {
+        attempts: 3, attemptTimeoutMilliseconds: 15_000, totalTimeoutMilliseconds: 15_000, signal: request.signal,
+      });
       if (!request.isCurrent()) return;
       setDetail((latest) => {
         if (!latest) return page;
@@ -260,7 +269,9 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     const requestScope = scopeKey;
     setDetailLoading(true); setError('');
     try {
-      const page = await api<LogicalSessionDetail>(detailPath(tenant, session, current.next_cursor), token.trim(), { signal: AbortSignal.any([request.signal, AbortSignal.timeout(15_000)]) });
+      const page = await apiRead<LogicalSessionDetail>(detailPath(tenant, session, current.next_cursor), token.trim(), {
+        attempts: 3, attemptTimeoutMilliseconds: 15_000, totalTimeoutMilliseconds: 15_000, signal: request.signal,
+      });
       if (!request.isCurrent()) return;
       loadedOlderDetail.current = true;
       setDetail((latest) => {
@@ -302,8 +313,8 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       const selectedAtBatchStart = selectedRef.current;
       const selectedIdentity = selectedAtBatchStart ? sessionIdentityKey(selectedAtBatchStart) : undefined;
       const refresh = async () => {
-        await loadSessions(false, filtersRef.current, true);
-        if (generation !== scopeGeneration.current || !autoRefreshRef.current) return;
+        const listLoaded = await loadSessions(false, filtersRef.current, true);
+        if (!listLoaded || generation !== scopeGeneration.current || !autoRefreshRef.current) return;
         const latestSelection = selectedRef.current;
         if (selectedAtBatchStart && latestSelection && sessionIdentityKey(latestSelection) === selectedIdentity
           && sessionEventsRequireDetailRefresh(batchDetailEvents, latestSelection, detailRef.current)) {
@@ -398,6 +409,17 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     }
   }
 
+  function cancelListLoad() {
+    if (!listInFlight.current) return;
+    listSequence.current += 1;
+    listRequests.current.invalidate();
+    listInFlight.current = false;
+    refreshDirty.current = false;
+    dirtyEventIdentities.current.clear();
+    setLoading(false);
+    setRefreshing(false);
+  }
+
   const hasScope = Boolean(token.trim());
   const status = !hasScope ? 'idle' : refreshing ? 'refreshing' : streamState;
   const visibleSessions = listScope === scopeKey ? sessions : [];
@@ -409,6 +431,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       <Checkbox checked={autoRefresh} onChange={(_, data) => toggleAutoRefresh(data.checked === true)} label={t('sessions.autoRefresh')} />
       <span className={`session-live-state ${status}`} role="status">{autoRefresh ? t(`sessions.live.${status}`) : t('sessions.paused')}</span>
       <Button appearance="secondary" disabled={loading || refreshing || detailLoading} onClick={() => { void loadSessions(false, filters, visibleSessions.length > 0); if (selected) void refreshSelected(selected); }}>{t('sessions.refreshNow')}</Button>
+      {(loading || refreshing) && <Button appearance="secondary" onClick={cancelListLoad}>{t('common.cancel')}</Button>}
     </div>
     <form className="session-controls" onSubmit={(event) => { event.preventDefault(); setFilters({ ...draft }); }}>
       <label>{t('sessions.search')}<input value={draft.q} onChange={(event) => setDraft({ ...draft, q: event.target.value })} placeholder={t('sessions.searchPlaceholder')} /></label>
