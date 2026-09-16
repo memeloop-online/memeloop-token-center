@@ -16,12 +16,17 @@ export function requestFailed(request: RequestView): boolean {
 }
 
 /**
- * Failed requests only have actual usage when the provider reported it; estimates,
- * settlement ceilings and unobserved or unrecorded counts stay in details instead
- * of being presented as actual consumption.
+ * Pending usage is never actual: it is not yet settled and must not count toward
+ * aggregate traffic. Failed requests only have actual usage when the provider
+ * reported it; estimates, settlement ceilings and unobserved or unrecorded counts
+ * stay in details instead of being presented as actual consumption.
  */
 export function requestUsageIsActual(request: RequestView): boolean {
-  return request.usage_basis !== 'not_observed' && (!requestFailed(request) || request.usage_basis === 'provider_reported');
+  if (requestIsPending(request)) return false;
+  return request.usage_basis !== 'provider_estimated'
+    && request.usage_basis !== 'contract_ceiling'
+    && request.usage_basis !== 'not_observed'
+    && (!requestFailed(request) || request.usage_basis === 'provider_reported');
 }
 
 /** Stored input includes both cache components, including normalized Anthropic usage. */

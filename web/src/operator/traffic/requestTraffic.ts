@@ -1,5 +1,6 @@
 import type { RequestEvent, RequestListCursor, RequestListResponse, RequestView, TypedFilterAst } from '../../types.js';
 import { requestOutcome } from '../../requestStatusPresentation.js';
+import { requestUsageIsActual } from '../../requestTablePresentation.js';
 
 export const emptyTypedFilterAst: TypedFilterAst = { logical_operator: 'and', conditions: [] };
 
@@ -56,8 +57,13 @@ export function summarizeVisibleRequests(requests: readonly RequestView[]): Visi
   for (const request of requests) {
     // RequestView input_tokens is inclusive of cached input; adding the cache
     // fields here would double-count them.
-    if (Number.isFinite(request.input_tokens)) totalTokens += request.input_tokens;
-    if (Number.isFinite(request.output_tokens)) totalTokens += request.output_tokens;
+    // Only actual usage counts toward live traffic tokens: pending, estimated,
+    // settlement-ceiling, not-observed and unrecorded failed counts are not
+    // consumption. Failed usage is actual only when the provider reported it.
+    if (requestUsageIsActual(request)) {
+      if (Number.isFinite(request.input_tokens)) totalTokens += request.input_tokens;
+      if (Number.isFinite(request.output_tokens)) totalTokens += request.output_tokens;
+    }
     const currency = typeof request.currency === 'string' && request.currency.trim() ? request.currency : undefined;
     const cost = currency ? Number(request.cost) : NaN;
     if (currency && Number.isFinite(cost)) localCosts.set(currency, (localCosts.get(currency) ?? 0) + cost);

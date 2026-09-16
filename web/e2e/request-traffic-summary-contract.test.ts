@@ -81,3 +81,25 @@ test('finished-request rate includes disconnected and interrupted outcomes but n
   assert.equal(summary.unknown, 1);
   assert.equal(summary.successRate, 1 / 3);
 });
+
+test('totalTokens counts actual usage only: pending and non-actual history never count', () => {
+  const nonActual = (status_code: number, usage_basis: RequestView['usage_basis']): RequestView => ({
+    ...request(status_code, 100), input_tokens: 1_000, output_tokens: 2_000, usage_basis,
+  });
+  const failedProviderReported: RequestView = { ...request(500, 100), input_tokens: 20, output_tokens: 3, usage_basis: 'provider_reported' };
+  const summary = summarizeVisibleRequests([
+    { ...request(200, 100), input_tokens: 10, output_tokens: 2, usage_basis: 'provider_reported' },
+    failedProviderReported,
+    { ...request(null, null), input_tokens: 5_000, output_tokens: 6_000, usage_basis: 'provider_reported' },
+    nonActual(200, 'provider_estimated'),
+    nonActual(200, 'contract_ceiling'),
+    nonActual(502, 'not_observed'),
+    nonActual(502, undefined),
+    nonActual(502, null),
+  ]);
+  assert.equal(summary.failed, 4);
+  assert.equal(summary.running, 1);
+  assert.equal(summary.totalTokens, 35);
+  // Failed provider-reported usage is actual and remains included.
+  assert.equal(summarizeVisibleRequests([failedProviderReported]).totalTokens, 23);
+});
