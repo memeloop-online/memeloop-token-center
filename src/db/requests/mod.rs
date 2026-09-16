@@ -25,7 +25,9 @@ pub(crate) use lifecycle::{
 };
 pub use metered_projection::MeteredUsageProjectionTask;
 pub use queries::RequestListFilter;
-pub(crate) use queries::{request_detail_accounting_projection, search_prefix};
+pub(crate) use queries::{
+    request_detail_accounting_projection, request_usage_basis_from_row, search_prefix,
+};
 pub use settlement::normalize_proxy_usage;
 pub(crate) use settlement::{
     price_token_usage, reserve_usage_in_transaction, settle_confirmed_image_charge_in_transaction,

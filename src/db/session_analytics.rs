@@ -745,7 +745,7 @@ impl Database {
         } else {
             reference_query
         };
-        let mut session_query = sqlx::query(&session_query)
+        let mut session_query = sqlx::query(&*session_query)
             .bind(tenant_id)
             .bind(&key_id)
             .bind(limit);
