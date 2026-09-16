@@ -1,7 +1,7 @@
 use super::super::*;
 
 #[derive(Debug, Deserialize, Default)]
-struct ModelsQuery {
+pub(in crate::api) struct ModelsQuery {
     client_version: Option<String>,
 }
 
