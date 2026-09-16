@@ -17,6 +17,7 @@ const displayValuesByLabel: Record<string, string> = {
   'Generation billing units': '1.25T',
   'Cached tokens': '1.25T',
   'Cache-write tokens': '1.25T',
+  'Average TPS': '0.21',
 };
 const exactValuesByLabel: Record<string, string> = {
   Requests: '1,250,000,000,000',
@@ -25,6 +26,7 @@ const exactValuesByLabel: Record<string, string> = {
   'Generation billing units': '1,250,000,000,000',
   'Cached tokens': '1,250,000,000,000',
   'Cache-write tokens': '1,250,000,000,000',
+  'Average TPS': '0.208333 TPS',
 };
 
 async function localChromiumExecutable() {
@@ -56,6 +58,11 @@ test('UsageAnalysis keeps every rendered NumericMetric exact value on one readab
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/usage-analysis.html`);
     await page.locator('.usage-metrics .metric-exact').first().waitFor();
+    await page.locator('.usage-metrics .metric-label').getByText('Average TPS', { exact: true }).focus();
+    const tpsDefinition = page.getByRole('tooltip').filter({ hasText: 'Total recorded output tokens divided by total request time' });
+    await tpsDefinition.waitFor();
+    assert.match(await tpsDefinition.innerText(), /Includes all requests in the current filter/);
+    await page.keyboard.press('Escape');
 
     for (const theme of ['dark', 'light'] as const) {
       await page.evaluate((value) => { document.documentElement.dataset.theme = value; }, theme);
@@ -91,7 +98,8 @@ test('UsageAnalysis keeps every rendered NumericMetric exact value on one readab
         });
 
         const numericCards = layout.cards.filter((card) => card.exactText !== undefined);
-        assert.equal(numericCards.length, 6, `${theme} ${width}px fixture must render all UsageAnalysis NumericMetric cards`);
+        assert.equal(numericCards.length, 7, `${theme} ${width}px fixture must render all UsageAnalysis NumericMetric cards`);
+        assert.equal(layout.cards.some(card => card.label === 'P95 TPS'), false, 'bucket averages cannot establish request TPS percentiles');
         for (const card of numericCards) {
           const expectedDisplay = card.label ? displayValuesByLabel[card.label] : undefined;
           const expectedExact = card.label ? exactValuesByLabel[card.label] : undefined;

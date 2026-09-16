@@ -56,8 +56,8 @@ export function throughputOption(points: UsageAnalysisTimeBucket[], copy: UsageC
     ...baseOption(labels, `${copy.requests}: ${copy.success}, ${copy.failures}`),
     tooltip: { trigger: 'axis', confine: true, valueFormatter: (value: unknown) => format.number(Number(value)) },
     series: [
-      { name: copy.success, type: 'bar', stack: 'requests', barMaxWidth: 24, data: points.map((point) => point.success) },
-      { name: copy.failures, type: 'bar', stack: 'requests', barMaxWidth: 24, data: points.map((point) => point.failed) },
+      { name: copy.success, type: 'bar', barMaxWidth: 24, data: points.map((point) => point.success) },
+      { name: copy.failures, type: 'bar', barMaxWidth: 24, data: points.map((point) => point.failed) },
     ],
   };
 }

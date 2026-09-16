@@ -31,7 +31,7 @@ import {
 } from '../keyPagination';
 import { directCredentialSchema, oauthCreationProxyMode, supportsDirectConnection } from '../providerConnectionMethods';
 import { UpstreamAvailability, manualHealthLabel } from '../UpstreamAvailability';
-import { QuotaResetCreditExpiry, UpstreamQuota } from '../UpstreamQuota';
+import { UpstreamQuota } from '../UpstreamQuotaPanel';
 import { QuotaSummary } from '../QuotaSummary';
 import { useUpstreamQuotaReads } from '../useUpstreamQuotaReads';
 import { connectionSchema, isPrivateProxyUrl, ProxyInput, UpstreamConnection } from '../UpstreamConnection';
@@ -319,7 +319,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             </div>
             <div className="provider-directory-summary"><span className={`status ${value.status === 'active' ? 'ok' : 'pending'}`}>{enumLabel(t, 'status', value.status)}</span><span>{t('providers.routes', { count: formatNumber(value.route_count, locale) })}</span></div>
             <div className="provider-directory-summary"><small>{t('providers.recentAvailability')}</small><span>{availabilityLoading ? t('common.loading') : !facts ? t('providerDirectory.unavailable') : terminal > 0 ? t('providerDirectory.successful', { percent: formatPercent(facts.metrics.successful_requests / terminal, locale) }) : t('providerDirectory.noRequests')}</span></div>
-            <div className="provider-directory-summary" aria-busy={Boolean(cachedQuota?.generation === generation && cachedQuota.busy)}><small>{t('quota.title')}</small><span role="status">{cachedQuota?.generation === generation && cachedQuota.busy ? t('quota.refreshing') : cachedQuota?.generation === generation && cachedQuota.queued ? t('quota.queued') : <QuotaSummary snapshot={quota} refreshFailed={quotaRefreshFailed} />}</span>{quota?.provider === 'openai-codex' && <QuotaResetCreditExpiry snapshot={quota} />}</div>
+            <div className="provider-directory-summary" aria-busy={Boolean(cachedQuota?.generation === generation && cachedQuota.busy)}><small>{t('quota.title')}</small><span role="status">{cachedQuota?.generation === generation && cachedQuota.busy ? t('quota.refreshing') : cachedQuota?.generation === generation && cachedQuota.queued ? t('quota.queued') : <QuotaSummary snapshot={quota} refreshFailed={quotaRefreshFailed} showWindowReset showResetCreditExpiryInTooltip={quota?.provider === 'openai-codex'} />}</span></div>
             <div className="provider-directory-actions">
               <Button appearance="secondary" type="button" disabled={!token || !(value.tenant_external_id ?? tenant) || value.status !== 'active' || Boolean(quotaReads.progress?.busy) || Boolean(cachedQuota?.generation === generation && cachedQuota.busy)} onClick={() => void quotaReads.read(value)}>{t('quota.refreshAccount')}</Button>
               <Button appearance="secondary" type="button" aria-expanded={detailOpen} aria-controls={`provider-details-${value.id}`} disabled={Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} onClick={() => setProviderDetail(detailOpen ? undefined : value.id)}>{t(detailOpen ? 'providerDirectory.close' : 'providerDirectory.open')}</Button>

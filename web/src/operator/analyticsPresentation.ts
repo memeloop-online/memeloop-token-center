@@ -1,6 +1,43 @@
-import { formatMilliseconds, formatNumber, type FormattedValue } from '../format.js';
+import { formatMetricDisplay, formatMilliseconds, formatNumber, type FormattedValue } from '../format.js';
 import type { Locale } from '../i18n.js';
 import type { UsageAnalysisTimeBucket } from '../types.js';
+
+export function averageBucketTps(point: Pick<UsageAnalysisTimeBucket, 'avg_duration_ms' | 'output_tokens' | 'requests'>): number | null {
+  if (!Number.isFinite(point.output_tokens) || point.output_tokens < 0) return null;
+  if (!Number.isFinite(point.requests) || point.requests <= 0) return null;
+  if (point.avg_duration_ms == null || !Number.isFinite(point.avg_duration_ms) || point.avg_duration_ms <= 0) return null;
+  return point.output_tokens / (point.avg_duration_ms * point.requests / 1_000);
+}
+
+export function averageBucketTpsSeries(points: readonly Pick<UsageAnalysisTimeBucket, 'avg_duration_ms' | 'output_tokens' | 'requests'>[]): Array<number | null> {
+  return points.map((point) => averageBucketTps(point));
+}
+
+// Usage facts and their rollups increment requests and duration_count together
+// (including failed requests and generation jobs). avg_duration_ms therefore
+// reconstructs total recorded duration, not a mean of per-request TPS values.
+// The API has no per-request TPS distribution: bucket averages cannot supply P95.
+export function averageSeriesTps(points: readonly Pick<UsageAnalysisTimeBucket, 'avg_duration_ms' | 'output_tokens' | 'requests'>[]): number | null {
+  let outputTokens = 0;
+  let durationMillis = 0;
+  for (const point of points) {
+    if (!Number.isFinite(point.output_tokens) || point.output_tokens < 0) continue;
+    if (!Number.isFinite(point.requests) || point.requests <= 0) continue;
+    if (point.avg_duration_ms == null || !Number.isFinite(point.avg_duration_ms) || point.avg_duration_ms <= 0) continue;
+    outputTokens += point.output_tokens;
+    durationMillis += point.avg_duration_ms * point.requests;
+  }
+  if (durationMillis <= 0) return null;
+  return outputTokens / (durationMillis / 1_000);
+}
+
+export function formatTps(value: number | null | undefined, locale: Locale): FormattedValue {
+  if (value == null || !Number.isFinite(value) || value < 0) return { text: '—' };
+  const maximumFractionDigits = value >= 1_000 ? 0 : 2;
+  const text = formatNumber(value, locale, maximumFractionDigits);
+  const title = formatNumber(value, locale, 6);
+  return { text, title: `${title} TPS` };
+}
 
 export function analyticsDuration(value: number | null | undefined, locale: Locale): FormattedValue {
   const title = formatMilliseconds(value, locale);

@@ -1,7 +1,7 @@
 import { createRoot } from 'react-dom/client';
 import { MtcFluentProvider } from '../../src/design-system';
 import { I18nProvider } from '../../src/i18n';
-import { UpstreamQuotaDetails } from '../../src/operator/UpstreamQuota';
+import { UpstreamQuotaDetails } from '../../src/operator/UpstreamQuotaPanel';
 import { QuotaSummary } from '../../src/operator/QuotaSummary';
 import type { UpstreamQuotaSnapshot } from '../../src/operator/upstreamQuota';
 import '../../src/styles.css';
