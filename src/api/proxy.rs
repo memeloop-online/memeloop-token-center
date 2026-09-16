@@ -1038,13 +1038,6 @@ pub(in crate::api) async fn proxy_with_identity(
         }
     };
     admission.finish("completed", None, Some(body.len()));
-    drop(request_capture_memory);
-    memory.release(
-        body.len(),
-        crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
-    );
-    let request_body_length = body.len();
-    drop(body);
     let client_name = client_name(&headers);
     let conversation = matches!(
         protocol,
@@ -1052,10 +1045,22 @@ pub(in crate::api) async fn proxy_with_identity(
     )
     .then(|| ProxyConversation {
         key: key.clone(),
-        request_json: original_request_json,
+        request_body: body.clone(),
         hints: conversation_hints,
         client_name,
     });
+    drop(original_request_json);
+    drop(request_capture_memory);
+    if conversation.is_some() {
+        memory.release_request_tree_copies(body.len());
+    } else {
+        memory.release(
+            body.len(),
+            crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+        );
+    }
+    let request_body_length = body.len();
+    drop(body);
     let mut buffered_request = BufferedRequest {
         state: &state,
         reservation,
@@ -1712,9 +1717,65 @@ fn validate_buffered_chat_success(body: &[u8]) -> Result<(), &'static str> {
 #[derive(Clone)]
 struct ProxyConversation {
     key: AuthenticatedKey,
-    request_json: Value,
+    request_body: Bytes,
     hints: crate::conversation::ConversationHints,
     client_name: Option<String>,
+}
+
+struct ProxyConversationProjection<'a> {
+    conversation: &'a ProxyConversation,
+    request_json: Value,
+    memory: &'a crate::gateway_body::memory::ProxyMemoryReservation,
+}
+
+impl ProxyConversation {
+    fn project<'a>(
+        &'a self,
+        memory: &'a crate::gateway_body::memory::ProxyMemoryReservation,
+    ) -> Result<ProxyConversationProjection<'a>, AppError> {
+        if !memory.try_reserve_conversation_projection(&self.request_body) {
+            return Err(AppError::Overloaded);
+        }
+        match serde_json::from_slice(&self.request_body) {
+            Ok(request_json) => Ok(ProxyConversationProjection {
+                conversation: self,
+                request_json,
+                memory,
+            }),
+            Err(_) => {
+                memory.release_conversation_projection(&self.request_body);
+                Err(AppError::Internal)
+            }
+        }
+    }
+
+    fn log_projection_error(request_id: Uuid, error: &AppError) {
+        tracing::warn!(
+            %request_id,
+            stage = "conversation_projection",
+            error_category = error.diagnostic_category(),
+            "proxy conversation projection skipped"
+        );
+    }
+}
+
+impl<'a> ProxyConversationProjection<'a> {
+    fn input<'b>(&'b self, upstream_response_id: Option<&'b str>) -> ProxyConversationInput<'b> {
+        ProxyConversationInput {
+            key: &self.conversation.key,
+            request_json: &self.request_json,
+            hints: &self.conversation.hints,
+            client_name: self.conversation.client_name.as_deref(),
+            upstream_response_id,
+        }
+    }
+}
+
+impl Drop for ProxyConversationProjection<'_> {
+    fn drop(&mut self) {
+        self.memory
+            .release_conversation_projection(&self.conversation.request_body);
+    }
 }
 
 struct BufferedRequest<'a> {
@@ -2190,16 +2251,15 @@ async fn finish_buffered_request_with_upstream_attribution(
         Err(AppError::Overloaded)
     };
     let stored_response = format!("gap://{request_id}/response");
-    let conversation = request
-        .conversation
-        .as_ref()
-        .map(|conversation| ProxyConversationInput {
-            key: &conversation.key,
-            request_json: &conversation.request_json,
-            hints: &conversation.hints,
-            client_name: conversation.client_name.as_deref(),
-            upstream_response_id: response_id.as_deref(),
-        });
+    let conversation = request.conversation.as_ref().and_then(|conversation| {
+        match conversation.project(&request.memory) {
+            Ok(projection) => Some(projection),
+            Err(error) => {
+                ProxyConversation::log_projection_error(request_id, &error);
+                None
+            }
+        }
+    });
     let terminal = FinishProxyRequest {
         first_output_ms: None,
         generation_duration_ms: None,
@@ -2215,7 +2275,9 @@ async fn finish_buffered_request_with_upstream_attribution(
         usage_basis: Some(usage_basis),
         error_code: error_code.as_deref(),
         response_object: &stored_response,
-        conversation,
+        conversation: conversation
+            .as_ref()
+            .map(|projection| projection.input(response_id.as_deref())),
     };
     let terminal_phase = proxy_diagnostics::Phase::new(
         proxy_diagnostics::Context::for_request(request_id),

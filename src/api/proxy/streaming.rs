@@ -187,7 +187,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         // archive tails have a separate bounded EOF owner below.
         let _proxy_lifecycle_permit = proxy_lifecycle_permit;
         let archive_memory = memory.clone();
-        let _request_memory = memory;
+        let request_memory = memory;
         let _stream_activity = stream_activity;
         let _upstream_activity = upstream_activity;
         let lifecycle_started = tokio::time::Instant::now();
@@ -844,6 +844,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 output_token_ceiling,
                 requested_service_tier,
                 conversation,
+                memory: request_memory,
                 tenant_id,
                 transport_error,
                 delivered_billable,

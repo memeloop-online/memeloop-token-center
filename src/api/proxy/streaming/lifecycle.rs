@@ -18,6 +18,7 @@ pub(super) struct StreamingFinalizationInput<'a> {
     pub(super) output_token_ceiling: i64,
     pub(super) requested_service_tier: Option<String>,
     pub(super) conversation: Option<ProxyConversation>,
+    pub(super) memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     pub(super) tenant_id: Uuid,
     pub(super) transport_error: Option<&'static str>,
     pub(super) delivered_billable: bool,
@@ -101,6 +102,7 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
         output_token_ceiling,
         requested_service_tier,
         conversation,
+        memory,
         tenant_id,
         transport_error,
         delivered_billable,
@@ -260,15 +262,16 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
     } else {
         CodexRetryTerminal::Failed
     };
-    let conversation_input = conversation
-        .as_ref()
-        .map(|conversation| ProxyConversationInput {
-            key: &conversation.key,
-            request_json: &conversation.request_json,
-            hints: &conversation.hints,
-            client_name: conversation.client_name.as_deref(),
-            upstream_response_id: response_id.as_deref(),
-        });
+    let conversation =
+        conversation
+            .as_ref()
+            .and_then(|conversation| match conversation.project(&memory) {
+                Ok(projection) => Some(projection),
+                Err(error) => {
+                    ProxyConversation::log_projection_error(request_id, &error);
+                    None
+                }
+            });
     let (first_output_ms, generation_duration_ms) = output_timing.finish(
         error_code.is_none()
             && sse_summary.as_ref().is_some_and(|summary| {
@@ -293,7 +296,9 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
             usage,
             error_code,
             response_object: &stored_response,
-            conversation: conversation_input,
+            conversation: conversation
+                .as_ref()
+                .map(|projection| projection.input(response_id.as_deref())),
         },
         response_archive_attempt.as_ref(),
         &gap_response,

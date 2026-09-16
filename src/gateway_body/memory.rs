@@ -304,6 +304,26 @@ impl ProxyMemoryReservation {
         }
     }
 
+    /// Keep one raw request-body copy charged while a text conversation waits
+    /// for a streaming terminal. The two JSON-tree/working copies can be
+    /// released after request admission; terminal projection reacquires them
+    /// briefly before parsing the retained bytes.
+    pub(crate) fn release_request_tree_copies(&self, bytes: usize) {
+        self.release(bytes, REQUEST_MEMORY_WEIGHT.saturating_sub(1));
+    }
+
+    /// Reserve the transient JSON-tree copies required to project a retained
+    /// raw conversation body. Its scanner allowance remains held from ingress
+    /// through the request lifecycle, so only the two released body copies are
+    /// reacquired here.
+    pub(crate) fn try_reserve_conversation_projection(&self, body: &[u8]) -> bool {
+        self.try_grow(body.len(), REQUEST_MEMORY_WEIGHT.saturating_sub(1))
+    }
+
+    pub(crate) fn release_conversation_projection(&self, body: &[u8]) {
+        self.release(body.len(), REQUEST_MEMORY_WEIGHT.saturating_sub(1));
+    }
+
     pub(crate) fn try_reserve_json(&self, body: &[u8]) -> bool {
         // Preflight without allocating a JSON tree. Charge string copies by
         // input bytes and tree/map nodes separately, so tiny-token arrays and
