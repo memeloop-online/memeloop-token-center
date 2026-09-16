@@ -28,8 +28,8 @@ const MAX_ENTRIES: usize = 128;
 const BODY_LIMIT: usize = 1024 * 1024;
 const QUOTA_TIMEOUT: Duration = Duration::from_secs(8);
 const QUOTA_MAX_READ_BUDGET: Duration = Duration::from_secs(30);
-const QUOTA_PERMIT_WAIT: Duration = QUOTA_MAX_READ_BUDGET;
-const QUOTA_SINGLEFLIGHT_WAIT: Duration = Duration::from_secs(65);
+const QUOTA_PERMIT_WAIT: Duration = Duration::from_secs(35);
+const QUOTA_SINGLEFLIGHT_WAIT: Duration = Duration::from_secs(70);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct QuotaBudget {
@@ -1325,7 +1325,7 @@ mod tests {
                 .is_ok()
         });
         tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::time::advance(Duration::from_secs(66)).await;
         assert!(!singleflight.is_finished());
         drop(owner);
         assert!(singleflight.await.unwrap());
@@ -1339,7 +1339,7 @@ mod tests {
                 .is_ok()
         });
         tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::time::advance(Duration::from_secs(31)).await;
         assert!(!admission.is_finished());
         drop(owners);
         assert!(admission.await.unwrap());

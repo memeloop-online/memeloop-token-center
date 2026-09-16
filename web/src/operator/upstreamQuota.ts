@@ -57,7 +57,7 @@ export interface UpstreamQuotaSnapshot {
 }
 
 /** Covers the server's bounded queue plus one bounded supplier read. */
-export const UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS = 75_000;
+export const UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS = 85_000;
 
 /** The next expiration belongs to reset opportunities, not a usage window. */
 export function quotaResetCreditExpiry(snapshot: UpstreamQuotaSnapshot, now = Date.now()): { state: 'known' | 'unknown' | 'none'; at?: number } {
