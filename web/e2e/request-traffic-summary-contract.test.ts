@@ -43,6 +43,8 @@ test('visible traffic summary separates terminal health from live work', () => {
     unknown: 0,
     successRate: 2 / 3,
     averageDurationMs: 240,
+    totalTokens: 0,
+    localCosts: [],
   });
 });
 
@@ -55,6 +57,8 @@ test('visible traffic summary has no fabricated rate or latency without terminal
     unknown: 0,
     successRate: null,
     averageDurationMs: null,
+    totalTokens: 0,
+    localCosts: [],
   });
   const unknown = summarizeVisibleRequests([{ ...request(200, 100), completed_at: undefined }]);
   assert.equal(unknown.unknown, 1);

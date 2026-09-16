@@ -16,6 +16,11 @@ import './overview.css';
 
 const EChart = lazy(() => import('../charts/EChart').then((module) => ({ default: module.EChart })));
 
+function localizedBucketInterval(epoch: number, duration: number, locale: 'en' | 'zh-CN', timeZone: string) {
+  const options: Intl.DateTimeFormatOptions = { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false, timeZone };
+  return `[${new Date(epoch).toLocaleString(locale, options)}, ${new Date(epoch + duration).toLocaleString(locale, options)})`;
+}
+
 function CostLines({ costs, locale }: { costs: OperatorUsageAnalysisTrends['time_series'][number]['costs']; locale: 'zh-CN' | 'en' }) {
   if (!costs.length) return <>—</>;
   return <span className="usage-cost-lines">{[...costs].sort((left, right) => left.currency.localeCompare(right.currency)).map(({ cost, currency }) => <span key={currency} title={formatCurrencyDisplay(cost, currency, locale).title}>{formatCurrencyDisplay(cost, currency, locale).text}</span>)}</span>;
@@ -41,15 +46,19 @@ export function OverviewTrends({ state, onDrilldown }: { state: ResourceState<Op
     averageLatency: t('usage.average'), p95Latency: t('usage.p95Approx'),
     cost: localSettlementLabel(locale), noData: t('usage.noData'),
   }), [locale, t]);
-  const format: UsageChartFormatters = useMemo(() => ({
-    bucket: (value) => new Date(value).toLocaleString(locale, {
-      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false, timeZone: displayTimeZone(),
-    }),
-    cost: (value, currency) => formatCurrencyDisplay(value, currency, locale).text,
-    duration: (value) => analyticsDuration(value, locale).text,
-    number: (value) => formatMetricDisplay(value, locale).text,
-    percent: (value) => formatPercent(value, locale),
-  }), [locale]);
+  const format: UsageChartFormatters = useMemo(() => {
+    const timeZone = displayTimeZone();
+    const duration = stats?.granularity === 'day' ? 86_400_000 : 3_600_000;
+    const options: Intl.DateTimeFormatOptions = { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false, timeZone };
+    return {
+      bucket: (value) => new Date(value).toLocaleString(locale, options),
+      bucketInterval: (value) => localizedBucketInterval(value, duration, locale, timeZone),
+      cost: (value, currency) => formatCurrencyDisplay(value, currency, locale).text,
+      duration: (value) => analyticsDuration(value, locale).text,
+      number: (value) => formatMetricDisplay(value, locale).text,
+      percent: (value) => formatPercent(value, locale),
+    };
+  }), [locale, stats?.granularity]);
   const throughput = useMemo(() => throughputOption(stats?.time_series ?? [], copy, format), [stats, copy, format]);
   const latency = useMemo(() => latencyOption(finiteP95Points(stats?.time_series ?? []), copy, format), [stats, copy, format]);
   const costs = useMemo(() => costOption(stats?.time_series ?? [], copy, format), [stats, copy, format]);

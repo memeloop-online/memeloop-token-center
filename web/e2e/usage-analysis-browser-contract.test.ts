@@ -48,7 +48,11 @@ test('Usage analysis keeps exact localized metrics and real trend charts contain
       await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/usage-analysis.html`);
       await page.locator('.usage-overview-chart-grid .usage-echart canvas').nth(2).waitFor();
       assert.equal(await page.locator('.usage-metrics svg').count(), 0, 'one real bucket must not fabricate a trend curve');
-      assert.equal(await page.locator('.usage-metrics [data-ratio]').count(), 1, 'success ratio has a data-backed background even without a trend');
+      assert.equal(await page.locator('.usage-metrics [data-ratio]').count(), 2, 'success and cache rates have data-backed backgrounds even without a trend');
+      const cacheRate = page.locator('.usage-metrics .analytics-metric').filter({ hasText: locale === 'en' ? 'Cache rate' : '缓存率' });
+      assert.equal(await cacheRate.count(), 1);
+      assert.equal(await cacheRate.locator('.metric-value').innerText(), '44.44%');
+      assert.equal(await cacheRate.locator('.analytics-metric-ratio').getAttribute('data-ratio'), String(4 / 9));
       for (const theme of ['dark', 'light'] as const) {
         await page.evaluate((value) => { document.documentElement.dataset.theme = value; }, theme);
         for (const width of viewports) {

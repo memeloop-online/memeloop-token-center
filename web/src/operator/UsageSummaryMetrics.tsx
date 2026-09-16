@@ -20,6 +20,14 @@ export function UsageSummaryMetrics({ stats }: { stats: OperatorUsageAnalysis })
   const { locale, t } = useI18n();
   const { summary, time_series: points } = stats;
   const rate = summary.requests > 0 ? summary.success / summary.requests : null;
+  // UsageAnalysis input_tokens excludes the cached portion; the denominator is
+  // everything that could have been read or written through the cache.
+  const cacheRateOf = (metrics: Pick<OperatorUsageAnalysis['summary'], 'input_tokens' | 'cached_input_tokens' | 'cache_write_tokens'>) => {
+    const denominator = metrics.input_tokens + metrics.cached_input_tokens + metrics.cache_write_tokens;
+    if (!Number.isFinite(metrics.cached_input_tokens) || !Number.isFinite(denominator) || denominator <= 0) return null;
+    return metrics.cached_input_tokens / denominator;
+  };
+  const cacheRate = cacheRateOf(summary);
   const number = (value: number) => formatMetricDisplay(value, locale);
   const exactValue = (text: string, title?: string) => <span className="metric-number"><span className="metric-exact" title={title ?? text}>{text}</span></span>;
   const numeric = (label: string, value: number, trend: number[], tone = '') => <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={label} value={exactValue(number(value).text, number(value).title)} trend={trend} tone={tone} />;
@@ -32,11 +40,10 @@ export function UsageSummaryMetrics({ stats }: { stats: OperatorUsageAnalysis })
   const averageTps = formatTps(averageSeriesTps(points), locale);
   const currency = summary.costs.length === 1 ? summary.costs[0].currency : undefined;
   return <section className="metrics usage-metrics" aria-label={t('usage.tab.overview')}>
-    {numeric(t('usage.requests'), summary.requests, points.map((point) => point.requests))}
-    <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={t('usage.successRate')} value={formatPercent(rate, locale)} ratio={rate} />
-    {numeric(t('usage.failures'), summary.failed, points.map((point) => point.failed), 'negative')}
-    <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={localSettlementLabel(locale)} labelContent={<LocalSettlementNotice />} value={summary.costs.length ? <span className="usage-cost-lines">{summary.costs.map(({ cost, currency }) => { const display = formatCurrencyDisplay(cost, currency, locale); return <span key={currency} title={display.title}>{display.text}</span>; })}</span> : '—'} formatSample={(_value, index) => { const cost = points[index].costs.find(item => item.currency === currency); return cost ? formatCurrencyDisplay(cost.cost, cost.currency, locale).title ?? '—' : '—'; }} trend={currency ? points.map((point) => point.costs.some(cost => cost.currency === currency) ? Number(point.costs.find(cost => cost.currency === currency)!.cost) : null) : undefined} />
     {numeric(t('usage.totalTokens'), totalTokens(summary), points.map(totalTokens))}
+    <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={t('usage.cacheRate')} labelContent={<DetailTooltip content={t('usage.cacheRateHint')}><span tabIndex={0}>{t('usage.cacheRate')}</span></DetailTooltip>} value={formatPercent(cacheRate, locale)} ratio={cacheRate} formatSample={(value) => formatPercent(value, locale)} trend={points.map(cacheRateOf)} />
+    <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={t('usage.successRate')} value={formatPercent(rate, locale)} ratio={rate} />
+    <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={localSettlementLabel(locale)} labelContent={<LocalSettlementNotice />} value={summary.costs.length ? <span className="usage-cost-lines">{summary.costs.map(({ cost, currency }) => { const display = formatCurrencyDisplay(cost, currency, locale); return <span key={currency} title={display.title}>{display.text}</span>; })}</span> : '—'} formatSample={(_value, index) => { const cost = points[index].costs.find(item => item.currency === currency); return cost ? formatCurrencyDisplay(cost.cost, cost.currency, locale).title ?? '—' : '—'; }} trend={currency ? points.map((point) => point.costs.some(cost => cost.currency === currency) ? Number(point.costs.find(cost => cost.currency === currency)!.cost) : null) : undefined} />
     {numeric(t('usage.generationUnits'), summary.generation_units, points.map((point) => point.generation_units))}
     {numeric(t('usage.cachedTokens'), summary.cached_input_tokens, points.map((point) => point.cached_input_tokens))}
     {numeric(t('usage.cacheWriteTokens'), summary.cache_write_tokens, points.map((point) => point.cache_write_tokens))}

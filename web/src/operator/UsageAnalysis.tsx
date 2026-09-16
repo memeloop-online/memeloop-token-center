@@ -85,6 +85,12 @@ function CostValue({ costs }: { costs: UsageAnalysisCost[] }) {
 }
 function successRate(metrics: UsageAnalysisMetrics) { return metrics.requests > 0 ? metrics.success / metrics.requests : undefined; }
 
+function localizedBucketInterval(epoch: number, duration: number, locale: 'en' | 'zh-CN', timeZone: string) {
+  const options: Intl.DateTimeFormatOptions = { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false, timeZone };
+  const language = locale === 'en' ? 'en-US' : 'zh-CN';
+  return `[${new Date(epoch).toLocaleString(language, options)}, ${new Date(epoch + duration).toLocaleString(language, options)})`;
+}
+
 function GenerationBreakdown({ stats }: { stats: OperatorUsageAnalysis }) {
   const { locale, t } = useI18n(); const copy = localCopy[locale];
   const rows = [
@@ -149,7 +155,17 @@ export function UsageAnalysis({ token, tenant, upstreams, onOpenSession }: { tok
   const selectUtcBucket = (point: UsageAnalysisTimeBucket) => { const millis = stats?.granularity === 'hour' ? 3_600_000 : 86_400_000; const next = { ...selection, preset: 'custom' as const, customFrom: localDateTimeInput(point.bucket_start), customTo: localDateTimeInput(point.bucket_start + millis - 1) }; setSelection(next); setApplied(next); setTab('overview'); };
 
   const chartCopy: UsageChartCopy = useMemo(() => ({ requests: copy.requests, success: copy.success, failures: copy.failures, averageLatency: copy.averageLatency, p95Latency: copy.p95Latency, cost: localSettlementLabel(locale), noData: copy.chartEmpty }), [copy, locale]);
-  const chartFormatters: UsageChartFormatters = useMemo(() => ({ bucket: (epoch) => new Date(epoch).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false, timeZone: displayTimeZone() }), cost: (value, currency) => formatCurrency(value, currency, locale), duration: (value) => formatMilliseconds(value, locale), number: (value) => formatMetricDisplay(value, locale).text, percent: (value) => formatPercent(value, locale) }), [locale, displayTimeZone()]);
+  const chartFormatters: UsageChartFormatters = useMemo(() => {
+    const timeZone = displayTimeZone();
+    const duration = stats?.granularity === 'day' ? 86_400_000 : 3_600_000;
+    const language = locale === 'en' ? 'en-US' : 'zh-CN';
+    const options: Intl.DateTimeFormatOptions = { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false, timeZone };
+    return {
+      bucket: (epoch) => new Date(epoch).toLocaleString(language, options),
+      bucketInterval: (epoch) => localizedBucketInterval(epoch, duration, locale, timeZone),
+      cost: (value, currency) => formatCurrency(value, currency, locale), duration: (value) => formatMilliseconds(value, locale), number: (value) => formatMetricDisplay(value, locale).text, percent: (value) => formatPercent(value, locale),
+    };
+  }, [locale, stats?.granularity]);
   const throughput = useMemo(() => throughputOption(stats?.time_series ?? [], chartCopy, chartFormatters), [stats?.time_series, chartCopy, chartFormatters]);
   const latency = useMemo(() => latencyOption(finiteP95Points(stats?.time_series ?? []), chartCopy, chartFormatters), [stats?.time_series, chartCopy, chartFormatters]);
   const costs = useMemo(() => costOption(stats?.time_series ?? [], chartCopy, chartFormatters), [stats?.time_series, chartCopy, chartFormatters]);
