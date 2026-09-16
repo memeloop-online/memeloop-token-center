@@ -23,9 +23,13 @@ export function credentialRouteOptions(routes: ModelRouteView[], accounts: Upstr
         name: account ? `${account.name}${duplicateName ? ` (${shortIdentity(id, accounts.map(value => value.id))})` : ''}` : `${zh ? '账号' : 'Account'} ${shortIdentity(id, ids)}`,
       };
     });
-    const state = !route.enabled ? (zh ? '已停用' : 'Disabled')
-      : candidates?.length === 0 ? (zh ? '无可用候选账号' : 'No eligible accounts')
-      : candidates === undefined ? (zh ? '候选目录未知' : 'Candidate catalog unknown')
+    const catalogState = candidates === undefined ? 'unknown' : candidates.length === 0 ? 'empty' : 'confirmed';
+    // Availability is independent from the catalog state so disabled, empty and
+    // healthy scopes never share a preview group.
+    const availability = !route.enabled ? 'disabled' : candidates?.length === 0 ? 'unavailable' : 'healthy';
+    const state = availability === 'disabled' ? (zh ? '已停用' : 'Disabled')
+      : availability === 'unavailable' ? (zh ? '无可用候选账号' : 'No eligible accounts')
+      : catalogState === 'unknown' ? (zh ? '候选目录未知' : 'Candidate catalog unknown')
       : '';
     const scope = candidates === undefined ? (zh ? '候选范围未确认' : 'Candidate scope unconfirmed')
       : ids.length > 1 ? (zh ? `共享候选 · ${ids.length} 个账号` : `Shared candidates · ${ids.length} accounts`)
@@ -35,6 +39,9 @@ export function credentialRouteOptions(routes: ModelRouteView[], accounts: Upstr
     const accountDescription = candidateAccounts.map(account => `${account.name} · ${account.provider}`).join(' / ');
     return {
       value: route.id,
+      accountIds: [...ids].sort(),
+      catalogState,
+      availability,
       scopeIdentity: JSON.stringify([route.public_model, candidates === undefined ? 'unknown' : 'confirmed', [...ids].sort()]),
       label: route.public_model,
       chipDescription: [scope, ids.length === 1 ? candidateAccounts[0].name : providerNames].filter(Boolean).join(' · '),
