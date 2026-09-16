@@ -326,6 +326,14 @@ Then('连续事件期间会话计数有界前进且活跃筛选移除已完成�
   );
   const responses = await Promise.all(observation.liveRequests);
   assert.deepEqual(responses.map((response) => response.status).sort(), [200, 200, 429, 429]);
+  const sessionReadyRequests = observation.sessionReadyRequests;
+  assert.ok(sessionReadyRequests, 'session-ready request observation must cover the live calls');
+  const ready = await sessionReadyRequests;
+  assert.equal(
+    ready.requestIds.size,
+    4,
+    'all four live requests must be durable before the active projection disappears',
+  );
   await eventually(async () => assert.equal(await page.locator('.session-card').count(), 0), 5_000, 'completed session remained in the active filter');
   const refreshes = observation.sessionListRequests.length - observation.baselineSessionListRequests;
   assert.ok(refreshes >= 1 && refreshes <= 6, `continuous event refresh count was not bounded: ${refreshes}`);

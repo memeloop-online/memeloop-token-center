@@ -112,7 +112,10 @@ impl Database {
         }
         let transient = snapshot.is_transient();
         let cooldown = snapshot.effective_cooldown_until(cooldown_override_ms);
-        let wait_eligible = transient && allow_transient_probe;
+        let wait_eligible = matches!(
+            snapshot.last_failure_kind.as_str(),
+            "connection" | "unavailable"
+        ) && allow_transient_probe;
         if cooldown > now
             || snapshot.probe_lease_until > now
             || (transient && !allow_transient_probe)

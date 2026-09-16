@@ -71,6 +71,42 @@ mod tests {
                 .await
                 .unwrap()
         );
+        let UpstreamAttemptAdmission::Healthy {
+            failure_epoch: delivered_epoch,
+        } = database
+            .claim_upstream_account_attempt(account, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("delivered probe must publish a healthy cohort");
+        };
+        assert_eq!(delivered_epoch, first);
+        assert!(
+            !database
+                .release_upstream_account_probe(account, 1, first)
+                .await
+                .unwrap(),
+            "the old owner's inconclusive release cannot clear a delivered healthy cohort"
+        );
+        assert!(
+            database
+                .record_admitted_upstream_account_failure(
+                    account,
+                    1,
+                    UpstreamFailureKind::Connection,
+                    UpstreamHealthConfig::DEFAULT,
+                    delivered_epoch,
+                )
+                .await
+                .unwrap(),
+            "the delivered cohort fence must remain authoritative after the old owner exits"
+        );
+        assert!(
+            database
+                .record_upstream_account_success(account, 1, delivered_epoch)
+                .await
+                .unwrap()
+        );
         let (a, b, c, renewal) = tokio::join!(
             database.claim_upstream_account_attempt(account, 1),
             database.claim_upstream_account_attempt(account, 1),

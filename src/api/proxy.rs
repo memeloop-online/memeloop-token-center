@@ -474,13 +474,6 @@ async fn next_sendable_proxy_route(
                     stage = "upstream_shared_probe_rejected",
                     "bounded shared probe capacity is unavailable"
                 );
-                // The request has not been sent. Join the bounded recovery
-                // wait below so an existing shared probe can publish success
-                // through database health instead of exposing a local
-                // process-capacity rejection as no healthy upstream.
-                if transient_candidate.is_none() {
-                    transient_candidate = Some((planned.route.clone(), deferred.candidate_rank));
-                }
             }
         }
     }

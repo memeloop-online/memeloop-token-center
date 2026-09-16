@@ -390,6 +390,7 @@ impl Database {
                 last_failure_kind.as_str(),
                 "connection" | "unavailable" | "invalid_response"
             );
+            let wait_eligible = matches!(last_failure_kind.as_str(), "connection" | "unavailable");
             if cooldown_until > now || probe_lease_until > now || (transient_only && !transient) {
                 return Ok(UpstreamAttemptAdmission::Unavailable {
                     cooldown_until,
@@ -397,7 +398,7 @@ impl Database {
                     shared_probe_eligible: last_failure_kind == "connection"
                         && cooldown_until <= now
                         && probe_lease_until > now,
-                    transient_wait_eligible: transient,
+                    transient_wait_eligible: wait_eligible,
                 });
             }
             let lease_token = Uuid::now_v7();
@@ -432,7 +433,7 @@ impl Database {
                     cooldown_until,
                     probe_lease_until,
                     shared_probe_eligible: false,
-                    transient_wait_eligible: transient,
+                    transient_wait_eligible: wait_eligible,
                 }
             });
         }
@@ -803,6 +804,7 @@ impl Database {
              SET probe_lease_until = 0, probe_lease_token = '', updated_at = $1
              WHERE upstream_account_id = $2 AND credential_generation = $3
                AND probe_lease_token = $4
+               AND consecutive_failures > 0 AND probe_lease_until > $1
                AND EXISTS (
                  SELECT 1 FROM upstream_accounts account
                  WHERE account.id = upstream_account_health.upstream_account_id
@@ -915,7 +917,7 @@ mod tests {
                 ..
             }
         ));
-        for kind in ["connection", "unavailable", "invalid_response"] {
+        for kind in ["connection", "unavailable"] {
             sqlx::query("UPDATE upstream_account_health SET last_failure_kind = $1 WHERE upstream_account_id = $2")
                 .bind(kind).bind(account.to_string()).execute(&database.pool).await.unwrap();
             assert!(matches!(
@@ -929,7 +931,12 @@ mod tests {
                 }
             ));
         }
-        for kind in ["quota_exhausted", "rate_limited", "credential"] {
+        for kind in [
+            "quota_exhausted",
+            "rate_limited",
+            "credential",
+            "invalid_response",
+        ] {
             sqlx::query("UPDATE upstream_account_health SET cooldown_until = 0, last_failure_kind = $1 WHERE upstream_account_id = $2")
                 .bind(kind).bind(account.to_string()).execute(&database.pool).await.unwrap();
             assert!(matches!(

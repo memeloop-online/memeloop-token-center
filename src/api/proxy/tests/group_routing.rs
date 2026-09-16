@@ -693,7 +693,10 @@ async fn gateway_component_without_configured_strategy_dispatches_healthy_accoun
     assert_eq!(after.cooldown_until, before.cooldown_until);
     assert_eq!(after.consecutive_failures, before.consecutive_failures);
     assert_eq!(after.probe_lease_until, before.probe_lease_until);
-    assert_eq!(after.updated_at, before.updated_at);
+    assert!(
+        after.updated_at > before.updated_at,
+        "native success may rotate the healthy cohort fence"
+    );
 }
 
 #[tokio::test]

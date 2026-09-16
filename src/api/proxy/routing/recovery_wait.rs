@@ -482,11 +482,14 @@ mod tests {
                 Instant::now() + Duration::from_secs(20),
                 semaphore,
                 None,
-                |_| {
+                |permit| {
                     if let Some(entered) = entered.take() {
                         let _ = entered.send(());
                     }
-                    std::future::pending::<Result<Check<()>, AppError>>()
+                    async move {
+                        let _permit = permit;
+                        std::future::pending::<Result<Check<()>, AppError>>().await
+                    }
                 },
             )
             .await

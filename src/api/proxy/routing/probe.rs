@@ -361,6 +361,7 @@ impl UpstreamAttemptGuard {
         self.stop_heartbeat();
         if let Some(state) = state
             && self.owns_probe_lease
+            && !self.recovered_on_delivery
             && let Some(token) = self.lease_token
         {
             let _ = state
@@ -520,6 +521,7 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
         }
         UpstreamAttemptTerminal::Inconclusive => {
             if owns_probe_lease
+                && !recovered_on_delivery
                 && let Some(lease_token) = lease_token
                 && let Err(error) = state
                     .db
