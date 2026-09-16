@@ -436,9 +436,10 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     listInFlight.current = false;
     // Cancellation only stops the currently owned request. Events that arrived
     // in this scope still describe server state we have not observed, so keep
-    // their batch for the next manual refresh or stream invalidation. Do not
-    // immediately replace a user-cancelled request with another one.
-    refreshDirty.current = refreshDirty.current || dirtyEventIdentities.current.size > 0 || dirtyDetailEvents.current.size > 0;
+    // their batch for the next manual refresh or stream invalidation. Clear
+    // only the scheduling latch so refresh().finally cannot immediately
+    // replace a user-cancelled request with another one.
+    refreshDirty.current = false;
     setLoading(false);
     setRefreshing(false);
   }
