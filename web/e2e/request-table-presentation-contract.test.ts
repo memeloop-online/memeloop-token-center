@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestIsPending, requestUsageIsActual } from '../src/requestTablePresentation.js';
+import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestDisplayedCost, requestIsPending, requestUsageIsActual } from '../src/requestTablePresentation.js';
 import { requestViewFromEvent } from '../src/operator/traffic/requestTraffic.js';
 import type { RequestEvent } from '../src/types.js';
 import type { RequestView } from '../src/types.js';
@@ -40,10 +40,13 @@ test('unreliable failed usage and cost remain unknown without erasing reported s
     assert.equal(requestCostCopy(failed, 'en').unknown, true);
     assert.equal(failed.cost, '35');
   }
-  const unobserved = { ...request, status_code: 499, usage_basis: 'not_observed' as const, cost: '0' };
+  const unobserved = { ...request, status_code: 499, usage_basis: 'not_observed' as const, cost: '35' };
   assert.equal(requestUsageIsActual(unobserved), false);
   assert.equal(requestCostCopy(unobserved, 'en').unknown, false);
-  assert.equal(unobserved.cost, '0');
+  assert.equal(requestDisplayedCost(unobserved), '0');
+  assert.equal(requestDisplayedCost({ ...unobserved, status_code: 200 }), '35');
+  assert.equal(requestDisplayedCost({ ...unobserved, status_code: null }), '35');
+  assert.equal(requestCostCopy({ ...unobserved, status_code: null }, 'en').label, 'Awaiting settlement');
   const reported = { ...request, status_code: 499, cost: '0.2' };
   assert.equal(requestUsageIsActual(reported), true);
   assert.equal(requestCostCopy(reported, 'en').unknown, false);
@@ -78,12 +81,12 @@ test('average output TPS uses recorded total seconds, distinguishes valid zero f
   assert.equal(averageRequestOutputTps({ ...request, output_tokens: -1 }), null);
 });
 
-test('unobserved local zero is presented as a zero local cost', () => {
-  const unobserved = requestCostCopy({ ...request, usage_basis: 'not_observed', cost: '0' }, 'en');
+test('failed unobserved cost is presented as policy zero while success remains unchanged', () => {
+  const unobserved = requestCostCopy({ ...request, status_code: 502, usage_basis: 'not_observed', cost: '35' }, 'en');
   assert.equal(unobserved.unknown, false);
   assert.equal(unobserved.label, 'Usage not observed');
-  assert.match(unobserved.hint, /settled this request at 0/);
-  assert.equal(requestCostCopy(request, 'en').unknown, false);
+  assert.match(unobserved.hint, /defaults to 0/);
+  assert.equal(requestCostCopy({ ...request, status_code: 200, usage_basis: 'not_observed', cost: '35' }, 'en').unknown, true);
 });
 
 test('credential identity remains meaningful without inventing an alias for explicitly unbound history', () => {

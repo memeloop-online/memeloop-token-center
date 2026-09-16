@@ -276,6 +276,15 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     const ledgerTip = page.getByRole('tooltip').filter({ hasText: 'Local ledger amount:' });
     await ledgerTip.waitFor();
     assert.match(await ledgerTip.innerText(), /0\.001234/, 'the original local ledger amount remains inspectable, never rewritten to free');
+
+    await page.goto(`${origin}/e2e/fixtures/request-diagnostics.html?usage-basis=not_observed`);
+    const failedUnobservedRow = page.locator('tbody tr').first();
+    const failedUnobservedDiagnostics = page.locator('[data-fixture-request="recorded"] .request-diagnostics');
+    await failedUnobservedDiagnostics.waitFor();
+    assert.equal(await failedUnobservedRow.locator('.request-cost-cell').innerText(), '$0.00');
+    assert.equal(await failedUnobservedDiagnostics.locator('.request-detail-primary > div').last().innerText(), 'Cost$0.00');
+    assert.doesNotMatch(await failedUnobservedRow.locator('.request-cost-cell').innerText(), /35/);
+    assert.match(await failedUnobservedRow.locator('.request-cost-cell').getAttribute('title') ?? '', /defaults to 0/);
   } catch (reason) {
     const diagnostics = await fixtureDiagnostics(page, current.value, history, pageErrors, consoleErrors);
     process.stderr.write(`request-diagnostics browser contract failed: ${JSON.stringify(diagnostics)}\n`);

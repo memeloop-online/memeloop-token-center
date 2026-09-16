@@ -66,13 +66,19 @@ export function requestCostCopy(request: RequestView, locale: string) {
   const zh = locale === 'zh-CN';
   /** Recorded local ledger amounts stay visible in details, explicitly labelled as local settlement rather than supplier usage. */
   const ledgerLabel = zh ? '本地账本金额' : 'Local ledger amount';
-  if (request.usage_basis === 'not_observed') return {
+  if (requestIsPending(request)) return {
+    unknown: true,
+    ledgerLabel,
+    label: zh ? '待结算' : 'Awaiting settlement',
+    hint: zh ? '请求仍在进行中，费用尚未结算。' : 'The request is still in progress; cost has not been settled.',
+  };
+  if (requestFailed(request) && request.usage_basis === 'not_observed') return {
     unknown: false,
     ledgerLabel,
     label: zh ? '未观测用量' : 'Usage not observed',
     hint: zh
-      ? '本地账本已按 0 结算并释放预留；未观测到供应商实际用量。'
-      : 'The local ledger settled this request at 0 and released the reservation; supplier usage was not observed.',
+      ? '这是失败请求，未观测到供应商实际用量；本地计费默认按 0 显示。'
+      : 'This request failed without observed supplier usage; local billing defaults to 0.',
   };
   if (!requestUsageIsActual(request)) return {
     unknown: true, ledgerLabel,
@@ -95,6 +101,11 @@ export function requestCostCopy(request: RequestView, locale: string) {
       ? '本地已结算金额；不是供应商实际消耗账单。'
       : 'Locally settled amount; not the supplier’s actual usage invoice.',
   };
+}
+
+/** Failed requests without supplier evidence display the policy amount (zero) even before a historical rebate is posted. */
+export function requestDisplayedCost(request: RequestView): string {
+  return requestFailed(request) && request.usage_basis === 'not_observed' ? '0' : request.cost;
 }
 
 export function requestCredentialLabel(request: RequestView, fallback: string | undefined): { label: string } | { key: 'request.unnamedCredential' | 'request.missingCredential' } {

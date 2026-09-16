@@ -8,7 +8,7 @@ import { useAnchoredPopover } from './useAnchoredPopover.js';
 import { DetailTooltip } from './design-system';
 import { RequestStatus } from './RequestStatus';
 import { unnamedSessionName } from './sessionTitles.js';
-import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestFailed, requestIsPending, requestUsageCopy, requestUsageIsActual } from './requestTablePresentation';
+import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestDisplayedCost, requestFailed, requestIsPending, requestUsageCopy, requestUsageIsActual } from './requestTablePresentation';
 import { requestErrorCopy } from './requestStatusPresentation';
 
 export function Shell({ children, operator = false }: { children: ReactNode; operator?: boolean }) {
@@ -243,7 +243,7 @@ export function RequestDiagnostics({
   const credentialLabel = 'label' in credential ? credential.label : t(credential.key);
   const duration = formatDurationDisplay(request.duration_ms, locale);
   const timingDetails = `${t('request.receivedAt')}: ${new Date(request.created_at).toLocaleString(locale)} · ${t('request.completedAt')}: ${request.completed_at == null ? (pending ? (zh ? '尚未结束' : 'Still running') : missing) : new Date(request.completed_at).toLocaleString(locale)} · ${t('request.duration')}: ${duration.title ?? missing}`;
-  const cost = currencyForRequest ? formatCurrencyDisplay(request.cost, currencyForRequest, locale) : { text: missing };
+  const cost = currencyForRequest ? formatCurrencyDisplay(requestDisplayedCost(request), currencyForRequest, locale) : { text: missing };
   const costCopy = requestCostCopy(request, locale);
   const settlement = <DetailTooltip content={t('request.pendingUsage')}><span tabIndex={0}>{zh ? '待结算' : 'Awaiting settlement'}</span></DetailTooltip>;
 
@@ -320,7 +320,7 @@ export function RequestTable({
               ? `${t('request.completedAt')}: ${new Date(request.completed_at).toLocaleString(locale)}`
               : '';
             const pending = requestIsPending(request);
-            const cost = pending ? { text: '—', title: copy.pendingUsage } : currencyForRequest ? formatCurrencyDisplay(request.cost, currencyForRequest, locale) : { text: '—' };
+            const cost = pending ? { text: '—', title: copy.pendingUsage } : currencyForRequest ? formatCurrencyDisplay(requestDisplayedCost(request), currencyForRequest, locale) : { text: '—' };
             const costCopy = requestCostCopy(request, locale);
             const duration = formatDurationDisplay(request.duration_ms, locale);
             const credential = requestCredentialLabel(request, credentialAlias);
