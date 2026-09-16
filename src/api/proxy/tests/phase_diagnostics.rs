@@ -7,9 +7,10 @@ async fn unauthorized_responses_request_does_not_poll_or_spool_the_body() {
     let observed = polls.clone();
     let body = Body::from_stream(futures_util::stream::poll_fn(move |_| {
         observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        std::task::Poll::Ready(Some(Ok::<_, std::convert::Infallible>(Bytes::from_static(
-            b"must-not-be-read",
-        ))))
+        std::task::Poll::Ready(Some(Ok::<_, std::convert::Infallible>(Bytes::from(vec![
+            b'x';
+            4 * 1024 * 1024
+        ]))))
     }));
     let response = router_for_role(fixture.state.clone(), RuntimeRole::Gateway)
         .oneshot(Request::post("/v1/responses").body(body).unwrap())
