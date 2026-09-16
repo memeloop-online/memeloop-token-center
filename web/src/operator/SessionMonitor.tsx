@@ -436,11 +436,11 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     listInFlight.current = false;
     // Cancellation only stops the currently owned request. Events that arrived
     // in this scope still describe server state we have not observed, so keep
-    // their batch and schedule a fresh (non-overlapping) read below.
+    // their batch for the next manual refresh or stream invalidation. Do not
+    // immediately replace a user-cancelled request with another one.
     refreshDirty.current = refreshDirty.current || dirtyEventIdentities.current.size > 0 || dirtyDetailEvents.current.size > 0;
     setLoading(false);
     setRefreshing(false);
-    if (refreshDirty.current) scheduleRefresh();
   }
 
   const hasScope = Boolean(token.trim());

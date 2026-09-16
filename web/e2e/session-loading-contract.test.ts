@@ -56,7 +56,7 @@ test('live refresh is explicitly opt-in, while session invalidation stays below 
   assert.match(source, /checked=\{autoRefresh\}/);
   assert.match(source, /<Checkbox checked=\{autoRefresh\}/);
   assert.match(source, /<Button appearance="secondary" disabled=\{loading \|\| refreshing \|\| detailLoading\}/);
-  assert.match(source, /if \(detailInFlight\.current\) \{ detailRefreshDirty\.current = true; return; \}/, 'detail overlap remains dirty until it settles');
+  assert.match(source, /if \(detailInFlight\.current\) \{ detailRefreshDirty\.current = true; return false; \}/, 'detail overlap remains dirty until it settles');
   assert.match(source, /for \(const event of batchDetailEvents\) dirtyDetailEvents\.current\.add\(event\);/, 'overlapping batch events are retained');
   assert.match(source, /sessions\.refreshNow/);
 });

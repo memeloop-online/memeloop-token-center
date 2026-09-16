@@ -246,8 +246,11 @@ test('cancellation retains current-scope SSE work, while a scope transition drop
     await page.waitForFunction(() => window.sessionListReads === 2);
     await page.getByRole('button', { name: 'Cancel', exact: true }).click();
     await page.waitForFunction(() => window.sessionListAborts === 1);
-    // The event was observed before cancel, so it is retried in this scope.
-    await page.clock.fastForward(500);
+    // Cancellation retains the batch but must not create an unsolicited new
+    // request; the user's next refresh consumes the same current-scope work.
+    await page.clock.fastForward(1_000);
+    assert.equal(await page.evaluate(() => window.sessionListReads), 2);
+    await page.getByRole('button', { name: 'Refresh', exact: true }).click();
     await page.waitForFunction(() => window.sessionListReads === 3);
     await page.evaluate(() => window.resolveSessionList(true));
 
