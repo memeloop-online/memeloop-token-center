@@ -4,6 +4,27 @@ import test from 'node:test';
 import { latestDeclaredSessionName, sessionFallback, unnamedSessionName } from '../src/sessionTitles.js';
 
 const sessions = await readFile(new URL('../src/SessionViews.tsx', import.meta.url), 'utf8');
+const components = await readFile(new URL('../src/components.tsx', import.meta.url), 'utf8');
+
+test('request table and diagnostics reuse declared names and the shared contextual fallback', () => {
+  const diagnostics = components.slice(components.indexOf('export function RequestDiagnostics'), components.indexOf('export function RequestTable'));
+  const table = components.slice(components.indexOf('export function RequestTable'));
+  for (const surface of [diagnostics, table]) {
+    assert.match(surface, /session_name\?\.trim\(\) \|\| unnamedSessionName\(t, locale, request\.created_at, request\.credential_identity\?\.key_alias\?\.trim\(\) \|\| request\.credential_identity\?\.key_id\)/);
+    assert.doesNotMatch(surface, /sessions\.reportedNameMissing/);
+    assert.match(surface, /context\.association === 'confirmed'/);
+    assert.match(surface, /request-session-unlinked[^\n]*sessions\.unlinkedRequests/);
+  }
+});
+
+test('whitespace declarations use retained credential and receipt time without inventing a title', () => {
+  const translate = (key: string, variables?: Record<string, string | number>) => JSON.stringify({ key, variables });
+  const time = Date.UTC(2026, 8, 16, 4, 0);
+  const fallback = unnamedSessionName(translate, 'zh-CN', time, 'Operator credential');
+  assert.equal('  Real session title  '.trim() || fallback, 'Real session title');
+  assert.equal('   '.trim() || fallback, JSON.stringify({ key: 'sessions.unnamedSession', variables: { time: new Date(time).toLocaleString('zh-CN'), credential: 'Operator credential' } }));
+  assert.equal(unnamedSessionName(translate, 'en', time), JSON.stringify({ key: 'sessions.unnamedSessionNoCredential', variables: { time: new Date(time).toLocaleString('en') } }));
+});
 
 test('session titles use reported names and shared activity plus credential context when absent', () => {
   assert.match(sessions, /session\.session_name\?\.trim\(\) \|\| unnamedSessionName/);
