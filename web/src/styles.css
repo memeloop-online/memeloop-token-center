@@ -283,7 +283,7 @@ th {
   font-size:var(--fontSizeBase200,12px)
 }
 td code {
-  color:#8bd7cc
+  color:var(--colorBrandForeground1,#8bd7cc)
 }
 .clickable {
   cursor:pointer
