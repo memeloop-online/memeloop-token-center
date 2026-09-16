@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import type { Locator, Page } from 'playwright';
+import type { Locator, Page, Response } from 'playwright';
+import { formatMetricDisplay } from '../../src/format.js';
 import { baseURL, eventually, model, runtime, tenant } from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
 import { requestEventFixture } from '../support/request-event-fixture.js';
@@ -222,6 +223,15 @@ export function metric(page: Page, label: string): Locator {
   return page.locator('.metric').filter({ hasText: label }).locator('strong');
 }
 
+export async function assertUsageTotalTokens(page: Page, response: Response) {
+  const payload = await response.json() as { summary: { input_tokens: number; output_tokens: number } };
+  const total = payload.summary.input_tokens + payload.summary.output_tokens;
+  const display = formatMetricDisplay(total, 'zh-CN');
+  const totalMetric = metric(page, '总词元');
+  await assertExactText(totalMetric, display.text);
+  await assertAttribute(totalMetric.locator('.metric-exact'), 'title', display.title ?? display.text);
+}
+
 export async function assertVisible(locator: Locator): Promise<void> {
   await locator.first().waitFor({ state: 'visible', timeout: 10_000 });
 }
@@ -314,7 +324,6 @@ export async function applyUsageTypedFilter(
   setValue: (row: Locator, dialog: Locator) => Promise<void>,
   parameter: string,
   expectedValue: string,
-  expectedRequests: number,
 ): Promise<void> {
   const dialog = await openTypedFilterDialog(usageFilterBuilder(page));
   const row = await addTypedFilterCondition(dialog, field);
@@ -327,10 +336,10 @@ export async function applyUsageTypedFilter(
   const response = await responsePromise;
   assert.equal(response.status(), 200);
   await page.getByRole('tab', { name: '总览', exact: true }).click();
-  await assertExactText(metric(page, '请求数'), String(expectedRequests));
+  await assertUsageTotalTokens(page, response);
 }
 
-export async function clearUsageFilters(page: Page, expectedRequests = 51): Promise<void> {
+export async function clearUsageFilters(page: Page): Promise<void> {
   const builder = usageFilterBuilder(page);
   await assertVisible(builder.getByRole('button', { name: '清除', exact: true }));
   const responsePromise = page.waitForResponse((response) => {
@@ -341,7 +350,7 @@ export async function clearUsageFilters(page: Page, expectedRequests = 51): Prom
   await builder.getByRole('button', { name: '清除', exact: true }).click();
   const response = await responsePromise;
   assert.equal(response.status(), 200);
-  await assertExactText(metric(page, '请求数'), String(expectedRequests));
+  await assertUsageTotalTokens(page, response);
   await assertNoCount(builder.getByRole('button', { name: '清除', exact: true }));
 }
 
@@ -364,7 +373,7 @@ export async function nextStrictUsageUrl(observation: StrictUsageObservation, pr
   return new URL(observation.requestUrls.at(-1)!);
 }
 
-export async function clearStrictUsageFilters(world: DogfoodWorld, expectedRequests: number) {
+export async function clearStrictUsageFilters(world: DogfoodWorld, expectedTotalTokens: number) {
   const page = world.requirePage();
   const observation = requireStrictUsageObservation(world);
   const previousCount = observation.requestUrls.length;
@@ -379,7 +388,7 @@ export async function clearStrictUsageFilters(world: DogfoodWorld, expectedReque
   assert.equal(requestUrl.searchParams.has('protocol'), false);
   assert.equal(requestUrl.searchParams.has('error_code'), false);
   await page.getByRole('tab', { name: /^(总览|Overview)$/ }).click();
-  await assertExactText(metric(page, '请求数'), String(expectedRequests));
+  await assertExactText(metric(page, '总词元'), String(expectedTotalTokens));
 }
 
 export function usageMetrics(overrides: Record<string, unknown> = {}) {

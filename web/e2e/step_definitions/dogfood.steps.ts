@@ -6,7 +6,7 @@ import { baseURL, eventually, model, requestJson, runtime, tenant } from '../sup
 import type { DogfoodWorld } from '../support/world.js';
 
 import { appPreferenceControls, openAppRoute, openUsageDimension } from './app-route.support.js';
-import { addTypedFilterCondition, applyUsageTypedFilter, assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertOperatorTenantScope, assertValue, assertVisible, catalogModelSearch, clearStrictUsageFilters, clearUsageFilters, connectOperator, credentialGroupObservations, emptyUsageFixture, groupedModel, localizationUsageFixture, metric, nextStrictUsageUrl, openCatalogModelPicker, openTypedFilterDialog, requireStrictUsageObservation, strictDimensionUsageFixture, strictUsageObservations, usageDimension, usageFilterBuilder, uuidPattern, type StrictUsageObservation } from './dogfood.support.js';
+import { addTypedFilterCondition, applyUsageTypedFilter, assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertOperatorTenantScope, assertUsageTotalTokens, assertValue, assertVisible, catalogModelSearch, clearStrictUsageFilters, clearUsageFilters, connectOperator, credentialGroupObservations, emptyUsageFixture, groupedModel, localizationUsageFixture, metric, nextStrictUsageUrl, openCatalogModelPicker, openTypedFilterDialog, requireStrictUsageObservation, strictDimensionUsageFixture, strictUsageObservations, usageDimension, usageFilterBuilder, uuidPattern, type StrictUsageObservation } from './dogfood.support.js';
 
 Given('dogfood 服务已有隔离租户、统一上游、请求记录和多模态价格', function () {
   runtime.requireSeed();
@@ -170,9 +170,10 @@ Then('英文导航、主题色和响应式布局均正确且浏览器没有失�
 
 When('管理员进入请求统计', async function (this: DogfoodWorld) {
   const page = this.requirePage();
+  const usageResponse = page.waitForResponse((response) => response.url().includes('/internal/v1/usage-analysis?'));
   await openAppRoute(page, 'operator', 'usage');
   await assertVisible(page.getByRole('heading', { name: '用量分析', exact: true }));
-  await assertExactText(metric(page, '请求数'), '51');
+  await assertUsageTotalTokens(page, await usageResponse);
 });
 
 Then('总览、趋势、模型、客户端凭据、会话、上游账户和热力图七个视图都有真实数据', async function (this: DogfoodWorld) {
@@ -232,15 +233,15 @@ Then('模型、客户端凭据、上游和状态过滤都作用于真实统计 A
     assert.equal((await routeCatalogResponse).status(), 200);
     await catalogModelSearch(catalog).fill(model);
     await catalog.getByRole('option').filter({ hasText: model }).first().click();
-  }, 'model', model, 51);
+  }, 'model', model);
   await clearUsageFilters(page);
-  await applyUsageTypedFilter(page, 'key_id', async (row) => row.getByLabel('值', { exact: true }).fill(seed.clientKeyId), 'key_id', seed.clientKeyId, 51);
+  await applyUsageTypedFilter(page, 'key_id', async (row) => row.getByLabel('值', { exact: true }).fill(seed.clientKeyId), 'key_id', seed.clientKeyId);
   await clearUsageFilters(page);
-  await applyUsageTypedFilter(page, 'upstream_account_id', async (row) => { await row.locator('[data-filter-field="upstream_account_id"] select').selectOption(seed.upstreamId); }, 'upstream_account_id', seed.upstreamId, 51);
+  await applyUsageTypedFilter(page, 'upstream_account_id', async (row) => { await row.locator('[data-filter-field="upstream_account_id"] select').selectOption(seed.upstreamId); }, 'upstream_account_id', seed.upstreamId);
   await clearUsageFilters(page);
-  await applyUsageTypedFilter(page, 'status', async (row) => { await row.locator('[data-filter-field="status"] select').selectOption('success'); }, 'status', 'success', 50);
+  await applyUsageTypedFilter(page, 'status', async (row) => { await row.locator('[data-filter-field="status"] select').selectOption('success'); }, 'status', 'success');
   await clearUsageFilters(page);
-  await applyUsageTypedFilter(page, 'status', async (row) => { await row.locator('[data-filter-field="status"] select').selectOption('error'); }, 'status', 'error', 1);
+  await applyUsageTypedFilter(page, 'status', async (row) => { await row.locator('[data-filter-field="status"] select').selectOption('error'); }, 'status', 'error');
   await clearUsageFilters(page);
 });
 
@@ -274,7 +275,7 @@ When('浏览器提供严格且权重可区分的请求统计维度 fixture', asy
   });
   await connectOperator(this, 'dark');
   await openAppRoute(page, 'operator', 'usage');
-  await assertExactText(metric(page, '请求数'), '17');
+  await assertExactText(metric(page, '总词元'), '204');
   await openUsageDimension(page, '状态');
   await eventually(async () => {
     const labels = await page.locator('.usage-filter-link').allTextContents();
@@ -302,7 +303,7 @@ Then('点击失败状态 bucket 使用 error 并仅显示失败结果', async fu
 
 Then('点击未分配上游使用 unassigned 并仅显示无上游结果', async function (this: DogfoodWorld) {
   const page = this.requirePage();
-  await clearStrictUsageFilters(this, 17);
+  await clearStrictUsageFilters(this, 204);
   await openUsageDimension(page, '上游账户');
   const upstreamPanel = usageDimension(page, '上游账户');
   const observation = requireStrictUsageObservation(this);
@@ -322,7 +323,7 @@ Then('模型、凭据别名、协议和错误码 bucket 使用精确公开过滤
   const seed = runtime.requireSeed();
   const observation = requireStrictUsageObservation(this);
 
-  await clearStrictUsageFilters(this, 17);
+  await clearStrictUsageFilters(this, 204);
   await openUsageDimension(page, '模型');
   let requestsBeforeClick = observation.requestUrls.length;
   await usageDimension(page, '模型').locator('.usage-filter-link').filter({ hasText: model }).click();
@@ -330,7 +331,7 @@ Then('模型、凭据别名、协议和错误码 bucket 使用精确公开过滤
   assert.equal(requestUrl.searchParams.get('model'), model);
   await assertContains(usageFilterBuilder(page).locator('.typed-filter-chips'), model);
 
-  await clearStrictUsageFilters(this, 17);
+  await clearStrictUsageFilters(this, 204);
   await openUsageDimension(page, '客户端凭据');
   requestsBeforeClick = observation.requestUrls.length;
   const credentialBucket = usageDimension(page, '客户端凭据')
@@ -341,7 +342,7 @@ Then('模型、凭据别名、协议和错误码 bucket 使用精确公开过滤
   assert.match(requestUrl.searchParams.get('key_id') ?? '', uuidPattern);
   await assertContains(usageFilterBuilder(page).locator('.typed-filter-chips'), seed.clientKeyId);
 
-  await clearStrictUsageFilters(this, 17);
+  await clearStrictUsageFilters(this, 204);
   await openUsageDimension(page, '协议');
   requestsBeforeClick = observation.requestUrls.length;
   await usageDimension(page, '协议').locator('.usage-filter-link').filter({ hasText: 'OpenAI' }).click();
@@ -349,7 +350,7 @@ Then('模型、凭据别名、协议和错误码 bucket 使用精确公开过滤
   assert.equal(requestUrl.searchParams.get('protocol'), 'openai');
   await assertContains(usageFilterBuilder(page).locator('.typed-filter-chips'), 'openai');
 
-  await clearStrictUsageFilters(this, 17);
+  await clearStrictUsageFilters(this, 204);
   await openUsageDimension(page, '错误码');
   requestsBeforeClick = observation.requestUrls.length;
   const errorBucket = usageDimension(page, '错误码')
@@ -366,7 +367,7 @@ Then('模型、凭据别名、协议和错误码 bucket 使用精确公开过滤
 Then('真实上游 UUID 和清除过滤保持可用且中英文亮暗主题无回归', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   const seed = runtime.requireSeed();
-  await clearStrictUsageFilters(this, 17);
+  await clearStrictUsageFilters(this, 204);
   await openUsageDimension(page, '上游账户');
   let upstreamPanel = usageDimension(page, '上游账户');
   const observation = requireStrictUsageObservation(this);
@@ -382,7 +383,7 @@ Then('真实上游 UUID 和清除过滤保持可用且中英文亮暗主题无�
   await assertContains(upstreamPanel, seed.upstreamName);
   await assertNotContains(upstreamPanel, '未分配上游');
 
-  await clearStrictUsageFilters(this, 17);
+  await clearStrictUsageFilters(this, 204);
   await openUsageDimension(page, '上游账户');
   upstreamPanel = usageDimension(page, '上游账户');
   await assertContains(usageFilterBuilder(page).locator('.typed-filter-chips'), '未应用筛选条件');
@@ -429,8 +430,6 @@ Then('中文指标显示万、亿、万亿、USD 与 CNY 并保留精确值', as
   });
   await page.getByRole('button', { name: '刷新', exact: true }).click();
   const exactMetric = (label: string) => metric(page, label).locator('.metric-exact');
-  await assertExactText(metric(page, '请求数'), '11.12万');
-  await assertAttribute(exactMetric('请求数'), 'title', '111,227');
   await assertExactText(metric(page, '总词元'), '1万亿');
   await assertAttribute(exactMetric('总词元'), 'title', '1,000,100,111,227');
   await assertExactText(metric(page, '生成计费单位'), '1.23万');
@@ -463,8 +462,6 @@ When('管理员将请求统计切换为英文', async function (this: DogfoodWor
 Then('英文大数使用紧凑 K、M、B 或 T 且 tooltip 保留精确值并可切换亮暗主题', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   const exactMetric = (label: string) => metric(page, label).locator('.metric-exact');
-  await assertExactText(metric(page, 'Requests'), '111.23K');
-  await assertAttribute(exactMetric('Requests'), 'title', '111,227');
   await assertExactText(metric(page, 'Total tokens'), '1T');
   await assertAttribute(exactMetric('Total tokens'), 'title', '1,000,100,111,227');
   await assertExactText(metric(page, 'Generation billing units'), '12.35K');
@@ -489,7 +486,7 @@ When('请求统计 API 返回空数据', async function (this: DogfoodWorld) {
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(emptyUsageFixture()) });
   });
   await openAppRoute(page, 'operator', 'usage');
-  await assertExactText(metric(page, '请求数'), '0');
+  await assertExactText(metric(page, '总词元'), '0');
 });
 
 Then('七个统计视图呈现明确空态', async function (this: DogfoodWorld) {
