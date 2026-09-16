@@ -42,7 +42,7 @@ pub(super) use readiness::{
 pub(crate) use recovery_wait::wait as wait_media_recovery;
 pub(super) use route_types::{
     PlannedProxyRoute, PreparedProxyRoute, ProxyRequestContext, ProxyRoutePlanInput,
-    ProxyRouteResponse, ProxySendError,
+    ProxyRouteResponse, ProxySendError, TransportFailureKind,
 };
 
 pub(super) fn plan_proxy_route(

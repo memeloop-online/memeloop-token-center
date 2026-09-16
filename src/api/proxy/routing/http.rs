@@ -101,8 +101,26 @@ pub(super) async fn send_reqwest_proxy_route(
             upstream_activity,
             codex_retry: CodexRetryTerminalGuard::inactive(),
         }),
-        Err(error) if error.is_connect() => Err(ProxySendError::RetryableConnection("connect")),
-        // Do not replay ambiguous POST delivery.
-        Err(_) => Err(ProxySendError::NonRetryableTransport),
+        Err(error) => Err(classify_reqwest_send_error(error)),
     }
+}
+
+fn classify_reqwest_send_error(error: reqwest::Error) -> ProxySendError {
+    if error.is_connect() {
+        return ProxySendError::RetryableConnection("connect");
+    }
+    // Do not replay ambiguous POST delivery. Persist only allowlisted error
+    // classes; the error may contain the upstream URL and must not escape.
+    let kind = if error.is_timeout() {
+        TransportFailureKind::Timeout
+    } else if error.is_body() {
+        TransportFailureKind::Body
+    } else if error.is_decode() {
+        TransportFailureKind::Decode
+    } else if error.is_request() {
+        TransportFailureKind::Request
+    } else {
+        TransportFailureKind::Other
+    };
+    ProxySendError::NonRetryableTransport(kind)
 }

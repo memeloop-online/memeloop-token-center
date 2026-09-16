@@ -48,6 +48,7 @@ fn streaming_upstream_evidence(
         transport_error,
         Some(
             "upstream_stream"
+                | "upstream_stream_read_error"
                 | "upstream_timeout"
                 | "upstream_read_timeout"
                 | "upstream_request_timeout"
@@ -385,15 +386,26 @@ mod tests {
     #[test]
     fn ambiguous_transport_dominates_its_derived_incomplete_capture_state() {
         let incomplete = summary(ResponsesSseOutcome::Incomplete, false, true);
-        assert_eq!(
-            streaming_upstream_evidence(
-                false,
-                Some("upstream_stream"),
-                Some(&incomplete),
-                Some("upstream_stream")
-            ),
-            StreamingUpstreamEvidence::Inconclusive
-        );
+        for error in ["upstream_stream", "upstream_stream_read_error"] {
+            assert_eq!(
+                streaming_upstream_evidence(false, Some(error), Some(&incomplete), Some(error)),
+                StreamingUpstreamEvidence::Inconclusive
+            );
+        }
+    }
+
+    #[test]
+    fn durable_protocol_failure_categories_keep_invalid_response_health_semantics() {
+        let incomplete = summary(ResponsesSseOutcome::Incomplete, false, true);
+        for error in [
+            "upstream_eof_without_terminal",
+            "upstream_response_terminal_conflict",
+        ] {
+            assert_eq!(
+                streaming_upstream_evidence(false, Some(error), Some(&incomplete), Some(error)),
+                StreamingUpstreamEvidence::InvalidResponse
+            );
+        }
     }
 
     #[test]

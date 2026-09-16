@@ -87,6 +87,17 @@ impl ResponseIdentityGate {
             match self.response_id.as_deref() {
                 None => self.response_id = Some(response_id),
                 Some(current) if current == response_id => {}
+                Some(_)
+                    if matches!(
+                        payload_name,
+                        "response.completed"
+                            | "response.failed"
+                            | "response.incomplete"
+                            | "response.error"
+                    ) =>
+                {
+                    return Err("upstream_response_terminal_conflict");
+                }
                 Some(_) => return Err("upstream_invalid_response"),
             }
         }
@@ -187,6 +198,10 @@ impl ResponsesStreamingSanitizer {
         if !self.framer.is_complete() {
             self.last_rejection_stage = Some("eof_incomplete");
             return Err("upstream_incomplete_response");
+        }
+        if self.terminal.is_none() {
+            self.last_rejection_stage = Some("eof_without_terminal");
+            return Err("upstream_eof_without_terminal");
         }
         let terminal = self.terminal_hold.release();
         self.progress_heartbeat = None;
@@ -302,6 +317,14 @@ impl ResponsesStreamingSanitizer {
             .as_deref()
             .is_some_and(|event_name| event_name != payload_name)
         {
+            if event_name.as_deref().and_then(terminal_kind).is_some()
+                || terminal_kind(payload_name).is_some()
+            {
+                return Err(SanitizerRejection::new(
+                    "upstream_response_terminal_conflict",
+                    "terminal_conflict",
+                ));
+            }
             return Err(SanitizerRejection::new(
                 "upstream_invalid_response",
                 "event_type_mismatch",
@@ -349,8 +372,8 @@ impl ResponsesStreamingSanitizer {
             Some(StreamTerminal::Failed) => return Ok(()),
             Some(StreamTerminal::Completed | StreamTerminal::Incomplete) => {
                 return Err(SanitizerRejection::new(
-                    "upstream_invalid_response",
-                    "post_terminal",
+                    "upstream_response_terminal_conflict",
+                    "terminal_conflict",
                 ));
             }
             None => {}

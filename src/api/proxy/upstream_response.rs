@@ -7,7 +7,7 @@ use http::{HeaderMap, StatusCode, Version};
 pub(super) type UpstreamByteStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, &'static str>> + Send + 'static>>;
 
-pub(super) const UPSTREAM_STREAM_ERROR: &str = "upstream_stream";
+pub(super) const UPSTREAM_STREAM_ERROR: &str = "upstream_stream_read_error";
 pub(super) const UPSTREAM_READ_TIMEOUT: &str = "upstream_read_timeout";
 pub(super) const UPSTREAM_REQUEST_TIMEOUT: &str = "upstream_request_timeout";
 

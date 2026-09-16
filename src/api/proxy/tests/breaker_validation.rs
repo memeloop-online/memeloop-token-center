@@ -194,10 +194,10 @@ async fn ambiguous_codex_response_does_not_open_the_shared_account_breaker() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status_code, Some(502));
-    assert!(matches!(
+    assert_eq!(
         rows[0].error_code.as_deref(),
-        Some("upstream_stream") | Some("upstream_incomplete_response")
-    ));
+        Some("upstream_stream_read_error")
+    );
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let health_rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
@@ -259,7 +259,7 @@ async fn failed_codex_protocol_mismatch_opens_the_invalid_response_breaker() {
     assert_eq!(rows[0].status_code, Some(502));
     assert_eq!(
         rows[0].error_code.as_deref(),
-        Some("upstream_invalid_response")
+        Some("upstream_response_terminal_conflict")
     );
     wait_for_account_failure_count(&fixture, 1).await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();

@@ -366,7 +366,7 @@ fn sanitizer_rejects_bad_ids_and_bare_lifecycle_events_before_terminal_delivery(
         (
             b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-b\"}}\n\n"
                 .as_slice(),
-            "upstream_invalid_response",
+            "upstream_response_terminal_conflict",
         ),
         (
             b"data: {\"type\":\"response.completed\",\"response\":{}}\n\n".as_slice(),
@@ -556,4 +556,17 @@ fn sanitizer_rejection_stages_are_static_and_content_free() {
         .unwrap();
     assert_eq!(eof.finish(), Err("upstream_incomplete_response"));
     assert_eq!(eof.last_rejection_stage(), "eof_incomplete");
+
+    let mut missing_terminal = ResponsesStreamingSanitizer::default();
+    missing_terminal
+        .push(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-clean-eof\"}}\n\n")
+        .unwrap();
+    assert_eq!(
+        missing_terminal.finish(),
+        Err("upstream_eof_without_terminal")
+    );
+    assert_eq!(
+        missing_terminal.last_rejection_stage(),
+        "eof_without_terminal"
+    );
 }

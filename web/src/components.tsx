@@ -9,6 +9,7 @@ import { DetailTooltip } from './design-system';
 import { RequestStatus } from './RequestStatus';
 import { unnamedSessionName } from './sessionTitles.js';
 import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestIsPending, requestUsageCopy } from './requestTablePresentation';
+import { requestErrorCopy } from './requestStatusPresentation';
 
 export function Shell({ children, operator = false }: { children: ReactNode; operator?: boolean }) {
   const { locale, setLocale, t } = useI18n();
@@ -253,7 +254,7 @@ export function RequestDiagnostics({
       <div><b>{zh ? '最终上游' : 'Final upstream'}</b><RequestMetadata label={upstreamName || (request.upstream_account_id ? (zh ? '未命名上游' : 'Unnamed upstream') : missing)} fields={[[t('request.upstreamId'), request.upstream_account_id]]} /></div>
       <div><b>{t('request.status')}</b><RequestStatus request={request} /></div>
       <div><b>{t('request.request')}</b><RequestMetadata label={zh ? '记录标识' : 'Record identifiers'} fields={[[zh ? '请求 ID' : 'Request ID', request.request_id]]} /></div>
-      {request.error_code && <div className="request-detail-wide"><b>{t('request.error')}</b>{request.error_code}</div>}
+      {request.error_code && <div className="request-detail-wide"><b>{t('request.error')}</b><DetailTooltip content={`${t('traffic.errorCode')}: ${request.error_code}`}><span tabIndex={0}>{requestErrorCopy(request.error_code, locale)}</span></DetailTooltip></div>}
       <div><b>{t('request.duration')}</b><DetailTooltip content={timingDetails}><span className="request-detail-timing" tabIndex={0}>{duration.text === '—' ? missing : duration.text}</span></DetailTooltip></div>
       <div><RequestOutputRate request={request} /></div>
     </section>

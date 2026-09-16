@@ -81,6 +81,7 @@ async fn progress_heartbeat_interrupts_a_quiet_upstream_before_stream_timeout() 
 fn observed_downstream_close_keeps_cancellation_attribution() {
     for error in [
         "upstream_stream",
+        "upstream_stream_read_error",
         "upstream_timeout",
         "upstream_invalid_response",
         "upstream_incomplete_response",

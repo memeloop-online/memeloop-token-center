@@ -6,7 +6,7 @@ fn classification(status: Option<StatusCode>, error: Option<&ProxySendError>) ->
         (Some(_), None) => "upstream_http_status",
         (None, Some(ProxySendError::RetryableConnection(_))) => "connect_not_delivered",
         (None, Some(ProxySendError::OuterDeadline)) => "outer_deadline_delivery_unknown",
-        (None, Some(ProxySendError::NonRetryableTransport)) => "transport_delivery_unknown",
+        (None, Some(ProxySendError::NonRetryableTransport(kind))) => kind.diagnostic_outcome(),
         (None, Some(ProxySendError::AmbiguousResponse(_))) => "response_delivery_unknown",
         (None, Some(ProxySendError::CandidateUnavailable)) => "local_candidate_unavailable",
         (None, Some(ProxySendError::CredentialUnavailable | ProxySendError::Credential)) => {
@@ -137,8 +137,8 @@ mod tests {
                 "connect_not_delivered",
             ),
             (
-                ProxySendError::NonRetryableTransport,
-                "transport_delivery_unknown",
+                ProxySendError::NonRetryableTransport(TransportFailureKind::ConnectionReset),
+                "transport_connection_reset_delivery_unknown",
             ),
             (
                 ProxySendError::OuterDeadline,
@@ -162,5 +162,46 @@ mod tests {
             super::super::failover_disposition(None, Some(&ProxySendError::OuterDeadline)),
             super::super::outcome::FailoverDisposition::Stop
         );
+    }
+
+    #[test]
+    fn transport_failure_labels_are_allowlisted_and_durable() {
+        for (kind, outcome, error_code) in [
+            (
+                TransportFailureKind::Timeout,
+                "transport_timeout_delivery_unknown",
+                "upstream_transport_timeout",
+            ),
+            (
+                TransportFailureKind::ConnectionReset,
+                "transport_connection_reset_delivery_unknown",
+                "upstream_transport_connection_reset",
+            ),
+            (
+                TransportFailureKind::Body,
+                "transport_body_delivery_unknown",
+                "upstream_transport_body",
+            ),
+            (
+                TransportFailureKind::Decode,
+                "transport_decode_delivery_unknown",
+                "upstream_transport_decode",
+            ),
+            (
+                TransportFailureKind::Request,
+                "transport_request_delivery_unknown",
+                "upstream_transport_request",
+            ),
+            (
+                TransportFailureKind::Other,
+                "transport_other_delivery_unknown",
+                "upstream_transport_other",
+            ),
+        ] {
+            assert_eq!(kind.diagnostic_outcome(), outcome);
+            assert_eq!(kind.error_code(), error_code);
+            assert!(!outcome.contains("http"));
+            assert!(!error_code.contains("http"));
+        }
     }
 }
