@@ -440,14 +440,19 @@ mod tests {
                 .is_none()
         );
         assert!(
-            request["input"][0]["tools"][0]["parameters"]["properties"]["message"]
+            request["tools"][0]["tools"][1]["parameters"]["properties"]["message"]
                 .get("encrypted")
                 .is_none()
         );
         assert!(
-            request["tools"][0]["tools"][1]["parameters"]["properties"]["message"]
+            request["tools"][0]["tools"][2]["parameters"]["properties"]["message"]
                 .get("encrypted")
                 .is_some()
+        );
+        assert!(
+            request["input"][0]["tools"][0]["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_none()
         );
         assert_eq!(request["input"][1]["content"][1]["type"], "input_text");
         assert_eq!(
@@ -456,6 +461,19 @@ mod tests {
         );
 
         let output = convert(&request).expect("fixture converts to Kimi Chat");
+        let spawn_agent = output["tools"]
+            .as_array()
+            .and_then(|tools| {
+                tools
+                    .iter()
+                    .find(|tool| tool["function"]["name"] == "collaboration__spawn_agent")
+            })
+            .expect("fixture keeps the collaboration spawn_agent tool");
+        assert!(
+            spawn_agent["function"]["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_none()
+        );
         assert_eq!(output["messages"][0]["role"], "user");
         assert!(output.to_string().contains("delegated task fixture"));
         assert!(!output.to_string().contains("never forward this metadata"));

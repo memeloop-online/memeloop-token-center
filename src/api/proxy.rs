@@ -843,6 +843,8 @@ pub(in crate::api) async fn proxy_with_identity(
     pinned_route: Option<Uuid>,
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 ) -> Result<Response, AppError> {
+    let codex_multi_agent_v2_client =
+        crate::api::request_normalization::is_official_codex_user_agent(&headers);
     let diagnostic_context = proxy_diagnostics::Context::current();
     let request_id = diagnostic_context.request_id;
     let preparation = proxy_diagnostics::Phase::new(diagnostic_context, "request_preparation");
@@ -925,6 +927,7 @@ pub(in crate::api) async fn proxy_with_identity(
         protocol,
         request_id,
         request_json: &request_json,
+        codex_multi_agent_v2_client,
     };
     let mut route_plan = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
         request: request_context,
@@ -960,6 +963,7 @@ pub(in crate::api) async fn proxy_with_identity(
                     protocol,
                     request_id,
                     request_json: &request_json,
+                    codex_multi_agent_v2_client,
                 },
                 original_body_length: body.len(),
                 candidates,
@@ -974,6 +978,7 @@ pub(in crate::api) async fn proxy_with_identity(
         protocol,
         request_id,
         request_json: &request_json,
+        codex_multi_agent_v2_client,
     };
     let primary = route_plan.primary_route();
     let upstream_account_id = Some(primary.account_id);

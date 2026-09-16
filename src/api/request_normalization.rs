@@ -1,6 +1,28 @@
+use http::{HeaderMap, header};
 use serde_json::Value;
 
 const COLLABORATION_TOOL_NAMES: &[&str] = &["spawn_agent", "send_message", "followup_task"];
+
+/// CPA applies MultiAgentV2 compatibility only to the official Codex client
+/// envelope.  Keep that boundary strict so a normal Responses caller cannot
+/// accidentally trigger the agent-message downgrade on a third-party route.
+pub(super) fn is_official_codex_user_agent(headers: &HeaderMap) -> bool {
+    let mut values = headers.get_all(header::USER_AGENT).iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+    let Ok(user_agent) = value.to_str() else {
+        return false;
+    };
+    let user_agent = user_agent.trim();
+    user_agent.starts_with("Codex Desktop/")
+        || user_agent.starts_with("codex-tui/")
+        || user_agent == "codex_cli_rs"
+        || user_agent.starts_with("codex_cli_rs/")
+}
 
 /// Normalize the subset of Codex MultiAgentV2 request shapes that a declared
 /// third-party upstream can read.  The native Codex route deliberately does
@@ -72,55 +94,111 @@ fn rewrite_tool_definition(definition: &mut Value) {
 }
 
 fn rewrite_agent_message(item: &mut Value) {
-    let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) else {
+    let Some(content) = item.get("content").and_then(Value::as_array).cloned() else {
         return;
     };
-    for part in content.iter_mut() {
-        if part.get("type").and_then(Value::as_str) != Some("encrypted_content") {
-            continue;
-        }
-        let Some(text) = part
-            .get("encrypted_content")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-        else {
-            // Non-string payloads are left untouched and will fail closed in
-            // the destination transport instead of being guessed at.
-            continue;
-        };
-        if let Some(part) = part.as_object_mut() {
-            part.insert("type".into(), Value::String("input_text".into()));
-            part.insert("text".into(), Value::String(text));
-            part.remove("encrypted_content");
-        }
-    }
+
+    let normalized_content = content
+        .into_iter()
+        .map(|mut part| {
+            if part.get("type").and_then(Value::as_str) == Some("encrypted_content")
+                && let Some(text) = part
+                    .get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                && let Some(part) = part.as_object_mut()
+            {
+                part.insert("type".into(), Value::String("input_text".into()));
+                part.insert("text".into(), Value::String(text));
+                part.remove("encrypted_content");
+            }
+            part
+        })
+        .collect::<Vec<_>>();
 
     // CPA's compatibility rewrite lowers the inter-agent envelope to an
     // ordinary user message.  Only do so once every part is readable; an
     // opaque payload remains agent_message and is rejected by the target
     // transport instead of being silently forwarded as an unknown object.
-    let readable = !content.is_empty()
-        && content
-            .iter()
-            .all(|part| match part.get("type").and_then(Value::as_str) {
-                Some("input_text" | "output_text" | "text") => {
-                    part.get("text").is_some_and(Value::is_string)
-                }
-                Some("input_image") => part.get("image_url").is_some_and(Value::is_string),
-                _ => false,
-            });
-    if readable {
+    let Some(sanitized_content) = normalized_content
+        .iter()
+        .map(|part| match part.get("type").and_then(Value::as_str) {
+            Some("input_text" | "output_text" | "text") => part
+                .get("text")
+                .and_then(Value::as_str)
+                .map(|text| serde_json::json!({"type":"input_text", "text":text})),
+            Some("input_image") => part
+                .get("image_url")
+                .and_then(Value::as_str)
+                .map(|image_url| {
+                    let mut sanitized = serde_json::json!({
+                        "type": "input_image",
+                        "image_url": image_url,
+                    });
+                    if let Some(detail) = part.get("detail").filter(Value::is_string) {
+                        sanitized["detail"] = detail.clone();
+                    }
+                    sanitized
+                }),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
         if let Some(item) = item.as_object_mut() {
-            item.insert("type".into(), Value::String("message".into()));
-            item.insert("role".into(), Value::String("user".into()));
+            item.insert("content".into(), Value::Array(normalized_content));
         }
+        return;
+    };
+    if sanitized_content.is_empty() {
+        return;
+    }
+
+    // An agent envelope is an internal transport shape.  Once it becomes a
+    // normal user message, retain only the standard message fields and the
+    // allow-listed content fields above; author/recipient and passthrough
+    // metadata must never reach a strict third-party upstream.
+    if let Some(item) = item.as_object_mut() {
+        item.clear();
+        item.insert("type".into(), Value::String("message".into()));
+        item.insert("role".into(), Value::String("user".into()));
+        item.insert("content".into(), Value::Array(sanitized_content));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::HeaderValue;
     use serde_json::json;
+
+    #[test]
+    fn official_codex_user_agent_boundary_matches_cpa_and_fails_closed() {
+        for user_agent in [
+            "Codex Desktop/1.2.3",
+            "codex-tui/0.1.0",
+            "codex_cli_rs",
+            "codex_cli_rs/0.1.0",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::USER_AGENT, HeaderValue::from_static(user_agent));
+            assert!(is_official_codex_user_agent(&headers), "{user_agent}");
+        }
+        for user_agent in ["Mozilla/5.0", "Codex Desktop", "codex_cli_rs-other"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::USER_AGENT, HeaderValue::from_static(user_agent));
+            assert!(!is_official_codex_user_agent(&headers), "{user_agent}");
+        }
+        let mut duplicate = HeaderMap::new();
+        duplicate.append(
+            header::USER_AGENT,
+            HeaderValue::from_static("Codex Desktop/1.2.3"),
+        );
+        duplicate.append(
+            header::USER_AGENT,
+            HeaderValue::from_static("Codex Desktop/4.5.6"),
+        );
+        assert!(!is_official_codex_user_agent(&duplicate));
+    }
 
     #[test]
     fn disabled_normalization_leaves_native_shape_untouched() {
@@ -195,8 +273,7 @@ mod tests {
                 "internal_chat_message_metadata_passthrough":{"turn_id":"turn"},
                 "content":[
                     {"type":"input_text","text":"prefix"},
-                    {"type":"encrypted_content","encrypted_content":"delegated task","trace":"keep"},
-                    {"type":"encrypted_content","encrypted_content":{"ciphertext":"opaque"}}
+                    {"type":"encrypted_content","encrypted_content":"delegated task","trace":"keep"}
                 ]
             }]
         });
@@ -204,10 +281,13 @@ mod tests {
 
         assert_eq!(request["input"][0]["type"], "message");
         assert_eq!(request["input"][0]["role"], "user");
-        assert_eq!(
-            request["input"][0]["internal_chat_message_metadata_passthrough"]["turn_id"],
-            "turn"
+        assert!(
+            request["input"][0]
+                .get("internal_chat_message_metadata_passthrough")
+                .is_none()
         );
+        assert!(request["input"][0].get("author").is_none());
+        assert!(request["input"][0].get("recipient").is_none());
         assert_eq!(request["input"][0]["content"][1]["type"], "input_text");
         assert_eq!(request["input"][0]["content"][1]["text"], "delegated task");
         assert!(
@@ -215,9 +295,23 @@ mod tests {
                 .get("encrypted_content")
                 .is_none()
         );
-        assert_eq!(request["input"][0]["content"][1]["trace"], "keep");
+        assert!(request["input"][0]["content"][1].get("trace").is_none());
+    }
+
+    #[test]
+    fn opaque_agent_message_stays_agent_message_and_keeps_payload() {
+        let mut request = json!({
+            "input": [{"type":"agent_message","role":"system", "content":[
+                {"type":"input_text","text":"prefix"},
+                {"type":"encrypted_content","encrypted_content":{"ciphertext":"opaque"}}
+            ]}]
+        });
+        normalize_codex_multi_agent_v2(&mut request, true);
+
+        assert_eq!(request["input"][0]["type"], "agent_message");
+        assert_eq!(request["input"][0]["role"], "system");
         assert_eq!(
-            request["input"][0]["content"][2]["encrypted_content"]["ciphertext"],
+            request["input"][0]["content"][1]["encrypted_content"]["ciphertext"],
             "opaque"
         );
     }

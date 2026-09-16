@@ -8,6 +8,26 @@
       "tools": [
         {
           "type": "function",
+          "name": "spawn_agent",
+          "description": "Spawns an agent to complete a delegated task.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string",
+                "encrypted": {
+                  "type": "boolean",
+                  "description": "internal wire marker"
+                },
+                "description": "Task body"
+              },
+              "model": {"type": "string"}
+            },
+            "required": ["message"]
+          }
+        },
+        {
+          "type": "function",
           "name": "send_message",
           "description": "Send a task to another agent",
           "parameters": {
