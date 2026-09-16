@@ -135,7 +135,7 @@ fn rewrite_agent_message(item: &mut Value) {
                         "type": "input_image",
                         "image_url": image_url,
                     });
-                    if let Some(detail) = part.get("detail").filter(Value::is_string) {
+                    if let Some(detail) = part.get("detail").filter(|detail| detail.is_string()) {
                         sanitized["detail"] = detail.clone();
                     }
                     sanitized
