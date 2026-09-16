@@ -8,6 +8,7 @@ import { requestCostCopy } from './requestTablePresentation.js';
 import { deriveSemanticExecution } from './sessionSemantics.js';
 import { latestDeclaredSessionName, sessionFallback, unnamedSessionName } from './sessionTitles.js';
 import { SessionReplayPanel, type SessionReplayArchiveLoader } from './sessionReplayViews.js';
+import type { ArchiveRangeLoader } from './archiveRange.js';
 import type { ConversationRequest, LogicalSessionDetail, LogicalSessionSummary, RequestView, UsageAnalysisCost } from './types.js';
 
 const semanticPalette = ['#6859d9', '#18a999', '#e68a2e', '#d74f70', '#4078c0', '#8a63b8'];
@@ -277,7 +278,7 @@ function SessionActivity({ detail, summary, currency, loading, onSelect }: {
   </div>;
 }
 
-export function SessionDetailSurface({ detail, summary, currency, showDiagnosticIds = false, loading, onLoadOlder, onSelect, onClose, loadReplayArchive }: {
+export function SessionDetailSurface({ detail, summary, currency, showDiagnosticIds = false, loading, onLoadOlder, onSelect, onClose, loadReplayArchive, loadArchiveRange }: {
   detail: LogicalSessionDetail;
   summary?: LogicalSessionSummary;
   currency?: string;
@@ -288,6 +289,7 @@ export function SessionDetailSurface({ detail, summary, currency, showDiagnostic
   onClose?: () => void;
   /** Optional owner-scoped archive reader; the shared view never receives a credential. */
   loadReplayArchive?: SessionReplayArchiveLoader;
+  loadArchiveRange?: ArchiveRangeLoader;
 }) {
   const { locale, t } = useI18n();
   const declaredSessionName = latestDeclaredSessionName(detail);
@@ -307,7 +309,7 @@ export function SessionDetailSurface({ detail, summary, currency, showDiagnostic
   return <section className="session-detail" aria-label={title}>
     <header className="session-detail-heading"><div><span className="eyebrow">{t('sessions.logicalSession')}</span><h2>{title}</h2>{detail.unlinked && <p className="mtc-secondary-text">{t('sessions.unlinkedDetail')}</p>}</div>{onClose && <Button appearance="secondary" onClick={onClose} aria-label={t('common.close')}>×</Button>}</header>
     {showDiagnosticIds && <div className="session-diagnostics"><Disclosure title={t('sessions.diagnostics')}><code className="break-anywhere">{detail.session_id}</code><CopyDiagnostic value={detail.session_id} kind="session" />{reportedSessionId && <><small>{t('sessions.reportedSession')}</small><code className="break-anywhere">{reportedSessionId}</code><CopyDiagnostic value={reportedSessionId} kind="session" /></>}</Disclosure></div>}
-    {!(detail.unlinked && detail.session_id.startsWith('unlinked:')) && <SessionReplayPanel detail={detail} scopeKey={summary?.key_id ?? detail.session_id} loadArchiveDetail={loadReplayArchive} onLoadEarlierRequests={onLoadOlder} loadingEarlier={loading} />}
+    {!(detail.unlinked && detail.session_id.startsWith('unlinked:')) && <SessionReplayPanel detail={detail} scopeKey={summary?.key_id ?? detail.session_id} loadArchiveDetail={loadReplayArchive} loadArchiveRange={loadArchiveRange} onLoadEarlierRequests={onLoadOlder} loadingEarlier={loading} />}
     <Disclosure title={t('sessions.executionTimeline')} defaultOpen={detail.unlinked}><SessionActivity detail={detail} summary={summary} currency={currency} loading={loading} onSelect={onSelect} /></Disclosure>
     {detail.has_more && <div className="load-more"><Button appearance="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('sessions.loadEarlier')}</Button></div>}
     {!detail.unlinked && <Disclosure title={t('sessions.semantic')}><SemanticExecutionPanel detail={detail} /></Disclosure>}
