@@ -479,7 +479,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       if (!dirtyEventIdentities.current.size && !dirtyDetailEvents.current.size) refreshDirty.current = false;
     } finally {
       manualRefreshInFlight.current = false;
-      if (generation === scopeGeneration.current
+      if (!refreshCancelled.current && generation === scopeGeneration.current
         && (refreshDirty.current || dirtyEventIdentities.current.size > 0 || dirtyDetailEvents.current.size > 0)) {
         refreshDirty.current = true;
         scheduleRefresh();

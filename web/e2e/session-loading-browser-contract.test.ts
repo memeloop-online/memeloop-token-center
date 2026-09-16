@@ -247,20 +247,32 @@ test('cancellation retains current-scope SSE work, while a scope transition drop
     await page.getByRole('button', { name: 'Cancel', exact: true }).click();
     await page.waitForFunction(() => window.sessionListAborts === 1);
     // Cancellation retains the batch but must not create an unsolicited new
-    // request; the user's next refresh consumes the same current-scope work.
+    // request; the user's next refresh owns the same current-scope work.
     await page.clock.fastForward(1_000);
     assert.equal(await page.evaluate(() => window.sessionListReads), 2);
     await page.getByRole('button', { name: 'Refresh', exact: true }).click();
     await page.waitForFunction(() => window.sessionListReads === 3);
-    await page.evaluate(() => window.resolveSessionList(true));
+    await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await page.waitForFunction(() => window.sessionListAborts === 2);
+    await page.clock.fastForward(1_000);
+    assert.equal(await page.evaluate(() => window.sessionListReads), 3,
+      'cancelling a manual refresh must not let its finally block restart the retained batch');
 
-    await page.getByRole('button', { name: 'Queue stale session event', exact: true }).click();
-    await page.locator('.session-controls').getByLabel('Model', { exact: true }).fill('new-projection');
-    await page.getByRole('button', { name: 'Apply filters', exact: true }).click();
+    await page.getByRole('button', { name: 'Simulate other credential event', exact: true }).click();
+    await page.clock.fastForward(500);
     await page.waitForFunction(() => window.sessionListReads === 4);
     await page.evaluate(() => window.resolveSessionList(true));
     await page.clock.fastForward(1_000);
     assert.equal(await page.evaluate(() => window.sessionListReads), 4,
+      'the next real SSE clears cancellation once and schedules exactly one refresh');
+
+    await page.getByRole('button', { name: 'Queue stale session event', exact: true }).click();
+    await page.locator('.session-controls').getByLabel('Model', { exact: true }).fill('new-projection');
+    await page.getByRole('button', { name: 'Apply filters', exact: true }).click();
+    await page.waitForFunction(() => window.sessionListReads === 5);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await page.clock.fastForward(1_000);
+    assert.equal(await page.evaluate(() => window.sessionListReads), 5,
       'the queued old-projection event cannot run after the new scope snapshot');
   } finally { await browser.close(); await server.close(); }
 });
