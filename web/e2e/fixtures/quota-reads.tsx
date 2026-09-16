@@ -31,9 +31,10 @@ function Fixture() {
   const { t } = useI18n();
   const [generation, setGeneration] = useState(1);
   const [tenant, setTenant] = useState('default');
-  const accounts = Array.from({ length: 5 }, (_, index) => ({ id: `account-${index}`, credential_generation: generation, tenant_external_id: tenant, status: 'active' }));
+  const [disabled, setDisabled] = useState<string[]>([]);
+  const accounts = Array.from({ length: 5 }, (_, index) => ({ id: `account-${index}`, credential_generation: generation, tenant_external_id: tenant, status: disabled.includes(`account-${index}`) ? 'disabled' : 'active' }));
   const quota = useUpstreamQuotaReads('fixture-only', tenant, accounts);
-  return <main><button onClick={() => void quota.readAll()} disabled={quota.progress?.busy}>{t('quota.refreshAll')}</button><button onClick={() => { void quota.read(accounts[0]); void quota.read(accounts[0]); }}>Duplicate read</button><button onClick={() => setGeneration(value => value + 1)}>Change generation</button><button onClick={() => setTenant('other')}>Change tenant</button><output>{quota.progress ? `${quota.progress.done}/${quota.progress.total}` : 'idle'}</output>
+  return <main><button onClick={() => void quota.readAll()} disabled={quota.progress?.busy}>{t('quota.refreshAll')}</button><button onClick={() => { void quota.read(accounts[0]); void quota.read(accounts[0]); }}>Duplicate read</button><button onClick={() => setGeneration(value => value + 1)}>Change generation</button><button onClick={() => setTenant('other')}>Change tenant</button><button onClick={() => setDisabled(['account-0'])}>Disable first</button><button onClick={() => setDisabled(['account-1'])}>Disable second</button><output>{quota.progress ? `${quota.progress.done}/${quota.progress.total}` : 'idle'}</output>
     {accounts.map(account => {
       const entry = quota.entries[account.id]?.generation === generation ? quota.entries[account.id] : undefined;
       const summary = quotaSummaryPresentation(entry?.snapshot, Date.now(), entry?.refreshFailed);
