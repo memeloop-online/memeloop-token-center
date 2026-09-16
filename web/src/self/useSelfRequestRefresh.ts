@@ -12,7 +12,6 @@ export interface SelfRequestRefresh {
   intervalMs: number;
   paused: boolean;
   setIntervalMs: (value: number) => void;
-  refreshNow: () => void;
 }
 
 /**
@@ -33,10 +32,6 @@ export function useSelfRequestRefresh(refresh: () => void, ready: boolean): Self
     );
   }, []);
 
-  const refreshNow = useCallback(() => {
-    refreshRef.current();
-  }, []);
-
   useEffect(() => {
     const onVisibilityChange = () => setPaused(document.hidden);
     onVisibilityChange();
@@ -50,5 +45,5 @@ export function useSelfRequestRefresh(refresh: () => void, ready: boolean): Self
     return () => window.clearInterval(timer);
   }, [intervalMs, paused, ready]);
 
-  return { intervalMs, paused, setIntervalMs, refreshNow };
+  return { intervalMs, paused, setIntervalMs };
 }

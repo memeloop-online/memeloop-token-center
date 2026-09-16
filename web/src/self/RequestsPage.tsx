@@ -75,6 +75,10 @@ export function RequestsPage({ credential, credentialView, onError, onOpenReques
           setHasOlder(page.length === requestPageSize);
         }
         setStats(pageStats);
+        // A current successful poll is authoritative for this page and clears
+        // a retryable error from an earlier poll. Stale responses returned
+        // above, so they can never erase an error from the active identity.
+        onError('');
         return;
       }
       setRequests(page);
@@ -142,7 +146,9 @@ export function RequestsPage({ credential, credentialView, onError, onOpenReques
 
   const cadenceLabels = zh ? ['手动', '5秒', '30秒', '1分', '5分'] : ['Manual', '5s', '30s', '1m', '5m'];
   const cadenceIndex = Math.max(0, selfRequestRefreshIntervals.findIndex((interval) => interval === intervalMs));
-  const refreshState = intervalMs === 0
+  const refreshState = refreshing
+    ? (zh ? '轮询 · 正在更新第一页与统计' : 'Polling · updating the first page and summary')
+    : intervalMs === 0
     ? (zh ? '手动 · 点击“刷新”更新列表与统计，不会自动轮询' : 'Manual · press Refresh to update the list and summary; no automatic polling')
     : paused
       ? (zh ? '轮询 · 后台已暂停，返回后继续' : 'Polling · paused in background; resumes on return')
@@ -206,7 +212,7 @@ export function RequestsPage({ credential, credentialView, onError, onOpenReques
           <Button appearance="secondary" type="button" onClick={clearFilters} disabled={loading}>{t('traffic.clearFilters')}</Button>
         </div>
       </form>
-      <div aria-busy={loading}>
+      <div aria-busy={loading || refreshing}>
         {loading && requests.length === 0 ? <div className="boot">{t('common.loading')}</div> : <RequestTable requests={requests} currency={credentialView.currency} credentialAlias={credentialView.alias} onSelect={onOpenRequest} onOpenSession={onOpenSession} />}
       </div>
       {hasOlder && <div className="load-more"><Button appearance="secondary" type="button" disabled={loading} onClick={() => void fetchPage(appliedFilters.current, 'append')}>{loading ? t('common.loading') : t('traffic.loadOlder')}</Button></div>}

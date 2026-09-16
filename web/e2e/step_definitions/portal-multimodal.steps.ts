@@ -115,7 +115,8 @@ When('下游用户筛选失败请求并打开详情', async function (this: Dogf
   const page = this.requirePage();
   const seed = runtime.requireSeed();
   await openAppRoute(page, 'portal', 'requests');
-  const filters = page.locator('.self-request-filters');
+  const filters = page.locator('.self-request-filter-panel');
+  await filters.getByRole('button', { name: '高级筛选' }).click();
   await filters.getByLabel('上游 ID').fill(seed.upstreamId);
   await filters.getByLabel('路由 ID').fill(seed.routeId);
   await filters.getByLabel('最低费用').fill('0');
@@ -148,7 +149,7 @@ Then('只能看到自己的错误正文且清除筛选后可加载完整历史',
   await assertContains(drawer, 'upstream rejected the request');
   await drawer.getByRole('button', { name: '关闭', exact: true }).click();
 
-  const filters = page.locator('.self-request-filters');
+  const filters = page.locator('.self-request-filter-panel');
   await completeSelfRequestQuery(page, emptyRequestFilters,
     () => filters.getByRole('button', { name: '清除筛选', exact: true }).click());
   await assertCount(page.locator('.self-history tbody tr'), 50);
