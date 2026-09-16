@@ -1,0 +1,125 @@
+/* Self-service requests page filters and polling controls. Fluent tokens carry
+   the theme; literal fallbacks mirror the dark shell for pre-hydration paint. */
+
+.self-request-header {
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 10px 20px;
+}
+
+.self-request-refresh {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px 14px;
+  margin-left: auto;
+}
+
+.self-request-cadence {
+  min-width: 150px;
+}
+
+.self-request-refresh-state {
+  align-self: center;
+  color: var(--colorNeutralForeground2, #a6bac0);
+  font-size: var(--fontSizeBase200, 12px);
+  line-height: var(--lineHeightBase200, 16px);
+  max-width: 34em;
+  padding-bottom: 6px;
+}
+
+.self-request-refresh-state.paused {
+  color: var(--colorPaletteDarkYellowForeground2, #c89c3c);
+}
+
+.self-request-filter-panel {
+  background: var(--colorNeutralBackground2, #081216);
+  border: 1px solid var(--colorNeutralStroke2, #22363c);
+  border-radius: var(--borderRadiusMedium, 4px);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 16px 0;
+  padding: 12px;
+}
+
+.self-request-filter-grid {
+  display: grid;
+  gap: 4px 12px;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+}
+
+.self-request-filter-grid .self-request-field-narrow {
+  max-width: 220px;
+}
+
+.self-request-advanced {
+  border-top: 1px solid var(--colorNeutralStroke2, #22363c);
+  padding-top: 2px;
+}
+
+.self-request-advanced .fui-AccordionHeader {
+  padding-left: 0;
+}
+
+.self-request-advanced .fui-AccordionPanel {
+  margin: 0;
+}
+
+.self-request-filter-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+:root[data-theme='light'] .self-request-filter-panel {
+  background: var(--colorNeutralBackground2, #f3f8f6);
+  border-color: var(--colorNeutralStroke2, #c5d6d2);
+}
+
+:root[data-theme='light'] .self-request-refresh-state {
+  color: var(--colorNeutralForeground2, #536e79);
+}
+
+:root[data-theme='light'] .self-request-refresh-state.paused {
+  color: var(--colorPaletteDarkYellowForeground2, #8b5f00);
+}
+
+@media (max-width: 720px) {
+  .self-request-refresh {
+    margin-left: 0;
+    width: 100%;
+  }
+
+  .self-request-cadence {
+    flex: 1 1 140px;
+  }
+
+  .self-request-refresh-state {
+    flex-basis: 100%;
+    padding-bottom: 0;
+  }
+
+  .self-request-filter-grid {
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  }
+}
+
+@media (max-width: 480px) {
+  .self-request-filter-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .self-request-filter-grid .self-request-field-narrow {
+    max-width: none;
+  }
+
+  .self-request-filter-actions {
+    justify-content: stretch;
+  }
+
+  .self-request-filter-actions > * {
+    flex: 1 1 auto;
+  }
+}
