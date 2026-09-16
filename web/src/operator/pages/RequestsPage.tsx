@@ -11,12 +11,14 @@ import type { RequestDetail, RequestEvent, RequestListResponse, RequestView, Typ
 import type { SessionStreamState } from '../SessionMonitor';
 import { queryForTenant } from '../scope/operatorShared';
 import { TypedFilterBuilder } from '../TypedFilterBuilder';
+import { RequestRefreshControl } from '../traffic/RequestRefreshControl';
+import { mergeBatchedRequestPage } from '../traffic/requestRefresh';
 import {
-  emptyTypedFilterAst, filteredRequestRefreshDelay, mergeLiveRequestEvents, mergeRefreshedRequestPage,
+  emptyTypedFilterAst, filteredRequestRefreshDelay, mergeRefreshedRequestPage,
   summarizeVisibleRequests, typedFiltersActive, typedRequestQueryBody, visibleRequestMetricSeries,
 } from '../traffic/requestTraffic';
 
-export function RequestsPage({ token, tenant, liveEvents, streamRevision, streamState, streamError, onOpenSessions, onOpenSession, requestFocus, onRequestFocusHandled, requestDrilldown, onRequestDrilldownHandled }: {
+export function RequestsPage({ token, tenant, liveEvents, streamRevision, streamState, streamError, onOpenSessions, onOpenSession, requestFocus, onRequestFocusHandled, requestDrilldown, onRequestDrilldownHandled, requestRefresh, streamOverflowRevision = 0, onProtectRequests }: {
   token: string;
   tenant: string;
   liveEvents: ReadonlyMap<string, RequestEvent>;
@@ -29,6 +31,9 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   onRequestFocusHandled?: (revision: number) => void;
   requestDrilldown?: { ast: TypedFilterAst; revision: number };
   onRequestDrilldownHandled?: (revision: number) => void;
+  requestRefresh?: { intervalMs: number; paused: boolean; onIntervalChange: (value: number) => void };
+  streamOverflowRevision?: number;
+  onProtectRequests?: (ids: string[]) => void;
 }) {
   const { t } = useI18n();
   const diagnosticLabels = { requestId: t('request.correlationId'), streamInterrupted: t('request.streamInterrupted') };
@@ -44,8 +49,13 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   const sequence = useRef(0);
   const errorSource = useRef<'detail' | 'load' | 'refresh' | undefined>(undefined);
   const olderFilteredResultsVisible = useRef(false);
+  const loadedHistoryIds = useRef(new Set<string>());
   const requestsRef = useRef(requests);
   const loadingRef = useRef(false);
+  const paused = useRef(false);
+  paused.current = requestRefresh?.paused ?? false;
+  const reconcileOverflow = useRef(false);
+  const previousOverflowRevision = useRef(streamOverflowRevision);
   const filteredRefresh = useRef<{
     controller?: AbortController;
     firstPendingAt?: number;
@@ -93,9 +103,9 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   function scheduleFilteredRefresh() {
     const state = filteredRefresh.current;
     const currentScope = scope.current;
-    if (!currentScope.token || !currentScope.tenant || !typedFiltersActive(currentScope.filters)) return;
+    if (!currentScope.token || !currentScope.tenant || (!typedFiltersActive(currentScope.filters) && !reconcileOverflow.current)) return;
     state.pending = true;
-    if (state.inFlight || loadingRef.current) return;
+    if (state.inFlight || loadingRef.current || paused.current) return;
 
     const now = Date.now();
     state.firstPendingAt ??= now;
@@ -109,14 +119,15 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
 
   async function refreshFilteredRequests() {
     const state = filteredRefresh.current;
-    if (state.inFlight || loadingRef.current || !state.pending) return;
+    if (state.inFlight || loadingRef.current || !state.pending || paused.current) return;
     const currentScope = scope.current;
-    if (!currentScope.token || !currentScope.tenant || !typedFiltersActive(currentScope.filters)) return;
+    if (!currentScope.token || !currentScope.tenant || (!typedFiltersActive(currentScope.filters) && !reconcileOverflow.current)) return;
     state.inFlight = true;
     state.pending = false;
     state.firstPendingAt = undefined;
     const requestSequence = ++state.requestSequence;
     const scopeSequence = state.scopeSequence;
+    const overflowAtStart = previousOverflowRevision.current;
     const controller = new AbortController();
     state.controller = controller;
     try {
@@ -128,10 +139,17 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
         || latest.token !== currentScope.token || latest.tenant !== currentScope.tenant || latest.filters !== currentScope.filters) return;
       // Keep the current drawer and scroll position intact. This replacement is
       // the exact server-filtered first page, not a guessed local merge.
-      setRequests((current) => mergeRefreshedRequestPage(current, next, olderFilteredResultsVisible.current));
+      if (typedFiltersActive(currentScope.filters)) {
+        setRequests((current) => mergeRefreshedRequestPage(current, next, olderFilteredResultsVisible.current));
+      } else {
+        const current = requestsRef.current;
+        const page = mergeBatchedRequestPage(mergeRefreshedRequestPage(current, next, current.length > 100), new Map(liveEventsRef.current), next.next_cursor !== null, loadedHistoryIds.current);
+        setRequests(page.requests); setHasOlder(page.hasOlder);
+      }
+      if (previousOverflowRevision.current === overflowAtStart) reconcileOverflow.current = false;
       // A retained history tail owns its pagination state. A first-page
       // cursor must not reopen an already exhausted tail.
-      if (!olderFilteredResultsVisible.current || next.next_cursor === null) {
+      if (typedFiltersActive(currentScope.filters) && (!olderFilteredResultsVisible.current || next.next_cursor === null)) {
         setHasOlder(next.next_cursor !== null);
       }
       if (next.next_cursor === null) {
@@ -160,6 +178,9 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
     const last = requests.at(-1);
     const before = last ? { before_created_at: last.created_at, before_id: last.request_id } : undefined;
     if (older && (!hasOlder || !before)) return;
+    // Freeze insertion before the page fetch, not after it resolves: otherwise
+    // a live batch could move the visible tail while this cursor is in flight.
+    if (older) for (const request of requestsRef.current) loadedHistoryIds.current.add(request.request_id);
     const refreshWasActive = older && (filteredRefresh.current.pending || filteredRefresh.current.inFlight);
     // A foreground page request owns the request list until it settles. Abort
     // any background first-page refresh rather than running two query POSTs.
@@ -170,6 +191,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
     const request = ++sequence.current;
     const currentScope = { token, tenant, filters: nextFilters };
     if (!older) {
+      loadedHistoryIds.current.clear();
       olderFilteredResultsVisible.current = false;
       setOlderFilteredResultsStale(false);
       setRequests([]); setHasOlder(false); closeRequestDetail();
@@ -183,10 +205,16 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
       });
       const latest = scope.current;
       if (controller.signal.aborted || request !== sequence.current || latest.token !== currentScope.token || latest.tenant !== currentScope.tenant || latest.filters !== currentScope.filters) return;
-      setRequests((current) => older
-        ? [...current, ...next.requests.filter((value) => !current.some((existing) => existing.request_id === value.request_id))]
-        : typedFiltersActive(nextFilters) ? next.requests : mergeLiveRequestEvents(next.requests, new Map(liveEventsRef.current), next.next_cursor === null));
-      setHasOlder(next.next_cursor !== null);
+      if (!older && !typedFiltersActive(nextFilters)) {
+        const page = mergeBatchedRequestPage(next.requests, new Map(liveEventsRef.current), next.next_cursor !== null);
+        setRequests(page.requests); setHasOlder(page.hasOlder);
+      } else {
+        if (older) for (const request of next.requests) loadedHistoryIds.current.add(request.request_id);
+        setRequests((current) => older
+          ? [...current, ...next.requests.filter((value) => !current.some((existing) => existing.request_id === value.request_id))]
+          : next.requests);
+        setHasOlder(next.next_cursor !== null);
+      }
       if (older && typedFiltersActive(nextFilters) && next.requests.length > 0) olderFilteredResultsVisible.current = true;
     } catch (reason) {
       if (request === sequence.current && !controller.signal.aborted) {
@@ -228,16 +256,40 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   }, [tenant, token]);
 
   useEffect(() => {
+    onProtectRequests?.(requests.map(request => request.request_id));
+  }, [requests, onProtectRequests]);
+  useEffect(() => () => onProtectRequests?.([]), [onProtectRequests]);
+
+  useEffect(() => {
+    if (requestRefresh?.paused) {
+      const state = filteredRefresh.current;
+      const pending = state.pending || state.inFlight;
+      cancelFilteredRefresh();
+      state.pending = pending;
+    } else if (filteredRefresh.current.pending) scheduleFilteredRefresh();
+  }, [requestRefresh?.paused]);
+
+  useEffect(() => {
+    if (streamOverflowRevision !== previousOverflowRevision.current) {
+      previousOverflowRevision.current = streamOverflowRevision;
+      if (loadedHistoryIds.current.size && !typedFiltersActive(filters)) return;
+      reconcileOverflow.current = true;
+      scheduleFilteredRefresh();
+    }
+  }, [streamOverflowRevision]);
+
+  useEffect(() => {
     if (liveEvents.size === 0) return;
     if (typedFiltersActive(filters)) {
       const terminalizedVisiblePending = olderFilteredResultsVisible.current
-        && [...liveEventsRef.current.values()].some((event) => event.event_kind === 'finished'
+        && [...liveEventsRef.current.values()].some((event) => (event.event_kind === 'finished' || event.completed_at != null)
           && requestsRef.current.some((request) => request.request_id === event.request_id && request.status_code === null));
       if (terminalizedVisiblePending) setOlderFilteredResultsStale(true);
       scheduleFilteredRefresh();
       return;
     }
-    setRequests((current) => mergeLiveRequestEvents(current, new Map(liveEventsRef.current), !hasOlderRef.current));
+    const page = mergeBatchedRequestPage(requestsRef.current, new Map(liveEventsRef.current), hasOlderRef.current, loadedHistoryIds.current);
+    setRequests(page.requests); setHasOlder(page.hasOlder);
   }, [streamRevision]);
 
   useEffect(() => {
@@ -278,7 +330,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
     const requestId = selectedRequestId.current;
     if (!requestId) return;
     const event = liveEvents.get(requestId);
-    if (event?.event_kind !== 'finished' || event.event_id === refreshedTerminalEvent.current) return;
+    if (!event || (event.event_kind !== 'finished' && event.completed_at == null) || event.event_id === refreshedTerminalEvent.current) return;
     refreshedTerminalEvent.current = event.event_id;
     void openRequestDetail(requestId);
   }, [streamRevision]);
@@ -302,7 +354,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
     {error && <div className="notice error" role="alert">{t(errorSource.current === 'detail' ? 'request.detail' : 'request.listSource')}: {error}</div>}
     {upstreamError && <div className="notice error" role="alert">{t('request.upstreamSource')}: {upstreamError}</div>}
     {streamError && <div className="notice error" role="alert">{t('request.streamSource')}: {streamError}</div>}
-    <RequestsPanel requests={requests} upstreams={upstreams} filters={filters} loading={loading} hasOlder={hasOlder} streamState={streamState} token={token} tenant={tenant} olderFilteredResultsStale={olderFilteredResultsStale}
+    <RequestsPanel requests={requests} upstreams={upstreams} filters={filters} loading={loading} hasOlder={hasOlder} streamState={streamState} token={token} tenant={tenant} olderFilteredResultsStale={olderFilteredResultsStale} requestRefresh={requestRefresh} historyLoaded={loadedHistoryIds.current.size > 0}
       onApply={(next) => { setFilters(next); scope.current = { token, tenant, filters: next }; void load(next); }}
       onClear={() => { setFilters(emptyTypedFilterAst); scope.current = { token, tenant, filters: emptyTypedFilterAst }; void load(emptyTypedFilterAst); }}
       onLoadOlder={() => void load(filters, true)} onRefreshFilteredResults={() => void load(filters)} onSelect={selectRequest} onOpenSessions={onOpenSessions} onOpenSession={onOpenSession} />
@@ -310,7 +362,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   </>;
 }
 
-function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, streamState, token, tenant, olderFilteredResultsStale, onApply, onClear, onLoadOlder, onRefreshFilteredResults, onSelect, onOpenSessions, onOpenSession }: {
+function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, streamState, token, tenant, olderFilteredResultsStale, onApply, onClear, onLoadOlder, onRefreshFilteredResults, onSelect, onOpenSessions, onOpenSession, requestRefresh, historyLoaded }: {
   requests: RequestView[];
   upstreams: UpstreamAccount[];
   filters: TypedFilterAst;
@@ -320,6 +372,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   token: string;
   tenant: string;
   olderFilteredResultsStale: boolean;
+  historyLoaded: boolean;
   onApply: (filters: TypedFilterAst) => void;
   onClear: () => void;
   onLoadOlder: () => void;
@@ -327,6 +380,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   onSelect: (request: RequestView) => Promise<void>;
   onOpenSessions: () => void;
   onOpenSession: (sessionId: string) => void;
+  requestRefresh?: { intervalMs: number; paused: boolean; onIntervalChange: (value: number) => void };
 }) {
   const { locale, t } = useI18n();
   const summary = summarizeVisibleRequests(requests);
@@ -335,6 +389,8 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   const sampling = { timestamps: points.map(point => point.timestamp), timeZone: displayTimeZone() };
   const count = (value: number) => formatMetricDisplay(value, locale);
   return <article className="panel request-page-surface"><div className="panel-title traffic-heading"><div><h2>{typedFiltersActive(filters) ? t('traffic.filtered') : t('traffic.live')}</h2><span>{typedFiltersActive(filters) ? t('traffic.filteredHint') : t('traffic.liveHint')}</span></div><div className="traffic-heading-actions"><div className={`request-live-state session-live-state ${streamState}`} role="status">{t(`sessions.live.${streamState}`)}</div><div className="segmented" role="group" aria-label={t('sessions.monitorMode')}><ToggleButton appearance="subtle" checked>{t('sessions.requestsMode')}</ToggleButton><ToggleButton appearance="subtle" checked={false} onClick={onOpenSessions}>{t('sessions.sessionsMode')}</ToggleButton></div></div></div>
+    {requestRefresh && <RequestRefreshControl {...requestRefresh} />}
+    {historyLoaded && !typedFiltersActive(filters) && <div className="request-refresh-control"><span>{locale === 'zh-CN' ? '正在浏览历史：已显示请求继续更新，新请求暂不插入。' : 'Browsing history: visible requests keep updating; new requests are not inserted.'}</span><Button appearance="subtle" disabled={loading} onClick={onRefreshFilteredResults}>{locale === 'zh-CN' ? '返回最新请求' : 'Return to latest requests'}</Button></div>}
     <TypedFilterBuilder ast={filters} disabled={loading} onApply={onApply} onClear={onClear} scope="requests" token={token} tenant={tenant} upstreams={upstreams} />
     {olderFilteredResultsStale && <div className="notice warning" role="status">{t('traffic.olderFilteredResultsStale')}<Button appearance="secondary" disabled={loading} onClick={onRefreshFilteredResults}>{t('traffic.refreshFilteredResults')}</Button></div>}
     {requests.length > 0 && <section className="metrics request-traffic-metrics" aria-label={t('monitoring.summary')}>
