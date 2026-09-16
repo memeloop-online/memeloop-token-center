@@ -1541,12 +1541,14 @@ async fn mock_comfyui_megapixel_generation(world: &mut TokenCenterWorld) {
         .await;
     Mock::given(method("GET"))
         .and(path("/view"))
+        .and(header("range", "bytes=0-0"))
         .respond_with(
-            ResponseTemplate::new(200)
+            ResponseTemplate::new(206)
                 .insert_header("content-type", "image/png")
-                .set_body_bytes(b"mock-megapixel-png"),
+                .insert_header("content-range", "bytes 0-0/18")
+                .set_body_bytes(b"m"),
         )
-        .expect(0)
+        .expect(2)
         .mount(server)
         .await;
 }
@@ -4487,7 +4489,7 @@ async fn aggregate_openai_images_are_refunded_and_cleaned(world: &mut TokenCente
         .await
         .expect("key after aggregate image failure JSON");
     assert_eq!(key["available_balance"], "0");
-    let downloads = world
+    let validations = world
         .mock
         .as_ref()
         .expect("mock server")
@@ -4496,8 +4498,20 @@ async fn aggregate_openai_images_are_refunded_and_cleaned(world: &mut TokenCente
         .expect("aggregate image upstream requests")
         .into_iter()
         .filter(|request| request.url.path().starts_with("/generated/aggregate-"))
-        .count();
-    assert_eq!(downloads, 0);
+        .collect::<Vec<_>>();
+    assert_eq!(validations.len(), 10);
+    assert!(validations.iter().all(|request| {
+        request
+            .headers
+            .get("authorization")
+            .and_then(|values| values.to_str().ok())
+            == Some("Bearer image-secret")
+            && request
+                .headers
+                .get("range")
+                .and_then(|values| values.to_str().ok())
+                == Some("bytes=0-0")
+    }));
 }
 
 #[then("the oversized image is quarantined and reconciled with no partial response archive")]

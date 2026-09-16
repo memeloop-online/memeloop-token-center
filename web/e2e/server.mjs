@@ -181,8 +181,18 @@ const upstream = createServer((request, response) => {
       return;
     }
     if (request.method === 'GET' && requestUrl.pathname === '/assets/browser-video.mp4') {
-      response.writeHead(200, { 'content-type': 'video/mp4' });
-      response.end(Buffer.from('browser-video-asset'));
+      const asset = Buffer.from('browser-video-asset');
+      if (request.headers.range === 'bytes=0-0') {
+        response.writeHead(206, {
+          'content-type': 'video/mp4',
+          'content-range': `bytes 0-0/${asset.length}`,
+          'content-length': '1',
+        });
+        response.end(asset.subarray(0, 1));
+        return;
+      }
+      response.writeHead(200, { 'content-type': 'video/mp4', 'content-length': `${asset.length}` });
+      response.end(asset);
       return;
     }
     if (request.method === 'POST' && requestUrl.pathname === '/prompt') {
@@ -221,8 +231,18 @@ const upstream = createServer((request, response) => {
       return;
     }
     if (request.method === 'GET' && requestUrl.pathname === '/view') {
-      response.writeHead(200, { 'content-type': 'image/png' });
-      response.end(Buffer.from('browser-png-asset'));
+      const asset = Buffer.from('browser-png-asset');
+      if (request.headers.range === 'bytes=0-0') {
+        response.writeHead(206, {
+          'content-type': 'image/png',
+          'content-range': `bytes 0-0/${asset.length}`,
+          'content-length': '1',
+        });
+        response.end(asset.subarray(0, 1));
+        return;
+      }
+      response.writeHead(200, { 'content-type': 'image/png', 'content-length': `${asset.length}` });
+      response.end(asset);
       return;
     }
     if (request.method !== 'POST' || requestUrl.pathname !== '/v1/chat/completions') {
