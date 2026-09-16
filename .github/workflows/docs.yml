@@ -34,6 +34,8 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
 
       - name: Derive GitHub Pages base path
         id: pages
@@ -47,27 +49,14 @@ jobs:
           fi
 
       - name: Install dependencies
-        if: hashFiles('docs/package-lock.json') != ''
-        run: npm ci --prefix docs
-
-      - name: Bootstrap documentation lockfile in CI
-        if: hashFiles('docs/package-lock.json') == ''
-        run: npm install --prefix docs --package-lock-only --ignore-scripts --no-audit
-
-      - name: Export documentation lockfile
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: docs-package-lock
-          path: docs/package-lock.json
+        run: npm ci --prefix docs --no-audit
 
       - name: Build site
-        if: hashFiles('docs/node_modules/.package-lock.json') != ''
         env:
           DOCS_BASE: ${{ steps.pages.outputs.base }}
         run: npm run --prefix docs build
 
       - name: Upload HTML preview artifact
-        if: hashFiles('docs/node_modules/.package-lock.json') != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: docs-site-html

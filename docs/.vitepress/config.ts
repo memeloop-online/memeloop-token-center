@@ -28,15 +28,6 @@ function computeSrcExclude(): string[] {
   return patterns
 }
 
-// The root landing page links to /zh/ and /en/. Until a locale has content,
-// treat links into it as intentionally unresolved so the dead-link check
-// stays green for partial trees.
-function computeIgnoreDeadLinks(): (string | RegExp)[] {
-  return LOCALES.filter((locale) => !existsSync(path.join(docsDir, locale, 'index.md'))).map(
-    (locale) => new RegExp(`^/${locale}(/|$)`)
-  )
-}
-
 function fileTitle(file: string): string {
   try {
     const match = readFileSync(file, 'utf8').match(/^#\s+(.+)$/m)
@@ -56,9 +47,9 @@ function sidebarItems(dir: string, linkPrefix: string): DefaultTheme.SidebarItem
   const entries = readdirSync(dir)
     .filter((entry) => !entry.startsWith('.'))
     .sort((a, b) => {
-      const aIndex = a === 'index.md' ? 0 : 1
-      const bIndex = b === 'index.md' ? 0 : 1
-      return aIndex - bIndex || a.localeCompare(b)
+      const order = ['index.md', 'getting-started.md', 'upstreams.md', 'routing.md', 'credentials.md', 'requests.md', 'api.md', 'development.md', 'operator-ui.md']
+      const rank = (name: string) => order.includes(name) ? order.indexOf(name) : order.length
+      return rank(a) - rank(b) || a.localeCompare(b)
     })
 
   const items: DefaultTheme.SidebarItem[] = []
@@ -74,7 +65,9 @@ function sidebarItems(dir: string, linkPrefix: string): DefaultTheme.SidebarItem
         continue
       }
       items.push({
-        text: index?.text ?? nameTitle(entry),
+        text: entry === 'guide'
+          ? (linkPrefix.startsWith('/zh/') ? '使用指南' : 'User guide')
+          : index?.text ?? nameTitle(entry),
         collapsed: false,
         items: rest,
         ...(index ? { link: index.link } : {})
@@ -122,7 +115,6 @@ export default defineConfig({
   cleanUrls: true,
   lastUpdated: true,
   srcExclude: computeSrcExclude(),
-  ignoreDeadLinks: computeIgnoreDeadLinks(),
 
   head: [['meta', { name: 'theme-color', content: '#0e7490' }]],
 
