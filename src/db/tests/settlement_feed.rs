@@ -79,11 +79,30 @@ async fn finish(
     request_id: Uuid,
     reservation: &UsageReservation,
 ) -> Result<FinishProxyRequestResult, AppError> {
+    finish_with_usage_basis(
+        fixture,
+        request_id,
+        reservation,
+        RequestUsageBasis::ProviderReported,
+        7,
+        3,
+    )
+    .await
+}
+
+async fn finish_with_usage_basis(
+    fixture: &SettlementFixture,
+    request_id: Uuid,
+    reservation: &UsageReservation,
+    usage_basis: RequestUsageBasis,
+    input_tokens: i64,
+    output_tokens: i64,
+) -> Result<FinishProxyRequestResult, AppError> {
     let response_object = format!("gap://settlement-feed/{request_id}/response");
     fixture
         .database
         .finish_proxy_request(FinishProxyRequest {
-            usage_basis: Some(RequestUsageBasis::ProviderReported),
+            usage_basis: Some(usage_basis),
             first_output_ms: None,
             generation_duration_ms: None,
             request_id,
@@ -95,8 +114,8 @@ async fn finish(
             status_code: 200,
             duration_ms: 1,
             usage: TokenUsage {
-                input_tokens: 7,
-                output_tokens: 3,
+                input_tokens,
+                output_tokens,
                 ..TokenUsage::default()
             },
             error_code: None,
@@ -419,5 +438,246 @@ async fn metered_unlimited_terminal_does_not_publish_or_advance_sequence() {
             .await
             .unwrap(),
         0
+    );
+}
+
+#[tokio::test]
+async fn correction_preview_only_returns_contract_ceiling_with_stable_cursor() {
+    let fixture = fixture(EnforcementMode::Prepaid).await;
+    let first_request = Uuid::now_v7();
+    let null_request = Uuid::now_v7();
+    let second_request = Uuid::now_v7();
+    let first_reservation = start(&fixture, first_request).await;
+    let null_reservation = start(&fixture, null_request).await;
+    let second_reservation = start(&fixture, second_request).await;
+    finish_with_usage_basis(
+        &fixture,
+        first_request,
+        &first_reservation,
+        RequestUsageBasis::ContractCeiling,
+        10,
+        10,
+    )
+    .await
+    .unwrap();
+    finish_with_usage_basis(
+        &fixture,
+        null_request,
+        &null_reservation,
+        RequestUsageBasis::ProviderReported,
+        10,
+        10,
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE request_records SET usage_basis = NULL WHERE id = $1")
+        .bind(null_request.to_string())
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE account_settlement_feed SET usage_basis = NULL WHERE request_id = $1")
+        .bind(null_request.to_string())
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
+    finish_with_usage_basis(
+        &fixture,
+        second_request,
+        &second_reservation,
+        RequestUsageBasis::ContractCeiling,
+        10,
+        10,
+    )
+    .await
+    .unwrap();
+
+    let now = unix_millis();
+    let first_page = fixture
+        .database
+        .list_settlement_correction_previews(
+            fixture.account_id,
+            now.saturating_sub(10_000),
+            now.saturating_add(10_000),
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_page.items.len(), 1);
+    let first = &first_page.items[0];
+    assert_eq!(
+        first.original.usage_basis,
+        RequestUsageBasis::ContractCeiling
+    );
+    assert_eq!(first.evidence.archive_state, RequestArchiveState::Gap);
+    assert!(!first.evidence.response_available);
+    assert_eq!(first.evidence.provider_usage, "not_evaluated");
+    assert_eq!(
+        first.invariants.settlement_feed,
+        SettlementCorrectionFeedState::Matched
+    );
+    assert_eq!(
+        first.review_state,
+        SettlementCorrectionReviewState::ReadyForEvidence
+    );
+    assert!(first.usage_ledger_entry_id.is_some());
+    assert_eq!(first.pending_correction.corrected_cost, None);
+    assert_eq!(first.pending_correction.corrected_usage_basis, None);
+
+    let cursor = first_page.next_cursor.expect("second correction candidate");
+    let second_page = fixture
+        .database
+        .list_settlement_correction_previews(
+            fixture.account_id,
+            now.saturating_sub(10_000),
+            now.saturating_add(10_000),
+            1,
+            Some((cursor.after_created_at, cursor.after_request_id)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_page.items.len(), 1);
+    assert_ne!(second_page.items[0].request_id, first.request_id);
+    assert_ne!(second_page.items[0].request_id, null_request);
+    assert!(second_page.next_cursor.is_none());
+    assert!(matches!(
+        fixture
+            .database
+            .list_settlement_correction_previews(
+                fixture.account_id,
+                now.saturating_sub(10_000),
+                now.saturating_add(10_000),
+                1,
+                Some((cursor.after_created_at, null_request)),
+            )
+            .await,
+        Err(AppError::BadRequest(_))
+    ));
+}
+
+#[tokio::test]
+async fn correction_preview_distinguishes_metered_and_invariant_mismatch() {
+    let metered = fixture(EnforcementMode::MeteredUnlimited).await;
+    let metered_request = Uuid::now_v7();
+    let metered_reservation = start(&metered, metered_request).await;
+    finish_with_usage_basis(
+        &metered,
+        metered_request,
+        &metered_reservation,
+        RequestUsageBasis::ContractCeiling,
+        10,
+        10,
+    )
+    .await
+    .unwrap();
+    let now = unix_millis();
+    let metered_page = metered
+        .database
+        .list_settlement_correction_previews(
+            metered.account_id,
+            now.saturating_sub(10_000),
+            now.saturating_add(10_000),
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(metered_page.items.len(), 1);
+    assert_eq!(
+        metered_page.items[0].invariants.settlement_feed,
+        SettlementCorrectionFeedState::NotApplicableMetered
+    );
+    assert_eq!(
+        metered_page.items[0].review_state,
+        SettlementCorrectionReviewState::ReadyForEvidence
+    );
+
+    let prepaid = fixture(EnforcementMode::Prepaid).await;
+    let prepaid_request = Uuid::now_v7();
+    let prepaid_reservation = start(&prepaid, prepaid_request).await;
+    finish_with_usage_basis(
+        &prepaid,
+        prepaid_request,
+        &prepaid_reservation,
+        RequestUsageBasis::ContractCeiling,
+        10,
+        10,
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE usage_reservations SET actual_micros = actual_micros + 1 WHERE id = $1")
+        .bind(prepaid_reservation.id.to_string())
+        .execute(&prepaid.database.pool)
+        .await
+        .unwrap();
+    let mismatch_page = prepaid
+        .database
+        .list_settlement_correction_previews(
+            prepaid.account_id,
+            now.saturating_sub(10_000),
+            now.saturating_add(10_000),
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(mismatch_page.items.len(), 1);
+    assert!(
+        !mismatch_page.items[0]
+            .invariants
+            .reservation_actual_matches_cost
+    );
+    assert_eq!(
+        mismatch_page.items[0].review_state,
+        SettlementCorrectionReviewState::InvariantMismatch
+    );
+}
+
+#[tokio::test]
+async fn correction_preview_preserves_negative_tokens_but_never_marks_them_ready() {
+    let fixture = fixture(EnforcementMode::Prepaid).await;
+    let request_id = Uuid::now_v7();
+    let reservation = start(&fixture, request_id).await;
+    finish_with_usage_basis(
+        &fixture,
+        request_id,
+        &reservation,
+        RequestUsageBasis::ContractCeiling,
+        10,
+        10,
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE request_records SET input_tokens = -1, output_tokens = 21 WHERE id = $1")
+        .bind(request_id.to_string())
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
+
+    let now = unix_millis();
+    let page = fixture
+        .database
+        .list_settlement_correction_previews(
+            fixture.account_id,
+            now.saturating_sub(10_000),
+            now.saturating_add(10_000),
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    let preview = &page.items[0];
+    assert_eq!(preview.original.input_tokens, -1);
+    assert_eq!(preview.original.output_tokens, 21);
+    assert!(!preview.invariants.token_counts_non_negative);
+    assert!(!preview.invariants.token_ceiling_matches_reservation);
+    assert_eq!(
+        preview.review_state,
+        SettlementCorrectionReviewState::InvariantMismatch
+    );
+    assert_eq!(
+        serde_json::to_value(preview).unwrap()["original"]["input_tokens"],
+        -1
     );
 }

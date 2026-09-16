@@ -15,4 +15,6 @@ pub(in crate::api) use pricing::{
     upsert_generation_price, upsert_price,
 };
 pub(in crate::api) use settlement_adjustments::reconcile_settlement_adjustment;
-pub(in crate::api) use settlements::list_account_settlements;
+pub(in crate::api) use settlements::{
+    list_account_settlements, list_settlement_correction_previews,
+};
