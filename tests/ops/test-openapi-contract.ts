@@ -127,6 +127,10 @@ test("operator monitoring snapshot has explicit scope/window and bounded termina
   assert.deepEqual(health.properties.status.enum, ["healthy", "degraded", "unhealthy", "unknown"]);
   assert.equal(health.properties.version.const, "upstream_breaker_v1");
   assert.equal(document.components.schemas.MonitoringUpstreamModel.properties.terminal_outcomes.maxItems, 5);
+  const metrics = document.components.schemas.MonitoringMetrics;
+  assert.ok(!metrics.required.includes("total_tokens")); assert.ok(!metrics.required.includes("cache_rate"));
+  assert.equal(metrics.properties.total_tokens.type, "integer"); assert.equal(metrics.properties.total_tokens.format, "int64"); assert.equal(metrics.properties.total_tokens.minimum, 0);
+  assert.deepEqual(metrics.properties.cache_rate.type, ["number", "null"]); assert.equal(metrics.properties.cache_rate.minimum, 0); assert.equal(metrics.properties.cache_rate.maximum, 1);
   assert.equal(operation["x-query-plan"]["raw-request-records"], "forbidden");
 });
 

@@ -42,7 +42,9 @@ pub(super) fn monitoring_snapshot_sql(
     };
     let rollup = format!(
         r#"SELECT a.upstream_account_id, a.model, a.status_class, a.currency,
-                  a.requests, a.duration_count, a.duration_sum_ms,
+                  a.requests, a.input_tokens, a.output_tokens,
+                  a.cached_input_tokens, a.cache_write_tokens,
+                  a.duration_count, a.duration_sum_ms,
                   a.duration_bucket_0, a.duration_bucket_1, a.duration_bucket_2,
                   a.duration_bucket_3, a.duration_bucket_4, a.duration_bucket_5,
                   a.duration_bucket_6, a.duration_bucket_7, a.duration_bucket_8,
@@ -322,6 +324,12 @@ fn request_fact_sql(from_parameter: &str, to_parameter: &str, scope_predicate: &
     format!(
         r#"SELECT f.upstream_account_id, f.model, f.status_class, f.currency,
                   CAST(1 AS BIGINT) AS requests,
+                  CASE
+                      WHEN f.input_tokens >= f.cached_input_tokens + f.cache_write_tokens
+                          THEN f.input_tokens - f.cached_input_tokens - f.cache_write_tokens
+                      ELSE 0
+                  END AS input_tokens,
+                  f.output_tokens, f.cached_input_tokens, f.cache_write_tokens,
                   CAST(1 AS BIGINT) AS duration_count, f.duration_ms AS duration_sum_ms,
                   CASE WHEN f.duration_ms <= 10 THEN 1 ELSE 0 END AS duration_bucket_0,
                   CASE WHEN f.duration_ms > 10 AND f.duration_ms <= 50 THEN 1 ELSE 0 END AS duration_bucket_1,
@@ -348,6 +356,10 @@ fn generation_fact_sql(from_parameter: &str, to_parameter: &str, scope_predicate
     format!(
         r#"SELECT f.upstream_account_id, f.model, f.status_class, f.currency,
                   CAST(1 AS BIGINT) AS requests,
+                  CAST(0 AS BIGINT) AS input_tokens,
+                  CAST(0 AS BIGINT) AS output_tokens,
+                  CAST(0 AS BIGINT) AS cached_input_tokens,
+                  CAST(0 AS BIGINT) AS cache_write_tokens,
                   CAST(1 AS BIGINT) AS duration_count, f.duration_ms AS duration_sum_ms,
                   CASE WHEN f.duration_ms <= 10 THEN 1 ELSE 0 END AS duration_bucket_0,
                   CASE WHEN f.duration_ms > 10 AND f.duration_ms <= 50 THEN 1 ELSE 0 END AS duration_bucket_1,
@@ -374,6 +386,10 @@ fn metric_sums() -> &'static str {
     r#"CAST(COALESCE(SUM(requests), 0) AS BIGINT) AS requests,
        CAST(COALESCE(SUM(CASE WHEN status_class = 'success' THEN requests ELSE 0 END), 0) AS BIGINT) AS successful_requests,
        CAST(COALESCE(SUM(CASE WHEN status_class = 'failure' THEN requests ELSE 0 END), 0) AS BIGINT) AS failed_requests,
+       CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT) AS input_tokens,
+       CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT) AS output_tokens,
+       CAST(COALESCE(SUM(cached_input_tokens), 0) AS BIGINT) AS cached_input_tokens,
+       CAST(COALESCE(SUM(cache_write_tokens), 0) AS BIGINT) AS cache_write_tokens,
        CAST(COALESCE(SUM(duration_count), 0) AS BIGINT) AS duration_count,
        CAST(COALESCE(SUM(duration_sum_ms), 0) AS BIGINT) AS duration_sum_ms,
        CAST(COALESCE(SUM(duration_bucket_0), 0) AS BIGINT) AS duration_bucket_0,
@@ -406,6 +422,12 @@ mod tests {
                 assert!(sql.contains("usage_analysis_"), "{sql}");
                 assert!(sql.contains("request_stats_facts"), "{sql}");
                 assert!(sql.contains("generation_stats_facts"), "{sql}");
+                assert!(sql.contains("a.cached_input_tokens"), "{sql}");
+                assert!(sql.contains("SUM(cache_write_tokens)"), "{sql}");
+                assert!(
+                    sql.contains("f.input_tokens - f.cached_input_tokens - f.cache_write_tokens"),
+                    "{sql}"
+                );
                 assert!(!sql.contains("request_records"), "{sql}");
                 assert!(!sql.contains("generation_jobs"), "{sql}");
                 assert!(sql.contains("LIMIT 10"), "{sql}");

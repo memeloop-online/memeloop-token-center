@@ -1160,6 +1160,10 @@ pub struct MonitoringMetrics {
     pub requests: i64,
     pub successful_requests: i64,
     pub failed_requests: i64,
+    /// Uncached input, cached reads, cache writes, and output, each counted once.
+    pub total_tokens: i64,
+    /// Cached reads divided by all input tokens. `None` means there was no input usage.
+    pub cache_rate: Option<f64>,
     pub avg_duration_ms: Option<f64>,
     pub p95_duration_ms: Option<i64>,
     /// True when the percentile falls above the final finite histogram bound.
@@ -1463,6 +1467,12 @@ impl TokenUsage {
 
     pub fn total_tokens(&self) -> i64 {
         self.total_input_tokens().saturating_add(self.output_tokens)
+    }
+
+    pub fn cache_rate(&self) -> Option<f64> {
+        let total_input_tokens = self.total_input_tokens();
+        (total_input_tokens > 0)
+            .then(|| self.cached_input_tokens as f64 / total_input_tokens as f64)
     }
 }
 

@@ -9,7 +9,7 @@ use super::{
 };
 use crate::model::{
     MonitoringFreshness, MonitoringHealth, MonitoringMetrics, MonitoringTerminalOutcome,
-    MonitoringUpstreamModel, OperatorMonitoringSnapshot, UsageAnalysisCost,
+    MonitoringUpstreamModel, OperatorMonitoringSnapshot, TokenUsage, UsageAnalysisCost,
 };
 
 #[path = "monitoring_snapshot_sql.rs"]
@@ -179,6 +179,10 @@ struct MetricsAccumulator {
     requests: i64,
     successful_requests: i64,
     failed_requests: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    cached_input_tokens: i64,
+    cache_write_tokens: i64,
     duration_count: i64,
     duration_sum_ms: i64,
     duration_buckets: [i64; 12],
@@ -194,6 +198,18 @@ impl MetricsAccumulator {
         self.failed_requests = self
             .failed_requests
             .saturating_add(row.try_get("failed_requests")?);
+        self.input_tokens = self
+            .input_tokens
+            .saturating_add(row.try_get("input_tokens")?);
+        self.output_tokens = self
+            .output_tokens
+            .saturating_add(row.try_get("output_tokens")?);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(row.try_get("cached_input_tokens")?);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(row.try_get("cache_write_tokens")?);
         self.duration_count = self
             .duration_count
             .saturating_add(row.try_get("duration_count")?);
@@ -214,10 +230,19 @@ impl MetricsAccumulator {
     }
 
     fn finish(self) -> MonitoringMetrics {
+        let usage = TokenUsage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cached_input_tokens: self.cached_input_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+            service_tier: None,
+        };
         MonitoringMetrics {
             requests: self.requests,
             successful_requests: self.successful_requests,
             failed_requests: self.failed_requests,
+            total_tokens: usage.total_tokens(),
+            cache_rate: usage.cache_rate(),
             avg_duration_ms: (self.duration_count > 0)
                 .then(|| self.duration_sum_ms as f64 / self.duration_count as f64),
             p95_duration_ms: approximate_quantile(95, self.duration_count, &self.duration_buckets),
