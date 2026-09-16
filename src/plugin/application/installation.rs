@@ -11,6 +11,8 @@ const INSTALLER: &str = "/usr/local/bin/install-plugin-oci";
 const PACKAGE_DEADLINE: Duration = Duration::from_secs(3 * 60 * 60);
 const STORAGE_DEADLINE: Duration = Duration::from_secs(60);
 const LEASE_RENEWAL: Duration = Duration::from_secs(30);
+const ATTEMPT_RECLAMATION_GRACE: Duration = Duration::from_secs(60);
+const ATTEMPT_RECLAMATION_LIMIT: usize = 8;
 static INSTALL_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
 // An uninterruptible filesystem read retains this permit until it actually
@@ -242,7 +244,7 @@ impl ApplicationPlugins {
             return Ok(replay);
         }
         let policy = self.install_policy().await?;
-        self.refresh_inventory().await?;
+        self.reclaim_unreferenced_installation_attempts().await?;
         if self
             .inventory
             .read()
@@ -319,7 +321,9 @@ impl ApplicationPlugins {
         input: &InstallPluginRequest,
         policy: &InstallPolicy,
     ) -> Result<(String, serde_json::Value), AppError> {
-        let inventory_root = policy.plugin_root.join(&input.inventory_id);
+        let inventory_root = policy
+            .plugin_root
+            .join(inventory_attempt_storage_id(attempt_id)?);
         let (trust, mut checkpoints) = bounded_install_phase(STORAGE_DEADLINE, async {
             let trust = trust_digest(policy).await?;
             tokio::fs::create_dir_all(&policy.plugin_root)
@@ -332,7 +336,7 @@ impl ApplicationPlugins {
                 return Err(AppError::Forbidden);
             }
             let claim_root = inventory_root.clone();
-            let owner = operation_id.to_owned();
+            let owner = attempt_id.to_owned();
             let permit = tokio::time::timeout(
                 ADMISSION_WAIT,
                 INSTALL_STORAGE_PERMITS.clone().acquire_owned(),
@@ -362,8 +366,8 @@ impl ApplicationPlugins {
                     .arg(reference)
                     .arg("--plugin-dir")
                     .arg(&policy.plugin_root)
-                    .arg("--inventory-id")
-                    .arg(&input.inventory_id)
+                    .arg("--publication-attempt-id")
+                    .arg(attempt_id)
                     .env_clear()
                     // Only fixed runtime loader/search paths cross the process
                     // boundary; service tokens and unrelated host settings do not.
@@ -371,7 +375,7 @@ impl ApplicationPlugins {
                     .env("PATH", "/usr/local/bin:/usr/bin:/bin")
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
-                    .stderr(Stdio::null())
+                    .stderr(Stdio::piped())
                     .kill_on_drop(true);
                 for source in &policy.allowed_sources {
                     command.arg("--allowed-source").arg(source);
@@ -389,12 +393,36 @@ impl ApplicationPlugins {
                 if let Some(credentials) = policy.credentials_for(reference) {
                     credentials.apply(&mut command);
                 }
-                if !command
-                    .status()
-                    .await
-                    .map_err(|_| AppError::Internal)?
-                    .success()
-                {
+                let mut child = command.spawn().map_err(|_| {
+                    tracing::warn!(stage = "installer_spawn", "plugin installation failed");
+                    AppError::Internal
+                })?;
+                let mut stderr = child.stderr.take().ok_or(AppError::Internal)?;
+                let capture = async {
+                    use tokio::io::AsyncReadExt;
+                    let mut captured = Vec::new();
+                    let mut buffer = [0u8; 4096];
+                    loop {
+                        let count = stderr.read(&mut buffer).await?;
+                        if count == 0 {
+                            break;
+                        }
+                        let retain = count.min((64 * 1024usize).saturating_sub(captured.len()));
+                        captured.extend_from_slice(&buffer[..retain]);
+                    }
+                    Ok::<_, std::io::Error>(captured)
+                };
+                // Drain concurrently (bounded retained bytes) without an orphan
+                // task. Existing phase timeout drops/kills this owned child.
+                let (status, captured) = tokio::join!(child.wait(), capture);
+                let status = status.map_err(|_| AppError::Internal)?;
+                if !status.success() {
+                    log_installer_diagnostics(&captured.unwrap_or_default());
+                    tracing::warn!(
+                        stage = "installer_exit",
+                        exit_code = status.code(),
+                        "plugin installation failed"
+                    );
                     return Err(AppError::Internal);
                 }
                 let checkpoint = package_checkpoint(&inventory_root, reference, &trust).await?;
@@ -407,9 +435,7 @@ impl ApplicationPlugins {
             .await?;
         }
         bounded_install_phase(STORAGE_DEADLINE, async {
-            let runtime = self
-                .review_runtime(policy.plugin_root.join(&input.inventory_id))
-                .await?;
+            let runtime = self.review_runtime(inventory_root).await?;
             let digest = review_digest(&runtime, &trust)?;
             let review = json!({"plugins":runtime.manifests()});
             if serde_json::to_vec(&review)
@@ -481,7 +507,9 @@ impl ApplicationPlugins {
         }) {
             return Err(AppError::Forbidden);
         }
-        let root = policy.plugin_root.join(&record.inventory_id);
+        let root = policy
+            .plugin_root
+            .join(inventory_attempt_storage_id(&record.attempt_id)?);
         let runtime = self.review_runtime(root.clone()).await?;
         let trust = trust_digest(&policy).await?;
         if review_digest(&runtime, &trust)? != digest {
@@ -526,6 +554,124 @@ impl ApplicationPlugins {
             .register_plugin_installation(id, digest, actor)
             .await
     }
+
+    pub(crate) async fn reclaim_unreferenced_installation_attempts(
+        &self,
+    ) -> Result<usize, AppError> {
+        if self.installation_policy_file.is_none() {
+            return Ok(0);
+        }
+        let policy = self.install_policy().await?;
+        self.refresh_inventory().await?;
+        let inventory_roots = self
+            .inventory
+            .read()
+            .await
+            .values()
+            .map(|entry| entry.root.clone())
+            .collect::<BTreeSet<_>>();
+        let referenced_attempts = self.db.referenced_plugin_installation_attempts().await?;
+        let plugin_root = policy.plugin_root;
+        tokio::task::spawn_blocking(move || {
+            reclaim_installation_attempt_roots(
+                &plugin_root,
+                &inventory_roots,
+                &referenced_attempts,
+                ATTEMPT_RECLAMATION_GRACE,
+            )
+        })
+        .await
+        .map_err(|_| AppError::Internal)?
+    }
+}
+
+fn inventory_attempt_id(name: &std::ffi::OsStr) -> Option<String> {
+    let value = name.to_str()?.strip_prefix("mtc-attempt-")?;
+    let attempt = uuid::Uuid::parse_str(value).ok()?;
+    (attempt.to_string() == value).then(|| value.to_owned())
+}
+
+fn reclaim_installation_attempt_roots(
+    plugin_root: &std::path::Path,
+    inventory_roots: &BTreeSet<PathBuf>,
+    referenced_attempts: &BTreeSet<String>,
+    minimum_age: Duration,
+) -> Result<usize, AppError> {
+    let parent = std::fs::symlink_metadata(plugin_root).map_err(|_| AppError::Internal)?;
+    if !parent.is_dir() || parent.file_type().is_symlink() {
+        return Err(AppError::Forbidden);
+    }
+    let entries = std::fs::read_dir(plugin_root).map_err(|_| AppError::Internal)?;
+    let mut reclaimed = 0usize;
+    for entry in entries {
+        if reclaimed >= ATTEMPT_RECLAMATION_LIMIT {
+            break;
+        }
+        let entry = entry.map_err(|_| AppError::Internal)?;
+        let entry_name = entry.file_name();
+        let (attempt_id, root, recovery_entry) =
+            if let Some(attempt_id) = inventory_attempt_id(&entry_name) {
+                (attempt_id, entry.path(), false)
+            } else if let Some(original) = entry_name
+                .to_str()
+                .and_then(|name| name.strip_prefix(".mtc-reclaim-complete-"))
+            {
+                let Some(attempt_id) = inventory_attempt_id(std::ffi::OsStr::new(original)) else {
+                    continue;
+                };
+                (attempt_id, plugin_root.join(original), true)
+            } else if let Some(original) = entry_name
+                .to_str()
+                .and_then(|name| name.strip_prefix(".mtc-reclaim-"))
+            {
+                let Some(attempt_id) = inventory_attempt_id(std::ffi::OsStr::new(original)) else {
+                    continue;
+                };
+                (attempt_id, plugin_root.join(original), true)
+            } else {
+                continue;
+            };
+        if referenced_attempts.contains(&attempt_id) || inventory_roots.contains(&root) {
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(entry.path()) {
+            Ok(metadata)
+                if !metadata.file_type().is_symlink()
+                    && (metadata.is_dir() || recovery_entry && metadata.is_file()) =>
+            {
+                metadata
+            }
+            _ => continue,
+        };
+        if metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_none_or(|age| age < minimum_age)
+        {
+            continue;
+        }
+        let inode_marker = plugin_root.join(format!(".mtc-publish-inode-mtc-attempt-{attempt_id}"));
+        let result = if recovery_entry {
+            crate::plugin_publication::clear_claimed_directory(&root, attempt_id.as_bytes())
+        } else {
+            std::fs::symlink_metadata(&inode_marker)
+                .map(|_| ())
+                .and_then(|()| {
+                    crate::plugin_publication::clear_claimed_directory(&root, attempt_id.as_bytes())
+                })
+        };
+        match result {
+            Ok(true) => reclaimed += 1,
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                stage = "inventory_reclaim",
+                errno = error.raw_os_error(),
+                "plugin installation attempt reclamation failed"
+            ),
+        }
+    }
+    Ok(reclaimed)
 }
 
 async fn bounded_install_phase<T>(
@@ -596,6 +742,51 @@ impl InstallPolicy {
 // The final name never exists without a complete, durable owner receipt. A
 // killed creator leaves only an unreferenced hidden temporary directory; retries
 // can claim the final name without deleting or adopting arbitrary existing roots.
+fn log_installer_diagnostics(bytes: &[u8]) {
+    for (stage, category, errno) in installer_diagnostics(bytes) {
+        tracing::warn!(stage, category, errno, "plugin installer diagnostic");
+    }
+}
+
+fn installer_diagnostics(bytes: &[u8]) -> Vec<(&'static str, &'static str, Option<i64>)> {
+    let mut diagnostics = Vec::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value
+            .get("mtc_plugin_install")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+        {
+            continue;
+        }
+        let stage = match value.get("stage").and_then(serde_json::Value::as_str) {
+            Some("package_publish") => "package_publish",
+            Some("package_rename") => "package_rename",
+            Some("install") => "install",
+            _ => continue,
+        };
+        let category = match value.get("category").and_then(serde_json::Value::as_str) {
+            Some("digest_pin") => "digest_pin",
+            Some("source_policy") => "source_policy",
+            Some("signature") => "signature",
+            Some("registry") => "registry",
+            Some("artifact") => "artifact",
+            Some("package") => "package",
+            Some("target_exists") => "target_exists",
+            Some("storage") => "storage",
+            _ => continue,
+        };
+        let errno = value
+            .get("errno")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|value| (1..=4095).contains(value));
+        diagnostics.push((stage, category, errno));
+    }
+    diagnostics
+}
+
 #[cfg(target_os = "linux")]
 fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppError> {
     use rustix::fs::{Mode, OFlags, RenameFlags, open, renameat_with};
@@ -617,6 +808,16 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
         std::fs::File::open(&temporary)
             .and_then(|file| file.sync_all())
             .map_err(|_| AppError::Internal)?;
+        crate::plugin_publication::reserve_directory_name(root, owner.as_bytes()).map_err(
+            |error| {
+                crate::plugin_publication::report_io("inventory_claim", &error);
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    AppError::Forbidden
+                } else {
+                    AppError::Internal
+                }
+            },
+        )?;
         let directory = open(
             parent,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
@@ -652,8 +853,43 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
                     return Err(AppError::Forbidden);
                 }
             }
-            Err(_) => return Err(AppError::Internal),
+            Err(error) if crate::plugin_publication::unsupported_rename(error) => {
+                let publish = || -> std::io::Result<()> {
+                    let directory =
+                        crate::plugin_publication::claim_directory(root, owner.as_bytes())?;
+                    crate::plugin_publication::link_file_at(
+                        &marker,
+                        &directory,
+                        std::path::Path::new(".mtc-install-owner"),
+                    )?;
+                    rustix::fs::fsync(&directory)?;
+                    crate::plugin_publication::claim_directory(root, owner.as_bytes())?;
+                    Ok(())
+                };
+                publish().map_err(|error| {
+                    crate::plugin_publication::report_io("inventory_claim", &error);
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        AppError::Forbidden
+                    } else {
+                        AppError::Internal
+                    }
+                })?;
+            }
+            Err(error) => {
+                crate::plugin_publication::report_io("inventory_rename", &error.into());
+                return Err(AppError::Internal);
+            }
         }
+        crate::plugin_publication::bind_existing_directory(root, owner.as_bytes()).map_err(
+            |error| {
+                crate::plugin_publication::report_io("inventory_claim", &error);
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    AppError::Forbidden
+                } else {
+                    AppError::Internal
+                }
+            },
+        )?;
         std::fs::File::open(parent)
             .and_then(|file| file.sync_all())
             .map_err(|_| AppError::Internal)
@@ -662,6 +898,14 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
     let _ = std::fs::remove_file(marker);
     let _ = std::fs::remove_dir(temporary);
     result
+}
+
+fn inventory_attempt_storage_id(attempt_id: &str) -> Result<String, AppError> {
+    let attempt = uuid::Uuid::parse_str(attempt_id).map_err(|_| AppError::Internal)?;
+    if attempt.to_string() != attempt_id {
+        return Err(AppError::Internal);
+    }
+    Ok(format!("mtc-attempt-{attempt}"))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -910,6 +1154,24 @@ async fn append_inventory_file(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn installer_diagnostic_projection_never_forwards_untrusted_text() {
+        let bytes = br#"raw secret/path/provider body
+{"mtc_plugin_install":1,"stage":"package_publish","category":"storage","errno":22,"message":"secret/path"}
+{"mtc_plugin_install":1,"stage":"secret/path","category":"storage","errno":22}
+{"mtc_plugin_install":1,"stage":"install","category":"secret/path"}
+{"mtc_plugin_install":1,"stage":"install","category":"signature","errno":"secret/path"}
+{"mtc_plugin_install":1,"stage":"package_rename","category":"storage","errno":999999}
+"#;
+        assert_eq!(
+            super::installer_diagnostics(bytes),
+            vec![
+                ("package_publish", "storage", Some(22)),
+                ("install", "signature", None),
+                ("package_rename", "storage", None),
+            ]
+        );
+    }
     use super::*;
     use crate::{
         AppState,
@@ -997,11 +1259,7 @@ mod tests {
         // The existing distribution tests exercise real signature verification
         // and mock-registry installation. This fixture seeds its verified output
         // to exercise the independent review/approval/publication HTTP boundary.
-        let package = root.join("installed/new-plugin");
-        std::fs::create_dir_all(&package).unwrap();
-        std::fs::write(package.join("plugin.json"),serde_json::to_vec(&json!({"id":"new-plugin","version":"1.0.0","wit_version":"0.2.0","wasm":null,"capabilities":[],"contributions":{}})).unwrap()).unwrap();
         let reference = format!("ghcr.io/example/new@sha256:{}", "a".repeat(64));
-        std::fs::write(package.join(".mtc-oci-install.json"),serde_json::to_vec(&json!({"format_version":1,"source":"ghcr.io/example/new","digest":format!("sha256:{}","a".repeat(64)),"signature_policy":"cosign-public-key"})).unwrap()).unwrap();
         let (record, run) = state
             .db
             .begin_plugin_installation(
@@ -1015,10 +1273,12 @@ mod tests {
             .await
             .unwrap();
         assert!(run);
-        let runtime = authority
-            .review_runtime(root.join("installed"))
-            .await
-            .unwrap();
+        let attempt_root = root.join(inventory_attempt_storage_id(&record.attempt_id).unwrap());
+        let package = attempt_root.join("new-plugin");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("plugin.json"),serde_json::to_vec(&json!({"id":"new-plugin","version":"1.0.0","wit_version":"0.2.0","wasm":null,"capabilities":[],"contributions":{}})).unwrap()).unwrap();
+        std::fs::write(package.join(".mtc-oci-install.json"),serde_json::to_vec(&json!({"format_version":1,"source":"ghcr.io/example/new","digest":format!("sha256:{}","a".repeat(64)),"signature_policy":"cosign-public-key"})).unwrap()).unwrap();
+        let runtime = authority.review_runtime(attempt_root).await.unwrap();
         let policy = authority.install_policy().await.unwrap();
         let digest = review_digest(&runtime, &trust_digest(&policy).await.unwrap()).unwrap();
         state
@@ -1439,6 +1699,14 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(
+            state
+                .db
+                .referenced_plugin_installation_attempts()
+                .await
+                .unwrap()
+                .contains(&old.attempt_id)
+        );
         let (new, run) = state
             .db
             .begin_plugin_installation(
@@ -1454,6 +1722,14 @@ mod tests {
         assert!(run);
         assert_eq!(old.id, new.id);
         assert_ne!(old.attempt_id, new.attempt_id);
+        assert!(
+            state
+                .db
+                .referenced_plugin_installation_attempts()
+                .await
+                .unwrap()
+                .contains(&new.attempt_id)
+        );
         assert!(
             state
                 .db
@@ -1493,6 +1769,14 @@ mod tests {
             state.db.plugin_installation(&new.id).await.unwrap().status,
             "failed"
         );
+        assert!(
+            !state
+                .db
+                .referenced_plugin_installation_attempts()
+                .await
+                .unwrap()
+                .contains(&new.attempt_id)
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1525,6 +1809,144 @@ mod tests {
         let unrelated = directory.path().join("unrelated");
         std::fs::create_dir(&unrelated).unwrap();
         assert!(claim_inventory_root(&unrelated, "owner").is_err());
+        assert!(
+            crate::plugin_publication::clear_claimed_directory(&root, b"another-owner").is_err()
+        );
+        assert!(root.exists());
+        crate::plugin_publication::clear_claimed_directory(&root, b"owner").unwrap();
+        assert!(!root.exists());
+        assert!(
+            !directory
+                .path()
+                .join(".mtc-publish-owner-inventory")
+                .exists()
+        );
+        assert!(
+            !directory
+                .path()
+                .join(".mtc-publish-inode-inventory")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn attempt_storage_names_require_exact_canonical_uuid() {
+        let attempt = uuid::Uuid::now_v7().to_string();
+        assert_eq!(
+            inventory_attempt_id(std::ffi::OsStr::new(&format!("mtc-attempt-{attempt}"))),
+            Some(attempt.clone())
+        );
+        assert_eq!(
+            inventory_attempt_id(std::ffi::OsStr::new(&format!(
+                "mtc-attempt-{}",
+                attempt.to_uppercase()
+            ))),
+            None
+        );
+        assert_eq!(inventory_attempt_id(std::ffi::OsStr::new(&attempt)), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reclamation_removes_only_unreferenced_owned_attempt_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        let attempts = [
+            uuid::Uuid::now_v7().to_string(),
+            uuid::Uuid::now_v7().to_string(),
+            uuid::Uuid::now_v7().to_string(),
+            uuid::Uuid::now_v7().to_string(),
+            uuid::Uuid::now_v7().to_string(),
+            uuid::Uuid::now_v7().to_string(),
+        ];
+        let roots = attempts
+            .iter()
+            .map(|attempt| {
+                let root = directory
+                    .path()
+                    .join(inventory_attempt_storage_id(attempt).unwrap());
+                claim_inventory_root(&root, attempt).unwrap();
+                std::fs::write(root.join("payload"), b"immutable").unwrap();
+                root
+            })
+            .collect::<Vec<_>>();
+        std::fs::create_dir_all(roots[3].join("nested/deep")).unwrap();
+        std::fs::write(roots[3].join("nested/deep/payload"), b"immutable").unwrap();
+        let interrupted_quarantine = directory
+            .path()
+            .join(format!(".mtc-reclaim-mtc-attempt-{}", attempts[4]));
+        std::fs::create_dir(&interrupted_quarantine).unwrap();
+        std::fs::rename(&roots[4], interrupted_quarantine.join("root")).unwrap();
+        let terminal_quarantine = directory
+            .path()
+            .join(format!(".mtc-reclaim-mtc-attempt-{}", attempts[5]));
+        std::fs::create_dir(&terminal_quarantine).unwrap();
+        std::fs::rename(&roots[5], terminal_quarantine.join("root")).unwrap();
+        std::fs::remove_dir_all(terminal_quarantine.join("root")).unwrap();
+        std::fs::write(
+            directory
+                .path()
+                .join(format!(".mtc-reclaim-complete-mtc-attempt-{}", attempts[5])),
+            attempts[5].as_bytes(),
+        )
+        .unwrap();
+        std::fs::remove_file(
+            directory
+                .path()
+                .join(format!(".mtc-publish-owner-mtc-attempt-{}", attempts[5])),
+        )
+        .unwrap();
+        std::fs::remove_file(
+            directory
+                .path()
+                .join(format!(".mtc-publish-inode-mtc-attempt-{}", attempts[5])),
+        )
+        .unwrap();
+        let inventory_roots = BTreeSet::from([roots[0].clone()]);
+        let referenced_attempts = BTreeSet::from([attempts[1].clone()]);
+        std::fs::remove_file(
+            directory
+                .path()
+                .join(format!(".mtc-publish-inode-mtc-attempt-{}", attempts[2])),
+        )
+        .unwrap();
+        assert_eq!(
+            reclaim_installation_attempt_roots(
+                directory.path(),
+                &inventory_roots,
+                &referenced_attempts,
+                Duration::ZERO,
+            )
+            .unwrap(),
+            2
+        );
+        assert!(roots[0].exists());
+        assert!(roots[1].exists());
+        assert!(roots[2].join("payload").exists());
+        assert!(!roots[3].exists());
+        assert!(!interrupted_quarantine.exists());
+        assert!(!terminal_quarantine.exists());
+        assert!(
+            !directory
+                .path()
+                .join(format!(".mtc-reclaim-complete-mtc-attempt-{}", attempts[5]))
+                .exists()
+        );
+        assert!(
+            !directory
+                .path()
+                .join(format!(".mtc-publish-owner-mtc-attempt-{}", attempts[5]))
+                .exists()
+        );
+        assert_eq!(
+            reclaim_installation_attempt_roots(
+                directory.path(),
+                &inventory_roots,
+                &referenced_attempts,
+                Duration::ZERO,
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -1598,9 +2020,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_checkpoint_skips_only_exact_bytes_under_unchanged_trust() {
+    async fn checkpoint_verifies_exact_bytes_and_retry_starts_a_new_physical_root() {
         let (directory, state, record, _) = fixture().await;
-        let root = directory.path().join("private-install-root/installed");
+        let root = directory
+            .path()
+            .join("private-install-root")
+            .join(inventory_attempt_storage_id(&record.attempt_id).unwrap());
         let reference = &record.packages[0];
         let checkpoint = package_checkpoint(&root, reference, "trust").await.unwrap();
         assert!(
@@ -1656,11 +2081,8 @@ mod tests {
             .await
             .unwrap();
         assert!(run);
-        assert_eq!(retry.completed_packages, 1);
-        assert_eq!(
-            retry.checkpoints[reference].tree_digest,
-            checkpoints[reference].tree_digest
-        );
+        assert_eq!(retry.completed_packages, 0);
+        assert!(retry.checkpoints.is_empty());
         assert_ne!(active.attempt_id, retry.attempt_id);
     }
 

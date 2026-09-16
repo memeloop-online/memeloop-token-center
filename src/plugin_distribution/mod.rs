@@ -80,6 +80,9 @@ pub struct InstallPluginOptions {
     pub credentials: RegistryCredentials,
     pub cosign_public_keys: Vec<Vec<u8>>,
     pub cosign_keyless: Option<CosignKeylessIdentity>,
+    /// Portable directory publication is safe only inside an unpublished,
+    /// attempt-scoped inventory root. Legacy active roots require atomic rename.
+    pub allow_portable_publication: bool,
 }
 
 pub use crate::plugin::CosignKeylessIdentity;
@@ -172,6 +175,22 @@ pub enum PluginDistributionError {
     TargetExists,
     #[error("plugin installation storage operation failed")]
     Storage,
+}
+
+impl PluginDistributionError {
+    /// Safe machine category; never includes artifact content or host paths.
+    pub fn diagnostic_category(&self) -> &'static str {
+        match self {
+            Self::DigestPinRequired => "digest_pin",
+            Self::SourceDenied => "source_policy",
+            Self::SignatureVerification => "signature",
+            Self::Registry => "registry",
+            Self::InvalidArtifact(_) => "artifact",
+            Self::InvalidPackage(_) => "package",
+            Self::TargetExists => "target_exists",
+            Self::Storage => "storage",
+        }
+    }
 }
 
 #[async_trait]
@@ -558,7 +577,7 @@ async fn install_plugin_oci_with_verifier(
     tokio::fs::create_dir(&staging_path)
         .await
         .map_err(|_| PluginDistributionError::Storage)?;
-    let mut staging = StagingGuard::new(staging_path.clone());
+    let staging = StagingGuard::new(staging_path.clone());
 
     let config = pull_config(&client, &reference, &manifest.config).await?;
     if config.format_version != 1 {
@@ -587,8 +606,24 @@ async fn install_plugin_oci_with_verifier(
     sync_directory(&staging_path).await?;
 
     let target = options.plugin_root.join(&package.id);
-    match atomic_noreplace_rename(&options.plugin_root, &staging_path, &package.id) {
-        Ok(()) => staging.disarm(),
+    let publication_root = options.plugin_root.clone();
+    let publication_staging = staging_path.clone();
+    let publication_id = package.id.clone();
+    let allow_portable_publication = options.allow_portable_publication;
+    let (publication, mut staging) = tokio::task::spawn_blocking(move || {
+        let result = atomic_noreplace_rename(
+            &publication_root,
+            &publication_staging,
+            &publication_id,
+            allow_portable_publication,
+        );
+        (result, staging)
+    })
+    .await
+    .map_err(|_| PluginDistributionError::Storage)?;
+    match publication {
+        Ok(true) => staging.disarm(),
+        Ok(false) => {}
         Err(PluginDistributionError::TargetExists) => {
             // A registration failure may follow a successful install. Reverify
             // the signed artifact above, then compare every installed byte with
@@ -616,62 +651,155 @@ async fn install_plugin_oci_with_verifier(
     })
 }
 
-fn identical_packages(left: &Path, right: &Path) -> Result<bool, PluginDistributionError> {
+fn package_fingerprint(
+    root: &Path,
+) -> Result<std::collections::BTreeMap<PathBuf, Vec<u8>>, PluginDistributionError> {
+    let directory = crate::plugin_publication::directory_fd(root)
+        .map_err(|_| PluginDistributionError::Storage)?;
+    package_fingerprint_at(&directory)
+}
+
+fn package_fingerprint_at(
+    root: &rustix::fd::OwnedFd,
+) -> Result<std::collections::BTreeMap<PathBuf, Vec<u8>>, PluginDistributionError> {
+    use rustix::fs::{Dir, Mode, OFlags, openat};
     use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
     use std::{collections::BTreeMap, io::Read};
-    fn fingerprint(root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>, PluginDistributionError> {
-        let mut pending = vec![PathBuf::new()];
-        let mut result = BTreeMap::new();
-        let mut total = 0u64;
-        let mut entries = 0usize;
-        while let Some(relative) = pending.pop() {
-            let path = root.join(&relative);
-            let metadata =
-                std::fs::symlink_metadata(&path).map_err(|_| PluginDistributionError::Storage)?;
-            if metadata.file_type().is_symlink() || relative.as_os_str().len() > MAX_PATH_BYTES {
-                return Err(PluginDistributionError::TargetExists);
-            }
-            if metadata.is_dir() {
-                for entry in
-                    std::fs::read_dir(&path).map_err(|_| PluginDistributionError::Storage)?
-                {
-                    let entry = entry.map_err(|_| PluginDistributionError::Storage)?;
-                    entries += 1;
-                    if entries > MAX_FILES * MAX_PATH_BYTES {
-                        return Err(PluginDistributionError::TargetExists);
-                    }
-                    pending.push(relative.join(entry.file_name()));
+    let first = openat(
+        root,
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| PluginDistributionError::Storage)?;
+    let mut pending = vec![(PathBuf::new(), std::fs::File::from(first))];
+    let mut result = BTreeMap::new();
+    let mut total = 0u64;
+    let mut entries = 0usize;
+    while let Some((relative, file)) = pending.pop() {
+        let metadata = file
+            .metadata()
+            .map_err(|_| PluginDistributionError::Storage)?;
+        if relative.as_os_str().len() > MAX_PATH_BYTES {
+            return Err(PluginDistributionError::TargetExists);
+        }
+        if metadata.is_dir() {
+            for entry in Dir::read_from(&file).map_err(|_| PluginDistributionError::Storage)? {
+                let entry = entry.map_err(|_| PluginDistributionError::Storage)?;
+                let name = entry.file_name().to_bytes();
+                if name == b"." || name == b".." {
+                    continue;
                 }
-            } else if metadata.is_file() {
-                if result.len() > MAX_FILES || metadata.len() > MAX_WASM_BYTES {
+                entries += 1;
+                if entries > MAX_FILES * MAX_PATH_BYTES {
                     return Err(PluginDistributionError::TargetExists);
                 }
-                let file =
-                    std::fs::File::open(path).map_err(|_| PluginDistributionError::Storage)?;
-                let mut reader = file.take(MAX_WASM_BYTES + 1);
-                let mut hash = Sha256::new();
-                let mut buffer = [0u8; 65536];
-                loop {
-                    let count = reader
-                        .read(&mut buffer)
-                        .map_err(|_| PluginDistributionError::Storage)?;
-                    if count == 0 {
-                        break;
+                let name = std::ffi::OsStr::from_bytes(name);
+                let child = openat(
+                    &file,
+                    name,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                    Mode::empty(),
+                )
+                .map_err(|error| {
+                    if matches!(error, rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) {
+                        PluginDistributionError::TargetExists
+                    } else {
+                        PluginDistributionError::Storage
                     }
-                    total += count as u64;
-                    if total > MAX_TOTAL_BYTES + 16 * 1024 {
-                        return Err(PluginDistributionError::TargetExists);
-                    }
-                    hash.update(&buffer[..count]);
+                })?;
+                if pending.len() >= MAX_FILES * 2 {
+                    return Err(PluginDistributionError::TargetExists);
                 }
-                result.insert(relative, hash.finalize().to_vec());
-            } else {
+                pending.push((relative.join(name), std::fs::File::from(child)));
+            }
+        } else if metadata.is_file() {
+            if result.len() > MAX_FILES || metadata.len() > MAX_WASM_BYTES {
                 return Err(PluginDistributionError::TargetExists);
             }
+            let mut reader = file.take(MAX_WASM_BYTES + 1);
+            let mut hash = Sha256::new();
+            let mut buffer = [0u8; 65536];
+            loop {
+                let count = reader
+                    .read(&mut buffer)
+                    .map_err(|_| PluginDistributionError::Storage)?;
+                if count == 0 {
+                    break;
+                }
+                total += count as u64;
+                if total > MAX_TOTAL_BYTES + 16 * 1024 {
+                    return Err(PluginDistributionError::TargetExists);
+                }
+                hash.update(&buffer[..count]);
+            }
+            result.insert(relative, hash.finalize().to_vec());
+        } else {
+            return Err(PluginDistributionError::TargetExists);
         }
-        Ok(result)
     }
-    Ok(fingerprint(left)? == fingerprint(right)?)
+    Ok(result)
+}
+
+fn identical_packages(left: &Path, right: &Path) -> Result<bool, PluginDistributionError> {
+    Ok(package_fingerprint(left)? == package_fingerprint(right)?)
+}
+
+fn portable_publish(
+    root: &Path,
+    staging: &Path,
+    plugin_id: &str,
+) -> Result<bool, PluginDistributionError> {
+    use crate::plugin_publication::{claim_directory, link_file_at, report_io, sync_directory};
+    let target = root.join(plugin_id);
+    let expected = package_fingerprint(staging)?;
+    // Bind ownership to ALL verified bytes, including the source/digest/trust receipt.
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for (path, hash) in &expected {
+        digest.update(path.as_os_str().as_encoded_bytes());
+        digest.update([0]);
+        digest.update(hash);
+    }
+    let owner = digest.finalize();
+    let publish = || -> std::io::Result<()> {
+        let directory = claim_directory(&target, &owner)?;
+        for relative in expected
+            .keys()
+            .filter(|path| path.as_path() != Path::new("plugin.json"))
+        {
+            link_file_at(&staging.join(relative), &directory, relative)?;
+        }
+        // No extra or mismatched files may become executable with this manifest.
+        let mut actual =
+            package_fingerprint_at(&directory).map_err(|_| std::io::ErrorKind::AlreadyExists)?;
+        let mut required = expected.clone();
+        actual.remove(Path::new("plugin.json"));
+        required.remove(Path::new("plugin.json"));
+        if actual != required {
+            return Err(std::io::ErrorKind::AlreadyExists.into());
+        }
+        // The loader requires plugin.json. Publish it only after every payload
+        // and receipt directory entry is durable; concurrent resumes are identical.
+        link_file_at(
+            &staging.join("plugin.json"),
+            &directory,
+            Path::new("plugin.json"),
+        )?;
+        rustix::fs::fsync(&directory)?;
+        claim_directory(&target, &owner)?;
+        sync_directory(root)
+    };
+    publish().map_err(|error| {
+        report_io("package_publish", &error);
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            PluginDistributionError::TargetExists
+        } else {
+            PluginDistributionError::Storage
+        }
+    })?;
+    Ok(false) // Staging was linked, not moved: its guard must still clean it.
 }
 
 #[cfg(target_os = "linux")]
@@ -679,32 +807,59 @@ fn atomic_noreplace_rename(
     root: &Path,
     staging: &Path,
     plugin_id: &str,
-) -> Result<(), PluginDistributionError> {
+    allow_portable_publication: bool,
+) -> Result<bool, PluginDistributionError> {
     use rustix::fs::{Mode, OFlags, RenameFlags, open, renameat_with};
 
     let staging_name = staging
         .file_name()
         .ok_or(PluginDistributionError::Storage)?;
-    let root = open(
+    let directory = open(
         root,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(|_| PluginDistributionError::Storage)?;
-    renameat_with(
-        &root,
-        staging_name,
-        &root,
+    finish_package_rename(
+        root,
+        staging,
         plugin_id,
-        RenameFlags::NOREPLACE,
+        allow_portable_publication,
+        renameat_with(
+            &directory,
+            staging_name,
+            &directory,
+            plugin_id,
+            RenameFlags::NOREPLACE,
+        ),
     )
-    .map_err(|error| {
-        if error == rustix::io::Errno::EXIST {
-            PluginDistributionError::TargetExists
-        } else {
-            PluginDistributionError::Storage
+}
+
+#[cfg(target_os = "linux")]
+fn finish_package_rename(
+    root: &Path,
+    staging: &Path,
+    plugin_id: &str,
+    allow_portable_publication: bool,
+    result: Result<(), rustix::io::Errno>,
+) -> Result<bool, PluginDistributionError> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(error)
+            if allow_portable_publication
+                && crate::plugin_publication::unsupported_rename(error) =>
+        {
+            portable_publish(root, staging, plugin_id)
         }
-    })
+        Err(error) => {
+            crate::plugin_publication::report_io("package_rename", &error.into());
+            Err(if error == rustix::io::Errno::EXIST {
+                PluginDistributionError::TargetExists
+            } else {
+                PluginDistributionError::Storage
+            })
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -712,7 +867,8 @@ fn atomic_noreplace_rename(
     _root: &Path,
     _staging: &Path,
     _plugin_id: &str,
-) -> Result<(), PluginDistributionError> {
+    _allow_portable_publication: bool,
+) -> Result<bool, PluginDistributionError> {
     // The production target is K8s/Linux. Refuse an emulated check-then-rename
     // on platforms without Linux renameat2 instead of silently permitting a
     // target-replacement race.
