@@ -1666,7 +1666,7 @@ fn generation_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, A
                 .as_object_mut()
                 .and_then(|value| value.remove("provider_assets"))
                 .is_some();
-            Ok((value, provider_metadata_only))
+            Ok::<_, AppError>((value, provider_metadata_only))
         })
         .transpose()?
         .map_or((None, false), |(value, metadata_only)| {
