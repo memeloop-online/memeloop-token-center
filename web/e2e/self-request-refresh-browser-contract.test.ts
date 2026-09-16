@@ -83,7 +83,7 @@ test('self request polling is accessible, identity-safe, visibility-aware, and h
     await cadence.selectOption('0');
     await page.getByRole('status').filter({ hasText: 'Manual' }).waitFor();
     await page.getByRole('button', { name: 'Load older requests', exact: true }).click();
-    await page.getByText('older-second', { exact: true }).waitFor();
+    await page.locator('.request-model-cell code').filter({ hasText: /^older-second$/ }).waitFor();
     const loaded = await page.locator('.request-id-control.compact code').allTextContents();
     historyRefresh = true;
     const refreshStarted = page.waitForRequest(request => new URL(request.url()).pathname === '/self/v1/requests', { timeout: 5_000 });
