@@ -7,7 +7,13 @@ use super::{
 };
 use crate::api::{limits::MAX_RESPONSES_SSE_TERMINAL_HOLD_BYTES, proxy::safe_response_id};
 
-const SAFE_FAILURE_EVENT: &[u8] = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"upstream request failed\",\"type\":\"upstream_error\"}}\n\n";
+// Codex records `response.failed` as a terminal Responses error. A generic
+// `error` event is valid SSE but is ignored by the Codex Responses parser, so
+// a following clean EOF is surfaced as "stream closed before
+// response.completed" and loses the explicit upstream failure. Keep this
+// envelope fixed and redacted, and do not mint a response id or a successful
+// terminal for a lifecycle we could not validate.
+const SAFE_FAILURE_EVENT: &[u8] = b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"upstream request failed\",\"type\":\"server_error\",\"code\":\"server_error\"}}}\n\n";
 
 /// A fixed terminal error frame for a downstream Responses SSE stream.  It
 /// deliberately contains no provider detail and lets a stream that has

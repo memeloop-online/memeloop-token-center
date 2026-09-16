@@ -40,7 +40,7 @@ async fn responses_done_then_trailing_partial_is_rejected_and_settled_once() {
     assert!(delivered.contains("response.created"));
     assert!(!delivered.contains("response.completed"));
     assert!(!delivered.contains("[DONE]"));
-    assert_eq!(delivered.matches("event: error").count(), 1);
+    assert_eq!(delivered.matches("event: response.failed").count(), 1);
     assert_eq!(delivered.matches("upstream request failed").count(), 1);
     upstream.await.unwrap();
     wait_for_request_settlement(&fixture, 1).await;
