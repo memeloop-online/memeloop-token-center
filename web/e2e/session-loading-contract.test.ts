@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import { defaultRequestRefreshInterval } from '../src/operator/traffic/requestRefresh.js';
+import { sessionEventRefreshDelayMs } from '../src/operator/sessionRefresh.js';
 
 const source = await readFile(new URL('../src/operator/SessionMonitor.tsx', import.meta.url), 'utf8');
 const list = source.slice(source.indexOf('async function loadSessions'), source.indexOf('async function selectSession'));
@@ -37,14 +39,23 @@ test('initial list work and SSE refreshes do not overlap and amplify slow databa
   assert.match(source, /const listLoaded = await loadSessions\(false, filtersRef\.current, true\);\s*if \(!listLoaded \|\| generation !== scopeGeneration\.current \|\| !autoRefreshRef\.current\) return/);
 });
 
-test('live refresh is explicitly opt-in, rate-limited and does not interrupt detail reads', () => {
+test('live refresh is explicitly opt-in, while session invalidation stays below the traffic render cadence', async () => {
+  const operator = await readFile(new URL('../src/operator/hooks/useOperatorRequestStream.ts', import.meta.url), 'utf8');
+  const operatorPage = await readFile(new URL('../src/operator/Operator.tsx', import.meta.url), 'utf8');
   assert.match(source, /\[autoRefresh, setAutoRefresh\] = useState\(false\)/);
   assert.match(source, /if \(!autoRefreshRef\.current \|\| refreshTimer/);
-  assert.match(source, /}, 3_000\)/);
+  assert.ok(sessionEventRefreshDelayMs <= 500, 'terminal session invalidation must settle within 500ms');
+  assert.equal(defaultRequestRefreshInterval, 5_000, 'request-table rendering retains its default 5-second cadence');
+  assert.match(source, /}, sessionEventRefreshDelayMs\)/);
+  assert.match(operator, /if \(this\.listeners\.size === 0\) return;/, 'unmounted Sessions never accumulates raw events');
+  assert.match(operator, /enqueueSessionEventIdentity\(this\.eventKeyIds\.current, event\);\s*this\.revision \+= 1;/);
+  assert.match(operator, /batch\.current\?\.enqueue\(event\)/, 'traffic events remain on the bounded request batch');
+  assert.match(operatorPage, /sessionEvents=\{stream\.sessionEvents\}/, 'Sessions owns the prompt event subscription');
   assert.match(source, /checked=\{autoRefresh\}/);
   assert.match(source, /<Checkbox checked=\{autoRefresh\}/);
   assert.match(source, /<Button appearance="secondary" disabled=\{loading \|\| refreshing \|\| detailLoading\}/);
-  assert.match(source, /if \(!session \|\| detailInFlight\.current\) return/);
+  assert.match(source, /if \(detailInFlight\.current\) \{ detailRefreshDirty\.current = true; return; \}/, 'detail overlap remains dirty until it settles');
+  assert.match(source, /for \(const event of batchDetailEvents\) dirtyDetailEvents\.current\.add\(event\);/, 'overlapping batch events are retained');
   assert.match(source, /sessions\.refreshNow/);
 });
 

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type RefObject } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { api } from '../../api.js';
 import { DrawerFrame } from '../../components.js';
 import { useI18n } from '../../i18n.js';
@@ -6,17 +6,18 @@ import type { RequestDetail, RequestView } from '../../types.js';
 import { LatestRequestGate, SessionMonitor, type SessionFocus } from '../SessionMonitor.js';
 import { messageOf, queryForTenant } from '../scope/operatorShared.js';
 import type { SessionStreamState } from '../SessionMonitor.js';
+import type { SessionEventChannel } from '../hooks/useOperatorRequestStream.js';
 
-export function SessionsPage({ token, tenant, focus, revision, eventKeyIds, streamState, streamError, onOpenRequests }: {
+export function SessionsPage({ token, tenant, focus, sessionEvents, streamState, streamError, onOpenRequests }: {
   token: string;
   tenant: string;
   focus?: SessionFocus;
-  revision: number;
-  eventKeyIds: RefObject<Set<string>>;
+  sessionEvents: SessionEventChannel;
   streamState: SessionStreamState;
   streamError: string;
   onOpenRequests: () => void;
 }) {
+  const revision = useSyncExternalStore(sessionEvents.subscribe, sessionEvents.snapshot);
   const { t } = useI18n();
   const scopeKey = `${tenant}\0${token}`;
   const [detail, setDetail] = useState<RequestDetail>();
@@ -77,7 +78,7 @@ export function SessionsPage({ token, tenant, focus, revision, eventKeyIds, stre
         token={token}
         tenant={tenant}
         revision={revision}
-        eventKeyIds={eventKeyIds}
+        eventKeyIds={sessionEvents.eventKeyIds}
         focus={focus}
         streamState={streamState}
         onSelectRequest={selectRequest}

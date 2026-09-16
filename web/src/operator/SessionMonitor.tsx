@@ -7,7 +7,7 @@ import { SessionDetailSurface, SessionList } from '../SessionViews.js';
 import { SessionCredentialFilter } from './SessionCredentialFilter.js';
 import {
   drainSessionEventIdentities, mergeSessionPage, sessionEventsRequireDetailRefresh, sessionEventTargetsSelection,
-  sessionIdentityKey,
+  sessionEventRefreshDelayMs, sessionIdentityKey,
 } from './sessionRefresh.js';
 import { LatestRequestGate } from './latestRequestGate.js';
 import type {
@@ -111,6 +111,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
   const refreshInFlight = useRef(false);
   const dirtyEventIdentities = useRef(new Set<string>());
   const dirtyDetailEvents = useRef(new Set<string>());
+  const detailRefreshDirty = useRef(false);
   const scopeGeneration = useRef(0);
   const filtersRef = useRef(filters);
   const selectedRef = useRef<LogicalSessionSummary | undefined>(selected);
@@ -218,12 +219,13 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
         setErrorScope(requestScope);
       }
     } finally {
-      if (request.isCurrent()) { detailInFlight.current = false; setDetailLoading(false); }
+      if (request.isCurrent()) { detailInFlight.current = false; setDetailLoading(false); if (detailRefreshDirty.current) scheduleRefresh(); }
     }
   }
 
   async function refreshSelected(session = selectedRef.current) {
-    if (!session || detailInFlight.current) return;
+    if (!session) return false;
+    if (detailInFlight.current) { detailRefreshDirty.current = true; return false; }
     const request = detailRequests.current.begin();
     detailInFlight.current = true;
     const requestScope = scopeKey;
@@ -231,7 +233,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       const page = await apiRead<LogicalSessionDetail>(detailPath(tenant, session), token.trim(), {
         attempts: 3, attemptTimeoutMilliseconds: 15_000, totalTimeoutMilliseconds: 15_000, signal: request.signal,
       });
-      if (!request.isCurrent()) return;
+      if (!request.isCurrent()) return false;
       setDetail((latest) => {
         if (!latest) return page;
         if (latest.session_id !== page.session_id) return latest;
@@ -250,13 +252,15 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
         };
       });
       setDetailScope(requestScope);
+      return true;
     } catch (reason) {
       if (request.isCurrent()) {
         setError(messageOf(reason, t('sessions.detailFailed')));
         setErrorScope(requestScope);
       }
+      return false;
     } finally {
-      if (request.isCurrent()) { detailInFlight.current = false; setDetailLoading(false); }
+      if (request.isCurrent()) { detailInFlight.current = false; setDetailLoading(false); if (detailRefreshDirty.current) scheduleRefresh(); }
     }
   }
 
@@ -292,7 +296,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
         setErrorScope(requestScope);
       }
     } finally {
-      if (request.isCurrent()) { detailInFlight.current = false; setDetailLoading(false); }
+      if (request.isCurrent()) { detailInFlight.current = false; setDetailLoading(false); if (detailRefreshDirty.current) scheduleRefresh(); }
     }
   }
 
@@ -307,26 +311,40 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       if (generation !== scopeGeneration.current || !autoRefreshRef.current) return;
       refreshInFlight.current = true;
       refreshDirty.current = false;
+      const batchEventIdentities = new Set(dirtyEventIdentities.current);
       dirtyEventIdentities.current.clear();
       const batchDetailEvents = new Set(dirtyDetailEvents.current);
       dirtyDetailEvents.current.clear();
       const selectedAtBatchStart = selectedRef.current;
       const selectedIdentity = selectedAtBatchStart ? sessionIdentityKey(selectedAtBatchStart) : undefined;
+      const restoreBatch = () => {
+        refreshDirty.current = true;
+        for (const identity of batchEventIdentities) dirtyEventIdentities.current.add(identity);
+        for (const identity of batchDetailEvents) dirtyDetailEvents.current.add(identity);
+      };
       const refresh = async () => {
         const listLoaded = await loadSessions(false, filtersRef.current, true);
-        if (!listLoaded || generation !== scopeGeneration.current || !autoRefreshRef.current) return;
+        if (generation !== scopeGeneration.current || !autoRefreshRef.current) return;
+        if (!listLoaded) { restoreBatch(); return; }
         const latestSelection = selectedRef.current;
         if (selectedAtBatchStart && latestSelection && sessionIdentityKey(latestSelection) === selectedIdentity
           && sessionEventsRequireDetailRefresh(batchDetailEvents, latestSelection, detailRef.current)) {
-          await refreshSelected(selectedAtBatchStart);
+          if (detailInFlight.current) {
+            for (const event of batchDetailEvents) dirtyDetailEvents.current.add(event);
+            detailRefreshDirty.current = true;
+            refreshDirty.current = true;
+            return;
+          }
+          detailRefreshDirty.current = false;
+          if (!await refreshSelected(selectedAtBatchStart)) restoreBatch();
         }
       };
       void refresh().finally(() => {
         if (generation !== scopeGeneration.current) return;
         refreshInFlight.current = false;
-        if (refreshDirty.current || dirtyEventIdentities.current.size > 0) scheduleRefresh();
+        if (!detailInFlight.current && (refreshDirty.current || dirtyEventIdentities.current.size > 0)) scheduleRefresh();
       });
-    }, 3_000);
+    }, sessionEventRefreshDelayMs);
   }
 
   useEffect(() => {
@@ -351,6 +369,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     refreshInFlight.current = false;
     dirtyEventIdentities.current.clear();
     dirtyDetailEvents.current.clear();
+    detailRefreshDirty.current = false;
     listSequence.current += 1;
     listRequests.current.invalidate();
     listInFlight.current = false;
@@ -375,6 +394,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       refreshInFlight.current = false;
       dirtyEventIdentities.current.clear();
       dirtyDetailEvents.current.clear();
+      detailRefreshDirty.current = false;
       listSequence.current += 1;
       listRequests.current.invalidate();
       listInFlight.current = false;
