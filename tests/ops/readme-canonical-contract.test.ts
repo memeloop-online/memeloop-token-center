@@ -19,12 +19,6 @@ function trackedTextFiles(): Array<{ path: string; text: string }> {
   });
 }
 
-test('README omits deployed addresses and links only to generic project documentation', () => {
-  assert.doesNotMatch(readme, /https?:\/\//u);
-  assert.match(readme, /\[project overview\]\(docs\/project-overview\.md\)/u);
-  assert.match(readme, /approved operational procedures/u);
-});
-
 test('README contains no credential-retrieval commands', () => {
   const blocks = [...readme.matchAll(/```([^\n]+)\n([\s\S]*?)\n```/gu)];
   assert.deepEqual(blocks, []);

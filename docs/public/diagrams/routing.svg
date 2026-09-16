@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 420" role="img" aria-labelledby="title desc">
+  <title id="title">Model routing authorization</title>
+  <desc id="desc">A client credential grants access to routes. Routes select direct accounts or provider groups. Explicit exclusions take precedence. Health and model compatibility determine dispatch candidates.</desc>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0 0 6 3 0 6" fill="none" stroke="#64748b"/></marker></defs>
+  <rect width="560" height="420" rx="20" fill="#f8fafc"/>
+  <g fill="#e0f2fe" stroke="#bae6fd"><rect x="160" y="24" width="240" height="54" rx="12"/><rect x="160" y="116" width="240" height="54" rx="12"/><rect x="32" y="218" width="230" height="58" rx="12"/><rect x="298" y="218" width="230" height="58" rx="12"/><rect x="120" y="348" width="320" height="48" rx="12"/></g>
+  <g fill="#0f172a" font-family="system-ui,sans-serif" font-size="17" text-anchor="middle"><text x="280" y="57">Client credential</text><text x="280" y="149">Authorized model routes</text><text x="147" y="253">Direct accounts</text><text x="413" y="253">Provider groups</text><text x="280" y="378">Dispatch candidates</text></g>
+  <g fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"><path d="M280 78v32"/><path d="M230 170v22H147v20"/><path d="M330 170v22h83v20"/><path d="M147 276v28h133v38"/><path d="M413 276v28H280"/></g>
+  <g fill="#475569" font-family="system-ui,sans-serif" font-size="14" text-anchor="middle"><text x="280" y="100">Route or route-group grant</text><text x="280" y="328">Exclusions → health → model compatibility</text></g>
+</svg>

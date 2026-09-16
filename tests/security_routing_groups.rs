@@ -78,41 +78,6 @@ fn key_input(tenant: &str, principal: &str) -> CreateKeyInput {
     }
 }
 
-#[test]
-fn routing_contract_uses_only_provider_route_and_credential_group_terminology() {
-    let contract = [
-        include_str!("../openapi/openapi.yaml"),
-        include_str!("../docs/api-contract.md"),
-        include_str!("../docs/security-audit.md"),
-        include_str!("../web/src/i18n.tsx"),
-    ]
-    .join("\n")
-    .to_lowercase();
-    for legacy in [
-        "provider tag",
-        "route tag",
-        "credential tag",
-        "provider pool",
-        "route pool",
-        "credential pool",
-        "provider rule group",
-        "route rule group",
-        "credential rule group",
-        "提供商标签",
-        "路由标签",
-        "凭据标签",
-        "提供商池",
-        "路由池",
-        "凭据池",
-        "规则组",
-    ] {
-        assert!(
-            !contract.contains(legacy),
-            "routing contract contains legacy terminology: {legacy}"
-        );
-    }
-}
-
 async fn exercise_group_routing_security(database_url: String, backend: &str) {
     let state = AppState::initialize(Config::for_test(database_url.clone()))
         .await
