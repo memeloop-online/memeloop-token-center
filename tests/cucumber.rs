@@ -92,6 +92,7 @@ struct TokenCenterWorld {
     synchronous_response_body: Vec<u8>,
     synchronous_response_content_length: Option<usize>,
     provider_asset_reads_repeatable: bool,
+    provider_asset_repeatability_declared: bool,
 }
 
 impl Default for TokenCenterWorld {
@@ -143,6 +144,7 @@ impl Default for TokenCenterWorld {
             synchronous_response_body: Vec::new(),
             synchronous_response_content_length: None,
             provider_asset_reads_repeatable: true,
+            provider_asset_repeatability_declared: true,
         }
     }
 }
@@ -539,9 +541,55 @@ async fn mock_siliconflow_video_generation(world: &mut TokenCenterWorld) {
     world.asset_mock = Some(asset_server);
 }
 
+#[given("the mock SiliconFlow upstream returns an undeclared one-use video URL")]
+async fn mock_siliconflow_one_use_video_generation(world: &mut TokenCenterWorld) {
+    world.provider_asset_repeatability_declared = false;
+    let asset_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/one-use.mp4"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "video/mp4")
+                .set_body_bytes(b"one-use-video"),
+        )
+        .expect(0)
+        .mount(&asset_server)
+        .await;
+    let asset_url = asset_server.uri();
+    let server = world.mock.as_ref().expect("mock server");
+    Mock::given(method("POST"))
+        .and(path("/v1/video/submit"))
+        .and(header("authorization", "Bearer siliconflow-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"requestId": "sf-one-use"})))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/video/status"))
+        .and(header("authorization", "Bearer siliconflow-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "Succeed",
+            "results": {"videos": [{"url": format!("{asset_url}/one-use.mp4?token=must-not-leak")}]}
+        })))
+        .mount(server)
+        .await;
+    world.asset_mock = Some(asset_server);
+}
+
 #[when("the service creates a job-priced SiliconFlow video route and key")]
 async fn create_siliconflow_video_route_and_key(world: &mut TokenCenterWorld) {
     let mock_url = world.mock.as_ref().expect("mock server").uri();
+    let mut provider_config = json!({
+        "base_url": format!("{mock_url}/v1"),
+        "network_scope": "private",
+        "video_api": "siliconflow-v1",
+        "video_models": ["Wan-AI/Wan2.2-T2V-A14B"],
+        "result_origins": [world.asset_mock.as_ref().expect("asset mock").uri()]
+    });
+    if world.provider_asset_repeatability_declared {
+        provider_config["provider_asset_reads_repeatable"] =
+            json!(world.provider_asset_reads_repeatable);
+    }
     let response = world
         .client
         .post(format!("{}/internal/v1/upstreams", world.service_url))
@@ -549,13 +597,7 @@ async fn create_siliconflow_video_route_and_key(world: &mut TokenCenterWorld) {
         .json(&json!({
             "name": "siliconflow-shared-account",
             "driver": "http-json",
-            "config": {
-                "base_url": format!("{mock_url}/v1"),
-                "network_scope": "private",
-                "video_api": "siliconflow-v1",
-                "video_models": ["Wan-AI/Wan2.2-T2V-A14B"],
-                "result_origins": [world.asset_mock.as_ref().expect("asset mock").uri()]
-            },
+            "config": provider_config,
             "credential": {"type": "api_key", "value": "siliconflow-secret"}
         }))
         .send()
@@ -772,6 +814,27 @@ async fn siliconflow_video_succeeds(world: &mut TokenCenterWorld) {
     panic!(
         "SiliconFlow generation did not complete: {}",
         world.response
+    );
+}
+
+#[then("the undeclared one-use video fails uncharged without a validation GET")]
+async fn siliconflow_one_use_video_fails_unconsumed(world: &mut TokenCenterWorld) {
+    assert_generation_failure_is_sanitized_and_refunded(
+        world,
+        "generation_asset_unavailable",
+        &["must-not-leak", "one-use.mp4"],
+    )
+    .await;
+    let requests = world
+        .asset_mock
+        .as_ref()
+        .expect("one-use asset mock")
+        .received_requests()
+        .await
+        .expect("one-use asset request recording");
+    assert!(
+        requests.is_empty(),
+        "one-use asset URL must not be consumed"
     );
 }
 
@@ -3019,6 +3082,31 @@ async fn mock_malformed_openai_image_ranges(world: &mut TokenCenterWorld) {
         .await;
     Mock::given(method("GET"))
         .and(path("/generated/malformed-range.png"))
+        .and(header("range", "bytes=7-7"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-range", "bytes 7-7/13")
+                .insert_header("content-length", "1")
+                .set_body_bytes(b"xy"),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/generated/malformed-range.png"))
+        .and(header("range", "bytes=999-1000"))
+        .respond_with(
+            ResponseTemplate::new(416)
+                .insert_header("content-range", "bytes */1001")
+                .set_body_bytes(Vec::<u8>::new()),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/generated/malformed-range.png"))
         .respond_with(
             ResponseTemplate::new(206)
                 .insert_header("content-range", "bytes 0-12/13")
@@ -4001,6 +4089,31 @@ async fn malformed_provider_ranges_are_rejected(world: &mut TokenCenterWorld) {
     } else {
         assert_eq!(short.status(), StatusCode::BAD_GATEWAY);
     }
+    let oversized = world
+        .client
+        .get(&asset_url)
+        .bearer_auth(&world.current_key)
+        .header("range", "bytes=7-7")
+        .send()
+        .await
+        .expect("oversized provider range response");
+    if oversized.status() == StatusCode::PARTIAL_CONTENT {
+        assert!(
+            oversized.bytes().await.is_err(),
+            "oversized provider body must fail closed"
+        );
+    } else {
+        assert_eq!(oversized.status(), StatusCode::BAD_GATEWAY);
+    }
+    let invalid_416 = world
+        .client
+        .get(&asset_url)
+        .bearer_auth(&world.current_key)
+        .header("range", "bytes=999-1000")
+        .send()
+        .await
+        .expect("invalid provider 416 response");
+    assert_eq!(invalid_416.status(), StatusCode::BAD_GATEWAY);
 }
 
 /// A malformed successful POST cannot prove that the provider did not charge.

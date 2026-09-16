@@ -154,7 +154,7 @@ impl ProviderCatalog {
                 },
                 "provider_asset_reads_repeatable": {
                     "type": "boolean",
-                    "default": true,
+                    "default": false,
                     "description": "Whether generated-asset GET URLs remain usable after a bounded validation GET. Set false for one-use URLs."
                 },
                 "image_main_model": {
@@ -279,7 +279,7 @@ impl ProviderCatalog {
             generation_adapter: Some(GenerationAdapterContribution {
                 api_version: "generation-adapter-v1".to_owned(),
                 provable_submit_idempotency: false,
-                provider_asset_reads_repeatable: true,
+                provider_asset_reads_repeatable: false,
             }),
             source: "builtin".to_owned(),
         }];

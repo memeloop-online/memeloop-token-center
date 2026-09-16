@@ -90,7 +90,7 @@ pub(super) fn provider_type(credential_schema: Value) -> ProviderType {
         generation_adapter: Some(super::catalog::GenerationAdapterContribution {
             api_version: "generation-adapter-v1".to_owned(),
             provable_submit_idempotency: false,
-            provider_asset_reads_repeatable: true,
+            provider_asset_reads_repeatable: false,
         }),
         source: "builtin".to_owned(),
     }

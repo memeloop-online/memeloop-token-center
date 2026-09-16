@@ -472,13 +472,25 @@ fn builtin_http_json_exposes_only_the_fixed_siliconflow_video_profile() {
         .pointer("/properties/video_api")
         .expect("video API profile schema");
     assert_eq!(video_api["enum"], json!(["siliconflow-v1"]));
+    assert_eq!(
+        http_json.config_schema["properties"]["provider_asset_reads_repeatable"]["default"],
+        false
+    );
+    assert!(
+        !http_json
+            .generation_adapter
+            .as_ref()
+            .unwrap()
+            .provider_asset_reads_repeatable
+    );
     crate::schema::validate_instance(
         &http_json.config_schema,
         &json!({
             "base_url": "https://api.siliconflow.cn/v1",
             "video_api": "siliconflow-v1",
             "video_models": ["Wan-AI/Wan2.2-T2V-A14B"],
-            "result_origins": ["https://s3.siliconflow.cn"]
+            "result_origins": ["https://s3.siliconflow.cn"],
+            "provider_asset_reads_repeatable": true
         }),
     )
     .unwrap();

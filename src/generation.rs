@@ -740,18 +740,20 @@ fn generation_driver_capabilities(state: &AppState, driver: &str) -> GenerationD
 }
 
 fn provider_asset_reads_repeatable(state: &AppState, route: &ResolvedUpstream) -> bool {
-    let provider_default = state
+    let Some(provider_default) = state
         .providers
         .get(&route.driver)
         .and_then(|provider| provider.generation_adapter.as_ref())
         .filter(|adapter| adapter.api_version == "generation-adapter-v1")
-        .is_some_and(|adapter| adapter.provider_asset_reads_repeatable);
-    provider_default
-        && route
-            .config
-            .get("provider_asset_reads_repeatable")
-            .and_then(Value::as_bool)
-            .unwrap_or(true)
+        .map(|adapter| adapter.provider_asset_reads_repeatable)
+    else {
+        return false;
+    };
+    route
+        .config
+        .get("provider_asset_reads_repeatable")
+        .and_then(Value::as_bool)
+        .unwrap_or(provider_default)
 }
 
 fn apply_workflow_parameters(
