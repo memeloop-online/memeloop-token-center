@@ -50,7 +50,7 @@ function GroupedFixture() {
   return <main style={{ padding: 16, maxWidth: 1100, margin: 'auto' }}>
     <h1>Grant preview</h1>
     <CredentialRouteAuthorization token="fixture" tenant="fixture" routes={entries} groups={groups} routeIds={ids} groupIds={groupIds} onRoutes={setIds} onGroups={setGroupIds} />
-    <output data-testid="grant-ids">{JSON.stringify({ ids, groupIds })}</output>
+    <output data-testid="grant-ids" style={{ overflowWrap: 'anywhere' }}>{JSON.stringify({ ids, groupIds })}</output>
   </main>;
 }
 createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider>{new URLSearchParams(location.search).has('grouped') ? <GroupedFixture /> : <Fixture />}</MtcFluentProvider></I18nProvider>);
