@@ -281,17 +281,11 @@ impl UpstreamAttemptGuard {
                     )
                     .await
             } else {
-                let Some(failure_epoch) = self.failure_epoch else {
-                    return Ok(false);
-                };
-                state
-                    .db
-                    .record_upstream_account_success(
-                        self.upstream_account_id,
-                        self.credential_generation,
-                        failure_epoch,
-                    )
-                    .await
+                // Healthy admissions keep their cohort fence until complete
+                // protocol and usage validation. Partial delivery can still
+                // end in a terminal invalid response, which must retain the
+                // original epoch so that failure remains authoritative.
+                Ok(false)
             }
         };
         match tokio::time::timeout(std::time::Duration::from_millis(250), recovery).await {

@@ -121,6 +121,22 @@ async fn incomplete_error_invalid_usage_and_out_of_budget_usage_remain_unobserve
         );
         assert_eq!(rows[0].cost, "0", "{defect}");
         assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+        let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+        let health = sqlx::query(
+            "SELECT consecutive_failures, last_failure_kind
+             FROM upstream_account_health WHERE upstream_account_id = $1",
+        )
+        .bind(fixture.upstream_account_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(health.get::<i64, _>("consecutive_failures"), 1, "{defect}");
+        assert_eq!(
+            health.get::<String, _>("last_failure_kind"),
+            "invalid_response",
+            "{defect}"
+        );
+        pool.close().await;
         upstream.verify().await;
     }
 }
