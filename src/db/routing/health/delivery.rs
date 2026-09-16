@@ -71,6 +71,42 @@ mod tests {
                 .await
                 .unwrap()
         );
+        let UpstreamAttemptAdmission::Healthy {
+            failure_epoch: delivered_epoch,
+        } = database
+            .claim_upstream_account_attempt(account, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("delivered probe must publish a healthy cohort");
+        };
+        assert_eq!(delivered_epoch, first);
+        assert!(
+            !database
+                .release_upstream_account_probe(account, 1, first)
+                .await
+                .unwrap(),
+            "the old owner's inconclusive release cannot clear a delivered healthy cohort"
+        );
+        assert!(
+            database
+                .record_admitted_upstream_account_failure(
+                    account,
+                    1,
+                    UpstreamFailureKind::Connection,
+                    UpstreamHealthConfig::DEFAULT,
+                    delivered_epoch,
+                )
+                .await
+                .unwrap(),
+            "the delivered cohort fence must remain authoritative after the old owner exits"
+        );
+        assert!(
+            database
+                .record_upstream_account_success(account, 1, delivered_epoch)
+                .await
+                .unwrap()
+        );
         let (a, b, c, renewal) = tokio::join!(
             database.claim_upstream_account_attempt(account, 1),
             database.claim_upstream_account_attempt(account, 1),
@@ -78,7 +114,7 @@ mod tests {
             database.renew_upstream_account_probe(account, 1, first),
         );
         for admitted in [a, b, c] {
-            assert_eq!(admitted.unwrap(), UpstreamAttemptAdmission::Healthy);
+            assert!(admitted.unwrap().is_healthy());
         }
         assert!(
             !renewal.unwrap(),
@@ -188,12 +224,12 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert_eq!(
+        assert!(
             database
                 .claim_upstream_account_attempt(account, 2)
                 .await
-                .unwrap(),
-            UpstreamAttemptAdmission::Healthy
+                .unwrap()
+                .is_healthy()
         );
         sqlx::query("DELETE FROM upstream_accounts WHERE id = $1")
             .bind(account.to_string())
@@ -285,14 +321,14 @@ mod tests {
                 .unwrap(),
             "the original owner cannot recreate health after shared success won"
         );
-        let rows: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+        let failures: i64 = sqlx::query_scalar(
+            "SELECT consecutive_failures FROM upstream_account_health WHERE upstream_account_id = $1",
         )
         .bind(account.to_string())
         .fetch_one(&database.pool)
         .await
         .unwrap();
-        assert_eq!(rows, 0);
+        assert_eq!(failures, 0);
         database.close().await;
     }
 

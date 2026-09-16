@@ -70,7 +70,8 @@ async fn ordinary_client_error_does_not_cool_down_a_shared_account() {
         .unwrap();
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let health_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+        "SELECT COUNT(*) FROM upstream_account_health
+         WHERE upstream_account_id = $1 AND consecutive_failures > 0",
     )
     .bind(fixture.accounts[0].to_string())
     .fetch_one(&pool)
@@ -115,7 +116,8 @@ async fn codex_retries_one_pre_delivery_connection_failure_before_breaker_accoun
     wait_for_request_settlement(&fixture, 1).await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let health_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+        "SELECT COUNT(*) FROM upstream_account_health
+         WHERE upstream_account_id = $1 AND consecutive_failures > 0",
     )
     .bind(fixture.upstream_account_id.to_string())
     .fetch_one(&pool)
@@ -200,7 +202,8 @@ async fn ambiguous_codex_response_does_not_open_the_shared_account_breaker() {
     );
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let health_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+        "SELECT COUNT(*) FROM upstream_account_health
+         WHERE upstream_account_id = $1 AND consecutive_failures > 0",
     )
     .bind(fixture.upstream_account_id.to_string())
     .fetch_one(&pool)
@@ -434,7 +437,8 @@ async fn valid_settled_sse_probe_recovers_the_account() {
     }
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let health_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+        "SELECT COUNT(*) FROM upstream_account_health
+         WHERE upstream_account_id = $1 AND consecutive_failures > 0",
     )
     .bind(fixture.upstream_account_id.to_string())
     .fetch_one(&pool)

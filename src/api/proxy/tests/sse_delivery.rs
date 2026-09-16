@@ -74,7 +74,8 @@ async fn dropping_downstream_body_records_client_cancelled_without_poisoning_ups
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let health_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+        "SELECT COUNT(*) FROM upstream_account_health
+         WHERE upstream_account_id = $1 AND consecutive_failures > 0",
     )
     .bind(fixture.upstream_account_id.to_string())
     .fetch_one(&pool)
@@ -143,7 +144,8 @@ async fn assert_delivery_database_fault(stage: &str, target_state: &str) {
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let health_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+        "SELECT COUNT(*) FROM upstream_account_health
+         WHERE upstream_account_id = $1 AND consecutive_failures > 0",
     )
     .bind(fixture.upstream_account_id.to_string())
     .fetch_one(&pool)

@@ -26,7 +26,7 @@ async fn invariants(database: &Database, peer: &Database) {
             .unwrap()
             .is_none()
     );
-    assert_eq!(
+    assert!(
         database
             .claim_upstream_account_attempt_with_strategy(
                 tenant,
@@ -38,8 +38,8 @@ async fn invariants(database: &Database, peer: &Database) {
                 false
             )
             .await
-            .unwrap(),
-        UpstreamAttemptAdmission::Healthy
+            .unwrap()
+            .is_healthy()
     );
 
     for kind in [

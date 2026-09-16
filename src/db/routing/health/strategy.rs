@@ -84,6 +84,7 @@ impl Database {
         cooldown_override_ms: Option<u64>,
         transient_only: bool,
     ) -> Result<UpstreamAttemptAdmission, AppError> {
+        let now = unix_millis();
         let unavailable = |cooldown_until, probe_lease_until, transient_wait_eligible| {
             UpstreamAttemptAdmission::Unavailable {
                 cooldown_until,
@@ -99,12 +100,22 @@ impl Database {
             return Ok(unavailable(0, 0, false));
         };
         if snapshot.consecutive_failures == 0 {
-            return Ok(UpstreamAttemptAdmission::Healthy);
+            return Ok(
+                match self
+                    .ensure_healthy_admission_epoch(upstream_account_id, credential_generation, now)
+                    .await?
+                {
+                    Some(failure_epoch) => UpstreamAttemptAdmission::Healthy { failure_epoch },
+                    None => unavailable(0, 0, true),
+                },
+            );
         }
-        let now = unix_millis();
         let transient = snapshot.is_transient();
         let cooldown = snapshot.effective_cooldown_until(cooldown_override_ms);
-        let wait_eligible = transient && allow_transient_probe;
+        let wait_eligible = matches!(
+            snapshot.last_failure_kind.as_str(),
+            "connection" | "unavailable"
+        ) && allow_transient_probe;
         if cooldown > now
             || snapshot.probe_lease_until > now
             || (transient && !allow_transient_probe)

@@ -383,7 +383,8 @@ async fn header_application_expiry_skips_to_standby_without_breaker_failure() {
     .await
     .unwrap();
     let primary_failure_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+        "SELECT COUNT(*) FROM upstream_account_health
+         WHERE upstream_account_id = $1 AND consecutive_failures > 0",
     )
     .bind(fixture.upstream_account_id.to_string())
     .fetch_one(&pool)

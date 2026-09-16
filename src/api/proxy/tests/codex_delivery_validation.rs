@@ -49,7 +49,8 @@ async fn codex_2xx_non_sse_is_ambiguous_and_never_crosses_accounts() {
     .unwrap();
     assert_eq!(actual, fixture.upstream_account_id.to_string());
     let health_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+        "SELECT COUNT(*) FROM upstream_account_health
+         WHERE upstream_account_id = $1 AND consecutive_failures > 0",
     )
     .bind(fixture.upstream_account_id.to_string())
     .fetch_one(&pool)
@@ -366,8 +367,14 @@ async fn streaming_codex_rejects_usage_without_canonical_total_after_delivery() 
     let upstream = MockServer::start().await;
     let body = concat!(
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-missing-total\"}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"delivered before invalid usage\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,",
+        "\"item\":{\"id\":\"item-missing-total\",\"type\":\"message\",\"role\":\"assistant\",",
+        "\"content\":[{\"type\":\"output_text\",\"text\":\"delivered before invalid usage\"}]}}\n\n",
         "data: {\"type\":\"response.completed\",\"response\":{",
-        "\"id\":\"resp-missing-total\",\"output\":[],",
+        "\"id\":\"resp-missing-total\",\"output\":[{\"id\":\"item-missing-total\",",
+        "\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",",
+        "\"text\":\"delivered before invalid usage\"}]}],",
         "\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
         "data: [DONE]\n\n"
     );
@@ -386,9 +393,13 @@ async fn streaming_codex_rejects_usage_without_canonical_total_after_delivery() 
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
+    assert!(
+        String::from_utf8_lossy(&body).contains("delivered before invalid usage"),
+        "billable output must reach the downstream before terminal validation"
+    );
     wait_for_request_settlement(&fixture, 1).await;
     let rows = fixture
         .state
@@ -403,6 +414,21 @@ async fn streaming_codex_rejects_usage_without_canonical_total_after_delivery() 
         Some("upstream_invalid_usage")
     );
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let health = sqlx::query(
+        "SELECT consecutive_failures, last_failure_kind
+         FROM upstream_account_health WHERE upstream_account_id = $1",
+    )
+    .bind(fixture.upstream_account_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(health.get::<i64, _>("consecutive_failures"), 1);
+    assert_eq!(
+        health.get::<String, _>("last_failure_kind"),
+        "invalid_response"
+    );
+    pool.close().await;
     upstream.verify().await;
 }
 

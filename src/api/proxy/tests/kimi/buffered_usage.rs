@@ -76,7 +76,9 @@ async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_origina
         fixture.route_id,
         fixture.upstream_account_id,
         1,
-        UpstreamAttemptAdmission::Healthy,
+        UpstreamAttemptAdmission::Healthy {
+            failure_epoch: Uuid::now_v7(),
+        },
         None,
     );
     let raw = reqwest::Client::new()
