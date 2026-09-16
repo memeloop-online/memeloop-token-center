@@ -270,9 +270,9 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     assert.match(await ceiling.locator('[data-rate="average"]').innerText(), /Average TPS\s+—/);
     assert.match(await ceiling.locator('[data-rate="generation"]').innerText(), /Gateway output rate\s+—/);
     assert.doesNotMatch(await ceiling.innerText(), /8,?560\.91/);
-    const unknownCost = ceiling.getByLabel('Cost unknown', { exact: true });
-    assert.equal(await unknownCost.innerText(), '—');
-    await unknownCost.focus();
+    const reviewCost = ceiling.getByLabel('Review required', { exact: true });
+    assert.equal(await reviewCost.innerText(), '—');
+    await reviewCost.focus();
     const ledgerTip = page.getByRole('tooltip').filter({ hasText: 'Local ledger amount:' });
     await ledgerTip.waitFor();
     assert.match(await ledgerTip.innerText(), /0\.001234/, 'the original local ledger amount remains inspectable, never rewritten to free');

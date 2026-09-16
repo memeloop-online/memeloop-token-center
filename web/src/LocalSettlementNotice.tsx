@@ -12,7 +12,7 @@ export function localSettlementTrendLabel(locale: Locale) {
 export function LocalSettlementNotice() {
   const { locale } = useI18n();
   const detail = locale === 'zh-CN'
-    ? '这是本地账本已确认的结算合计，可能包含保守上限结算，且部分历史用量来源未记录；不是供应商实际消耗或发票。失败且标为“未观测用量”的请求在请求与会话明细中按 0 显示。缺口数量按终态请求中 usage_basis=not_observed 的请求数统计。'
-    : 'This is the confirmed local-ledger settlement total and may include conservative ceiling settlements or historical rows without usage provenance; it is not supplier consumption or an invoice. Failed requests marked “Usage not observed” display as 0 in request and session details. The gap count is the number of terminal requests with usage_basis=not_observed.';
+    ? '这是本地账本已确认的结算合计，可能包含保守上限结算，且部分历史用量来源未记录；供应商实际用量或发票请以供应商记录为准。失败且标为“未观测用量”的请求在请求与会话明细中按 0 显示。缺口数量按终态请求中 usage_basis=not_observed 的请求数统计。'
+    : 'This is the confirmed local-ledger settlement total and may include conservative ceiling settlements or historical rows without usage provenance; use provider records for actual usage or invoice details. Failed requests marked “Usage not observed” display as 0 in request and session details. The gap count is the number of terminal requests with usage_basis=not_observed.';
   return <DetailTooltip content={detail}><span tabIndex={0}>{localSettlementLabel(locale)} ⓘ</span></DetailTooltip>;
 }

@@ -33,11 +33,22 @@ test('generation TPS requires observed output interval and does not relabel tota
   assert.equal(generationRequestOutputTps({ ...timed, generation_duration_ms: 1 }), 32000, 'no arbitrary high-rate threshold masks an otherwise recorded gateway interval');
 });
 
-test('unreliable failed usage and cost remain unknown without erasing reported settlements', () => {
+test('failed requests use policy zero only for unobserved usage and preserve reported settlements', () => {
+  for (const status_code of [499, 502, 503] as const) {
+    const failed = { ...request, status_code, usage_basis: 'not_observed' as const, cost: '35' };
+    assert.equal(requestUsageIsActual(failed), false);
+    assert.equal(requestCostCopy(failed, 'en').unknown, false);
+    assert.equal(requestDisplayedCost(failed), '0');
+  }
+  const cancelled = { ...request, status_code: 200, error_code: 'client_cancelled', usage_basis: 'not_observed' as const, cost: '35' };
+  assert.equal(requestUsageIsActual(cancelled), false);
+  assert.equal(requestDisplayedCost(cancelled), '0');
   for (const usage_basis of [undefined, null, 'provider_estimated', 'contract_ceiling'] as const) {
     const failed = { ...request, status_code: 499, usage_basis, cost: '35' };
     assert.equal(requestUsageIsActual(failed), false);
     assert.equal(requestCostCopy(failed, 'en').unknown, true);
+    assert.equal(requestCostCopy(failed, 'en').label, 'Review required');
+    assert.equal(requestDisplayedCost(failed), '35');
     assert.equal(failed.cost, '35');
   }
   const unobserved = { ...request, status_code: 499, usage_basis: 'not_observed' as const, cost: '35' };
@@ -50,6 +61,7 @@ test('unreliable failed usage and cost remain unknown without erasing reported s
   const reported = { ...request, status_code: 499, cost: '0.2' };
   assert.equal(requestUsageIsActual(reported), true);
   assert.equal(requestCostCopy(reported, 'en').unknown, false);
+  assert.equal(requestDisplayedCost(reported), '0.2');
   assert.equal(requestUsageIsActual({ ...request, usage_basis: 'not_observed' }), false);
 });
 
