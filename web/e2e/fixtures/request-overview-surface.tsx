@@ -11,7 +11,7 @@ import '../../src/styles/metrics.css';
 import '../../src/operator/operator.css';
 
 const health = { version: 'upstream_breaker_v1' as const, status: 'unknown' as const, observed_at: null };
-const summary = { requests: 10, successful_requests: 9, failed_requests: 1, avg_duration_ms: 180, p95_duration_ms: 420, costs: [] };
+const summary = { requests: 10, successful_requests: 9, failed_requests: 1, total_tokens: 4_096, cache_rate: null, avg_duration_ms: 180, p95_duration_ms: 420, costs: [] };
 const snapshot: OperatorMonitoringSnapshot = {
   contract_version: 'v1', generated_at: 0, scope: 'global',
   from_created_at: 0, to_created_at: 1000, granularity: 'hour',

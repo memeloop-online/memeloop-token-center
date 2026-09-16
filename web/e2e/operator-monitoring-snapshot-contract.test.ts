@@ -15,7 +15,7 @@ const snapshot: OperatorMonitoringSnapshot = {
   contract_version: 'v1', generated_at: 2_000, scope: 'tenant', tenant_external_id: 'tenant-a',
   from_created_at: 1_000, to_created_at: 2_000, granularity: 'hour',
   latency_is_approximate: true, latency_method: 'fixed_histogram_upper_bound_capped_60000ms',
-  summary: { requests: 0, successful_requests: 0, failed_requests: 0, avg_duration_ms: null, p95_duration_ms: null, costs: [] },
+  summary: { requests: 0, successful_requests: 0, failed_requests: 0, total_tokens: 0, cache_rate: null, avg_duration_ms: null, p95_duration_ms: null, costs: [] },
   freshness: { latest_terminal_created_at: null, age_millis: null },
   health: { version: 'upstream_breaker_v1', status: 'unknown', observed_at: null },
   top_upstream_models: [],
@@ -24,8 +24,21 @@ const snapshot: OperatorMonitoringSnapshot = {
 test('monitoring types preserve explicit window, currency arrays, and zero-traffic unknown health', () => {
   assert.equal(snapshot.scope, 'tenant');
   assert.equal(snapshot.summary.requests, 0);
+  assert.equal(snapshot.summary.total_tokens, 0);
+  assert.equal(snapshot.summary.cache_rate, null);
   assert.equal(snapshot.health.status, 'unknown');
   assert.deepEqual(snapshot.summary.costs, []);
+});
+
+test('monitoring summary surfaces additive token and cache facts without synthetic trends', () => {
+  assert.match(componentSource, /summary\.total_tokens === undefined/);
+  assert.match(componentSource, /formatNumber\(summary\.total_tokens, locale\)/, 'total tokens use exact local-number formatting');
+  assert.match(componentSource, /summary\.cache_rate \?\? null/);
+  assert.match(componentSource, /formatPercent\(cacheRate, locale\)/, 'an absent or null cache rate formats as —');
+  assert.match(componentSource, /label=\{t\('usage\.totalTokens'\)\} value=\{totalTokens\.text\} title=\{totalTokens\.title\} \/>/, 'the token card carries no trend prop');
+  assert.match(componentSource, /label=\{t\('usage\.cacheRate'\)\} value=\{formatPercent\(cacheRate, locale\)\} ratio=\{cacheRate\} \/>/, 'the cache card uses its true ratio as background without a trend prop');
+  assert.match(i18nSource, /'usage\.totalTokens': 'Total tokens'/);
+  assert.match(i18nSource, /'usage\.cacheRate': 'Cache rate'/);
 });
 
 test('overview sends an explicit tenant/global scope and exact time bounds', () => {

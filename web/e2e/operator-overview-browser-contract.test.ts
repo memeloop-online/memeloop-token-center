@@ -97,9 +97,21 @@ test('Overview keeps current sections visible through independent endpoint failu
     await nextPaint(page);
     assert.equal(await page.getByText('alpha-stale-model', { exact: true }).count(), 0, 'a late response from the previous tenant must not replace beta data');
     assert.equal(await page.getByText('beta-current-model', { exact: true }).count(), 1);
-    const requestMetric = page.locator('.operator-monitoring-metrics .analytics-metric').first();
-    assert.equal(await requestMetric.locator('svg path').getAttribute('d'), metricArea([3, 5, 9]), 'background area must use the current tenant’s actual trend points');
-    assert.equal(await requestMetric.evaluate((element) => getComputedStyle(element).borderTopWidth), '0px', 'statistics use flat surfaces rather than nested card borders');
+    const metricCards = page.locator('.operator-monitoring-metrics .analytics-metric');
+    const tokenMetric = metricCards.first();
+    assert.equal(await tokenMetric.locator('.metric-label').textContent(), 'Total tokens');
+    assert.equal(await tokenMetric.locator('.metric-value').textContent(), '12,345', 'total tokens use exact local-number formatting of the backend value');
+    assert.equal(await tokenMetric.locator('svg').count(), 0, 'no Monitoring time series exists, so total tokens must not synthesize a trend');
+    assert.equal(await tokenMetric.evaluate((element) => getComputedStyle(element).borderTopWidth), '0px', 'statistics use flat surfaces rather than nested card borders');
+    const successMetric = metricCards.nth(1);
+    assert.equal(await successMetric.locator('.metric-label').textContent(), 'Successful');
+    assert.equal(await successMetric.locator('.metric-value').textContent(), '15');
+    assert.equal(await successMetric.locator('svg path').getAttribute('d'), metricArea([3, 4, 8]), 'the successful metric background area keeps the current tenant’s actual trend points');
+    const cacheMetric = metricCards.nth(2);
+    assert.equal(await cacheMetric.locator('.metric-label').textContent(), 'Cache rate');
+    assert.equal(await cacheMetric.locator('.metric-value').textContent(), '50%');
+    assert.equal(await cacheMetric.locator('svg').count(), 0, 'no Monitoring time series exists, so cache rate must not synthesize a trend');
+    assert.equal(await cacheMetric.locator('.analytics-metric-ratio').getAttribute('data-ratio'), '0.5', 'cache rate background uses the supplied backend ratio');
     assert.equal(await page.locator('.operator-monitoring-metrics [data-ratio]').getAttribute('data-ratio'), String(15 / 17), 'success-rate background uses actual summary counts');
 
     assert.deepEqual(await endpointCounts(page, 'tenant-beta'), {
