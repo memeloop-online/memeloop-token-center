@@ -198,39 +198,77 @@
                     "type": "boolean",
                     "default": false,
                     "description": "Opt in to the host's Codex MultiAgentV2 request normalization for this provider."
+                  }
+                }
+              },
+              "codex_model_capabilities": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["version", "agent_instructions_template", "shell_type", "input_modalities"],
+                "description": "Versioned, fixed, non-secret Codex model-directory capabilities for an explicitly compatible provider. Account, route, and upstream identity must never be included.",
+                "properties": {
+                  "version": {
+                    "const": "codex-model-capabilities-v1"
                   },
-                  "codex_model_metadata": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["shell_type", "input_modalities"],
-                    "description": "Fixed, non-secret Codex model-directory capabilities for an explicitly compatible provider. Account, route, and upstream identity must never be included.",
-                    "properties": {
-                      "shell_type": {
-                        "type": "string",
-                        "enum": ["disabled", "shell_command"]
-                      },
-                      "apply_patch_tool_type": {
-                        "type": ["string", "null"],
-                        "enum": ["freeform", null]
-                      },
-                      "context_window": {
-                        "type": ["integer", "null"],
-                        "minimum": 1
-                      },
-                      "input_modalities": {
-                        "type": "array",
-                        "minItems": 1,
-                        "uniqueItems": true,
-                        "items": {
+                  "agent_instructions_template": {
+                    "const": "codex-generic-agent-v1"
+                  },
+                  "shell_type": {
+                    "type": "string",
+                    "enum": ["disabled", "unified_exec"]
+                  },
+                  "apply_patch_tool_type": {
+                    "type": ["string", "null"],
+                    "enum": ["freeform", null]
+                  },
+                  "fallback_context_window": {
+                    "type": ["integer", "null"],
+                    "minimum": 1
+                  },
+                  "input_modalities": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "items": {
+                      "type": "string",
+                      "enum": ["text", "image"]
+                    }
+                  },
+                  "supports_image_detail_original": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "include_skills_usage_instructions": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "include_plugin_usage_instructions": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "include_apps_usage_instructions": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "supported_reasoning_levels": {
+                    "type": "array",
+                    "uniqueItems": true,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["effort"],
+                      "properties": {
+                        "effort": {
                           "type": "string",
-                          "enum": ["text", "image"]
-                        }
-                      },
-                      "supports_image_detail_original": {
-                        "type": "boolean",
-                        "default": false
+                          "enum": ["none", "low", "medium", "high", "xhigh", "max", "ultra"]
+                        },
+                        "description": {"type": "string", "minLength": 1}
                       }
                     }
+                  },
+                  "default_reasoning_level": {
+                    "type": ["string", "null"],
+                    "enum": ["none", "low", "medium", "high", "xhigh", "max", "ultra", null]
                   }
                 }
               },

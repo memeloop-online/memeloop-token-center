@@ -1,6 +1,8 @@
 use http::{HeaderMap, header};
 use serde_json::Value;
 
+use crate::error::AppError;
+
 const COLLABORATION_TOOL_NAMES: &[&str] = &["spawn_agent", "send_message", "followup_task"];
 
 /// CPA applies MultiAgentV2 compatibility only to the official Codex client
@@ -18,8 +20,11 @@ pub(super) fn is_official_codex_user_agent(headers: &HeaderMap) -> bool {
         return false;
     };
     let user_agent = user_agent.trim();
-    user_agent.starts_with("Codex Desktop/")
+    user_agent.starts_with("Codex ")
         || user_agent.starts_with("codex-tui/")
+        || user_agent.starts_with("codex_vscode/")
+        || user_agent.starts_with("codex_atlas/")
+        || user_agent.starts_with("codex_chatgpt_desktop/")
         || user_agent == "codex_cli_rs"
         || user_agent.starts_with("codex_cli_rs/")
 }
@@ -27,12 +32,38 @@ pub(super) fn is_official_codex_user_agent(headers: &HeaderMap) -> bool {
 /// Normalize the subset of Codex MultiAgentV2 request shapes that a declared
 /// third-party upstream can read.  The native Codex route deliberately does
 /// not call this function. Readable agent messages are lowered to an ordinary
-/// user message, while opaque content is left untouched for the destination
-/// transport to reject; inter-agent content never gains a higher privilege
-/// role.
-pub(super) fn normalize_codex_multi_agent_v2(request: &mut Value, enabled: bool) {
+/// user message; opaque or malformed content fails closed before an upstream
+/// request can be dispatched.
+pub(super) fn normalize_codex_multi_agent_v2(
+    request: &mut Value,
+    enabled: bool,
+) -> Result<(), AppError> {
     if !enabled {
-        return;
+        return Ok(());
+    }
+
+    prepare_codex_multi_agent_v2_tools(request, true)?;
+    if let Some(input) = request.get_mut("input").and_then(Value::as_array_mut) {
+        for item in input {
+            if item.get("type").and_then(Value::as_str) == Some("agent_message") {
+                rewrite_agent_message(item)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Strip the internal collaboration message carrier from an official Codex
+/// parent request before it can spawn a third-party child. This stage is
+/// target-independent: a native Codex parent must also receive it so later
+/// child turns contain readable task text. No agent-message downgrade occurs
+/// here; that remains target-specific in `normalize_codex_multi_agent_v2`.
+pub(super) fn prepare_codex_multi_agent_v2_tools(
+    request: &mut Value,
+    enabled: bool,
+) -> Result<(), AppError> {
+    if !enabled {
+        return Ok(());
     }
 
     if let Some(tools) = request.get_mut("tools") {
@@ -46,11 +77,11 @@ pub(super) fn normalize_codex_multi_agent_v2(request: &mut Value, enabled: bool)
                         rewrite_tool_list(tools);
                     }
                 }
-                Some("agent_message") => rewrite_agent_message(item),
                 _ => {}
             }
         }
     }
+    Ok(())
 }
 
 fn rewrite_tool_list(value: &mut Value) {
@@ -93,64 +124,66 @@ fn rewrite_tool_definition(definition: &mut Value) {
     }
 }
 
-fn rewrite_agent_message(item: &mut Value) {
-    let Some(content) = item.get("content").and_then(Value::as_array).cloned() else {
-        return;
-    };
+fn malformed_agent_message() -> AppError {
+    AppError::BadRequest(
+        "third-party Codex MultiAgentV2 agent_message must contain readable content".into(),
+    )
+}
 
-    let normalized_content = content
-        .into_iter()
-        .map(|mut part| {
-            if part.get("type").and_then(Value::as_str) == Some("encrypted_content")
-                && let Some(text) = part
-                    .get("encrypted_content")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                && let Some(part) = part.as_object_mut()
-            {
-                part.insert("type".into(), Value::String("input_text".into()));
-                part.insert("text".into(), Value::String(text));
-                part.remove("encrypted_content");
-            }
-            part
-        })
-        .collect::<Vec<_>>();
+fn rewrite_agent_message(item: &mut Value) -> Result<(), AppError> {
+    let content = item
+        .get("content")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(malformed_agent_message)?;
+    if content.is_empty() {
+        return Err(malformed_agent_message());
+    }
 
-    // CPA's compatibility rewrite lowers the inter-agent envelope to an
-    // ordinary user message.  Only do so once every part is readable; an
-    // opaque payload remains agent_message and is rejected by the target
-    // transport instead of being silently forwarded as an unknown object.
-    let Some(sanitized_content) = normalized_content
-        .iter()
-        .map(|part| match part.get("type").and_then(Value::as_str) {
-            Some("input_text" | "output_text" | "text") => part
-                .get("text")
+    let mut sanitized_content = Vec::with_capacity(content.len());
+    for mut part in content {
+        if part.get("type").and_then(Value::as_str) == Some("encrypted_content") {
+            let text = part
+                .get("encrypted_content")
                 .and_then(Value::as_str)
-                .map(|text| serde_json::json!({"type":"input_text", "text":text})),
-            Some("input_image") => part
-                .get("image_url")
-                .and_then(Value::as_str)
-                .map(|image_url| {
-                    let mut sanitized = serde_json::json!({
-                        "type": "input_image",
-                        "image_url": image_url,
-                    });
-                    if let Some(detail) = part.get("detail").filter(|detail| detail.is_string()) {
-                        sanitized["detail"] = detail.clone();
-                    }
-                    sanitized
-                }),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()
-    else {
-        if let Some(item) = item.as_object_mut() {
-            item.insert("content".into(), Value::Array(normalized_content));
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(malformed_agent_message)?;
+            let Some(part) = part.as_object_mut() else {
+                return Err(malformed_agent_message());
+            };
+            part.insert("type".into(), Value::String("input_text".into()));
+            part.insert("text".into(), Value::String(text));
+            part.remove("encrypted_content");
         }
-        return;
-    };
-    if sanitized_content.is_empty() {
-        return;
+
+        let sanitized = match part.get("type").and_then(Value::as_str) {
+            Some("input_text" | "output_text" | "text") => {
+                let text = part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .ok_or_else(malformed_agent_message)?;
+                serde_json::json!({"type":"input_text", "text":text})
+            }
+            Some("input_image") => {
+                let image_url = part
+                    .get("image_url")
+                    .and_then(Value::as_str)
+                    .filter(|image_url| !image_url.is_empty())
+                    .ok_or_else(malformed_agent_message)?;
+                let mut sanitized = serde_json::json!({
+                    "type": "input_image",
+                    "image_url": image_url,
+                });
+                if let Some(detail) = part.get("detail").filter(|detail| detail.is_string()) {
+                    sanitized["detail"] = detail.clone();
+                }
+                sanitized
+            }
+            _ => return Err(malformed_agent_message()),
+        };
+        sanitized_content.push(sanitized);
     }
 
     // An agent envelope is an internal transport shape.  Once it becomes a
@@ -163,6 +196,7 @@ fn rewrite_agent_message(item: &mut Value) {
         item.insert("role".into(), Value::String("user".into()));
         item.insert("content".into(), Value::Array(sanitized_content));
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -175,7 +209,11 @@ mod tests {
     fn official_codex_user_agent_boundary_matches_cpa_and_fails_closed() {
         for user_agent in [
             "Codex Desktop/1.2.3",
+            "Codex 0.154.0",
             "codex-tui/0.1.0",
+            "codex_vscode/0.154.0",
+            "codex_atlas/0.154.0",
+            "codex_chatgpt_desktop/0.154.0",
             "codex_cli_rs",
             "codex_cli_rs/0.1.0",
         ] {
@@ -183,7 +221,13 @@ mod tests {
             headers.insert(header::USER_AGENT, HeaderValue::from_static(user_agent));
             assert!(is_official_codex_user_agent(&headers), "{user_agent}");
         }
-        for user_agent in ["Mozilla/5.0", "Codex Desktop", "codex_cli_rs-other"] {
+        for user_agent in [
+            "Mozilla/5.0",
+            "Codex",
+            "codex_cli_rs-other",
+            "codex_vscode",
+            "codex_vscode-not-versioned",
+        ] {
             let mut headers = HeaderMap::new();
             headers.insert(header::USER_AGENT, HeaderValue::from_static(user_agent));
             assert!(!is_official_codex_user_agent(&headers), "{user_agent}");
@@ -211,7 +255,7 @@ mod tests {
             ]}]
         });
         let original = request.clone();
-        normalize_codex_multi_agent_v2(&mut request, false);
+        normalize_codex_multi_agent_v2(&mut request, false).unwrap();
         assert_eq!(request, original);
     }
 
@@ -237,7 +281,7 @@ mod tests {
                 }}
             ]}]
         });
-        normalize_codex_multi_agent_v2(&mut request, true);
+        normalize_codex_multi_agent_v2(&mut request, true).unwrap();
 
         assert!(
             request["tools"][0]["parameters"]["properties"]["message"]
@@ -267,6 +311,37 @@ mod tests {
     }
 
     #[test]
+    fn parent_carrier_preparation_strips_schema_without_downgrading_agent_message() {
+        let mut request = json!({
+            "tools": [{"type":"function","name":"spawn_agent","parameters":{
+                "type":"object","properties":{"message":{"type":"string","encrypted":{"type":"boolean"}}}
+            }}],
+            "input": [{"type":"agent_message","role":"system",
+                "internal_chat_message_metadata_passthrough":{"turn_id":"keep-for-native"},
+                "content":[{"type":"encrypted_content","encrypted_content":"delegated task"}]
+            }]
+        });
+
+        prepare_codex_multi_agent_v2_tools(&mut request, true).unwrap();
+
+        assert!(
+            request["tools"][0]["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_none()
+        );
+        assert_eq!(request["input"][0]["type"], "agent_message");
+        assert_eq!(request["input"][0]["role"], "system");
+        assert_eq!(
+            request["input"][0]["internal_chat_message_metadata_passthrough"]["turn_id"],
+            "keep-for-native"
+        );
+        assert_eq!(
+            request["input"][0]["content"][0]["type"],
+            "encrypted_content"
+        );
+    }
+
+    #[test]
     fn readable_agent_message_lowers_to_user_without_promoting_role() {
         let mut request = json!({
             "input": [{"type":"agent_message","role":"system",
@@ -277,7 +352,7 @@ mod tests {
                 ]
             }]
         });
-        normalize_codex_multi_agent_v2(&mut request, true);
+        normalize_codex_multi_agent_v2(&mut request, true).unwrap();
 
         assert_eq!(request["input"][0]["type"], "message");
         assert_eq!(request["input"][0]["role"], "user");
@@ -299,14 +374,14 @@ mod tests {
     }
 
     #[test]
-    fn opaque_agent_message_stays_agent_message_and_keeps_payload() {
+    fn opaque_agent_message_is_rejected_without_mutating_native_shape() {
         let mut request = json!({
             "input": [{"type":"agent_message","role":"system", "content":[
                 {"type":"input_text","text":"prefix"},
                 {"type":"encrypted_content","encrypted_content":{"ciphertext":"opaque"}}
             ]}]
         });
-        normalize_codex_multi_agent_v2(&mut request, true);
+        assert!(normalize_codex_multi_agent_v2(&mut request, true).is_err());
 
         assert_eq!(request["input"][0]["type"], "agent_message");
         assert_eq!(request["input"][0]["role"], "system");
@@ -314,5 +389,18 @@ mod tests {
             request["input"][0]["content"][1]["encrypted_content"]["ciphertext"],
             "opaque"
         );
+    }
+
+    #[test]
+    fn empty_or_malformed_agent_messages_fail_closed() {
+        for item in [
+            json!({"type":"agent_message","content":[]}),
+            json!({"type":"agent_message"}),
+            json!({"type":"agent_message","content":[{"type":"future_content"}]}),
+            json!({"type":"agent_message","content":[{"type":"input_text","text":""}]}),
+        ] {
+            let mut request = json!({"input":[item]});
+            assert!(normalize_codex_multi_agent_v2(&mut request, true).is_err());
+        }
     }
 }

@@ -2391,14 +2391,11 @@ fn validate_provider_contribution(
             provider.id
         )));
     }
-    if provider
-        .request_compatibility
-        .codex_model_metadata
-        .is_some()
+    if provider.codex_model_capabilities.is_some()
         && !provider.request_compatibility.codex_multi_agent_v2
     {
         return Err(AppError::BadRequest(format!(
-            "plugin {plugin_id} provider {} must declare codex_multi_agent_v2 for Codex model metadata",
+            "plugin {plugin_id} provider {} must declare codex_multi_agent_v2 for Codex model capabilities",
             provider.id
         )));
     }

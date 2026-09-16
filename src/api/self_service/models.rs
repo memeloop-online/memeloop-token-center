@@ -28,9 +28,8 @@ pub(in crate::api) async fn list_models(
         .client_version
         .as_deref()
         .is_some_and(|version| !version.trim().is_empty())
-        && crate::api::request_normalization::is_official_codex_user_agent(&headers)
     {
-        return Ok(Json(codex_models_response(&state, &sources)));
+        return Ok(Json(codex_models_response(&state.providers, &sources)));
     }
     let mut models = std::collections::BTreeMap::<String, ModelCapabilities>::new();
     for source in sources {
@@ -88,23 +87,71 @@ pub(in crate::api) async fn list_models(
 struct CodexModelAvailability {
     openai_source_seen: bool,
     openai_multi_agent_v2: bool,
-    codex_model_metadata: Option<crate::provider::CodexModelMetadata>,
+    codex_model_capabilities: Option<crate::provider::CodexModelCapabilities>,
+    native_source_seen: bool,
+    third_party_source_seen: bool,
 }
 
 fn codex_models_response(
-    state: &AppState,
+    providers: &crate::provider::ProviderCatalog,
     sources: &[crate::db::GrantedModelCapabilitySource],
 ) -> Value {
-    let models = codex_model_availability(&state.providers, sources);
+    let models = codex_model_availability(providers, sources);
     json!({
-        "models": models.into_iter().map(|(model, availability)| {
-            codex_model_info(
-                &model,
-                availability.openai_source_seen && availability.openai_multi_agent_v2,
-                availability.codex_model_metadata.as_ref(),
-            )
-        }).collect::<Vec<_>>()
+        "models": models.into_iter()
+            // Codex replaces bundled entries by slug when applying this
+            // response. Do not let a gateway-owned profile overwrite a
+            // native Codex model whose complete bundled metadata we cannot
+            // reproduce exactly here.
+            .filter(|(model, availability)| should_advertise_codex_model(model, availability))
+            .map(|(model, availability)| {
+                codex_model_info(
+                    &model,
+                    availability.openai_source_seen && availability.openai_multi_agent_v2,
+                    availability.codex_model_capabilities.as_ref(),
+                )
+            })
+            .collect::<Vec<_>>()
     })
+}
+
+fn should_advertise_codex_model(model: &str, availability: &CodexModelAvailability) -> bool {
+    availability.third_party_source_seen
+        && !availability.native_source_seen
+        && availability.openai_multi_agent_v2
+        && !crate::provider::is_bundled_codex_model_slug(model)
+        && availability
+            .codex_model_capabilities
+            .as_ref()
+            .is_some_and(usable_codex_model_capabilities)
+}
+
+fn usable_codex_model_capabilities(capabilities: &crate::provider::CodexModelCapabilities) -> bool {
+    capabilities.version == crate::provider::CODEX_MODEL_CAPABILITIES_VERSION
+        && capabilities.agent_instructions_template
+            == crate::provider::CODEX_AGENT_INSTRUCTIONS_TEMPLATE_V1
+        && capabilities.shell_type == "unified_exec"
+        && capabilities.apply_patch_tool_type.as_deref() == Some("freeform")
+        && capabilities
+            .fallback_context_window
+            .is_some_and(|window| window > 0)
+        && capabilities
+            .input_modalities
+            .iter()
+            .any(|modality| modality == "text")
+        && !capabilities.supported_reasoning_levels.is_empty()
+        && capabilities
+            .default_reasoning_level
+            .as_ref()
+            .is_some_and(|default| {
+                capabilities
+                    .supported_reasoning_levels
+                    .iter()
+                    .any(|level| &level.effort == default)
+            })
+        && capabilities.include_skills_usage_instructions
+        && capabilities.include_plugin_usage_instructions
+        && capabilities.include_apps_usage_instructions
 }
 
 fn codex_model_availability(
@@ -120,9 +167,15 @@ fn codex_model_availability(
             continue;
         }
         let availability = models.entry(source.public_model.clone()).or_default();
+        if source.driver == crate::oauth::codex_device::PROVIDER_DRIVER {
+            availability.native_source_seen = true;
+        } else {
+            availability.third_party_source_seen = true;
+        }
+        let native = source.driver == crate::oauth::codex_device::PROVIDER_DRIVER;
         let compatible = providers.supports_codex_multi_agent_v2_model_catalog(&source.driver);
-        let metadata = if compatible {
-            providers.codex_model_metadata_for_catalog(&source.driver)
+        let capabilities = if compatible && !native {
+            providers.codex_model_capabilities_for_catalog(&source.driver)
         } else {
             None
         };
@@ -131,29 +184,41 @@ fn codex_model_availability(
             // conservative. This avoids claiming V2 when a public model
             // can route to an incompatible OpenAI provider.
             availability.openai_multi_agent_v2 &= compatible;
-            availability.codex_model_metadata = if availability.openai_multi_agent_v2 {
-                match (availability.codex_model_metadata.take(), metadata) {
-                    (Some(left), Some(right)) => Some(merge_codex_model_metadata(left, right)),
-                    _ => None,
-                }
-            } else {
-                None
-            };
+            if !native {
+                availability.codex_model_capabilities = if availability.openai_multi_agent_v2 {
+                    match (availability.codex_model_capabilities.take(), capabilities) {
+                        (Some(left), Some(right)) => merge_codex_model_capabilities(left, right),
+                        (None, Some(right)) => Some(right),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+            }
         } else {
             availability.openai_source_seen = true;
             availability.openai_multi_agent_v2 = compatible;
-            availability.codex_model_metadata = metadata;
+            availability.codex_model_capabilities = capabilities;
         }
     }
     models
 }
 
-fn merge_codex_model_metadata(
-    left: crate::provider::CodexModelMetadata,
-    right: crate::provider::CodexModelMetadata,
-) -> crate::provider::CodexModelMetadata {
-    let shell_type = if left.shell_type == right.shell_type {
-        left.shell_type
+fn merge_codex_model_capabilities(
+    left: crate::provider::CodexModelCapabilities,
+    right: crate::provider::CodexModelCapabilities,
+) -> Option<crate::provider::CodexModelCapabilities> {
+    if left.version != right.version {
+        return None;
+    }
+    let agent_instructions_template =
+        if left.agent_instructions_template == right.agent_instructions_template {
+            left.agent_instructions_template
+        } else {
+            return None;
+        };
+    let shell_type = if left.shell_type == "unified_exec" && right.shell_type == "unified_exec" {
+        "unified_exec".to_owned()
     } else {
         "disabled".to_owned()
     };
@@ -162,38 +227,96 @@ fn merge_codex_model_metadata(
     } else {
         None
     };
-    let context_window = if left.context_window == right.context_window {
-        left.context_window
-    } else {
-        None
-    };
+    let fallback_context_window =
+        match (left.fallback_context_window, right.fallback_context_window) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            _ => None,
+        };
     let input_modalities = left
         .input_modalities
         .into_iter()
         .filter(|modality| right.input_modalities.iter().any(|value| value == modality))
         .collect();
-    crate::provider::CodexModelMetadata {
+    let supported_reasoning_levels = left
+        .supported_reasoning_levels
+        .into_iter()
+        .filter_map(|left_level| {
+            let right_level = right
+                .supported_reasoning_levels
+                .iter()
+                .find(|right_level| right_level.effort == left_level.effort)?;
+            let description = if left_level.description == right_level.description {
+                left_level.description
+            } else {
+                None
+            };
+            Some(crate::provider::CodexReasoningLevel {
+                effort: left_level.effort,
+                description,
+            })
+        })
+        .collect::<Vec<_>>();
+    let default_reasoning_level = if left.default_reasoning_level == right.default_reasoning_level
+        && left
+            .default_reasoning_level
+            .as_ref()
+            .is_some_and(|default| {
+                supported_reasoning_levels
+                    .iter()
+                    .any(|level| &level.effort == default)
+            }) {
+        left.default_reasoning_level
+    } else {
+        None
+    };
+    Some(crate::provider::CodexModelCapabilities {
+        version: left.version,
+        agent_instructions_template,
         shell_type,
         apply_patch_tool_type,
-        context_window,
+        fallback_context_window,
         input_modalities,
         supports_image_detail_original: left.supports_image_detail_original
             && right.supports_image_detail_original,
-    }
+        include_skills_usage_instructions: left.include_skills_usage_instructions
+            && right.include_skills_usage_instructions,
+        include_plugin_usage_instructions: left.include_plugin_usage_instructions
+            && right.include_plugin_usage_instructions,
+        include_apps_usage_instructions: left.include_apps_usage_instructions
+            && right.include_apps_usage_instructions,
+        supported_reasoning_levels,
+        default_reasoning_level,
+    })
 }
 
 fn codex_model_info(
     model: &str,
     multi_agent_v2: bool,
-    metadata: Option<&crate::provider::CodexModelMetadata>,
+    capabilities: Option<&crate::provider::CodexModelCapabilities>,
 ) -> Value {
-    let metadata = metadata.filter(|_| multi_agent_v2);
+    let capabilities = capabilities
+        .filter(|_| multi_agent_v2)
+        .filter(|capabilities| usable_codex_model_capabilities(capabilities));
+    let multi_agent_v2 = multi_agent_v2 && capabilities.is_some();
+    let shell_type = capabilities.map_or("disabled", |capabilities| {
+        match capabilities.shell_type.as_str() {
+            "unified_exec" => "unified_exec",
+            _ => "disabled",
+        }
+    });
+    let instructions_template = capabilities
+        .map(|capabilities| capabilities.agent_instructions_template.as_str())
+        .map(|_| crate::provider::CODEX_GENERIC_AGENT_INSTRUCTIONS_V1);
+    let model_messages = instructions_template.map(|template| {
+        json!({
+            "instructions_template": template,
+        })
+    });
     let mut info = json!({
         "slug": model,
         "display_name": model,
         "description": null,
-        "supported_reasoning_levels": [],
-        "shell_type": metadata.map_or("disabled", |metadata| metadata.shell_type.as_str()),
+        "shell_type": shell_type,
         "visibility": "list",
         "supported_in_api": true,
         "priority": 0,
@@ -201,28 +324,38 @@ fn codex_model_info(
         "service_tiers": [],
         "availability_nux": null,
         "upgrade": null,
-        "model_messages": null,
-        "base_instructions": "",
-        "include_skills_usage_instructions": false,
-        "include_plugin_usage_instructions": false,
-        "include_apps_usage_instructions": false,
+        "model_messages": model_messages,
+        "base_instructions": instructions_template,
+        "include_skills_usage_instructions": capabilities
+            .is_some_and(|capabilities| capabilities.include_skills_usage_instructions),
+        "include_plugin_usage_instructions": capabilities
+            .is_some_and(|capabilities| capabilities.include_plugin_usage_instructions),
+        "include_apps_usage_instructions": capabilities
+            .is_some_and(|capabilities| capabilities.include_apps_usage_instructions),
         "supports_reasoning_summary_parameter": false,
         "default_reasoning_summary": "auto",
         "support_verbosity": false,
         "default_verbosity": null,
-        "apply_patch_tool_type": metadata.and_then(|metadata| metadata.apply_patch_tool_type.as_deref()),
+        "apply_patch_tool_type": capabilities.and_then(|capabilities| capabilities.apply_patch_tool_type.as_deref()),
         "web_search_tool_type": "text",
         "truncation_policy": {"mode": "bytes", "limit": 10000},
-        "supports_image_detail_original": metadata
-            .is_some_and(|metadata| metadata.supports_image_detail_original),
-        "context_window": metadata.and_then(|metadata| metadata.context_window),
+        "supports_image_detail_original": capabilities
+            .is_some_and(|capabilities| capabilities.supports_image_detail_original),
+        "context_window": capabilities.and_then(|capabilities| capabilities.fallback_context_window),
+        "max_context_window": capabilities
+            .and_then(|capabilities| capabilities.fallback_context_window),
         "auto_compact_token_limit": null,
         "effective_context_window_percent": 95,
         "experimental_supported_tools": [],
-        "input_modalities": metadata.map_or_else(
+        "input_modalities": capabilities.map_or_else(
             || vec!["text".to_owned()],
-            |metadata| metadata.input_modalities.clone(),
+            |capabilities| capabilities.input_modalities.clone(),
         ),
+        "supported_reasoning_levels": capabilities.map_or_else(Vec::new, |capabilities| {
+            capabilities.supported_reasoning_levels.clone()
+        }),
+        "default_reasoning_level": capabilities
+            .and_then(|capabilities| capabilities.default_reasoning_level.clone()),
         "supports_search_tool": false,
         "supports_experimental_context": false,
         "use_responses_lite": false,
@@ -300,26 +433,62 @@ mod tests {
     #[test]
     fn codex_model_info_is_conservative_and_marks_only_declared_multi_agent_models() {
         let providers = crate::provider::ProviderCatalog::builtins();
-        let kimi_metadata = providers
+        let kimi_capabilities = providers
             .get("kimi-oauth")
-            .and_then(|provider| provider.request_compatibility.codex_model_metadata.as_ref())
+            .and_then(|provider| provider.codex_model_capabilities.as_ref())
             .expect("Kimi declares Codex model capabilities");
-        let compatible = codex_model_info("kimi-k3-256k", true, Some(kimi_metadata));
+        let compatible = codex_model_info("kimi-k3-256k", true, Some(kimi_capabilities));
         assert_eq!(compatible["slug"], "kimi-k3-256k");
         assert_eq!(compatible["multi_agent_version"], "v2");
-        assert_eq!(compatible["shell_type"], "shell_command");
+        assert_eq!(compatible["shell_type"], "unified_exec");
         assert_eq!(compatible["apply_patch_tool_type"], "freeform");
         assert_eq!(compatible["context_window"], 262144);
+        assert_eq!(compatible["max_context_window"], 262144);
         assert_eq!(compatible["input_modalities"], json!(["text", "image"]));
+        assert_eq!(compatible["default_reasoning_level"], "medium");
+        assert_eq!(compatible["supported_reasoning_levels"][0]["effort"], "low");
+        assert_eq!(
+            compatible["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .len(),
+            5
+        );
+        assert_eq!(compatible["supports_image_detail_original"], false);
+        assert!(
+            compatible["base_instructions"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        );
+        assert_eq!(
+            compatible["model_messages"]["instructions_template"],
+            compatible["base_instructions"]
+        );
+        assert_eq!(compatible["include_skills_usage_instructions"], true);
+        assert_eq!(compatible["include_plugin_usage_instructions"], true);
+        assert_eq!(compatible["include_apps_usage_instructions"], true);
         assert!(compatible.get("account_id").is_none());
         assert!(compatible.get("upstream_model").is_none());
         assert!(compatible.get("credential").is_none());
 
         let unknown = codex_model_info("unknown-compatible", true, None);
+        assert_eq!(unknown["multi_agent_version"], "disabled");
         assert_eq!(unknown["shell_type"], "disabled");
         assert_eq!(unknown["input_modalities"], json!(["text"]));
 
-        let ordinary = codex_model_info("ordinary", false, Some(kimi_metadata));
+        let mut unknown_profile = kimi_capabilities.clone();
+        unknown_profile.agent_instructions_template = "future-profile".to_owned();
+        let rejected_profile = codex_model_info("future-profile", true, Some(&unknown_profile));
+        assert_eq!(rejected_profile["multi_agent_version"], "disabled");
+        assert!(rejected_profile["base_instructions"].is_null());
+
+        let mut mismatched_version = kimi_capabilities.clone();
+        mismatched_version.version = "future-capabilities-v2".to_owned();
+        assert!(
+            merge_codex_model_capabilities(kimi_capabilities.clone(), mismatched_version).is_none()
+        );
+
+        let ordinary = codex_model_info("ordinary", false, Some(kimi_capabilities));
         assert_eq!(ordinary["multi_agent_version"], "disabled");
         assert_eq!(ordinary["shell_type"], "disabled");
     }
@@ -339,26 +508,52 @@ mod tests {
         let providers = crate::provider::ProviderCatalog::builtins();
         let native = codex_model_availability(&providers, &[source("native-only", "openai-codex")]);
         assert!(native["native-only"].openai_multi_agent_v2);
+        assert!(native["native-only"].native_source_seen);
+        assert!(!native["native-only"].third_party_source_seen);
+        assert!(!should_advertise_codex_model(
+            "native-only",
+            &native["native-only"]
+        ));
         assert_eq!(
-            native["native-only"]
-                .codex_model_metadata
-                .as_ref()
-                .expect("native Codex metadata")
-                .shell_type,
-            "shell_command"
+            native["native-only"].codex_model_capabilities.as_ref(),
+            None
+        );
+        assert_eq!(
+            codex_models_response(&providers, &[source("native-only", "openai-codex")])["models"],
+            json!([])
         );
 
         let kimi = codex_model_availability(&providers, &[source("kimi-only", "kimi-oauth")]);
         assert!(kimi["kimi-only"].openai_multi_agent_v2);
+        assert!(should_advertise_codex_model(
+            "kimi-only",
+            &kimi["kimi-only"]
+        ));
+
+        let third_party_bundled_slug =
+            codex_model_availability(&providers, &[source("gpt-5.5", "kimi-oauth")]);
+        assert!(!should_advertise_codex_model(
+            "gpt-5.5",
+            &third_party_bundled_slug["gpt-5.5"]
+        ));
+        assert_eq!(
+            codex_models_response(&providers, &[source("gpt-5.5", "kimi-oauth")])["models"],
+            json!([])
+        );
         let kimi_info = codex_model_info(
             "kimi-only",
             true,
-            kimi["kimi-only"].codex_model_metadata.as_ref(),
+            kimi["kimi-only"].codex_model_capabilities.as_ref(),
         );
-        assert_eq!(kimi_info["shell_type"], "shell_command");
+        assert_eq!(kimi_info["shell_type"], "unified_exec");
         assert_eq!(kimi_info["apply_patch_tool_type"], "freeform");
         assert_eq!(kimi_info["context_window"], 262144);
         assert_eq!(kimi_info["input_modalities"], json!(["text", "image"]));
+        assert_eq!(kimi_info["supports_image_detail_original"], false);
+        assert_eq!(
+            codex_models_response(&providers, &[source("kimi-only", "kimi-oauth")])["models"][0]["slug"],
+            "kimi-only"
+        );
 
         let mixed = codex_model_availability(
             &providers,
@@ -368,13 +563,26 @@ mod tests {
             ],
         );
         assert!(mixed["mixed"].openai_multi_agent_v2);
+        assert!(mixed["mixed"].native_source_seen);
+        assert!(mixed["mixed"].third_party_source_seen);
+        assert!(!should_advertise_codex_model("mixed", &mixed["mixed"]));
         assert_eq!(
             mixed["mixed"]
-                .codex_model_metadata
+                .codex_model_capabilities
                 .as_ref()
-                .expect("compatible mixed metadata")
+                .expect("compatible mixed capabilities")
                 .shell_type,
-            "shell_command"
+            "unified_exec"
+        );
+        assert_eq!(
+            codex_models_response(
+                &providers,
+                &[
+                    source("mixed", "openai-codex"),
+                    source("mixed", "kimi-oauth"),
+                ]
+            )["models"],
+            json!([])
         );
 
         let incompatible = codex_model_availability(
@@ -387,7 +595,7 @@ mod tests {
         assert!(!incompatible["mixed-incompatible"].openai_multi_agent_v2);
         assert!(
             incompatible["mixed-incompatible"]
-                .codex_model_metadata
+                .codex_model_capabilities
                 .is_none()
         );
     }

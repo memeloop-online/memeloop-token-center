@@ -693,13 +693,23 @@ export interface ProviderType {
     third_party: boolean;
     responses_via_chat_v1: boolean;
     codex_multi_agent_v2: boolean;
-    codex_model_metadata?: {
-      shell_type: 'disabled' | 'shell_command';
-      apply_patch_tool_type?: 'freeform' | null;
-      context_window?: number | null;
-      input_modalities: Array<'text' | 'image'>;
-      supports_image_detail_original?: boolean;
-    };
+  };
+  codex_model_capabilities?: {
+    version: 'codex-model-capabilities-v1';
+    agent_instructions_template: 'codex-generic-agent-v1';
+    shell_type: 'disabled' | 'unified_exec';
+    apply_patch_tool_type?: 'freeform' | null;
+    fallback_context_window?: number | null;
+    input_modalities: Array<'text' | 'image'>;
+    supports_image_detail_original?: boolean;
+    include_skills_usage_instructions?: boolean;
+    include_plugin_usage_instructions?: boolean;
+    include_apps_usage_instructions?: boolean;
+    supported_reasoning_levels?: Array<{
+      effort: 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+      description?: string;
+    }>;
+    default_reasoning_level?: 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | null;
   };
   source: string;
 }

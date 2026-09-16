@@ -82,13 +82,27 @@ pub struct GenerationAdapterContribution {
     pub provider_asset_reads_repeatable: bool,
 }
 
-/// Explicit request-shape compatibility declarations owned by the provider
-/// catalog.  A capability is never inferred from a model name or URL: a
-/// third-party upstream must opt in before the gateway rewrites Codex
-/// collaboration payloads for it.
+/// Fixed reasoning metadata accepted by the Codex model-directory contract.
+/// Descriptions are optional because a conservative intersection may retain
+/// an effort while the provider descriptions differ.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct CodexModelMetadata {
+pub struct CodexReasoningLevel {
+    pub effort: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Versioned, non-secret model-directory capabilities contributed by a
+/// provider. A capability is never inferred from a model name or URL.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CodexModelCapabilities {
+    pub version: String,
+    /// A bounded strategy identifier. Providers select a gateway-owned
+    /// instruction template; they never inject arbitrary prompt text.
+    #[serde(default = "default_codex_agent_instructions_template")]
+    pub agent_instructions_template: String,
     /// Codex's model-directory value for the shell tool.  Keep this an
     /// explicit provider declaration rather than inferring it from a model
     /// slug or upstream URL.
@@ -96,13 +110,55 @@ pub struct CodexModelMetadata {
     #[serde(default)]
     pub apply_patch_tool_type: Option<String>,
     #[serde(default)]
-    pub context_window: Option<u64>,
+    pub fallback_context_window: Option<u64>,
     #[serde(default)]
     pub input_modalities: Vec<String>,
     #[serde(default)]
     pub supports_image_detail_original: bool,
+    #[serde(default)]
+    pub include_skills_usage_instructions: bool,
+    #[serde(default)]
+    pub include_plugin_usage_instructions: bool,
+    #[serde(default)]
+    pub include_apps_usage_instructions: bool,
+    #[serde(default)]
+    pub supported_reasoning_levels: Vec<CodexReasoningLevel>,
+    #[serde(default)]
+    pub default_reasoning_level: Option<String>,
 }
 
+pub(crate) const CODEX_MODEL_CAPABILITIES_VERSION: &str = "codex-model-capabilities-v1";
+pub(crate) const CODEX_AGENT_INSTRUCTIONS_TEMPLATE_V1: &str = "codex-generic-agent-v1";
+// Codex 0.154 bundled slugs. The reserved gpt-/codex- namespaces below also
+// protect future bundled additions until this fixture is refreshed.
+const BUNDLED_CODEX_MODEL_SLUGS: &[&str] = &[
+    "codex-auto-review",
+    "gpt-6-astra",
+    "gpt-daybreak-blue-latest",
+    "gpt-daybreak-red-latest",
+    "gpt-5.2",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.5",
+    "gpt-5.6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+];
+
+pub(crate) fn is_bundled_codex_model_slug(model: &str) -> bool {
+    BUNDLED_CODEX_MODEL_SLUGS.contains(&model)
+        || model.starts_with("gpt-")
+        || model.starts_with("codex-")
+}
+
+fn default_codex_agent_instructions_template() -> String {
+    CODEX_AGENT_INSTRUCTIONS_TEMPLATE_V1.to_owned()
+}
+
+/// Explicit request-shape compatibility declarations owned by the provider
+/// catalog.  A capability is never inferred from a model name or URL: a
+/// third-party upstream must opt in before the gateway rewrites Codex
+/// collaboration payloads for it.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RequestCompatibility {
@@ -115,19 +171,11 @@ pub struct RequestCompatibility {
     pub responses_via_chat_v1: bool,
     #[serde(default)]
     pub codex_multi_agent_v2: bool,
-    /// Optional fixed model-directory capabilities for providers that opt in
-    /// to Codex MultiAgentV2.  This contains no account, route, or upstream
-    /// identity and is intentionally absent for unknown providers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codex_model_metadata: Option<CodexModelMetadata>,
 }
 
 impl RequestCompatibility {
     pub(crate) fn is_default(&self) -> bool {
-        !self.third_party
-            && !self.responses_via_chat_v1
-            && !self.codex_multi_agent_v2
-            && self.codex_model_metadata.is_none()
+        !self.third_party && !self.responses_via_chat_v1 && !self.codex_multi_agent_v2
     }
 
     pub fn supports_codex_multi_agent_v2(&self) -> bool {
@@ -152,6 +200,8 @@ pub struct ProviderType {
     pub generation_adapter: Option<GenerationAdapterContribution>,
     #[serde(default, skip_serializing_if = "RequestCompatibility::is_default")]
     pub request_compatibility: RequestCompatibility,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_model_capabilities: Option<CodexModelCapabilities>,
     #[serde(default)]
     pub source: String,
 }
@@ -337,6 +387,7 @@ impl ProviderCatalog {
                 provider_asset_reads_repeatable: false,
             }),
             request_compatibility: Default::default(),
+            codex_model_capabilities: None,
             source: "builtin".to_owned(),
         }];
         types.push(crate::provider::cbcnx::provider_type(
@@ -378,6 +429,7 @@ impl ProviderCatalog {
                 provider_asset_reads_repeatable: true,
             }),
             request_compatibility: Default::default(),
+            codex_model_capabilities: None,
             source: "builtin".to_owned(),
         });
         types.push(ProviderType {
@@ -420,6 +472,7 @@ impl ProviderCatalog {
                 provider_asset_reads_repeatable: true,
             }),
             request_compatibility: Default::default(),
+            codex_model_capabilities: None,
             source: "builtin".to_owned(),
         });
         types.push(builtin_managed_oauth_provider(
@@ -553,14 +606,46 @@ impl ProviderCatalog {
             third_party: true,
             responses_via_chat_v1: true,
             codex_multi_agent_v2: true,
-            codex_model_metadata: Some(CodexModelMetadata {
-                shell_type: "shell_command".to_owned(),
-                apply_patch_tool_type: Some("freeform".to_owned()),
-                context_window: Some(256 * 1024),
-                input_modalities: vec!["text".to_owned(), "image".to_owned()],
-                supports_image_detail_original: false,
-            }),
         };
+        kimi.codex_model_capabilities = Some(CodexModelCapabilities {
+            version: CODEX_MODEL_CAPABILITIES_VERSION.to_owned(),
+            agent_instructions_template: CODEX_AGENT_INSTRUCTIONS_TEMPLATE_V1.to_owned(),
+            shell_type: "unified_exec".to_owned(),
+            apply_patch_tool_type: Some("freeform".to_owned()),
+            fallback_context_window: Some(256 * 1024),
+            input_modalities: vec!["text".to_owned(), "image".to_owned()],
+            supports_image_detail_original: false,
+            include_skills_usage_instructions: true,
+            include_plugin_usage_instructions: true,
+            include_apps_usage_instructions: true,
+            supported_reasoning_levels: vec![
+                CodexReasoningLevel {
+                    effort: "low".to_owned(),
+                    description: Some("Fast responses with lighter reasoning".to_owned()),
+                },
+                CodexReasoningLevel {
+                    effort: "medium".to_owned(),
+                    description: Some(
+                        "Balances speed and reasoning depth for everyday tasks".to_owned(),
+                    ),
+                },
+                CodexReasoningLevel {
+                    effort: "high".to_owned(),
+                    description: Some("Greater reasoning depth for complex problems".to_owned()),
+                },
+                CodexReasoningLevel {
+                    effort: "xhigh".to_owned(),
+                    description: Some("Extra high reasoning depth for complex problems".to_owned()),
+                },
+                CodexReasoningLevel {
+                    effort: "max".to_owned(),
+                    description: Some(
+                        "Maximum reasoning depth for the hardest problems".to_owned(),
+                    ),
+                },
+            ],
+            default_reasoning_level: Some("medium".to_owned()),
+        });
         kimi.credential_schema["properties"]["expires_at"] = json!({"type": ["integer", "null"], "description": "Unix milliseconds, absent source expiry remains unknown"});
         types.push(kimi);
         Self {
@@ -663,26 +748,17 @@ impl ProviderCatalog {
             || self.supports_codex_multi_agent_v2(driver)
     }
 
-    pub(crate) fn codex_model_metadata_for_catalog(
+    pub(crate) fn codex_model_capabilities_for_catalog(
         &self,
         driver: &str,
-    ) -> Option<CodexModelMetadata> {
-        if driver == crate::oauth::codex_device::PROVIDER_DRIVER {
-            return Some(CodexModelMetadata {
-                shell_type: "shell_command".to_owned(),
-                apply_patch_tool_type: Some("freeform".to_owned()),
-                context_window: None,
-                input_modalities: vec!["text".to_owned(), "image".to_owned()],
-                supports_image_detail_original: false,
-            });
-        }
+    ) -> Option<CodexModelCapabilities> {
         self.get(driver)
             .filter(|provider| {
                 provider
                     .request_compatibility
                     .supports_codex_multi_agent_v2()
             })
-            .and_then(|provider| provider.request_compatibility.codex_model_metadata.clone())
+            .and_then(|provider| provider.codex_model_capabilities.clone())
     }
 
     pub(crate) fn managed_oauth_adapter_for_driver(
@@ -773,6 +849,7 @@ fn builtin_managed_oauth_provider(
         component_adapter: None,
         generation_adapter: None,
         request_compatibility: Default::default(),
+        codex_model_capabilities: None,
         source: "builtin".to_owned(),
     }
 }
@@ -831,6 +908,7 @@ fn builtin_interactive_oauth_provider(
         component_adapter: None,
         generation_adapter: None,
         request_compatibility: Default::default(),
+        codex_model_capabilities: None,
         source: "builtin".to_owned(),
     }
 }

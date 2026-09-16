@@ -854,6 +854,11 @@ pub(in crate::api) async fn proxy_with_identity(
     let plugin_snapshot =
         proxy_diagnostics::Phase::new(diagnostic_context, "application_plugin_snapshot");
     let mut state = state.pin_application_plugins().await?;
+    // Tool preparation is a protocol/client concern, not a catalog lookup.  It
+    // must happen on the native parent request as well, so a later delegated
+    // child request cannot inherit the encrypted collaboration carrier.
+    let codex_multi_agent_v2_tools_prepared =
+        codex_multi_agent_v2_client && matches!(protocol, Protocol::OpenAiResponses);
     plugin_snapshot.finish("completed", None, None);
     let proxy_lifecycle_permit = state
         .proxy_lifecycle_permits
@@ -928,6 +933,7 @@ pub(in crate::api) async fn proxy_with_identity(
         request_id,
         request_json: &request_json,
         codex_multi_agent_v2_client,
+        codex_multi_agent_v2_tools_prepared,
     };
     let mut route_plan = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
         request: request_context,
@@ -964,6 +970,7 @@ pub(in crate::api) async fn proxy_with_identity(
                     request_id,
                     request_json: &request_json,
                     codex_multi_agent_v2_client,
+                    codex_multi_agent_v2_tools_prepared,
                 },
                 original_body_length: body.len(),
                 candidates,
@@ -979,6 +986,7 @@ pub(in crate::api) async fn proxy_with_identity(
         request_id,
         request_json: &request_json,
         codex_multi_agent_v2_client,
+        codex_multi_agent_v2_tools_prepared,
     };
     let primary = route_plan.primary_route();
     let upstream_account_id = Some(primary.account_id);

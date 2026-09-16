@@ -58,6 +58,7 @@ pub(in crate::api::proxy) struct ProxyRequestContext<'a> {
     pub(in crate::api::proxy) request_id: Uuid,
     pub(in crate::api::proxy) request_json: &'a Value,
     pub(in crate::api::proxy) codex_multi_agent_v2_client: bool,
+    pub(in crate::api::proxy) codex_multi_agent_v2_tools_prepared: bool,
 }
 
 pub(in crate::api::proxy) struct ProxyRoutePlanInput<'a> {

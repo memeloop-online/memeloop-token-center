@@ -403,7 +403,8 @@ mod tests {
                 "author":"/root", "recipient":"/root/worker",
                 "internal_chat_message_metadata_passthrough":{"instruction":"never forward this"},
                 "content":content}]});
-            crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut request, true);
+            crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut request, true)
+                .unwrap();
             assert_eq!(request["input"][0]["content"][0]["type"], "input_text");
             let output = convert(&request).unwrap();
             assert_eq!(output["messages"][0]["role"], "user");
@@ -418,13 +419,14 @@ mod tests {
         let mut request = json!({"input":[{"type":"agent_message","content":[
             {"type":"encrypted_content","encrypted_content":{"ciphertext":"opaque"}}
         ]}]});
-        crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut request, true);
-        let error = convert(&request).unwrap_err();
+        let error =
+            crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut request, true)
+                .unwrap_err();
         let AppError::BadRequest(message) = error else {
             panic!("expected input rejection")
         };
-        assert!(message.contains("unsupported agent message content"));
-        assert!(message.contains("readable input"));
+        assert!(message.contains("agent_message"));
+        assert_eq!(request["input"][0]["type"], "agent_message");
     }
 
     #[test]
@@ -432,7 +434,8 @@ mod tests {
         let mut request: Value =
             serde_json::from_str(include_str!("fixtures/codex-multi-agent-v2.json"))
                 .expect("valid Codex MultiAgentV2 fixture");
-        crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut request, true);
+        crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut request, true)
+            .unwrap();
 
         assert!(
             request["tools"][0]["tools"][0]["parameters"]["properties"]["message"]

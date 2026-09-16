@@ -11,13 +11,18 @@ pub(super) fn prepare_forwarded_request(
     route: &ResolvedUpstream,
     protocol: Protocol,
     request: &Value,
+    prepare_multi_agent_tools: bool,
     normalize_multi_agent: bool,
 ) -> Result<(Value, Option<responses::Context>), AppError> {
     let mut forwarded = request.clone();
-    crate::api::request_normalization::normalize_codex_multi_agent_v2(
-        &mut forwarded,
-        normalize_multi_agent,
-    );
+    if normalize_multi_agent {
+        crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut forwarded, true)?;
+    } else {
+        crate::api::request_normalization::prepare_codex_multi_agent_v2_tools(
+            &mut forwarded,
+            prepare_multi_agent_tools,
+        )?;
+    }
     if route.driver != crate::oauth::managed::kimi::PROVIDER_DRIVER {
         if let Some(model) = forwarded.get_mut("model") {
             *model = Value::String(route.upstream_model.clone());
@@ -342,6 +347,48 @@ mod tests {
         matchers::{method, path},
     };
 
+    fn route(driver: &str) -> ResolvedUpstream {
+        ResolvedUpstream {
+            route_id: uuid::Uuid::nil(),
+            account_id: uuid::Uuid::nil(),
+            transport_revision: 1,
+            credential_generation: 1,
+            driver: driver.to_owned(),
+            base_url: "https://upstream.invalid".to_owned(),
+            config: json!({}),
+            upstream_model: "upstream-model".to_owned(),
+            credential: crate::provider::UpstreamCredential::None,
+        }
+    }
+
+    fn kimi_route() -> ResolvedUpstream {
+        ResolvedUpstream {
+            route_id: uuid::Uuid::nil(),
+            account_id: uuid::Uuid::nil(),
+            transport_revision: 1,
+            credential_generation: 1,
+            driver: crate::oauth::managed::kimi::PROVIDER_DRIVER.to_owned(),
+            base_url: crate::oauth::managed::kimi::BASE_URL.to_owned(),
+            config: json!({}),
+            upstream_model: "kimi-k3-256k".to_owned(),
+            credential: crate::provider::UpstreamCredential::OAuth {
+                access_token: "access-token".to_owned(),
+                refresh_token: Some("refresh-token".to_owned()),
+                expires_at: None,
+                header: "authorization".to_owned(),
+                prefix: "Bearer ".to_owned(),
+                adapter_state: Some(json!({
+                    "schema": "kimi-oauth-v1",
+                    "device_id": null,
+                    "scope": null,
+                    "token_type": "bearer"
+                })),
+                proxy_url: None,
+                proxy_network_scope: None,
+            },
+        }
+    }
+
     fn chunk(choices: Value, usage: Value) -> String {
         format!(
             "data: {}\n\n",
@@ -435,5 +482,66 @@ mod tests {
                     .contains("response.completed")
             );
         }
+    }
+
+    #[test]
+    fn native_parent_route_prepares_carrier_without_agent_downgrade() {
+        let request = json!({
+            "model": "public-model",
+            "tools": [{"type":"function","name":"spawn_agent","parameters":{
+                "type":"object","properties":{"message":{"type":"string","encrypted":{"type":"boolean"}}}
+            }}],
+            "input": [{"type":"agent_message","role":"system",
+                "internal_chat_message_metadata_passthrough":{"turn_id":"native"},
+                "content":[{"type":"encrypted_content","encrypted_content":"delegated task"}]
+            }]
+        });
+        let (forwarded, _) = prepare_forwarded_request(
+            &route("openai-codex"),
+            Protocol::OpenAiResponses,
+            &request,
+            true,
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            forwarded["tools"][0]["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_none()
+        );
+        assert_eq!(forwarded["input"][0]["type"], "agent_message");
+        assert_eq!(forwarded["input"][0]["role"], "system");
+        assert_eq!(
+            forwarded["input"][0]["internal_chat_message_metadata_passthrough"]["turn_id"],
+            "native"
+        );
+    }
+
+    #[test]
+    fn third_party_route_downgrades_only_readable_agent_message() {
+        let request = json!({
+            "model": "public-model",
+            "input": [{"type":"agent_message","role":"system",
+                "author":"internal",
+                "content":[{"type":"encrypted_content","encrypted_content":"delegated task"}]
+            }]
+        });
+        let (forwarded, _) = prepare_forwarded_request(
+            &kimi_route(),
+            Protocol::OpenAiResponses,
+            &request,
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(forwarded["messages"][0]["role"], "user");
+        assert!(forwarded["messages"][0].get("author").is_none());
+        assert_eq!(forwarded["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(
+            forwarded["messages"][0]["content"][0]["text"],
+            "delegated task"
+        );
     }
 }

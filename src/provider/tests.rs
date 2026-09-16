@@ -228,6 +228,7 @@ fn test_provider(id: &str) -> ProviderType {
         component_adapter: None,
         generation_adapter: None,
         request_compatibility: Default::default(),
+        codex_model_capabilities: None,
         source: "test".into(),
     }
 }
@@ -292,26 +293,64 @@ fn multi_agent_compatibility_is_explicit_and_provider_scoped() {
             .request_compatibility
             .responses_via_chat_v1
     );
-    let kimi_metadata = catalog
+    let kimi_capabilities = catalog
         .get("kimi-oauth")
         .expect("Kimi provider")
-        .request_compatibility
-        .codex_model_metadata
+        .codex_model_capabilities
         .as_ref()
-        .expect("Kimi Codex model metadata");
-    assert_eq!(kimi_metadata.shell_type, "shell_command");
+        .expect("Kimi Codex model capabilities");
+    assert_eq!(kimi_capabilities.version, "codex-model-capabilities-v1");
     assert_eq!(
-        kimi_metadata.apply_patch_tool_type.as_deref(),
+        kimi_capabilities.agent_instructions_template,
+        "codex-generic-agent-v1"
+    );
+    assert_eq!(kimi_capabilities.shell_type, "unified_exec");
+    assert_eq!(
+        kimi_capabilities.apply_patch_tool_type.as_deref(),
         Some("freeform")
     );
-    assert_eq!(kimi_metadata.context_window, Some(256 * 1024));
+    assert_eq!(kimi_capabilities.fallback_context_window, Some(256 * 1024));
     assert_eq!(
-        kimi_metadata.input_modalities,
+        kimi_capabilities.input_modalities,
         vec!["text".to_owned(), "image".to_owned()]
+    );
+    assert!(!kimi_capabilities.supports_image_detail_original);
+    assert!(kimi_capabilities.include_skills_usage_instructions);
+    assert!(kimi_capabilities.include_plugin_usage_instructions);
+    assert!(kimi_capabilities.include_apps_usage_instructions);
+    assert_eq!(
+        kimi_capabilities.default_reasoning_level.as_deref(),
+        Some("medium")
     );
     assert!(!catalog.supports_codex_multi_agent_v2("openai-codex"));
     assert!(!catalog.supports_responses_via_chat_v1("openai-codex"));
     assert!(!catalog.supports_codex_multi_agent_v2("http-json"));
+}
+
+#[test]
+fn codex_0154_bundled_model_slugs_are_reserved_from_remote_catalogs() {
+    for slug in [
+        "gpt-6-astra",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-daybreak-blue-latest",
+        "gpt-daybreak-red-latest",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.2",
+        "codex-auto-review",
+    ] {
+        assert!(crate::provider::is_bundled_codex_model_slug(slug), "{slug}");
+    }
+    assert!(crate::provider::is_bundled_codex_model_slug(
+        "gpt-5.7-future"
+    ));
+    assert!(crate::provider::is_bundled_codex_model_slug("codex-next"));
+    assert!(!crate::provider::is_bundled_codex_model_slug(
+        "kimi-k3-256k"
+    ));
 }
 
 #[test]
