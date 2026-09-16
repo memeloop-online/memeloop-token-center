@@ -202,7 +202,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       ['config.runtimeProfiling.enabled=not-a-boolean'], ['config.runtimeProfiling.unknown=true'],
       ['config.archiveSpoolCompression.enabled=not-a-boolean'], ['config.archiveSpoolCompression.unknown=true'],
       ['config.proxyMemoryBudgetBytes=268435455'], ['config.proxyMemoryBudgetBytes=2147483649'],
-      ['config.responsesRequestSpoolBytes=4194303'], ['config.responsesRequestSpoolBytes=2147483649'], ['requestSpool.mountPath=relative/path'],
+      ['config.responsesRequestSpoolBytes=4194303'], ['config.responsesRequestSpoolBytes=2147483649'], ['requestSpool.mountPath=relative/path'], ['requestSpool.mountPath=/'],
     ];
     for (const [index, values] of invalid.entries()) {
       const args = ['template', `invalid-${index}`, chart, ...values!.flatMap((value) => ['--set-string', value])];
@@ -231,7 +231,6 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     for (const values of [
       ['config.responsesRequestSpoolBytes=33554431'],
       ['requestSpool.sizeLimit=127Mi'],
-      ['requestSpool.mountPath=/'],
       ['requestSpool.mountPath=/var/lib/../request-spool'],
       ['roles.gateway.resources.limits.ephemeral-storage=223Mi'],
       ['roles.all.enabled=true', 'roles.gateway.enabled=false', 'roles.control.enabled=false', 'roles.worker.enabled=false', 'roles.all.resources.limits.ephemeral-storage=223Mi'],
