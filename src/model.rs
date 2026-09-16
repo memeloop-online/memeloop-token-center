@@ -1260,6 +1260,10 @@ pub struct UsageAnalysisGenerationUnitsByBillingUnit {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct UsageAnalysisMetrics {
+    /// Comparable successful text requests with retained provider-reported usage.
+    /// Absence means this projection has no trustworthy rate source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_rate: Option<UsageOutputRate>,
     pub requests: i64,
     pub success: i64,
     pub failed: i64,
@@ -1274,6 +1278,13 @@ pub struct UsageAnalysisMetrics {
     /// The legacy numeric value is capped at 60 seconds, not an exact percentile.
     pub p95_is_capped: bool,
     pub costs: Vec<UsageAnalysisCost>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct UsageOutputRate {
+    pub requests: i64,
+    pub output_tokens: i64,
+    pub duration_ms: i64,
 }
 
 #[derive(Clone, Debug, Serialize)]

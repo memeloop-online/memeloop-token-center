@@ -162,6 +162,8 @@ export interface UsageAnalysisGenerationUnitByBillingUnit {
 }
 
 export interface UsageAnalysisMetrics {
+  /** Eligible successful non-compaction text samples with provider-reported usage and positive end-to-end duration. Absent on older servers; totals must never substitute for it. */
+  output_rate?: UsageAnalysisOutputRate;
   requests: number;
   success: number;
   failed: number;
@@ -175,6 +177,12 @@ export interface UsageAnalysisMetrics {
   /** Absent on older servers; never infer a precise 60-second P95 from that case. */
   p95_is_capped?: boolean;
   costs: UsageAnalysisCost[];
+}
+
+export interface UsageAnalysisOutputRate {
+  requests: number;
+  output_tokens: number;
+  duration_ms: number;
 }
 
 export interface UsageAnalysisBucket extends UsageAnalysisMetrics {

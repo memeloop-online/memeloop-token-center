@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 mod generation_sql;
+mod output_rate;
 mod session_accumulator;
 mod session_sql;
 use generation_sql::generation_usage_dimension_sql;
@@ -531,6 +532,15 @@ impl Database {
         for row in rows {
             accumulate_usage_row(&mut projections, &row)?;
         }
+        output_rate::attach_output_rates(
+            snapshot,
+            &mut projections,
+            &tenant_id,
+            tenant_scoped,
+            filter,
+            range,
+        )
+        .await?;
         Ok(projections)
     }
 }
@@ -1128,6 +1138,7 @@ SELECT 'heatmap' AS bucket_kind,
 
 #[derive(Default)]
 struct UsageMetricsAccumulator {
+    output_rate: Option<crate::model::UsageOutputRate>,
     label: String,
     requests: i64,
     successful_requests: i64,
@@ -1149,6 +1160,7 @@ impl UsageMetricsAccumulator {
             .then(|| self.duration_sum_ms as f64 / self.duration_count as f64);
         let p95_duration_ms = approximate_p95(self.duration_count, &self.duration_buckets);
         UsageAnalysisMetrics {
+            output_rate: self.output_rate,
             requests: self.requests,
             success: self.successful_requests,
             failed: self.failed_requests,
@@ -1175,6 +1187,7 @@ impl UsageMetricsAccumulator {
         let avg_duration_ms = (self.duration_count > 0)
             .then(|| self.duration_sum_ms as f64 / self.duration_count as f64);
         UsageAnalysisMetrics {
+            output_rate: self.output_rate,
             requests: self.requests,
             success: self.successful_requests,
             failed: self.failed_requests,

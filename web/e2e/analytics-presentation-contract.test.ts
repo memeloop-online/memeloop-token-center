@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { averageBucketTps, averageBucketTpsSeries, averageSeriesTps, analyticsAge, analyticsDuration, finiteP95Points, formatTps, histogramP95, metricArea } from '../src/operator/analyticsPresentation.js';
+import { averageBucketTps, averageBucketTpsSeries, averageSeriesTps, analyticsAge, analyticsDuration, finiteP95Points, formatTps, histogramP95, metricArea, seriesTpsSamples } from '../src/operator/analyticsPresentation.js';
 import { formatCurrencyDisplay, formatMetricDisplay } from '../src/format.js';
 import type { UsageAnalysisTimeBucket } from '../src/types.js';
 
@@ -32,15 +32,23 @@ test('micro areas encode real variation, zero baselines, and missing-value gaps 
   assert.equal((metricArea([1, 2, null, 2, 1])?.match(/M/g) ?? []).length, 2);
 });
 
-test('TPS summaries and background series are derived from historical buckets', () => {
+test('TPS summaries and background series derive only from eligible output_rate samples', () => {
   const points = [
-    { requests: 2, output_tokens: 200, avg_duration_ms: 200 } as UsageAnalysisTimeBucket,
-    { requests: 4, output_tokens: 120, avg_duration_ms: 500 } as UsageAnalysisTimeBucket,
-    { requests: 1, output_tokens: 60, avg_duration_ms: 1000 } as UsageAnalysisTimeBucket,
+    { output_rate: { requests: 2, output_tokens: 200, duration_ms: 400 }, requests: 99, output_tokens: 9_999, avg_duration_ms: 1 } as UsageAnalysisTimeBucket,
+    { output_rate: { requests: 4, output_tokens: 120, duration_ms: 2_000 }, requests: 7, output_tokens: 5_000, avg_duration_ms: 60_000 } as UsageAnalysisTimeBucket,
+    { output_rate: { requests: 1, output_tokens: 60, duration_ms: 1_000 } } as UsageAnalysisTimeBucket,
   ];
-  assert.deepEqual(points.map((point) => averageBucketTps(point)), [500, 60, 60]);
-  assert.equal(averageSeriesTps(points), 111.76470588235294);
-  assert.deepEqual(averageBucketTpsSeries([...points, { requests: 1, output_tokens: 10, avg_duration_ms: null } as UsageAnalysisTimeBucket]), [500, 60, 60, null]);
-  assert.equal(averageBucketTps({ requests: 2, output_tokens: 100, avg_duration_ms: 500 }), 100, 'one 1-second request plus a zero-duration failure: the backend counts both in the duration average');
+  assert.deepEqual(points.map((point) => averageBucketTps(point)), [500, 60, 60], 'total request, token and duration counts must not contaminate the eligible rate');
+  assert.equal(averageSeriesTps(points), 111.76470588235294, 'summary pools eligible numerators and denominators, not total counts');
+  assert.equal(seriesTpsSamples(points), 7);
+  const legacy = { requests: 2, output_tokens: 100, avg_duration_ms: 500 } as UsageAnalysisTimeBucket;
+  assert.equal(averageBucketTps(legacy), null, 'missing output_rate never falls back to legacy totals');
+  assert.equal(averageSeriesTps([legacy]), null, 'a series without provenance stays unavailable, not zero');
+  assert.equal(seriesTpsSamples([legacy]), null, 'unknown provenance never reports a fabricated zero sample count');
+  assert.deepEqual(averageBucketTpsSeries([...points, legacy]), [500, 60, 60, null], 'buckets without provenance remain real gaps');
+  assert.equal(averageBucketTps({ output_rate: { requests: 0, output_tokens: 100, duration_ms: 500 } } as UsageAnalysisTimeBucket), null, 'zero eligible samples render an em dash');
+  assert.equal(averageSeriesTps([{ output_rate: { requests: 0, output_tokens: 0, duration_ms: 0 } } as UsageAnalysisTimeBucket]), null);
+  assert.equal(seriesTpsSamples([{ output_rate: { requests: 0, output_tokens: 0, duration_ms: 0 } } as UsageAnalysisTimeBucket]), 0, 'known zero samples differ from unknown provenance');
   assert.deepEqual(formatTps(111.76470588235294, 'en'), { text: '111.76', title: '111.764706 TPS' });
+  assert.deepEqual(formatTps(null, 'en'), { text: '—' });
 });

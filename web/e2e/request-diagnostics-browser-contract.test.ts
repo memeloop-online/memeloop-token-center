@@ -124,7 +124,7 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     assert.doesNotMatch(historicalGapText, /Final upstream ID|Final route ID/, 'missing technical values do not occupy empty rows');
     assert.doesNotMatch(historicalGapText, /Cache read|Cache write/, 'missing historical cache fields must remain absent rather than becoming zero-valued rows');
     assert.match(await historicalGapDiagnostics.locator('.request-token-total').getAttribute('aria-label') ?? '', /Input tokens: 160.*Output tokens: 32/, 'known input/output remain available when historical cache telemetry is missing');
-    assert.match(await historicalGapDiagnostics.locator('.request-token-primary').innerText(), /Uncached input\s*Not recorded[\s\S]*Output\s*32/);
+    assert.match(await historicalGapDiagnostics.locator('.request-token-primary').innerText(), /Uncached input\s*—[\s\S]*Output\s*—/);
     assert.equal(await recordedDiagnostics.locator('.request-token-total > span').evaluate(element => getComputedStyle(element).textDecorationLine), 'line-through', 'detail reuses the de-emphasized total');
     assert.equal(await recordedDiagnostics.locator('.request-token-primary b').first().evaluate(element => getComputedStyle(element).textDecorationLine), 'none', 'detail non-cached counts retain normal emphasis');
     assert.equal(await recordedDiagnostics.locator('.request-detail-primary').getByRole('button', { name: 'Research key · Details', exact: true }).count(), 1, 'credential and usage share the same primary comparison group');
@@ -141,9 +141,10 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     assert.match(await recordedRow.locator('.request-token-primary').innerText(), /Uncached input\s*100[\s\S]*Output\s*32/);
     assert.equal(await recordedRow.locator('.request-token-total > span').evaluate(element => getComputedStyle(element).textDecorationLine), 'line-through');
     assert.equal(await recordedRow.locator('.request-token-primary b').first().evaluate(element => getComputedStyle(element).textDecorationLine), 'none');
-    assert.match(await recordedRow.locator('.request-tps-cell').innerText(), /Average TPS\s+25\.93/, '32 output tokens / 1.234 recorded seconds is explicitly average');
+    assert.match(await recordedRow.locator('.request-tps-cell').innerText(), /Average TPS\s+—/, 'failed delivery is not compared with successful generation in the list');
+    assert.match(await recordedDiagnostics.locator('[data-rate="average"]').innerText(), /Average TPS\s+25\.93/, 'reported failure usage remains available as delivery throughput in details');
     assert.match(await page.locator('tbody tr').nth(1).locator('.request-tps-cell').innerText(), /Average TPS\s+—/, 'missing duration never becomes zero TPS');
-    assert.match(await page.locator('tbody tr').nth(1).locator('.request-token-primary').innerText(), /Uncached input\s*Not recorded[\s\S]*Output\s*32/);
+    assert.match(await page.locator('tbody tr').nth(1).locator('.request-token-primary').innerText(), /Uncached input\s*—[\s\S]*Output\s*—/);
     const runningRow = page.locator('tbody tr').nth(2);
     assert.match(await runningRow.locator('.request-token-cell').innerText(), /Running/);
     assert.match(await runningRow.locator('.request-token-cell').innerText(), /Usage pending settlement/);
@@ -156,11 +157,11 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     assert.equal(await timedRow.locator('.request-outcome').getAttribute('data-outcome'), 'completed');
     await timedRow.locator('.request-outcome').focus();
     await page.getByRole('tooltip').filter({ hasText: 'not client acknowledgement' }).waitFor();
-    assert.match(await timedRow.locator('.request-tps-cell').innerText(), /Generation TPS\s+32/);
+    assert.match(await timedRow.locator('.request-tps-cell').innerText(), /Gateway output rate\s+32/);
     assert.match(await timedRow.locator('.request-tps-cell').innerText(), /Average TPS\s+25\.93/, 'average includes the first-output wait and remains alongside generation throughput');
-    assert.match(await recordedRow.locator('[data-rate="generation"]').innerText(), /Generation TPS\s+—/, 'missing generation timing does not borrow the average');
+    assert.match(await recordedRow.locator('[data-rate="generation"]').innerText(), /Gateway output rate\s+—/, 'missing generation timing does not borrow the average');
     assert.match(await historicalGapDiagnostics.locator('[data-rate="average"]').innerText(), /Average TPS\s+—/);
-    assert.match(await historicalGapDiagnostics.locator('[data-rate="generation"]').innerText(), /Generation TPS\s+—/);
+    assert.match(await historicalGapDiagnostics.locator('[data-rate="generation"]').innerText(), /Gateway output rate\s+—/);
     await timedRow.locator('[data-rate="generation"]').focus();
     await page.getByRole('tooltip').filter({ hasText: 'First output wait' }).waitFor();
     assert.match(await page.getByRole('tooltip').filter({ hasText: 'First output wait' }).innerText(), /234/);
@@ -265,11 +266,16 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     const ceiling = page.locator('[data-fixture-request="recorded"] .request-diagnostics');
     await ceiling.waitFor();
     assert.match(await ceiling.innerText(), /Settlement ceiling/);
-    assert.match(await ceiling.locator('.request-token-primary').innerText(), /≤/);
+    assert.match(await ceiling.locator('.request-token-primary').innerText(), /Uncached input\s*—[\s\S]*Output\s*—/);
     assert.match(await ceiling.locator('[data-rate="average"]').innerText(), /Average TPS\s+—/);
-    assert.match(await ceiling.locator('[data-rate="generation"]').innerText(), /Generation TPS\s+—/);
+    assert.match(await ceiling.locator('[data-rate="generation"]').innerText(), /Gateway output rate\s+—/);
     assert.doesNotMatch(await ceiling.innerText(), /8,?560\.91/);
-    assert.match(await ceiling.innerText(), /US\$<0\.01|\$<0\.01/, 'a ceiling settlement is not changed to free');
+    const unknownCost = ceiling.getByLabel('Cost unknown', { exact: true });
+    assert.equal(await unknownCost.innerText(), '—');
+    await unknownCost.focus();
+    const ledgerTip = page.getByRole('tooltip').filter({ hasText: 'Local ledger amount:' });
+    await ledgerTip.waitFor();
+    assert.match(await ledgerTip.innerText(), /0\.001234/, 'the original local ledger amount remains inspectable, never rewritten to free');
   } catch (reason) {
     const diagnostics = await fixtureDiagnostics(page, current.value, history, pageErrors, consoleErrors);
     process.stderr.write(`request-diagnostics browser contract failed: ${JSON.stringify(diagnostics)}\n`);

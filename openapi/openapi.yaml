@@ -9263,6 +9263,14 @@ components:
       type: object
       required: [requests, success, failed, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, avg_duration_ms, p95_duration_ms, p95_is_capped, costs]
       properties:
+        output_rate:
+          type: object
+          description: Retained successful provider-reported text requests, excluding known compaction. Total request time, not decoding time. Missing on older servers; zero samples means unavailable.
+          required: [requests, output_tokens, duration_ms]
+          properties:
+            requests: { type: integer, format: int64, minimum: 0 }
+            output_tokens: { type: integer, format: int64, minimum: 0 }
+            duration_ms: { type: integer, format: int64, minimum: 0 }
         requests: { type: integer, format: int64, minimum: 0 }
         success: { type: integer, format: int64, minimum: 0 }
         failed: { type: integer, format: int64, minimum: 0 }
