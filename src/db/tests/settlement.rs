@@ -403,7 +403,6 @@ async fn metered_usage_projection_is_exactly_once_and_skips_prepaid_hot_rows() {
                 output_tokens: 1,
                 ..TokenUsage::default()
             },
-            charge_contract_ceiling: false,
             error_code: None,
             response_object: "gap://metered-projection/response",
             conversation: Some(ProxyConversationInput {

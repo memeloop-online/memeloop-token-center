@@ -947,7 +947,7 @@ async fn generic_reaper_skips_active_synchronous_image_lease() {
             .fetch_one(&database.pool)
             .await
             .unwrap(),
-        1,
-        "a confirmed delivery is conservatively charged to its contract ceiling"
+        0,
+        "delivery without observed usage must not promote its reservation to actual cost"
     );
 }

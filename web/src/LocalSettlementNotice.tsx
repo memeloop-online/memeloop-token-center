@@ -5,10 +5,14 @@ export function localSettlementLabel(locale: Locale) {
   return locale === 'zh-CN' ? '本地结算' : 'Local settlement';
 }
 
+export function localSettlementTrendLabel(locale: Locale) {
+  return locale === 'zh-CN' ? '本地结算趋势' : 'Local settlement trend';
+}
+
 export function LocalSettlementNotice() {
   const { locale } = useI18n();
   const detail = locale === 'zh-CN'
-    ? '按本地账本结算，可能包含保守上限结算；不是供应商实际消耗或发票。部分历史用量来源未记录，不据此重算或推定实际消耗占比。'
-    : 'Settled by the local ledger and may include conservative ceiling settlements. This is not supplier consumption or an invoice. Some historical usage provenance is unavailable; this total does not recompute it or infer the share of actual usage.';
+    ? '这是本地账本已确认的结算合计，可能包含保守上限结算，且部分历史用量来源未记录；不是供应商实际消耗或发票。标为“未观测用量”的请求会释放预留并以 0 进入本地合计，但其供应商费用仍未知，因此本地合计不是完整供应商成本。缺口数量按终态请求中 usage_basis=not_observed 的请求数统计。'
+    : 'This is the confirmed local-ledger settlement total and may include conservative ceiling settlements or historical rows without usage provenance; it is not supplier consumption or an invoice. Requests marked “Usage not observed” release their reservation and contribute zero locally, while their supplier cost remains unknown, so this is not a complete supplier-cost total. The gap count is the number of terminal requests with usage_basis=not_observed.';
   return <DetailTooltip content={detail}><span tabIndex={0}>{localSettlementLabel(locale)} ⓘ</span></DetailTooltip>;
 }
