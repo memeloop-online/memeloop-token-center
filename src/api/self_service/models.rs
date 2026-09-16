@@ -169,6 +169,7 @@ fn codex_model_info(model: &str, multi_agent_v2: bool) -> Value {
         "use_responses_lite": false,
         "node_repl_auto_review_required": false,
         "node_repl_disabled": true,
+        "multi_agent_version": "disabled",
     });
     if multi_agent_v2 {
         info["multi_agent_version"] = Value::String("v2".into());
@@ -249,7 +250,7 @@ mod tests {
         assert!(compatible.get("credential").is_none());
 
         let ordinary = codex_model_info("ordinary", false);
-        assert!(ordinary.get("multi_agent_version").is_none());
+        assert_eq!(ordinary["multi_agent_version"], "disabled");
     }
 
     #[test]
