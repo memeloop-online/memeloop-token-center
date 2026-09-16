@@ -523,16 +523,16 @@ impl Database {
                  updated_at = $3
              WHERE tenant_id = $4 AND upstream_account_id = $5 AND id = $6
                AND settled_at IS NULL
+               AND EXISTS (
+                 SELECT 1 FROM upstream_accounts account
+                 WHERE account.id = upstream_account_id AND account.tenant_id = $4
+                   AND account.credential_generation = $7 AND account.updated_at = $8
+               )
                AND (
                  (state = 'accepted' AND $1 < available_credits AND $3 > observed_at)
                  OR (
                    state IN ('submitted', 'accepted', 'unknown')
                    AND credential_generation = $7 AND transport_updated_at = $8
-                   AND EXISTS (
-                     SELECT 1 FROM upstream_accounts account
-                     WHERE account.id = upstream_account_id AND account.tenant_id = $4
-                       AND account.credential_generation = $7 AND account.updated_at = $8
-                   )
                  )
                )
              RETURNING state, settled_at",
@@ -586,6 +586,11 @@ impl Database {
                AND state = 'accepted' AND settled_at IS NULL
                AND available_credits > $3
                AND observed_at < $4
+               AND EXISTS (
+                 SELECT 1 FROM upstream_accounts account
+                 WHERE account.id = upstream_account_id AND account.tenant_id = $1
+                   AND account.credential_generation = $5 AND account.updated_at = $6
+               )
              ORDER BY created_at DESC, id DESC
              LIMIT 1",
         )
@@ -593,6 +598,8 @@ impl Database {
         .bind(&account_id)
         .bind(available)
         .bind(observed_at)
+        .bind(account.credential_generation)
+        .bind(account.updated_at)
         .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else {
@@ -607,7 +614,12 @@ impl Database {
                  last_reconciled_at = $3, settled_at = $3, updated_at = $3
              WHERE id = $4 AND tenant_id = $5 AND upstream_account_id = $6
                AND state = 'accepted' AND settled_at IS NULL
-               AND available_credits > $1 AND observed_at < $7",
+               AND available_credits > $1 AND observed_at < $7
+               AND EXISTS (
+                 SELECT 1 FROM upstream_accounts account
+                 WHERE account.id = upstream_account_id AND account.tenant_id = $5
+                   AND account.credential_generation = $8 AND account.updated_at = $9
+               )",
         )
         .bind(available)
         .bind(applicable)
@@ -616,6 +628,8 @@ impl Database {
         .bind(&tenant)
         .bind(&account_id)
         .bind(observed_at)
+        .bind(account.credential_generation)
+        .bind(account.updated_at)
         .execute(&mut *tx)
         .await?;
         if changed.rows_affected() == 1 {
@@ -627,7 +641,7 @@ impl Database {
                 "reconciled",
                 None,
                 Some("accepted_credit_decrease_observed"),
-                observed_at,
+                unix_millis(),
             )
             .await?;
         }
@@ -816,6 +830,18 @@ mod tests {
                 .is_err(),
             "an unresolved operation blocks a differently keyed preparation"
         );
+        assert!(
+            !db.settle_accepted_quota_reset_from_observation(&account, 1, 0, now + 1)
+                .await
+                .unwrap(),
+            "a submitted dispatch cannot be settled by a lower credit observation"
+        );
+        assert!(
+            db.prepare_quota_reset(input("after-submitted-observation"))
+                .await
+                .is_err(),
+            "submitted remains the unique active operation after observation"
+        );
 
         db.finish_quota_reset(&operation.id, false, Some("reset_dispatch_unknown"))
             .await
@@ -877,6 +903,30 @@ mod tests {
                 .await
                 .unwrap(),
             "fresh counts cannot release an unknown dispatch"
+        );
+        let mut changed_unknown_account = account.clone();
+        changed_unknown_account.credential_generation += 1;
+        changed_unknown_account.updated_at = now + 1;
+        sqlx::query(
+            "UPDATE upstream_accounts SET credential_generation = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4",
+        )
+        .bind(changed_unknown_account.credential_generation)
+        .bind(changed_unknown_account.updated_at)
+        .bind(account.id.to_string())
+        .bind(tenant.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            !db.settle_accepted_quota_reset_from_observation(
+                &changed_unknown_account,
+                0,
+                0,
+                now + 4
+            )
+            .await
+            .unwrap(),
+            "credential changes cannot settle an unknown dispatch"
         );
 
         let mut accepted_account = account.clone();
