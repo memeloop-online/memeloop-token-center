@@ -3883,10 +3883,10 @@ async fn codex_streaming_truncated_upstream_ends_with_a_safe_sse_error_frame() {
         .await
         .unwrap();
     assert_eq!(rows[0].status_code, Some(502));
-    assert!(matches!(
+    assert_eq!(
         rows[0].error_code.as_deref(),
-        Some("upstream_stream") | Some("upstream_incomplete_response")
-    ));
+        Some("upstream_stream_read_error")
+    );
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
 }
 

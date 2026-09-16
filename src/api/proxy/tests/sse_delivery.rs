@@ -227,6 +227,60 @@ async fn assert_codex_terminal_rejection(
 }
 
 #[tokio::test]
+async fn codex_clean_eof_without_terminal_is_durable_and_explicit_downstream() {
+    let fixture = codex_route_fixture("clean-eof-without-terminal").await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-clean-eof\"}}\n\n"
+            ),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "clean eof", "stream": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .expect("a clean EOF without a terminal must stay valid SSE");
+    let delivered = String::from_utf8(delivered.to_vec()).unwrap();
+    assert!(delivered.contains("response.created"));
+    assert_eq!(delivered.matches("event: response.failed").count(), 1);
+    assert!(!delivered.contains("response.completed"));
+
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(502));
+    assert_eq!(
+        rows[0].error_code.as_deref(),
+        Some("upstream_eof_without_terminal")
+    );
+    assert_eq!(
+        rows[0].upstream_account_id,
+        Some(fixture.upstream_account_id)
+    );
+    assert_eq!(rows[0].route_id, Some(fixture.route_id));
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    upstream.verify().await;
+}
+
+#[tokio::test]
 async fn codex_terminal_id_conflict_never_archives_or_settles_as_success() {
     assert_codex_terminal_rejection(
         "terminal-id-conflict",
@@ -237,7 +291,7 @@ async fn codex_terminal_id_conflict_never_archives_or_settles_as_success() {
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-b\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
             "data: [DONE]\n\n"
         ),
-        "upstream_invalid_response",
+        "upstream_response_terminal_conflict",
         None,
     )
     .await;
