@@ -6,7 +6,12 @@ async fn concurrent_large_streams_dispatch_while_buffered_partition_is_busy() {
     fixture
         .state
         .db
-        .upsert_model_price(&fixture.model, "USD", Decimal::ZERO, Decimal::ZERO)
+        .grant(
+            fixture.credit_account_id,
+            Decimal::from(32),
+            "large stream memory admission fixture",
+            "large-stream-memory-admission-balance",
+        )
         .await
         .unwrap();
     let held = fixture.state.proxy_memory_budget.reservation();
@@ -34,7 +39,7 @@ async fn concurrent_large_streams_dispatch_while_buffered_partition_is_busy() {
     for _ in 0..2 {
         let fixture = fixture.clone();
         let endpoint = upstream.uri();
-        requests.push(tokio::spawn(async move {
+        let mut request = tokio::spawn(async move {
             send_codex_route_to_endpoint(
                 &fixture,
                 endpoint,
@@ -46,14 +51,33 @@ async fn concurrent_large_streams_dispatch_while_buffered_partition_is_busy() {
                 }),
             )
             .await
-        }));
-        // Observe actual dispatch before starting the next ingress. The first
-        // upstream deliberately has not returned headers when the second sends.
-        tokio::time::timeout(Duration::from_secs(15), dispatched.acquire())
-            .await
-            .expect("large stream must reach upstream without retained admission")
-            .unwrap()
-            .forget();
+        });
+        // Observe actual dispatch before starting the next ingress. A local
+        // admission error is ready first and must fail with its response rather
+        // than being misreported as a dispatch timeout. The upstream delays
+        // headers, so a dispatched request remains active while the next large
+        // stream enters the gateway.
+        tokio::select! {
+            biased;
+            response = &mut request => {
+                let response = response.expect("large stream request task");
+                let status = response.status();
+                let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+                    .await
+                    .expect("early large stream response body");
+                panic!(
+                    "large stream returned before upstream dispatch: status={status}, body={}",
+                    String::from_utf8_lossy(&body)
+                );
+            }
+            permit = dispatched.acquire() => {
+                permit.expect("dispatch semaphore remains open").forget();
+            }
+            _ = tokio::time::sleep(Duration::from_secs(15)) => {
+                panic!("large stream did not reach upstream");
+            }
+        }
+        requests.push(request);
     }
     assert_eq!(
         fixture.state.proxy_memory_budget.snapshot().2,
