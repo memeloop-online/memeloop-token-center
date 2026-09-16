@@ -28,6 +28,27 @@ impl ArchiveStore {
     }
 
     pub async fn get_bounded(&self, location: &str, maximum: usize) -> Result<Bytes, AppError> {
+        if location.ends_with(super::compressed::SUFFIX) {
+            let download = self.open_stream(location, None).await?;
+            if download.object_size > maximum as u64 {
+                return Err(AppError::Storage(
+                    "archive object exceeds read limit".into(),
+                ));
+            }
+            let mut body = BytesMut::with_capacity(download.object_size as usize);
+            let mut stream = download.stream;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk
+                    .map_err(|_| AppError::Storage("archive compressed read failed".into()))?;
+                if body.len().saturating_add(chunk.len()) > maximum {
+                    return Err(AppError::Storage(
+                        "archive object exceeds read limit".into(),
+                    ));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            return Ok(body.freeze());
+        }
         let path = archive_path(location)?;
         let metadata = self.inner.head(&path).await?;
         if metadata.size > maximum as u64 {
@@ -57,6 +78,9 @@ impl ArchiveStore {
     }
 
     pub async fn head_size(&self, location: &str) -> Result<u64, AppError> {
+        if location.ends_with(super::compressed::SUFFIX) {
+            return self.compressed_size(location).await;
+        }
         Ok(self.inner.head(&archive_path(location)?).await?.size)
     }
 }

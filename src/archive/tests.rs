@@ -42,7 +42,7 @@ impl MultipartUpload for TestMultipartUpload {
     }
 }
 
-fn memory_store() -> ArchiveStore {
+pub(super) fn memory_store() -> ArchiveStore {
     ArchiveStore {
         inner: Arc::new(InMemory::new()),
         readiness: Arc::new(tokio::sync::Mutex::new(ReadinessCache::default())),
@@ -64,6 +64,8 @@ fn test_writer(aborts: Arc<AtomicUsize>, fail_parts: bool) -> ArchiveWriter {
         multipart_part_bytes: 1,
         hasher: blake3::Hasher::new(),
         size_bytes: 0,
+        compressed: false,
+        compressed_pending: bytes::BytesMut::new(),
     }
 }
 

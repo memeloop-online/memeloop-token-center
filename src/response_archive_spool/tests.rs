@@ -9,7 +9,17 @@ const PEPPER: &[u8] = b"existing-test-pepper-over-thirty-two-bytes";
 
 #[tokio::test]
 async fn both_buffered_purposes_recover_exact_bytes_only_after_terminal() {
-    let (_dir, state, pool, identity) = fixture().await;
+    buffered_purposes_recover(false).await;
+}
+
+#[tokio::test]
+async fn compressed_objects_bind_both_purposes_and_recover_original_bytes() {
+    buffered_purposes_recover(true).await;
+}
+
+async fn buffered_purposes_recover(compressed: bool) {
+    let (_dir, mut state, pool, identity) = fixture().await;
+    std::sync::Arc::make_mut(&mut state.config).archive_object_compression_enabled = compressed;
     let request = Bytes::from_static(b"{\"messages\":[{\"content\":\"private request\"}]}");
     let response = Bytes::from_static(b"{\"output\":\"complete private response\"}");
     assert!(
@@ -67,6 +77,8 @@ async fn both_buffered_purposes_recover_exact_bytes_only_after_terminal() {
             .unwrap();
     let request_locator: String = row.get("request_object");
     let response_locator: String = row.get("response_object");
+    assert_eq!(request_locator.ends_with(".mtcz1"), compressed);
+    assert_eq!(response_locator.ends_with(".mtcz1"), compressed);
     assert_ne!(request_locator, response_locator);
     assert_eq!(state.archive.get(&request_locator).await.unwrap(), request);
     assert_eq!(

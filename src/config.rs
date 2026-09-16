@@ -169,6 +169,9 @@ pub struct Config {
     /// formats; this role-independent switch deliberately defaults off.
     #[serde(default)]
     pub archive_spool_compression_enabled: bool,
+    /// Reader-first rollout: affects only new text objects, never legacy reads.
+    #[serde(default)]
+    pub archive_object_compression_enabled: bool,
     pub archive_path: Option<String>,
     pub s3_bucket: Option<String>,
     pub s3_endpoint: Option<String>,
@@ -238,6 +241,10 @@ impl std::fmt::Debug for Config {
             .field(
                 "archive_spool_compression_enabled",
                 &self.archive_spool_compression_enabled,
+            )
+            .field(
+                "archive_object_compression_enabled",
+                &self.archive_object_compression_enabled,
             )
             .field("archive_path", &self.archive_path)
             .field("s3_bucket", &self.s3_bucket)
@@ -428,6 +435,10 @@ impl Config {
                 "MTC_ARCHIVE_SPOOL_COMPRESSION_ENABLED",
                 DEFAULT_ARCHIVE_SPOOL_COMPRESSION_ENABLED,
             ),
+            archive_object_compression_enabled: env_bool(
+                "MTC_ARCHIVE_OBJECT_COMPRESSION_ENABLED",
+                false,
+            ),
             archive_path: env::var("MTC_ARCHIVE_PATH").ok(),
             s3_bucket: env::var("MTC_S3_BUCKET").ok(),
             s3_endpoint: env::var("MTC_S3_ENDPOINT").ok(),
@@ -489,6 +500,7 @@ impl Config {
             ),
             archive_backend: ArchiveBackend::Memory,
             archive_spool_compression_enabled: DEFAULT_ARCHIVE_SPOOL_COMPRESSION_ENABLED,
+            archive_object_compression_enabled: false,
             archive_path: None,
             s3_bucket: None,
             s3_endpoint: None,

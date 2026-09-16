@@ -49,7 +49,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       observed: render('observed', ['--set', 'serviceMonitor.enabled=true', '--set', 'roles.gateway.autoscaling.enabled=true']),
       gatewayMetrics: render('gateway-metrics', ['--show-only', 'templates/servicemonitor.yaml', '--set', 'serviceMonitor.enabled=true', '--set', 'roles.control.enabled=false']),
       profiling: render('profiling', ['--show-only', 'templates/deployment.yaml', '--set', 'config.runtimeProfiling.enabled=true']),
-      archiveCompression: render('archive-compression', ['--show-only', 'templates/deployment.yaml', '--set', 'config.archiveSpoolCompression.enabled=true']),
+      archiveCompression: render('archive-compression', ['--show-only', 'templates/deployment.yaml', '--set', 'config.archiveSpoolCompression.enabled=true', '--set', 'config.archiveObjectCompression.enabled=true']),
       digest: render('digest', ['--set-string', 'image.tag=must-not-render', '--set-string', `image.digest=${reviewed}`]),
       configmap: render('configmap-plugin', ['--set', 'plugins.enabled=true', '--set', 'plugins.existingConfigMap=token-center-plugins']),
       pvc: render('pvc-plugin', ['--set', 'plugins.enabled=true', '--set', 'plugins.existingClaim=token-center-plugins']),
@@ -154,6 +154,8 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     count('profiling', /name: MTC_RUNTIME_PROFILING_ENABLED\n\s+value: "true"/, 1);
     count('default', /name: MTC_ARCHIVE_SPOOL_COMPRESSION_ENABLED\n\s+value: "false"/, 3);
     count('archiveCompression', /name: MTC_ARCHIVE_SPOOL_COMPRESSION_ENABLED\n\s+value: "true"/, 3);
+    count('default', /name: MTC_ARCHIVE_OBJECT_COMPRESSION_ENABLED\n\s+value: "false"/, 3);
+    count('archiveCompression', /name: MTC_ARCHIVE_OBJECT_COMPRESSION_ENABLED\n\s+value: "true"/, 3);
     count('default', /^kind: Ingress$/gm, 0); count('gateway', /^kind: Ingress$/gm, 1); count('control', /^kind: Ingress$/gm, 1); count('both', /^kind: Ingress$/gm, 2);
     for (const needle of ['ingressClassName: public-gateway', 'marker: gateway-only', '100.64.0.2/32', 'host: "gateway.example.test"', 'secretName: gateway-tls', '- path: /v1', '- path: /self', '- path: /portal', '- path: /ui-assets']) has('gateway', needle);
     lacks('gateway', /control\.internal|higress-private|control-only|control-tls|path:\s*\/internal|path:\s*\/operator/);
@@ -184,6 +186,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       ['serviceAccount.automount=true'], ['plugins.mountpath=/plugins'], ['hostAliases[0].ip=10.28.0.22'], ['config.databaseMaxConnection=8'], ['config.gatewayBodyReadConcurrency=8193'], ['config.responsesBodyMaxBytes=67108865'], ['config.audioBodyMaxBytes=-1'], ['config.responsesBodyReadConcurrency=9'],
       ['config.runtimeProfiling.enabled=not-a-boolean'], ['config.runtimeProfiling.unknown=true'],
       ['config.archiveSpoolCompression.enabled=not-a-boolean'], ['config.archiveSpoolCompression.unknown=true'],
+      ['config.archiveObjectCompression.enabled=not-a-boolean'], ['config.archiveObjectCompression.unknown=true'],
       ['config.proxyMemoryBudgetBytes=268435455'], ['config.proxyMemoryBudgetBytes=2147483649'],
     ];
     for (const [index, values] of invalid.entries()) {

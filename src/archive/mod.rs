@@ -18,6 +18,7 @@ use futures_util::{Stream, TryStreamExt, stream};
 use object_store::{ObjectStoreExt, PutPayload, memory::InMemory, path::Path};
 
 mod backend;
+mod compressed;
 mod download;
 mod multipart;
 mod objects;
@@ -61,5 +62,7 @@ impl Default for ReadinessCache {
     }
 }
 
+#[cfg(test)]
+mod compressed_tests;
 #[cfg(test)]
 mod tests;
