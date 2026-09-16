@@ -11,12 +11,13 @@ import type { RequestDetail, RequestEvent, RequestListResponse, RequestView, Typ
 import type { SessionStreamState } from '../SessionMonitor';
 import { queryForTenant } from '../scope/operatorShared';
 import { TypedFilterBuilder } from '../TypedFilterBuilder';
+import { RequestRefreshControl } from '../traffic/RequestRefreshControl';
 import {
   emptyTypedFilterAst, filteredRequestRefreshDelay, mergeLiveRequestEvents, mergeRefreshedRequestPage,
   summarizeVisibleRequests, typedFiltersActive, typedRequestQueryBody, visibleRequestMetricSeries,
 } from '../traffic/requestTraffic';
 
-export function RequestsPage({ token, tenant, liveEvents, streamRevision, streamState, streamError, onOpenSessions, onOpenSession, requestFocus, onRequestFocusHandled, requestDrilldown, onRequestDrilldownHandled }: {
+export function RequestsPage({ token, tenant, liveEvents, streamRevision, streamState, streamError, onOpenSessions, onOpenSession, requestFocus, onRequestFocusHandled, requestDrilldown, onRequestDrilldownHandled, requestRefresh, streamOverflowRevision = 0, onProtectRequests }: {
   token: string;
   tenant: string;
   liveEvents: ReadonlyMap<string, RequestEvent>;
@@ -29,6 +30,9 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   onRequestFocusHandled?: (revision: number) => void;
   requestDrilldown?: { ast: TypedFilterAst; revision: number };
   onRequestDrilldownHandled?: (revision: number) => void;
+  requestRefresh?: { intervalMs: number; paused: boolean; onIntervalChange: (value: number) => void };
+  streamOverflowRevision?: number;
+  onProtectRequests?: (ids: string[]) => void;
 }) {
   const { t } = useI18n();
   const diagnosticLabels = { requestId: t('request.correlationId'), streamInterrupted: t('request.streamInterrupted') };
@@ -46,6 +50,10 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   const olderFilteredResultsVisible = useRef(false);
   const requestsRef = useRef(requests);
   const loadingRef = useRef(false);
+  const paused = useRef(false);
+  paused.current = requestRefresh?.paused ?? false;
+  const reconcileOverflow = useRef(false);
+  const previousOverflowRevision = useRef(streamOverflowRevision);
   const filteredRefresh = useRef<{
     controller?: AbortController;
     firstPendingAt?: number;
@@ -93,9 +101,9 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   function scheduleFilteredRefresh() {
     const state = filteredRefresh.current;
     const currentScope = scope.current;
-    if (!currentScope.token || !currentScope.tenant || !typedFiltersActive(currentScope.filters)) return;
+    if (!currentScope.token || !currentScope.tenant || (!typedFiltersActive(currentScope.filters) && !reconcileOverflow.current)) return;
     state.pending = true;
-    if (state.inFlight || loadingRef.current) return;
+    if (state.inFlight || loadingRef.current || paused.current) return;
 
     const now = Date.now();
     state.firstPendingAt ??= now;
@@ -109,14 +117,15 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
 
   async function refreshFilteredRequests() {
     const state = filteredRefresh.current;
-    if (state.inFlight || loadingRef.current || !state.pending) return;
+    if (state.inFlight || loadingRef.current || !state.pending || paused.current) return;
     const currentScope = scope.current;
-    if (!currentScope.token || !currentScope.tenant || !typedFiltersActive(currentScope.filters)) return;
+    if (!currentScope.token || !currentScope.tenant || (!typedFiltersActive(currentScope.filters) && !reconcileOverflow.current)) return;
     state.inFlight = true;
     state.pending = false;
     state.firstPendingAt = undefined;
     const requestSequence = ++state.requestSequence;
     const scopeSequence = state.scopeSequence;
+    const overflowAtStart = previousOverflowRevision.current;
     const controller = new AbortController();
     state.controller = controller;
     try {
@@ -128,7 +137,10 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
         || latest.token !== currentScope.token || latest.tenant !== currentScope.tenant || latest.filters !== currentScope.filters) return;
       // Keep the current drawer and scroll position intact. This replacement is
       // the exact server-filtered first page, not a guessed local merge.
-      setRequests((current) => mergeRefreshedRequestPage(current, next, olderFilteredResultsVisible.current));
+      setRequests((current) => typedFiltersActive(currentScope.filters)
+        ? mergeRefreshedRequestPage(current, next, olderFilteredResultsVisible.current)
+        : mergeLiveRequestEvents(mergeRefreshedRequestPage(current, next, current.length > 100), new Map(liveEventsRef.current), next.next_cursor === null));
+      if (previousOverflowRevision.current === overflowAtStart) reconcileOverflow.current = false;
       // A retained history tail owns its pagination state. A first-page
       // cursor must not reopen an already exhausted tail.
       if (!olderFilteredResultsVisible.current || next.next_cursor === null) {
@@ -228,6 +240,28 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   }, [tenant, token]);
 
   useEffect(() => {
+    onProtectRequests?.(requests.map(request => request.request_id));
+  }, [requests, onProtectRequests]);
+  useEffect(() => () => onProtectRequests?.([]), [onProtectRequests]);
+
+  useEffect(() => {
+    if (requestRefresh?.paused) {
+      const state = filteredRefresh.current;
+      const pending = state.pending || state.inFlight;
+      cancelFilteredRefresh();
+      state.pending = pending;
+    } else if (filteredRefresh.current.pending) scheduleFilteredRefresh();
+  }, [requestRefresh?.paused]);
+
+  useEffect(() => {
+    if (streamOverflowRevision !== previousOverflowRevision.current) {
+      previousOverflowRevision.current = streamOverflowRevision;
+      reconcileOverflow.current = true;
+      scheduleFilteredRefresh();
+    }
+  }, [streamOverflowRevision]);
+
+  useEffect(() => {
     if (liveEvents.size === 0) return;
     if (typedFiltersActive(filters)) {
       const terminalizedVisiblePending = olderFilteredResultsVisible.current
@@ -278,7 +312,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
     const requestId = selectedRequestId.current;
     if (!requestId) return;
     const event = liveEvents.get(requestId);
-    if (event?.event_kind !== 'finished' || event.event_id === refreshedTerminalEvent.current) return;
+    if (!event || (event.event_kind !== 'finished' && event.completed_at == null) || event.event_id === refreshedTerminalEvent.current) return;
     refreshedTerminalEvent.current = event.event_id;
     void openRequestDetail(requestId);
   }, [streamRevision]);
@@ -302,7 +336,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
     {error && <div className="notice error" role="alert">{t(errorSource.current === 'detail' ? 'request.detail' : 'request.listSource')}: {error}</div>}
     {upstreamError && <div className="notice error" role="alert">{t('request.upstreamSource')}: {upstreamError}</div>}
     {streamError && <div className="notice error" role="alert">{t('request.streamSource')}: {streamError}</div>}
-    <RequestsPanel requests={requests} upstreams={upstreams} filters={filters} loading={loading} hasOlder={hasOlder} streamState={streamState} token={token} tenant={tenant} olderFilteredResultsStale={olderFilteredResultsStale}
+    <RequestsPanel requests={requests} upstreams={upstreams} filters={filters} loading={loading} hasOlder={hasOlder} streamState={streamState} token={token} tenant={tenant} olderFilteredResultsStale={olderFilteredResultsStale} requestRefresh={requestRefresh}
       onApply={(next) => { setFilters(next); scope.current = { token, tenant, filters: next }; void load(next); }}
       onClear={() => { setFilters(emptyTypedFilterAst); scope.current = { token, tenant, filters: emptyTypedFilterAst }; void load(emptyTypedFilterAst); }}
       onLoadOlder={() => void load(filters, true)} onRefreshFilteredResults={() => void load(filters)} onSelect={selectRequest} onOpenSessions={onOpenSessions} onOpenSession={onOpenSession} />
@@ -310,7 +344,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   </>;
 }
 
-function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, streamState, token, tenant, olderFilteredResultsStale, onApply, onClear, onLoadOlder, onRefreshFilteredResults, onSelect, onOpenSessions, onOpenSession }: {
+function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, streamState, token, tenant, olderFilteredResultsStale, onApply, onClear, onLoadOlder, onRefreshFilteredResults, onSelect, onOpenSessions, onOpenSession, requestRefresh }: {
   requests: RequestView[];
   upstreams: UpstreamAccount[];
   filters: TypedFilterAst;
@@ -327,6 +361,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   onSelect: (request: RequestView) => Promise<void>;
   onOpenSessions: () => void;
   onOpenSession: (sessionId: string) => void;
+  requestRefresh?: { intervalMs: number; paused: boolean; onIntervalChange: (value: number) => void };
 }) {
   const { locale, t } = useI18n();
   const summary = summarizeVisibleRequests(requests);
@@ -335,6 +370,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   const sampling = { timestamps: points.map(point => point.timestamp), timeZone: displayTimeZone() };
   const count = (value: number) => formatMetricDisplay(value, locale);
   return <article className="panel request-page-surface"><div className="panel-title traffic-heading"><div><h2>{typedFiltersActive(filters) ? t('traffic.filtered') : t('traffic.live')}</h2><span>{typedFiltersActive(filters) ? t('traffic.filteredHint') : t('traffic.liveHint')}</span></div><div className="traffic-heading-actions"><div className={`request-live-state session-live-state ${streamState}`} role="status">{t(`sessions.live.${streamState}`)}</div><div className="segmented" role="group" aria-label={t('sessions.monitorMode')}><ToggleButton appearance="subtle" checked>{t('sessions.requestsMode')}</ToggleButton><ToggleButton appearance="subtle" checked={false} onClick={onOpenSessions}>{t('sessions.sessionsMode')}</ToggleButton></div></div></div>
+    {requestRefresh && <RequestRefreshControl {...requestRefresh} />}
     <TypedFilterBuilder ast={filters} disabled={loading} onApply={onApply} onClear={onClear} scope="requests" token={token} tenant={tenant} upstreams={upstreams} />
     {olderFilteredResultsStale && <div className="notice warning" role="status">{t('traffic.olderFilteredResultsStale')}<Button appearance="secondary" disabled={loading} onClick={onRefreshFilteredResults}>{t('traffic.refreshFilteredResults')}</Button></div>}
     {requests.length > 0 && <section className="metrics request-traffic-metrics" aria-label={t('monitoring.summary')}>

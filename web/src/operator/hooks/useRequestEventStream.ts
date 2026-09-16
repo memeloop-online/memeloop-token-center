@@ -105,7 +105,6 @@ export function useRequestEventStream({
               if (eventName !== `request.${event.event_kind}`) throw new Error('SSE event name does not match request event_kind');
               if (!isAfter(event, cursor.current)) return;
               cursor.current = { eventAt: event.event_at, eventId: id };
-              dispatch({ type: 'live' });
               callback.current(event);
             },
             () => {

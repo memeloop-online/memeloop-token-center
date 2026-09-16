@@ -12,6 +12,7 @@ import type { RequestDrilldown } from './overviewDrilldown';
 import { useOperatorScope } from './hooks/useOperatorScope';
 import { useOperatorResource } from './hooks/useOperatorResource';
 import { useOperatorRequestStream } from './hooks/useOperatorRequestStream';
+import { useRequestRefreshPreference } from './hooks/useRequestRefreshPreference';
 import { OperatorAccessSettings } from './OperatorAccessSettings';
 import { operatorRouteKeys, isOperatorRouteKey, type OperatorRouteKey } from './scope/operatorRoutes';
 import {
@@ -90,6 +91,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
   }
   const activeRoute = route ?? internalRoute;
   const pageScopeKey = `${credentialScope.current.generation}:${scope.tenant}:${activeRoute}`;
+  const requestRefresh = useRequestRefreshPreference();
   const stream = useOperatorRequestStream({
     token: scope.activeCredential,
     tenant: scope.tenant,
@@ -99,6 +101,8 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
     enabled: Boolean(scope.activeCredential && scope.validated && scope.tenant)
       && (activeRoute === 'requests' || activeRoute === 'sessions'),
     disconnectedMessage: t('traffic.streamDisconnected'),
+    intervalMs: requestRefresh.intervalMs,
+    paused: requestRefresh.paused,
   });
 
   useEffect(() => {
@@ -170,7 +174,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
     if (isOperatorRouteKey(activeRoute)) {
       switch (activeRoute) {
         case 'overview': page = <><OverviewPage {...pageProps} onNavigate={navigate} onRequestDrilldown={queueRequestDrilldown} onOpenUsageSession={openSession} onOpenSession={openSessionById} /><PluginOverviewCards cards={pluginRegistry.overviewCards} token={scope.activeCredential} tenant={scope.tenant} /></>; break;
-        case 'requests': page = <RequestsPage {...pageProps} liveEvents={stream.events.current} streamRevision={stream.revision} streamState={stream.state} streamError={stream.error} onOpenSessions={() => navigate('sessions')} onOpenSession={openSessionById} requestFocus={requestFocus} onRequestFocusHandled={(revision) => setRequestFocus((current) => current?.revision === revision ? undefined : current)} requestDrilldown={activeRequestDrilldown} onRequestDrilldownHandled={(revision) => setRequestDrilldown((current) => current?.revision === revision ? undefined : current)} />; break;
+        case 'requests': page = <RequestsPage {...pageProps} requestRefresh={requestRefresh} streamOverflowRevision={stream.overflowRevision} onProtectRequests={stream.protectRequests} liveEvents={stream.events.current} streamRevision={stream.revision} streamState={stream.state} streamError={stream.error} onOpenSessions={() => navigate('sessions')} onOpenSession={openSessionById} requestFocus={requestFocus} onRequestFocusHandled={(revision) => setRequestFocus((current) => current?.revision === revision ? undefined : current)} requestDrilldown={activeRequestDrilldown} onRequestDrilldownHandled={(revision) => setRequestDrilldown((current) => current?.revision === revision ? undefined : current)} />; break;
         case 'sessions': page = <SessionsPage {...pageProps} focus={sessionFocus} revision={stream.revision} eventKeyIds={stream.sessionEventKeyIds} streamState={stream.state} streamError={stream.error} onOpenRequests={() => navigate('requests')} />; break;
         case 'usage': page = <UsagePage {...pageProps} onOpenSession={openSession} />; break;
         case 'generations': page = <GenerationsPage {...pageProps} />; break;
