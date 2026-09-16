@@ -226,7 +226,9 @@ export async function run(binary: string, output: string): Promise<boolean> {
   const work = mkdtempSync(join(tmpdir(), "mtc-durable-rss-"));
   const database = join(work, "service.db");
   const archive = join(work, "archive");
+  const requestSpool = join(work, "request-spool");
   mkdirSync(archive);
+  mkdirSync(requestSpool);
   const report: Record<string, any> = {
     benchmark: "durable-archive-release-process-rss", binary,
     binary_sha256: createHash("sha256").update(readFileSync(binary)).digest("hex"),
@@ -285,6 +287,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
       MTC_DATABASE_MAX_CONNECTIONS: "2", MTC_SERVICE_TOKEN: token,
       MTC_KEY_PEPPER: "durable-rss-pepper-has-at-least-thirty-two-bytes",
       MTC_ARCHIVE_BACKEND: "filesystem", MTC_ARCHIVE_PATH: archive,
+      MTC_RESPONSES_REQUEST_SPOOL_PATH: requestSpool,
       MTC_ALLOW_OAUTH_LOOPBACK: "true", MTC_RUN_MIGRATIONS_ON_START: "false",
       MTC_PROXY_MEMORY_BUDGET_BYTES: String(256 * MIB), MTC_RESPONSES_BODY_MAX_BYTES: String(16 * MIB),
       MTC_PRICING_MODELS_DEV_URL: `${mockUrl}/catalog`, MTC_PRICING_LITELLM_URL: `${mockUrl}/catalog`,

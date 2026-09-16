@@ -80,6 +80,7 @@ pub struct AppState {
     pub(crate) request_event_streams: request_event_stream::RequestEventStreamLimiter,
     pub(crate) gateway_body_read_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) responses_body_read_permits: Arc<tokio::sync::Semaphore>,
+    pub(crate) responses_request_spool: gateway_body::request_spool::RequestSpoolAdmission,
     /// Shared bounded lifecycle admission for synchronous media requests.
     pub(crate) image_response_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) gateway_body_rejections: Arc<gateway_body::GatewayBodyRejectionMetrics>,
@@ -114,6 +115,10 @@ impl AppState {
         ));
         let gateway_body_read_concurrency = config.gateway_body_read_concurrency as usize;
         let responses_body_read_concurrency = config.responses_body_read_concurrency as usize;
+        let responses_request_spool = gateway_body::request_spool::RequestSpoolAdmission::new(
+            config.responses_request_spool_path.clone().into(),
+            config.responses_request_spool_bytes as usize,
+        );
         if config.run_migrations_on_start {
             let migration_db = Database::connect_for_migration(
                 &config.database_url,
@@ -199,6 +204,7 @@ impl AppState {
             responses_body_read_permits: Arc::new(tokio::sync::Semaphore::new(
                 responses_body_read_concurrency,
             )),
+            responses_request_spool,
             // Cloned request/router states share the same bounded synchronous
             // media budget (OpenAI Images and Audio transcription);
             // independently initialized applications do not contend with it.

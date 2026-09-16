@@ -2,7 +2,7 @@ use axum::{
     Json,
     body::Body,
     extract::{Request, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -73,6 +73,10 @@ pub(super) async fn authenticate_control_before_body(
             Err(crate::gateway_body::GatewayBodyAdmissionError::CapacityExhausted) => {
                 return Err(AppError::Overloaded);
             }
+            Err(
+                crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolCapacityExhausted
+                | crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolUnavailable,
+            ) => return Err(AppError::Overloaded),
             Err(crate::gateway_body::GatewayBodyAdmissionError::Timeout) => {
                 return Ok(control_body_rejection(
                     StatusCode::REQUEST_TIMEOUT,
@@ -178,6 +182,7 @@ pub(super) async fn authenticate_gateway_before_body(
             state.config.responses_body_max_bytes as usize,
             state.config.audio_body_max_bytes as usize,
             Some(&state.proxy_memory_budget),
+            &state.responses_request_spool,
         )
         .await
         {
@@ -233,6 +238,30 @@ fn gateway_body_admission_rejection(
                 .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Ingress);
             gateway_body_capacity_rejection()
         }
+        crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolCapacityExhausted => {
+            tracing::warn!(
+                request_id = %request_id,
+                route_class = "responses",
+                reason = "request_spool_capacity_exhausted",
+                "gateway request spool admission rejected"
+            );
+            gateway_request_spool_rejection(
+                "request_spool_capacity_exhausted",
+                "request spool capacity is temporarily exhausted",
+            )
+        }
+        crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolUnavailable => {
+            tracing::error!(
+                request_id = %request_id,
+                route_class = "responses",
+                reason = "request_spool_unavailable",
+                "gateway request spool unavailable"
+            );
+            gateway_request_spool_rejection(
+                "request_spool_unavailable",
+                "request spool is temporarily unavailable",
+            )
+        }
         crate::gateway_body::GatewayBodyAdmissionError::Timeout => (
             StatusCode::REQUEST_TIMEOUT,
             Json(json!({"error": {
@@ -268,6 +297,18 @@ fn gateway_body_admission_rejection(
 
 fn gateway_body_capacity_rejection() -> Response {
     AppError::Overloaded.into_response()
+}
+
+fn gateway_request_spool_rejection(code: &'static str, message: &'static str) -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": {"code": code, "message": message}})),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
 }
 
 fn safe_gateway_request_id(headers: &HeaderMap) -> String {
@@ -330,6 +371,10 @@ pub(super) async fn admit_cloud_webhook_before_body(
         Err(crate::gateway_body::GatewayBodyAdmissionError::CapacityExhausted) => {
             return Err(AppError::Overloaded);
         }
+        Err(
+            crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolCapacityExhausted
+            | crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolUnavailable,
+        ) => return Err(AppError::Overloaded),
         Err(crate::gateway_body::GatewayBodyAdmissionError::Timeout) => {
             return Ok(control_body_rejection(
                 StatusCode::REQUEST_TIMEOUT,
@@ -417,6 +462,25 @@ mod response_body_guard_tests {
                 .expect("UTF-8 error")
                 .contains("service_overloaded")
         );
+    }
+
+    #[tokio::test]
+    async fn request_spool_capacity_exhaustion_is_retryable_and_explainable() {
+        let response = gateway_request_spool_rejection(
+            "request_spool_capacity_exhausted",
+            "request spool capacity is temporarily exhausted",
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("1"))
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("error body");
+        let body = std::str::from_utf8(&body).expect("UTF-8 error");
+        assert!(body.contains("request_spool_capacity_exhausted"));
+        assert!(body.contains("temporarily exhausted"));
     }
 
     #[test]

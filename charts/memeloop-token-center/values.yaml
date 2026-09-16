@@ -41,8 +41,8 @@ roles:
       type: ClusterIP
       port: 8080
     resources:
-      requests: { cpu: 100m, memory: 256Mi }
-      limits: { cpu: "1", memory: 512Mi }
+      requests: { cpu: 100m, memory: 256Mi, ephemeral-storage: 64Mi }
+      limits: { cpu: "1", memory: 1Gi, ephemeral-storage: 256Mi }
     autoscaling:
       # Size this together with config.databaseMaxConnections and the database
       # connection budget before enabling.
@@ -100,8 +100,8 @@ roles:
       type: ClusterIP
       port: 8080
     resources:
-      requests: { cpu: 100m, memory: 192Mi }
-      limits: { cpu: "1", memory: 512Mi }
+      requests: { cpu: 100m, memory: 256Mi, ephemeral-storage: 64Mi }
+      limits: { cpu: "1", memory: 1Gi, ephemeral-storage: 256Mi }
     autoscaling:
       enabled: false
       minReplicas: 1
@@ -111,6 +111,12 @@ roles:
       behavior: {}
     podDisruptionBudget: { enabled: false, minAvailable: 1 }
 
+# Authenticated Responses bodies are first written to bounded node-local disk.
+# The file is request-owned and unlinked on completion, rejection, or cancellation.
+requestSpool:
+  mountPath: /var/lib/memeloop-token-center/request-spool
+  sizeLimit: 160Mi
+
 config:
   # Keep the sum across replicas below the PostgreSQL/PgBouncer connection budget.
   databaseMaxConnections: 4
@@ -119,14 +125,16 @@ config:
   proxyLifecycleConcurrency: 64
   # Weighted text-body/JSON/ciphertext admission. Keep pod memory at least
   # this budget + 256Mi; raising body max also requires budget >= max * 12 + 1Mi.
-  proxyMemoryBudgetBytes: 268435456
+  proxyMemoryBudgetBytes: 536870912
   # Gateway request bodies are admitted independently of proxy lifecycles.
   # Saturation returns 503 before reading the body; supported range is 1..8192.
   gatewayBodyReadConcurrency: 1024
-  # `/v1/responses` may buffer more than the normal 4 MiB gateway request.
-  # It is separately capped at four concurrent reads (64 MiB maximum buffered
-  # by default) so it cannot turn the 1024 general permits into 16 GiB.
-  responsesBodyMaxBytes: 16777216
+  # `/v1/responses` may exceed the normal 4 MiB gateway request. Four dedicated
+  # concurrent reads and the separate process disk-byte budget bound admission.
+  responsesBodyMaxBytes: 33554432
+  # Per-process bytes admitted to request spool files. Capacity saturation is
+  # a retryable 503 and remains distinct from the 413 request-size boundary.
+  responsesRequestSpoolBytes: 134217728
   # Independent multipart ceiling for `/v1/audio/transcriptions`; changing it
   # does not widen `/v1/responses` or other text endpoints.
   audioBodyMaxBytes: 26214400

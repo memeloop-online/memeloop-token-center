@@ -30,7 +30,7 @@ interface RuntimeDeployment {
     securityContext: { runAsUser: number; runAsGroup: number; fsGroup: number };
     containers: Array<{ env: Array<{ name: string }>; volumeMounts: Array<{ name: string; readOnly?: boolean; subPath?: string }> }>;
     initContainers: Array<{ name: string; args: string[]; volumeMounts: Array<{ readOnly?: boolean }> }>;
-    volumes: Array<{ name: string; persistentVolumeClaim?: { claimName: string; readOnly: boolean }; secret?: { secretName: string } }>;
+    volumes: Array<{ name: string; emptyDir?: { sizeLimit?: string; medium?: string }; persistentVolumeClaim?: { claimName: string; readOnly: boolean }; secret?: { secretName: string } }>;
   } } };
 }
 
@@ -73,7 +73,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       archiveReadyBoundary: render('archive-ready-boundary', ['--set', 'config.s3.readinessDeadlineMillis=5001', '--set', 'probes.readiness.timeoutSeconds=8']),
       archiveLive: render('archive-live', ['--set', 'config.s3.readinessDeadlineMillis=30000', '--set', 'probes.readiness.path=/livez']),
       proxyMemory: render('proxy-memory', ['--set', 'config.proxyMemoryBudgetBytes=536870912', '--set', 'roles.gateway.resources.requests.memory=512Mi', '--set', 'roles.gateway.resources.limits.memory=768Mi']),
-      fractionalMemory: render('fractional-memory', ['--set', 'roles.gateway.resources.limits.memory=0.5Gi']),
+      fractionalMemory: render('fractional-memory', ['--set', 'roles.gateway.resources.limits.memory=0.75Gi']),
       maximumBodyMemory: render('maximum-body-memory', ['--set', 'config.responsesBodyMaxBytes=67108864', '--set', 'config.proxyMemoryBudgetBytes=1073741824', '--set', 'roles.gateway.resources.requests.memory=1Gi', '--set', 'roles.gateway.resources.limits.memory=1280Mi']),
     };
     const has = (key: string, needle: string): void => assert.ok(output[key]!.includes(needle), `${key} render lacks ${needle}`);
@@ -112,12 +112,29 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     }
 
     has('default', 'kind: NetworkPolicy'); has('default', 'kind: PodDisruptionBudget');
-    count('default', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "268435456"/, 3);
+    count('default', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "536870912"/, 3);
     count('proxyMemory', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "536870912"/, 3);
     const gatewayDeployment = output.default!.split(/^---$/m).find((document) => document.includes('kind: Deployment') && document.includes('app.kubernetes.io/component: gateway'))!;
-    assert.match(gatewayDeployment, /limits:\s+cpu: [^\n]+\s+memory: 512Mi/);
-    assert.match(gatewayDeployment, /requests:\s+cpu: [^\n]+\s+memory: 256Mi/);
-    has('fractionalMemory', 'memory: 0.5Gi');
+    assert.match(gatewayDeployment, /limits:\s+cpu: [^\n]+\s+ephemeral-storage: 256Mi\s+memory: 1Gi/);
+    assert.match(gatewayDeployment, /requests:\s+cpu: [^\n]+\s+ephemeral-storage: 64Mi\s+memory: 256Mi/);
+    has('fractionalMemory', 'memory: 0.75Gi');
+    count('default', /name: MTC_RESPONSES_REQUEST_SPOOL_BYTES\n\s+value: "134217728"/, 3);
+    count('default', /name: MTC_RESPONSES_REQUEST_SPOOL_PATH\n\s+value: "\/var\/lib\/memeloop-token-center\/request-spool"/, 3);
+    const deployments = parseAllDocuments(output.default!).map(document => document.toJSON() as RuntimeDeployment).filter(document => document?.kind === 'Deployment');
+    for (const deployment of deployments) {
+      const role = deployment.spec.template.metadata.labels['app.kubernetes.io/component'];
+      const pod = deployment.spec.template.spec;
+      const spoolMount = pod.containers[0]!.volumeMounts?.find(item => item.name === 'responses-request-spool');
+      const spoolVolume = pod.volumes?.find(item => item.name === 'responses-request-spool');
+      if (role === 'gateway' || role === 'all') {
+        assert.equal(spoolMount?.readOnly, false, `${role}: request spool mount must be writable`);
+        assert.equal(spoolVolume?.emptyDir?.sizeLimit, '160Mi', `${role}: request spool must use bounded emptyDir`);
+        assert.equal(spoolVolume?.emptyDir?.medium, undefined, `${role}: request spool must use node disk`);
+      } else {
+        assert.equal(spoolMount, undefined, `${role}: does not accept Responses bodies`);
+        assert.equal(spoolVolume, undefined, `${role}: does not accept Responses bodies`);
+      }
+    }
     for (const deployment of output.default!.split(/^---$/m).filter((document) => document.includes('kind: Deployment'))) {
       for (const [name, value] of [['CONNECT_TIMEOUT', '5000'], ['REQUEST_TIMEOUT', '30000'], ['READINESS_DEADLINE', '5000']]) {
         assert.match(deployment, new RegExp(`name: MTC_S3_${name}_MILLIS\\s+value: "${value}"`), 'every role must use the same bounded S3 defaults');
@@ -148,7 +165,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     count('default', 'name: MTC_RUN_MIGRATIONS_ON_START', 3); has('default', 'args: ["migrate"]'); has('migration', 'restartPolicy: Never'); has('migration', '- name: registry-credentials');
     count('default', 'name: MTC_ARCHIVE_BACKEND', 3); count('default', 'value: "s3"', 3); lacks('default', 'name: MTC_MEMELOOP_CLOUD_WEBHOOK_SECRET'); has('webhook', 'name: memeloop-cloud-integration'); has('webhook', 'key: webhook-secret');
     count('default', 'name: MTC_GATEWAY_BODY_READ_CONCURRENCY', 3); count('default', 'value: "1024"', 3);
-    count('default', 'name: MTC_RESPONSES_BODY_MAX_BYTES', 3); count('default', 'value: "16777216"', 3); count('default', 'name: MTC_RESPONSES_BODY_READ_CONCURRENCY', 3);
+    count('default', 'name: MTC_RESPONSES_BODY_MAX_BYTES', 3); count('default', 'value: "33554432"', 3); count('default', 'name: MTC_RESPONSES_BODY_READ_CONCURRENCY', 3);
     count('default', 'name: MTC_AUDIO_BODY_MAX_BYTES', 3); count('default', 'value: "26214400"', 3);
     count('default', /name: MTC_RUNTIME_PROFILING_ENABLED\n\s+value: "false"/, 1);
     count('profiling', /name: MTC_RUNTIME_PROFILING_ENABLED\n\s+value: "true"/, 1);
@@ -188,6 +205,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       ['config.archiveSpoolCompression.enabled=not-a-boolean'], ['config.archiveSpoolCompression.unknown=true'],
       ['config.archiveObjectCompression.enabled=not-a-boolean'], ['config.archiveObjectCompression.unknown=true'],
       ['config.proxyMemoryBudgetBytes=268435455'], ['config.proxyMemoryBudgetBytes=2147483649'],
+      ['config.responsesRequestSpoolBytes=4194303'], ['config.responsesRequestSpoolBytes=2147483649'], ['requestSpool.mountPath=relative/path'], ['requestSpool.mountPath=/'],
     ];
     for (const [index, values] of invalid.entries()) {
       const args = ['template', `invalid-${index}`, chart, ...values!.flatMap((value) => ['--set-string', value])];
@@ -205,13 +223,24 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     }
     const oldSchema = spawnSync(helm, ['template', 'invalid-old-schema', chart, '--set', 'migration.schemaVersion=58'], { cwd: repository, encoding: 'utf8', shell: false });
     for (const values of [
-      ['roles.gateway.resources.limits.memory=511Mi'],
-      ['roles.all.enabled=true', 'roles.gateway.enabled=false', 'roles.control.enabled=false', 'roles.worker.enabled=false', 'roles.all.resources.limits.memory=511Mi'],
-      ['config.proxyMemoryBudgetBytes=536870912'],
+      ['roles.gateway.resources.limits.memory=767Mi'],
+      ['roles.all.enabled=true', 'roles.gateway.enabled=false', 'roles.control.enabled=false', 'roles.worker.enabled=false', 'roles.all.resources.limits.memory=767Mi'],
+      ['config.proxyMemoryBudgetBytes=805306369'],
     ]) {
       const result = spawnSync(helm, ['template', 'invalid-workload-budget', chart, ...values.flatMap((value) => ['--set', value])], { cwd: repository, encoding: 'utf8', shell: false });
       assert.notEqual(result.status, 0, `memory cross-field gate accepted ${values.join(',')}`);
       assert.match(result.stderr, /memory must cover config.proxyMemoryBudgetBytes plus 256Mi/);
+    }
+    for (const values of [
+      ['config.responsesRequestSpoolBytes=33554431'],
+      ['requestSpool.sizeLimit=127Mi'],
+      ['requestSpool.mountPath=/var/lib/../request-spool'],
+      ['roles.gateway.resources.limits.ephemeral-storage=223Mi'],
+      ['roles.all.enabled=true', 'roles.gateway.enabled=false', 'roles.control.enabled=false', 'roles.worker.enabled=false', 'roles.all.resources.limits.ephemeral-storage=223Mi'],
+    ]) {
+      const result = spawnSync(helm, ['template', 'invalid-spool-budget', chart, ...values.flatMap((value) => ['--set', value])], { cwd: repository, encoding: 'utf8', shell: false });
+      assert.notEqual(result.status, 0, `request spool cross-field gate accepted ${values.join(',')}`);
+      assert.match(result.stderr, /responsesRequestSpoolBytes must cover|requestSpool.sizeLimit must cover|requestSpool.mountPath must be|ephemeral-storage must cover/);
     }
     assert.notEqual(oldSchema.status, 0, 'release values schema accepted migration.schemaVersion=58');
     for (const budget of ['268435456', '805306368']) {

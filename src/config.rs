@@ -12,6 +12,10 @@ pub const DEFAULT_RESPONSES_BODY_MAX_BYTES: u32 = 16 * 1024 * 1024;
 pub const MIN_RESPONSES_BODY_MAX_BYTES: u32 = 4 * 1024 * 1024;
 pub const MAX_RESPONSES_BODY_MAX_BYTES: u32 = 64 * 1024 * 1024;
 pub const DEFAULT_RESPONSES_BODY_READ_CONCURRENCY: u32 = 4;
+pub const DEFAULT_RESPONSES_REQUEST_SPOOL_BYTES: u32 = 64 * 1024 * 1024;
+pub const MAX_RESPONSES_REQUEST_SPOOL_BYTES: u32 = 2 * 1024 * 1024 * 1024;
+pub const DEFAULT_RESPONSES_REQUEST_SPOOL_PATH: &str =
+    "/var/lib/memeloop-token-center/request-spool";
 pub const DEFAULT_PROXY_MEMORY_BUDGET_BYTES: u32 = 256 * 1024 * 1024;
 pub const MAX_RESPONSES_BODY_READ_CONCURRENCY: u32 = 8;
 pub const DEFAULT_AUDIO_BODY_MAX_BYTES: u32 = 25 * 1024 * 1024;
@@ -146,6 +150,12 @@ pub struct Config {
     /// Maximum `/v1/responses` request body size. It is separately admitted so
     /// its 16 MiB default cannot consume all general body-read capacity.
     pub responses_body_max_bytes: u32,
+    /// Process-local node-disk budget for authenticated Responses request spools.
+    #[serde(default = "default_responses_request_spool_bytes")]
+    pub responses_request_spool_bytes: u32,
+    /// Absolute writable directory mounted only into gateway-capable roles.
+    #[serde(default = "default_responses_request_spool_path")]
+    pub responses_request_spool_path: String,
     /// Maximum `/v1/audio/transcriptions` multipart body size. This is kept
     /// independent from Responses so audio uploads cannot widen text ingress.
     #[serde(default = "default_audio_body_max_bytes")]
@@ -221,6 +231,14 @@ impl std::fmt::Debug for Config {
                 &self.gateway_body_read_concurrency,
             )
             .field("responses_body_max_bytes", &self.responses_body_max_bytes)
+            .field(
+                "responses_request_spool_bytes",
+                &self.responses_request_spool_bytes,
+            )
+            .field(
+                "responses_request_spool_path",
+                &self.responses_request_spool_path,
+            )
             .field("audio_body_max_bytes", &self.audio_body_max_bytes)
             .field(
                 "responses_body_read_concurrency",
@@ -405,6 +423,14 @@ impl Config {
                 "MTC_RESPONSES_BODY_MAX_BYTES",
                 DEFAULT_RESPONSES_BODY_MAX_BYTES,
             )?),
+            responses_request_spool_bytes: env_u32(
+                "MTC_RESPONSES_REQUEST_SPOOL_BYTES",
+                DEFAULT_RESPONSES_REQUEST_SPOOL_BYTES,
+            )?,
+            responses_request_spool_path: env_string(
+                "MTC_RESPONSES_REQUEST_SPOOL_PATH",
+                DEFAULT_RESPONSES_REQUEST_SPOOL_PATH,
+            ),
             audio_body_max_bytes: env_u32(
                 "MTC_AUDIO_BODY_MAX_BYTES",
                 DEFAULT_AUDIO_BODY_MAX_BYTES,
@@ -474,6 +500,21 @@ impl Config {
         {
             return Err(ConfigError::InvalidProxyMemoryBudget);
         }
+        let spool_path = std::path::Path::new(&self.responses_request_spool_path);
+        let valid_spool_path = spool_path.is_absolute()
+            && spool_path != std::path::Path::new("/")
+            && spool_path.components().all(|component| {
+                matches!(
+                    component,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )
+            });
+        if self.responses_request_spool_bytes < self.responses_body_max_bytes
+            || self.responses_request_spool_bytes > MAX_RESPONSES_REQUEST_SPOOL_BYTES
+            || !valid_spool_path
+        {
+            return Err(ConfigError::InvalidResponsesRequestSpool);
+        }
         Ok(())
     }
 
@@ -486,6 +527,11 @@ impl Config {
             proxy_memory_budget_bytes: DEFAULT_PROXY_MEMORY_BUDGET_BYTES,
             gateway_body_read_concurrency: DEFAULT_GATEWAY_BODY_READ_CONCURRENCY,
             responses_body_max_bytes: DEFAULT_RESPONSES_BODY_MAX_BYTES,
+            responses_request_spool_bytes: DEFAULT_RESPONSES_REQUEST_SPOOL_BYTES,
+            responses_request_spool_path: std::env::temp_dir()
+                .join("memeloop-token-center-request-spool")
+                .to_string_lossy()
+                .into_owned(),
             audio_body_max_bytes: DEFAULT_AUDIO_BODY_MAX_BYTES,
             responses_body_read_concurrency: DEFAULT_RESPONSES_BODY_READ_CONCURRENCY,
             upstream_health: UpstreamHealthConfig::DEFAULT,
@@ -644,6 +690,14 @@ fn responses_body_max_bytes(value: u32) -> u32 {
     value.clamp(MIN_RESPONSES_BODY_MAX_BYTES, MAX_RESPONSES_BODY_MAX_BYTES)
 }
 
+const fn default_responses_request_spool_bytes() -> u32 {
+    DEFAULT_RESPONSES_REQUEST_SPOOL_BYTES
+}
+
+fn default_responses_request_spool_path() -> String {
+    DEFAULT_RESPONSES_REQUEST_SPOOL_PATH.to_owned()
+}
+
 const fn default_audio_body_max_bytes() -> u32 {
     DEFAULT_AUDIO_BODY_MAX_BYTES
 }
@@ -658,6 +712,10 @@ pub enum ConfigError {
         "MTC_PROXY_MEMORY_BUDGET_BYTES must be 256 MiB..2 GiB, at least twelve times MTC_RESPONSES_BODY_MAX_BYTES plus 1 MiB, and at least three times MTC_AUDIO_BODY_MAX_BYTES; pod memory must cover this budget plus 256 MiB"
     )]
     InvalidProxyMemoryBudget,
+    #[error(
+        "MTC_RESPONSES_REQUEST_SPOOL_BYTES must cover MTC_RESPONSES_BODY_MAX_BYTES and remain at most 2 GiB; MTC_RESPONSES_REQUEST_SPOOL_PATH must be an absolute non-root path without traversal components"
+    )]
+    InvalidResponsesRequestSpool,
     #[error(
         "S3 timeouts must be bounded: connect/readiness 100..30000 ms, request 100..120000 ms, connect <= request"
     )]
@@ -906,7 +964,7 @@ mod tests {
             MAX_RESPONSES_BODY_READ_CONCURRENCY
         );
         assert_eq!(DEFAULT_AUDIO_BODY_MAX_BYTES, 25 * 1024 * 1024);
-        let config = Config::for_test("sqlite::memory:".to_owned());
+        let mut config = Config::for_test("sqlite::memory:".to_owned());
         assert_eq!(
             config.responses_body_max_bytes,
             DEFAULT_RESPONSES_BODY_MAX_BYTES
@@ -915,6 +973,32 @@ mod tests {
             config.responses_body_read_concurrency,
             DEFAULT_RESPONSES_BODY_READ_CONCURRENCY
         );
+        assert_eq!(
+            config.responses_request_spool_bytes,
+            DEFAULT_RESPONSES_REQUEST_SPOOL_BYTES
+        );
+        assert!(std::path::Path::new(&config.responses_request_spool_path).is_absolute());
+        config.responses_request_spool_bytes = config.responses_body_max_bytes - 1;
+        assert!(matches!(
+            config.validate_proxy_memory_budget(),
+            Err(ConfigError::InvalidResponsesRequestSpool)
+        ));
+        config.responses_request_spool_bytes = DEFAULT_RESPONSES_REQUEST_SPOOL_BYTES;
+        config.responses_request_spool_path = "relative/request-spool".to_owned();
+        assert!(matches!(
+            config.validate_proxy_memory_budget(),
+            Err(ConfigError::InvalidResponsesRequestSpool)
+        ));
+        config.responses_request_spool_path = "/var/lib/../request-spool".to_owned();
+        assert!(matches!(
+            config.validate_proxy_memory_budget(),
+            Err(ConfigError::InvalidResponsesRequestSpool)
+        ));
+        config.responses_request_spool_path = "/".to_owned();
+        assert!(matches!(
+            config.validate_proxy_memory_budget(),
+            Err(ConfigError::InvalidResponsesRequestSpool)
+        ));
     }
 
     #[test]

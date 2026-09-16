@@ -49,6 +49,10 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
   value: {{ .Values.config.gatewayBodyReadConcurrency | quote }}
 - name: MTC_RESPONSES_BODY_MAX_BYTES
   value: {{ printf "%d" (int64 .Values.config.responsesBodyMaxBytes) | quote }}
+- name: MTC_RESPONSES_REQUEST_SPOOL_BYTES
+  value: {{ printf "%d" (int64 .Values.config.responsesRequestSpoolBytes) | quote }}
+- name: MTC_RESPONSES_REQUEST_SPOOL_PATH
+  value: {{ .Values.requestSpool.mountPath | quote }}
 - name: MTC_RESPONSES_BODY_READ_CONCURRENCY
   value: {{ .Values.config.responsesBodyReadConcurrency | quote }}
 - name: MTC_AUDIO_BODY_MAX_BYTES

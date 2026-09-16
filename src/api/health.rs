@@ -104,6 +104,7 @@ pub(super) async fn prometheus_metrics(
         retained_request_memory_used_bytes,
         retained_request_memory_limit_bytes,
     ) = state.proxy_memory_budget.snapshot();
+    let request_spool = state.responses_request_spool.snapshot();
     let runtime = crate::metrics::RuntimeMetrics {
         database: runtime,
         request_event_streams: state.request_event_streams.active_count(),
@@ -114,6 +115,10 @@ pub(super) async fn prometheus_metrics(
         retained_request_memory_limit_bytes,
         gateway_body_reads: (state.config.gateway_body_read_concurrency as usize)
             .saturating_sub(state.gateway_body_read_permits.available_permits()),
+        responses_request_spools: request_spool.active_files,
+        responses_request_spool_used_bytes: request_spool.used_bytes,
+        responses_request_spool_limit_bytes: request_spool.limit_bytes,
+        responses_request_spool_capacity_rejections: request_spool.capacity_rejections,
         proxy_lifecycles: (state.config.proxy_lifecycle_concurrency as usize)
             .saturating_sub(state.proxy_lifecycle_permits.available_permits()),
         proxy_archive_streams: crate::PROXY_ARCHIVE_STREAM_CONCURRENCY

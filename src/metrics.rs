@@ -731,6 +731,10 @@ pub struct RuntimeMetrics {
     pub retained_request_memory_used_bytes: usize,
     pub retained_request_memory_limit_bytes: usize,
     pub gateway_body_reads: usize,
+    pub responses_request_spools: usize,
+    pub responses_request_spool_used_bytes: usize,
+    pub responses_request_spool_limit_bytes: usize,
+    pub responses_request_spool_capacity_rejections: u64,
     pub proxy_lifecycles: usize,
     pub proxy_archive_streams: usize,
     pub plugin_cache_entries: usize,
@@ -963,6 +967,7 @@ fn render_runtime(output: &mut String, runtime: &RuntimeMetrics) {
     for (queue, value) in [
         ("request_event_streams", runtime.request_event_streams),
         ("gateway_body_reads", runtime.gateway_body_reads),
+        ("responses_request_spools", runtime.responses_request_spools),
         ("proxy_lifecycles", runtime.proxy_lifecycles),
         ("proxy_archive_streams", runtime.proxy_archive_streams),
     ] {
@@ -975,6 +980,41 @@ fn render_runtime(output: &mut String, runtime: &RuntimeMetrics) {
         "# HELP memeloop_token_center_gateway_body_rejections_total Rejected gateway request bodies by fixed route class and reason.\n",
     );
     output.push_str("# TYPE memeloop_token_center_gateway_body_rejections_total counter\n");
+    for route_class in crate::gateway_body::GatewayBodyRouteClass::ALL {
+        for reason in crate::gateway_body::GatewayBodyRejectionReason::ALL {
+            let value = runtime.gateway_body_rejections[route_class.index()][reason.index()];
+            let _ = writeln!(
+                output,
+                "memeloop_token_center_gateway_body_rejections_total{{route_class=\"{}\",reason=\"{}\"}} {value}",
+                route_class.label(),
+                reason.label(),
+            );
+        }
+    }
+    output.push_str(
+        "# HELP memeloop_token_center_request_spool_bytes Process-local node-disk request spool bytes.\n",
+    );
+    output.push_str("# TYPE memeloop_token_center_request_spool_bytes gauge\n");
+    let _ = writeln!(
+        output,
+        "memeloop_token_center_request_spool_bytes{{measure=\"used\"}} {}",
+        runtime.responses_request_spool_used_bytes
+    );
+    let _ = writeln!(
+        output,
+        "memeloop_token_center_request_spool_bytes{{measure=\"limit\"}} {}",
+        runtime.responses_request_spool_limit_bytes
+    );
+    output.push_str(
+        "# HELP memeloop_token_center_request_spool_capacity_rejections_total Responses request spools rejected by the fixed process-local disk budget.\n",
+    );
+    output
+        .push_str("# TYPE memeloop_token_center_request_spool_capacity_rejections_total counter\n");
+    let _ = writeln!(
+        output,
+        "memeloop_token_center_request_spool_capacity_rejections_total {}",
+        runtime.responses_request_spool_capacity_rejections
+    );
     output.push_str("# HELP memeloop_token_center_proxy_memory_bytes Actual weighted memory admission permits by fixed pool and measure.\n");
     output.push_str("# TYPE memeloop_token_center_proxy_memory_bytes gauge\n");
     for (pool, used, limit) in [
@@ -997,17 +1037,6 @@ fn render_runtime(output: &mut String, runtime: &RuntimeMetrics) {
             output,
             "memeloop_token_center_proxy_memory_bytes{{pool=\"{pool}\",measure=\"limit\"}} {limit}"
         );
-    }
-    for route_class in crate::gateway_body::GatewayBodyRouteClass::ALL {
-        for reason in crate::gateway_body::GatewayBodyRejectionReason::ALL {
-            let value = runtime.gateway_body_rejections[route_class.index()][reason.index()];
-            let _ = writeln!(
-                output,
-                "memeloop_token_center_gateway_body_rejections_total{{route_class=\"{}\",reason=\"{}\"}} {value}",
-                route_class.label(),
-                reason.label(),
-            );
-        }
     }
     output.push_str(
         "# HELP memeloop_token_center_plugin_cache_entries Resolved plugin configuration and service-data cache entries.\n",
@@ -1483,6 +1512,31 @@ mod tests {
                 "memeloop_token_center_proxy_memory_bytes{pool=\"retained_request\",measure=\"used\"} 65536",
                 "memeloop_token_center_proxy_memory_bytes{pool=\"retained_request\",measure=\"limit\"} 67108864",
             ]
+        );
+    }
+
+    #[test]
+    fn request_spool_metrics_report_fixed_process_local_series() {
+        let rendered = Metrics::default().render(&RuntimeMetrics {
+            responses_request_spools: 2,
+            responses_request_spool_used_bytes: 25_788_305,
+            responses_request_spool_limit_bytes: 134_217_728,
+            responses_request_spool_capacity_rejections: 3,
+            ..RuntimeMetrics::default()
+        });
+        assert!(rendered.contains(
+            "memeloop_token_center_background_work_items{queue=\"responses_request_spools\",state=\"active\"} 2"
+        ));
+        assert!(
+            rendered
+                .contains("memeloop_token_center_request_spool_bytes{measure=\"used\"} 25788305")
+        );
+        assert!(
+            rendered
+                .contains("memeloop_token_center_request_spool_bytes{measure=\"limit\"} 134217728")
+        );
+        assert!(
+            rendered.contains("memeloop_token_center_request_spool_capacity_rejections_total 3")
         );
     }
 

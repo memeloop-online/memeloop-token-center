@@ -41,7 +41,7 @@ export function run(
   assert.equal(
     result.status,
     0,
-    `${command} ${args.join(' ')} failed (${result.status ?? result.signal}):\n${result.stderr}`,
+    `${command} ${args.join(' ')} failed (${result.status ?? result.signal}):\n${result.stdout}${result.stderr}`,
   );
   return result.stdout;
 }

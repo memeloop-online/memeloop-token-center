@@ -8,6 +8,16 @@
 {{- if lt (int64 .Values.config.proxyMemoryBudgetBytes) (add (mul (int64 .Values.config.responsesBodyMaxBytes) 12) 1048576) -}}
 {{- fail "config.proxyMemoryBudgetBytes must cover responsesBodyMaxBytes times 12 plus 1Mi" -}}
 {{- end -}}
+{{- if lt (int64 .Values.config.responsesRequestSpoolBytes) (int64 .Values.config.responsesBodyMaxBytes) -}}
+{{- fail "config.responsesRequestSpoolBytes must cover config.responsesBodyMaxBytes" -}}
+{{- end -}}
+{{- if or (eq .Values.requestSpool.mountPath "/") (contains ".." .Values.requestSpool.mountPath) -}}
+{{- fail "requestSpool.mountPath must be a dedicated absolute path without traversal components" -}}
+{{- end -}}
+{{- $requestSpoolSizeBytes := include "memeloop-token-center.memoryBytes" .Values.requestSpool.sizeLimit | int64 -}}
+{{- if lt $requestSpoolSizeBytes (int64 .Values.config.responsesRequestSpoolBytes) -}}
+{{- fail "requestSpool.sizeLimit must cover config.responsesRequestSpoolBytes" -}}
+{{- end -}}
 {{- include "memeloop-token-center.runtimeInventory.validate" . -}}
 {{- range $role := list "gateway" "control" "worker" "all" }}
 {{- $roleConfig := index $.Values.roles $role }}
@@ -19,6 +29,12 @@
 {{- $requiredMemory := add (int64 $.Values.config.proxyMemoryBudgetBytes) 268435456 -}}
 {{- if lt $memoryBytes $requiredMemory -}}
 {{- fail (printf "roles.%s.resources.limits.memory must cover config.proxyMemoryBudgetBytes plus 256Mi (%d bytes required)" $role $requiredMemory) -}}
+{{- end -}}
+{{- $ephemeralStorageLimit := dig "resources" "limits" "ephemeral-storage" "" $roleConfig -}}
+{{- $ephemeralStorageBytes := include "memeloop-token-center.memoryBytes" $ephemeralStorageLimit | int64 -}}
+{{- $requiredEphemeralStorage := add $requestSpoolSizeBytes 67108864 -}}
+{{- if lt $ephemeralStorageBytes $requiredEphemeralStorage -}}
+{{- fail (printf "roles.%s.resources.limits.ephemeral-storage must cover requestSpool.sizeLimit plus 64Mi headroom" $role) -}}
 {{- end -}}
 {{- end }}
 ---
@@ -203,17 +219,30 @@ spec:
             capabilities: { drop: ["ALL"] }
           resources:
             {{- toYaml $roleConfig.resources | nindent 12 }}
-          {{- if or $.Values.plugins.enabled $.Values.plugins.runtimeInventory.enabled }}
+          {{- if or (or $.Values.plugins.enabled $.Values.plugins.runtimeInventory.enabled) (or (eq $role "gateway") (eq $role "all")) }}
           volumeMounts:
+            {{- if or (eq $role "gateway") (eq $role "all") }}
+            - name: responses-request-spool
+              mountPath: {{ $.Values.requestSpool.mountPath | quote }}
+              readOnly: false
+            {{- end }}
+            {{- if or $.Values.plugins.enabled $.Values.plugins.runtimeInventory.enabled }}
             {{- include "memeloop-token-center.runtimeInventory.mounts" (dict "root" $ "writer" $runtimeWriter) | nindent 12 }}
             {{- if $.Values.plugins.enabled }}
             - name: plugins
               mountPath: {{ $.Values.plugins.mountPath }}
               readOnly: true
             {{- end }}
+            {{- end }}
           {{- end }}
-      {{- if or $.Values.plugins.enabled $.Values.plugins.runtimeInventory.enabled }}
+      {{- if or (or $.Values.plugins.enabled $.Values.plugins.runtimeInventory.enabled) (or (eq $role "gateway") (eq $role "all")) }}
       volumes:
+        {{- if or (eq $role "gateway") (eq $role "all") }}
+        - name: responses-request-spool
+          emptyDir:
+            sizeLimit: {{ $.Values.requestSpool.sizeLimit | quote }}
+        {{- end }}
+        {{- if or $.Values.plugins.enabled $.Values.plugins.runtimeInventory.enabled }}
         {{- include "memeloop-token-center.runtimeInventory.volumes" (dict "root" $ "writer" $runtimeWriter) | nindent 8 }}
         {{- if $.Values.plugins.enabled }}
         - name: plugins
@@ -258,6 +287,7 @@ spec:
               - key: {{ $.Values.plugins.ociInstaller.registryAuthSecret.passwordKey | quote }}
                 path: password
               {{- end }}
+        {{- end }}
         {{- end }}
         {{- end }}
       {{- end }}

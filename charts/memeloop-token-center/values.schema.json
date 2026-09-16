@@ -11,6 +11,7 @@
     "migration",
     "serviceAccount",
     "roles",
+    "requestSpool",
     "config",
     "plugins",
     "ingress",
@@ -119,6 +120,15 @@
         }
       ]
     },
+    "requestSpool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mountPath", "sizeLimit"],
+      "properties": {
+        "mountPath": { "type": "string", "pattern": "^/.+$" },
+        "sizeLimit": { "$ref": "#/definitions/resourceQuantity" }
+      }
+    },
     "config": {
       "type": "object",
       "additionalProperties": false,
@@ -128,6 +138,7 @@
         "proxyMemoryBudgetBytes",
         "gatewayBodyReadConcurrency",
         "responsesBodyMaxBytes",
+        "responsesRequestSpoolBytes",
         "audioBodyMaxBytes",
         "responsesBodyReadConcurrency",
         "upstreamHealth",
@@ -148,6 +159,7 @@
         "proxyMemoryBudgetBytes": { "type": "integer", "minimum": 268435456, "maximum": 2147483648 },
         "gatewayBodyReadConcurrency": { "type": "integer", "minimum": 1, "maximum": 8192 },
         "responsesBodyMaxBytes": { "type": "integer", "minimum": 4194304, "maximum": 67108864 },
+        "responsesRequestSpoolBytes": { "type": "integer", "minimum": 4194304, "maximum": 2147483648 },
         "audioBodyMaxBytes": { "type": "integer", "minimum": 0 },
         "responsesBodyReadConcurrency": { "type": "integer", "minimum": 1, "maximum": 8 },
         "upstreamHealth": {
