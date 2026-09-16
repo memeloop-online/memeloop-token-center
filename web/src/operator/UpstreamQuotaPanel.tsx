@@ -116,7 +116,7 @@ export function UpstreamQuota({ accountId, accountName = accountId, credentialGe
     requestRef.current = controller;
     setBusy(true); setError(undefined);
     try {
-      const value = await api<UpstreamQuotaSnapshot>(upstreamQuotaPath(accountId, tenant), token, { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(20_000)]) });
+      const value = await api<UpstreamQuotaSnapshot>(upstreamQuotaPath(accountId, tenant), token, { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(45_000)]) });
       if (scopeRef.current !== scope || controller.signal.aborted) return;
       if (value.upstream_account_id !== accountId || value.tenant_external_id !== tenant || value.contract_version !== 'upstream_quota_v1') throw new Error('Quota scope mismatch');
       setSnapshot(value);
