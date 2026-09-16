@@ -1569,10 +1569,11 @@ export function ProvidersPage({ token, tenant, writeTenant, onOpenRequest }: Ope
     },
     t('common.requestFailed'),
   );
-  // Statistics are independent: a slow aggregation must not hold the account
-  // list, create forms, or OAuth actions behind a four-request waterfall.
+  // Statistics are independent and non-critical. Start them only after the
+  // account directory is usable so their aggregation queries cannot contend
+  // with the initial account/provider reads for the small control-plane pool.
   const statistics = useOperatorResource(
-    Boolean(token), `${token}\0${tenant}`,
+    Boolean(token) && resource.state.kind === 'ready', `${token}\0${tenant}`,
     async (signal) => {
       const now = Date.now();
       const [availability, windowResult] = await Promise.all([
