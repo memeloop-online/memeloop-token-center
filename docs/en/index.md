@@ -24,3 +24,9 @@ features:
     details: Extend routing and administration with plugins, combining capabilities for your needs.
     link: /en/plugins/
 ---
+
+## See how your services are running
+
+![MTC overview with request trends, usage, and remaining upstream quotas](/images/overview.png)
+
+Captured from the live Chinese-language interface. Identity details are replaced; statistics are unchanged.

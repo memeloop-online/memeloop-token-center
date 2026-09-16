@@ -1,5 +1,7 @@
 # Memeloop Token Center
 
+简体中文 · [English](README.en.md)
+
 Memeloop Token Center（MTC）是面向团队的 AI 网关：通过一个入口管理模型服务、客户端凭据、路由权限与用量。
 
 完整产品文档见[文档站](https://memeloop-online.github.io/memeloop-token-center/zh/)。
@@ -10,6 +12,7 @@ Memeloop Token Center（MTC）是面向团队的 AI 网关：通过一个入口�
 
 - OpenAI 兼容：`/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/embeddings`
 - Anthropic：`/v1/messages`、`/v1/messages/count_tokens`
+- 语音转写：`/v1/audio/transcriptions`
 - 生成任务：`/v1/images/generations`、`/v1/videos/generations`、`/v1/generations`
 
 接口与模型的可用能力取决于接入的上游及路由配置。使用方法见[产品文档](https://memeloop-online.github.io/memeloop-token-center/zh/)。
@@ -30,7 +33,7 @@ Memeloop Token Center（MTC）是面向团队的 AI 网关：通过一个入口�
 
 ## 插件
 
-通过 WebAssembly 插件扩展模型服务、OAuth 登录、流量策略与请求改写。接口、能力与开发流程见[插件开发文档](https://memeloop-online.github.io/memeloop-token-center/zh/)。
+通过 WebAssembly 插件扩展模型服务、OAuth 登录、流量策略与请求改写。接口、能力与开发流程见[插件开发文档](https://memeloop-online.github.io/memeloop-token-center/zh/plugins/)。
 
 ## 产品界面
 
