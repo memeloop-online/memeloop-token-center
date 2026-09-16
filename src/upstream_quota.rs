@@ -27,8 +27,9 @@ const STALE_MS: i64 = 300_000;
 const MAX_ENTRIES: usize = 128;
 const BODY_LIMIT: usize = 1024 * 1024;
 const QUOTA_TIMEOUT: Duration = Duration::from_secs(8);
-const QUOTA_MAX_DEFAULT_RETRY_BUDGET: Duration = Duration::from_secs(30);
-const QUOTA_ADMISSION_WAIT: Duration = Duration::from_secs(10);
+const QUOTA_MAX_READ_BUDGET: Duration = Duration::from_secs(30);
+const QUOTA_PERMIT_WAIT: Duration = QUOTA_MAX_READ_BUDGET;
+const QUOTA_SINGLEFLIGHT_WAIT: Duration = Duration::from_secs(65);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct QuotaBudget {
@@ -41,14 +42,14 @@ struct QuotaBudget {
 fn codex_quota_budget(config: &Value) -> Result<QuotaBudget, &'static str> {
     let value = config.get("transport_policy");
     let policy = crate::provider::CodexTransportPolicy::parse(value)?;
-    // Retry-only account policies must not silently opt a control-plane read
-    // into the generation default (21 minutes). Explicit timeout fields do
-    // apply, using the same bounded account policy as generation and catalog.
+    // Quota reads honor a shorter explicit account timeout and connection
+    // policy, but never inherit the generation path's 21-minute ceiling.
     let explicit_total = value.is_some_and(|p| p.get("request_timeout_millis").is_some());
     let total = if explicit_total {
-        Duration::from_millis(policy.request_timeout_millis)
+        Duration::from_millis(policy.request_timeout_millis).min(QUOTA_MAX_READ_BUDGET)
     } else {
-        let attempts = u64::try_from(policy.connect_attempts).unwrap_or(1);
+        let attempts =
+            u64::try_from(policy.connect_attempts).map_err(|_| "invalid_transport_policy")?;
         let connection_budget = policy
             .connect_timeout_millis
             .saturating_mul(attempts)
@@ -60,7 +61,7 @@ fn codex_quota_budget(config: &Value) -> Result<QuotaBudget, &'static str> {
             .saturating_add(1_000);
         Duration::from_millis(connection_budget)
             .max(QUOTA_TIMEOUT)
-            .min(QUOTA_MAX_DEFAULT_RETRY_BUDGET)
+            .min(QUOTA_MAX_READ_BUDGET)
     };
     let read = if value.is_some_and(|p| p.get("read_timeout_millis").is_some()) {
         Duration::from_millis(policy.read_timeout_millis).min(total)
@@ -488,7 +489,7 @@ impl QuotaCache {
             (cached.value.clone(), cached.refresh_generation)
         };
         let fallback = |error| stale_or_error(previous.clone(), empty(Some(error)), now);
-        let Ok(_flight) = tokio::time::timeout(QUOTA_ADMISSION_WAIT, entry.flight.lock()).await
+        let Ok(_flight) = tokio::time::timeout(QUOTA_SINGLEFLIGHT_WAIT, entry.flight.lock()).await
         else {
             return fallback("quota_refresh_in_progress");
         };
@@ -504,7 +505,7 @@ impl QuotaCache {
                 return value.clone();
             }
         }
-        let Ok(permit) = tokio::time::timeout(QUOTA_ADMISSION_WAIT, self.permits.acquire()).await
+        let Ok(permit) = tokio::time::timeout(QUOTA_PERMIT_WAIT, self.permits.acquire()).await
         else {
             return fallback("quota_busy");
         };
@@ -1126,6 +1127,16 @@ mod tests {
                 connect_retry_delay: Duration::from_millis(150),
             }
         );
+        assert_eq!(
+            codex_quota_budget(&json!({"transport_policy":{
+                "connect_timeout_millis":1000,
+                "read_timeout_millis":60000,
+                "request_timeout_millis":60000
+            }}))
+            .unwrap()
+            .total,
+            QUOTA_MAX_READ_BUDGET
+        );
     }
 
     #[tokio::test]
@@ -1300,5 +1311,38 @@ mod tests {
         assert!(entry.flight.try_lock().is_err());
         drop(flight);
         assert!(entry.flight.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn quota_waiters_do_not_expire_at_the_old_ten_second_boundary() {
+        tokio::time::pause();
+        let entry = Arc::new(Entry::default());
+        let owner = entry.flight.lock().await;
+        let waiting_entry = Arc::clone(&entry);
+        let singleflight = tokio::spawn(async move {
+            tokio::time::timeout(QUOTA_SINGLEFLIGHT_WAIT, waiting_entry.flight.lock())
+                .await
+                .is_ok()
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        assert!(!singleflight.is_finished());
+        drop(owner);
+        assert!(singleflight.await.unwrap());
+
+        let permits = Arc::new(Semaphore::new(4));
+        let owners = permits.clone().acquire_many_owned(4).await.unwrap();
+        let waiting_permits = Arc::clone(&permits);
+        let admission = tokio::spawn(async move {
+            tokio::time::timeout(QUOTA_PERMIT_WAIT, waiting_permits.acquire_owned())
+                .await
+                .is_ok()
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        assert!(!admission.is_finished());
+        drop(owners);
+        assert!(admission.await.unwrap());
+        tokio::time::resume();
     }
 }
