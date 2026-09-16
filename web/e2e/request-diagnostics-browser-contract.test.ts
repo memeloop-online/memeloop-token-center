@@ -99,7 +99,8 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     assert.equal(await stage('read table request ID', () => tableId.textContent(), history, current), requestId);
     assert.match(await stage('read recorded cache split', () => recordedRow.locator('.request-token-cell .request-value-info').getAttribute('aria-label'), history, current) ?? '', /Cache read 40.*Cache write 20/);
     const recordedText = await stage('read recorded diagnostics', () => recorded.textContent(), history, current) ?? '';
-    assert.match(recordedText, /http_429/);
+    assert.match(recordedText, /The request failed/);
+    assert.doesNotMatch(recordedText, /http_429/, 'internal error codes are supplemental diagnostics, not permanent detail copy');
     assert.match(recordedText, /Production Codex/);
     assert.match(recordedText, /Research key/);
     assert.doesNotMatch(recordedText, new RegExp(`${upstreamId}|${routeId}|${requestId}|${sessionId}`), 'technical identifiers are supplemental, not permanent detail rows');
