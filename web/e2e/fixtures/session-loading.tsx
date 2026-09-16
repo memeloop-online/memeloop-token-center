@@ -15,12 +15,14 @@ declare global {
     sessionDetailReads: number;
     sessionListReads: number;
     sessionListAborts: number;
-    resolveSessionList: (ok: boolean) => void;
+    resolveSessionList: (status: boolean | number) => void;
+    resolveSessionDetail: (status: boolean | number) => void;
   }
 }
 window.sessionListReads = 0;
 window.sessionListAborts = 0;
 window.sessionDetailReads = 0;
+const controlledDetail = new URLSearchParams(location.search).has('controlled-detail');
 const session: LogicalSessionSummary = {
   session_id: 'fixture-session', session_name: 'Retained session', task_kind: null,
   cluster_id: null, unlinked: false, key_id: 'fixture-key', key_alias: 'Fixture key',
@@ -80,11 +82,12 @@ window.fetch = async (input, init) => {
         reject(new DOMException('The operation was aborted', 'AbortError'));
       };
       signal?.addEventListener('abort', abort, { once: true });
-      window.resolveSessionList = (ok) => {
+      window.resolveSessionList = (result) => {
         signal?.removeEventListener('abort', abort);
-        resolve(new Response(JSON.stringify(ok
+        const status = typeof result === 'number' ? result : result ? 200 : 503;
+        resolve(new Response(JSON.stringify(status >= 200 && status < 300
           ? { generated_at: Date.now(), sessions: [session, unlinkedSession], next_cursor: null }
-          : { error: { message: 'Fixture list unavailable' } }), { status: ok ? 200 : 503 }));
+          : { error: { message: 'Fixture list unavailable' } }), { status }));
       };
     });
   }
@@ -92,10 +95,25 @@ window.fetch = async (input, init) => {
     ? decodeURIComponent(new URL(url, window.location.href).pathname.split('/').at(-1) ?? '')
     : session.session_id;
   if (url.includes('/sessions/')) window.sessionDetailReads += 1;
-  return new Response(JSON.stringify({
+  const detailResponse = (result: boolean | number) => {
+    const status = typeof result === 'number' ? result : result ? 200 : 503;
+    return new Response(JSON.stringify(status >= 200 && status < 300 ? {
     session_id: detailSession, cluster_id: null, unlinked: detailSession.startsWith('unlinked:'),
     requests: sessionRequests[detailSession] ?? [], edges: [], has_more: false, next_cursor: null, edges_truncated: false,
-  }));
+    } : { error: { message: 'Fixture detail unavailable' } }), { status });
+  };
+  if (controlledDetail && url.includes('/sessions/')) {
+    return new Promise<Response>((resolve, reject) => {
+      const signal = init?.signal;
+      const abort = () => reject(new DOMException('The operation was aborted', 'AbortError'));
+      signal?.addEventListener('abort', abort, { once: true });
+      window.resolveSessionDetail = (result) => {
+        signal?.removeEventListener('abort', abort);
+        resolve(detailResponse(result));
+      };
+    });
+  }
+  return detailResponse(true);
 };
 function Fixture() {
   const [revision, setRevision] = useState(0);

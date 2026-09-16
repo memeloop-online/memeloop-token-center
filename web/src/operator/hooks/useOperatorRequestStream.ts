@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { RequestEvent } from '../../types';
-import { enqueueSessionEventIdentity } from '../sessionRefresh';
+import { SessionEventChannel } from '../sessionEventChannel';
 import { useRequestEventStream } from './useRequestEventStream';
 import { coalesceRequestEvent, RequestRefreshBatch } from '../traffic/requestRefresh.js';
 
@@ -13,7 +13,7 @@ export function useOperatorRequestStream({ token, tenant, enabled, disconnectedM
   paused?: boolean;
 }) {
   const events = useRef(new Map<string, RequestEvent>());
-  const sessionEventKeyIds = useRef(new Set<string>());
+  const sessionEvents = useRef(new SessionEventChannel());
   const [revision, setRevision] = useState(0);
   const [overflowRevision, setOverflowRevision] = useState(0);
   const batch = useRef<RequestRefreshBatch | undefined>(undefined);
@@ -21,7 +21,7 @@ export function useOperatorRequestStream({ token, tenant, enabled, disconnectedM
 
   useEffect(() => {
     events.current.clear();
-    sessionEventKeyIds.current.clear();
+    sessionEvents.current.clear();
     setRevision((value) => value + 1);
     const next = new RequestRefreshBatch(intervalMs, {
       schedule: (callback, delay) => window.setTimeout(callback, delay), cancel: timer => window.clearTimeout(timer),
@@ -37,7 +37,6 @@ export function useOperatorRequestStream({ token, tenant, enabled, disconnectedM
         if (!protectedSet.has(id)) published.delete(id);
       }
       events.current = published;
-      for (const event of values.values()) enqueueSessionEventIdentity(sessionEventKeyIds.current, event);
       if (overflow) setOverflowRevision(value => value + 1);
       setRevision(value => value + 1);
     });
@@ -57,9 +56,14 @@ export function useOperatorRequestStream({ token, tenant, enabled, disconnectedM
     enabled: enabled && !paused,
     disconnectedMessage,
     onEvent: (event) => {
+      // Session state filters must not inherit the operator traffic page's
+      // user-selected rendering cadence. A terminal event has to invalidate
+      // an active-session row promptly, while request-table rendering remains
+      // coalesced in the batch below.
+      sessionEvents.current.publish(event);
       batch.current?.enqueue(event);
     },
   });
 
-  return { ...stream, events, sessionEventKeyIds, revision, overflowRevision, protectRequests };
+  return { ...stream, events, sessionEvents: sessionEvents.current, revision, overflowRevision, protectRequests };
 }
