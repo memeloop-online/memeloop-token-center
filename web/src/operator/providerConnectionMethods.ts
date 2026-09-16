@@ -2,11 +2,18 @@ import type { ProviderType } from '../types.js';
 
 type JsonSchema = Record<string, unknown>;
 
+/** Native Kimi device login is available only for the advertised built-in adapter. */
+export function isKimiDeviceProvider(provider?: Pick<ProviderType, 'id' | 'source' | 'oauth_adapter'>): boolean {
+  return provider?.source === 'builtin' && provider.id === 'kimi-oauth'
+    && provider.oauth_adapter?.flow_kind === 'kimi_device';
+}
+
 /** Creation support follows the native OAuth start contracts, not all OAuth plugins. */
 export function oauthCreationProxyMode(provider?: ProviderType): 'required' | 'optional' | 'none' {
   if (provider?.oauth_adapter?.flow_kind === 'openai_device') return 'required';
   if (provider?.source === 'builtin' && ((provider.id === 'cursor' && provider.oauth_adapter?.flow_kind === 'cursor_pkce')
-    || (provider.id === 'github-copilot' && provider.oauth_adapter?.flow_kind === 'github_device_copilot'))) return 'optional';
+    || (provider.id === 'github-copilot' && provider.oauth_adapter?.flow_kind === 'github_device_copilot')
+    || isKimiDeviceProvider(provider))) return 'optional';
   return 'none';
 }
 

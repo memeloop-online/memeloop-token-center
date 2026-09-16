@@ -33,4 +33,10 @@ function Fixture() {
     if (!response.ok) throw new Error('fixture list read failed');
   }} /></main>;
 }
-createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider>{new URLSearchParams(location.search).has('full-page') ? <ProvidersPage token="fixture-token" tenant="fixture-a" /> : <Fixture />}</MtcFluentProvider></I18nProvider>);
+function ScopedProvidersFixture() {
+  const [tenant, setTenant] = useState('fixture-a');
+  const [token, setToken] = useState('fixture-token');
+  return <><button onClick={() => setTenant('fixture-b')}>Switch tenant</button><button onClick={() => setToken('next-fixture-token')}>Switch credential</button><ProvidersPage token={token} tenant={tenant} /></>;
+}
+const params = new URLSearchParams(location.search);
+createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider>{params.has('scope-controls') ? <ScopedProvidersFixture /> : params.has('full-page') ? <ProvidersPage token="fixture-token" tenant="fixture-a" /> : <Fixture />}</MtcFluentProvider></I18nProvider>);
