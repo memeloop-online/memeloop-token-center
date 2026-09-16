@@ -15,6 +15,8 @@ pub(crate) struct CodexTransportPolicy {
     pub connect_timeout_millis: u64,
     pub read_timeout_millis: u64,
     pub request_timeout_millis: u64,
+    /// Maximum local memory queue time; does not extend the request deadline.
+    pub memory_admission_wait_millis: u64,
 }
 
 impl Default for CodexTransportPolicy {
@@ -29,6 +31,7 @@ impl Default for CodexTransportPolicy {
             connect_timeout_millis: 5_000,
             read_timeout_millis: 600_000,
             request_timeout_millis: 1_260_000,
+            memory_admission_wait_millis: 30_000,
         }
     }
 }
@@ -52,6 +55,7 @@ impl CodexTransportPolicy {
             || !(100..=60_000).contains(&policy.connect_timeout_millis)
             || !(1_000..=1_260_000).contains(&policy.read_timeout_millis)
             || !(1_000..=1_260_000).contains(&policy.request_timeout_millis)
+            || !(100..=300_000).contains(&policy.memory_admission_wait_millis)
             || policy.connect_timeout_millis >= policy.request_timeout_millis
             || policy.read_timeout_millis > policy.request_timeout_millis
             || value.is_some_and(|value| value.get("shared_probe_attempts") == Some(&Value::Null))
@@ -86,6 +90,7 @@ mod tests {
         assert_eq!(policy.connect_timeout_millis, 5_000);
         assert_eq!(policy.read_timeout_millis, 600_000);
         assert_eq!(policy.request_timeout_millis, 1_260_000);
+        assert_eq!(policy.memory_admission_wait_millis, 30_000);
         let independent_phases = CodexTransportPolicy::parse(Some(&json!({
             "connect_timeout_millis": 5_000,
             "read_timeout_millis": 1_000,
@@ -118,6 +123,8 @@ mod tests {
             json!({"connect_timeout_millis": 60001}),
             json!({"read_timeout_millis": 999}),
             json!({"request_timeout_millis": 1260001}),
+            json!({"memory_admission_wait_millis": 99}),
+            json!({"memory_admission_wait_millis": 300001}),
             json!({"read_timeout_millis": 2000, "request_timeout_millis": 1000}),
             json!({"connect_timeout_millis": 2000, "read_timeout_millis": 1000, "request_timeout_millis": 1000}),
             json!({"connect_timeout_millis": 1000, "read_timeout_millis": 1000, "request_timeout_millis": 1000}),

@@ -396,6 +396,11 @@ impl ProviderCatalog {
                     "type": "integer", "minimum": 1000, "maximum": 1260000, "default": 1260000,
                     "description": "One absolute budget from the first send through the complete response body, including the sole permitted classified HTTP 400 replay."
                 },
+                "memory_admission_wait_millis": {
+                    "type": "integer", "minimum": 100, "maximum": 300000, "default": 30000,
+                    "title": "Memory queue timeout (ms)",
+                    "description": "Maximum wait for gateway memory capacity within the request deadline."
+                },
                 "candidate_attempts": {
                     "type": "integer",
                     "minimum": 1,

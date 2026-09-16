@@ -1,6 +1,78 @@
 use super::*;
 
 #[tokio::test]
+async fn concurrent_large_streams_dispatch_while_buffered_partition_is_busy() {
+    let fixture = std::sync::Arc::new(codex_route_fixture("large-stream-admission").await);
+    fixture
+        .state
+        .db
+        .upsert_model_price(&fixture.model, "USD", Decimal::ZERO, Decimal::ZERO)
+        .await
+        .unwrap();
+    let held = fixture.state.proxy_memory_budget.reservation();
+    assert!(held.try_grow(48 * 1024 * 1024, 1));
+    assert!(
+        held.finalize_request(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+    );
+    let dispatched = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let signal = dispatched.clone();
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(move |_: &wiremock::Request| {
+            signal.add_permits(1);
+            ResponseTemplate::new(200)
+                .set_body_raw(completed_codex_sse("done"), "text/event-stream")
+                .set_delay(Duration::from_secs(60))
+        })
+        .expect(2)
+        .mount(&upstream)
+        .await;
+    let mut requests = Vec::new();
+    for _ in 0..2 {
+        let fixture = fixture.clone();
+        let endpoint = upstream.uri();
+        requests.push(tokio::spawn(async move {
+            send_codex_route_to_endpoint(
+                &fixture,
+                endpoint,
+                "/v1/responses",
+                json!({
+                    "model": fixture.model,
+                    "input": "x".repeat(16 * 1024 * 1024 - 1024),
+                    "stream": true
+                }),
+            )
+            .await
+        }));
+        // Observe actual dispatch before starting the next ingress. The first
+        // upstream deliberately has not returned headers when the second sends.
+        tokio::time::timeout(Duration::from_secs(15), dispatched.acquire())
+            .await
+            .expect("large stream must reach upstream without retained admission")
+            .unwrap()
+            .forget();
+    }
+    assert_eq!(
+        fixture.state.proxy_memory_budget.snapshot().2,
+        48 * 1024 * 1024
+    );
+    for request in requests {
+        assert!(!request.is_finished());
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+    }
+    assert_eq!(
+        fixture.state.proxy_memory_budget.snapshot().0,
+        48 * 1024 * 1024
+    );
+    drop(held);
+    assert_eq!(fixture.state.proxy_memory_budget.snapshot().0, 0);
+    upstream.verify().await;
+}
+
+#[tokio::test]
 async fn executed_response_waits_for_memory_without_replaying_upstream() {
     let fixture = std::sync::Arc::new(codex_route_fixture("response-memory-wait").await);
     let held = fixture.state.proxy_memory_budget.reservation();
