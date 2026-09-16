@@ -1,7 +1,7 @@
 import { LocalSettlementNotice, localSettlementLabel } from '../LocalSettlementNotice';
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
-import { DetailTooltip } from '../design-system';
+import { DataSurface, DetailTooltip } from '../design-system';
 import { Metric, NumberMetric, RequestTable } from '../components';
 import { formatCompactCurrency, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
@@ -72,14 +72,14 @@ export function OverviewPage({ credential, credentialView, onError, onOpenReques
       <NumberMetric label={t('request.tokens')} value={summary ? summary.input_tokens + summary.output_tokens : undefined} />
       <Metric label={localSettlementLabel(locale)} labelContent={<LocalSettlementNotice />} value={<DetailTooltip content={cost.title ?? cost.text}><span tabIndex={0}>{cost.text}</span></DetailTooltip>} />
     </section>
-    <article className="panel key-summary self-account-summary">
+    <DataSurface className="key-summary self-account-summary">
       <div><span className="eyebrow">{t('self.stableCredential')}</span><DetailTooltip content={currentKey.key_id}><h2 tabIndex={0}>{currentKey.alias}</h2></DetailTooltip><span>{t(`enforcementMode.${currentKey.policy.enforcement_mode}`)}</span></div>
       <Metric label={t('self.balance', { currency: currentKey.currency })} value={<DetailTooltip content={balance.title ?? balance.text}><span tabIndex={0}>{balance.text}</span></DetailTooltip>} />
-    </article>
-    {limits && <article className="panel self-limit-snapshot"><LimitSnapshot value={limits} enforcementMode={currentKey.policy.enforcement_mode} /></article>}
-    <article className="panel self-history self-overview-recent">
+    </DataSurface>
+    {limits && <DataSurface className="self-limit-snapshot"><LimitSnapshot value={limits} enforcementMode={currentKey.policy.enforcement_mode} /></DataSurface>}
+    <DataSurface className="self-history self-overview-recent">
       <div className="panel-title"><h2>{t('self.recent')}</h2><span>{locale === 'zh-CN' ? '不限时间 · ' : 'All time · '}{t('self.loadedRequests', { count: formatNumber(recentRequests.length, locale) })}</span></div>
       <RequestTable requests={recentRequests} currency={currentKey.currency} credentialAlias={currentKey.alias} onSelect={onOpenRequest} onOpenSession={onOpenSession} />
-    </article>
+    </DataSurface>
   </div>;
 }
