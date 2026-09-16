@@ -370,7 +370,8 @@ mod tests {
         let account: crate::provider::UpstreamAccountView = serde_json::from_value(json!({
             "id":Uuid::from_u128(1),"tenant_id":Uuid::from_u128(2),"name":"fixture","driver":"openai-codex",
             "auth_kind":"oauth","connection_method":"native_oauth","credential_generation":1,"status":"active",
-            "config":{"transport_policy":{"request_timeout_millis":20000}},"can_refresh":true,"can_rotate":false,
+            "config":{"transport_policy":{"read_timeout_millis":20000,"request_timeout_millis":20000}},
+            "can_refresh":true,"can_rotate":false,
             "can_reauthorize":true,"route_count":0,"created_at":0,"updated_at":10
         })).unwrap();
         assert_eq!(
