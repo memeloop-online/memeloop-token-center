@@ -286,7 +286,11 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     assert.equal(await failedUnobservedCost.locator('b').innerText(), 'Cost');
     assert.equal(await failedUnobservedCost.locator('span[tabindex="0"]').innerText(), '$0.00');
     assert.doesNotMatch(await failedUnobservedRow.locator('.request-cost-cell').innerText(), /35/);
-    assert.match(await failedUnobservedRow.locator('.request-cost-cell').getAttribute('title') ?? '', /defaults to 0/);
+    const failedUnobservedCostValue = failedUnobservedRow.locator('.request-cost-cell .request-value-info');
+    await failedUnobservedCostValue.focus();
+    const failedUnobservedCostTooltip = page.getByRole('tooltip').filter({ hasText: 'defaults to 0' });
+    await failedUnobservedCostTooltip.waitFor();
+    assert.match(await failedUnobservedCostTooltip.innerText(), /defaults to 0/);
   } catch (reason) {
     const diagnostics = await fixtureDiagnostics(page, current.value, history, pageErrors, consoleErrors);
     process.stderr.write(`request-diagnostics browser contract failed: ${JSON.stringify(diagnostics)}\n`);
