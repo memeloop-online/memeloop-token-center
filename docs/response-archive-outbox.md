@@ -35,6 +35,11 @@ recoverable by the worker after the existing request finalizer converges.
 - Upload attempts are leased and renewed; each attempt is bounded to
   120 seconds, with at most ten attempts. Each tick drains at most 32 tasks,
   using the existing shared archive permit budget.
+- The 120-second bound is a worker-side safety deadline, not a client delivery
+  deadline or a hot-reloadable setting. A deadline expiry is retained as the
+  bounded `upload_timeout` diagnostic; other object-store failures remain
+  `upload_failed`. Both preserve the sealed spool for the existing fenced retry
+  path, and retry exhaustion records an explicit gap before ciphertext cleanup.
 - Each upload query fetches at most 256 chunks and 1 MiB of ciphertext,
   checks the lease in the same statement snapshot, and does not take the
   producer's global budget lock.

@@ -880,6 +880,13 @@ async fn exhausted_upload_gap_is_immediately_cleanup_eligible() {
     assert_eq!(audit, 1);
 }
 
+#[test]
+fn archive_retry_reason_codes_preserve_timeout_without_accepting_untrusted_values() {
+    assert_eq!(reason_code("upload_timeout"), "upload_timeout");
+    assert_eq!(reason_code("upload_failed"), "upload_failed");
+    assert_eq!(reason_code("payload-bearing-untrusted-reason"), "internal");
+}
+
 #[tokio::test]
 async fn cleanup_time_budget_stops_between_committed_batches() {
     let (_dir, db, first) = fixture().await;
