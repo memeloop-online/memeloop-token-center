@@ -17,7 +17,7 @@ test('Portal shares Fluent controls, surfaces and metric styling across themes',
     for (const theme of ['light', 'dark']) for (const width of [390, 1440]) {
       const page = await browser.newPage({ viewport: { width, height: 1000 } });
       const errors: string[] = []; page.on('pageerror', error => errors.push(error.message));
-      await page.addInitScript(theme => { localStorage.setItem('mtc-locale', 'en'); document.documentElement.dataset.theme = theme; }, theme);
+      await page.addInitScript(() => { localStorage.setItem('mtc-locale', 'en'); });
       await page.route('**/self/v1/**', route => {
         assert.equal(route.request().method(), 'GET', 'fixture allows no writes');
         const path = new URL(route.request().url()).pathname;
@@ -25,6 +25,7 @@ test('Portal shares Fluent controls, surfaces and metric styling across themes',
         return route.fulfill({ json });
       });
       await page.goto(base);
+      await page.evaluate(theme => { document.documentElement.dataset.theme = theme; }, theme);
       const input = page.locator('.self-sign-in .fui-Input input');
       await input.fill('fixture-only-client-token');
       assert.equal(await input.getAttribute('type'), 'password');
