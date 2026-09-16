@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use object_store::{ObjectStore, ObjectStoreExt, path::Path};
 
 use super::{ArchiveStore, path::archive_path, path::content_location};
@@ -22,6 +22,8 @@ pub struct ArchiveWriter {
     pub(super) multipart_part_bytes: usize,
     pub(super) hasher: blake3::Hasher,
     pub(super) size_bytes: u64,
+    pub(super) compressed: bool,
+    pub(super) compressed_pending: BytesMut,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -45,7 +47,25 @@ impl ArchiveStore {
             multipart_part_bytes: ARCHIVE_MULTIPART_PART_BYTES,
             hasher: blake3::Hasher::new(),
             size_bytes: 0,
+            compressed: false,
+            compressed_pending: BytesMut::new(),
         })
+    }
+
+    /// Opt-in text archive format. The suffix is part of the durable locator;
+    /// callers must bind the returned locator, not the original staging name.
+    pub(crate) async fn start_compressed_writer(
+        &self,
+        location: &str,
+    ) -> Result<ArchiveWriter, AppError> {
+        let mut writer = self
+            .start_writer(&format!("{location}{}", super::compressed::SUFFIX))
+            .await?;
+        writer
+            .write_wire(Bytes::from_static(super::compressed::MAGIC))
+            .await?;
+        writer.compressed = true;
+        Ok(writer)
     }
 }
 
@@ -58,6 +78,33 @@ impl ArchiveWriter {
         if self.inner.is_none() {
             return Err(AppError::Storage("archive writer is already closed".into()));
         }
+        if self.compressed && next_size > super::compressed::MAX_PLAIN {
+            return Err(AppError::Storage(
+                "archive text object exceeds format limit".into(),
+            ));
+        }
+        self.hasher.update(&bytes);
+        self.size_bytes = next_size;
+        if self.compressed {
+            while !bytes.is_empty() {
+                let count = bytes
+                    .len()
+                    .min(super::compressed::BLOCK - self.compressed_pending.len());
+                self.compressed_pending
+                    .extend_from_slice(&bytes.split_to(count));
+                if self.compressed_pending.len() == super::compressed::BLOCK {
+                    let frame = super::compressed::frame(&self.compressed_pending)?;
+                    self.compressed_pending.clear();
+                    self.write_wire(frame).await?;
+                }
+            }
+        } else {
+            self.write_wire(bytes).await?;
+        }
+        Ok(())
+    }
+
+    async fn write_wire(&mut self, mut bytes: Bytes) -> Result<(), AppError> {
         while !bytes.is_empty() {
             let capacity = self
                 .inner
@@ -76,11 +123,6 @@ impl ArchiveWriter {
             // when handed one large Bytes. Bound each call to one part so the
             // capacity wait above remains a hard rather than advisory limit.
             let part = bytes.split_to(bytes.len().min(self.multipart_part_bytes));
-            self.hasher.update(&part);
-            self.size_bytes = self
-                .size_bytes
-                .checked_add(u64::try_from(part.len()).map_err(|_| AppError::Internal)?)
-                .ok_or_else(|| AppError::Storage("archive object size overflow".into()))?;
             self.inner
                 .as_mut()
                 .expect("archive writer was checked open")
@@ -99,18 +141,20 @@ impl ArchiveWriter {
                 return Err(error.into());
             }
         }
-        debug_assert_eq!(self.size_bytes, next_size);
         Ok(())
     }
 
     pub async fn finish(mut self) -> Result<String, AppError> {
         self.finish_multipart().await?;
-        let location = content_location(
+        let mut location = content_location(
             std::mem::replace(&mut self.hasher, blake3::Hasher::new())
                 .finalize()
                 .to_hex()
                 .as_str(),
         );
+        if self.compressed {
+            location.push_str(super::compressed::SUFFIX);
+        }
         let destination = archive_path(&location)?;
         self.store.copy(&self.staging, &destination).await?;
         self.store.delete(&self.staging).await?;
@@ -142,6 +186,18 @@ impl ArchiveWriter {
     }
 
     async fn finish_multipart(&mut self) -> Result<(), AppError> {
+        if self.inner.is_none() {
+            return Err(AppError::Storage("archive writer is already closed".into()));
+        }
+        if self.compressed {
+            if !self.compressed_pending.is_empty() {
+                let frame = super::compressed::frame(&self.compressed_pending)?;
+                self.compressed_pending.clear();
+                self.write_wire(frame).await?;
+            }
+            self.write_wire(super::compressed::footer(self.size_bytes, &self.hasher))
+                .await?;
+        }
         let Some(mut inner) = self.inner.take() else {
             return Err(AppError::Storage("archive writer is already closed".into()));
         };

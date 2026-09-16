@@ -22,6 +22,9 @@ impl ArchiveStore {
         location: &str,
         range: Option<Range<u64>>,
     ) -> Result<ArchiveDownload, AppError> {
+        if location.ends_with(super::compressed::SUFFIX) {
+            return self.compressed_stream(location, range).await;
+        }
         let path = archive_path(location)?;
         let requested_range = range.clone();
         let result = self

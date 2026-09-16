@@ -149,6 +149,9 @@ config:
   # replica runs a reader that accepts both the legacy and compressed formats.
   archiveSpoolCompression:
     enabled: false
+  # Enable only after all readers understand versioned lossless text objects.
+  archiveObjectCompression:
+    enabled: false
   databaseUrlSecret:
     name: memeloop-token-center-secrets
     key: database-url

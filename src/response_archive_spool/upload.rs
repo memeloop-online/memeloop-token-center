@@ -351,7 +351,14 @@ async fn upload(
     ));
     let transfer = async {
         *phase = "object_start";
-        let mut writer = state.archive.start_writer(&attempt.object_locator).await?;
+        let mut writer = if state.config.archive_object_compression_enabled {
+            state
+                .archive
+                .start_compressed_writer(&attempt.object_locator)
+                .await?
+        } else {
+            state.archive.start_writer(&attempt.object_locator).await?
+        };
         let mut total = 0_i64;
         let mut seq = 0;
         while seq < task.chunk_count {
@@ -392,7 +399,12 @@ async fn upload(
         }
         *phase = "object_finish";
         let stored = writer.finish_staged().await?;
-        if stored.object_locator != attempt.object_locator
+        let expected_locator = if state.config.archive_object_compression_enabled {
+            format!("{}.mtcz1", attempt.object_locator)
+        } else {
+            attempt.object_locator.clone()
+        };
+        if stored.object_locator != expected_locator
             || stored.size_bytes != u64::try_from(total).map_err(|_| AppError::Internal)?
         {
             return Err(AppError::Internal);
