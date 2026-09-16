@@ -1,7 +1,8 @@
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+use std::task::Poll;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -74,6 +75,7 @@ impl ProxyMemoryBudget {
             retained: Mutex::new(None),
             json_body_ceiling: AtomicUsize::new(0),
             json_node_ceiling: AtomicUsize::new(0),
+            admission: OnceLock::new(),
             #[cfg(test)]
             retained_wait_started: self.retained_wait_started.clone(),
             #[cfg(test)]
@@ -123,6 +125,7 @@ pub(crate) struct ProxyMemoryReservation {
     retained: Mutex<Option<OwnedSemaphorePermit>>,
     json_body_ceiling: AtomicUsize,
     json_node_ceiling: AtomicUsize,
+    admission: OnceLock<(std::time::Duration, crate::metrics::Metrics)>,
     #[cfg(test)]
     retained_wait_started: Arc<tokio::sync::Notify>,
     #[cfg(test)]
@@ -130,6 +133,59 @@ pub(crate) struct ProxyMemoryReservation {
 }
 
 impl ProxyMemoryReservation {
+    /// Snapshot the selected account's policy for this request. Retries cannot
+    /// replace its selected queue policy or metrics owner.
+    pub(crate) fn configure_admission(
+        &self,
+        wait: std::time::Duration,
+        metrics: crate::metrics::Metrics,
+    ) {
+        let _ = self.admission.set((wait, metrics));
+    }
+
+    async fn acquire(
+        &self,
+        semaphore: &Arc<Semaphore>,
+        units: u32,
+        deadline: tokio::time::Instant,
+        stage: crate::metrics::memory_admission::Stage,
+    ) -> Option<OwnedSemaphorePermit> {
+        let wait = self.admission.get().map(|(wait, _)| *wait).unwrap_or(
+            std::time::Duration::from_millis(
+                crate::provider::CodexTransportPolicy::default().memory_admission_wait_millis,
+            ),
+        );
+        let deadline = deadline.min(tokio::time::Instant::now() + wait);
+        // All admissions use Tokio's fair asynchronous queue. A try-acquire
+        // fast path can overtake an already queued multi-permit waiter.
+        let mut observation = None;
+        let permit = {
+            let mut acquire = Box::pin(semaphore.clone().acquire_many_owned(units));
+            tokio::time::timeout_at(
+                deadline,
+                std::future::poll_fn(|context| match acquire.as_mut().poll(context) {
+                    Poll::Ready(permit) => Poll::Ready(permit),
+                    Poll::Pending => {
+                        if observation.is_none() {
+                            observation = self
+                                .admission
+                                .get()
+                                .map(|(_, metrics)| metrics.proxy_memory_wait(stage));
+                        }
+                        Poll::Pending
+                    }
+                }),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+        };
+        if let Some(observation) = observation {
+            observation.finish(permit.is_some());
+        }
+        permit
+    }
+
     pub(crate) fn has_buffered_response(&self) -> bool {
         self.response_reserved.load(Ordering::Acquire)
     }
@@ -150,15 +206,15 @@ impl ProxyMemoryReservation {
         };
         #[cfg(test)]
         self.retained_wait_started.notify_one();
-        let Ok(permit) = tokio::time::timeout_at(
-            deadline,
-            self.retained_requests.clone().acquire_many_owned(units),
-        )
-        .await
+        let Some(permit) = self
+            .acquire(
+                &self.retained_requests,
+                units,
+                deadline,
+                crate::metrics::memory_admission::Stage::Retained,
+            )
+            .await
         else {
-            return false;
-        };
-        let Ok(permit) = permit else {
             return false;
         };
         let Ok(mut retained) = self.retained.lock() else {
@@ -195,12 +251,15 @@ impl ProxyMemoryReservation {
         let units = bytes.div_ceil(UNIT_BYTES) as u32;
         #[cfg(test)]
         self.response_wait_started.notify_one();
-        let Ok(permit) =
-            tokio::time::timeout_at(deadline, self.permits.clone().acquire_many_owned(units)).await
+        let Some(permit) = self
+            .acquire(
+                &self.permits,
+                units,
+                deadline,
+                crate::metrics::memory_admission::Stage::Response,
+            )
+            .await
         else {
-            return false;
-        };
-        let Ok(permit) = permit else {
             return false;
         };
         let Ok(mut held) = self.held.lock() else {
@@ -482,6 +541,85 @@ mod tests {
                 )
                 .await
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_wait_and_absolute_deadline_bound_response_admission() {
+        let budget = ProxyMemoryBudget::new(1024 * 1024);
+        let held = budget.reservation();
+        assert!(held.try_grow(1024 * 1024, 1));
+        let metrics = crate::metrics::Metrics::default();
+        for (configured, absolute, expected) in [(100, 1000, 100), (1000, 50, 50)] {
+            let waiting = budget.reservation();
+            waiting.configure_admission(
+                std::time::Duration::from_millis(configured),
+                metrics.clone(),
+            );
+            let started = tokio::time::Instant::now();
+            assert!(
+                !waiting
+                    .reserve_buffered_response(
+                        1,
+                        started + std::time::Duration::from_millis(absolute)
+                    )
+                    .await
+            );
+            assert_eq!(
+                started.elapsed(),
+                std::time::Duration::from_millis(expected)
+            );
+            assert!(!waiting.has_buffered_response());
+        }
+        let rendered = metrics.render(&crate::metrics::RuntimeMetrics::default());
+        assert!(
+            rendered.contains("proxy_memory_waits_total{stage=\"response\",outcome=\"timeout\"} 2")
+        );
+        assert!(rendered.contains("proxy_memory_waiting{stage=\"response\"} 0"));
+        drop(held);
+        assert_eq!(budget.snapshot().0, 0);
+    }
+
+    #[tokio::test]
+    async fn response_queue_cancellation_releases_fifo_head_and_all_permits() {
+        let budget = ProxyMemoryBudget::new(1024 * 1024);
+        let held = budget.reservation();
+        assert!(held.try_grow(1024 * 1024, 1));
+        let metrics = crate::metrics::Metrics::default();
+        let mut waiters = Vec::new();
+        for maximum in [128 * 1024, 64 * 1024] {
+            let waiting = budget.reservation();
+            waiting.configure_admission(std::time::Duration::from_secs(5), metrics.clone());
+            waiters.push(tokio::spawn(async move {
+                assert!(
+                    waiting
+                        .reserve_buffered_response(
+                            maximum,
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(5)
+                        )
+                        .await
+                );
+                waiting
+            }));
+            budget.wait_for_response_reservation_for_test().await;
+        }
+        let first = waiters.remove(0);
+        first.abort();
+        assert!(first.await.err().unwrap().is_cancelled());
+        drop(held);
+        let second = waiters.remove(0).await.unwrap();
+        assert_eq!(budget.snapshot().0, 3 * 64 * 1024);
+        drop(second);
+        assert_eq!(budget.snapshot().0, 0);
+        let rendered = metrics.render(&crate::metrics::RuntimeMetrics::default());
+        assert!(
+            rendered
+                .contains("proxy_memory_waits_total{stage=\"response\",outcome=\"cancelled\"} 1")
+        );
+        assert!(
+            rendered
+                .contains("proxy_memory_waits_total{stage=\"response\",outcome=\"admitted\"} 1")
+        );
+        assert!(rendered.contains("proxy_memory_waiting{stage=\"response\"} 0"));
     }
 
     #[tokio::test]

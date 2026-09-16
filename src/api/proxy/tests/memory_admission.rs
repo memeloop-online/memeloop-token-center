@@ -1,6 +1,118 @@
 use super::*;
 
 #[tokio::test]
+async fn concurrent_large_streams_dispatch_while_buffered_partition_is_busy() {
+    let fixture = std::sync::Arc::new(codex_route_fixture("large-stream-admission").await);
+    // The gateway conservatively reserves input bytes as tokens. Admit both
+    // 8 MiB requests through the credential's real TPM and prepaid balance so
+    // this test reaches the memory partition behavior it intends to exercise.
+    fixture
+        .state
+        .db
+        .update_key_policy(
+            fixture.key_id,
+            KeyPolicy {
+                tokens_per_minute: 32 * 1024 * 1024,
+                ..KeyPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    fixture
+        .state
+        .db
+        .grant(
+            fixture.credit_account_id,
+            Decimal::from(32),
+            "large stream memory admission fixture",
+            "large-stream-memory-admission-balance",
+        )
+        .await
+        .unwrap();
+    let held = fixture.state.proxy_memory_budget.reservation();
+    let retained_partition = fixture.state.config.proxy_memory_budget_bytes as usize / 4;
+    assert!(held.try_grow(retained_partition, 1));
+    assert!(
+        held.finalize_request(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+    );
+    let dispatched = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let signal = dispatched.clone();
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(move |_: &wiremock::Request| {
+            signal.add_permits(1);
+            ResponseTemplate::new(200)
+                .set_body_raw(completed_codex_sse("done"), "text/event-stream")
+                .set_delay(Duration::from_secs(60))
+        })
+        .expect(2)
+        .mount(&upstream)
+        .await;
+    let mut requests = Vec::new();
+    for _ in 0..2 {
+        let fixture = fixture.clone();
+        let endpoint = upstream.uri();
+        let mut request = tokio::spawn(async move {
+            send_codex_route_to_endpoint(
+                &fixture,
+                endpoint,
+                "/v1/responses",
+                json!({
+                    "model": fixture.model,
+                    "input": "x".repeat(8 * 1024 * 1024),
+                    "stream": true
+                }),
+            )
+            .await
+        });
+        // Observe actual dispatch before starting the next ingress. A local
+        // admission error is ready first and must fail with its response rather
+        // than being misreported as a dispatch timeout. The upstream delays
+        // headers, so a dispatched request remains active while the next large
+        // stream enters the gateway.
+        tokio::select! {
+            biased;
+            response = &mut request => {
+                let response = response.expect("large stream request task");
+                let status = response.status();
+                let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+                    .await
+                    .expect("early large stream response body");
+                panic!(
+                    "large stream returned before upstream dispatch: status={status}, body={}",
+                    String::from_utf8_lossy(&body)
+                );
+            }
+            permit = dispatched.acquire() => {
+                permit.expect("dispatch semaphore remains open").forget();
+            }
+            _ = tokio::time::sleep(Duration::from_secs(15)) => {
+                panic!("large stream did not reach upstream");
+            }
+        }
+        requests.push(request);
+    }
+    assert_eq!(
+        fixture.state.proxy_memory_budget.snapshot().2,
+        retained_partition
+    );
+    for request in requests {
+        assert!(!request.is_finished());
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+    }
+    assert_eq!(
+        fixture.state.proxy_memory_budget.snapshot().0,
+        retained_partition
+    );
+    drop(held);
+    assert_eq!(fixture.state.proxy_memory_budget.snapshot().0, 0);
+    upstream.verify().await;
+}
+
+#[tokio::test]
 async fn executed_response_waits_for_memory_without_replaying_upstream() {
     let fixture = std::sync::Arc::new(codex_route_fixture("response-memory-wait").await);
     let held = fixture.state.proxy_memory_budget.reservation();

@@ -115,6 +115,43 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn unexpected_json_waits_for_memory_before_polling_any_body_bytes() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let budget = Arc::new(crate::gateway_body::memory::ProxyMemoryBudget::new(
+            1024 * 1024,
+        ));
+        let held = budget.reservation();
+        assert!(held.try_grow(1024 * 1024, 1));
+        let polled = Arc::new(AtomicBool::new(false));
+        let observed = polled.clone();
+        let response = UpstreamResponse::Prefetched {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            version: http::Version::HTTP_11,
+            content_length: Some(2),
+            stream: Box::pin(futures_util::stream::once(async move {
+                observed.store(true, Ordering::SeqCst);
+                Ok(Bytes::from_static(b"{}"))
+            })),
+        };
+        let memory = budget.reservation();
+        let read = tokio::spawn(async move {
+            read_bounded_upstream(response, 1024, &memory, Instant::now(), false).await
+        });
+        budget.wait_for_response_reservation_for_test().await;
+        assert!(!polled.load(Ordering::SeqCst));
+        assert!(!read.is_finished());
+        assert_eq!(budget.snapshot().0, 1024 * 1024);
+        drop(held);
+        assert_eq!(read.await.unwrap().unwrap(), b"{}");
+        assert!(polled.load(Ordering::SeqCst));
+        assert_eq!(budget.snapshot().0, 0);
+    }
+
+    #[tokio::test]
     async fn buffered_reader_preserves_only_allowlisted_transport_timeouts() {
         for (upstream_error, expected) in [
             (

@@ -69,7 +69,6 @@ mod sse_delivery_tests;
 
 const PROXY_BODY_CHANNEL_CAPACITY: usize = 1;
 const MAX_INPUT_TOKEN_OVERHEAD_CEILING: i64 = 1_000_000;
-const RETAINED_REQUEST_ADMISSION_WAIT: Duration = Duration::from_secs(1);
 
 fn validate_openai_chat_choice_count(request: &Value) -> Result<(), AppError> {
     if openai_chat_choice_count(request)? == 1 {
@@ -978,6 +977,20 @@ pub(in crate::api) async fn proxy_with_identity(
     let primary = route_plan.primary_route();
     let upstream_account_id = Some(primary.account_id);
     let model_route_id = Some(primary.route_id);
+    let memory_wait = if codex_transport::is_driver(&primary.driver) {
+        crate::provider::CodexTransportPolicy::parse(primary.config.get("transport_policy"))
+            .map_err(|_| AppError::BadRequest("invalid Codex transport policy".into()))?
+            .memory_admission_wait_millis
+    } else {
+        crate::provider::CodexTransportPolicy::default().memory_admission_wait_millis
+    };
+    memory.configure_admission(Duration::from_millis(memory_wait), state.metrics.clone());
+    let requested_native_stream = request_json.get("stream").and_then(Value::as_bool) == Some(true)
+        && !route_plan.primary.is_component()
+        && matches!(
+            protocol,
+            Protocol::OpenAiChat | Protocol::OpenAiResponses | Protocol::AnthropicMessages
+        );
     let price_lookup = proxy_diagnostics::Phase::new(diagnostic_context, "model_price_lookup");
     let price = state.db.model_price(&model, &key.currency).await?;
     price_lookup.finish("completed", None, None);
@@ -1058,16 +1071,17 @@ pub(in crate::api) async fn proxy_with_identity(
     };
     // Admission ACK includes reservation, request record, and encrypted sealed
     // request spool in one transaction. No upstream work starts before it.
-    // A requested stream can still return a successful JSON envelope, so it
-    // needs the buffered-response safety partition until the response headers
-    // prove that the actual downstream path is SSE. Waiting here is bounded,
-    // FIFO, and occurs after durable admission but before any upstream send.
+    // Native streams retain their charged request under the process-wide
+    // budget, without occupying buffered-response headroom while waiting for
+    // headers. An unexpected JSON response must reserve capacity before its
+    // first body read. Non-stream and component paths keep their partition.
     let retained_admission =
         proxy_diagnostics::Phase::new(diagnostic_context, "retained_memory_admission");
-    if !buffered_request
-        .memory
-        .finalize_request(tokio::time::Instant::now() + RETAINED_REQUEST_ADMISSION_WAIT)
-        .await
+    if !requested_native_stream
+        && !buffered_request
+            .memory
+            .finalize_request(recovery_wait_deadline)
+            .await
     {
         retained_admission.finish("rejected", Some(503), None);
         state
@@ -1092,7 +1106,15 @@ pub(in crate::api) async fn proxy_with_identity(
             .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
         return Ok(response);
     }
-    retained_admission.finish("completed", None, None);
+    retained_admission.finish(
+        if requested_native_stream {
+            "stream_deferred"
+        } else {
+            "completed"
+        },
+        None,
+        None,
+    );
     let AuthorizedProxyRoutes {
         primary,
         remaining_candidates,

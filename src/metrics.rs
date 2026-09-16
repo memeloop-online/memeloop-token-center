@@ -10,6 +10,7 @@ use std::{
 };
 
 mod codex;
+pub(crate) mod memory_admission;
 pub(crate) mod plugin_execution;
 
 pub(crate) use codex::{CodexBadRequestClassification, CodexBadRequestRetry};
@@ -38,6 +39,7 @@ pub struct Metrics {
 }
 
 struct MetricsInner {
+    memory_admission: memory_admission::Counters,
     plugin_execution: plugin_execution::Counters,
     proxy_memory_rejections: [AtomicU64; 6],
     http: Mutex<BTreeMap<HttpLabels, RequestSeries>>,
@@ -62,6 +64,7 @@ struct MetricsInner {
 impl Default for MetricsInner {
     fn default() -> Self {
         Self {
+            memory_admission: memory_admission::Counters::default(),
             plugin_execution: plugin_execution::Counters::default(),
             proxy_memory_rejections: std::array::from_fn(|_| AtomicU64::new(0)),
             http: Mutex::default(),
@@ -400,6 +403,13 @@ impl Metrics {
         self.inner.proxy_memory_rejections[stage as usize].fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn proxy_memory_wait(
+        &self,
+        stage: memory_admission::Stage,
+    ) -> memory_admission::WaitGuard {
+        self.inner.memory_admission.wait(stage)
+    }
+
     pub(crate) fn observe_proxy_memory_error(
         &self,
         stage: ProxyMemoryRejectionStage,
@@ -578,6 +588,7 @@ impl Metrics {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let mut output = String::with_capacity(16 * 1024);
+        self.inner.memory_admission.render(&mut output);
         self.inner.plugin_execution.render(&mut output);
         output.push_str("# HELP memeloop_token_center_proxy_memory_rejections_total Capacity rejections by fixed admission stage.\n");
         output.push_str("# TYPE memeloop_token_center_proxy_memory_rejections_total counter\n");
