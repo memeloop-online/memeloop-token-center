@@ -1,7 +1,7 @@
 use super::super::*;
 use super::stats::{
-    FILTERED_ACTIVITY_SOURCE_FACTS, FILTERED_ACTIVITY_SOURCE_PENDING,
-    FILTERED_ACTIVITY_SOURCE_ROLLUPS, StatsFilter, validate_stats_filter,
+    StatsFilter, filtered_activity_source_facts, filtered_activity_source_pending,
+    filtered_activity_source_rollups, validate_stats_filter,
 };
 
 const DAY_MILLIS: i64 = 86_400_000;
@@ -90,20 +90,20 @@ fn is_global_unfiltered(tenant_external_id: Option<&str>, filter: &StatsFilter) 
 
 fn pricing_activity_source(filter: &StatsFilter) -> String {
     if filter.status.as_deref() == Some("pending") {
-        return FILTERED_ACTIVITY_SOURCE_PENDING.to_owned();
+        return filtered_activity_source_pending();
     }
     if filter.min_duration_ms.is_some()
         || filter.max_duration_ms.is_some()
         || filter.min_cost_micros.is_some()
         || filter.max_cost_micros.is_some()
     {
-        return FILTERED_ACTIVITY_SOURCE_FACTS.to_owned();
+        return filtered_activity_source_facts();
     }
     // Reuse the authoritative filters rather than creating a second tenant/
     // protocol/alias policy. Split only the fact edge predicate into disjoint
     // index ranges. When there are no complete days, $17 >= $18 and the
     // additional right bound prevents overlap with the left interval.
-    FILTERED_ACTIVITY_SOURCE_ROLLUPS
+    filtered_activity_source_rollups()
         .split("\nUNION ALL\n")
         .flat_map(|arm| {
             if arm.contains(EDGE_PREDICATE) {

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use super::super::effective_cost::{REQUEST_ADJUSTMENT_JOINS, REQUEST_FACT_EFFECTIVE_COST_SQL};
 use super::super::*;
 
 pub(crate) const MAX_STATS_RANGE_MILLIS: i64 = 93 * 86_400_000;
@@ -13,7 +14,25 @@ SELECT a.day_bucket * 86400000 AS created_at,
        a.input_tokens,
        a.output_tokens,
        a.currency,
-       a.cost_micros,
+       a.cost_micros - COALESCE((
+           SELECT SUM(f.cost_micros - (__MTC_REQUEST_EFFECTIVE_COST__))
+             FROM request_stats_facts f
+             LEFT JOIN request_records billing_request
+               ON billing_request.id = f.request_id
+              AND billing_request.created_at = f.created_at
+             __MTC_REQUEST_ADJUSTMENT_JOINS__
+            WHERE f.tenant_id = a.tenant_id
+              AND f.key_id = a.key_id
+              AND f.created_at / 86400000 = a.day_bucket
+              AND f.model = a.model
+              AND f.protocol = a.protocol
+              AND f.status_class = a.status_class
+              AND f.error_code = a.error_code
+              AND f.upstream_account_id = a.upstream_account_id
+              AND f.model_route_id = a.model_route_id
+              AND f.service_tier = a.service_tier
+              AND f.currency = a.currency
+       ), 0) AS cost_micros,
        a.requests
 FROM request_daily_aggregates a
 JOIN key_records k ON k.id = a.key_id AND k.tenant_id = a.tenant_id
@@ -43,9 +62,13 @@ SELECT f.created_at,
        CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.input_tokens END AS input_tokens,
        CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.output_tokens END AS output_tokens,
        f.currency,
-       f.cost_micros,
+       __MTC_REQUEST_EFFECTIVE_COST__,
        CAST(1 AS BIGINT) AS requests
 FROM request_stats_facts f
+LEFT JOIN request_records billing_request
+  ON billing_request.id = f.request_id
+ AND billing_request.created_at = f.created_at
+__MTC_REQUEST_ADJUSTMENT_JOINS__
 JOIN key_records k ON k.id = f.key_id AND k.tenant_id = f.tenant_id
 JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
 JOIN tenants t ON t.id = f.tenant_id
@@ -135,9 +158,13 @@ SELECT f.created_at,
        CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.input_tokens END AS input_tokens,
        CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.output_tokens END AS output_tokens,
        f.currency,
-       f.cost_micros,
+       __MTC_REQUEST_EFFECTIVE_COST__,
        CAST(1 AS BIGINT) AS requests
 FROM request_stats_facts f
+LEFT JOIN request_records billing_request
+  ON billing_request.id = f.request_id
+ AND billing_request.created_at = f.created_at
+__MTC_REQUEST_ADJUSTMENT_JOINS__
 JOIN key_records k ON k.id = f.key_id AND k.tenant_id = f.tenant_id
 JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
 JOIN tenants t ON t.id = f.tenant_id
@@ -259,6 +286,27 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND ($16 = '' OR LOWER(p.external_id) LIKE $16 ESCAPE '\')
   AND $17 >= 0 AND $18 >= 0
 "#;
+
+fn expand_effective_cost_source(template: &str) -> String {
+    template
+        .replace(
+            "__MTC_REQUEST_EFFECTIVE_COST__",
+            REQUEST_FACT_EFFECTIVE_COST_SQL,
+        )
+        .replace("__MTC_REQUEST_ADJUSTMENT_JOINS__", REQUEST_ADJUSTMENT_JOINS)
+}
+
+pub(crate) fn filtered_activity_source_rollups() -> String {
+    expand_effective_cost_source(FILTERED_ACTIVITY_SOURCE_ROLLUPS)
+}
+
+pub(crate) fn filtered_activity_source_facts() -> String {
+    expand_effective_cost_source(FILTERED_ACTIVITY_SOURCE_FACTS)
+}
+
+pub(crate) fn filtered_activity_source_pending() -> String {
+    expand_effective_cost_source(FILTERED_ACTIVITY_SOURCE_PENDING)
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct StatsFilter {
@@ -428,11 +476,11 @@ impl Database {
             || filter.min_cost_micros.is_some()
             || filter.max_cost_micros.is_some();
         let activity_source = if filter.status.as_deref() == Some("pending") {
-            FILTERED_ACTIVITY_SOURCE_PENDING
+            filtered_activity_source_pending()
         } else if use_facts {
-            FILTERED_ACTIVITY_SOURCE_FACTS
+            filtered_activity_source_facts()
         } else {
-            FILTERED_ACTIVITY_SOURCE_ROLLUPS
+            filtered_activity_source_rollups()
         };
         const DAY_MILLIS: i64 = 86_400_000;
         let full_day_from = from_created_at

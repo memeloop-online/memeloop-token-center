@@ -1,3 +1,4 @@
+use super::super::effective_cost::effective_displayed_cost_micros;
 use super::super::*;
 use crate::filter_ast::{
     TypedFilterAst, TypedFilterField, TypedFilterOperator, TypedFilterValue, filter_integer,
@@ -1163,7 +1164,12 @@ fn request_view_from_row(row: &AnyRow) -> Result<RequestView, AppError> {
     let billed_units: Option<i64> = row.try_get("billed_units")?;
     let billing_unit: Option<String> = row.try_get("billing_unit")?;
     let cost_micros: Option<i64> = row.try_get("cost_micros")?;
-    let cost = cost_micros.map(micros_to_decimal_string);
+    let usage_basis: Option<String> = row.try_get("usage_basis")?;
+    let cost = cost_micros
+        .map(|value| {
+            effective_displayed_cost_micros(value, persisted_status_code, usage_basis.as_deref())
+        })
+        .map(micros_to_decimal_string);
     let currency: Option<String> = row.try_get("currency")?;
     let billable = row.try_get::<i64, _>("billable")? != 0;
     let tokens = (generation_status.is_none()
@@ -1414,7 +1420,16 @@ fn request_event_views(rows: Vec<AnyRow>) -> Result<Vec<RequestEventView>, AppEr
             let billed_units: Option<i64> = row.try_get("billed_units")?;
             let billing_unit: Option<String> = row.try_get("billing_unit")?;
             let cost_micros: Option<i64> = row.try_get("current_cost_micros")?;
-            let cost = cost_micros.map(micros_to_decimal_string);
+            let usage_basis = request_usage_basis_from_row(&row)?;
+            let cost = cost_micros
+                .map(|value| {
+                    effective_displayed_cost_micros(
+                        value,
+                        persisted_status_code,
+                        usage_basis.as_ref().map(|value| value.as_str()),
+                    )
+                })
+                .map(micros_to_decimal_string);
             let currency: Option<String> = row.try_get("currency")?;
             let tokens = (generation_status.is_none()
                 && !audio_transcription
@@ -1443,7 +1458,7 @@ fn request_event_views(rows: Vec<AnyRow>) -> Result<Vec<RequestEventView>, AppEr
                 },
             );
             Ok(RequestEventView {
-                usage_basis: request_usage_basis_from_row(&row)?,
+                usage_basis,
                 compaction: row
                     .try_get::<Option<i64>, _>("compaction")?
                     .filter(|value| *value == 1)

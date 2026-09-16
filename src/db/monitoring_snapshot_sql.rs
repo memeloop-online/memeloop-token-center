@@ -1,3 +1,7 @@
+use super::effective_cost::{
+    request_adjustment_join_sql, request_fact_effective_cost_sql,
+    request_rollup_effective_cost_for_bucket_sql,
+};
 use super::{MonitoringGranularity, MonitoringScope};
 
 pub(super) const TOP_UPSTREAM_MODEL_LIMIT: usize = 10;
@@ -18,7 +22,7 @@ pub(super) fn monitoring_snapshot_sql(
     scope: &MonitoringScope,
     granularity: MonitoringGranularity,
 ) -> String {
-    let (table, bucket_column, _bucket_millis) = match granularity {
+    let (table, bucket_column, bucket_millis) = match granularity {
         MonitoringGranularity::Hour => ("usage_analysis_hourly", "hour_bucket", 3_600_000),
         MonitoringGranularity::Day => ("usage_analysis_daily", "day_bucket", 86_400_000),
     };
@@ -40,6 +44,16 @@ pub(super) fn monitoring_snapshot_sql(
             "$6",
         ),
     };
+    let effective_rollup_cost = request_rollup_effective_cost_for_bucket_sql(
+        "a",
+        "rollup_fact",
+        "rollup_request",
+        "rollup_feed",
+        "rollup_adjustments",
+        bucket_column,
+        bucket_millis,
+        true,
+    );
     let rollup = format!(
         r#"SELECT a.upstream_account_id, a.model, a.status_class, a.currency,
                   a.requests, a.input_tokens, a.output_tokens,
@@ -49,9 +63,10 @@ pub(super) fn monitoring_snapshot_sql(
                   a.duration_bucket_3, a.duration_bucket_4, a.duration_bucket_5,
                   a.duration_bucket_6, a.duration_bucket_7, a.duration_bucket_8,
                   a.duration_bucket_9, a.duration_bucket_10, a.duration_bucket_11,
-                  a.cost_micros
+                  {effective_rollup_cost}
              FROM {table} a
             WHERE {rollup_predicate}"#,
+        effective_rollup_cost = effective_rollup_cost
     );
     let left_requests = request_fact_sql(left_from, left_to, fact_predicate);
     let left_generations = generation_fact_sql(left_from, left_to, fact_predicate);
@@ -321,6 +336,9 @@ fn selected_values(row_count: usize, columns_per_row: usize) -> Option<String> {
 }
 
 fn request_fact_sql(from_parameter: &str, to_parameter: &str, scope_predicate: &str) -> String {
+    let effective_cost =
+        request_fact_effective_cost_sql("f", "billing_request", "billing_adjustments");
+    let adjustment_joins = request_adjustment_join_sql("f", "billing_feed", "billing_adjustments");
     format!(
         r#"SELECT f.upstream_account_id, f.model, f.status_class, f.currency,
                   CAST(1 AS BIGINT) AS requests,
@@ -343,12 +361,18 @@ fn request_fact_sql(from_parameter: &str, to_parameter: &str, scope_predicate: &
                   CASE WHEN f.duration_ms > 10000 AND f.duration_ms <= 30000 THEN 1 ELSE 0 END AS duration_bucket_9,
                   CASE WHEN f.duration_ms > 30000 AND f.duration_ms <= 60000 THEN 1 ELSE 0 END AS duration_bucket_10,
                   CASE WHEN f.duration_ms > 60000 THEN 1 ELSE 0 END AS duration_bucket_11,
-                  f.cost_micros
+                  {effective_cost}
              FROM request_stats_facts f
+             LEFT JOIN request_records billing_request
+               ON billing_request.id = f.request_id
+              AND billing_request.created_at = f.created_at
+             {adjustment_joins}
             WHERE {from_parameter} <= {to_parameter}
               AND f.created_at >= {from_parameter}
               AND f.created_at <= {to_parameter}
               AND {scope_predicate}"#,
+        effective_cost = effective_cost,
+        adjustment_joins = adjustment_joins
     )
 }
 

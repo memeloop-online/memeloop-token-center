@@ -1,4 +1,8 @@
 use super::UsageAnalysisGranularity;
+use crate::db::effective_cost::{
+    request_adjustment_join_sql, request_fact_effective_cost_sql,
+    request_session_rollup_effective_cost_sql,
+};
 
 pub(super) fn session_usage_dimension_sql(
     granularity: UsageAnalysisGranularity,
@@ -65,6 +69,23 @@ pub(super) fn session_usage_dimension_sql(
               AND ($10 = '' OR fact.model_route_id = $10)"#,
         tenant_predicate = tenant_predicate.replace("{alias}", "fact"),
     );
+    let effective_rollup_cost = request_session_rollup_effective_cost_sql(
+        "rollup",
+        "rollup_fact",
+        "rollup_request",
+        "rollup_feed",
+        "rollup_adjustments",
+        bucket_column,
+        if matches!(granularity, UsageAnalysisGranularity::Hour) {
+            3_600_000
+        } else {
+            86_400_000
+        },
+    );
+    let effective_fact_cost =
+        request_fact_effective_cost_sql("fact", "billing_request", "billing_adjustments");
+    let adjustment_joins =
+        request_adjustment_join_sql("fact", "billing_feed", "billing_adjustments");
     format!(
         r#"WITH session_activity AS (
                SELECT rollup.tenant_id, rollup.key_id, rollup.session_id,
@@ -75,7 +96,7 @@ pub(super) fn session_usage_dimension_sql(
                       rollup.cached_input_tokens, rollup.cache_write_tokens,
                       rollup.generation_units,
                       rollup.duration_count, rollup.duration_sum_ms,
-                      rollup.cost_micros
+                      {effective_rollup_cost}
                  FROM {table} rollup
                 WHERE rollup.{bucket_column} >= $3 AND rollup.{bucket_column} < $4
                   {rollup_filters}
@@ -94,8 +115,12 @@ pub(super) fn session_usage_dimension_sql(
                            ELSE 0 END,
                       fact.output_tokens, fact.cached_input_tokens,
                       fact.cache_write_tokens, fact.generation_units, 1,
-                      fact.duration_ms, fact.cost_micros
+                      fact.duration_ms, {effective_fact_cost}
                  FROM request_stats_facts fact
+                 LEFT JOIN request_records billing_request
+                   ON billing_request.id = fact.request_id
+                  AND billing_request.created_at = fact.created_at
+                 {adjustment_joins}
                 WHERE $13 <= $14 AND fact.created_at >= $13 AND fact.created_at <= $14
                   {fact_filters}
                UNION ALL
@@ -113,8 +138,12 @@ pub(super) fn session_usage_dimension_sql(
                            ELSE 0 END,
                       fact.output_tokens, fact.cached_input_tokens,
                       fact.cache_write_tokens, fact.generation_units, 1,
-                      fact.duration_ms, fact.cost_micros
+                      fact.duration_ms, {effective_fact_cost}
                  FROM request_stats_facts fact
+                 LEFT JOIN request_records billing_request
+                   ON billing_request.id = fact.request_id
+                  AND billing_request.created_at = fact.created_at
+                 {adjustment_joins}
                 WHERE $15 <= $16 AND fact.created_at >= $15 AND fact.created_at <= $16
                   {fact_filters}
                UNION ALL
@@ -198,5 +227,8 @@ pub(super) fn session_usage_dimension_sql(
              FROM ranked_sessions
             WHERE session_rank <= 100
             ORDER BY session_rank, session_id, currency"#,
+        effective_rollup_cost = effective_rollup_cost,
+        effective_fact_cost = effective_fact_cost,
+        adjustment_joins = adjustment_joins,
     )
 }

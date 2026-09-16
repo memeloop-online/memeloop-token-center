@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use sqlx::Row;
 use uuid::Uuid;
 
+use super::effective_cost::request_session_total_effective_cost_sql;
 use super::*;
 use crate::model::{
     ConversationRequestView, LogicalSessionDetail, LogicalSessionSummary,
@@ -263,7 +264,7 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
        )
        SELECT recent.*, key_record.alias AS key_alias,
               COALESCE(totals.currency, '') AS currency,
-              COALESCE(totals.cost_micros, 0) AS cost_micros,
+              __SESSION_TOTAL_EFFECTIVE_COST__ AS cost_micros,
               COALESCE(completed.requests, 0) AS requests,
               COALESCE(completed.errors, 0) AS errors,
               COALESCE(completed.input_tokens, 0) AS input_tokens,
@@ -314,8 +315,25 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
            ON latest_activity.key_id = recent.key_id
           AND latest_activity.session_id = recent.session_id
           AND latest_activity.activity_rank = 1
-        ORDER BY recent.last_activity_at DESC, recent.session_id DESC,
-                 recent.key_id DESC, totals.currency ASC"#;
+                 ORDER BY recent.last_activity_at DESC, recent.session_id DESC,
+                         recent.key_id DESC, totals.currency ASC"#;
+
+pub(super) fn recent_sessions_first_page_sql() -> String {
+    effective_session_query(RECENT_SESSIONS_FIRST_PAGE_SQL)
+}
+
+fn effective_session_query(template: &str) -> String {
+    template.replace(
+        "__SESSION_TOTAL_EFFECTIVE_COST__",
+        &request_session_total_effective_cost_sql(
+            "totals",
+            "billing_fact",
+            "billing_request",
+            "billing_feed",
+            "billing_adjustments",
+        ),
+    )
+}
 
 pub(super) fn should_use_candidate_first_page(
     allow_candidate_first: bool,
@@ -668,7 +686,7 @@ impl Database {
                )
                SELECT recent.*, key_record.alias AS key_alias,
                       COALESCE(totals.currency, '') AS currency,
-                      COALESCE(totals.cost_micros, 0) AS cost_micros,
+                      __SESSION_TOTAL_EFFECTIVE_COST__ AS cost_micros,
                       COALESCE(completed.requests, 0) AS requests,
                       COALESCE(completed.errors, 0) AS errors,
                       COALESCE(completed.input_tokens, 0) AS input_tokens,
@@ -719,14 +737,15 @@ impl Database {
                    ON latest_activity.key_id = recent.key_id
                   AND latest_activity.session_id = recent.session_id
                   AND latest_activity.activity_rank = 1
-                ORDER BY recent.last_activity_at DESC, recent.session_id DESC,
+               ORDER BY recent.last_activity_at DESC, recent.session_id DESC,
                          recent.key_id DESC, totals.currency ASC"#;
+        let reference_query = effective_session_query(reference_query);
         let session_query = if use_candidate_first_page {
-            RECENT_SESSIONS_FIRST_PAGE_SQL
+            recent_sessions_first_page_sql()
         } else {
             reference_query
         };
-        let mut session_query = sqlx::query(session_query)
+        let mut session_query = sqlx::query(&session_query)
             .bind(tenant_id)
             .bind(&key_id)
             .bind(limit);
@@ -810,12 +829,12 @@ impl Database {
         {
             sqlx::query(
                 r#"SELECT id, created_at, completed_at, source_completed_at, protocol, model, status_code, duration_ms, first_output_ms, generation_duration_ms,
-                          input_tokens, cached_input_tokens, cache_write_tokens, output_tokens,
+                          usage_basis, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens,
                           cost_micros, currency, error_code, archive_state,
                           source_kind, provenance_kind, archive_source, external_request_id
                      FROM (
                          SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms,
-                                r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens,
+                                r.usage_basis, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens,
                                 r.cost_micros, r.currency, r.error_code,
                                 CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state,
                                 'live' AS source_kind, 'native' AS provenance_kind,
@@ -830,7 +849,7 @@ impl Database {
                           WHERE r.key_id = $1 AND r.conversation_cluster_id IS NULL
                          UNION ALL
                          SELECT archive_request_id, source_started_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model,
-                                status_code, duration_ms, CAST(NULL AS BIGINT) AS first_output_ms, CAST(NULL AS BIGINT) AS generation_duration_ms, input_tokens,
+                                status_code, duration_ms, CAST(NULL AS BIGINT) AS first_output_ms, CAST(NULL AS BIGINT) AS generation_duration_ms, CAST(NULL AS TEXT) AS usage_basis, input_tokens,
                                 CAST(0 AS BIGINT) AS cached_input_tokens,
                                 CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens,
                                 CAST(0 AS BIGINT), NULL AS currency, error_code,
@@ -854,12 +873,12 @@ impl Database {
         } else {
             sqlx::query(
                 r#"SELECT id, created_at, completed_at, source_completed_at, protocol, model, status_code, duration_ms, first_output_ms, generation_duration_ms,
-                          input_tokens, cached_input_tokens, cache_write_tokens, output_tokens,
+                          usage_basis, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens,
                           cost_micros, currency, error_code, archive_state,
                           source_kind, provenance_kind, archive_source, external_request_id
                      FROM (
                          SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms,
-                                r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens,
+                                r.usage_basis, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens,
                                 r.cost_micros, r.currency, r.error_code,
                                 CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state,
                                 'live' AS source_kind, 'native' AS provenance_kind,
@@ -874,7 +893,7 @@ impl Database {
                           WHERE r.key_id = $1 AND r.conversation_cluster_id IS NULL
                          UNION ALL
                          SELECT archive_request_id, source_started_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model,
-                                status_code, duration_ms, CAST(NULL AS BIGINT) AS first_output_ms, CAST(NULL AS BIGINT) AS generation_duration_ms, input_tokens,
+                                status_code, duration_ms, CAST(NULL AS BIGINT) AS first_output_ms, CAST(NULL AS BIGINT) AS generation_duration_ms, CAST(NULL AS TEXT) AS usage_basis, input_tokens,
                                 CAST(0 AS BIGINT) AS cached_input_tokens,
                                 CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens,
                                 CAST(0 AS BIGINT), NULL AS currency, error_code,
@@ -904,7 +923,14 @@ impl Database {
                 let raw_cached_input_tokens: i64 = row.try_get("cached_input_tokens")?;
                 let raw_cache_write_tokens: i64 = row.try_get("cache_write_tokens")?;
                 let raw_output_tokens: i64 = row.try_get("output_tokens")?;
-                let cost_micros: i64 = row.try_get("cost_micros")?;
+                let raw_cost_micros: i64 = row.try_get("cost_micros")?;
+                let status_code: Option<i64> = row.try_get("status_code")?;
+                let usage_basis: Option<String> = row.try_get("usage_basis")?;
+                let cost_micros = super::effective_cost::effective_displayed_cost_micros(
+                    raw_cost_micros,
+                    status_code,
+                    usage_basis.as_deref(),
+                );
                 let completed_at = row.try_get("completed_at")?;
                 let (mut usage, billing, currency) =
                     super::requests::request_detail_accounting_projection(
@@ -932,7 +958,7 @@ impl Database {
                 }
                 Ok(ConversationRequestView {
                     request: RequestView {
-                        usage_basis: None,
+                        usage_basis: super::requests::request_usage_basis_from_row(&row)?,
                         compaction: None,
                         first_output_ms: row.try_get("first_output_ms")?,
                         generation_duration_ms: row.try_get("generation_duration_ms")?,
@@ -940,7 +966,7 @@ impl Database {
                         created_at: row.try_get("created_at")?,
                         completed_at,
                         source_completed_at: row.try_get("source_completed_at")?,
-                        lifecycle_state: match row.try_get::<Option<i64>, _>("status_code")? {
+                        lifecycle_state: match status_code {
                             None => crate::model::RequestLifecycleState::Pending,
                             Some(499) => crate::model::RequestLifecycleState::Cancelled,
                             Some(code) if (200..400).contains(&code) => {
@@ -952,7 +978,7 @@ impl Database {
                         model: row.try_get("model")?,
                         upstream_account_id: None,
                         route_id: None,
-                        status_code: row.try_get("status_code")?,
+                        status_code,
                         duration_ms: row.try_get("duration_ms")?,
                         input_tokens: if audio_transcription {
                             0

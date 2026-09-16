@@ -566,7 +566,7 @@ async fn explain_candidate_first(
 ) -> Value {
     let statement = format!(
         "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, TIMING OFF) {}",
-        super::super::session_analytics::RECENT_SESSIONS_FIRST_PAGE_SQL
+        super::super::session_analytics::recent_sessions_first_page_sql()
     );
     let row = sqlx::query(sqlx::AssertSqlSafe(statement))
         .bind(tenant_id.to_string())
