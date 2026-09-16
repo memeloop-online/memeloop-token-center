@@ -91,13 +91,18 @@ pub struct GenerationAdapterContribution {
 pub struct RequestCompatibility {
     #[serde(default)]
     pub third_party: bool,
+    /// The provider translates OpenAI Responses requests through the host's
+    /// Chat transport. This is an explicit hook for future DeepSeek/GLM-style
+    /// adapters; it is not inferred from a URL or model name.
+    #[serde(default)]
+    pub responses_via_chat_v1: bool,
     #[serde(default)]
     pub codex_multi_agent_v2: bool,
 }
 
 impl RequestCompatibility {
     pub(crate) fn is_default(&self) -> bool {
-        !self.third_party && !self.codex_multi_agent_v2
+        !self.third_party && !self.responses_via_chat_v1 && !self.codex_multi_agent_v2
     }
 
     pub fn supports_codex_multi_agent_v2(&self) -> bool {
@@ -521,6 +526,7 @@ impl ProviderCatalog {
         });
         kimi.request_compatibility = RequestCompatibility {
             third_party: true,
+            responses_via_chat_v1: true,
             codex_multi_agent_v2: true,
         };
         kimi.credential_schema["properties"]["expires_at"] = json!({"type": ["integer", "null"], "description": "Unix milliseconds, absent source expiry remains unknown"});
@@ -609,6 +615,20 @@ impl ProviderCatalog {
                 .request_compatibility
                 .supports_codex_multi_agent_v2()
         })
+    }
+
+    pub fn supports_responses_via_chat_v1(&self, driver: &str) -> bool {
+        self.get(driver).is_some_and(|provider| {
+            provider.request_compatibility.third_party
+                && provider.request_compatibility.responses_via_chat_v1
+        })
+    }
+
+    /// Model catalogs also include native Codex routes, whose transport reads
+    /// MultiAgentV2 without the third-party normalization hook.
+    pub fn supports_codex_multi_agent_v2_model_catalog(&self, driver: &str) -> bool {
+        driver == crate::oauth::codex_device::PROVIDER_DRIVER
+            || self.supports_codex_multi_agent_v2(driver)
     }
 
     pub(crate) fn managed_oauth_adapter_for_driver(

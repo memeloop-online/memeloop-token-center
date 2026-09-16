@@ -94,18 +94,31 @@ fn codex_models_response(
     state: &AppState,
     sources: &[crate::db::GrantedModelCapabilitySource],
 ) -> Value {
+    let models = codex_model_availability(&state.providers, sources);
+    json!({
+        "models": models.into_iter().map(|(model, availability)| {
+            codex_model_info(
+                &model,
+                availability.openai_source_seen && availability.openai_multi_agent_v2,
+            )
+        }).collect::<Vec<_>>()
+    })
+}
+
+fn codex_model_availability(
+    providers: &crate::provider::ProviderCatalog,
+    sources: &[crate::db::GrantedModelCapabilitySource],
+) -> std::collections::BTreeMap<String, CodexModelAvailability> {
     let mut models = std::collections::BTreeMap::<String, CodexModelAvailability>::new();
     for source in sources {
         if source.protocol != "openai" {
             continue;
         }
-        let Some(provider) = state.providers.get(&source.driver) else {
+        if providers.get(&source.driver).is_none() {
             continue;
-        };
+        }
         let availability = models.entry(source.public_model.clone()).or_default();
-        let compatible = provider
-            .request_compatibility
-            .supports_codex_multi_agent_v2();
+        let compatible = providers.supports_codex_multi_agent_v2_model_catalog(&source.driver);
         if availability.openai_source_seen {
             // Later sources can only make the advertisement more
             // conservative. This avoids claiming V2 when a public model
@@ -116,14 +129,7 @@ fn codex_models_response(
             availability.openai_multi_agent_v2 = compatible;
         }
     }
-    json!({
-        "models": models.into_iter().map(|(model, availability)| {
-            codex_model_info(
-                &model,
-                availability.openai_source_seen && availability.openai_multi_agent_v2,
-            )
-        }).collect::<Vec<_>>()
-    })
+    models
 }
 
 fn codex_model_info(model: &str, multi_agent_v2: bool) -> Value {
@@ -244,6 +250,44 @@ mod tests {
 
         let ordinary = codex_model_info("ordinary", false);
         assert!(ordinary.get("multi_agent_version").is_none());
+    }
+
+    #[test]
+    fn codex_catalog_treats_native_and_declared_kimi_routes_as_multi_agent_compatible() {
+        fn source(model: &str, driver: &str) -> crate::db::GrantedModelCapabilitySource {
+            crate::db::GrantedModelCapabilitySource {
+                public_model: model.into(),
+                upstream_model: "private-upstream-name".into(),
+                protocol: "openai".into(),
+                driver: driver.into(),
+                config_json: "{}".into(),
+            }
+        }
+
+        let providers = crate::provider::ProviderCatalog::builtins();
+        let native = codex_model_availability(&providers, &[source("native-only", "openai-codex")]);
+        assert!(native["native-only"].openai_multi_agent_v2);
+
+        let kimi = codex_model_availability(&providers, &[source("kimi-only", "kimi-oauth")]);
+        assert!(kimi["kimi-only"].openai_multi_agent_v2);
+
+        let mixed = codex_model_availability(
+            &providers,
+            &[
+                source("mixed", "openai-codex"),
+                source("mixed", "kimi-oauth"),
+            ],
+        );
+        assert!(mixed["mixed"].openai_multi_agent_v2);
+
+        let incompatible = codex_model_availability(
+            &providers,
+            &[
+                source("mixed-incompatible", "openai-codex"),
+                source("mixed-incompatible", "http-json"),
+            ],
+        );
+        assert!(!incompatible["mixed-incompatible"].openai_multi_agent_v2);
     }
 
     #[test]

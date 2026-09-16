@@ -2391,6 +2391,14 @@ fn validate_provider_contribution(
             provider.id
         )));
     }
+    if provider.request_compatibility.responses_via_chat_v1
+        && !provider.request_compatibility.third_party
+    {
+        return Err(AppError::BadRequest(format!(
+            "plugin {plugin_id} provider {} must declare third_party for Responses-via-Chat compatibility",
+            provider.id
+        )));
+    }
     crate::schema::validate_definition(&provider.config_schema)?;
     crate::schema::validate_definition(&provider.credential_schema)?;
     let supported_credentials = [

@@ -189,6 +189,11 @@
                     "default": false,
                     "description": "Explicitly identifies a non-native upstream contract; this is never inferred from a URL or model name."
                   },
+                  "responses_via_chat_v1": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Explicitly identifies a provider adapter that translates OpenAI Responses through Chat Completions."
+                  },
                   "codex_multi_agent_v2": {
                     "type": "boolean",
                     "default": false,

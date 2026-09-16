@@ -284,7 +284,16 @@ fn plugin_provider_generation_capabilities_are_versioned_and_extensible() {
 fn multi_agent_compatibility_is_explicit_and_provider_scoped() {
     let catalog = ProviderCatalog::builtins();
     assert!(catalog.supports_codex_multi_agent_v2("kimi-oauth"));
+    assert!(catalog.supports_responses_via_chat_v1("kimi-oauth"));
+    assert!(
+        catalog
+            .get("kimi-oauth")
+            .expect("Kimi provider")
+            .request_compatibility
+            .responses_via_chat_v1
+    );
     assert!(!catalog.supports_codex_multi_agent_v2("openai-codex"));
+    assert!(!catalog.supports_responses_via_chat_v1("openai-codex"));
     assert!(!catalog.supports_codex_multi_agent_v2("http-json"));
 }
 

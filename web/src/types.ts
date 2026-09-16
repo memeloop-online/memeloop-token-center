@@ -691,6 +691,7 @@ export interface ProviderType {
   };
   request_compatibility?: {
     third_party: boolean;
+    responses_via_chat_v1: boolean;
     codex_multi_agent_v2: boolean;
   };
   source: string;
