@@ -83,6 +83,28 @@ pub(in crate::api) async fn prepare_quota_reset(
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(result)))
 }
 
+pub(in crate::api) async fn current_quota_reset(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Query(query): Query<QuotaQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "providers:write").await?;
+    let tenant = query.tenant_external_id.trim();
+    if tenant.is_empty() || tenant.len() > 200 {
+        return Err(AppError::BadRequest(
+            "reset requires explicit tenant".into(),
+        ));
+    }
+    require_service_tenant(&service, tenant)?;
+    state.db.require_upstream_tenant(account_id, tenant).await?;
+    let result = state
+        .db
+        .current_quota_reset_operation_for_tenant(tenant, &account_id.to_string())
+        .await?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(result)))
+}
+
 pub(in crate::api) async fn confirm_quota_reset(
     State(state): State<AppState>,
     headers: HeaderMap,

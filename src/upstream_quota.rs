@@ -490,6 +490,29 @@ impl QuotaCache {
         let mut value = match result {
             Ok(mut value) => {
                 value.finalize_reset_capability();
+                if account.driver == "openai-codex"
+                    && let (Some(available), Some(applicable), Some(observed_at)) = (
+                        value.reset_capability.available_credits,
+                        value.reset_capability.applicable_credits,
+                        value.observed_at,
+                    )
+                    && let Err(error) = state
+                        .db
+                        .settle_accepted_quota_reset_from_observation(
+                            account.id,
+                            available,
+                            applicable,
+                            observed_at,
+                        )
+                        .await
+                {
+                    tracing::warn!(
+                        upstream_account_id = %account.id,
+                        credential_generation = account.credential_generation,
+                        error_category = error.diagnostic_category(),
+                        "fresh quota evidence could not reconcile an accepted reset"
+                    );
+                }
                 value
             }
             Err(error) => fallback(error),

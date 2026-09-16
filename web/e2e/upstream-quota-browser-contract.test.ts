@@ -7,7 +7,7 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
 
-declare global { interface Window { quotaReads: number; quotaWrites: number; quotaPrepares: number; quotaConfirms: number; quotaStatuses: number; quotaReconciles: number } }
+declare global { interface Window { quotaReads: number; quotaWrites: number; quotaPrepares: number; quotaConfirms: number; quotaStatuses: number; quotaReconciles: number; quotaCurrents: number } }
 
 test('upstream themes and mock-only quota demand, consent and reconciliation contract', { timeout: 90_000 }, async () => {
   if (!existsSync(chromium.executablePath())) {
@@ -86,8 +86,10 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     await page.getByText('Codex usage · 5-hour limit', { exact: true }).waitFor();
     assert.equal(await page.getByRole('region', { name: 'Quota reset', exact: true }).count(), 1, 'one flat reset section owns explanation and action');
     const reset = page.getByRole('button', { name: 'Reset upstream quota', exact: true });
+    await page.waitForFunction(() => window.quotaCurrents === 1 && !document.querySelector<HTMLButtonElement>('.upstream-quota-reset-action button')?.disabled);
     await reset.hover();
     assert.deepEqual(await page.evaluate(() => [window.quotaReads, window.quotaPrepares, window.quotaConfirms, window.quotaWrites]), [1, 0, 0, 0]);
+    assert.equal(await page.evaluate(() => window.quotaCurrents), 1, 'one DB-only read recovers an unresolved operation after refresh');
     await reset.click();
     const dialog = page.getByRole('dialog');
     await dialog.waitFor();

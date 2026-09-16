@@ -40,7 +40,8 @@ pub(in crate::api) use native_oauth_import::{
 pub(in crate::api) use proxy_settings::get_upstream_proxy_settings;
 pub(in crate::api) use quota::upstream_quota;
 pub(in crate::api) use quota::{
-    confirm_quota_reset, get_quota_reset, prepare_quota_reset, reconcile_quota_reset,
+    confirm_quota_reset, current_quota_reset, get_quota_reset, prepare_quota_reset,
+    reconcile_quota_reset,
 };
 
 pub(crate) use oauth::refresh_managed_upstream_oauth_for_worker;

@@ -33,11 +33,11 @@ if (mode === 'kimi') {
   snapshot.windows = snapshot.windows.map((window, index) => ({ ...window, id: index ? 'summary' : 'limit-0', label: index ? 'summary' : 'limit-0', source: 'kimi_usage', unit: null, used_percent: index ? 25 : 0, remaining: 100, limit: 100, reset_at: now + (index ? 604_800_000 : 18_000_000) }));
   if (params.has('units')) snapshot.windows.push(...['requests', 'tokens', 'Vendor Compute Units'].map(unit => ({ ...snapshot.windows[0], id: unit, label: unit, period_seconds: null, reset_at: null, used_percent: null, remaining: 25, limit: 100, unit })));
 }
-declare global { interface Window { quotaReads: number; quotaWrites: number; quotaPrepares: number; quotaConfirms: number; quotaStatuses: number; quotaReconciles: number } }
+declare global { interface Window { quotaReads: number; quotaWrites: number; quotaPrepares: number; quotaConfirms: number; quotaStatuses: number; quotaReconciles: number; quotaCurrents: number } }
 window.quotaReads = 0; window.quotaWrites = 0;
 window.quotaPrepares = 0; window.quotaConfirms = 0;
-window.quotaStatuses = 0; window.quotaReconciles = 0;
-let operation = { id: 'mock-operation', upstream_account_id: 'quota-account', state: 'prepared', expires_at: now + 120_000, effect: 'supplier_defined_codex_rate_limits', consumes_credits: 1, last_reconciled_at: null as number | null, reconciled_available_credits: null as number | null, reconciled_applicable_credits: null as number | null };
+window.quotaStatuses = 0; window.quotaReconciles = 0; window.quotaCurrents = 0;
+let operation = { id: 'mock-operation', upstream_account_id: 'quota-account', state: 'prepared', expires_at: now + 120_000, effect: 'supplier_defined_codex_rate_limits', consumes_credits: 1, last_reconciled_at: null as number | null, reconciled_available_credits: null as number | null, reconciled_applicable_credits: null as number | null, settled_at: null as number | null };
 window.fetch = async (_input, init) => {
   const url = new URL(String(_input), location.origin);
   const method = init?.method ?? 'GET';
@@ -46,13 +46,18 @@ window.fetch = async (_input, init) => {
   if (url.origin !== location.origin || url.searchParams.get('tenant_external_id') !== 'default'
     || !((url.pathname === quota && method === 'GET')
       || (url.pathname === `${reset}prepare` && method === 'POST')
+      || (url.pathname === `${reset}current` && method === 'GET')
       || (url.pathname === `${reset}mock-operation` && method === 'GET')
       || (['confirm', 'reconcile'].some((action) => url.pathname === `${reset}mock-operation/${action}`) && method === 'POST'))) {
     throw new Error('Unexpected request in mock-only quota fixture');
   }
   if (init?.method && init.method !== 'GET') window.quotaWrites += 1;
-  window.quotaReads += 1;
+  if (url.pathname === quota) window.quotaReads += 1;
   const path = String(_input);
+  if (url.pathname === `${reset}current`) {
+    window.quotaCurrents += 1;
+    return new Response('null');
+  }
   if (path.includes('/quota-reset/')) {
     if (path.includes('/prepare')) {
       window.quotaPrepares += 1;

@@ -62,7 +62,8 @@ export function QuotaResetCreditExpiry({ snapshot, now }: { snapshot: UpstreamQu
 
 /** Capability discovery must remain visible even when the first read fails.
  * An absent snapshot is unknown, never evidence that a supplier supports reset.
- * Rendering this section performs no network or quota operation.
+ * Rendering without a snapshot performs no request. An actionable snapshot may
+ * recover durable local reset state, but never reads supplier quota or mutates it.
  */
 export function UpstreamQuotaResetSection({ accountId, accountName, tenant, token, snapshot, readFailed = false }: {
   accountId: string; accountName: string; tenant: string; token: string;

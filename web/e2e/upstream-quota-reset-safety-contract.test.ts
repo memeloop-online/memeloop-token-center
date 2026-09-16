@@ -19,6 +19,13 @@ test('reset confirmation remains memory-only, scope-bound and non-retrying', () 
   assert.match(source, /headers: \{ 'Idempotency-Key': confirmIdempotencyKey\.current \}/);
   assert.match(source, /confirmation: 'consume_one_supplier_reset_credit'/);
   assert.match(source, /this component never retries a credit-consuming request automatically/);
+  assert.match(source, /Preparation never dispatches the supplier credit-consuming request/);
+  assert.match(source, /currentPath/);
+  assert.match(source, /response\.settled_at != null/);
+  assert.match(source, /quota\.resetSettledDetail/);
+  assert.match(source, /reason instanceof ApiError && reason\.status === 409 \? 'prepare-rejected' : 'prepare-unavailable'/);
+  assert.match(source, /setError\('dispatch-unknown'\)/);
+  assert.match(source, /setError\('status-unavailable'\)/);
   assert.match(source, /operation\.state === 'prepared' && secret\.current/);
   assert.doesNotMatch(source, /attempted|setAttempted/);
   assert.match(source, /disabled=\{busy \|\| !capability\.prepare_available\}/);
