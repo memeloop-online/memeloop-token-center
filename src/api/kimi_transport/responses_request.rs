@@ -478,6 +478,26 @@ mod tests {
         assert!(output.to_string().contains("delegated task fixture"));
         assert!(!output.to_string().contains("never forward this metadata"));
         assert!(!output.to_string().contains("encrypted_content"));
+        let messages = output["messages"].as_array().expect("converted messages");
+        let assistant = messages
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("spawn/followup assistant tool calls");
+        let calls = assistant["tool_calls"].as_array().expect("tool calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["function"]["name"], "collaboration__spawn_agent");
+        assert!(
+            calls[0]["function"]["arguments"]
+                .as_str()
+                .is_some_and(|arguments| arguments.contains("gpt-5.5"))
+        );
+        assert_eq!(calls[1]["function"]["name"], "collaboration__followup_task");
+        assert!(messages.iter().any(|message| {
+            message["role"] == "tool" && message["tool_call_id"] == "spawn-call"
+        }));
+        assert!(messages.iter().any(|message| {
+            message["role"] == "tool" && message["tool_call_id"] == "followup-call"
+        }));
     }
 
     #[test]

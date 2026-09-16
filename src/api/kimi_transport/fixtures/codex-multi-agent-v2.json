@@ -1,5 +1,5 @@
 {
-  "model": "kimi-k3",
+  "model": "gpt-5.5",
   "stream": false,
   "tools": [
     {
@@ -94,6 +94,30 @@
         {"type": "input_text", "text": "Message Type: NEW_TASK\nPayload:\n"},
         {"type": "encrypted_content", "encrypted_content": "delegated task fixture"}
       ]
+    },
+    {
+      "type": "function_call",
+      "namespace": "collaboration",
+      "name": "spawn_agent",
+      "call_id": "spawn-call",
+      "arguments": "{\"message\":\"spawn task for kimi route\",\"model\":\"gpt-5.5\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "spawn-call",
+      "output": "{\"status\":\"started\",\"agent_id\":\"fixture-agent\"}"
+    },
+    {
+      "type": "function_call",
+      "namespace": "collaboration",
+      "name": "followup_task",
+      "call_id": "followup-call",
+      "arguments": "{\"message\":\"follow up fixture\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "followup-call",
+      "output": "{\"status\":\"queued\"}"
     }
   ]
 }
