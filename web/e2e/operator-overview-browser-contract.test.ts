@@ -112,7 +112,7 @@ test('Overview keeps current sections visible through independent endpoint failu
     assert.equal(await cacheMetric.locator('.metric-value').textContent(), '50%');
     assert.equal(await cacheMetric.locator('svg').count(), 0, 'no Monitoring time series exists, so cache rate must not synthesize a trend');
     assert.equal(await cacheMetric.locator('.analytics-metric-ratio').getAttribute('data-ratio'), '0.5', 'cache rate background uses the supplied backend ratio');
-    assert.equal(await page.locator('.operator-monitoring-metrics [data-ratio]').getAttribute('data-ratio'), String(15 / 17), 'success-rate background uses actual summary counts');
+    assert.equal(await successMetric.locator('[data-ratio]').getAttribute('data-ratio'), String(15 / 17), 'success-rate background uses actual summary counts');
 
     assert.deepEqual(await endpointCounts(page, 'tenant-beta'), {
       '/internal/v1/monitoring-snapshot': 1,
