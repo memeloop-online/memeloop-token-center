@@ -6571,8 +6571,9 @@ components:
           properties:
             code:
               type: string
-              enum: [unauthorized, forbidden, unpriced_model, insufficient_quota, rate_limit_exceeded, not_found, conflict, invalid_request, websocket_upgrade_required, upstream_error, internal_error]
+              enum: [unauthorized, forbidden, unpriced_model, insufficient_quota, rate_limit_exceeded, not_found, conflict, invalid_request, websocket_upgrade_required, upstream_error, internal_error, generation_asset_unavailable, image_result_not_retained]
             message: { type: string }
+            retryable: { type: boolean }
     ArchiveContentUnavailableErrorResponse:
       type: object
       additionalProperties: false

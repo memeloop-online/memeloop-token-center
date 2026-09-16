@@ -213,6 +213,11 @@ async fn provider_generation_asset_response(
         )));
     }
     let status = upstream.status();
+    if range.is_some() && status != StatusCode::PARTIAL_CONTENT {
+        return Err(AppError::Upstream(
+            "generation asset provider ignored the requested byte range".into(),
+        ));
+    }
     let content_type = upstream
         .headers()
         .get(header::CONTENT_TYPE)
@@ -364,6 +369,7 @@ fn range_not_satisfiable(size: u64) -> Response {
         .header(header::CONTENT_RANGE, format!("bytes */{size}"))
         .header(header::CONTENT_LENGTH, 0)
         .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CACHE_CONTROL, "private, no-store")
         .body(Body::empty())
         .expect("static range response is valid")
 }
