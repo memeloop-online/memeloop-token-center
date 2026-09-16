@@ -1,5 +1,6 @@
 use super::super::super::*;
 use super::{SettlementFixture, finish_with_usage_basis, start};
+use crate::model::RequestUsageBasis;
 
 async fn postgres_fixture(database_url: &str) -> SettlementFixture {
     let directory = tempfile::tempdir().unwrap();
