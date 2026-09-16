@@ -128,7 +128,7 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     // Read failures are mock-only; no reset/prepare/reconcile calls are made.
     for (const [mode, message] of [
       ['stale-error', 'Quota connection configuration validation failed. Check this account’s network proxy and destination access policy configuration.'],
-      ['rate-limited', 'The supplier rate-limited quota reading. Retry manually later; this does not mean quota is exhausted.'],
+      ['rate-limited', 'The supplier rate-limited quota reading. This read did not succeed; retry manually later.'],
       ['permission', 'Your current credential cannot read upstream quota for this tenant. Check your sign-in and read permissions.'],
     ]) {
       await page.goto(`${base}/e2e/fixtures/upstream-quota.html?mode=${mode}`);
@@ -136,7 +136,7 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
       await page.getByRole('alert').getByText(message, { exact: true }).waitFor();
       if (mode !== 'permission') {
         await page.getByText('Codex usage · 5-hour limit', { exact: true }).waitFor();
-        await page.getByText(/This refresh failed\. The values below are only the last successful observation from .+, not current quota\./).waitFor();
+        await page.getByText(/This refresh failed\. The values below are the last successful observation from .+ and may be outdated\. Retry manually for current quota\./).waitFor();
         assert.equal(await page.getByRole('meter').count(), 1);
       }
       assert.equal(await page.getByText('fixture-sensitive-message-must-not-render').count(), 0);
