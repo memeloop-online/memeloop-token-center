@@ -41,7 +41,7 @@ jobs:
           GITHUB_EVENT_AFTER: ${{ github.event.after }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
-          node ops/ci/detect-expensive-ci-scopes.ts "$EVENT_NAME" --verified-merge "$GITHUB_OUTPUT"
+          node scripts/ci/detect-expensive-ci-scopes.ts "$EVENT_NAME" --verified-merge "$GITHUB_OUTPUT"
 
   repository-security:
     runs-on: ubuntu-latest
@@ -494,7 +494,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=service-release-input
       - name: Seal the binary identity for same-run acceptance
         run: >-
-          node ops/ci/create-memory-binary-manifest.ts
+          node scripts/ci/create-memory-binary-manifest.ts
           "$RUNNER_TEMP/release-service-input/memeloop-token-center"
           "$GITHUB_SHA"
           "$RUNNER_TEMP/memory-binary"
@@ -510,7 +510,7 @@ jobs:
             "$RUNNER_TEMP/memory-binary/cosign"
       - name: Seal the complete Docker-native service release input
         run: >-
-          node ops/ci/create-release-service-input-manifest.ts
+          node scripts/ci/create-release-service-input-manifest.ts
           "$RUNNER_TEMP/memory-binary"
           "$GITHUB_SHA"
       - name: Normalize exported binary permissions for artifact transport
@@ -555,7 +555,7 @@ jobs:
           path: ${{ runner.temp }}/release-service-input
       - name: Verify the actual same-run Docker-native service input
         run: >-
-          node ops/ci/verify-release-service-input.ts
+          node scripts/ci/verify-release-service-input.ts
           "$RUNNER_TEMP/release-service-input"
           "$GITHUB_SHA"
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -620,13 +620,13 @@ jobs:
           path: ${{ runner.temp }}/release-service-input
       - name: Verify the exact Docker-native service input
         run: >-
-          node ops/ci/verify-release-service-input.ts
+          node scripts/ci/verify-release-service-input.ts
           "$RUNNER_TEMP/release-service-input"
           "$GITHUB_SHA"
       - name: Validate shared immutable release inputs
         env:
           RELEASE_REGISTRY: ghcr.io/${{ github.repository_owner }}
-        run: node ops/ci/validate-release-inputs.ts "$RELEASE_REGISTRY" "$GITHUB_SHA" prefixed
+        run: node scripts/ci/validate-release-inputs.ts "$RELEASE_REGISTRY" "$GITHUB_SHA" prefixed
       - name: Install checksum-pinned crane registry client
         run: |
           archive="$RUNNER_TEMP/go-containerregistry_Linux_x86_64.tar.gz"
@@ -692,7 +692,7 @@ jobs:
           IMAGE: ${{ matrix.image }}
           DIGEST: ${{ steps.build.outputs.digest }}
           CACHE_SCOPE: ${{ matrix.cache_scope }}
-        run: node ops/ci/verify-published-image.ts "$IMAGE" "$DIGEST" "$CACHE_SCOPE" "$RUNNER_TEMP"
+        run: node scripts/ci/verify-published-image.ts "$IMAGE" "$DIGEST" "$CACHE_SCOPE" "$RUNNER_TEMP"
       - name: Upload immutable image digest manifest
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
         with:
@@ -734,7 +734,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Verify the complete release set by immutable digest
-        run: node ops/ci/verify-ghcr-release.ts "$RUNNER_TEMP/release-evidence" "$RUNNER_TEMP/release-manifest.json"
+        run: node scripts/ci/verify-ghcr-release.ts "$RUNNER_TEMP/release-evidence" "$RUNNER_TEMP/release-manifest.json"
       - name: Upload the complete immutable release manifest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -783,7 +783,7 @@ jobs:
       - name: Enforce focused source-module boundaries
         run: node --test tests/ops/source-module-size-contract.test.ts
       - name: Validate GitHub release contracts
-        run: node ops/ci/run-release-source-contracts.ts
+        run: node scripts/ci/run-release-source-contracts.ts
       - name: Validate exact-revision memory binary reuse
         run: node --test tests/ops/memory-binary-contract.test.ts
       - name: Validate fail-closed expensive CI scope detection

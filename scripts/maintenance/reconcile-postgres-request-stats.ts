@@ -285,7 +285,7 @@ export function main(argv = process.argv.slice(2)): number {
       console.log("No completed UTC request days matched the selected range.");
       return 0;
     }
-    const reconcileSql = resolve(dirname(fileURLToPath(import.meta.url)), "postgres/reconcile-observability-day.sql");
+    const reconcileSql = resolve(dirname(fileURLToPath(import.meta.url)), "reconcile-observability-day.sql");
     for (const day of days) {
       console.log(`Request statistics UTC day ${day}:`);
       inventoryDay(environment, day);

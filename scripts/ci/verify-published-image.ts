@@ -32,7 +32,7 @@ const indexPath = join(runner, `${cacheScope}-index.json`);
 const attestations = join(runner, `${cacheScope}-attestations`);
 mkdirSync(attestations, { mode: 0o700 });
 run(process.execPath, [
-  'ops/ci/verify-buildkit-attestations.ts', image, digest, indexPath, attestations,
+  'scripts/ci/verify-buildkit-attestations.ts', image, digest, indexPath, attestations,
 ], SCOPE, 'BuildKit attestation verification');
 
 const index = parseObject(readFileSync(indexPath, 'utf8'), SCOPE, 'OCI index evidence');

@@ -14,14 +14,14 @@ test('memory acceptance binary artifacts remain bound to their exact revision an
     const destinationDirectory = join(temporary, 'destination');
     const destination = join(destinationDirectory, 'memeloop-token-center');
     run(process.execPath, [
-      'ops/ci/create-memory-binary-manifest.ts',
+      'scripts/ci/create-memory-binary-manifest.ts',
       process.execPath,
       revision,
       artifact,
     ]);
     mkdirSync(destinationDirectory);
     run(process.execPath, [
-      'ops/ci/install-memory-binary.ts',
+      'scripts/ci/install-memory-binary.ts',
       artifact,
       revision,
       destination,
@@ -33,7 +33,7 @@ test('memory acceptance binary artifacts remain bound to their exact revision an
     mkdirSync(tamperedDestinationDirectory);
     appendFileSync(join(artifact, 'memeloop-token-center'), 'tampered');
     rejected(process.execPath, [
-      'ops/ci/install-memory-binary.ts',
+      'scripts/ci/install-memory-binary.ts',
       artifact,
       revision,
       join(tamperedDestinationDirectory, 'memeloop-token-center'),
@@ -45,7 +45,7 @@ test('memory acceptance binary artifacts remain bound to their exact revision an
 
 test('memory binary installer reports all missing required positional arguments accurately', () => {
   const result = spawnSync(process.execPath, [
-    'ops/ci/install-memory-binary.ts',
+    'scripts/ci/install-memory-binary.ts',
     '/tmp/memory-binary-artifact',
     '',
     '/tmp/memeloop-token-center',
@@ -65,19 +65,19 @@ test('Docker-native service release inputs bind binary, runtime libraries, featu
     copyFileSync(process.execPath, join(exported, 'memeloop-token-center'));
     writeFileSync(join(exported, 'libgcc_s.so.1'), 'gcc runtime');
     writeFileSync(join(exported, 'libstdc++.so.6'), 'cxx runtime');
-    run(process.execPath, ['ops/ci/create-memory-binary-manifest.ts', join(exported, 'memeloop-token-center'), revision, artifact]);
+    run(process.execPath, ['scripts/ci/create-memory-binary-manifest.ts', join(exported, 'memeloop-token-center'), revision, artifact]);
     copyFileSync(join(exported, 'libgcc_s.so.1'), join(artifact, 'libgcc_s.so.1'));
     copyFileSync(join(exported, 'libstdc++.so.6'), join(artifact, 'libstdc++.so.6'));
     writeFileSync(join(artifact, 'install-plugin-oci'), 'verified installer');
     writeFileSync(join(artifact, 'cosign'), 'verified signature checker');
-    run(process.execPath, ['ops/ci/create-release-service-input-manifest.ts', artifact, revision]);
+    run(process.execPath, ['scripts/ci/create-release-service-input-manifest.ts', artifact, revision]);
     // GitHub artifact download normalizes file modes. The final Dockerfile
     // restores the executable bit while digest verification remains valid.
     chmodSync(join(artifact, 'memeloop-token-center'), 0o644);
-    run(process.execPath, ['ops/ci/verify-release-service-input.ts', artifact, revision]);
+    run(process.execPath, ['scripts/ci/verify-release-service-input.ts', artifact, revision]);
 
     appendFileSync(join(artifact, 'libstdc++.so.6'), 'tampered');
-    rejected(process.execPath, ['ops/ci/verify-release-service-input.ts', artifact, revision], { cwd: repository });
+    rejected(process.execPath, ['scripts/ci/verify-release-service-input.ts', artifact, revision], { cwd: repository });
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }
