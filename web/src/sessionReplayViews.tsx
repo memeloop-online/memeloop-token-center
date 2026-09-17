@@ -70,7 +70,7 @@ function unknownLabel(t: Translate, reason: ReplayUnknownReason | null, requestA
 }
 
 function messageLabel(t: Translate, role: 'user' | 'assistant' | 'agent') {
-  return role === 'user' ? t('sessionReplay.user') : t('sessionReplay.agent');
+  return role === 'user' ? t('sessionReplay.userInput') : t('sessionReplay.agentOutput');
 }
 
 function bodyOrder(item: SessionReplayItem) {
@@ -101,7 +101,7 @@ function EntryContent({ entry, t, summaryOnly = false }: { entry: ReplayEntry; t
   </article>;
 
   if (item.kind === 'message') return <article className={`session-replay-entry message ${item.role}`} data-replay-kind={item.kind}>
-    <header><b>{messageLabel(t, item.role)}</b><span>{item.body === 'request' ? t('request.request') : t('request.response')}</span></header>
+    <header><b>{messageLabel(t, item.role)}</b></header>
     <ArchiveText kind="message" t={t} value={item.text ?? unknownLabel(t, item.unknown)} />
     {item.truncated && <small className="session-replay-flag">{t('sessionReplay.truncated')}</small>}
   </article>;

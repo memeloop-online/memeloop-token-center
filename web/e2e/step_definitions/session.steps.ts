@@ -16,6 +16,7 @@ import {
 import { requestEventFixture } from '../support/request-event-fixture.js';
 import type { DogfoodWorld } from '../support/world.js';
 import { appPreferenceControls, openAppRoute } from './app-route.support.js';
+import { defaultRequestRefreshInterval } from '../../src/operator/traffic/requestRefresh.js';
 
 interface SessionObservation {
   liveRequests: Promise<Response>[];
@@ -334,7 +335,11 @@ Then('连续事件期间会话计数有界前进且活跃筛选移除已完成�
     4,
     'all four live requests must be durable before the active projection disappears',
   );
-  await eventually(async () => assert.equal(await page.locator('.session-card').count(), 0), 5_000, 'completed session remained in the active filter');
+  await eventually(
+    async () => assert.equal(await page.locator('.session-card').count(), 0),
+    defaultRequestRefreshInterval + 3_000,
+    'completed session remained in the active filter',
+  );
   const refreshes = observation.sessionListRequests.length - observation.baselineSessionListRequests;
   assert.ok(refreshes >= 1 && refreshes <= 6, `continuous event refresh count was not bounded: ${refreshes}`);
   assert.match(await page.locator('.session-result-count').textContent() ?? '', /0/);
@@ -397,9 +402,14 @@ Then('其他凭据事件和无事件重连不会污染已打开的会话', async
   await visible(page.locator('.session-detail-region .session-detail'));
   await page.getByRole('checkbox', { name: '自动刷新', exact: true }).check();
   const observation = observations.get(this)!;
+  const listCount = observation.sessionListRequests.length;
   const detailCount = observation.detailRequests.length;
   releaseOtherEvent();
-  await page.locator('.session-live-state.refreshing').waitFor();
+  await eventually(
+    () => assert.ok(observation.sessionListRequests.length > listCount),
+    defaultRequestRefreshInterval + 3_000,
+    'another credential event did not refresh the session list',
+  );
   await page.locator('.session-live-state.reconnecting').waitFor();
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
   assert.equal(observation.detailRequests.length, detailCount, 'another credential event refreshed the selected detail');

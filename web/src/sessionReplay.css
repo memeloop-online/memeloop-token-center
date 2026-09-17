@@ -116,8 +116,9 @@
   border-radius: 10px;
   background: var(--replay-entry);
 }
-.session-replay-entry.message.user { border-left: 3px solid #64b8ec; }
-.session-replay-entry.message.assistant { border-left: 3px solid #5ed8c6; }
+.session-replay-entry.message.user { border-left: 3px solid #64b8ec; background: color-mix(in srgb, var(--replay-entry), #64b8ec 6%); }
+.session-replay-entry.message.assistant,
+.session-replay-entry.message.agent { border-left: 3px solid #5ed8c6; background: color-mix(in srgb, var(--replay-entry), #5ed8c6 6%); }
 .session-replay-entry.tool-call { border-left: 3px solid #e5a750; }
 .session-replay-entry.tool-result { border-left: 3px solid #9d80dd; }
 .session-replay-entry.unknown { border-left: 3px solid #c38a50; background: color-mix(in srgb, var(--replay-entry), #805b1e 16%); }

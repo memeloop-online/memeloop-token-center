@@ -39,18 +39,17 @@ test('session reads retry a transient failure inside one deadline and remain can
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-loading.html`);
     await page.waitForFunction(() => window.sessionListReads === 1);
-    await page.locator('.session-browser').getByText('Loading…', { exact: true }).waitFor();
+    await page.locator('.session-list-skeleton').waitFor();
     assert.equal(await page.getByText('Retained session', { exact: true }).count(), 0);
     await page.evaluate(() => window.resolveSessionList(false));
     await page.waitForFunction(() => window.sessionListReads === 2);
     assert.equal(await page.getByRole('button', { name: 'Retry loading sessions', exact: true }).count(), 0,
       'an early 503 is retried before surfacing an error');
-    await page.locator('.session-browser').getByText('Loading…', { exact: true }).waitFor();
+    await page.locator('.session-list-skeleton').waitFor();
     await page.evaluate(() => window.resolveSessionList(true));
     await page.getByText('Retained session', { exact: true }).first().waitFor();
-    assert.equal(await page.getByRole('checkbox', { name: 'Auto-refresh', exact: true }).isChecked(), false);
-    await page.getByRole('checkbox', { name: 'Auto-refresh', exact: true }).check();
-    await page.getByRole('button', { name: 'Simulate session event' }).click();
+    assert.equal(await page.getByRole('checkbox', { name: 'Auto-refresh', exact: true }).isChecked(), true);
+    await page.getByRole('button', { name: 'Simulate session event', exact: true }).click();
     await page.waitForFunction(() => window.sessionListReads === 3);
     assert.ok(await page.getByText('Retained session', { exact: true }).count() > 0);
     await page.evaluate(() => window.resolveSessionList(false));
@@ -113,7 +112,6 @@ test('session events refresh only the exact selected credential and session deta
     await page.evaluate(() => window.resolveSessionList(true));
     await page.waitForFunction(() => window.sessionDetailReads === 2);
 
-    await page.getByRole('checkbox', { name: 'Auto-refresh', exact: true }).check();
     await page.getByRole('button', { name: 'Simulate other credential event', exact: true }).click();
     await page.waitForFunction(() => window.sessionListReads === 3);
     await page.evaluate(() => window.resolveSessionList(true));
@@ -153,6 +151,50 @@ test('session events refresh only the exact selected credential and session deta
   } finally { await browser.close(); await server.close(); }
 });
 
+test('manual and background pauses resume with authoritative list and selected detail reads', { timeout: 45_000 }, async () => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
+    return test.skip('Chromium required');
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-loading.html`);
+    await page.waitForFunction(() => window.sessionListReads === 1);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await page.waitForFunction(() => window.sessionDetailReads === 1);
+
+    const autoRefresh = page.getByRole('checkbox', { name: 'Auto-refresh', exact: true });
+    await autoRefresh.uncheck();
+    await page.getByRole('button', { name: 'Simulate session event', exact: true }).click();
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    assert.equal(await page.evaluate(() => window.sessionListReads), 1, 'manual pause keeps queued events without reading');
+    await autoRefresh.check();
+    await page.waitForFunction(() => window.sessionListReads === 2);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await page.waitForFunction(() => window.sessionDetailReads === 2);
+
+    await page.getByRole('button', { name: 'Pause shared refresh', exact: true }).click();
+    await page.getByRole('button', { name: 'Simulate session event', exact: true }).click();
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    assert.equal(await page.evaluate(() => window.sessionListReads), 2, 'background pause keeps queued events without reading');
+    await page.getByRole('button', { name: 'Resume shared refresh', exact: true }).click();
+    await page.waitForFunction(() => window.sessionListReads === 3);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await page.waitForFunction(() => window.sessionDetailReads === 3);
+
+    await page.getByRole('button', { name: 'Simulate session event overflow', exact: true }).click();
+    await page.waitForFunction(() => window.sessionListReads === 4);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await page.waitForFunction(() => window.sessionDetailReads === 4);
+  } finally { await browser.close(); await server.close(); }
+});
+
 test('a failed SSE list batch is retained and retried on the next session cadence', { timeout: 45_000 }, async () => {
   if (!existsSync(chromium.executablePath())) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
@@ -171,7 +213,6 @@ test('a failed SSE list batch is retained and retried on the next session cadenc
     await page.waitForFunction(() => window.sessionListReads === 1);
     await page.evaluate(() => window.resolveSessionList(true));
     await page.waitForFunction(() => window.sessionDetailReads === 1);
-    await page.getByRole('checkbox', { name: 'Auto-refresh', exact: true }).check();
     await page.getByRole('button', { name: 'Simulate session event', exact: true }).click();
     await page.clock.fastForward(500);
     await page.waitForFunction(() => window.sessionListReads === 2);
@@ -204,7 +245,6 @@ test('a failed SSE detail batch is retained after the detail lane settles', { ti
     await page.evaluate(() => window.resolveSessionList(true));
     await page.waitForFunction(() => window.sessionDetailReads === 1);
     await page.evaluate(() => window.resolveSessionDetail(true));
-    await page.getByRole('checkbox', { name: 'Auto-refresh', exact: true }).check();
     await page.getByRole('button', { name: 'Simulate session event', exact: true }).click();
     await page.clock.fastForward(500);
     await page.waitForFunction(() => window.sessionListReads === 2);
@@ -240,7 +280,6 @@ test('cancellation retains current-scope SSE work, while a scope transition drop
     await page.waitForFunction(() => window.sessionListReads === 1);
     await page.evaluate(() => window.resolveSessionList(true));
     await page.waitForFunction(() => window.sessionDetailReads === 1);
-    await page.getByRole('checkbox', { name: 'Auto-refresh', exact: true }).check();
     await page.getByRole('button', { name: 'Simulate session event', exact: true }).click();
     await page.clock.fastForward(500);
     await page.waitForFunction(() => window.sessionListReads === 2);
@@ -296,8 +335,6 @@ test('a successful manual refresh confirms a cancelled selected-detail batch bef
     await page.evaluate(() => window.resolveSessionList(true));
     await page.waitForFunction(() => window.sessionDetailReads === 1);
     await page.evaluate(() => window.resolveSessionDetail(true));
-    await page.getByRole('checkbox', { name: 'Auto-refresh', exact: true }).check();
-
     await page.getByRole('button', { name: 'Simulate session event', exact: true }).click();
     await page.clock.fastForward(500);
     await page.waitForFunction(() => window.sessionListReads === 2);

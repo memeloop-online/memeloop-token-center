@@ -48,6 +48,7 @@ export function useOperatorRequestStream({ token, tenant, enabled, disconnectedM
 
   useEffect(() => { batch.current?.setInterval(intervalMs); }, [intervalMs]);
   useEffect(() => { batch.current?.setPaused(paused || !enabled); }, [paused, enabled]);
+  useEffect(() => { sessionEvents.current.setCadence(intervalMs, paused || !enabled); }, [intervalMs, paused, enabled]);
   const protectRequests = useCallback((ids: string[]) => { protectedIds.current = ids; batch.current?.protect(ids); }, []);
 
   const stream = useRequestEventStream({
@@ -56,10 +57,8 @@ export function useOperatorRequestStream({ token, tenant, enabled, disconnectedM
     enabled: enabled && !paused,
     disconnectedMessage,
     onEvent: (event) => {
-      // Session state filters must not inherit the operator traffic page's
-      // user-selected rendering cadence. A terminal event has to invalidate
-      // an active-session row promptly, while request-table rendering remains
-      // coalesced in the batch below.
+      // Both surfaces publish at the selected cadence, but Sessions keeps its
+      // exact identities separate from the bounded request-table cache.
       sessionEvents.current.publish(event);
       batch.current?.enqueue(event);
     },

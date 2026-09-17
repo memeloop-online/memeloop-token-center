@@ -5,9 +5,11 @@ import { useI18n } from '../i18n.js';
 import { Button, Checkbox } from '../design-system';
 import { SessionDetailSurface, SessionList } from '../SessionViews.js';
 import { SessionCredentialFilter } from './SessionCredentialFilter.js';
+import { RequestRefreshControl } from './traffic/RequestRefreshControl.js';
+import { defaultRequestRefreshInterval } from './traffic/requestRefresh.js';
 import {
   drainSessionEventIdentities, mergeSessionPage, sessionEventsRequireDetailRefresh, sessionEventTargetsSelection,
-  sessionEventRefreshDelayMs, sessionIdentityKey,
+  sessionIdentityKey, sessionRefreshDelayMs,
 } from './sessionRefresh.js';
 import { LatestRequestGate } from './latestRequestGate.js';
 import type {
@@ -69,14 +71,16 @@ function messageOf(reason: unknown, fallback: string) {
   return reason instanceof Error ? reason.message : fallback;
 }
 
-export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, streamState, onSelectRequest }: {
+export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOverflowed, focus, streamState, onSelectRequest, refreshCadence }: {
   token: string;
   tenant: string;
   revision: number;
   eventKeyIds: RefObject<Set<string>>;
+  eventOverflowed: RefObject<boolean>;
   focus?: SessionFocus;
   streamState: SessionStreamState;
   onSelectRequest: (request: RequestView) => Promise<void>;
+  refreshCadence?: { intervalMs: number; paused: boolean; onIntervalChange: (value: number) => void };
 }) {
   const { locale, t } = useI18n();
   const scopeKey = `${tenant}\0${token}`;
@@ -94,9 +98,16 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
   const [draft, setDraft] = useState<SessionFilters>(emptySessionFilters);
   const [filters, setFilters] = useState<SessionFilters>(emptySessionFilters);
   const [refreshing, setRefreshing] = useState(false);
-  const [autoRefresh, setAutoRefresh] = useState(false);
+  const [localRefreshInterval, setLocalRefreshInterval] = useState(defaultRequestRefreshInterval);
+  const [manualPaused, setManualPaused] = useState(false);
+  const refreshInterval = refreshCadence?.intervalMs ?? localRefreshInterval;
+  const backgroundPaused = refreshCadence?.paused ?? false;
+  const autoRefresh = !manualPaused && !backgroundPaused;
   const autoRefreshRef = useRef(autoRefresh);
   autoRefreshRef.current = autoRefresh;
+  const refreshIntervalRef = useRef(refreshInterval);
+  refreshIntervalRef.current = refreshInterval;
+  const backgroundPausedRef = useRef(backgroundPaused);
   const listSequence = useRef(0);
   const listRequests = useRef(new LatestRequestGate());
   const listInFlight = useRef(false);
@@ -117,6 +128,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
   const dirtyEventIdentities = useRef(new Set<string>());
   const dirtyDetailEvents = useRef(new Set<string>());
   const detailRefreshDirty = useRef(false);
+  const forceDetailRefresh = useRef(false);
   const scopeGeneration = useRef(0);
   const filtersRef = useRef(filters);
   const selectedRef = useRef<LogicalSessionSummary | undefined>(selected);
@@ -305,12 +317,11 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     }
   }
 
-  function scheduleRefresh() {
+  function scheduleRefresh(delayMs = 0) {
     // Do not launch a second full list read while its initial/manual page is
     // still loading. The dirty set is drained once that read has settled.
     if (!autoRefreshRef.current || manualRefreshInFlight.current || refreshTimer.current !== undefined || refreshInFlight.current || listInFlight.current) return;
     const generation = scopeGeneration.current;
-    setRefreshing(true);
     refreshTimer.current = window.setTimeout(() => {
       refreshTimer.current = undefined;
       if (generation !== scopeGeneration.current || !autoRefreshRef.current) return;
@@ -322,18 +333,20 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       dirtyDetailEvents.current.clear();
       const selectedAtBatchStart = selectedRef.current;
       const selectedIdentity = selectedAtBatchStart ? sessionIdentityKey(selectedAtBatchStart) : undefined;
+      const forceSelectedDetail = forceDetailRefresh.current;
       const restoreBatch = () => {
         refreshDirty.current = true;
         for (const identity of batchEventIdentities) dirtyEventIdentities.current.add(identity);
         for (const identity of batchDetailEvents) dirtyDetailEvents.current.add(identity);
       };
+      let retryDelay = 0;
       const refresh = async () => {
         const listLoaded = await loadSessions(false, filtersRef.current, true);
         if (generation !== scopeGeneration.current || !autoRefreshRef.current) return;
-        if (!listLoaded) { restoreBatch(); return; }
+        if (!listLoaded) { restoreBatch(); retryDelay = sessionRefreshDelayMs(refreshIntervalRef.current); return; }
         const latestSelection = selectedRef.current;
         if (selectedAtBatchStart && latestSelection && sessionIdentityKey(latestSelection) === selectedIdentity
-          && sessionEventsRequireDetailRefresh(batchDetailEvents, latestSelection, detailRef.current)) {
+          && (forceSelectedDetail || sessionEventsRequireDetailRefresh(batchDetailEvents, latestSelection, detailRef.current))) {
           if (detailInFlight.current) {
             for (const event of batchDetailEvents) dirtyDetailEvents.current.add(event);
             detailRefreshDirty.current = true;
@@ -341,16 +354,19 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
             return;
           }
           detailRefreshDirty.current = false;
-          if (!await refreshSelected(selectedAtBatchStart)) restoreBatch();
+          if (!await refreshSelected(selectedAtBatchStart)) {
+            restoreBatch();
+            retryDelay = sessionRefreshDelayMs(refreshIntervalRef.current);
+          } else forceDetailRefresh.current = false;
         }
       };
       void refresh().finally(() => {
         if (generation !== scopeGeneration.current) return;
         refreshInFlight.current = false;
         if (!refreshCancelled.current && !detailInFlight.current
-          && (refreshDirty.current || dirtyEventIdentities.current.size > 0)) scheduleRefresh();
+          && (refreshDirty.current || dirtyEventIdentities.current.size > 0)) scheduleRefresh(retryDelay);
       });
-    }, sessionEventRefreshDelayMs);
+    }, delayMs);
   }
 
   useEffect(() => {
@@ -369,6 +385,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     // Events arriving after this synchronous boundary receive a new revision
     // and are processed against the in-flight snapshot normally.
     eventKeyIds.current.clear();
+    eventOverflowed.current = false;
     if (refreshTimer.current !== undefined) window.clearTimeout(refreshTimer.current);
     refreshTimer.current = undefined;
     refreshDirty.current = false;
@@ -377,6 +394,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     dirtyEventIdentities.current.clear();
     dirtyDetailEvents.current.clear();
     detailRefreshDirty.current = false;
+    forceDetailRefresh.current = false;
     listSequence.current += 1;
     listRequests.current.invalidate();
     listInFlight.current = false;
@@ -403,6 +421,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       dirtyEventIdentities.current.clear();
       dirtyDetailEvents.current.clear();
       detailRefreshDirty.current = false;
+      forceDetailRefresh.current = false;
       listSequence.current += 1;
       listRequests.current.invalidate();
       listInFlight.current = false;
@@ -410,24 +429,37 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     };
   }, [token, tenant, filters]);
 
-  useEffect(() => {
-    if (!token.trim() || revision === 0) return;
-    refreshCancelled.current = false;
+  function queuePendingSessionEvents() {
+    const overflowed = eventOverflowed.current;
+    eventOverflowed.current = false;
     const eventIdentities = drainSessionEventIdentities(eventKeyIds.current);
-    if (!autoRefreshRef.current) return;
     for (const identity of eventIdentities) dirtyEventIdentities.current.add(identity);
     const selectedAtEvent = selectedRef.current;
     if (selectedAtEvent && sessionEventTargetsSelection(eventIdentities, selectedAtEvent)) {
       for (const identity of eventIdentities) dirtyDetailEvents.current.add(identity);
     }
+    if (overflowed && selectedAtEvent) forceDetailRefresh.current = true;
+    return eventIdentities.size;
+  }
+
+  useEffect(() => {
+    if (!token.trim() || revision === 0 || !autoRefreshRef.current) return;
+    refreshCancelled.current = false;
+    queuePendingSessionEvents();
     refreshDirty.current = true;
     scheduleRefresh();
   }, [revision, eventKeyIds]);
 
   function toggleAutoRefresh(enabled: boolean) {
-    autoRefreshRef.current = enabled;
-    setAutoRefresh(enabled);
-    if (enabled) { refreshCancelled.current = false; refreshDirty.current = true; scheduleRefresh(); }
+    autoRefreshRef.current = enabled && !backgroundPaused;
+    setManualPaused(!enabled);
+    if (enabled && !backgroundPaused) {
+      refreshCancelled.current = false;
+      queuePendingSessionEvents();
+      forceDetailRefresh.current = Boolean(selectedRef.current);
+      refreshDirty.current = true;
+      scheduleRefresh();
+    }
     else {
       if (refreshTimer.current !== undefined) window.clearTimeout(refreshTimer.current);
       refreshTimer.current = undefined;
@@ -437,6 +469,25 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       if (!refreshInFlight.current) setRefreshing(false);
     }
   }
+
+  useEffect(() => {
+    const resumedFromBackground = backgroundPausedRef.current && !backgroundPaused;
+    backgroundPausedRef.current = backgroundPaused;
+    autoRefreshRef.current = !manualPaused && !backgroundPaused;
+    if (refreshTimer.current !== undefined) window.clearTimeout(refreshTimer.current);
+    refreshTimer.current = undefined;
+    if (!autoRefreshRef.current) {
+      if (!refreshInFlight.current) setRefreshing(false);
+      return;
+    }
+    refreshCancelled.current = false;
+    if (resumedFromBackground) {
+      queuePendingSessionEvents();
+      forceDetailRefresh.current = Boolean(selectedRef.current);
+      refreshDirty.current = true;
+    }
+    if (dirtyEventIdentities.current.size || dirtyDetailEvents.current.size || refreshDirty.current) scheduleRefresh();
+  }, [refreshInterval, backgroundPaused]);
 
   function cancelListLoad() {
     if (!listInFlight.current) return;
@@ -459,8 +510,8 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     const selectedAtStart = selectedRef.current;
     const selectedIdentity = selectedAtStart ? sessionIdentityKey(selectedAtStart) : undefined;
     // Snapshot only work that was already dirty when the user pressed
-    // Refresh.  A new stream event arriving while this work is in flight
-    // stays dirty and is handled by the normal 500ms lane afterwards.
+    // Refresh. A new stream event arriving while this work is in flight
+    // stays dirty and is handled by the selected refresh cadence afterwards.
     const observedListEvents = new Set(dirtyEventIdentities.current);
     const observedDetailEvents = new Set(dirtyDetailEvents.current);
     manualRefreshInFlight.current = true;
@@ -494,8 +545,14 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
   const visibleError = errorScope === scopeKey ? error : '';
   return <>
     {visibleError && <div className="notice error" role="alert">{visibleError} <button type="button" className="secondary" disabled={loading} onClick={() => void loadSessions(false, filters, visibleSessions.length > 0)}>{t('sessions.retryLoad')}</button></div>}
+    <RequestRefreshControl
+      intervalMs={refreshInterval}
+      onIntervalChange={refreshCadence?.onIntervalChange ?? setLocalRefreshInterval}
+      paused={manualPaused || backgroundPaused}
+      pausedHint={manualPaused ? t('sessions.paused') : undefined}
+    />
     <div className="session-refresh-controls">
-      <Checkbox checked={autoRefresh} onChange={(_, data) => toggleAutoRefresh(data.checked === true)} label={t('sessions.autoRefresh')} />
+      <Checkbox checked={!manualPaused} onChange={(_, data) => toggleAutoRefresh(data.checked === true)} label={t('sessions.autoRefresh')} />
       <span className={`session-live-state ${status}`} role="status">{autoRefresh ? t(`sessions.live.${status}`) : t('sessions.paused')}</span>
       <Button appearance="secondary" disabled={loading || refreshing || detailLoading} onClick={() => { void refreshNow(); }}>{t('sessions.refreshNow')}</Button>
       {(loading || refreshing) && <Button appearance="secondary" onClick={cancelListLoad}>{t('common.cancel')}</Button>}
@@ -514,7 +571,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
         {listScope === scopeKey && nextCursor && <div className="load-more"><Button appearance="secondary" disabled={loading} onClick={() => void loadSessions(true, filters)}>{loading ? t('common.loading') : t('sessions.loadOlder')}</Button></div>}
       </section>
       <div className="session-detail-region">
-        {!visibleDetail && detailLoading && <div className="empty" role="status">{t('common.loading')}</div>}
+        {!visibleDetail && detailLoading && <div className="session-detail-skeleton" role="status" aria-label={t('common.loading')}><i /><i /><i /><i /></div>}
         {!visibleDetail && !detailLoading && <div className="empty">{selected && visibleError ? <button type="button" className="secondary" onClick={() => void selectSession(selected)}>{t('sessions.retryLoad')}</button> : t('sessions.selectHint')}</div>}
         {visibleDetail && <SessionDetailSurface detail={visibleDetail} summary={selected} showDiagnosticIds loading={detailLoading} onLoadOlder={() => void loadEarlier()} loadReplayArchive={loadReplayArchive} loadArchiveRange={loadArchiveRange} onSelect={(request) => { void onSelectRequest(request); }} onClose={() => { detailRequests.current.invalidate(); detailInFlight.current = false; setDetailLoading(false); setDetail(undefined); setDetailScope(''); setSelected(undefined); selectedRef.current = undefined; }} />}
       </div>

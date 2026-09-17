@@ -6,6 +6,7 @@ import { DrawerFrame, RequestDiagnostics, RequestTable } from '../../components'
 import { formatCurrencyDisplay, formatDurationDisplay, formatMetricDisplay, formatPercent } from '../../format';
 import { LocalSettlementNotice, localSettlementLabel } from '../../LocalSettlementNotice';
 import { AnalyticsMetric } from '../AnalyticsMetric';
+import { ImageGenerationQuarantine } from '../ImageGenerationQuarantine';
 import { displayTimeZone } from '../../charts/displayTimeZone';
 import { useI18n } from '../../i18n';
 import type { RequestDetail, RequestEvent, RequestListResponse, RequestView, TypedFilterAst, UpstreamAccount } from '../../types';
@@ -19,9 +20,10 @@ import {
   summarizeVisibleRequests, typedFiltersActive, typedRequestQueryBody, visibleRequestMetricSeries,
 } from '../traffic/requestTraffic';
 
-export function RequestsPage({ token, tenant, liveEvents, streamRevision, streamState, streamError, onOpenSessions, onOpenSession, requestFocus, onRequestFocusHandled, requestDrilldown, onRequestDrilldownHandled, requestRefresh, streamOverflowRevision = 0, onProtectRequests }: {
+export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, streamRevision, streamState, streamError, onOpenSessions, onOpenSession, requestFocus, onRequestFocusHandled, requestDrilldown, onRequestDrilldownHandled, requestRefresh, streamOverflowRevision = 0, onProtectRequests }: {
   token: string;
   tenant: string;
+  writeTenant?: string;
   liveEvents: ReadonlyMap<string, RequestEvent>;
   streamRevision: number;
   streamState: SessionStreamState;
@@ -47,6 +49,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   const [error, setError] = useState('');
   const [upstreamError, setUpstreamError] = useState('');
   const [olderFilteredResultsStale, setOlderFilteredResultsStale] = useState(false);
+  const [imageReviewOpen, setImageReviewOpen] = useState(false);
   const sequence = useRef(0);
   const errorSource = useRef<'detail' | 'load' | 'refresh' | undefined>(undefined);
   const olderFilteredResultsVisible = useRef(false);
@@ -240,7 +243,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
     olderFilteredResultsVisible.current = false;
     errorSource.current = undefined;
     loadingRef.current = false;
-    sequence.current += 1; setFilters(emptyTypedFilterAst); setRequests([]); setDetail(undefined); setHasOlder(false); setLoading(false); setOlderFilteredResultsStale(false); setError(''); setUpstreamError('');
+    sequence.current += 1; setFilters(emptyTypedFilterAst); setRequests([]); setDetail(undefined); setHasOlder(false); setLoading(false); setOlderFilteredResultsStale(false); setImageReviewOpen(false); setError(''); setUpstreamError('');
     if (!token || !tenant) { setUpstreams([]); return () => { cancelFilteredRefresh(); loadAbort.current?.abort(); }; }
     const upstreamRequest = ++upstreamSequence.current;
     void api<UpstreamAccount[]>(`/internal/v1/upstreams${queryForTenant(tenant)}`, token)
@@ -248,7 +251,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
       .catch((reason) => { if (upstreamRequest === upstreamSequence.current) { setUpstreams([]); setUpstreamError(apiDiagnosticMessage(reason, t('common.requestFailed'), diagnosticLabels)); } });
     void load(emptyTypedFilterAst);
     return () => { cancelFilteredRefresh(); loadAbort.current?.abort(); };
-  }, [tenant, token]);
+  }, [tenant, token, writeTenant]);
 
   useEffect(() => {
     selectedRequestId.current = undefined; refreshedTerminalEvent.current = undefined;
@@ -355,15 +358,18 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
     {error && <div className="notice error" role="alert">{t(errorSource.current === 'detail' ? 'request.detail' : 'request.listSource')}: {error}</div>}
     {upstreamError && <div className="notice error" role="alert">{t('request.upstreamSource')}: {upstreamError}</div>}
     {streamError && <div className="notice error" role="alert">{t('request.streamSource')}: {streamError}</div>}
-    <RequestsPanel requests={requests} upstreams={upstreams} filters={filters} loading={loading} hasOlder={hasOlder} streamState={streamState} token={token} tenant={tenant} olderFilteredResultsStale={olderFilteredResultsStale} requestRefresh={requestRefresh} historyLoaded={loadedHistoryIds.current.size > 0}
+    <RequestsPanel requests={requests} upstreams={upstreams} filters={filters} loading={loading} hasOlder={hasOlder} streamState={streamState} token={token} tenant={tenant} olderFilteredResultsStale={olderFilteredResultsStale} requestRefresh={requestRefresh} historyLoaded={loadedHistoryIds.current.size > 0} imageReviewOpen={imageReviewOpen} onToggleImageReview={() => setImageReviewOpen((open) => !open)}
       onApply={(next) => { setFilters(next); scope.current = { token, tenant, filters: next }; void load(next); }}
       onClear={() => { setFilters(emptyTypedFilterAst); scope.current = { token, tenant, filters: emptyTypedFilterAst }; void load(emptyTypedFilterAst); }}
       onLoadOlder={() => void load(filters, true)} onRefreshFilteredResults={() => void load(filters)} onSelect={selectRequest} onOpenSessions={onOpenSessions} onOpenSession={onOpenSession} />
+    {imageReviewOpen && <section className="request-image-review" aria-label={t('quarantine.title')}>
+      <ImageGenerationQuarantine token={token} tenant={tenant} writeTenant={writeTenant} />
+    </section>}
     {detail && <RequestDrawer detail={detail} upstreamName={upstreams.find((account) => account.id === detail.upstream_account_id)?.name} onOpenSession={onOpenSession} onClose={closeRequestDetail} />}
   </>;
 }
 
-function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, streamState, token, tenant, olderFilteredResultsStale, onApply, onClear, onLoadOlder, onRefreshFilteredResults, onSelect, onOpenSessions, onOpenSession, requestRefresh, historyLoaded }: {
+function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, streamState, token, tenant, olderFilteredResultsStale, onApply, onClear, onLoadOlder, onRefreshFilteredResults, onSelect, onOpenSessions, onOpenSession, requestRefresh, historyLoaded, imageReviewOpen, onToggleImageReview }: {
   requests: RequestView[];
   upstreams: UpstreamAccount[];
   filters: TypedFilterAst;
@@ -374,6 +380,8 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   tenant: string;
   olderFilteredResultsStale: boolean;
   historyLoaded: boolean;
+  imageReviewOpen: boolean;
+  onToggleImageReview: () => void;
   onApply: (filters: TypedFilterAst) => void;
   onClear: () => void;
   onLoadOlder: () => void;
@@ -390,7 +398,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   const sampling = { timestamps: points.map(point => point.timestamp), timeZone: displayTimeZone() };
   const count = (value: number) => formatMetricDisplay(value, locale);
   const settlementCurrency = summary.localCosts.length === 1 ? summary.localCosts[0].currency : undefined;
-  return <article className="panel request-page-surface"><div className="panel-title traffic-heading"><div><h2>{typedFiltersActive(filters) ? t('traffic.filtered') : t('traffic.live')}</h2><span>{typedFiltersActive(filters) ? t('traffic.filteredHint') : t('traffic.liveHint')}</span></div><div className="traffic-heading-actions"><div className={`request-live-state session-live-state ${streamState}`} role="status">{t(`sessions.live.${streamState}`)}</div><div className="segmented" role="group" aria-label={t('sessions.monitorMode')}><ToggleButton appearance="subtle" checked>{t('sessions.requestsMode')}</ToggleButton><ToggleButton appearance="subtle" checked={false} onClick={onOpenSessions}>{t('sessions.sessionsMode')}</ToggleButton></div></div></div>
+  return <article className="panel request-page-surface"><div className="panel-title traffic-heading"><div><h2>{typedFiltersActive(filters) ? t('traffic.filtered') : t('traffic.live')}</h2><span>{typedFiltersActive(filters) ? t('traffic.filteredHint') : t('traffic.liveHint')}</span></div><div className="traffic-heading-actions"><Button appearance="secondary" aria-expanded={imageReviewOpen} onClick={onToggleImageReview}>{t('quarantine.menuItem')}</Button><div className={`request-live-state session-live-state ${streamState}`} role="status">{t(`sessions.live.${streamState}`)}</div><div className="segmented" role="group" aria-label={t('sessions.monitorMode')}><ToggleButton appearance="subtle" checked>{t('sessions.requestsMode')}</ToggleButton><ToggleButton appearance="subtle" checked={false} onClick={onOpenSessions}>{t('sessions.sessionsMode')}</ToggleButton></div></div></div>
     {requestRefresh && <RequestRefreshControl {...requestRefresh} />}
     {historyLoaded && !typedFiltersActive(filters) && <div className="request-refresh-control"><span>{locale === 'zh-CN' ? '正在浏览历史：已显示请求继续更新，新请求暂不插入。' : 'Browsing history: visible requests keep updating; new requests are not inserted.'}</span><Button appearance="subtle" disabled={loading} onClick={onRefreshFilteredResults}>{locale === 'zh-CN' ? '返回最新请求' : 'Return to latest requests'}</Button></div>}
     <TypedFilterBuilder ast={filters} disabled={loading} onApply={onApply} onClear={onClear} scope="requests" token={token} tenant={tenant} upstreams={upstreams} />

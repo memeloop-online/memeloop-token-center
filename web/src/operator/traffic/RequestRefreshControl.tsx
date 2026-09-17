@@ -4,8 +4,8 @@ import { useI18n } from '../../i18n';
 import { requestRefreshIntervals } from './requestRefresh';
 import './RequestRefreshControl.css';
 
-export function RequestRefreshControl({ intervalMs, onIntervalChange, paused }: {
-  intervalMs: number; onIntervalChange: (value: number) => void; paused: boolean;
+export function RequestRefreshControl({ intervalMs, onIntervalChange, paused, pausedHint }: {
+  intervalMs: number; onIntervalChange: (value: number) => void; paused: boolean; pausedHint?: string;
 }) {
   const { locale } = useI18n();
   const id = useId();
@@ -19,6 +19,6 @@ export function RequestRefreshControl({ intervalMs, onIntervalChange, paused }: 
         onChange={(_, data) => onIntervalChange(requestRefreshIntervals[data.value])} />
       <div className="request-refresh-ticks" aria-hidden="true">{labels.map(label => <span key={label}>{label}</span>)}</div>
     </div>
-    <span className="request-refresh-hint">{paused ? (zh ? '后台已暂停，返回后继续' : 'Paused in background; resumes on return') : (zh ? '列表与统计同步更新' : 'List and summary update together')}</span>
+    <span className="request-refresh-hint">{paused ? (pausedHint ?? (zh ? '后台已暂停，返回后继续' : 'Paused in background; resumes on return')) : (zh ? '列表与统计同步更新' : 'List and summary update together')}</span>
   </div>;
 }

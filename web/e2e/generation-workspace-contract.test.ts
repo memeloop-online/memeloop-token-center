@@ -31,7 +31,7 @@ async function settle(page: Page) {
   await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
 }
 
-test('generation workspace keeps jobs first, gates review behind more-actions, stacks on mobile', { timeout: 60_000 }, async context => {
+test('generation workspace keeps job lifecycle distinct from request traffic and stacks on mobile', { timeout: 60_000 }, async context => {
   const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ?? chromium.executablePath();
   if (!existsSync(executablePath)) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
@@ -47,18 +47,14 @@ test('generation workspace keeps jobs first, gates review behind more-actions, s
   try {
     const page = await browser.newPage({ viewport: { width: 390, height: 900 } });
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
-    let quarantineReads = 0;
     await page.route('**/internal/v1/generations?**', route => route.fulfill({ json: [queuedJob, doneJob] }));
-    await page.route('**/internal/v1/image-generation-quarantine**', async route => {
-      assert.equal(route.request().method(), 'GET', 'this test never writes a quarantine resolution');
-      quarantineReads += 1;
-      await route.fulfill({ json: [] });
-    });
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/generation-workspace.html`);
     const panel = page.locator('.operator-generations');
     await panel.getByText('fixture-video-queued').waitFor();
-    assert.equal(await page.locator('.generation-review').count(), 0, 'review workspace is absent by default');
-    assert.equal(quarantineReads, 0, 'default page never reads privileged quarantine data');
+    assert.equal(await panel.getByRole('button', { name: 'More actions', exact: true }).count(), 0,
+      'generation jobs do not hide request review behind a generic menu');
+    assert.equal(await panel.getByRole('button', { name: 'Image requests requiring review', exact: true }).count(), 0,
+      'request reconciliation belongs to Requests, not generation jobs');
 
     // Truthful status copy: queued reads Pending, succeeded reads Completed.
     const queuedRow = panel.locator('tbody tr', { hasText: 'fixture-video-queued' });
@@ -86,31 +82,8 @@ test('generation workspace keeps jobs first, gates review behind more-actions, s
       const box = await doneRow.locator(selector).boundingBox();
       assert.ok(box && box.x >= 0 && box.x + box.width <= 390, `${selector} fully inside the 390px viewport`);
     }
-
-    // More-actions entry mounts the review workspace; reads still require the explicit open.
-    const moreActions = panel.getByRole('button', { name: 'More actions', exact: true });
-    await moreActions.click();
-    await page.getByRole('menuitem', { name: 'Image result review', exact: true }).click();
-    const openReview = page.getByRole('button', { name: 'Open manual review (tenant service credential required)', exact: true });
-    await openReview.waitFor();
-    assert.equal(quarantineReads, 0, 'mounting the workspace entry does not read quarantine data');
-    await openReview.click();
-    await page.getByText('No image requests await review', { exact: false }).waitFor();
-    assert.equal(quarantineReads, 1);
-
-    // Accessible close path returns focus to the more-actions trigger; reopening works.
-    await page.getByRole('button', { name: 'Back to jobs', exact: true }).click();
-    assert.equal(await page.locator('.generation-review').count(), 0, 'closing unmounts the review workspace');
-    assert.equal(await moreActions.evaluate(el => el === document.activeElement), true, 'focus returns to the more-actions trigger');
-    await moreActions.click();
-    await page.getByRole('menuitem', { name: 'Image result review', exact: true }).click();
-    await openReview.waitFor();
-    assert.equal(quarantineReads, 1, 'reopening the workspace entry does not read again');
-
-    // A scope change collapses the workspace without any automatic quarantine read.
+    // A scope change keeps the job workspace authoritative for its tenant.
     await page.getByLabel('Fixture tenant').selectOption('beta');
-    assert.equal(await page.locator('.generation-review').count(), 0, 'scope change collapses the review workspace');
-    assert.equal(quarantineReads, 1, 'scope change never triggers an automatic quarantine read');
     await panel.getByText('fixture-video-queued').waitFor();
   } finally { await browser.close(); await server.close(); }
 });

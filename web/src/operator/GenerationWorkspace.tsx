@@ -1,7 +1,5 @@
 import { useConfirmDialog } from '../useConfirmDialog';
-import { ImageGenerationQuarantine } from './ImageGenerationQuarantine';
 import { useEffect, useRef, useState } from 'react';
-import { Menu, MenuItem, MenuList, MenuPopover, MenuTrigger } from '@fluentui/react-components';
 import { ApiError, api } from '../api';
 import { DrawerFrame } from '../components';
 import { Button } from '../design-system';
@@ -37,9 +35,6 @@ export function GenerationWorkspace({ token, tenant, writeTenant = tenant }: { t
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
-  const [reviewOpen, setReviewOpen] = useState(false);
-  const reviewTrigger = useRef<HTMLButtonElement>(null);
-  const hadReview = useRef(false);
   const loadSequence = useRef(0);
   const detailSequence = useRef(0);
   const scope = useRef({ token, tenant, writeTenant });
@@ -65,15 +60,9 @@ export function GenerationWorkspace({ token, tenant, writeTenant = tenant }: { t
 
   useEffect(() => {
     loadSequence.current += 1; detailSequence.current += 1;
-    setJobs([]); setDetail(undefined); setBusy(''); setLoading(false); setMessage(''); setError(''); setReviewOpen(false);
+    setJobs([]); setDetail(undefined); setBusy(''); setLoading(false); setMessage(''); setError('');
     void load();
   }, [token, tenant, writeTenant]);
-
-  // Closing the review workspace returns focus to its entry point.
-  useEffect(() => {
-    if (reviewOpen) { hadReview.current = true; return; }
-    if (hadReview.current) { hadReview.current = false; reviewTrigger.current?.focus(); }
-  }, [reviewOpen]);
 
   const select = async (job: OperatorGenerationJob) => {
     const sequence = ++detailSequence.current;
@@ -127,10 +116,7 @@ export function GenerationWorkspace({ token, tenant, writeTenant = tenant }: { t
     {!detail && error && <div className="notice error" role="alert">{error}</div>}
     {!detail && message && <div className="notice success" role="status">{message}</div>}
     <article className="panel operator-generations">
-      <div className="panel-title"><div><h2>{t('generations.title')}</h2><p className="muted">{t('generations.description')}</p></div><div className="row-actions"><span>{formatNumber(jobs.length, locale)}</span><Button appearance="secondary" disabled={loading || !token.trim()} onClick={() => void load()}>{loading ? t('common.loading') : t('usage.refresh')}</Button>
-        <Menu><MenuTrigger disableButtonEnhancement><Button ref={reviewTrigger} appearance="secondary">{t('generations.moreActions')}</Button></MenuTrigger>
-          <MenuPopover><MenuList><MenuItem disabled={reviewOpen || !tenant || !token.trim()} onClick={() => setReviewOpen(true)}>{t('quarantine.menuItem')}</MenuItem></MenuList></MenuPopover>
-        </Menu></div></div>
+      <div className="panel-title"><div><h2>{t('generations.title')}</h2><p className="muted">{t('generations.description')}</p></div><div className="row-actions"><span>{formatNumber(jobs.length, locale)}</span><Button appearance="secondary" disabled={loading || !token.trim()} onClick={() => void load()}>{loading ? t('common.loading') : t('usage.refresh')}</Button></div></div>
       {jobs.length === 0 ? <div className="empty">{loading ? t('common.loading') : t('generations.empty')}</div> : <div className="table-scroll generation-table-scroll"><table className="generation-table">
         <thead><tr><th>{t('request.time')}</th><th>{t('operator.tenant')}</th><th>{t('generations.credential')}</th><th>{t('request.model')}</th><th>{t('generations.driver')}</th><th>{t('request.status')}</th><th>{t('generations.units')}</th><th>{t('request.cost')}</th><th>{t('request.actions')}</th></tr></thead>
         <tbody>{jobs.map((job) => <tr key={job.job_id}>
@@ -143,10 +129,6 @@ export function GenerationWorkspace({ token, tenant, writeTenant = tenant }: { t
         </tr>)}</tbody>
       </table></div>}
     </article>
-    {reviewOpen && <section className="generation-review" aria-label={t('quarantine.title')}>
-      <div className="row-actions generation-review-actions"><Button appearance="secondary" onClick={() => setReviewOpen(false)}>{t('generations.backToJobs')}</Button></div>
-      <ImageGenerationQuarantine token={token} tenant={tenant} writeTenant={writeTenant} />
-    </section>}
     {detail && <DrawerFrame title={detail.model} eyebrow={t('generations.detailTitle')} onClose={() => setDetail(undefined)}>
       {error && <div className="notice error" role="alert">{error}</div>}
       {message && <div className="notice success" role="status">{message}</div>}

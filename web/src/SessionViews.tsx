@@ -168,10 +168,13 @@ export function SessionList({ values, loading, showCredential, onSelect, selecte
   layout?: 'cards' | 'sidebar';
 }) {
   const { locale, t } = useI18n();
-  if (!values.length) return <div className="empty">{loading ? t('common.loading') : t('sessions.empty')}</div>;
+  if (!values.length && loading) return <div className="session-list-skeleton" role="status" aria-label={t('common.loading')}>
+    {[0, 1, 2, 3].map((value) => <span key={value}><i /><i /><i /></span>)}
+  </div>;
+  if (!values.length) return <div className="empty">{t('sessions.empty')}</div>;
   if (layout === 'sidebar') return <div className="session-list session-list-sidebar" aria-label={t('sessions.recent')}>
     {values.map((session) => {
-      const title = session.unlinked ? t('sessions.unlinkedRequests') : session.session_name?.trim() || unnamedSessionName(t, locale, session.last_activity_at, session.key_alias.trim() || session.key_id);
+      const title = session.unlinked ? t('sessions.unlinkedRequests') : session.session_name?.trim() || unnamedSessionName(t, locale, session.last_activity_at, session.key_alias.trim() || undefined, true);
       const isSelected = selected?.session_id === session.session_id && selected?.key_id === session.key_id;
       return <article className="session-card session-sidebar-card" key={`${session.key_id}:${session.session_id}`}>
         <button type="button" className={`session-sidebar-item${isSelected ? ' selected' : ''}`} onClick={() => onSelect(session)} aria-pressed={isSelected} aria-label={t('sessions.open', { name: title })}>
@@ -185,7 +188,7 @@ export function SessionList({ values, loading, showCredential, onSelect, selecte
   return <div className="session-list">{values.map((session) => {
     const title = session.unlinked
       ? t('sessions.unlinkedRequests')
-      : session.session_name?.trim() || unnamedSessionName(t, locale, session.last_activity_at, session.key_alias.trim() || session.key_id);
+      : session.session_name?.trim() || unnamedSessionName(t, locale, session.last_activity_at, session.key_alias.trim() || undefined);
     return <article className="session-card" key={`${session.key_id}:${session.session_id}`}>
       <div className="session-card-heading"><b>{title}</b><span>{session.task_kind && <span className="pill">{session.task_kind}</span>}<span className={`status ${statusTone(session.last_status)}`}>{t(`sessions.status.${session.last_status}`)}</span></span></div>
       {session.unlinked && <span className="session-unlinked-label">{t('sessions.unlinkedReason')}</span>}

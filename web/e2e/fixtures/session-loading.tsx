@@ -117,7 +117,10 @@ window.fetch = async (input, init) => {
 };
 function Fixture() {
   const [revision, setRevision] = useState(0);
+  const [refreshInterval, setRefreshInterval] = useState(0);
+  const [backgroundPaused, setBackgroundPaused] = useState(false);
   const keys = useRef(new Set<string>());
+  const overflowed = useRef(false);
   const queue = (keyId: string, sessionId: string, requestId = 'new-fixture-request',
     eventKind: RequestEventKind = 'finished', archiveState: RequestArchiveState = 'pending') => {
     enqueueSessionEventIdentity(keys.current, {
@@ -141,7 +144,11 @@ function Fixture() {
     <button onClick={() => emit('fixture-key', 'other-session')}>Simulate other session event</button>
     <button onClick={() => emit('fixture-key', 'fixture-session', 'archived-fixture-request', 'archive_bound', 'pending')}>Simulate archive bound event</button>
     <button onClick={() => emit('fixture-key', 'confirmed-session', 'projected-fixture-request', 'projected')}>Simulate confirmed projection</button>
-    <SessionMonitor token="fixture-only" tenant="default" revision={revision} eventKeyIds={keys} streamState="live" onSelectRequest={async () => {}} />
+    <button onClick={() => { overflowed.current = true; emit('other-key', 'other-session', 'overflow-retained-event'); }}>Simulate session event overflow</button>
+    <button onClick={() => setBackgroundPaused(true)}>Pause shared refresh</button>
+    <button onClick={() => setBackgroundPaused(false)}>Resume shared refresh</button>
+    <SessionMonitor token="fixture-only" tenant="default" revision={revision} eventKeyIds={keys} eventOverflowed={overflowed} streamState="live"
+      refreshCadence={{ intervalMs: refreshInterval, paused: backgroundPaused, onIntervalChange: setRefreshInterval }} onSelectRequest={async () => {}} />
   </main></MtcFluentProvider></I18nProvider>;
 }
 createRoot(document.getElementById('root')!).render(<Fixture />);
