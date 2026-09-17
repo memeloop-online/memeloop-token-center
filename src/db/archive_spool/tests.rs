@@ -693,9 +693,15 @@ async fn terminal_gap_event_is_atomic_idempotent_and_preserves_snapshot_facts() 
     assert_eq!(event.status_code, Some(503));
     assert_eq!(event.input_tokens, 45);
     assert_eq!(event.output_tokens, 67);
-    assert_eq!(event.billing.cost.as_deref(), Some("0.000123"));
+    assert_eq!(event.billing.cost.as_deref(), Some("0"));
     assert_eq!(event.billing.currency.as_deref(), Some("USD"));
     assert_eq!(event.error_code.as_deref(), Some("upstream_error"));
+    let raw_cost: i64 = sqlx::query_scalar("SELECT cost_micros FROM request_records WHERE id = $1")
+        .bind(id.request_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(raw_cost, 123);
 }
 
 async fn terminal(db: &Database, id: ArchiveSpoolIdentity) {
