@@ -5,10 +5,14 @@ use super::conversations::{
     ConversationProjectionEnqueueInput, enqueue_conversation_projection_in_transaction,
     materialize_conversation_content_in_transaction,
 };
-use super::settlement::resize_usage_reservation_in_transaction;
+use super::settlement::{
+    reserve_metered_usage_with_id_in_transaction, resize_usage_reservation_in_transaction,
+    settle_metered_usage_in_transaction,
+};
 use crate::archive_staging::{
     ArchiveStagingOwner, ArchiveStagingPurpose, ArchiveStagingWriteLease,
 };
+use crate::model::MeteredUsageReservation;
 use tracing::Instrument;
 
 pub struct NewRequest {
@@ -41,12 +45,35 @@ pub struct FinishRequest {
     pub response_object: String,
 }
 
+struct MeteredRequestUsage<'a> {
+    billed_units: i64,
+    billing_unit: &'a str,
+}
+
 pub struct StartProxyRequest<'a> {
     pub request_id: Uuid,
     pub key: &'a AuthenticatedKey,
     pub price: &'a ModelPrice,
     pub input_token_ceiling: i64,
     pub output_token_ceiling: i64,
+    pub protocol: &'a str,
+    pub model: &'a str,
+    pub request_object: &'a str,
+    pub upstream_account_id: Option<Uuid>,
+    pub model_route_id: Option<Uuid>,
+}
+
+/// Admission contract for a synchronous request billed in provider-defined
+/// generation units rather than tokens.
+///
+/// Unit quantity, billing unit, and price snapshot are persisted independently
+/// from token ceilings so metered media can share RPM, concurrency, balance,
+/// and budget enforcement without consuming TPM.
+pub struct StartMeteredSynchronousRequest<'a> {
+    pub request_id: Uuid,
+    pub key: &'a AuthenticatedKey,
+    pub price: &'a GenerationPrice,
+    pub unit_ceiling: i64,
     pub protocol: &'a str,
     pub model: &'a str,
     pub request_object: &'a str,
@@ -102,6 +129,20 @@ pub struct FinishProxyRequest<'a> {
     pub conversation: Option<ProxyConversationInput<'a>>,
 }
 
+/// Terminal contract paired with [`StartMeteredSynchronousRequest`].
+pub struct FinishMeteredSynchronousRequest<'a> {
+    pub request_id: Uuid,
+    pub tenant_id: Uuid,
+    pub reservation: &'a MeteredUsageReservation,
+    pub unit_ceiling: i64,
+    pub billed_units: i64,
+    pub generation_duration_ms: Option<i64>,
+    pub status_code: i64,
+    pub duration_ms: i64,
+    pub error_code: Option<&'a str>,
+    pub response_object: &'a str,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ProxyRequestUpstreamAttribution {
     KeepSelected,
@@ -139,6 +180,44 @@ impl Database {
         input: StartProxyRequest<'_>,
     ) -> Result<UsageReservation, AppError> {
         self.start_proxy_request_inner(input, None).await
+    }
+
+    pub async fn start_metered_synchronous_request(
+        &self,
+        input: StartMeteredSynchronousRequest<'_>,
+    ) -> Result<MeteredUsageReservation, AppError> {
+        if input.unit_ceiling <= 0 || input.price.billing_unit.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "metered request requires a positive unit ceiling and billing unit".into(),
+            ));
+        }
+        let reservation_id = Uuid::now_v7();
+        let mut transaction = self.begin_write_transaction().await?;
+        let now = unix_millis();
+        let reservation = reserve_metered_usage_with_id_in_transaction(
+            &mut transaction,
+            input.key,
+            input.price,
+            input.unit_ceiling,
+            now,
+            reservation_id,
+        )
+        .await?;
+        let started = NewRequest {
+            request_id: input.request_id,
+            key_id: input.key.key_id,
+            tenant_id: input.key.tenant_id,
+            protocol: input.protocol.to_owned(),
+            model: input.model.to_owned(),
+            request_object: input.request_object.to_owned(),
+            reservation_id,
+            upstream_account_id: input.upstream_account_id,
+            model_route_id: input.model_route_id,
+        };
+        insert_request_started_record_in_transaction(&mut transaction, &started, now).await?;
+        insert_request_started_event_in_transaction(&mut transaction, &started, now).await?;
+        transaction.commit().await?;
+        Ok(reservation)
     }
 
     #[cfg(test)]
@@ -720,6 +799,47 @@ impl Database {
             .await
     }
 
+    pub async fn finish_metered_synchronous_request(
+        &self,
+        input: FinishMeteredSynchronousRequest<'_>,
+    ) -> Result<FinishProxyRequestResult, AppError> {
+        if input.unit_ceiling <= 0
+            || input.billed_units < 0
+            || input.billed_units > input.unit_ceiling
+        {
+            return Err(AppError::BadRequest(
+                "metered request usage exceeds its admitted unit ceiling".into(),
+            ));
+        }
+        let proxy_input = FinishProxyRequest {
+            usage_basis: None,
+            first_output_ms: None,
+            generation_duration_ms: input.generation_duration_ms,
+            request_id: input.request_id,
+            tenant_id: input.tenant_id,
+            reservation: &input.reservation.reservation,
+            input_token_ceiling: 0,
+            output_token_ceiling: 0,
+            requested_service_tier: None,
+            status_code: input.status_code,
+            duration_ms: input.duration_ms,
+            usage: TokenUsage::default(),
+            error_code: input.error_code,
+            response_object: input.response_object,
+            routing_session_id: None,
+            routing_terminal_observed_at: None,
+            conversation: None,
+        };
+        self.finish_proxy_request_inner(
+            proxy_input,
+            None,
+            None,
+            ProxyRequestUpstreamAttribution::KeepSelected,
+            Some(&input),
+        )
+        .await
+    }
+
     /// Commits a terminal proxy response and its durable staging binding as a
     /// single database transaction. `None` is retained for gap locators and
     /// historical content-addressed response locators.
@@ -733,6 +853,7 @@ impl Database {
             response_archive_lease,
             None,
             ProxyRequestUpstreamAttribution::KeepSelected,
+            None,
         )
         .await
     }
@@ -743,8 +864,14 @@ impl Database {
         response_archive_lease: Option<&ArchiveStagingWriteLease>,
         upstream_attribution: ProxyRequestUpstreamAttribution,
     ) -> Result<FinishProxyRequestResult, AppError> {
-        self.finish_proxy_request_inner(input, response_archive_lease, None, upstream_attribution)
-            .await
+        self.finish_proxy_request_inner(
+            input,
+            response_archive_lease,
+            None,
+            upstream_attribution,
+            None,
+        )
+        .await
     }
 
     pub(crate) async fn finish_proxy_request_with_buffered_archive_and_upstream_attribution(
@@ -753,7 +880,7 @@ impl Database {
         archive: &crate::response_archive_spool::BufferedArchive<'_>,
         upstream_attribution: ProxyRequestUpstreamAttribution,
     ) -> Result<FinishProxyRequestResult, AppError> {
-        self.finish_proxy_request_inner(input, None, Some(archive), upstream_attribution)
+        self.finish_proxy_request_inner(input, None, Some(archive), upstream_attribution, None)
             .await
     }
 
@@ -763,6 +890,7 @@ impl Database {
         response_archive_lease: Option<&ArchiveStagingWriteLease>,
         buffered_archive: Option<&crate::response_archive_spool::BufferedArchive<'_>>,
         upstream_attribution: ProxyRequestUpstreamAttribution,
+        metered: Option<&FinishMeteredSynchronousRequest<'_>>,
     ) -> Result<FinishProxyRequestResult, AppError> {
         if let Some(archive) = buffered_archive
             && (archive.identity().request_id != input.request_id
@@ -891,7 +1019,7 @@ impl Database {
             }
 
             let reservation_row = sqlx::query(
-            "SELECT account_id, key_id, enforcement_mode, reserved_micros, reserved_tokens, rate_window_start, status, actual_micros, price_snapshot_json FROM usage_reservations WHERE id = $1",
+            "SELECT account_id, key_id, enforcement_mode, reserved_micros, reserved_tokens, reserved_units, billing_unit, micros_per_unit, rate_window_start, status, actual_micros, price_snapshot_json FROM usage_reservations WHERE id = $1",
         )
         .bind(&reservation_id)
         .fetch_optional(&mut *transaction)
@@ -919,7 +1047,9 @@ impl Database {
             let price_snapshot_json: Option<String> =
                 reservation_row.try_get("price_snapshot_json")?;
             let (input_micros_per_million, output_micros_per_million, price_tiers) =
-                if let Some(snapshot) = price_snapshot_json {
+                if metered.is_some() {
+                    (0, 0, Vec::new())
+                } else if let Some(snapshot) = price_snapshot_json {
                     let price: ModelPrice =
                         serde_json::from_str(&snapshot).map_err(|_| AppError::Internal)?;
                     (
@@ -1042,6 +1172,39 @@ impl Database {
             );
         };
 
+        let trusted_metered = if let Some(metered_input) = metered {
+            let reserved_units: i64 = reservation_row.try_get("reserved_units")?;
+            let billing_unit: String = reservation_row.try_get("billing_unit")?;
+            let micros_per_unit: i64 = reservation_row.try_get("micros_per_unit")?;
+            if trusted_reservation.reserved_tokens != 0
+                || reserved_units != metered_input.unit_ceiling
+                || reserved_units != metered_input.reservation.unit_ceiling
+                || billing_unit != metered_input.reservation.billing_unit
+                || micros_per_unit != metered_input.reservation.micros_per_unit
+            {
+                return Err(AppError::Conflict(
+                    "metered request reservation contract mismatch".into(),
+                ));
+            }
+            Some(MeteredUsageReservation {
+                reservation: trusted_reservation.clone(),
+                unit_ceiling: reserved_units,
+                billing_unit,
+                micros_per_unit,
+            })
+        } else {
+            if reservation_row.try_get::<i64, _>("reserved_units")? != 0
+                || !reservation_row
+                    .try_get::<String, _>("billing_unit")?
+                    .is_empty()
+            {
+                return Err(AppError::Conflict(
+                    "token request cannot settle a metered reservation".into(),
+                ));
+            }
+            None
+        };
+
         if let ProxyRequestUpstreamAttribution::LastDispatched(assignment) = upstream_attribution {
             let upstream_account_id = assignment.map(|(account_id, _)| account_id.to_string());
             let model_route_id = assignment.map(|(_, route_id)| route_id.to_string());
@@ -1100,7 +1263,16 @@ impl Database {
             ));
         }
 
-        let (usage, status_code, error_code, response_object, usage_invalid) =
+        let (usage, status_code, error_code, response_object, usage_invalid) = if metered.is_some()
+        {
+            (
+                TokenUsage::default(),
+                input.status_code,
+                input.error_code.map(str::to_owned),
+                input.response_object.to_owned(),
+                false,
+            )
+        } else {
             match normalize_proxy_usage(
                 &input.usage,
                 input.input_token_ceiling,
@@ -1122,7 +1294,8 @@ impl Database {
                     true,
                 ),
                 Err(error) => return Err(error),
-            };
+            }
+        };
 
         if let Some(explicit_session_id) = input.routing_session_id {
             super::session_routing::upsert_session_routing_terminal_from_request_in_transaction(
@@ -1196,13 +1369,23 @@ impl Database {
         let reservation_status: String = reservation_row.try_get("status")?;
         let cost_micros = match reservation_status.as_str() {
             "reserved" => {
-                settle_token_usage_in_transaction(
-                    &mut transaction,
-                    &trusted_reservation,
-                    &usage,
-                    now,
-                )
-                .await?
+                if let Some(trusted_metered) = trusted_metered.as_ref() {
+                    settle_metered_usage_in_transaction(
+                        &mut transaction,
+                        trusted_metered,
+                        metered.map(|input| input.billed_units).unwrap_or_default(),
+                        now,
+                    )
+                    .await?
+                } else {
+                    settle_token_usage_in_transaction(
+                        &mut transaction,
+                        &trusted_reservation,
+                        &usage,
+                        now,
+                    )
+                    .await?
+                }
             }
             // A split settlement acquires its feed sequence only when this
             // transaction publishes the complete terminal snapshot.
@@ -1221,7 +1404,7 @@ impl Database {
             input.usage_basis
         };
         BudgetHold::set_phase(&mut hold, "terminal_facts_and_event");
-        let finished = record_request_finished_with_basis_in_transaction(
+        let finished = record_request_finished_with_basis_and_metering_in_transaction(
             &mut transaction,
             &FinishRequest {
                 first_output_ms: input.first_output_ms,
@@ -1243,6 +1426,12 @@ impl Database {
                 .enforcement_mode
                 .enforces_prepaid_limits(),
             usage_basis,
+            trusted_metered
+                .as_ref()
+                .map(|reservation| MeteredRequestUsage {
+                    billed_units: metered.map(|input| input.billed_units).unwrap_or_default(),
+                    billing_unit: &reservation.billing_unit,
+                }),
         )
         .await?;
         if !finished {
@@ -1626,6 +1815,25 @@ async fn record_request_finished_with_basis_in_transaction(
     project_aggregates: bool,
     usage_basis: Option<crate::model::RequestUsageBasis>,
 ) -> Result<bool, AppError> {
+    record_request_finished_with_basis_and_metering_in_transaction(
+        tx,
+        request,
+        completed_at,
+        project_aggregates,
+        usage_basis,
+        None,
+    )
+    .await
+}
+
+async fn record_request_finished_with_basis_and_metering_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    request: &FinishRequest,
+    completed_at: i64,
+    project_aggregates: bool,
+    usage_basis: Option<crate::model::RequestUsageBasis>,
+    metered_usage: Option<MeteredRequestUsage<'_>>,
+) -> Result<bool, AppError> {
     let request_id = request.request_id.to_string();
     let locator = sqlx::query(
         "SELECT created_at, tenant_id, key_id FROM request_record_locators WHERE id = $1",
@@ -1639,8 +1847,16 @@ async fn record_request_finished_with_basis_in_transaction(
     let created_at: i64 = locator.try_get("created_at")?;
     let tenant_id: String = locator.try_get("tenant_id")?;
     let key_id: String = locator.try_get("key_id")?;
+    let billed_units = metered_usage
+        .as_ref()
+        .map(|usage| usage.billed_units)
+        .unwrap_or_default();
+    let billing_unit = metered_usage
+        .as_ref()
+        .map(|usage| usage.billing_unit)
+        .unwrap_or("");
     let updated = sqlx::query(
-        "UPDATE request_records SET status_code = $1, duration_ms = $2, input_tokens = $3, cached_input_tokens = $4, cache_write_tokens = $5, output_tokens = $6, service_tier = $7, cost_micros = $8, error_code = $9, response_object = $10, completed_at = $11, first_output_ms = $14, generation_duration_ms = $15, usage_basis = $16 WHERE id = $12 AND created_at = $13 AND completed_at IS NULL",
+        "UPDATE request_records SET status_code = $1, duration_ms = $2, input_tokens = $3, cached_input_tokens = $4, cache_write_tokens = $5, output_tokens = $6, service_tier = $7, cost_micros = $8, error_code = $9, response_object = $10, completed_at = $11, first_output_ms = $14, generation_duration_ms = $15, usage_basis = $16, billed_units = $17, billing_unit = $18 WHERE id = $12 AND created_at = $13 AND completed_at IS NULL",
     )
     .bind(request.status_code)
     .bind(request.duration_ms)
@@ -1658,6 +1874,8 @@ async fn record_request_finished_with_basis_in_transaction(
     .bind(request.first_output_ms)
     .bind(request.generation_duration_ms)
     .bind(usage_basis.map(crate::model::RequestUsageBasis::as_str))
+    .bind(billed_units)
+    .bind(billing_unit)
     .execute(&mut **tx)
     .await?;
     if updated.rows_affected() == 0 {
@@ -1674,7 +1892,7 @@ async fn record_request_finished_with_basis_in_transaction(
         .await?;
     }
     let fact_inserted = sqlx::query(
-        "INSERT INTO request_stats_facts (request_id, tenant_id, key_id, created_at, model, protocol, status_class, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, service_tier, currency, cost_micros, session_id) SELECT id, tenant_id, key_id, created_at, model, protocol, CASE WHEN status_code BETWEEN 200 AND 399 AND COALESCE(error_code, '') = '' THEN 'success' ELSE 'failure' END, COALESCE(error_code, ''), COALESCE(upstream_account_id, ''), COALESCE(model_route_id, ''), COALESCE(duration_ms, 0), CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE input_tokens END, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE output_tokens END, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE cached_input_tokens END, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE cache_write_tokens END, CASE WHEN protocol = 'audio-transcription' THEN output_tokens ELSE 0 END, service_tier, currency, CASE WHEN ((status_code < 200 OR status_code >= 400) OR COALESCE(error_code, '') <> '') AND COALESCE(usage_basis, '') <> 'provider_reported' THEN 0 ELSE cost_micros END, COALESCE(conversation_cluster_id, 'unlinked:' || key_id) FROM request_records WHERE id = $1 AND created_at = $2 AND completed_at IS NOT NULL AND status_code IS NOT NULL ON CONFLICT(request_id) DO NOTHING",
+        "INSERT INTO request_stats_facts (request_id, tenant_id, key_id, created_at, model, protocol, status_class, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, billing_unit, service_tier, currency, cost_micros, session_id) SELECT id, tenant_id, key_id, created_at, model, protocol, CASE WHEN status_code BETWEEN 200 AND 399 AND COALESCE(error_code, '') = '' THEN 'success' ELSE 'failure' END, COALESCE(error_code, ''), COALESCE(upstream_account_id, ''), COALESCE(model_route_id, ''), COALESCE(duration_ms, 0), input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, billed_units, billing_unit, service_tier, currency, CASE WHEN ((status_code < 200 OR status_code >= 400) OR COALESCE(error_code, '') <> '') AND COALESCE(usage_basis, '') <> 'provider_reported' THEN 0 ELSE cost_micros END, COALESCE(conversation_cluster_id, 'unlinked:' || key_id) FROM request_records WHERE id = $1 AND created_at = $2 AND completed_at IS NOT NULL AND status_code IS NOT NULL ON CONFLICT(request_id) DO NOTHING",
     )
     .bind(&request_id)
     .bind(created_at)
@@ -1838,7 +2056,7 @@ async fn record_request_finished_with_basis_in_transaction(
                        upstream_account_id, model_route_id, modality, billing_unit,
                        currency, units)
                    SELECT tenant_id, key_id, created_at / {divisor}, model, status_class,
-                          error_code, upstream_account_id, model_route_id, 'audio', 'second',
+                          error_code, upstream_account_id, model_route_id, 'audio', billing_unit,
                           currency, generation_units
                      FROM request_stats_facts
                     WHERE request_id = $1 AND protocol = 'audio-transcription'

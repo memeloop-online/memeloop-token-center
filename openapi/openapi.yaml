@@ -5606,10 +5606,12 @@ paths:
       description: |
         Phase one accepts one uncompressed PCM16 WAV `file` and a required `model`.
         `prompt` and `hotwords` (a JSON string array encoded as a multipart text field)
-        are optional. `temperature` is accepted for client compatibility and ignored.
+        are optional. `temperature`, when present, must be between 0 and 1 and is
+        forwarded to the selected upstream.
         `response_format` is `json` by default or `verbose_json`.
 
-        Authentication, explicit `audio` model-route grants, upstream health admission,
+        Authentication, explicit `openai-audio` model-route grants backed by the `audio`
+        provider modality, upstream health admission,
         key RPM/concurrency limits, balance/budget reservation, and per-second generation
         pricing all apply. Actual duration is measured from the trusted WAV format/data
         chunks before dispatch; millisecond-resolution duration is retained in audit history and the
@@ -5627,6 +5629,9 @@ paths:
       responses:
         '200':
           description: Normalized transcription response.
+          headers:
+            X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+            X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
           content:
             application/json:
               schema:
@@ -5636,9 +5641,13 @@ paths:
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '408': { $ref: '#/components/responses/RequestTimeout' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '424': { $ref: '#/components/responses/UnpricedModel' }
         '429': { $ref: '#/components/responses/UsageRejected' }
         '502': { $ref: '#/components/responses/UpstreamError' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
   /v1/messages:
     post:
@@ -6154,6 +6163,38 @@ components:
           schema: { $ref: '#/components/schemas/Group' }
     InvalidRequest:
       description: Invalid JSON, field, state transition, idempotency reuse, or unsupported operation.
+      headers:
+        X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+        X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    RequestTimeout:
+      description: The bounded request body or upstream response deadline expired.
+      headers:
+        X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+        X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    PayloadTooLarge:
+      description: The multipart body, audio file, field, or upstream response exceeded its configured bound.
+      headers:
+        X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+        X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    UnsupportedMediaType:
+      description: Content encoding, multipart media type, or audio representation is not supported.
+      headers:
+        X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+        X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    ServiceUnavailable:
+      description: Bounded body admission or a required internal service is temporarily unavailable.
       headers:
         X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
         X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
@@ -6894,7 +6935,7 @@ components:
         display_name: { type: string }
         protocols:
           type: array
-          items: { type: string, enum: [openai, anthropic, audio, generation] }
+          items: { type: string, enum: [openai, anthropic, openai-audio, generation] }
         modalities:
           type: array
           items: { type: string, enum: [text, embedding, image, video, audio] }
@@ -7833,7 +7874,7 @@ components:
           items: { type: string, format: uuid }
           default: []
         upstream_model: { type: string, minLength: 1, maxLength: 500 }
-        protocol: { type: string, enum: [openai, anthropic, audio, generation] }
+        protocol: { type: string, enum: [openai, anthropic, openai-audio, generation] }
         priority: { type: integer, format: int64, minimum: -1000000, maximum: 1000000, default: 0 }
         enabled:
           type: boolean
@@ -7904,7 +7945,7 @@ components:
           uniqueItems: true
           items: { type: string, format: uuid }
         upstream_model: { type: string, minLength: 1, maxLength: 500 }
-        protocol: { type: string, enum: [openai, anthropic, audio, generation] }
+        protocol: { type: string, enum: [openai, anthropic, openai-audio, generation] }
         priority: { type: integer, format: int64, minimum: -1000000, maximum: 1000000 }
         included_provider_group_ids:
           type: array
@@ -8111,7 +8152,7 @@ components:
           uniqueItems: true
           items: { type: string, format: uuid }
         upstream_model: { type: string }
-        protocol: { type: string, enum: [openai, anthropic, audio, generation] }
+        protocol: { type: string, enum: [openai, anthropic, openai-audio, generation] }
         priority: { type: integer, format: int64, minimum: -1000000, maximum: 1000000 }
         enabled: { type: boolean }
         included_provider_group_ids:
@@ -9881,7 +9922,7 @@ components:
         prompt: { type: string, maxLength: 32000 }
         hotwords: { type: string, description: JSON-encoded array of at most 256 non-empty strings. }
         response_format: { type: string, enum: [json, verbose_json], default: json }
-        temperature: { type: number, description: Accepted and ignored for compatibility. }
+        temperature: { type: number, minimum: 0, maximum: 1, description: Forwarded to the selected upstream. }
     OpenAIAudioTranscriptionJson:
       type: object
       additionalProperties: false
@@ -9894,7 +9935,9 @@ components:
       required: [text, duration, segments]
       properties:
         text: { type: string }
-        duration: { type: number, minimum: 0, description: Trusted input WAV duration in seconds. }
+        task: { type: string }
+        language: { type: string }
+        duration: { type: number, minimum: 0, description: Upstream-reported duration when present, otherwise the trusted input WAV duration in seconds. }
         segments:
           type: array
           items:
@@ -9902,9 +9945,27 @@ components:
             additionalProperties: false
             required: [start, end, text]
             properties:
+              id: { type: integer, minimum: 0 }
+              seek: { type: integer, minimum: 0 }
               start: { type: number, minimum: 0 }
               end: { type: number, minimum: 0 }
               text: { type: string }
+              tokens: { type: array, maxItems: 1000000, items: { type: integer, minimum: 0 } }
+              temperature: { type: number }
+              avg_logprob: { type: number }
+              compression_ratio: { type: number }
+              no_speech_prob: { type: number }
+        words:
+          type: array
+          maxItems: 1000000
+          items:
+            type: object
+            additionalProperties: false
+            required: [word, start, end]
+            properties:
+              word: { type: string }
+              start: { type: number, minimum: 0 }
+              end: { type: number, minimum: 0 }
     AnthropicMessageRequest:
       type: object
       required: [model, messages]

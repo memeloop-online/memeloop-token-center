@@ -1,6 +1,106 @@
 use super::super::*;
 
 #[tokio::test]
+async fn sqlite_v105_upgrades_real_v103_audio_rows_without_losing_generation_units() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("openai-audio-v105.db").display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    sqlx::query(
+        "CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let mut transaction = database.pool.begin().await.unwrap();
+    apply_migration_range(&mut transaction, SQLITE_MIGRATIONS, 1, 103)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    // The first row is the exact v103 lifecycle shape: request_records carried
+    // seconds temporarily, while request_stats_facts already projected them
+    // into generation_units. The second, older compatibility shape proves the
+    // narrower guarded backfill without weakening preservation of the v103 row.
+    for statement in [
+        "INSERT INTO model_routes (id, tenant_id, public_model, upstream_account_id, upstream_model, protocol, priority, enabled, created_at, updated_at) VALUES ('route-a', 'tenant-a', 'whisper-1', 'upstream-a', 'whisper-1', 'audio', 0, 1, 60000, 60000)",
+        "INSERT INTO usage_reservations (id, account_id, key_id, price_id, reserved_micros, reserved_tokens, rate_window_start, actual_micros, status, created_at, settled_at, enforcement_mode) VALUES ('reservation-v103', 'account-a', 'key-a', 'price-a', 700, 7, 60000, 700, 'settled', 61000, 62000, 'prepaid'), ('reservation-compat', 'account-a', 'key-a', 'price-a', 300, 3, 60000, 300, 'settled', 63000, 64000, 'prepaid')",
+        "INSERT INTO rate_limit_windows (key_id, window_start, requests, tokens) VALUES ('key-a', 60000, 3, 15)",
+        "INSERT INTO request_records (id, tenant_id, key_id, created_at, completed_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code, request_object, response_object, reservation_id, upstream_account_id, model_route_id, cached_input_tokens, cache_write_tokens, service_tier, currency, usage_basis) VALUES ('request-v103', 'tenant-a', 'key-a', 61000, 62000, 'audio-transcription', 'whisper-1', 200, 1000, 0, 7, 700, NULL, '{}', '{}', 'reservation-v103', 'upstream-a', 'route-a', 0, 0, 'default', 'USD', 'contract_ceiling'), ('request-compat', 'tenant-a', 'key-a', 63000, 64000, 'audio-transcription', 'whisper-1', 200, 1000, 0, 3, 300, NULL, '{}', '{}', 'reservation-compat', 'upstream-a', 'route-a', 0, 0, 'default', 'USD', 'contract_ceiling')",
+        "INSERT INTO request_stats_facts (request_id, tenant_id, key_id, created_at, model, protocol, status_class, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, service_tier, currency, cost_micros, session_id) VALUES ('request-v103', 'tenant-a', 'key-a', 61000, 'whisper-1', 'audio-transcription', 'success', '', 'upstream-a', 'route-a', 1000, 0, 0, 0, 0, 7, 'default', 'USD', 700, 'unlinked:key-a'), ('request-compat', 'tenant-a', 'key-a', 63000, 'whisper-1', 'audio-transcription', 'success', '', 'upstream-a', 'route-a', 1000, 0, 3, 0, 0, 0, 'default', 'USD', 300, 'unlinked:key-a')",
+    ] {
+        sqlx::query(statement)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+    let mut transaction = database.pool.begin().await.unwrap();
+    apply_migration_range(&mut transaction, SQLITE_MIGRATIONS, 105, 105)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT protocol FROM model_routes WHERE id = 'route-a'")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap(),
+        "openai-audio"
+    );
+    let reservation = sqlx::query(
+        "SELECT reserved_tokens, reserved_units, billing_unit FROM usage_reservations WHERE id = 'reservation-v103'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(reservation.get::<i64, _>("reserved_tokens"), 0);
+    assert_eq!(reservation.get::<i64, _>("reserved_units"), 7);
+    assert_eq!(reservation.get::<String, _>("billing_unit"), "second");
+    let request = sqlx::query(
+        "SELECT output_tokens, billed_units, billing_unit FROM request_records WHERE id = 'request-v103'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(request.get::<i64, _>("output_tokens"), 0);
+    assert_eq!(request.get::<i64, _>("billed_units"), 7);
+    assert_eq!(request.get::<String, _>("billing_unit"), "second");
+    let v103_fact = sqlx::query(
+        "SELECT output_tokens, generation_units, billing_unit FROM request_stats_facts WHERE request_id = 'request-v103'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(v103_fact.get::<i64, _>("output_tokens"), 0);
+    assert_eq!(v103_fact.get::<i64, _>("generation_units"), 7);
+    assert_eq!(v103_fact.get::<String, _>("billing_unit"), "second");
+    let compatibility_fact = sqlx::query(
+        "SELECT output_tokens, generation_units, billing_unit FROM request_stats_facts WHERE request_id = 'request-compat'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(compatibility_fact.get::<i64, _>("output_tokens"), 0);
+    assert_eq!(compatibility_fact.get::<i64, _>("generation_units"), 3);
+    assert_eq!(
+        compatibility_fact.get::<String, _>("billing_unit"),
+        "second"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT tokens FROM rate_limit_windows WHERE key_id = 'key-a' AND window_start = 60000",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap(),
+        5,
+        "only the two legacy audio reservations are removed from the shared TPM window"
+    );
+}
+
+#[tokio::test]
 async fn sqlite_v66_preserves_existing_upstream_cooldown_and_probe_lease() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(

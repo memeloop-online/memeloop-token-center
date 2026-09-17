@@ -58,7 +58,7 @@ pub(super) fn generation_usage_dimension_sql(
                UNION ALL
                SELECT f.tenant_id, f.key_id, f.model, 'audio-transcription' AS protocol,
                       f.status_class, f.error_code, f.upstream_account_id,
-                      f.model_route_id, 'audio' AS modality, 'second' AS billing_unit,
+                      f.model_route_id, 'audio' AS modality, f.billing_unit,
                       f.currency, f.generation_units
                  FROM request_stats_facts f
                 WHERE $13 <= $14 AND f.created_at >= $13 AND f.created_at <= $14
@@ -67,7 +67,7 @@ pub(super) fn generation_usage_dimension_sql(
                UNION ALL
                SELECT f.tenant_id, f.key_id, f.model, 'audio-transcription' AS protocol,
                       f.status_class, f.error_code, f.upstream_account_id,
-                      f.model_route_id, 'audio' AS modality, 'second' AS billing_unit,
+                      f.model_route_id, 'audio' AS modality, f.billing_unit,
                       f.currency, f.generation_units
                  FROM request_stats_facts f
                 WHERE $15 <= $16 AND f.created_at >= $15 AND f.created_at <= $16

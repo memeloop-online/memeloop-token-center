@@ -13,8 +13,9 @@ pub(crate) use conversations::{
     ConversationObservationInput, attach_conversation_upstream_response_in_transaction,
 };
 pub use lifecycle::{
-    AttachProxyArchiveResult, FinishProxyRequest, FinishProxyRequestResult, FinishRequest,
-    NewRequest, ProxyConversationInput, StartProxyRequest,
+    AttachProxyArchiveResult, FinishMeteredSynchronousRequest, FinishProxyRequest,
+    FinishProxyRequestResult, FinishRequest, NewRequest, ProxyConversationInput,
+    StartMeteredSynchronousRequest, StartProxyRequest,
 };
 pub(crate) use lifecycle::{
     ProxyRequestUpstreamAttribution, SwitchProxyCandidateInput, allocate_request_event_cursor,

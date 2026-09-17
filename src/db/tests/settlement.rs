@@ -23,6 +23,105 @@ fn responses_auto_tier_alias_settles_against_the_admitted_default_contract() {
 }
 
 #[tokio::test]
+async fn metered_failure_releases_budget_and_concurrency_without_consuming_tpm() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("metered-failure.db").display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    database.migrate().await.unwrap();
+    let pepper = b"metered request settlement pepper over thirty-two bytes";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "metered-failure".to_owned(),
+                principal_external_id: "member".to_owned(),
+                alias: "metered-failure".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy {
+                    tokens_per_minute: 1,
+                    max_concurrency: 1,
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let window_start = unix_millis() / 60_000 * 60_000;
+    sqlx::query(
+        "INSERT INTO rate_limit_windows (key_id, window_start, requests, tokens) VALUES ($1, $2, 0, 1)",
+    )
+    .bind(key.key_id.to_string())
+    .bind(window_start)
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let price = database
+        .upsert_generation_price("metered-model", "USD", "second", Decimal::new(25, 2))
+        .await
+        .unwrap();
+    let request_id = Uuid::now_v7();
+    let reservation = database
+        .start_metered_synchronous_request(StartMeteredSynchronousRequest {
+            request_id,
+            key: &key,
+            price: &price,
+            unit_ceiling: 2,
+            protocol: "audio-transcription",
+            model: "metered-model",
+            request_object: "metadata-only-json:{}",
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+    let admitted = database.key_limit_snapshot(key.key_id).await.unwrap();
+    assert_eq!(admitted.tpm.used, 1);
+    assert_eq!(admitted.concurrency.active, 1);
+    assert_eq!(admitted.reserved_balance, "0.5");
+
+    database
+        .finish_metered_synchronous_request(FinishMeteredSynchronousRequest {
+            request_id,
+            tenant_id: key.tenant_id,
+            reservation: &reservation,
+            unit_ceiling: 2,
+            billed_units: 0,
+            generation_duration_ms: Some(1_500),
+            status_code: 502,
+            duration_ms: 5,
+            error_code: Some("upstream_failed"),
+            response_object: "metadata-only-json:{}",
+        })
+        .await
+        .unwrap();
+    let settled = database.key_limit_snapshot(key.key_id).await.unwrap();
+    assert_eq!(settled.tpm.used, 1);
+    assert_eq!(settled.concurrency.active, 0);
+    assert_eq!(settled.reserved_balance, "0");
+    assert_eq!(settled.available_balance, "10");
+    let request = database
+        .request_archive_refs(key.key_id, request_id)
+        .await
+        .unwrap()
+        .view;
+    assert!(request.usage.tokens.is_none());
+    assert_eq!(
+        request.usage.generation.unwrap().billed_units,
+        Some(0),
+        "failed metered requests settle zero units without token fallback"
+    );
+}
+
+#[tokio::test]
 async fn sqlite_generation_terminal_settlement_holds_the_writer_slot_until_refund_commit() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(

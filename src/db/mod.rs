@@ -157,9 +157,10 @@ pub use providers::{
 };
 pub use requests::{
     AttachProxyArchiveResult, ConversationDetailFilter, ConversationListFilter,
-    ConversationProjectionTask, FinishProxyRequest, FinishProxyRequestResult, FinishRequest,
-    MeteredUsageProjectionTask, NewRequest, ProxyConversationInput, RequestListFilter,
-    StartProxyRequest, StatsFilter, normalize_proxy_usage,
+    ConversationProjectionTask, FinishMeteredSynchronousRequest, FinishProxyRequest,
+    FinishProxyRequestResult, FinishRequest, MeteredUsageProjectionTask, NewRequest,
+    ProxyConversationInput, RequestListFilter, StartMeteredSynchronousRequest, StartProxyRequest,
+    StatsFilter, normalize_proxy_usage,
 };
 pub(crate) use requests::{
     ConversationObservationInput, MAX_STATS_RANGE_MILLIS, ProxyRequestUpstreamAttribution,

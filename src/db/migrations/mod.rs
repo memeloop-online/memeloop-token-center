@@ -553,6 +553,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "bounded transient health signal windows",
         sql: include_str!("../../../migrations/common/0104_transient_health_signal_windows.sql"),
     },
+    Migration {
+        version: 105,
+        name: "OpenAI Audio metered request accounting",
+        sql: include_str!("../../../migrations/common/0105_openai_audio_metered_requests.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1091,6 +1096,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 104,
         name: "bounded transient health signal windows",
         sql: include_str!("../../../migrations/common/0104_transient_health_signal_windows.sql"),
+    },
+    Migration {
+        version: 105,
+        name: "OpenAI Audio metered request accounting",
+        sql: include_str!("../../../migrations/common/0105_openai_audio_metered_requests.sql"),
     },
 ];
 

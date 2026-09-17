@@ -3,7 +3,7 @@ use reqwest::multipart::{Form, Part};
 
 use super::*;
 
-const AUDIO_PROTOCOL: &str = "audio";
+const AUDIO_PROTOCOL: &str = "openai-audio";
 const AUDIO_AUDIT_PROTOCOL: &str = "audio-transcription";
 const AUDIO_CLIENT_PROTOCOL: &str = "openai-audio-transcription";
 const MAX_HOTWORDS: usize = 256;
@@ -38,6 +38,7 @@ struct AudioTranscriptionForm {
     prompt: Option<String>,
     hotwords: Option<Vec<String>>,
     response_format: AudioResponseFormat,
+    temperature: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,6 +51,8 @@ struct RewrittenAudioMetadata {
     hotwords: Option<Vec<String>>,
     #[serde(default)]
     response_format: AudioResponseFormat,
+    #[serde(default)]
+    temperature: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -95,6 +98,7 @@ pub(super) async fn create_audio_transcription(
             "prompt": form.prompt,
             "hotwords": form.hotwords,
             "response_format": form.response_format.as_str(),
+            "temperature": form.temperature,
         }),
     )
     .await?;
@@ -137,9 +141,6 @@ pub(super) async fn create_audio_transcription(
             "audio transcription price must use second billing".into(),
         ));
     }
-    let reservation_price = generation_price
-        .reservation_price()
-        .ok_or_else(|| AppError::BadRequest("generation price is too large".into()))?;
     let request_object = metadata_only_locator(json!({
         "kind": "audio_transcription",
         "media_archived": false,
@@ -165,12 +166,11 @@ pub(super) async fn create_audio_transcription(
     )?;
     let reservation = state
         .db
-        .start_proxy_request(StartProxyRequest {
+        .start_metered_synchronous_request(StartMeteredSynchronousRequest {
             request_id,
             key: &key,
-            price: &reservation_price,
-            input_token_ceiling: 0,
-            output_token_ceiling: audio.billed_seconds,
+            price: &generation_price,
+            unit_ceiling: audio.billed_seconds,
             protocol: AUDIO_AUDIT_PROTOCOL,
             model: &metadata.model,
             request_object: &request_object,
@@ -425,6 +425,7 @@ async fn parse_audio_transcription_form(
     let mut prompt = None;
     let mut hotwords = None;
     let mut response_format = None;
+    let mut temperature = None;
     while let Some(field) = multipart
         .next_field()
         .await
@@ -463,10 +464,16 @@ async fn parse_audio_transcription_form(
                 set_once_text(&mut response_format, field, "response_format").await?
             }
             "temperature" => {
-                let _ = field
+                if temperature.is_some() {
+                    return Err(AppError::BadRequest(
+                        "temperature must be supplied once".into(),
+                    ));
+                }
+                let raw = field
                     .text()
                     .await
                     .map_err(|_| AppError::BadRequest("invalid temperature field".into()))?;
+                temperature = Some(parse_temperature(&raw)?);
             }
             _ => {
                 return Err(AppError::BadRequest(format!(
@@ -493,6 +500,7 @@ async fn parse_audio_transcription_form(
         prompt,
         hotwords,
         response_format,
+        temperature,
     };
     validate_optional_prompt(form.prompt.as_deref())?;
     validate_hotwords(form.hotwords.as_deref())?;
@@ -530,7 +538,26 @@ fn validate_audio_metadata(metadata: &RewrittenAudioMetadata) -> Result<(), AppE
         return Err(AppError::BadRequest("model is required".into()));
     }
     validate_optional_prompt(metadata.prompt.as_deref())?;
-    validate_hotwords(metadata.hotwords.as_deref())
+    validate_hotwords(metadata.hotwords.as_deref())?;
+    validate_temperature(metadata.temperature)
+}
+
+fn parse_temperature(value: &str) -> Result<f64, AppError> {
+    let temperature = value
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| AppError::BadRequest("temperature must be a number from 0 to 1".into()))?;
+    validate_temperature(Some(temperature))?;
+    Ok(temperature)
+}
+
+fn validate_temperature(temperature: Option<f64>) -> Result<(), AppError> {
+    if temperature.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+        return Err(AppError::BadRequest(
+            "temperature must be a number from 0 to 1".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_optional_prompt(prompt: Option<&str>) -> Result<(), AppError> {
@@ -674,6 +701,9 @@ fn upstream_form(
             serde_json::to_string(hotwords).map_err(|_| AppError::Internal)?,
         );
     }
+    if let Some(temperature) = metadata.temperature {
+        form = form.text("temperature", temperature.to_string());
+    }
     Ok(form)
 }
 
@@ -764,6 +794,21 @@ fn normalize_audio_response(
     if response_format == AudioResponseFormat::Json {
         return Ok(json!({"text": text}));
     }
+    let mut verbose = serde_json::Map::new();
+    verbose.insert("text".to_owned(), Value::String(text.to_owned()));
+    for field in ["task", "language"] {
+        if let Some(value) = object.get(field) {
+            let value = value.as_str().ok_or_else(|| {
+                AppError::Upstream(format!("audio upstream {field} must be a string"))
+            })?;
+            verbose.insert(field.to_owned(), Value::String(value.to_owned()));
+        }
+    }
+    let duration = match object.get("duration") {
+        Some(value) => finite_non_negative(Some(value), "duration")?,
+        None => measured_duration_seconds,
+    };
+    verbose.insert("duration".to_owned(), json!(duration));
     let mut segments = Vec::new();
     if let Some(upstream_segments) = object.get("segments") {
         let upstream_segments = upstream_segments
@@ -786,14 +831,82 @@ fn normalize_audio_response(
                     "audio upstream segment timestamps are invalid".into(),
                 ));
             }
-            segments.push(json!({"start":start,"end":end,"text":text}));
+            let segment = segment.as_object().ok_or_else(|| {
+                AppError::Upstream("audio upstream segment must be an object".into())
+            })?;
+            let mut normalized = serde_json::Map::new();
+            for field in ["id", "seek"] {
+                if let Some(value) = segment.get(field) {
+                    value.as_i64().filter(|value| *value >= 0).ok_or_else(|| {
+                        AppError::Upstream(format!("audio segment {field} is invalid"))
+                    })?;
+                    normalized.insert(field.to_owned(), value.clone());
+                }
+            }
+            normalized.insert("start".to_owned(), json!(start));
+            normalized.insert("end".to_owned(), json!(end));
+            normalized.insert("text".to_owned(), Value::String(text.to_owned()));
+            if let Some(tokens) = segment.get("tokens") {
+                let tokens = tokens
+                    .as_array()
+                    .filter(|tokens| tokens.len() <= 1_000_000)
+                    .ok_or_else(|| AppError::Upstream("audio segment tokens are invalid".into()))?;
+                if tokens
+                    .iter()
+                    .any(|token| token.as_i64().filter(|value| *value >= 0).is_none())
+                {
+                    return Err(AppError::Upstream(
+                        "audio segment tokens are invalid".into(),
+                    ));
+                }
+                normalized.insert("tokens".to_owned(), Value::Array(tokens.clone()));
+            }
+            for field in [
+                "temperature",
+                "avg_logprob",
+                "compression_ratio",
+                "no_speech_prob",
+            ] {
+                if let Some(value) = segment.get(field) {
+                    value
+                        .as_f64()
+                        .filter(|value| value.is_finite())
+                        .ok_or_else(|| {
+                            AppError::Upstream(format!("audio segment {field} is invalid"))
+                        })?;
+                    normalized.insert(field.to_owned(), value.clone());
+                }
+            }
+            segments.push(Value::Object(normalized));
         }
     }
-    Ok(json!({
-        "text": text,
-        "duration": measured_duration_seconds,
-        "segments": segments,
-    }))
+    verbose.insert("segments".to_owned(), Value::Array(segments));
+    if let Some(words) = object.get("words") {
+        let words = words
+            .as_array()
+            .filter(|words| words.len() <= 1_000_000)
+            .ok_or_else(|| AppError::Upstream("audio upstream words are invalid".into()))?;
+        let mut normalized_words = Vec::with_capacity(words.len());
+        for word in words {
+            let word = word
+                .as_object()
+                .ok_or_else(|| AppError::Upstream("audio upstream word is invalid".into()))?;
+            let text = word
+                .get("word")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AppError::Upstream("audio upstream word text is missing".into()))?;
+            let start = finite_non_negative(word.get("start"), "word start")?;
+            let end = finite_non_negative(word.get("end"), "word end")?;
+            if end < start {
+                return Err(AppError::Upstream(
+                    "audio upstream word timestamps are invalid".into(),
+                ));
+            }
+            normalized_words.push(json!({"word": text, "start": start, "end": end}));
+        }
+        verbose.insert("words".to_owned(), Value::Array(normalized_words));
+    }
+    Ok(Value::Object(verbose))
 }
 
 fn finite_non_negative(value: Option<&Value>, field: &str) -> Result<f64, AppError> {
@@ -812,7 +925,7 @@ fn metadata_only_locator(metadata: Value) -> Result<String, AppError> {
 
 async fn finish_audio_failure(
     state: &AppState,
-    reservation: &crate::model::UsageReservation,
+    reservation: &crate::model::MeteredUsageReservation,
     request_id: Uuid,
     tenant_id: Uuid,
     audio: Pcm16WavDuration,
@@ -837,7 +950,7 @@ async fn finish_audio_failure(
 #[allow(clippy::too_many_arguments)]
 async fn finish_audio_request(
     state: &AppState,
-    reservation: &crate::model::UsageReservation,
+    reservation: &crate::model::MeteredUsageReservation,
     request_id: Uuid,
     tenant_id: Uuid,
     audio: Pcm16WavDuration,
@@ -850,27 +963,17 @@ async fn finish_audio_request(
     let response_object = metadata_only_locator(response_metadata)?;
     state
         .db
-        .finish_proxy_request(FinishProxyRequest {
-            usage_basis: None,
-            first_output_ms: None,
+        .finish_metered_synchronous_request(FinishMeteredSynchronousRequest {
             generation_duration_ms: Some(audio.duration_ms),
             request_id,
             tenant_id,
             reservation,
-            input_token_ceiling: 0,
-            output_token_ceiling: audio.billed_seconds,
-            requested_service_tier: None,
+            unit_ceiling: audio.billed_seconds,
+            billed_units: billed_seconds,
             status_code: i64::from(status.as_u16()),
             duration_ms: started.elapsed().as_millis().min(i64::MAX as u128) as i64,
-            usage: TokenUsage {
-                output_tokens: billed_seconds,
-                ..TokenUsage::default()
-            },
             error_code,
             response_object: &response_object,
-            routing_session_id: None,
-            routing_terminal_observed_at: None,
-            conversation: None,
         })
         .await?;
     Ok(())
@@ -958,8 +1061,16 @@ mod tests {
                 1.5,
             )
             .unwrap(),
-            json!({"text":"hello","duration":1.5,"segments":[{"start":0.0,"end":1.4,"text":"hello"}]})
+            json!({"text":"hello","duration":1.5,"segments":[{"id":1,"start":0.0,"end":1.4,"text":"hello"}]})
         );
+    }
+
+    #[test]
+    fn temperature_is_strictly_bounded_before_upstream_dispatch() {
+        assert_eq!(parse_temperature("0.3").unwrap(), 0.3);
+        for invalid in ["-0.1", "1.1", "NaN", "inf", "not-a-number"] {
+            assert!(parse_temperature(invalid).is_err(), "accepted {invalid}");
+        }
     }
 
     #[tokio::test]
@@ -989,7 +1100,14 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "text":"sensitive transcript",
                 "duration":999,
-                "segments":[{"id":9,"start":0,"end":1.4,"text":"sensitive transcript"}]
+                "task":"transcribe",
+                "language":"en",
+                "segments":[{
+                    "id":9,"seek":12,"start":0,"end":1.4,"text":"sensitive transcript",
+                    "tokens":[1,2],"temperature":0.2,"avg_logprob":-0.3,
+                    "compression_ratio":1.1,"no_speech_prob":0.01
+                }],
+                "words":[{"word":"sensitive","start":0,"end":0.7}]
             })))
             .expect(1)
             .mount(&upstream)
@@ -1034,7 +1152,10 @@ mod tests {
                     principal_external_id: "member".to_owned(),
                     alias: "audio".to_owned(),
                     currency: "USD".to_owned(),
-                    policy: KeyPolicy::default(),
+                    policy: KeyPolicy {
+                        tokens_per_minute: 1,
+                        ..KeyPolicy::default()
+                    },
                     initial_balance: Decimal::TEN,
                     idempotency_key: None,
                 },
@@ -1079,12 +1200,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response_body["text"], "sensitive transcript");
-        assert_eq!(response_body["duration"], 1.5000625);
+        assert_eq!(response_body["duration"], 999.0);
+        assert_eq!(response_body["task"], "transcribe");
+        assert_eq!(response_body["language"], "en");
         assert_eq!(
             response_body["segments"][0],
             json!({
-                "start":0.0,"end":1.4,"text":"sensitive transcript"
+                "id":9,"seek":12,"start":0.0,"end":1.4,"text":"sensitive transcript",
+                "tokens":[1,2],"temperature":0.2,"avg_logprob":-0.3,
+                "compression_ratio":1.1,"no_speech_prob":0.01
             })
+        );
+        assert_eq!(
+            response_body["words"][0],
+            json!({"word":"sensitive","start":0.0,"end":0.7})
         );
         let requests = upstream.received_requests().await.unwrap();
         assert!(
@@ -1092,6 +1221,18 @@ mod tests {
                 .body
                 .windows(b"asr-upstream".len())
                 .any(|window| window == b"asr-upstream")
+        );
+        assert!(
+            requests[0]
+                .body
+                .windows(b"name=\"temperature\"".len())
+                .any(|window| window == b"name=\"temperature\"")
+        );
+        assert!(
+            requests[0]
+                .body
+                .windows(b"0.3".len())
+                .any(|window| window == b"0.3")
         );
 
         let refs = state
@@ -1177,6 +1318,17 @@ mod tests {
                 .unwrap()
                 .available_balance,
             "9.5"
+        );
+        assert_eq!(
+            state
+                .db
+                .key_limit_snapshot(issued.key_id)
+                .await
+                .unwrap()
+                .tpm
+                .used,
+            0,
+            "audio seconds must not enter the token rate window"
         );
         let from = unix_millis().saturating_sub(3_600_000);
         let to = unix_millis().saturating_add(3_600_000);

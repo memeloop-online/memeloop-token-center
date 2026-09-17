@@ -788,7 +788,7 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
   onCatalogValidity: (valid: boolean, allowCustom: boolean) => void;
 }) {
   const { locale, t } = useI18n();
-  const knownProtocols = ['openai', 'anthropic', 'audio', 'generation'];
+  const knownProtocols = ['openai', 'anthropic', 'openai-audio', 'generation'];
   const journey = formJourneyCopy(locale);
   const priorityHintId = useId();
   const protocolId = useId();
@@ -829,7 +829,7 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
       <MultiCombobox label={t('routes.excludeProviderGroups')} options={providerGroupOptions} value={selections(draft.excluded_provider_group_ids, providerGroupOptions)} onChange={(selected) => onChange({ ...draft, excluded_provider_group_ids: selected.map((item) => item.value) })} placeholder={t('routes.searchProviderGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('routes.exclusionWins')} />
     </div>
     </AdvancedFormSection>
-    <div className="route-protocol-field"><div className="route-protocol-heading"><label htmlFor={protocolId}>{t('routes.protocol')}</label><DetailTooltip content={t('routes.protocolCompatibilityHint')}><Button appearance="subtle" type="button">{journey.protocolHelp}</Button></DetailTooltip></div><Select id={protocolId} aria-invalid={!protocolCompatible} value={draft.protocol} onChange={(event) => onChange({ ...draft, protocol: event.target.value })}>{knownProtocols.map((protocol) => <option disabled={candidateIds.length > 0 && !supportedByAll.includes(protocol)} key={protocol} value={protocol}>{protocol === 'generation' ? t('routes.generation') : protocol === 'audio' ? 'OpenAI Audio' : protocol === 'anthropic' ? 'Anthropic' : 'OpenAI'}</option>)}</Select></div>
+    <div className="route-protocol-field"><div className="route-protocol-heading"><label htmlFor={protocolId}>{t('routes.protocol')}</label><DetailTooltip content={t('routes.protocolCompatibilityHint')}><Button appearance="subtle" type="button">{journey.protocolHelp}</Button></DetailTooltip></div><Select id={protocolId} aria-invalid={!protocolCompatible} value={draft.protocol} onChange={(event) => onChange({ ...draft, protocol: event.target.value })}>{knownProtocols.map((protocol) => <option disabled={candidateIds.length > 0 && !supportedByAll.includes(protocol)} key={protocol} value={protocol}>{protocol === 'generation' ? t('routes.generation') : protocol === 'openai-audio' ? 'OpenAI Audio' : protocol === 'anthropic' ? 'Anthropic' : 'OpenAI'}</option>)}</Select></div>
     {!protocolCompatible && <p className="field-error" role="alert">{t('routes.protocolIncompatible')}</p>}
     <UpstreamModelCombobox token={token} tenant={tenant} upstreams={upstreams} providers={providers} accountIds={draft.upstream_account_ids} includedProviderGroupIds={draft.included_provider_group_ids} excludedProviderGroupIds={draft.excluded_provider_group_ids} syncAccountIds={candidateIds} protocol={draft.protocol} value={draft.upstream_model} onChange={(upstream_model) => onChange({ ...draft, upstream_model, custom_model_confirmed: false })} customModelConfirmed={draft.custom_model_confirmed} onValidityChange={(valid, allowCustom) => onCatalogValidity(valid && protocolCompatible, allowCustom)} />
     <AdvancedFormSection action title={journey.priority} invalid={!priorityValid}>
