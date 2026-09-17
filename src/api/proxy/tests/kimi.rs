@@ -289,6 +289,7 @@ async fn fake_glm_via_chat_provider_uses_strict_chat_contract_and_reverse_maps_t
             item["type"] == "function_call"
                 && item["name"] == "followup_task"
                 && item["namespace"] == "collaboration"
+                && item["encrypted_function_args"] == json!([])
         })
     }));
 
@@ -356,6 +357,7 @@ async fn fake_glm_via_chat_provider_uses_strict_chat_contract_and_reverse_maps_t
     assert!(streamed_body.contains("response.completed"));
     assert!(streamed_body.contains(r#""name":"spawn_agent""#));
     assert!(streamed_body.contains(r#""namespace":"collaboration""#));
+    assert!(streamed_body.contains(r#""encrypted_function_args":[]"#));
     upstream.verify().await;
 }
 

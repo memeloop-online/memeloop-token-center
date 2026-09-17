@@ -67,6 +67,19 @@ impl Context {
             );
         } else {
             item["arguments"] = Value::String(arguments.into());
+            if identity.is_some_and(|identity| {
+                identity.namespace == "collaboration"
+                    && matches!(
+                        identity.name.as_str(),
+                        "spawn_agent" | "send_message" | "followup_task"
+                    )
+            }) {
+                // Codex uses this explicit empty marker to distinguish a
+                // plaintext collaboration message from encrypted tool
+                // arguments. Omitting it makes the child task unreadable to
+                // Responses-via-Chat providers.
+                item["encrypted_function_args"] = json!([]);
+            }
         }
         item
     }
@@ -725,6 +738,49 @@ mod tests {
     }
 
     #[test]
+    fn buffered_marks_only_plaintext_collaboration_message_calls() {
+        let context = Context::new(&json!({
+            "model": "third-party-model",
+            "tools": [
+                {"type":"namespace","name":"collaboration","tools":[
+                    {"type":"function","name":"spawn_agent","parameters":{"type":"object"}},
+                    {"type":"function","name":"send_message","parameters":{"type":"object"}},
+                    {"type":"function","name":"followup_task","parameters":{"type":"object"}}
+                ]},
+                {"type":"namespace","name":"other","tools":[
+                    {"type":"function","name":"spawn_agent","parameters":{"type":"object"}}
+                ]},
+                {"type":"function","name":"lookup","parameters":{"type":"object"}}
+            ]
+        }));
+        let response = buffered(&context, &json!({
+            "created": 12,
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {"tool_calls": [
+                    {"id":"spawn","function":{"name":"collaboration__spawn_agent","arguments":"{}"}},
+                    {"id":"send","function":{"name":"collaboration__send_message","arguments":"{}"}},
+                    {"id":"follow","function":{"name":"collaboration__followup_task","arguments":"{}"}},
+                    {"id":"other","function":{"name":"other__spawn_agent","arguments":"{}"}},
+                    {"id":"lookup","function":{"name":"lookup","arguments":"{}"}}
+                ]}
+            }],
+            "usage": {"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}
+        }))
+        .unwrap();
+
+        let output = response["output"].as_array().unwrap();
+        assert_eq!(output.len(), 5);
+        for item in &output[..3] {
+            assert_eq!(item["namespace"], "collaboration");
+            assert_eq!(item["encrypted_function_args"], json!([]));
+        }
+        for item in &output[3..] {
+            assert!(item.get("encrypted_function_args").is_none());
+        }
+    }
+
+    #[test]
     fn stream_delivers_deltas_but_cannot_complete_without_usage() {
         let mut stream = Stream::new(Context::for_kimi(&json!({"model":"kimi-k3"})));
         let events = stream
@@ -795,6 +851,7 @@ mod tests {
         assert!(wire.contains("\"name\":\"spawn_agent\""));
         assert!(wire.contains("\"name\":\"followup_task\""));
         assert!(wire.matches("\"namespace\":\"collaboration\"").count() >= 2);
+        assert!(wire.matches("\"encrypted_function_args\":[]").count() >= 2);
         assert!(wire.contains("spawn agent"));
         assert!(wire.contains("follow"));
     }
