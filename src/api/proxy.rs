@@ -1108,7 +1108,6 @@ async fn proxy_with_identity_and_conversation_spool(
     .then(|| ProxyConversation {
         key: key.clone(),
         request_body: conversation_spool
-            .clone()
             .map(ConversationBody::Spool)
             .unwrap_or_else(|| ConversationBody::InMemory(body.clone())),
         hints: conversation_hints,
