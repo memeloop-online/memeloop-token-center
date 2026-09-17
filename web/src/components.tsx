@@ -183,11 +183,11 @@ function RequestSessionMetadata({ value }: { value: string }) {
  * portal and operator request drawer cannot drift or turn absent telemetry
  * into inferred values.
  */
-function RequestOutputRate({ request, details = false }: { request: RequestView; details?: boolean }) {
+function RequestOutputRate({ request }: { request: RequestView }) {
   const { locale, t } = useI18n();
-  const excludedFailure = !details && requestFailed(request);
-  const generation = excludedFailure ? null : generationRequestOutputTps(request);
-  const average = excludedFailure ? null : averageRequestOutputTps(request);
+  const excludedFailure = requestFailed(request);
+  const generation = generationRequestOutputTps(request);
+  const average = averageRequestOutputTps(request);
   const first = request.first_output_ms;
   const wait = typeof first === 'number' && Number.isFinite(first) && first >= 0
     ? `${t('request.firstOutputWait')}: ${formatMilliseconds(first, locale)}` : t('request.firstOutputMissing');
@@ -260,7 +260,7 @@ export function RequestDiagnostics({
       <div><b>{t('request.request')}</b><RequestMetadata label={zh ? '记录标识' : 'Record identifiers'} fields={[[zh ? '请求 ID' : 'Request ID', request.request_id]]} /></div>
       {request.error_code && <div className="request-detail-wide"><b>{t('request.error')}</b><DetailTooltip content={`${t('traffic.errorCode')}: ${request.error_code}`}><span tabIndex={0}>{requestErrorCopy(request.error_code, locale)}</span></DetailTooltip></div>}
       <div><b>{t('request.duration')}</b><DetailTooltip content={timingDetails}><span className="request-detail-timing" tabIndex={0}>{duration.text === '—' ? missing : duration.text}</span></DetailTooltip></div>
-      <div><RequestOutputRate request={request} details /></div>
+      <div><RequestOutputRate request={request} /></div>
     </section>
     {context && <section className="request-detail-group request-detail-session" aria-label={t('request.session')}><div className="request-detail-wide"><b>{t('request.session')}</b>
       {context.association === 'confirmed'

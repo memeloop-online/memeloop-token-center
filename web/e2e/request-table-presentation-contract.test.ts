@@ -19,7 +19,12 @@ test('generation TPS requires observed output interval and does not relabel tota
   assert.equal(averageRequestOutputTps(timed), 16);
   assert.equal(generationRequestOutputTps(request), null);
   for (const generation_duration_ms of [null, 0, -1, Number.NaN, Infinity]) assert.equal(generationRequestOutputTps({ ...timed, generation_duration_ms }), null);
-  assert.equal(generationRequestOutputTps({ ...timed, status_code: 499 }), 64, 'a later disconnect does not erase reported usage and a complete recorded interval');
+  for (const status_code of [499, 502, 503] as const) {
+    assert.equal(generationRequestOutputTps({ ...timed, status_code }), null, `${status_code} failures do not expose generation throughput`);
+    assert.equal(averageRequestOutputTps({ ...timed, status_code }), null, `${status_code} failures do not expose average throughput`);
+  }
+  assert.equal(generationRequestOutputTps({ ...timed, status_code: 200, error_code: 'upstream_incomplete_response' }), null, 'a terminal error hides generation throughput even with a 2xx status');
+  assert.equal(averageRequestOutputTps({ ...timed, status_code: 200, error_code: 'upstream_incomplete_response' }), null, 'a terminal error hides average throughput even with a 2xx status');
   for (const usage_basis of [undefined, null, 'contract_ceiling', 'provider_estimated', 'not_observed'] as const) {
     assert.equal(generationRequestOutputTps({ ...timed, usage_basis }), null);
     assert.equal(averageRequestOutputTps({ ...timed, usage_basis }), null);

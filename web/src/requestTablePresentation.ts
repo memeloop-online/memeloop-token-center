@@ -41,19 +41,19 @@ export function nonCachedRequestInput(request: RequestView): number | null {
   return input - cached - written;
 }
 
-/** End-to-end output throughput, not an inferred model decoding speed. */
+/** End-to-end output throughput for successful provider-reported requests, not an inferred model decoding speed. */
 export function averageRequestOutputTps(request: RequestView): number | null {
-  if (request.usage_basis !== 'provider_reported' || request.compaction === true || requestIsPending(request) || !tokenCount(request.output_tokens)
+  if (request.usage_basis !== 'provider_reported' || request.compaction === true || requestIsPending(request) || requestFailed(request) || !tokenCount(request.output_tokens)
     || !timingMs(request.duration_ms) || request.duration_ms <= 0) return null;
   const rate = request.output_tokens * 1000 / request.duration_ms;
   return Number.isFinite(rate) ? rate : null;
 }
 
-/** Gateway-observed output rate over the recorded first-output-to-terminal interval; may include buffered delivery, never a model decoding measurement. */
+/** Gateway-observed output rate for successful provider-reported requests over the recorded first-output-to-terminal interval; may include buffered delivery, never a model decoding measurement. */
 export function generationRequestOutputTps(request: RequestView): number | null {
   const first = request.first_output_ms;
   const generation = request.generation_duration_ms;
-  if (request.usage_basis !== 'provider_reported' || request.compaction === true || requestIsPending(request) || !tokenCount(request.output_tokens)
+  if (request.usage_basis !== 'provider_reported' || request.compaction === true || requestIsPending(request) || requestFailed(request) || !tokenCount(request.output_tokens)
     || !timingMs(first) || !timingMs(generation) || generation <= 0) return null;
   if (!timingMs(request.duration_ms) || request.duration_ms < first + generation) return null;
   const rate = request.output_tokens * 1000 / generation;
