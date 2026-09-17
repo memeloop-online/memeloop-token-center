@@ -998,8 +998,8 @@ async fn proxy_with_identity_and_conversation_spool(
     let primary = route_plan.primary_route();
     // Freeze before reservation and archive work: later candidates/reloads may
     // change account transport settings, never replenish the request budget.
-    let attempt_budget = routing::RequestAttemptBudget::from_primary(primary, request_id)?;
-    let recovery_wait_deadline =
+    let mut attempt_budget = routing::RequestAttemptBudget::from_primary(primary, request_id)?;
+    let route_preparation_recovery_wait_deadline =
         attempt_budget.recovery_wait_deadline(state.config.upstream_health);
     if let Some(mut candidates) = strategy_candidates {
         let strategy =
@@ -1009,7 +1009,7 @@ async fn proxy_with_identity_and_conversation_spool(
             key.tenant_id,
             selection_seed,
             request_id,
-            recovery_wait_deadline,
+            route_preparation_recovery_wait_deadline,
             &mut candidates,
         )
         .await?;
@@ -1127,6 +1127,12 @@ async fn proxy_with_identity_and_conversation_spool(
         }
     };
     admission.finish("completed", None, Some(archive_request_body.len()));
+    // Freeze policy before admission, but start its absolute network clock only
+    // after the durable request transaction has positively committed. Waiting
+    // for the global archive budget must never consume the candidate budget.
+    attempt_budget.arm();
+    let recovery_wait_deadline =
+        attempt_budget.recovery_wait_deadline(state.config.upstream_health);
     drop(archive_request_body);
     drop(archive_output_memory);
     let client_name = client_name(&headers);

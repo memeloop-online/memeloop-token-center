@@ -33,6 +33,7 @@ mod kimi;
 mod memory_admission;
 mod memory_metrics;
 mod phase_diagnostics;
+mod postgres_attempt_deadline;
 mod recovery_wait;
 mod soonest_reset;
 mod sse_delivery;

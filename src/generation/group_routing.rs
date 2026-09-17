@@ -72,8 +72,9 @@ pub(crate) async fn prepare_route_for_protocol(
     if !state.plugins.has_group_routing_hooks() {
         return Ok(native);
     }
-    let deadline = MediaAttemptBudget::from_primary(&native, request_id)?
-        .recovery_wait_deadline(state.config.upstream_health);
+    let mut attempt_budget = MediaAttemptBudget::from_primary(&native, request_id)?;
+    attempt_budget.arm();
+    let deadline = attempt_budget.recovery_wait_deadline(state.config.upstream_health);
     crate::group_routing::prepare(
         state,
         key.tenant_id,
