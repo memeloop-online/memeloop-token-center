@@ -590,8 +590,12 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             output_timing.observe(&frame.bytes, frame.terminal, observed_ms);
                         }
                         if let Some(spool) = archive_sender.as_mut()
-                            && !spool
-                                .append(delivery_frames.iter().map(|f| f.bytes.clone()).collect())
+                            && !spool.append(
+                                delivery_frames
+                                    .iter()
+                                    .map(|frame| super::archive_retention::sse_frame(&frame.bytes))
+                                    .collect(),
+                            )
                         {
                             tracing::warn!(%request_id, stage = "response_spool_ack", "proxy archive gap");
                             drop(archive_sender.take());

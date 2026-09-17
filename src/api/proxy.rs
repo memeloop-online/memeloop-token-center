@@ -15,6 +15,7 @@ pub(crate) async fn classify_media_rate_limit(
 #[path = "codex_transport.rs"]
 pub(in crate::api) mod codex_transport;
 
+mod archive_retention;
 mod buffered_upstream;
 mod chat_sse_usage;
 mod conversation_hints;
@@ -1019,9 +1020,10 @@ pub(in crate::api) async fn proxy_with_identity(
         Some(primary.credential_generation),
     );
     let admitted_request_object = format!("gap://{request_id}/request");
+    let archive_request_body = archive_retention::json_body(&body, &original_request_json)?;
     let request_capture_memory = state.metrics.memory_usage(
         crate::metrics::MemoryComponent::StreamCapture,
-        body.len().saturating_mul(3),
+        archive_request_body.len().saturating_mul(3),
     );
     let reservation = match state
         .db
@@ -1038,7 +1040,7 @@ pub(in crate::api) async fn proxy_with_identity(
                 upstream_account_id,
                 model_route_id,
             },
-            &body,
+            &archive_request_body,
             state.config.key_pepper.as_bytes(),
             state.config.archive_spool_compression_enabled,
         )
@@ -1046,12 +1048,17 @@ pub(in crate::api) async fn proxy_with_identity(
     {
         Ok(reservation) => reservation,
         Err(error) => {
-            admission.finish(error.diagnostic_category(), None, Some(body.len()));
+            admission.finish(
+                error.diagnostic_category(),
+                None,
+                Some(archive_request_body.len()),
+            );
             tracing::error!(%request_id, stage = "request_transaction_admission", failure_domain = "local_admission", error_category = error.diagnostic_category(), "proxy request admission failed");
             return Err(error);
         }
     };
-    admission.finish("completed", None, Some(body.len()));
+    admission.finish("completed", None, Some(archive_request_body.len()));
+    drop(archive_request_body);
     let client_name = client_name(&headers);
     let conversation = matches!(
         protocol,
@@ -2310,14 +2317,15 @@ async fn finish_buffered_request_with_upstream_attribution(
     // Seal the independent response spool in the terminal transaction. Only
     // its durable ACK gates delivery, never an object-store upload.
     let capture_started = Instant::now();
+    let archive_body = archive_retention::json_body_if_valid(&body);
     let response_capture_memory = request.state.metrics.memory_usage(
         crate::metrics::MemoryComponent::StreamCapture,
-        body.len().saturating_mul(3),
+        archive_body.len().saturating_mul(3),
     );
     let response_capture_permit = request.state.proxy_memory_budget.reservation();
     let response_archive = if request.memory.has_buffered_response()
         || response_capture_permit.try_grow(
-            body.len(),
+            archive_body.len(),
             crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
         ) {
         BufferedArchive::new(
@@ -2327,7 +2335,7 @@ async fn finish_buffered_request_with_upstream_attribution(
                 reservation_id: request.reservation.id,
             },
             crate::response_archive_spool::BufferedArchivePurpose::Response,
-            &body,
+            &archive_body,
             request.state.config.key_pepper.as_bytes(),
             request.state.config.archive_spool_compression_enabled,
         )
