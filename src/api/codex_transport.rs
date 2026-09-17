@@ -31,9 +31,9 @@ pub(super) use bad_request::{
     BadRequestDisposition, BadRequestUnclassifiableReason, classify_bad_request,
 };
 
-pub(super) const DRIVER: &str = "openai-codex";
-pub(super) const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-pub(super) const RESPONSES_PATH: &str = "/responses";
+pub(in crate::api) const DRIVER: &str = "openai-codex";
+pub(in crate::api) const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+pub(in crate::api) const RESPONSES_PATH: &str = "/responses";
 // A conservative identity remains the fallback when a downstream caller is
 // not a recognized first-party Codex client. Native Codex may safely preserve
 // a narrowly-defined client identity below, but account configuration never
@@ -259,11 +259,80 @@ pub(super) fn outbound_base_url(configured: &str) -> String {
     configured.to_owned()
 }
 
+/// Prepare the native Codex request used by the synchronous Images adapter.
+///
+/// This shares the account-scoped fingerprinted client, OAuth credential and
+/// SOCKS5H binding with text traffic. The Responses body remains non-streaming
+/// so the image result is bounded as one JSON response instead of entering the
+/// text SSE event admission path.
+pub(in crate::api) async fn prepare_image_request(
+    state: &crate::AppState,
+    route: &crate::provider::ResolvedUpstream,
+    body: &Value,
+    request_id: Uuid,
+) -> Result<wreq::RequestBuilder, AppError> {
+    if route.driver != DRIVER || route.base_url != BASE_URL {
+        return Err(AppError::BadRequest(
+            "OpenAI Codex image route has an invalid fixed transport".into(),
+        ));
+    }
+    validate_route_config(&route.config)?;
+    validate_credential_contract(&route.credential)?;
+    let main_model = route
+        .config
+        .get("image_main_model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            AppError::BadRequest("OpenAI Codex image routes require config.image_main_model".into())
+        })?;
+    trusted_reservation_token_bound(&route.config, main_model)?;
+    if route.upstream_model != "gpt-image-2"
+        || body.get("model").and_then(Value::as_str) != Some(main_model)
+        || body.get("stream").and_then(Value::as_bool) != Some(false)
+        || body.get("store").and_then(Value::as_bool) != Some(false)
+        || body.pointer("/tools/0/type").and_then(Value::as_str) != Some("image_generation")
+        || body.pointer("/tools/0/model").and_then(Value::as_str) != Some("gpt-image-2")
+    {
+        return Err(AppError::BadRequest(
+            "OpenAI Codex image route requires the verified gpt-image-2 non-streaming contract"
+                .into(),
+        ));
+    }
+    let body = serde_json::to_vec(body).map_err(|_| AppError::Internal)?;
+
+    let outbound_base_url = outbound_base_url(&route.base_url);
+    crate::network::validate_codex_transport(
+        &outbound_base_url,
+        &route.config,
+        route.credential.proxy(),
+        state.config.codex_test_loopback,
+    )
+    .await?;
+    let client = state
+        .codex_clients
+        .snapshot(route)
+        .map_err(|_| AppError::Upstream("OpenAI Codex transport is unavailable".into()))?;
+    let target_url = crate::network::upstream_api_url(&outbound_base_url, RESPONSES_PATH);
+    let mut request = client.post(target_url).body(body);
+    if let Some((proxy_url, _)) = route.credential.proxy() {
+        request = request.proxy(
+            wreq::Proxy::all(proxy_url)
+                .map_err(|_| AppError::BadRequest("OpenAI Codex proxy is invalid".into()))?,
+        );
+    }
+    apply_wreq_image_wire_headers(
+        request,
+        &route.credential,
+        &request_id.to_string(),
+        crate::db::unix_millis(),
+    )
+}
+
 /// Unit-test-only task-local endpoint substitution. The production artifact
 /// has no corresponding configuration field, environment variable, or code
 /// path; persisted Codex accounts must still pass the fixed-base check.
 #[cfg(test)]
-pub(super) async fn with_test_endpoint<F>(endpoint: String, future: F) -> F::Output
+pub(in crate::api) async fn with_test_endpoint<F>(endpoint: String, future: F) -> F::Output
 where
     F: Future,
 {
@@ -774,13 +843,20 @@ pub(super) fn validate_route_config(config: &Value) -> Result<(), AppError> {
                 | "network_scope"
                 | "reservation_token_bounds"
                 | "output_token_limits"
+                | "image_main_model"
                 | "transport_policy"
         )
+    });
+    let valid_image_main_model = object.get("image_main_model").is_none_or(|value| {
+        value.as_str().is_some_and(|model| {
+            !model.trim().is_empty() && model.len() <= 200 && !model.chars().any(char::is_control)
+        })
     });
     if !known_keys
         || object.get("base_url").and_then(Value::as_str) != Some(BASE_URL)
         || object.get("network_scope").and_then(Value::as_str) != Some("public")
         || reservation_bounds(config).is_none()
+        || !valid_image_main_model
         || !valid_transport_policy(object.get("transport_policy"))
     {
         return Err(AppError::BadRequest(
@@ -982,6 +1058,31 @@ pub(super) fn apply_wreq_wire_headers(
         .header(header::CONTENT_TYPE, "application/json")
         .header("originator", client_identity.originator)
         .header(header::USER_AGENT, client_identity.user_agent)
+        .header("session-id", session_id)
+        .header("chatgpt-account-id", account_id))
+}
+
+fn apply_wreq_image_wire_headers(
+    request: wreq::RequestBuilder,
+    credential: &UpstreamCredential,
+    session_id: &str,
+    now: i64,
+) -> Result<wreq::RequestBuilder, AppError> {
+    validate_credential_contract(credential)?;
+    let account_id = account_header_value(credential)?;
+    let Some((credential_header, credential_value)) = credential.request_header(now)? else {
+        return Err(AppError::BadRequest(
+            "OpenAI Codex credential is missing authorization".into(),
+        ));
+    };
+    Ok(request
+        .default_headers(false)
+        .header(credential_header, credential_value)
+        .header(header::ACCEPT, "application/json")
+        .header(header::ACCEPT_ENCODING, "identity")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("originator", DEFAULT_ORIGINATOR)
+        .header(header::USER_AGENT, USER_AGENT)
         .header("session-id", session_id)
         .header("chatgpt-account-id", account_id))
 }

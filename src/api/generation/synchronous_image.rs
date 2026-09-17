@@ -123,6 +123,103 @@ pub(super) enum ImageResponseFormat {
     Antigravity,
 }
 
+pub(super) enum SynchronousImageUpstreamRequest {
+    Reqwest(reqwest::RequestBuilder),
+    Codex(wreq::RequestBuilder),
+}
+
+enum SynchronousImageUpstreamResponse {
+    Reqwest(reqwest::Response),
+    Codex(wreq::Response),
+}
+
+impl SynchronousImageUpstreamResponse {
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::Reqwest(response) => response.status(),
+            Self::Codex(response) => response.status(),
+        }
+    }
+
+    fn bytes_stream(
+        self,
+    ) -> std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<Bytes, ImageResponseReadError>> + Send>,
+    > {
+        match self {
+            Self::Reqwest(response) => Box::pin(response.bytes_stream().map(|chunk| {
+                chunk.map_err(|error| {
+                    tracing::warn!(
+                        is_timeout = error.is_timeout(),
+                        is_connect = error.is_connect(),
+                        "synchronous image upstream response stream failed"
+                    );
+                    ImageResponseReadError::Transport
+                })
+            })),
+            Self::Codex(response) => Box::pin(response.bytes_stream().map(|chunk| {
+                chunk.map_err(|error| {
+                    tracing::warn!(
+                        is_timeout = error.is_timeout(),
+                        is_connect = error.is_connect(),
+                        "native Codex image response stream failed"
+                    );
+                    ImageResponseReadError::Transport
+                })
+            })),
+        }
+    }
+
+    async fn classify_rate_limit(self) -> crate::db::UpstreamFailureKind {
+        match self {
+            Self::Reqwest(response) => crate::api::classify_media_rate_limit(response).await,
+            Self::Codex(response) => {
+                crate::api::proxy::classify_codex_media_rate_limit(response).await
+            }
+        }
+    }
+}
+
+enum SynchronousImageSendError {
+    Reqwest(reqwest::Error),
+    Codex(wreq::Error),
+}
+
+impl SynchronousImageSendError {
+    fn is_connect(&self) -> bool {
+        match self {
+            Self::Reqwest(error) => error.is_connect(),
+            Self::Codex(error) => {
+                error.is_connect() || error.is_proxy_connect() || error.is_dns() || error.is_tls()
+            }
+        }
+    }
+
+    fn is_timeout(&self) -> bool {
+        match self {
+            Self::Reqwest(error) => error.is_timeout(),
+            Self::Codex(error) => error.is_timeout(),
+        }
+    }
+}
+
+impl SynchronousImageUpstreamRequest {
+    async fn send(self) -> Result<SynchronousImageUpstreamResponse, SynchronousImageSendError> {
+        match self {
+            Self::Reqwest(request) => request
+                .send()
+                .await
+                .map(SynchronousImageUpstreamResponse::Reqwest)
+                .map_err(SynchronousImageSendError::Reqwest),
+            Self::Codex(request) => request
+                .send()
+                .await
+                .map(SynchronousImageUpstreamResponse::Codex)
+                .map_err(SynchronousImageSendError::Codex),
+        }
+    }
+}
+
 pub(super) struct SyncImageRequest<'a> {
     pub(super) state: &'a AppState,
     pub(super) reservation: &'a crate::model::UsageReservation,
@@ -244,7 +341,7 @@ pub(super) async fn execute_synchronous_image_request(
     _request_body: Bytes,
     _staged_request_object: &str,
     route: &crate::provider::ResolvedUpstream,
-    request: reqwest::RequestBuilder,
+    request: SynchronousImageUpstreamRequest,
     response_format: ImageResponseFormat,
 ) -> Result<Response, AppError> {
     let state = context.state;
@@ -298,7 +395,10 @@ pub(super) async fn execute_synchronous_image_request(
     state.metrics.observe_upstream(
         &route.driver,
         "image",
-        upstream_result.as_ref().ok().map(reqwest::Response::status),
+        upstream_result
+            .as_ref()
+            .ok()
+            .map(|response| response.status()),
         context.started.elapsed(),
     );
     let upstream = match upstream_result {
@@ -333,7 +433,7 @@ pub(super) async fn execute_synchronous_image_request(
             .store(true, std::sync::atomic::Ordering::Release);
     }
     if upstream_status == StatusCode::TOO_MANY_REQUESTS {
-        let kind = crate::api::classify_media_rate_limit(upstream).await;
+        let kind = upstream.classify_rate_limit().await;
         attempt
             .complete(crate::api::MediaAttemptTerminal::Failed {
                 kind,
@@ -371,7 +471,7 @@ pub(super) async fn execute_synchronous_image_request(
         )
         .await;
     }
-    let response_bytes = match read_image_response_bounded(upstream).await {
+    let response_bytes = match read_synchronous_image_response_bounded(upstream).await {
         Ok(bytes) => bytes,
         Err(ImageResponseReadError::Transport) => {
             attempt
@@ -381,7 +481,7 @@ pub(super) async fn execute_synchronous_image_request(
         }
         Err(ImageResponseReadError::TooLarge) => {
             attempt
-                .complete(crate::api::MediaAttemptTerminal::invalid_response())
+                .complete(crate::api::MediaAttemptTerminal::Inconclusive)
                 .await;
             // No archive writer is created before the cumulative limit has
             // been checked, so an oversized body can never become a partial
@@ -465,17 +565,17 @@ where
 pub(in crate::api) async fn read_image_response_bounded(
     response: reqwest::Response,
 ) -> Result<Bytes, ImageResponseReadError> {
+    read_synchronous_image_response_bounded(SynchronousImageUpstreamResponse::Reqwest(response))
+        .await
+}
+
+async fn read_synchronous_image_response_bounded(
+    response: SynchronousImageUpstreamResponse,
+) -> Result<Bytes, ImageResponseReadError> {
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| {
-            tracing::warn!(
-                is_timeout = error.is_timeout(),
-                is_connect = error.is_connect(),
-                "synchronous image upstream response stream failed"
-            );
-            ImageResponseReadError::Transport
-        })?;
+        let chunk = chunk?;
         if body.len().saturating_add(chunk.len()) > MAX_IMAGE_RESPONSE {
             return Err(ImageResponseReadError::TooLarge);
         }

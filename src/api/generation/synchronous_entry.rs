@@ -1,8 +1,8 @@
 use super::super::*;
 use super::synchronous_image::{
-    ImageResponseFormat, SyncImageRequest, execute_synchronous_image_request, fail_image_request,
-    image_idempotency_replay_response, responses_tool_image_request,
-    scoped_upstream_image_idempotency,
+    ImageResponseFormat, SyncImageRequest, SynchronousImageUpstreamRequest,
+    execute_synchronous_image_request, fail_image_request, image_idempotency_replay_response,
+    responses_tool_image_request, scoped_upstream_image_idempotency,
 };
 
 #[cfg(test)]
@@ -110,7 +110,11 @@ async fn proxy_openai_image_generation(
         )
         .await?;
         let antigravity = route.driver == crate::provider::antigravity::DRIVER;
-        if !antigravity && !crate::provider::is_openai_compatible_http_driver(&route.driver) {
+        let native_codex = route.driver == crate::api::proxy::codex_transport::DRIVER;
+        if !antigravity
+            && !native_codex
+            && !crate::provider::is_openai_compatible_http_driver(&route.driver)
+        {
             return Err(AppError::Upstream(format!(
                 "generation driver {} does not implement the OpenAI Images API",
                 route.driver
@@ -127,11 +131,12 @@ async fn proxy_openai_image_generation(
         } else {
             image_count
         };
-        let responses_tool_mode = route
-            .config
-            .get("image_api_mode")
-            .and_then(Value::as_str)
-            .is_some_and(|value| value == "responses-tool");
+        let responses_tool_mode = native_codex
+            || route
+                .config
+                .get("image_api_mode")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == "responses-tool");
         if (responses_tool_mode || antigravity) && image_count != 1 {
             return Err(AppError::BadRequest(
                 "responses-tool image routes currently require n=1".into(),
@@ -164,14 +169,6 @@ async fn proxy_openai_image_generation(
             forwarded["model"] = Value::String(route.upstream_model.clone());
             ("/v1/images/generations", forwarded)
         };
-        let outbound_http = network::client_for_config_url_no_retry(
-            &state.http,
-            &route.base_url,
-            &route.config,
-            route.credential.proxy(),
-            state.config.allow_oauth_loopback,
-        )
-        .await?;
         let upstream_idempotency = image_idempotency.as_ref().map(|idempotency| {
             scoped_upstream_image_idempotency(
                 state.config.key_pepper.as_bytes(),
@@ -185,16 +182,34 @@ async fn proxy_openai_image_generation(
         let reservation_price = price
             .reservation_price()
             .ok_or_else(|| AppError::BadRequest("generation price is too large".into()))?;
-        let target_url = network::upstream_api_url(&route.base_url, upstream_path);
-        let mut request = outbound_http.post(target_url).json(&forwarded);
-        if let Some(upstream_idempotency) = upstream_idempotency.as_deref() {
-            request = request.header("idempotency-key", upstream_idempotency);
-        }
-        request = route.credential.apply(request, unix_millis())?;
-        if antigravity {
-            let config = crate::provider::antigravity::Config::from_account(&route.config)?;
-            request = config.apply_headers(request)?;
-        }
+        let request = if native_codex {
+            SynchronousImageUpstreamRequest::Codex(
+                crate::api::proxy::codex_transport::prepare_image_request(
+                    &state, &route, &forwarded, request_id,
+                )
+                .await?,
+            )
+        } else {
+            let outbound_http = network::client_for_config_url_no_retry(
+                &state.http,
+                &route.base_url,
+                &route.config,
+                route.credential.proxy(),
+                state.config.allow_oauth_loopback,
+            )
+            .await?;
+            let target_url = network::upstream_api_url(&route.base_url, upstream_path);
+            let mut request = outbound_http.post(target_url).json(&forwarded);
+            if let Some(upstream_idempotency) = upstream_idempotency.as_deref() {
+                request = request.header("idempotency-key", upstream_idempotency);
+            }
+            request = route.credential.apply(request, unix_millis())?;
+            if antigravity {
+                let config = crate::provider::antigravity::Config::from_account(&route.config)?;
+                request = config.apply_headers(request)?;
+            }
+            SynchronousImageUpstreamRequest::Reqwest(request)
+        };
         Ok::<_, AppError>((
             route,
             billed_units,

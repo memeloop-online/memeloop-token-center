@@ -36,6 +36,145 @@ fn request_json() -> Value {
 }
 
 #[tokio::test]
+async fn native_codex_image_uses_oauth_transport_and_non_streaming_responses_tool() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(crate::api::proxy::codex_transport::RESPONSES_PATH))
+        .and(wiremock::matchers::header("accept", "application/json"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer codex-image-access",
+        ))
+        .and(wiremock::matchers::header(
+            "chatgpt-account-id",
+            "codex-image-account",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "resp_codex_image",
+            "output": [{
+                "type": "image_generation_call",
+                "id": "ig_codex_image",
+                "result": "bW9jay1wbmc="
+            }],
+            "usage": {"input_tokens": 11, "output_tokens": 17, "total_tokens": 28}
+        })))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("codex-images.db").display()
+    );
+    let state = AppState::initialize(Config::for_test(database_url))
+        .await
+        .unwrap();
+    let tenant = "native-codex-image";
+    let account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant.into(),
+                name: "native Codex image".into(),
+                driver: crate::api::proxy::codex_transport::DRIVER.into(),
+                config: json!({
+                    "base_url": crate::api::proxy::codex_transport::BASE_URL,
+                    "network_scope": "public",
+                    "reservation_token_bounds": {"gpt-5.6-sol": 128000},
+                    "image_main_model": "gpt-5.6-sol"
+                }),
+                credential: UpstreamCredential::OAuth {
+                    access_token: "codex-image-access".into(),
+                    refresh_token: Some("codex-image-refresh".into()),
+                    expires_at: Some(unix_millis() + 60_000),
+                    header: "authorization".into(),
+                    prefix: "Bearer ".into(),
+                    adapter_state: Some(json!({
+                        "schema": "openai-codex-oauth-v1",
+                        "account_id": "codex-image-account"
+                    })),
+                    proxy_url: None,
+                    proxy_network_scope: None,
+                },
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let route = state
+        .db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: tenant.into(),
+            public_model: "codex-image".into(),
+            upstream_account_id: account.id,
+            upstream_model: "gpt-image-2".into(),
+            protocol: "generation".into(),
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    state
+        .db
+        .upsert_generation_price("codex-image", "USD", "image", Decimal::new(4, 2))
+        .await
+        .unwrap();
+    let issued = state
+        .db
+        .create_key_with_routing(
+            CreateKeyInput {
+                tenant_external_id: tenant.into(),
+                principal_external_id: "codex-image-user".into(),
+                alias: "codex-image-user".into(),
+                currency: "USD".into(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::ONE,
+                idempotency_key: None,
+            },
+            &[route.id],
+            &[],
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let payload = json!({
+        "model": "codex-image",
+        "prompt": "draw a fox",
+        "n": 1,
+        "size": "1024x1024"
+    });
+    let response = crate::api::proxy::codex_transport::with_test_endpoint(
+        upstream.uri(),
+        router_for_role(state, RuntimeRole::Gateway).oneshot(
+            Request::post("/v1/images/generations")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", issued.key))
+                .header("idempotency-key", "native-codex-image")
+                .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                .unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&response).unwrap()["data"][0]["b64_json"],
+        "bW9jay1wbmc="
+    );
+    let requests = upstream.received_requests().await.unwrap();
+    let forwarded: Value = requests[0].body_json().unwrap();
+    assert_eq!(forwarded["model"], "gpt-5.6-sol");
+    assert_eq!(forwarded["stream"], false);
+    assert_eq!(forwarded["store"], false);
+    assert_eq!(forwarded["tools"][0]["type"], "image_generation");
+    assert_eq!(forwarded["tools"][0]["model"], "gpt-image-2");
+}
+
+#[tokio::test]
 async fn native_image_parameter_validation_does_not_restrict_openai_forwarding() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))

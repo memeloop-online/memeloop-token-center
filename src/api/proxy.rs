@@ -12,6 +12,14 @@ pub(crate) async fn classify_media_rate_limit(
     kind
 }
 
+pub(in crate::api) async fn classify_codex_media_rate_limit(
+    response: wreq::Response,
+) -> crate::db::UpstreamFailureKind {
+    let (response, kind) = routing::classify_rate_limit(UpstreamResponse::Codex(response)).await;
+    drop(response);
+    kind
+}
+
 #[path = "codex_transport.rs"]
 pub(in crate::api) mod codex_transport;
 
