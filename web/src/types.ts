@@ -231,6 +231,9 @@ export interface MonitoringMetrics {
   requests: number;
   successful_requests: number;
   failed_requests: number;
+  /** Additive v1 fields; optional so older generated clients remain compatible. */
+  total_tokens?: number;
+  cache_rate?: number | null;
   avg_duration_ms: number | null;
   p95_duration_ms: number | null;
   p95_is_capped?: boolean;

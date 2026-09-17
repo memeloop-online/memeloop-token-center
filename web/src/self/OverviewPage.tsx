@@ -2,13 +2,15 @@ import { LocalSettlementNotice, localSettlementLabel } from '../LocalSettlementN
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { DataSurface, DetailTooltip } from '../design-system';
-import { Metric, NumberMetric, RequestTable } from '../components';
-import { formatCompactCurrency, formatNumber, formatPercent } from '../format';
+import { Metric, RequestTable } from '../components';
+import { formatCompactCurrency, formatMetricDisplay, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
 import { LimitSnapshot } from '../LimitSnapshot';
+import { AnalyticsMetric } from '../operator/AnalyticsMetric';
 import type { KeyLimitSnapshot, KeyView, RequestView, SelfStats } from '../types';
 import { selfErrorMessage } from './errors';
 import { emptyRequestFilters, requestsPath, statsPath } from './requestPaths';
+import './overviewMetrics.css';
 
 const overviewRequestCount = 5;
 
@@ -63,14 +65,20 @@ export function OverviewPage({ credential, credentialView, onError, onOpenReques
   const successRate = summary && summary.total_requests > 0
     ? summary.successful_requests / summary.total_requests
     : null;
+  const countMetric = (label: string, value: number | undefined, tone = '') => {
+    const display = formatMetricDisplay(value, locale);
+    return <AnalyticsMetric label={label} tone={tone} title={display.title} value={
+      <span className="metric-number"><span className="metric-exact" title={display.title ?? display.text}>{display.text}</span></span>
+    } />;
+  };
   return <div className="self-page self-overview" data-self-page="overview">
     <div className="self-overview-caption">{t('usage.preset.24h')}</div>
     <section className="metrics self-overview-metrics" aria-label={t('usage.preset.24h')}>
-      <NumberMetric label={t('traffic.total')} value={summary?.total_requests} />
-      <Metric label={t('usage.successRate')} value={formatPercent(successRate, locale)} tone="positive" />
-      <NumberMetric label={t('traffic.failure')} value={summary?.failed_requests} tone="negative" />
-      <NumberMetric label={t('request.tokens')} value={summary ? summary.input_tokens + summary.output_tokens : undefined} />
-      <Metric label={localSettlementLabel(locale)} labelContent={<LocalSettlementNotice />} value={<DetailTooltip content={cost.title ?? cost.text}><span tabIndex={0}>{cost.text}</span></DetailTooltip>} />
+      {countMetric(t('traffic.total'), summary?.total_requests)}
+      <AnalyticsMetric label={t('usage.successRate')} value={formatPercent(successRate, locale)} tone="positive" ratio={successRate} />
+      {countMetric(t('traffic.failure'), summary?.failed_requests, 'negative')}
+      {countMetric(t('request.tokens'), summary ? summary.input_tokens + summary.output_tokens : undefined)}
+      <AnalyticsMetric label={localSettlementLabel(locale)} labelContent={<LocalSettlementNotice />} value={<DetailTooltip content={cost.title ?? cost.text}><span tabIndex={0}>{cost.text}</span></DetailTooltip>} />
     </section>
     <DataSurface className="key-summary self-account-summary">
       <div><span className="eyebrow">{t('self.stableCredential')}</span><DetailTooltip content={currentKey.key_id}><h2 tabIndex={0}>{currentKey.alias}</h2></DetailTooltip><span>{t(`enforcementMode.${currentKey.policy.enforcement_mode}`)}</span></div>

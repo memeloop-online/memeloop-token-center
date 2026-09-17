@@ -22,10 +22,10 @@ test('production AppShell typography and actions share Fluent tokens in both the
     const unexpected: string[] = [], errors: string[] = [];
     page.on('pageerror', error => errors.push(error.message));
     const start = Date.UTC(2026, 8, 15, 12);
-    const base = { request_id: 'synthetic-running', created_at: start, completed_at: null, model: 'sample-model', protocol: 'openai', status_code: null, duration_ms: null, input_tokens: 0, output_tokens: 0, cost: '0', error_code: null };
+    const base = { request_id: 'synthetic-running', created_at: start, completed_at: null, model: 'sample-model', protocol: 'openai', status_code: null, duration_ms: null, input_tokens: 120, output_tokens: 30, cost: '0', error_code: null };
     const requests = [base,
-      { ...base, request_id: 'synthetic-success', created_at: start + 30_000, completed_at: start + 50_000, status_code: 200, duration_ms: 20_000 },
-      { ...base, request_id: 'synthetic-failure', created_at: start + 60_000, completed_at: start + 90_000, status_code: 502, duration_ms: 30_000 },
+      { ...base, request_id: 'synthetic-success', created_at: start + 30_000, completed_at: start + 50_000, status_code: 200, duration_ms: 20_000, input_tokens: 200, output_tokens: 100, usage_basis: 'provider_reported' },
+      { ...base, request_id: 'synthetic-failure', created_at: start + 60_000, completed_at: start + 90_000, status_code: 502, duration_ms: 30_000, input_tokens: 40, output_tokens: 10, usage_basis: 'provider_reported' },
     ];
     const metrics = { requests: 3, success: 1, failed: 1, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, cache_write_tokens: 0, generation_units: 0, avg_duration_ms: 25_000, p95_duration_ms: 30_000, costs: [] };
     await page.route('**/*', async route => {
@@ -56,7 +56,8 @@ test('production AppShell typography and actions share Fluent tokens in both the
     await page.goto(`${origin}/operator?view=requests`);
     const heading = page.locator('.request-page-surface .traffic-heading h2');
     await heading.waitFor();
-    await page.waitForFunction(() => document.querySelector('.request-traffic-metrics .metric-value')?.textContent === '3');
+    const totalTokens = page.locator('.request-traffic-metrics .analytics-metric').filter({ has: page.locator('.metric-label', { hasText: '总词元' }) });
+    await totalTokens.locator('.metric-value', { hasText: '350' }).waitFor();
     const load = page.locator('.load-more .fui-Button');
     await load.waitFor();
     for (const theme of ['light', 'dark']) for (const width of [390, 1440]) {

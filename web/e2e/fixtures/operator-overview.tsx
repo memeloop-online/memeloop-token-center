@@ -61,7 +61,7 @@ function monitoring(tenant: FixtureTenant): OperatorMonitoringSnapshot {
     contract_version: 'v1', generated_at: now, scope: 'tenant', tenant_external_id: tenant,
     from_created_at: now - 86_400_000, to_created_at: now, granularity: 'hour',
     latency_is_approximate: true, latency_method: 'fixed_histogram_upper_bound_capped_60000ms',
-    summary: { ...summary, avg_duration_ms: 180, p95_duration_ms: 420, costs: [{ currency: 'USD', cost: '0.017' }] },
+    summary: { ...summary, avg_duration_ms: 180, p95_duration_ms: 420, total_tokens: 12_345, cache_rate: 0.5, costs: [{ currency: 'USD', cost: '0.017' }] },
     freshness: { latest_terminal_created_at: now, age_millis: 0 },
     health: { version: 'upstream_breaker_v1', status: 'unknown', observed_at: now },
     top_upstream_models: [],

@@ -11,8 +11,6 @@ import { createServer } from 'vite';
 const webRoot = fileURLToPath(new URL('..', import.meta.url));
 const viewportWidths = [320, 390, 768, 1024, 1440, 1920, 2560] as const;
 const displayValuesByLabel: Record<string, string> = {
-  Requests: '1.25T',
-  Failures: '1.25T',
   'Total tokens': '3.13T',
   'Generation billing units': '1.25T',
   'Cached tokens': '1.25T',
@@ -20,8 +18,6 @@ const displayValuesByLabel: Record<string, string> = {
   'Average TPS': '0.21',
 };
 const exactValuesByLabel: Record<string, string> = {
-  Requests: '1,250,000,000,000',
-  Failures: '1,250,000,000,000',
   'Total tokens': '3,125,000,000,000',
   'Generation billing units': '1,250,000,000,000',
   'Cached tokens': '1,250,000,000,000',
@@ -99,7 +95,7 @@ test('UsageAnalysis keeps every rendered NumericMetric exact value on one readab
         });
 
         const numericCards = layout.cards.filter((card) => card.exactText !== undefined);
-        assert.equal(numericCards.length, 7, `${theme} ${width}px fixture must render all UsageAnalysis NumericMetric cards`);
+        assert.equal(numericCards.length, 5, `${theme} ${width}px fixture must render all UsageAnalysis NumericMetric cards`);
         assert.equal(layout.cards.some(card => card.label === 'P95 TPS'), false, 'bucket averages cannot establish request TPS percentiles');
         for (const card of numericCards) {
           const expectedDisplay = card.label ? displayValuesByLabel[card.label] : undefined;

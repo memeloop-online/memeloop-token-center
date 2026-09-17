@@ -15,10 +15,40 @@ export interface UsageChartCopy {
 
 export interface UsageChartFormatters {
   bucket: (epoch: number) => string;
+  /** Localized, half-open time interval for a concrete bucket. */
+  bucketInterval?: (epoch: number) => string;
   cost: (value: number, currency: string) => string;
   duration: (value: number) => string;
   number: (value: number) => string;
   percent: (value: number) => string;
+}
+
+interface AxisTooltipEntry {
+  dataIndex?: unknown;
+  marker?: unknown;
+  seriesIndex?: unknown;
+  seriesName?: unknown;
+  value?: unknown;
+}
+
+function axisTooltipEntries(params: unknown): AxisTooltipEntry[] {
+  if (Array.isArray(params)) return params.filter((value): value is AxisTooltipEntry => Boolean(value) && typeof value === 'object');
+  return params && typeof params === 'object' ? [params as AxisTooltipEntry] : [];
+}
+
+function bucketTooltip(
+  points: UsageAnalysisTimeBucket[],
+  format: UsageChartFormatters,
+  value: (entry: AxisTooltipEntry, seriesIndex: number) => string,
+) {
+  return (params: unknown) => {
+    const entries = axisTooltipEntries(params);
+    const index = Number(entries[0]?.dataIndex);
+    const point = Number.isInteger(index) ? points[index] : undefined;
+    const label = point ? (format.bucketInterval?.(point.bucket_start) ?? format.bucket(point.bucket_start)) : '';
+    const values = entries.map((entry, seriesIndex) => `${typeof entry.marker === 'string' ? entry.marker : ''}${typeof entry.seriesName === 'string' ? entry.seriesName : ''}: ${value(entry, seriesIndex)}`);
+    return [label, ...values].filter(Boolean).join('<br/>');
+  };
 }
 
 export function totalTokens(value: Pick<UsageAnalysisTimeBucket, 'input_tokens' | 'output_tokens' | 'cached_input_tokens' | 'cache_write_tokens'>) {
@@ -54,7 +84,7 @@ export function throughputOption(points: UsageAnalysisTimeBucket[], copy: UsageC
   const labels = points.map((point) => format.bucket(point.bucket_start));
   return {
     ...baseOption(labels, `${copy.requests}: ${copy.success}, ${copy.failures}`),
-    tooltip: { trigger: 'axis', confine: true, valueFormatter: (value: unknown) => format.number(Number(value)) },
+    tooltip: { trigger: 'axis', confine: true, formatter: bucketTooltip(points, format, (entry) => format.number(Number(entry.value))) },
     series: [
       { name: copy.success, type: 'bar', barMaxWidth: 24, data: points.map((point) => point.success) },
       { name: copy.failures, type: 'bar', barMaxWidth: 24, data: points.map((point) => point.failed) },
@@ -66,7 +96,7 @@ export function latencyOption(points: UsageAnalysisTimeBucket[], copy: UsageChar
   const labels = points.map((point) => format.bucket(point.bucket_start));
   return {
     ...baseOption(labels, `${copy.averageLatency}, ${copy.p95Latency}`),
-    tooltip: { trigger: 'axis', confine: true, valueFormatter: (value: unknown) => format.duration(Number(value)) },
+    tooltip: { trigger: 'axis', confine: true, formatter: bucketTooltip(points, format, (entry) => format.duration(Number(entry.value))) },
     yAxis: { type: 'value', axisLabel: { formatter: (value: number) => format.duration(value) } },
     series: [
       { name: copy.averageLatency, type: 'line', connectNulls: false, showSymbol: points.length < 32, smooth: 0.18, data: points.map((point) => point.avg_duration_ms) },
@@ -80,7 +110,13 @@ export function costOption(points: UsageAnalysisTimeBucket[], copy: UsageChartCo
   const currencies = costCurrencies(points);
   return {
     ...baseOption(labels, copy.cost),
-    tooltip: { trigger: 'axis', confine: true },
+    tooltip: {
+      trigger: 'axis', confine: true,
+      formatter: bucketTooltip(points, format, (entry, seriesIndex) => {
+        const index = Number(entry.seriesIndex);
+        return format.cost(Number(entry.value), currencies[Number.isInteger(index) ? index : seriesIndex] ?? '');
+      }),
+    },
     yAxis: { type: 'value' },
     series: currencies.map((currency) => ({
       name: `${copy.cost} · ${currency}`,

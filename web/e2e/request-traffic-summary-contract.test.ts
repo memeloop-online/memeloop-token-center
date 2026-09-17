@@ -43,6 +43,8 @@ test('visible traffic summary separates terminal health from live work', () => {
     unknown: 0,
     successRate: 2 / 3,
     averageDurationMs: 240,
+    totalTokens: 0,
+    localCosts: [],
   });
 });
 
@@ -55,6 +57,8 @@ test('visible traffic summary has no fabricated rate or latency without terminal
     unknown: 0,
     successRate: null,
     averageDurationMs: null,
+    totalTokens: 0,
+    localCosts: [],
   });
   const unknown = summarizeVisibleRequests([{ ...request(200, 100), completed_at: undefined }]);
   assert.equal(unknown.unknown, 1);
@@ -76,4 +80,59 @@ test('finished-request rate includes disconnected and interrupted outcomes but n
   assert.equal(summary.running, 1);
   assert.equal(summary.unknown, 1);
   assert.equal(summary.successRate, 1 / 3);
+});
+
+test('totalTokens counts actual usage only: pending and non-actual history never count', () => {
+  const nonActual = (status_code: number, usage_basis: RequestView['usage_basis']): RequestView => ({
+    ...request(status_code, 100), input_tokens: 1_000, output_tokens: 2_000, usage_basis,
+  });
+  const failedProviderReported: RequestView = { ...request(500, 100), input_tokens: 20, output_tokens: 3, usage_basis: 'provider_reported' };
+  const summary = summarizeVisibleRequests([
+    { ...request(200, 100), input_tokens: 10, output_tokens: 2, usage_basis: 'provider_reported' },
+    failedProviderReported,
+    { ...request(null, null), input_tokens: 5_000, output_tokens: 6_000, usage_basis: 'provider_reported' },
+    nonActual(200, 'provider_estimated'),
+    nonActual(200, 'contract_ceiling'),
+    nonActual(502, 'not_observed'),
+    nonActual(502, undefined),
+    nonActual(502, null),
+  ]);
+  assert.equal(summary.failed, 4);
+  assert.equal(summary.running, 1);
+  assert.equal(summary.totalTokens, 35);
+  // Failed provider-reported usage is actual and remains included.
+  assert.equal(summarizeVisibleRequests([failedProviderReported]).totalTokens, 23);
+});
+
+test('local cost totals follow the shared displayed-cost policy per currency', () => {
+  // Failed and cancelled without observed supplier usage: the nonzero
+  // historic ledger amount settles at zero under the shared policy.
+  const cancelledNotObserved: RequestView = {
+    ...request(499, 100), error_code: 'client_cancelled', usage_basis: 'not_observed',
+    cost: '4.25', currency: 'USD',
+  };
+  assert.deepEqual(summarizeVisibleRequests([cancelledNotObserved]).localCosts, [
+    { currency: 'USD', cost: 0 },
+  ]);
+
+  // A failed provider-reported request keeps its nonzero local settlement.
+  const failedProviderReported: RequestView = {
+    ...request(502, 100), usage_basis: 'provider_reported', cost: '1.5', currency: 'USD',
+  };
+  assert.deepEqual(summarizeVisibleRequests([failedProviderReported]).localCosts, [
+    { currency: 'USD', cost: 1.5 },
+  ]);
+
+  // Totals stay grouped per recorded currency; amounts without a recorded
+  // currency never contribute and currencies are never combined.
+  const summary = summarizeVisibleRequests([
+    cancelledNotObserved,
+    failedProviderReported,
+    { ...request(200, 100), usage_basis: 'provider_reported', cost: '2', currency: 'CNY' },
+    { ...request(200, 100), usage_basis: 'provider_reported', cost: '9.99' },
+  ]);
+  assert.deepEqual(summary.localCosts, [
+    { currency: 'CNY', cost: 2 },
+    { currency: 'USD', cost: 1.5 },
+  ]);
 });

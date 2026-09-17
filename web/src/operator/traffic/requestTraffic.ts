@@ -1,5 +1,6 @@
 import type { RequestEvent, RequestListCursor, RequestListResponse, RequestView, TypedFilterAst } from '../../types.js';
 import { requestOutcome } from '../../requestStatusPresentation.js';
+import { requestDisplayedCost, requestUsageIsActual } from '../../requestTablePresentation.js';
 
 export const emptyTypedFilterAst: TypedFilterAst = { logical_operator: 'and', conditions: [] };
 
@@ -38,6 +39,9 @@ export interface VisibleRequestTrafficSummary {
   unknown: number;
   successRate: number | null;
   averageDurationMs: number | null;
+  totalTokens: number;
+  /** Local settlement totals grouped by recorded currency; requests without a recorded currency never contribute and currencies are never combined. */
+  localCosts: Array<{ currency: string; cost: number }>;
 }
 
 export function summarizeVisibleRequests(requests: readonly RequestView[]): VisibleRequestTrafficSummary {
@@ -47,8 +51,28 @@ export function summarizeVisibleRequests(requests: readonly RequestView[]): Visi
   let unknown = 0;
   let durationTotal = 0;
   let durationCount = 0;
+  let totalTokens = 0;
+  const localCosts = new Map<string, number>();
 
   for (const request of requests) {
+    // RequestView input_tokens is inclusive of cached input; adding the cache
+    // fields here would double-count them.
+    // Only actual usage counts toward live traffic tokens: pending, estimated,
+    // settlement-ceiling, not-observed and unrecorded failed counts are not
+    // consumption. Failed usage is actual only when the provider reported it.
+    if (requestUsageIsActual(request)) {
+      if (Number.isFinite(request.input_tokens)) totalTokens += request.input_tokens;
+      if (Number.isFinite(request.output_tokens)) totalTokens += request.output_tokens;
+    }
+    // Local settlement amounts follow the shared displayed-cost policy: failed
+    // requests without observed supplier usage settle at zero regardless of any
+    // nonzero historic ledger amount. The policy amount is only parsed when a
+    // currency is recorded, and totals stay grouped per currency.
+    const currency = typeof request.currency === 'string' && request.currency.trim() ? request.currency : undefined;
+    if (currency) {
+      const cost = Number(requestDisplayedCost(request));
+      if (Number.isFinite(cost)) localCosts.set(currency, (localCosts.get(currency) ?? 0) + cost);
+    }
     const outcome = requestOutcome(request);
     if (outcome === 'running' || outcome === 'delivering') {
       running += 1;
@@ -75,6 +99,9 @@ export function summarizeVisibleRequests(requests: readonly RequestView[]): Visi
     unknown,
     successRate: terminal > 0 ? successful / terminal : null,
     averageDurationMs: durationCount > 0 ? durationTotal / durationCount : null,
+    totalTokens,
+    localCosts: [...localCosts.entries()].map(([currency, cost]) => ({ currency, cost }))
+      .sort((left, right) => left.currency.localeCompare(right.currency)),
   };
 }
 

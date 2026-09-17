@@ -56,6 +56,8 @@ export function MonitoringSnapshot({ snapshot, points = [], quotaSummary }: { sn
   const successRate = summary.requests > 0 ? summary.successful_requests / summary.requests : null;
   const range = `${new Date(snapshot.from_created_at).toLocaleString(locale)} – ${new Date(snapshot.to_created_at).toLocaleString(locale)}`;
   const count = (value: number) => formatMetricDisplay(value, locale);
+  const totalTokens: { text: string; title?: string } = summary.total_tokens === undefined ? { text: '—' } : { text: formatNumber(summary.total_tokens, locale), title: formatNumber(summary.total_tokens, locale) };
+  const cacheRate = summary.cache_rate ?? null;
   const average = analyticsDuration(summary.avg_duration_ms, locale);
   const averageTpsTrend = averageBucketTpsSeries(points);
   const averageTps = formatTps(averageSeriesTps(points), locale);
@@ -69,9 +71,9 @@ export function MonitoringSnapshot({ snapshot, points = [], quotaSummary }: { sn
         <RoutingStatusBadge health={snapshot.health} />
       </div>
       <section className="metrics operator-monitoring-metrics monitoring-metrics-grid" aria-label={t('monitoring.summary')}>
-        <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={t('usage.requests')} value={count(summary.requests).text} title={count(summary.requests).title} trend={points.map((point) => point.requests)} />
+        <AnalyticsMetric label={t('usage.totalTokens')} value={totalTokens.text} title={totalTokens.title} />
         <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={t('traffic.success')} value={count(summary.successful_requests).text} title={count(summary.successful_requests).title} tone="positive" trend={points.map((point) => point.success)} ratio={successRate} />
-        <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={t('traffic.failure')} value={count(summary.failed_requests).text} title={count(summary.failed_requests).title} tone="negative" trend={points.map((point) => point.failed)} ratio={successRate === null ? null : 1 - successRate} />
+        <AnalyticsMetric label={t('usage.cacheRate')} value={formatPercent(cacheRate, locale)} ratio={cacheRate} />
         <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={t('usage.successRate')} value={formatPercent(successRate, locale)} ratio={successRate} />
         <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={t('usage.averageTps')} labelContent={<DetailTooltip content={tpsHint}><span tabIndex={0}>{t('usage.averageTps')}</span></DetailTooltip>} value={averageTps.text} title={averageTps.title} formatSample={(value) => formatTps(value, locale).title ?? formatTps(value, locale).text} trend={averageTpsTrend} />
         <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={displayTimeZone()} label={t('usage.average')} value={average.text} title={average.title} formatSample={value => analyticsDuration(value, locale).title ?? analyticsDuration(value, locale).text} trend={points.map((point) => point.avg_duration_ms)} />
