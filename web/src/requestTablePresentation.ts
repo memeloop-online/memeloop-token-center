@@ -15,6 +15,10 @@ export function requestFailed(request: RequestView): boolean {
   return !requestIsPending(request) && (Boolean(request.error_code) || (request.status_code ?? 0) >= 400);
 }
 
+function failedCostDefaultsToZero(request: RequestView): boolean {
+  return requestFailed(request) && request.usage_basis !== 'provider_reported';
+}
+
 /**
  * Pending usage is never actual: it is not yet settled and must not count toward
  * aggregate traffic. Failed requests only have actual usage when the provider
@@ -77,13 +81,13 @@ export function requestCostCopy(request: RequestView, locale: string) {
     label: zh ? '待结算' : 'Awaiting settlement',
     hint: zh ? '请求仍在进行中，费用尚未结算。' : 'The request is still in progress; cost has not been settled.',
   };
-  if (requestFailed(request) && request.usage_basis === 'not_observed') return {
+  if (failedCostDefaultsToZero(request)) return {
     unknown: false,
     ledgerLabel,
-    label: zh ? '未观测用量' : 'Usage not observed',
+    label: zh ? '费用按 0 计算' : 'Cost set to 0',
     hint: zh
-      ? '这是失败请求，未观测到供应商实际用量；本地计费默认按 0 显示。'
-      : 'This request failed without observed supplier usage; local billing defaults to 0.',
+      ? '请求失败，费用按 0 计算。供应商回传用量时，以对应结算金额为准。'
+      : 'The request failed, so its cost is 0. A provider-reported usage record keeps its settled amount.',
   };
   if (!requestUsageIsActual(request)) return {
     unknown: true, ledgerLabel,
@@ -108,9 +112,9 @@ export function requestCostCopy(request: RequestView, locale: string) {
   };
 }
 
-/** Failed requests without supplier evidence display the policy amount (zero) even before a historical rebate is posted. */
+/** Failed requests require provider-reported usage evidence to retain a settled amount. */
 export function requestDisplayedCost(request: RequestView): string {
-  return requestFailed(request) && request.usage_basis === 'not_observed' ? '0' : request.cost;
+  return failedCostDefaultsToZero(request) ? '0' : request.cost;
 }
 
 export function requestCredentialLabel(request: RequestView, fallback: string | undefined): { label: string } | { key: 'request.unnamedCredential' | 'request.missingCredential' } {
