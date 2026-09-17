@@ -73,7 +73,7 @@ test('plugin OAuth uses default client, full callback once, safe errors and isol
     await page.reload(); await start.click();
     await page.getByLabel('完整回调地址', { exact: true }).fill('http://localhost:8080/callback?code=fixture-code&state=fixture-state');
     await page.getByRole('button', { name: '完成授权', exact: true }).click();
-    await page.getByText('服务器仍在处理登录。不会自动重发；请稍后检查账号列表。', { exact: true }).waitFor();
+    await page.getByText('登录正在处理。请稍后查看账号列表。', { exact: true }).waitFor();
     assert.equal(reads, 2, 'pending exchange leaves account refresh to an explicit read-only check');
     assert.match(await page.locator('body').innerText(), /可继续接入至/);
     assert.equal(completes, 3);
