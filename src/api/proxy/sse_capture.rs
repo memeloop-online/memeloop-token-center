@@ -215,6 +215,7 @@ impl ResponsesSseCapture {
             .map_or_else(Vec::new, |delivery| std::mem::take(&mut delivery.frames)))
     }
 
+    #[cfg(test)]
     pub(super) fn finish_summary(self) -> ResponsesSseSummary {
         self.finish_summary_after_local_boundary(false)
     }
