@@ -418,17 +418,14 @@ fn downstream_modalities<'a>(
     provider_modalities: &'a [String],
 ) -> Vec<&'a str> {
     let openai_compatible_http = crate::provider::is_openai_compatible_http_driver(driver);
-    let siliconflow_video = driver == "http-json"
-        && serde_json::from_str::<Value>(config_json)
-            .ok()
-            .is_some_and(|config| {
-                crate::generation::is_siliconflow_video_profile(&config, upstream_model)
-            });
-    let builtin: &[&str] = match protocol {
-        "generation" if siliconflow_video => &["image", "video"],
-        "generation" if openai_compatible_http => &["image"],
-        "generation" if driver == "volcengine-seedance" => &["video"],
-        "generation" if driver == "comfyui" => &["image", "video"],
+    let generation_adapter = serde_json::from_str::<Value>(config_json)
+        .ok()
+        .and_then(|config| {
+            crate::generation::GenerationProtocolAdapter::detect(driver, &config, upstream_model)
+        });
+    let builtin: &[&str] = match (protocol, generation_adapter) {
+        ("generation", Some(adapter)) => adapter.catalog_modalities(),
+        ("generation", None) if openai_compatible_http => &["image"],
         _ => &[],
     };
     if !builtin.is_empty() {
@@ -458,13 +455,8 @@ fn generation_parameter_schema(
     config_json: &str,
 ) -> Option<Value> {
     let config: Value = serde_json::from_str(config_json).ok()?;
-    match driver {
-        "comfyui" => crate::generation::comfyui_parameter_schema(&config).ok(),
-        "http-json" if crate::generation::is_siliconflow_video_profile(&config, upstream_model) => {
-            Some(crate::generation::siliconflow_video_parameter_schema())
-        }
-        _ => None,
-    }
+    crate::generation::GenerationProtocolAdapter::detect(driver, &config, upstream_model)
+        .and_then(|adapter| adapter.parameter_schema(&config))
 }
 
 #[cfg(test)]

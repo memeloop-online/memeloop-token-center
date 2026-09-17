@@ -6,11 +6,13 @@ use serde_json::{Map, Value};
 mod attempt;
 mod comfyui_schema;
 pub(crate) mod group_routing;
+mod protocol;
 mod siliconflow_video_schema;
 pub use comfyui_schema::{
     effective_parameter_schema as comfyui_parameter_schema,
     validate_config as validate_comfyui_config, validate_parameters as validate_comfyui_parameters,
 };
+pub(crate) use protocol::{GenerationProtocolAdapter, normalize_seedance_duration};
 use sha2::{Digest, Sha256};
 pub(crate) use siliconflow_video_schema::{
     parameter_schema as siliconflow_video_parameter_schema,
@@ -89,18 +91,6 @@ fn provider_reference_aad(owner_kind: &str, owner_id: uuid::Uuid) -> Vec<u8> {
     aad.push(0);
     aad.extend_from_slice(owner_id.as_bytes());
     aad
-}
-
-pub(crate) fn is_siliconflow_video_profile(config: &Value, upstream_model: &str) -> bool {
-    config.get("video_api").and_then(Value::as_str) == Some("siliconflow-v1")
-        && config
-            .get("video_models")
-            .and_then(Value::as_array)
-            .is_some_and(|models| {
-                models
-                    .iter()
-                    .any(|model| model.as_str() == Some(upstream_model))
-            })
 }
 
 /// Begins a non-secret, uniquely tracked staging attempt. The durable digest
@@ -463,8 +453,9 @@ async fn cancel_upstream_generation(
 ) -> Result<(), AppError> {
     let upstream_job_id = validated_upstream_job_id(upstream_job_id)?;
     let outbound_http = route_http(state, route, &route.base_url).await?;
-    let (request, requires_delete_proof) = match route.driver.as_str() {
-        "volcengine-seedance" => {
+    let adapter = GenerationProtocolAdapter::for_route(route)?;
+    let (request, requires_delete_proof) = match adapter {
+        GenerationProtocolAdapter::SeedanceV3 => {
             let url = generation_url(
                 &route.base_url,
                 &[
@@ -478,7 +469,7 @@ async fn cancel_upstream_generation(
             )?;
             (outbound_http.delete(url), false)
         }
-        "comfyui" => {
+        GenerationProtocolAdapter::ComfyUi => {
             let prefix = comfy_prefix(route)?;
             if prefix == "/api" {
                 let url =
@@ -496,7 +487,9 @@ async fn cancel_upstream_generation(
                 )
             }
         }
-        _ => return Err(AppError::Upstream("unsupported generation driver".into())),
+        GenerationProtocolAdapter::SiliconFlowVideoV1 => {
+            return Err(AppError::Upstream("unsupported generation driver".into()));
+        }
     };
     let _upstream_activity = state
         .metrics
@@ -609,15 +602,16 @@ async fn submit_attempt(
         .and_then(Value::as_object)
         .cloned()
         .ok_or_else(|| AppError::Storage("generation input archive is invalid".into()))?;
-    let (path, id_field) = match route.driver.as_str() {
-        "volcengine-seedance" => {
+    let adapter = GenerationProtocolAdapter::for_route(route)?;
+    let (path, id_field) = match adapter {
+        GenerationProtocolAdapter::SeedanceV3 => {
             input.insert(
                 "model".to_owned(),
                 Value::String(job.upstream_model.clone()),
             );
             ("/api/v3/contents/generations/tasks".to_owned(), "id")
         }
-        "comfyui" => {
+        GenerationProtocolAdapter::ComfyUi => {
             let prefix = comfy_prefix(route)?;
             let workflow_id = route
                 .config
@@ -653,7 +647,7 @@ async fn submit_attempt(
             input = Map::from_iter([("prompt".to_owned(), workflow)]);
             (format!("{prefix}/prompt"), "prompt_id")
         }
-        "http-json" if is_siliconflow_video_profile(&route.config, &job.upstream_model) => {
+        GenerationProtocolAdapter::SiliconFlowVideoV1 => {
             let mut parameters = validate_siliconflow_video_parameters(&Value::Object(input))?;
             parameters.insert(
                 "model".to_owned(),
@@ -662,7 +656,6 @@ async fn submit_attempt(
             input = parameters;
             ("/video/submit".to_owned(), "requestId")
         }
-        _ => return Err(AppError::Upstream("unsupported generation driver".into())),
     };
     let outbound_http = route_http(state, route, &route.base_url).await?;
     let request = outbound_http
@@ -792,16 +785,17 @@ async fn poll(
     upstream_job_id: &str,
 ) -> Result<(), AppError> {
     let mut attempt = attempt::Attempt::new(state, worker_id, job, route);
-    let result = match route.driver.as_str() {
-        "volcengine-seedance" => {
+    let result = match GenerationProtocolAdapter::for_route(route)? {
+        GenerationProtocolAdapter::SeedanceV3 => {
             poll_seedance(state, worker_id, job, route, upstream_job_id, &mut attempt).await
         }
-        "comfyui" => poll_comfy(state, worker_id, job, route, upstream_job_id, &mut attempt).await,
-        "http-json" if is_siliconflow_video_profile(&route.config, &job.upstream_model) => {
+        GenerationProtocolAdapter::ComfyUi => {
+            poll_comfy(state, worker_id, job, route, upstream_job_id, &mut attempt).await
+        }
+        GenerationProtocolAdapter::SiliconFlowVideoV1 => {
             poll_siliconflow_video(state, worker_id, job, route, upstream_job_id, &mut attempt)
                 .await
         }
-        _ => Err(AppError::Upstream("unsupported generation driver".into())),
     };
     attempt.finish(result).await
 }
