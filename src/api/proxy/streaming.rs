@@ -27,6 +27,27 @@ enum StreamPoll<T> {
 // while avoiding a material per-request event rate.
 const CODEX_RESPONSES_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_MAX_PROXY_RESPONSE_BODY: usize;
+}
+
+fn streaming_response_body_limit() -> usize {
+    #[cfg(test)]
+    if let Ok(limit) = TEST_MAX_PROXY_RESPONSE_BODY.try_with(|limit| *limit) {
+        return limit;
+    }
+    MAX_PROXY_RESPONSE_BODY
+}
+
+#[cfg(test)]
+pub(super) async fn with_test_response_body_limit<T>(
+    limit: usize,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    TEST_MAX_PROXY_RESPONSE_BODY.scope(limit, future).await
+}
+
 async fn poll_upstream_or_downstream_closed<T>(
     body_sender: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
     upstream: impl std::future::Future<Output = T>,
@@ -136,6 +157,7 @@ pub(super) struct StreamingResponse<'a> {
 
 pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Response, AppError> {
     let diagnostic_context = proxy_diagnostics::Context::for_request(input.request_id);
+    let response_body_limit = streaming_response_body_limit();
     let StreamingResponse {
         state,
         upstream,
@@ -422,7 +444,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 raw_chunk.len(),
                             );
                             response_bytes = response_bytes.saturating_add(raw_chunk.len());
-                            if response_bytes > MAX_PROXY_RESPONSE_BODY {
+                            if response_bytes > response_body_limit {
                                 transport_error = Some(transport_error_with_downstream_precedence(
                                     downstream_closed_observed || body_sender.is_closed(),
                                     "upstream_response_too_large",
@@ -749,7 +771,11 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             if transport_error.is_some() {
                 drop(archive_sender.take());
             }
-            let sse_summary = sse_capture.map(ResponsesSseCapture::finish_summary);
+            let local_response_boundary =
+                transport_error.is_some_and(buffered_upstream::is_local_response_boundary);
+            let sse_summary = sse_capture.map(|capture| {
+                capture.finish_summary_after_local_boundary(local_response_boundary)
+            });
             let incomplete = matches!(
                 sse_summary.as_ref().map(|summary| &summary.outcome),
                 Some(ResponsesSseOutcome::Incomplete)

@@ -224,6 +224,21 @@ fn strict_chat_event_limit_does_not_turn_missing_terminal_usage_into_semantic_ev
 }
 
 #[test]
+fn strict_chat_total_size_boundary_does_not_turn_missing_terminal_usage_into_semantic_evidence() {
+    let mut capture = ResponsesSseCapture::for_openai_chat_usage();
+    capture
+        .push_delivery_frames(
+            b"data: {\"id\":\"chatcmpl-size\",\"object\":\"chat.completion.chunk\",\"model\":\"fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"valid output\"},\"finish_reason\":null}]}\n\n",
+        )
+        .unwrap();
+    let summary = capture.finish_summary_after_local_boundary(true);
+    assert!(summary.usage_invalid);
+    assert!(summary.observed_protocol_invalid);
+    assert!(!summary.independently_observed_protocol_invalid);
+    assert!(summary.protocol_invalid);
+}
+
+#[test]
 fn strict_chat_valid_prefix_is_not_confused_with_missing_final_usage() {
     let mut capture = ResponsesSseCapture::for_openai_chat_usage();
     let frames = capture.push_delivery_frames(

@@ -34,23 +34,31 @@ impl BoundedUpstreamError {
 }
 
 pub(super) fn upstream_error_health_terminal(error_code: &str) -> UpstreamAttemptTerminal {
-    if matches!(
+    if is_local_response_boundary(error_code)
+        || matches!(
+            error_code,
+            "upstream_timeout"
+                | "upstream_read_timeout"
+                | "upstream_request_timeout"
+                | "upstream_stream"
+                | "upstream_stream_read_error"
+        )
+    {
+        UpstreamAttemptTerminal::Inconclusive
+    } else {
+        UpstreamAttemptTerminal::invalid_response()
+    }
+}
+
+pub(super) fn is_local_response_boundary(error_code: &str) -> bool {
+    matches!(
         error_code,
         "upstream_response_event_too_large"
             | "upstream_response_event_batch_too_large"
             | "upstream_response_terminal_too_large"
             | "upstream_response_too_large"
             | "upstream_response_memory_capacity"
-            | "upstream_timeout"
-            | "upstream_read_timeout"
-            | "upstream_request_timeout"
-            | "upstream_stream"
-            | "upstream_stream_read_error"
-    ) {
-        UpstreamAttemptTerminal::Inconclusive
-    } else {
-        UpstreamAttemptTerminal::invalid_response()
-    }
+    )
 }
 
 pub(super) async fn read_bounded_upstream(

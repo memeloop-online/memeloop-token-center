@@ -215,7 +215,14 @@ impl ResponsesSseCapture {
             .map_or_else(Vec::new, |delivery| std::mem::take(&mut delivery.frames)))
     }
 
-    pub(super) fn finish_summary(mut self) -> ResponsesSseSummary {
+    pub(super) fn finish_summary(self) -> ResponsesSseSummary {
+        self.finish_summary_after_local_boundary(false)
+    }
+
+    pub(super) fn finish_summary_after_local_boundary(
+        mut self,
+        local_boundary: bool,
+    ) -> ResponsesSseSummary {
         if let Some(chat_usage) = self.chat_usage.as_ref() {
             self.usage = chat_usage.usage();
             let usage_invalid = chat_usage.usage_invalid();
@@ -223,8 +230,8 @@ impl ResponsesSseCapture {
             // before DONE and terminal usage. Keep that derived incompleteness
             // request-scoped; only an independently observed Chat schema or
             // sequence violation may still poison account health.
-            let independently_usage_invalid =
-                self.framing_rejection.is_none() || chat_usage.observed_semantic_invalidity();
+            let independently_usage_invalid = chat_usage.observed_semantic_invalidity()
+                || (!local_boundary && self.framing_rejection.is_none());
             self.usage_invalid |= usage_invalid;
             self.invalid |= usage_invalid;
             self.observed_protocol_invalid |= usage_invalid;
