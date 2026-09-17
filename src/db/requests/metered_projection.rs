@@ -252,7 +252,7 @@ async fn project_metered_request_fact_in_transaction(
                    upstream_account_id, model_route_id, modality, billing_unit,
                    currency, units)
                SELECT tenant_id, key_id, created_at / {divisor}, model, status_class,
-                      error_code, upstream_account_id, model_route_id, 'audio', 'second',
+                      error_code, upstream_account_id, model_route_id, 'audio', billing_unit,
                       currency, generation_units
                  FROM request_stats_facts
                 WHERE request_id = $1 AND protocol = 'audio-transcription'

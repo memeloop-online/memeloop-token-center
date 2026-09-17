@@ -1,6 +1,84 @@
 use super::super::*;
 
 #[tokio::test]
+async fn sqlite_v105_canonicalizes_audio_routes_and_separates_metered_units() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("openai-audio-v105.db").display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    for statement in [
+        "CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)",
+        "CREATE TABLE model_routes (id TEXT PRIMARY KEY, protocol TEXT NOT NULL)",
+        "CREATE TABLE usage_reservations (id TEXT PRIMARY KEY, reserved_tokens BIGINT NOT NULL, status TEXT NOT NULL)",
+        "CREATE TABLE rate_limit_windows (key_id TEXT NOT NULL, window_start BIGINT NOT NULL, requests BIGINT NOT NULL, tokens BIGINT NOT NULL, PRIMARY KEY(key_id, window_start))",
+        "CREATE TABLE request_records (id TEXT PRIMARY KEY, reservation_id TEXT NOT NULL, key_id TEXT NOT NULL, created_at BIGINT NOT NULL, protocol TEXT NOT NULL, input_tokens BIGINT NOT NULL, cached_input_tokens BIGINT NOT NULL, cache_write_tokens BIGINT NOT NULL, output_tokens BIGINT NOT NULL)",
+        "CREATE TABLE request_stats_facts (request_id TEXT PRIMARY KEY, protocol TEXT NOT NULL, input_tokens BIGINT NOT NULL, cached_input_tokens BIGINT NOT NULL, cache_write_tokens BIGINT NOT NULL, output_tokens BIGINT NOT NULL, generation_units BIGINT NOT NULL DEFAULT 0)",
+        "INSERT INTO model_routes VALUES ('route-a', 'audio')",
+        "INSERT INTO usage_reservations VALUES ('reservation-a', 7, 'settled')",
+        "INSERT INTO rate_limit_windows VALUES ('key-a', 60000, 2, 12)",
+        "INSERT INTO request_records VALUES ('request-a', 'reservation-a', 'key-a', 61000, 'audio-transcription', 0, 0, 0, 7)",
+        "INSERT INTO request_stats_facts VALUES ('request-a', 'audio-transcription', 0, 0, 0, 7, 0)",
+    ] {
+        sqlx::query(statement)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+    let mut transaction = database.pool.begin().await.unwrap();
+    apply_migration_range(&mut transaction, SQLITE_MIGRATIONS, 105, 105)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT protocol FROM model_routes WHERE id = 'route-a'")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap(),
+        "openai-audio"
+    );
+    let reservation = sqlx::query(
+        "SELECT reserved_tokens, reserved_units, billing_unit FROM usage_reservations WHERE id = 'reservation-a'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(reservation.get::<i64, _>("reserved_tokens"), 0);
+    assert_eq!(reservation.get::<i64, _>("reserved_units"), 7);
+    assert_eq!(reservation.get::<String, _>("billing_unit"), "second");
+    let request = sqlx::query(
+        "SELECT output_tokens, billed_units, billing_unit FROM request_records WHERE id = 'request-a'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(request.get::<i64, _>("output_tokens"), 0);
+    assert_eq!(request.get::<i64, _>("billed_units"), 7);
+    assert_eq!(request.get::<String, _>("billing_unit"), "second");
+    let fact = sqlx::query(
+        "SELECT output_tokens, generation_units, billing_unit FROM request_stats_facts WHERE request_id = 'request-a'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(fact.get::<i64, _>("output_tokens"), 0);
+    assert_eq!(fact.get::<i64, _>("generation_units"), 7);
+    assert_eq!(fact.get::<String, _>("billing_unit"), "second");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT tokens FROM rate_limit_windows WHERE key_id = 'key-a' AND window_start = 60000",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap(),
+        5,
+        "only the legacy audio seconds are removed from the shared TPM window"
+    );
+}
+
+#[tokio::test]
 async fn sqlite_v66_preserves_existing_upstream_cooldown_and_probe_lease() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(

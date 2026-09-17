@@ -810,12 +810,12 @@ impl Database {
         {
             sqlx::query(
                 r#"SELECT id, created_at, completed_at, source_completed_at, protocol, model, status_code, duration_ms, first_output_ms, generation_duration_ms,
-                          usage_basis, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens,
+                          usage_basis, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, billed_units, billing_unit,
                           cost_micros, currency, error_code, archive_state,
                           source_kind, provenance_kind, archive_source, external_request_id
                      FROM (
                          SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms,
-                                r.usage_basis, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens,
+                                r.usage_basis, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.billed_units, r.billing_unit,
                                 r.cost_micros, r.currency, r.error_code,
                                 CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state,
                                 'live' AS source_kind, 'native' AS provenance_kind,
@@ -833,6 +833,7 @@ impl Database {
                                 status_code, duration_ms, CAST(NULL AS BIGINT) AS first_output_ms, CAST(NULL AS BIGINT) AS generation_duration_ms, CAST(NULL AS TEXT) AS usage_basis, input_tokens,
                                 CAST(0 AS BIGINT) AS cached_input_tokens,
                                 CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens,
+                                CAST(0 AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit,
                                 CAST(0 AS BIGINT), NULL AS currency, error_code,
                                 CASE WHEN request_object IS NULL OR request_object LIKE 'gap://%'
                                            OR response_object IS NULL OR response_object LIKE 'gap://%'
@@ -854,12 +855,12 @@ impl Database {
         } else {
             sqlx::query(
                 r#"SELECT id, created_at, completed_at, source_completed_at, protocol, model, status_code, duration_ms, first_output_ms, generation_duration_ms,
-                          usage_basis, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens,
+                          usage_basis, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, billed_units, billing_unit,
                           cost_micros, currency, error_code, archive_state,
                           source_kind, provenance_kind, archive_source, external_request_id
                      FROM (
                          SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms,
-                                r.usage_basis, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens,
+                                r.usage_basis, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.billed_units, r.billing_unit,
                                 r.cost_micros, r.currency, r.error_code,
                                 CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state,
                                 'live' AS source_kind, 'native' AS provenance_kind,
@@ -877,6 +878,7 @@ impl Database {
                                 status_code, duration_ms, CAST(NULL AS BIGINT) AS first_output_ms, CAST(NULL AS BIGINT) AS generation_duration_ms, CAST(NULL AS TEXT) AS usage_basis, input_tokens,
                                 CAST(0 AS BIGINT) AS cached_input_tokens,
                                 CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens,
+                                CAST(0 AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit,
                                 CAST(0 AS BIGINT), NULL AS currency, error_code,
                                 CASE WHEN request_object IS NULL OR request_object LIKE 'gap://%'
                                            OR response_object IS NULL OR response_object LIKE 'gap://%'
@@ -929,14 +931,17 @@ impl Database {
                         row.try_get("currency")?,
                     );
                 if audio_transcription {
-                    let billed_units = usage
-                        .tokens
-                        .as_ref()
-                        .and_then(|tokens| tokens.output_tokens);
                     usage.tokens = None;
                     usage.generation = Some(RequestGenerationUsageView {
-                        billed_units,
-                        billing_unit: Some("second".to_owned()),
+                        billed_units: completed_at
+                            .is_some()
+                            .then(|| row.try_get::<i64, _>("billed_units"))
+                            .transpose()?,
+                        billing_unit: completed_at
+                            .is_some()
+                            .then(|| row.try_get::<String, _>("billing_unit"))
+                            .transpose()?
+                            .filter(|value| !value.is_empty()),
                     });
                 }
                 Ok(ConversationRequestView {

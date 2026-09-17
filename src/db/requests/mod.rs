@@ -33,7 +33,8 @@ pub(crate) use queries::{
 pub(crate) use session_routing::{SessionRoutingTerminalInput, is_session_avoid_terminal};
 pub use settlement::normalize_proxy_usage;
 pub(crate) use settlement::{
-    price_token_usage, reserve_usage_in_transaction, settle_confirmed_image_charge_in_transaction,
+    price_token_usage, reserve_metered_usage_with_id_in_transaction, reserve_usage_in_transaction,
+    settle_confirmed_image_charge_in_transaction, settle_metered_usage_in_transaction,
     settle_token_usage_in_transaction,
 };
 pub use stats::StatsFilter;

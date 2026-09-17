@@ -1653,6 +1653,17 @@ pub struct UsageReservation {
     pub reserved_tokens: i64,
 }
 
+/// Reservation for a synchronous request priced in provider-defined units.
+/// The embedded usage reservation owns balance, budget, RPM, and concurrency
+/// admission; metered quantities remain outside token fields and TPM windows.
+#[derive(Clone, Debug)]
+pub struct MeteredUsageReservation {
+    pub reservation: UsageReservation,
+    pub unit_ceiling: i64,
+    pub billing_unit: String,
+    pub micros_per_unit: i64,
+}
+
 pub fn micros_to_decimal_string(micros: i64) -> String {
     let sign = if micros < 0 { "-" } else { "" };
     let absolute = micros.unsigned_abs();

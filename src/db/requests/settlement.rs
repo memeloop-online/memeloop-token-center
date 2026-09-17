@@ -97,7 +97,7 @@ impl Database {
         sqlx::query("UPDATE request_records SET submission_uncertain_at = $1, error_code = 'image_submission_uncertain' WHERE completed_at IS NULL AND submission_started_at IS NOT NULL AND submission_uncertain_at IS NULL AND id IN (SELECT q.id FROM request_records q WHERE q.created_at < $2 AND q.completed_at IS NULL AND q.submission_started_at IS NOT NULL AND q.submission_uncertain_at IS NULL AND NOT EXISTS (SELECT 1 FROM synchronous_image_idempotency s WHERE s.request_id = q.id AND s.key_id = q.key_id AND s.status = 'pending' AND s.lease_expires_at > $1) ORDER BY q.created_at, q.id LIMIT $3)")
             .bind(now).bind(cutoff).bind(limit.clamp(1, 1000)).execute(&self.pool).await?;
         let rows = sqlx::query(
-            "SELECT r.id, r.account_id, r.key_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.rate_window_start, q.id AS request_id, q.created_at AS request_created_at, q.tenant_id AS request_tenant_id, q.error_code AS pending_error_code, q.input_tokens AS pending_input_tokens, q.output_tokens AS pending_output_tokens, q.service_tier AS pending_service_tier FROM usage_reservations r LEFT JOIN request_records q ON q.reservation_id = r.id WHERE (r.status = 'reserved' OR (r.status = 'settled' AND q.id IS NOT NULL)) AND r.created_at < $1 AND q.completed_at IS NULL AND q.submission_started_at IS NULL AND NOT EXISTS (SELECT 1 FROM generation_jobs g WHERE g.reservation_id = r.id) AND NOT EXISTS (SELECT 1 FROM synchronous_image_idempotency s WHERE s.reservation_id = r.id AND s.status = 'pending' AND s.lease_expires_at > $2) ORDER BY r.created_at, r.id LIMIT $3",
+            "SELECT r.id, r.account_id, r.key_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.reserved_units, r.billing_unit, r.micros_per_unit, r.rate_window_start, q.id AS request_id, q.created_at AS request_created_at, q.tenant_id AS request_tenant_id, q.error_code AS pending_error_code, q.input_tokens AS pending_input_tokens, q.output_tokens AS pending_output_tokens, q.service_tier AS pending_service_tier FROM usage_reservations r LEFT JOIN request_records q ON q.reservation_id = r.id WHERE (r.status = 'reserved' OR (r.status = 'settled' AND q.id IS NOT NULL)) AND r.created_at < $1 AND q.completed_at IS NULL AND q.submission_started_at IS NULL AND NOT EXISTS (SELECT 1 FROM generation_jobs g WHERE g.reservation_id = r.id) AND NOT EXISTS (SELECT 1 FROM synchronous_image_idempotency s WHERE s.reservation_id = r.id AND s.status = 'pending' AND s.lease_expires_at > $2) ORDER BY r.created_at, r.id LIMIT $3",
         )
         .bind(cutoff)
         .bind(now)
@@ -130,6 +130,15 @@ impl Database {
                 rate_window_start: row.try_get("rate_window_start")?,
                 reserved_tokens: row.try_get("reserved_tokens")?,
             };
+            let reserved_units: i64 = row.try_get("reserved_units")?;
+            let billing_unit: String = row.try_get("billing_unit")?;
+            let micros_per_unit: i64 = row.try_get("micros_per_unit")?;
+            let metered_reservation = (reserved_units > 0).then(|| MeteredUsageReservation {
+                reservation: reservation.clone(),
+                unit_ceiling: reserved_units,
+                billing_unit,
+                micros_per_unit,
+            });
             if let Some(request_id) = request_id {
                 let tenant_id = request_tenant_id.ok_or(AppError::Internal)?;
                 let response_object = format!("gap://{request_id}/response");
@@ -153,8 +162,25 @@ impl Database {
                     .then(|| row.try_get::<Option<String>, _>("pending_service_tier"))
                     .transpose()?
                     .flatten();
-                let result = self
-                    .finish_proxy_request(FinishProxyRequest {
+                let duration_ms = request_created_at
+                    .map(|created_at| now.saturating_sub(created_at))
+                    .unwrap_or_default();
+                let result = if let Some(metered_reservation) = metered_reservation.as_ref() {
+                    self.finish_metered_synchronous_request(FinishMeteredSynchronousRequest {
+                        request_id,
+                        tenant_id,
+                        reservation: metered_reservation,
+                        unit_ceiling: metered_reservation.unit_ceiling,
+                        billed_units: 0,
+                        generation_duration_ms: None,
+                        status_code: 504,
+                        duration_ms,
+                        error_code: Some("request_expired"),
+                        response_object: &response_object,
+                    })
+                    .await
+                } else {
+                    self.finish_proxy_request(FinishProxyRequest {
                         usage_basis: Some(crate::model::RequestUsageBasis::NotObserved),
                         first_output_ms: None,
                         generation_duration_ms: None,
@@ -165,9 +191,7 @@ impl Database {
                         output_token_ceiling,
                         requested_service_tier: requested_service_tier.as_deref(),
                         status_code: 504,
-                        duration_ms: request_created_at
-                            .map(|created_at| now.saturating_sub(created_at))
-                            .unwrap_or_default(),
+                        duration_ms,
                         usage: TokenUsage::default(),
                         error_code: Some("request_expired"),
                         response_object: &response_object,
@@ -175,7 +199,8 @@ impl Database {
                         routing_terminal_observed_at: None,
                         conversation: None,
                     })
-                    .await;
+                    .await
+                };
                 let result = match result {
                     Ok(result) => result,
                     Err(AppError::Conflict(_)) => continue,
@@ -372,21 +397,127 @@ pub(crate) async fn reserve_usage_with_id_in_transaction(
 ) -> Result<UsageReservation, AppError> {
     let (reserved_micros, reserved_tokens) =
         reservation_ceiling_amounts(price, input_token_ceiling, output_token_ceiling)?;
+    reserve_usage_contract_with_id_in_transaction(
+        tx,
+        key,
+        ReservationContract {
+            price_id: price.id,
+            reserved_micros,
+            reserved_tokens,
+            enforce_tpm: true,
+            reserved_units: 0,
+            billing_unit: "",
+            micros_per_unit: 0,
+            price_snapshot_json: serde_json::to_string(price).map_err(|_| AppError::Internal)?,
+            input_micros_per_million: price.input_micros_per_million,
+            output_micros_per_million: price.output_micros_per_million,
+            price_tiers: price.tiers.clone(),
+        },
+        now,
+        id,
+    )
+    .await
+}
+
+pub(crate) async fn reserve_metered_usage_with_id_in_transaction(
+    tx: &mut Transaction<'_, Any>,
+    key: &AuthenticatedKey,
+    price: &GenerationPrice,
+    unit_ceiling: i64,
+    now: i64,
+    id: Uuid,
+) -> Result<MeteredUsageReservation, AppError> {
+    if unit_ceiling <= 0 || price.billing_unit.trim().is_empty() || price.micros_per_unit < 0 {
+        return Err(AppError::BadRequest(
+            "metered request requires a positive unit ceiling and billing unit".into(),
+        ));
+    }
+    let reserved_micros =
+        unit_ceiling
+            .checked_mul(price.micros_per_unit)
+            .ok_or(AppError::LimitExceeded {
+                reason: LimitReason::BalanceExhausted,
+                retry_after_seconds: None,
+            })?;
+    let reservation = reserve_usage_contract_with_id_in_transaction(
+        tx,
+        key,
+        ReservationContract {
+            price_id: price.id,
+            reserved_micros,
+            reserved_tokens: 0,
+            enforce_tpm: false,
+            reserved_units: unit_ceiling,
+            billing_unit: &price.billing_unit,
+            micros_per_unit: price.micros_per_unit,
+            price_snapshot_json: serde_json::to_string(price).map_err(|_| AppError::Internal)?,
+            input_micros_per_million: 0,
+            output_micros_per_million: 0,
+            price_tiers: Vec::new(),
+        },
+        now,
+        id,
+    )
+    .await?;
+    Ok(MeteredUsageReservation {
+        reservation,
+        unit_ceiling,
+        billing_unit: price.billing_unit.clone(),
+        micros_per_unit: price.micros_per_unit,
+    })
+}
+
+struct ReservationContract<'a> {
+    price_id: Uuid,
+    reserved_micros: i64,
+    reserved_tokens: i64,
+    enforce_tpm: bool,
+    reserved_units: i64,
+    billing_unit: &'a str,
+    micros_per_unit: i64,
+    price_snapshot_json: String,
+    input_micros_per_million: i64,
+    output_micros_per_million: i64,
+    price_tiers: Vec<ModelPriceTier>,
+}
+
+async fn reserve_usage_contract_with_id_in_transaction(
+    tx: &mut Transaction<'_, Any>,
+    key: &AuthenticatedKey,
+    contract: ReservationContract<'_>,
+    now: i64,
+    id: Uuid,
+) -> Result<UsageReservation, AppError> {
+    let ReservationContract {
+        price_id,
+        reserved_micros,
+        reserved_tokens,
+        enforce_tpm,
+        reserved_units,
+        billing_unit,
+        micros_per_unit,
+        price_snapshot_json,
+        input_micros_per_million,
+        output_micros_per_million,
+        price_tiers,
+    } = contract;
     let window_start = now / 60_000 * 60_000;
     if !key.policy.enforcement_mode.enforces_prepaid_limits() {
-        let price_snapshot_json = serde_json::to_string(price).map_err(|_| AppError::Internal)?;
         sqlx::query(
-            "INSERT INTO usage_reservations (id, account_id, key_id, price_id, reserved_micros, reserved_tokens, rate_window_start, status, created_at, price_snapshot_json, enforcement_mode) VALUES ($1, $2, $3, $4, $5, $6, $7, 'reserved', $8, $9, $10)",
+            "INSERT INTO usage_reservations (id, account_id, key_id, price_id, reserved_micros, reserved_tokens, reserved_units, billing_unit, micros_per_unit, rate_window_start, status, created_at, price_snapshot_json, enforcement_mode) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'reserved', $11, $12, $13)",
         )
         .bind(id.to_string())
         .bind(key.account_id.to_string())
         .bind(key.key_id.to_string())
-        .bind(price.id.to_string())
+        .bind(price_id.to_string())
         .bind(reserved_micros)
         .bind(reserved_tokens)
+        .bind(reserved_units)
+        .bind(billing_unit)
+        .bind(micros_per_unit)
         .bind(window_start)
         .bind(now)
-        .bind(price_snapshot_json)
+        .bind(&price_snapshot_json)
         .bind(key.policy.enforcement_mode.as_str())
         .execute(&mut **tx)
         .await?;
@@ -396,14 +527,14 @@ pub(crate) async fn reserve_usage_with_id_in_transaction(
             key_id: key.key_id,
             enforcement_mode: key.policy.enforcement_mode,
             reserved_micros,
-            input_micros_per_million: price.input_micros_per_million,
-            output_micros_per_million: price.output_micros_per_million,
-            price_tiers: price.tiers.clone(),
+            input_micros_per_million,
+            output_micros_per_million,
+            price_tiers,
             rate_window_start: window_start,
             reserved_tokens,
         });
     }
-    if reserved_tokens > key.policy.tokens_per_minute as i64 {
+    if enforce_tpm && reserved_tokens > key.policy.tokens_per_minute as i64 {
         return Err(AppError::LimitExceeded {
             reason: LimitReason::TpmExhausted,
             retry_after_seconds: Some(retry_after_until(now / 60_000 * 60_000 + 60_000, now)),
@@ -492,18 +623,29 @@ pub(crate) async fn reserve_usage_with_id_in_transaction(
         });
     }
 
-    let rate_result = sqlx::query(
-        "INSERT INTO rate_limit_windows (key_id, window_start, requests, tokens) VALUES ($1, $2, 1, $3) ON CONFLICT(key_id, window_start) DO UPDATE SET requests = rate_limit_windows.requests + 1, tokens = rate_limit_windows.tokens + $4 WHERE rate_limit_windows.requests < $5 AND rate_limit_windows.tokens + $6 <= $7",
-    )
-    .bind(key.key_id.to_string())
-    .bind(window_start)
-    .bind(reserved_tokens)
-    .bind(reserved_tokens)
-    .bind(i64::from(key.policy.requests_per_minute))
-    .bind(reserved_tokens)
-    .bind(key.policy.tokens_per_minute as i64)
-    .execute(&mut **tx)
-    .await?;
+    let rate_result = if enforce_tpm {
+        sqlx::query(
+            "INSERT INTO rate_limit_windows (key_id, window_start, requests, tokens) VALUES ($1, $2, 1, $3) ON CONFLICT(key_id, window_start) DO UPDATE SET requests = rate_limit_windows.requests + 1, tokens = rate_limit_windows.tokens + $4 WHERE rate_limit_windows.requests < $5 AND rate_limit_windows.tokens + $6 <= $7",
+        )
+        .bind(key.key_id.to_string())
+        .bind(window_start)
+        .bind(reserved_tokens)
+        .bind(reserved_tokens)
+        .bind(i64::from(key.policy.requests_per_minute))
+        .bind(reserved_tokens)
+        .bind(key.policy.tokens_per_minute as i64)
+        .execute(&mut **tx)
+        .await?
+    } else {
+        sqlx::query(
+            "INSERT INTO rate_limit_windows (key_id, window_start, requests, tokens) VALUES ($1, $2, 1, 0) ON CONFLICT(key_id, window_start) DO UPDATE SET requests = rate_limit_windows.requests + 1 WHERE rate_limit_windows.requests < $3",
+        )
+        .bind(key.key_id.to_string())
+        .bind(window_start)
+        .bind(i64::from(key.policy.requests_per_minute))
+        .execute(&mut **tx)
+        .await?
+    };
     if rate_result.rows_affected() == 0 {
         let window = sqlx::query(
             "SELECT requests, tokens FROM rate_limit_windows WHERE key_id = $1 AND window_start = $2",
@@ -512,12 +654,13 @@ pub(crate) async fn reserve_usage_with_id_in_transaction(
         .bind(window_start)
         .fetch_one(&mut **tx)
         .await?;
-        let reason =
-            if window.try_get::<i64, _>("requests")? >= i64::from(key.policy.requests_per_minute) {
-                LimitReason::RpmExhausted
-            } else {
-                LimitReason::TpmExhausted
-            };
+        let reason = if !enforce_tpm
+            || window.try_get::<i64, _>("requests")? >= i64::from(key.policy.requests_per_minute)
+        {
+            LimitReason::RpmExhausted
+        } else {
+            LimitReason::TpmExhausted
+        };
         return Err(AppError::LimitExceeded {
             reason,
             retry_after_seconds: Some(retry_after_until(window_start + 60_000, now)),
@@ -549,19 +692,21 @@ pub(crate) async fn reserve_usage_with_id_in_transaction(
     .bind(key.key_id.to_string())
     .execute(&mut **tx)
     .await?;
-    let price_snapshot_json = serde_json::to_string(price).map_err(|_| AppError::Internal)?;
     sqlx::query(
-        "INSERT INTO usage_reservations (id, account_id, key_id, price_id, reserved_micros, reserved_tokens, rate_window_start, status, created_at, price_snapshot_json, enforcement_mode) VALUES ($1, $2, $3, $4, $5, $6, $7, 'reserved', $8, $9, $10)",
+        "INSERT INTO usage_reservations (id, account_id, key_id, price_id, reserved_micros, reserved_tokens, reserved_units, billing_unit, micros_per_unit, rate_window_start, status, created_at, price_snapshot_json, enforcement_mode) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'reserved', $11, $12, $13)",
     )
     .bind(id.to_string())
     .bind(key.account_id.to_string())
     .bind(key.key_id.to_string())
-    .bind(price.id.to_string())
+    .bind(price_id.to_string())
     .bind(reserved_micros)
     .bind(reserved_tokens)
+    .bind(reserved_units)
+    .bind(billing_unit)
+    .bind(micros_per_unit)
     .bind(window_start)
     .bind(now)
-    .bind(price_snapshot_json)
+    .bind(&price_snapshot_json)
     .bind(key.policy.enforcement_mode.as_str())
     .execute(&mut **tx)
     .await?;
@@ -571,9 +716,9 @@ pub(crate) async fn reserve_usage_with_id_in_transaction(
         key_id: key.key_id,
         enforcement_mode: key.policy.enforcement_mode,
         reserved_micros,
-        input_micros_per_million: price.input_micros_per_million,
-        output_micros_per_million: price.output_micros_per_million,
-        price_tiers: price.tiers.clone(),
+        input_micros_per_million,
+        output_micros_per_million,
+        price_tiers,
         rate_window_start: window_start,
         reserved_tokens,
     })
@@ -788,6 +933,30 @@ pub(crate) async fn settle_token_usage_in_transaction(
     now: i64,
 ) -> Result<i64, AppError> {
     settle_token_usage_with_explicit_charge(tx, reservation, usage, now, None).await
+}
+
+pub(crate) async fn settle_metered_usage_in_transaction(
+    tx: &mut Transaction<'_, Any>,
+    reservation: &MeteredUsageReservation,
+    billed_units: i64,
+    now: i64,
+) -> Result<i64, AppError> {
+    if billed_units < 0 || billed_units > reservation.unit_ceiling {
+        return Err(AppError::BadRequest(
+            "metered request usage exceeds its admitted unit ceiling".into(),
+        ));
+    }
+    let actual_micros = billed_units
+        .checked_mul(reservation.micros_per_unit)
+        .ok_or(AppError::Internal)?;
+    settle_token_usage_with_explicit_charge(
+        tx,
+        &reservation.reservation,
+        &TokenUsage::default(),
+        now,
+        Some(actual_micros),
+    )
+    .await
 }
 
 pub(crate) async fn settle_confirmed_image_charge_in_transaction(

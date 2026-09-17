@@ -5641,9 +5641,13 @@ paths:
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '408': { $ref: '#/components/responses/RequestTimeout' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '424': { $ref: '#/components/responses/UnpricedModel' }
         '429': { $ref: '#/components/responses/UsageRejected' }
         '502': { $ref: '#/components/responses/UpstreamError' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
   /v1/messages:
     post:
@@ -6159,6 +6163,38 @@ components:
           schema: { $ref: '#/components/schemas/Group' }
     InvalidRequest:
       description: Invalid JSON, field, state transition, idempotency reuse, or unsupported operation.
+      headers:
+        X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+        X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    RequestTimeout:
+      description: The bounded request body or upstream response deadline expired.
+      headers:
+        X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+        X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    PayloadTooLarge:
+      description: The multipart body, audio file, field, or upstream response exceeded its configured bound.
+      headers:
+        X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+        X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    UnsupportedMediaType:
+      description: Content encoding, multipart media type, or audio representation is not supported.
+      headers:
+        X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+        X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    ServiceUnavailable:
+      description: Bounded body admission or a required internal service is temporarily unavailable.
       headers:
         X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
         X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
@@ -9899,7 +9935,9 @@ components:
       required: [text, duration, segments]
       properties:
         text: { type: string }
-        duration: { type: number, minimum: 0, description: Trusted input WAV duration in seconds. }
+        task: { type: string }
+        language: { type: string }
+        duration: { type: number, minimum: 0, description: Upstream-reported duration when present, otherwise the trusted input WAV duration in seconds. }
         segments:
           type: array
           items:
@@ -9907,9 +9945,27 @@ components:
             additionalProperties: false
             required: [start, end, text]
             properties:
+              id: { type: integer, minimum: 0 }
+              seek: { type: integer, minimum: 0 }
               start: { type: number, minimum: 0 }
               end: { type: number, minimum: 0 }
               text: { type: string }
+              tokens: { type: array, maxItems: 1000000, items: { type: integer, minimum: 0 } }
+              temperature: { type: number }
+              avg_logprob: { type: number }
+              compression_ratio: { type: number }
+              no_speech_prob: { type: number }
+        words:
+          type: array
+          maxItems: 1000000
+          items:
+            type: object
+            additionalProperties: false
+            required: [word, start, end]
+            properties:
+              word: { type: string }
+              start: { type: number, minimum: 0 }
+              end: { type: number, minimum: 0 }
     AnthropicMessageRequest:
       type: object
       required: [model, messages]
