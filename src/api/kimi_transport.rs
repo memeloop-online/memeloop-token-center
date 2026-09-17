@@ -75,7 +75,11 @@ pub(super) fn prepare_kimi_responses(
     model: &str,
     request: &mut Value,
 ) -> Result<super::responses_via_chat::Context, AppError> {
-    let context = super::responses_via_chat::prepare(&normalize_model(model), request)?;
+    let context = super::responses_via_chat::prepare_with_dialect(
+        &normalize_model(model),
+        request,
+        super::responses_via_chat::UsageDialect::Kimi,
+    )?;
     messages::repair(request);
     Ok(context)
 }

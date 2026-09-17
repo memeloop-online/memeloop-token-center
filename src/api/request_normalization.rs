@@ -19,29 +19,7 @@ pub(super) fn is_official_codex_user_agent(headers: &HeaderMap) -> bool {
     let Ok(user_agent) = value.to_str() else {
         return false;
     };
-    let user_agent = user_agent.trim();
-    if user_agent == "codex_cli_rs" {
-        return true;
-    }
-    let Some((originator, version_and_details)) = user_agent.split_once('/') else {
-        return false;
-    };
-    let Some(version) = version_and_details.split_whitespace().next() else {
-        return false;
-    };
-    if version.is_empty()
-        || !version
-            .as_bytes()
-            .first()
-            .is_some_and(|byte| byte.is_ascii_digit())
-    {
-        return false;
-    }
-    (originator.starts_with("Codex ") && originator.len() > "Codex ".len())
-        || matches!(
-            originator,
-            "codex-tui" | "codex_vscode" | "codex_atlas" | "codex_chatgpt_desktop" | "codex_cli_rs"
-        )
+    crate::api::codex_transport::is_first_party_codex_user_agent(user_agent)
 }
 
 /// Normalize the subset of Codex MultiAgentV2 request shapes that a declared
@@ -222,10 +200,13 @@ mod tests {
         for user_agent in [
             "Codex Desktop/1.2.3",
             "Codex Work/0.154.0 (Linux; x86_64)",
+            "Codex Work/0.154.0-dev",
             "codex-tui/0.1.0",
             "codex_vscode/0.154.0",
             "codex_atlas/0.154.0",
             "codex_chatgpt_desktop/0.154.0",
+            "codex-chrome-extension-sidepanel/0.154.0",
+            "codex-chrome-extension-sidepanel/0.154.0-dev",
             "codex_cli_rs",
             "codex_cli_rs/0.1.0",
         ] {
@@ -239,6 +220,9 @@ mod tests {
             "Codex /0.154.0",
             "Codex Work",
             "Codex Work/not-a-version",
+            "codex-chrome-extension-sidepanel",
+            "codex-chrome-extension-sidepanel/not-a-version",
+            "codex_vscode/1junk",
             "codex_cli_rs-other",
             "codex_vscode",
             "codex_vscode-not-versioned",

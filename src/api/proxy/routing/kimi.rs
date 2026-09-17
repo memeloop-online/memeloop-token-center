@@ -453,7 +453,7 @@ mod tests {
         let (_server, response) = mock_response(body).await;
         let translated = translate(
             response,
-            responses_via_chat::Context::new(&json!({"model":"kimi-k3"})),
+            responses_via_chat::Context::for_kimi(&json!({"model":"kimi-k3"})),
             true,
             true,
         )
@@ -485,7 +485,7 @@ mod tests {
             let (_server, response) = mock_response(body).await;
             let translated = translate(
                 response,
-                responses_via_chat::Context::new(&json!({"model":"kimi-k3"})),
+                responses_via_chat::Context::for_kimi(&json!({"model":"kimi-k3"})),
                 true,
                 true,
             )

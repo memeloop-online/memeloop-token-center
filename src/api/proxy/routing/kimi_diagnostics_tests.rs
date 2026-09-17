@@ -8,7 +8,7 @@ fn state() -> StreamState {
         upstream: Box::pin(futures_util::stream::empty()),
         framer: BoundedSseFramer::default(),
         usage: ChatSseUsageState::for_kimi(),
-        translator: responses_via_chat::Stream::new(responses_via_chat::Context::new(
+        translator: responses_via_chat::Stream::new(responses_via_chat::Context::for_kimi(
             &json!({"model":"kimi-k3"}),
         )),
         pending: VecDeque::new(),
@@ -57,7 +57,7 @@ fn translation_reasons_distinguish_usage_finish_and_limits_without_payload() {
     // Schema rejection now happens before any translator output is created.
     assert!(state.pending.is_empty());
     assert_eq!(state.translator.finish(), Err("empty_stream"));
-    let mut translator = responses_via_chat::Stream::new(responses_via_chat::Context::new(
+    let mut translator = responses_via_chat::Stream::new(responses_via_chat::Context::for_kimi(
         &json!({"model":"kimi-k3"}),
     ));
     translator
@@ -67,7 +67,7 @@ fn translation_reasons_distinguish_usage_finish_and_limits_without_payload() {
     let incomplete = String::from_utf8(translator.finish().unwrap().concat()).unwrap();
     assert!(incomplete.contains("response.incomplete"));
     assert!(!incomplete.contains("response.completed"));
-    let mut translator = responses_via_chat::Stream::new(responses_via_chat::Context::new(
+    let mut translator = responses_via_chat::Stream::new(responses_via_chat::Context::for_kimi(
         &json!({"model":"kimi-k3"}),
     ));
     translator

@@ -43,7 +43,7 @@ async fn translated_kimi_clean_eof_and_done_settle_and_archive_once() {
             .unwrap();
         let translated = routing::kimi::translate(
             raw,
-            crate::api::responses_via_chat::Context::new(&json!({"model":fixture.model})),
+            crate::api::responses_via_chat::Context::for_kimi(&json!({"model":fixture.model})),
             true,
             true,
         )
@@ -149,7 +149,7 @@ async fn kimi_translation_clears_length_and_uses_complete_unknown_length_memory_
         .await
         .unwrap();
     assert!(response.content_length().is_some());
-    let context = crate::api::responses_via_chat::Context::new(&json!({"model":"kimi"}));
+    let context = crate::api::responses_via_chat::Context::for_kimi(&json!({"model":"kimi"}));
     let translated = routing::kimi::translate(response, context, false, true).unwrap();
     assert!(translated.content_length().is_none());
     let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(
@@ -207,14 +207,29 @@ async fn generic_via_chat_provider_uses_chat_endpoint_credentials_and_reverse_ma
     )
     .await;
 
-    let mut fake_provider = fixture
+    let kimi_capabilities = fixture
         .state
         .providers
         .get(crate::oauth::managed::kimi::PROVIDER_DRIVER)
-        .expect("Kimi supplies a complete provider capability fixture")
+        .and_then(|provider| provider.codex_model_capabilities.clone())
+        .expect("Kimi supplies the shared capability fixture");
+    let mut fake_provider = fixture
+        .state
+        .providers
+        .get("http-json")
+        .expect("HTTP JSON supplies generic credential and config schemas")
         .clone();
     fake_provider.id = "fake-via-chat".into();
     fake_provider.display_name = "Fake Responses-via-Chat provider".into();
+    fake_provider.oauth_adapter = None;
+    fake_provider.component_adapter = None;
+    fake_provider.generation_adapter = None;
+    fake_provider.request_compatibility = crate::provider::RequestCompatibility {
+        third_party: true,
+        responses_via_chat_v1: true,
+        codex_multi_agent_v2: true,
+    };
+    fake_provider.codex_model_capabilities = Some(kimi_capabilities);
     fixture.state.providers.extend([fake_provider]).unwrap();
 
     Mock::given(method("POST"))

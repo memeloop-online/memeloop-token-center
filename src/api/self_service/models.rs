@@ -257,27 +257,22 @@ fn merge_codex_model_capabilities(
         .into_iter()
         .filter(|modality| right.input_modalities.iter().any(|value| value == modality))
         .collect();
-    let supported_reasoning_levels = left
-        .supported_reasoning_levels
-        .into_iter()
-        .filter_map(|left_level| {
-            let right_level = right
-                .supported_reasoning_levels
-                .iter()
-                .find(|right_level| right_level.effort == left_level.effort)?;
-            let description = if left_level.description == right_level.description
-                && !left_level.description.trim().is_empty()
-            {
-                left_level.description
-            } else {
-                return None;
-            };
-            Some(crate::provider::CodexReasoningLevel {
-                effort: left_level.effort,
-                description,
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut supported_reasoning_levels = Vec::new();
+    for left_level in left.supported_reasoning_levels {
+        let right_level = right
+            .supported_reasoning_levels
+            .iter()
+            .find(|right_level| right_level.effort == left_level.effort)?;
+        if left_level.description != right_level.description
+            || left_level.description.trim().is_empty()
+        {
+            return None;
+        }
+        supported_reasoning_levels.push(crate::provider::CodexReasoningLevel {
+            effort: left_level.effort,
+            description: left_level.description,
+        });
+    }
     let default_reasoning_level = if left.default_reasoning_level == right.default_reasoning_level
         && left
             .default_reasoning_level

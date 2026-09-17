@@ -45,7 +45,7 @@ fn state(chunks: Vec<Result<Bytes, &'static str>>) -> StreamState {
         upstream: Box::pin(futures_util::stream::iter(chunks)),
         framer: BoundedSseFramer::default(),
         usage: ChatSseUsageState::for_kimi(),
-        translator: responses_via_chat::Stream::new(responses_via_chat::Context::new(
+        translator: responses_via_chat::Stream::new(responses_via_chat::Context::for_kimi(
             &json!({"model":"kimi-k3"}),
         )),
         pending: VecDeque::new(),
@@ -199,7 +199,7 @@ async fn duplicate_call_ids_and_incomplete_custom_arguments_never_complete() {
     let custom = json!({"tool_calls":[{"index":0,"id":"custom-call","function":{"name":"patch","arguments":"{\"input\":"}}]});
     for delta in [duplicate, custom] {
         let mut state = state(vec![Ok(wire(Some("tool_calls"), usage(), delta))]);
-        state.translator = responses_via_chat::Stream::new(responses_via_chat::Context::new(
+        state.translator = responses_via_chat::Stream::new(responses_via_chat::Context::for_kimi(
             &json!({"model":"kimi-k3",
             "tools":[{"type":"custom","name":"patch"}]}),
         ));
