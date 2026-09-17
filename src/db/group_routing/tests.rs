@@ -118,6 +118,10 @@ async fn verify_group_selection(config: Config) {
     assert_eq!(selected.id, format!("{}:route", Uuid::from_u128(20)));
     assert_eq!((selected.priority, selected.version), (10, 7));
     assert_eq!(selected.strategy.plugin_id, "fixture");
+    assert_eq!(selected.transient_signal, TransientHealthSignal::default());
+    db.record_transient_health_sample(account, 1, true)
+        .await
+        .unwrap();
     sqlx::query("UPDATE provider_groups SET routing_priority = 11 WHERE id = $1")
         .bind(Uuid::from_u128(30).to_string())
         .execute(&db.pool)
@@ -130,6 +134,8 @@ async fn verify_group_selection(config: Config) {
         .unwrap();
     assert_eq!(selected.id, format!("{}:provider", Uuid::from_u128(30)));
     assert_eq!(selected.priority, 11);
+    assert_eq!(selected.transient_signal.sample_count, 1);
+    assert_eq!(selected.transient_signal.ewma_micros, 1_000_000);
     // The host consumes one statement for the full candidate set, not one
     // lookup per candidate that could mix configuration/priority revisions.
     let second_route = Uuid::now_v7();

@@ -77,7 +77,7 @@
           "additionalProperties": false,
           "required": ["version", "schema", "default"],
           "properties": {
-            "version": { "const": "group-routing-v1" },
+            "version": { "enum": ["group-routing-v1", "group-routing-v2"] },
             "health_policy": {
               "enum": ["plugin", "native"],
               "default": "plugin",

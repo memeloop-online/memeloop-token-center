@@ -11,6 +11,7 @@ mod bindings {
 }
 
 pub const GROUP_ROUTING_VERSION: &str = "group-routing-v1";
+pub const GROUP_ROUTING_V2_VERSION: &str = "group-routing-v2";
 const MAX_CANDIDATES: usize = 1024;
 pub(crate) const MAX_GROUP_ROUTING_JSON_BYTES: usize = 1024 * 1024;
 const MAX_DELAY_MS: u64 = 300_000;
@@ -71,6 +72,42 @@ pub struct GroupRoutingCandidate {
     pub health: GroupRoutingHealth,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupRoutingTransientSignal {
+    pub sample_count: u64,
+    pub ewma_micros: u32,
+    pub last_observed_at: i64,
+    pub recovery_successes: u64,
+    pub revision: u64,
+}
+
+impl GroupRoutingTransientSignal {
+    pub(crate) fn should_open(self, minimum_samples: u32, open_threshold_micros: u32) -> bool {
+        self.sample_count >= u64::from(minimum_samples) && self.ewma_micros >= open_threshold_micros
+    }
+
+    pub(crate) fn should_recover(
+        self,
+        recover_threshold_micros: u32,
+        minimum_probe_successes: u32,
+    ) -> bool {
+        self.ewma_micros <= recover_threshold_micros
+            && self.recovery_successes >= u64::from(minimum_probe_successes)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GroupRoutingCandidateV2 {
+    tenant_id: String,
+    route_id: String,
+    account_id: String,
+    generation: u64,
+    health: GroupRoutingHealth,
+    transient_signal: GroupRoutingTransientSignal,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GroupRoutingInput {
@@ -128,6 +165,91 @@ pub struct GroupRoutingDirective {
     pub stickiness: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupRoutingTransientPolicyMode {
+    Shadow,
+    Active,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupRoutingTransientPolicy {
+    pub mode: GroupRoutingTransientPolicyMode,
+    pub min_samples: u32,
+    pub open_micros: u32,
+    pub recover_micros: u32,
+    pub min_probe_successes: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GroupRoutingDirectiveV2 {
+    tenant_id: String,
+    route_id: String,
+    account_id: String,
+    generation: u64,
+    allow_transient_probe: bool,
+    cooldown_ms: u64,
+    recovery_wait_ms: u64,
+    recheck_ms: u64,
+    stickiness: bool,
+    transient_policy: GroupRoutingTransientPolicy,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GroupRoutingInputV2 {
+    tenant_id: String,
+    seed: u64,
+    remaining_deadline_ms: u64,
+    config: Value,
+    candidates: Vec<GroupRoutingCandidateV2>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota_context: Option<GroupRoutingQuotaContext>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GroupRoutingPlanV2 {
+    candidates: Vec<GroupRoutingDirectiveV2>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GroupRoutingObserveInputV2 {
+    tenant_id: String,
+    seed: u64,
+    remaining_deadline_ms: u64,
+    config: Value,
+    candidate: GroupRoutingCandidateV2,
+    outcome: GroupRoutingOutcome,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GroupRoutingExecutionDirective {
+    pub(crate) directive: GroupRoutingDirective,
+    pub(crate) transient_policy: Option<GroupRoutingTransientPolicy>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GroupRoutingExecutionPlan {
+    pub(crate) candidates: Vec<GroupRoutingExecutionDirective>,
+}
+
+impl GroupRoutingTransientPolicy {
+    pub(crate) fn is_active(self) -> bool {
+        self.mode == GroupRoutingTransientPolicyMode::Active
+    }
+
+    fn is_valid(self) -> bool {
+        (1..=10_000).contains(&self.min_samples)
+            && self.open_micros <= 1_000_000
+            && self.recover_micros <= self.open_micros
+            && (1..=64).contains(&self.min_probe_successes)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GroupRoutingPlan {
@@ -175,7 +297,10 @@ pub(super) fn validate_contribution(manifest: &PluginManifest) -> Result<(), App
         return Ok(());
     };
     if manifest.wasm.is_none()
-        || contribution.version != GROUP_ROUTING_VERSION
+        || !matches!(
+            contribution.version.as_str(),
+            GROUP_ROUTING_VERSION | GROUP_ROUTING_V2_VERSION
+        )
         || contribution.schema.get("type").and_then(Value::as_str) != Some("object")
         || schema_contains_write_only(&contribution.schema)
     {
@@ -279,6 +404,88 @@ fn validate_input(input: &GroupRoutingInput) -> Result<(), AppError> {
     Ok(())
 }
 
+fn v1_candidate(candidate: &GroupRoutingCandidateV2) -> GroupRoutingCandidate {
+    GroupRoutingCandidate {
+        tenant_id: candidate.tenant_id.clone(),
+        route_id: candidate.route_id.clone(),
+        account_id: candidate.account_id.clone(),
+        generation: candidate.generation,
+        health: candidate.health,
+    }
+}
+
+fn v1_directive(directive: &GroupRoutingDirectiveV2) -> GroupRoutingDirective {
+    GroupRoutingDirective {
+        tenant_id: directive.tenant_id.clone(),
+        route_id: directive.route_id.clone(),
+        account_id: directive.account_id.clone(),
+        generation: directive.generation,
+        allow_transient_probe: directive.allow_transient_probe,
+        cooldown_ms: directive.cooldown_ms,
+        recovery_wait_ms: directive.recovery_wait_ms,
+        recheck_ms: directive.recheck_ms,
+        stickiness: directive.stickiness,
+    }
+}
+
+fn validate_v2_input(input: &GroupRoutingInputV2) -> Result<GroupRoutingInput, AppError> {
+    if input.candidates.iter().any(|candidate| {
+        candidate.transient_signal.ewma_micros > 1_000_000
+            || candidate.transient_signal.last_observed_at < 0
+    }) {
+        return Err(invalid());
+    }
+    let v1 = GroupRoutingInput {
+        tenant_id: input.tenant_id.clone(),
+        seed: input.seed,
+        remaining_deadline_ms: input.remaining_deadline_ms,
+        config: input.config.clone(),
+        candidates: input.candidates.iter().map(v1_candidate).collect(),
+        quota_context: input.quota_context.clone(),
+    };
+    validate_input(&v1)?;
+    Ok(v1)
+}
+
+fn validate_v2_plan(
+    input: &GroupRoutingInputV2,
+    mut output: GroupRoutingPlanV2,
+) -> Result<GroupRoutingExecutionPlan, AppError> {
+    let v1_input = validate_v2_input(input)?;
+    if output
+        .candidates
+        .iter()
+        .any(|directive| !directive.transient_policy.is_valid())
+    {
+        return Err(invalid());
+    }
+    let activation_requested = input
+        .config
+        .get("transient_health_mode")
+        .and_then(Value::as_str)
+        == Some("active");
+    if !activation_requested {
+        for directive in &mut output.candidates {
+            directive.transient_policy.mode = GroupRoutingTransientPolicyMode::Shadow;
+        }
+    }
+    let v1_plan = GroupRoutingPlan {
+        candidates: output.candidates.iter().map(v1_directive).collect(),
+    };
+    validate_group_routing_plan(&v1_input, &v1_plan)?;
+    Ok(GroupRoutingExecutionPlan {
+        candidates: output
+            .candidates
+            .into_iter()
+            .zip(v1_plan.candidates)
+            .map(|(v2, directive)| GroupRoutingExecutionDirective {
+                directive,
+                transient_policy: Some(v2.transient_policy),
+            })
+            .collect(),
+    })
+}
+
 fn validate_quota_context(
     input: &GroupRoutingInput,
     context: &GroupRoutingQuotaContext,
@@ -327,6 +534,14 @@ fn validate_quota_context(
 }
 
 impl PluginRuntime {
+    pub(crate) fn group_routing_version(&self, plugin_id: &str) -> Option<&str> {
+        self.plugins
+            .iter()
+            .find(|plugin| plugin.manifest.id == plugin_id)
+            .and_then(|plugin| plugin.manifest.contributions.group_routing.as_ref())
+            .map(|contribution| contribution.version.as_str())
+    }
+
     pub(crate) fn quota_observation_plugin_ids(&self) -> Vec<String> {
         self.plugins
             .iter()
@@ -403,37 +618,159 @@ impl PluginRuntime {
         validator.validate(config)
     }
 
-    pub fn execute_group_routing_plan(
+    pub(crate) fn execute_group_routing_plan_with_health(
         &self,
         plugin_id: &str,
         input: &GroupRoutingInput,
-    ) -> Result<GroupRoutingPlan, AppError> {
+        transient_signals: Option<&[GroupRoutingTransientSignal]>,
+    ) -> Result<GroupRoutingExecutionPlan, AppError> {
+        let version = self.group_routing_version(plugin_id).ok_or_else(invalid)?;
         validate_input(input)?;
         if self.group_routing_uses_quota_context(plugin_id) != input.quota_context.is_some() {
             return Err(invalid());
         }
         self.validate_group_routing_configuration(plugin_id, &input.config)?;
+        if version == GROUP_ROUTING_V2_VERSION {
+            let signals = transient_signals
+                .filter(|signals| signals.len() == input.candidates.len())
+                .ok_or_else(invalid)?;
+            let v2 = GroupRoutingInputV2 {
+                tenant_id: input.tenant_id.clone(),
+                seed: input.seed,
+                remaining_deadline_ms: input.remaining_deadline_ms,
+                config: input.config.clone(),
+                candidates: input
+                    .candidates
+                    .iter()
+                    .cloned()
+                    .zip(signals.iter().copied())
+                    .map(|(candidate, transient_signal)| GroupRoutingCandidateV2 {
+                        tenant_id: candidate.tenant_id,
+                        route_id: candidate.route_id,
+                        account_id: candidate.account_id,
+                        generation: candidate.generation,
+                        health: candidate.health,
+                        transient_signal,
+                    })
+                    .collect(),
+                quota_context: input.quota_context.clone(),
+            };
+            let output =
+                self.call_group_routing(plugin_id, &v2, input.remaining_deadline_ms, false)?;
+            return validate_v2_plan(&v2, serde_json::from_str(&output).map_err(|_| invalid())?);
+        }
+        if transient_signals.is_some() {
+            return Err(invalid());
+        }
         let output =
             self.call_group_routing(plugin_id, input, input.remaining_deadline_ms, false)?;
-        let plan = serde_json::from_str(&output).map_err(|_| invalid())?;
+        let plan: GroupRoutingPlan = serde_json::from_str(&output).map_err(|_| invalid())?;
         validate_group_routing_plan(input, &plan)?;
-        Ok(plan)
+        Ok(GroupRoutingExecutionPlan {
+            candidates: plan
+                .candidates
+                .into_iter()
+                .map(|directive| GroupRoutingExecutionDirective {
+                    directive,
+                    transient_policy: None,
+                })
+                .collect(),
+        })
     }
 
-    pub fn execute_group_routing_observe(
+    pub fn execute_group_routing_plan(
+        &self,
+        plugin_id: &str,
+        input: &GroupRoutingInput,
+    ) -> Result<GroupRoutingPlan, AppError> {
+        if self.group_routing_version(plugin_id) != Some(GROUP_ROUTING_VERSION) {
+            return Err(invalid());
+        }
+        Ok(GroupRoutingPlan {
+            candidates: self
+                .execute_group_routing_plan_with_health(plugin_id, input, None)?
+                .candidates
+                .into_iter()
+                .map(|entry| entry.directive)
+                .collect(),
+        })
+    }
+
+    pub(crate) fn execute_group_routing_observe_with_health(
         &self,
         plugin_id: &str,
         input: &GroupRoutingObserveInput,
-    ) -> Result<GroupRoutingDirective, AppError> {
+        transient_signal: Option<GroupRoutingTransientSignal>,
+    ) -> Result<GroupRoutingExecutionDirective, AppError> {
         validate_candidate(&input.candidate, &input.tenant_id)?;
+        let version = self.group_routing_version(plugin_id).ok_or_else(invalid)?;
+        validate_input(&GroupRoutingInput {
+            tenant_id: input.tenant_id.clone(),
+            seed: input.seed,
+            remaining_deadline_ms: input.remaining_deadline_ms.max(1),
+            config: input.config.clone(),
+            candidates: vec![input.candidate.clone()],
+            quota_context: None,
+        })?;
         self.validate_group_routing_configuration(plugin_id, &input.config)?;
         // Observation often occurs after a long stream exhausts the
         // scheduling wait budget. It still gets bounded execution, but
         // validate_directive requires recovery_wait_ms == 0 in that case:
         // observation never extends the original request's wait deadline.
+        if version == GROUP_ROUTING_V2_VERSION {
+            let signal = transient_signal.ok_or_else(invalid)?;
+            let v2 = GroupRoutingObserveInputV2 {
+                tenant_id: input.tenant_id.clone(),
+                seed: input.seed,
+                remaining_deadline_ms: input.remaining_deadline_ms,
+                config: input.config.clone(),
+                candidate: GroupRoutingCandidateV2 {
+                    tenant_id: input.candidate.tenant_id.clone(),
+                    route_id: input.candidate.route_id.clone(),
+                    account_id: input.candidate.account_id.clone(),
+                    generation: input.candidate.generation,
+                    health: input.candidate.health,
+                    transient_signal: signal,
+                },
+                outcome: input.outcome,
+            };
+            let output =
+                self.call_group_routing(plugin_id, &v2, EXECUTION_LIMIT.as_millis() as u64, true)?;
+            let mut directive: GroupRoutingDirectiveV2 =
+                serde_json::from_str(&output).map_err(|_| invalid())?;
+            if !directive.transient_policy.is_valid() {
+                return Err(invalid());
+            }
+            if input
+                .config
+                .get("transient_health_mode")
+                .and_then(Value::as_str)
+                != Some("active")
+            {
+                directive.transient_policy.mode = GroupRoutingTransientPolicyMode::Shadow;
+            }
+            let directive_v1 = v1_directive(&directive);
+            let mut candidate = input.candidate.clone();
+            match input.outcome {
+                GroupRoutingOutcome::HardQuota => candidate.health = GroupRoutingHealth::HardQuota,
+                GroupRoutingOutcome::Authentication => {
+                    candidate.health = GroupRoutingHealth::Authentication
+                }
+                _ => {}
+            }
+            validate_directive(&directive_v1, &candidate, input.remaining_deadline_ms)?;
+            return Ok(GroupRoutingExecutionDirective {
+                directive: directive_v1,
+                transient_policy: Some(directive.transient_policy),
+            });
+        }
+        if transient_signal.is_some() {
+            return Err(invalid());
+        }
         let output =
             self.call_group_routing(plugin_id, input, EXECUTION_LIMIT.as_millis() as u64, true)?;
-        let directive = serde_json::from_str(&output).map_err(|_| invalid())?;
+        let directive: GroupRoutingDirective =
+            serde_json::from_str(&output).map_err(|_| invalid())?;
         let mut candidate = input.candidate.clone();
         // A failed authentication or hard-quota outcome cannot be converted
         // back to a transient probe by a guest's observation hook.
@@ -445,7 +782,23 @@ impl PluginRuntime {
             _ => {}
         }
         validate_directive(&directive, &candidate, input.remaining_deadline_ms)?;
-        Ok(directive)
+        Ok(GroupRoutingExecutionDirective {
+            directive,
+            transient_policy: None,
+        })
+    }
+
+    pub fn execute_group_routing_observe(
+        &self,
+        plugin_id: &str,
+        input: &GroupRoutingObserveInput,
+    ) -> Result<GroupRoutingDirective, AppError> {
+        if self.group_routing_version(plugin_id) != Some(GROUP_ROUTING_VERSION) {
+            return Err(invalid());
+        }
+        Ok(self
+            .execute_group_routing_observe_with_health(plugin_id, input, None)?
+            .directive)
     }
 
     fn call_group_routing(
@@ -548,6 +901,112 @@ mod tests {
             encoded.get("quota_context").is_none(),
             "legacy strict guests receive no new field"
         );
+        assert!(
+            encoded["candidates"][0].get("transient_signal").is_none(),
+            "v1 candidate JSON must remain byte-compatible"
+        );
+    }
+
+    #[test]
+    fn v2_requires_explicit_active_config_and_valid_integer_thresholds() {
+        let (v1, _) = fixture();
+        let mut input = GroupRoutingInputV2 {
+            tenant_id: v1.tenant_id,
+            seed: v1.seed,
+            remaining_deadline_ms: v1.remaining_deadline_ms,
+            config: serde_json::json!({}),
+            candidates: v1
+                .candidates
+                .into_iter()
+                .map(|candidate| GroupRoutingCandidateV2 {
+                    tenant_id: candidate.tenant_id,
+                    route_id: candidate.route_id,
+                    account_id: candidate.account_id,
+                    generation: candidate.generation,
+                    health: candidate.health,
+                    transient_signal: GroupRoutingTransientSignal {
+                        sample_count: 7,
+                        ewma_micros: 625_000,
+                        last_observed_at: 42,
+                        recovery_successes: 1,
+                        revision: 9,
+                    },
+                })
+                .collect(),
+            quota_context: None,
+        };
+        let directive = |mode| GroupRoutingDirectiveV2 {
+            tenant_id: "tenant".into(),
+            route_id: "route".into(),
+            account_id: "account".into(),
+            generation: 7,
+            allow_transient_probe: true,
+            cooldown_ms: 100,
+            recovery_wait_ms: 10,
+            recheck_ms: 100,
+            stickiness: false,
+            transient_policy: GroupRoutingTransientPolicy {
+                mode,
+                min_samples: 4,
+                open_micros: 700_000,
+                recover_micros: 300_000,
+                min_probe_successes: 2,
+            },
+        };
+        let shadowed = validate_v2_plan(
+            &input,
+            GroupRoutingPlanV2 {
+                candidates: vec![directive(GroupRoutingTransientPolicyMode::Active)],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            shadowed.candidates[0].transient_policy.unwrap().mode,
+            GroupRoutingTransientPolicyMode::Shadow
+        );
+        input.config = serde_json::json!({"transient_health_mode":"active"});
+        let active = validate_v2_plan(
+            &input,
+            GroupRoutingPlanV2 {
+                candidates: vec![directive(GroupRoutingTransientPolicyMode::Active)],
+            },
+        )
+        .unwrap();
+        assert!(active.candidates[0].transient_policy.unwrap().is_active());
+        let mut invalid = directive(GroupRoutingTransientPolicyMode::Active);
+        invalid.transient_policy.recover_micros = 700_001;
+        assert!(
+            validate_v2_plan(
+                &input,
+                GroupRoutingPlanV2 {
+                    candidates: vec![invalid]
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn checked_in_manifest_schema_accepts_only_the_two_group_routing_versions() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../../schemas/plugin-manifest.schema.json"))
+                .unwrap();
+        let manifest = |version: &str| {
+            serde_json::json!({
+                "id":"health-router", "version":"1.0.0", "wit_version":"0.2.0",
+                "wasm":"plugin.wasm", "capabilities":[],
+                "contributions":{"group_routing":{
+                    "version":version, "schema":{"type":"object"}, "default":{}
+                }}
+            })
+        };
+        assert!(
+            crate::schema::validate_instance(&schema, &manifest(GROUP_ROUTING_VERSION)).is_ok()
+        );
+        assert!(
+            crate::schema::validate_instance(&schema, &manifest(GROUP_ROUTING_V2_VERSION)).is_ok()
+        );
+        assert!(crate::schema::validate_instance(&schema, &manifest("group-routing-v3")).is_err());
     }
 
     #[test]

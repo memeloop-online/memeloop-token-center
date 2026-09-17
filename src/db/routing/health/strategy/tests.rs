@@ -191,6 +191,62 @@ async fn invariants(database: &Database, peer: &Database) {
     );
 }
 
+async fn transient_signal_invariants(database: &Database) {
+    database.migrate().await.unwrap();
+    let tenant = Uuid::now_v7();
+    let account = Uuid::now_v7();
+    sqlx::query("INSERT INTO tenants (id, external_id, created_at) VALUES ($1,$1,0)")
+        .bind(tenant.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO upstream_accounts (id,tenant_id,name,driver,auth_kind,config_json,status,credential_generation,created_at,updated_at) VALUES ($1,$2,'signal fixture','http-json','none','{}','active',3,0,0)")
+        .bind(account.to_string())
+        .bind(tenant.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+    let failed = database
+        .record_transient_health_sample(account, 3, true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed.sample_count, 1);
+    assert_eq!(failed.ewma_micros, TRANSIENT_EWMA_SCALE);
+    assert_eq!(failed.recovery_successes, 0);
+    assert_eq!(failed.revision, 1);
+    assert!(failed.should_open(1, 900_000));
+
+    let first_success = database
+        .record_transient_health_sample(account, 3, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_success.sample_count, 2);
+    assert_eq!(first_success.ewma_micros, 750_000);
+    assert_eq!(first_success.recovery_successes, 1);
+    assert_eq!(first_success.revision, 2);
+    assert!(!first_success.should_recover(600_000, 2));
+
+    let second_success = database
+        .record_transient_health_sample(account, 3, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second_success.ewma_micros, 562_500);
+    assert_eq!(second_success.recovery_successes, 2);
+    assert!(second_success.should_recover(600_000, 2));
+    assert!(
+        database
+            .record_transient_health_sample(account, 2, true)
+            .await
+            .unwrap()
+            .is_none(),
+        "a stale credential generation cannot publish a signal"
+    );
+}
+
 #[test]
 fn override_is_transient_only_and_bounded() {
     let mut snapshot = GroupRoutingHealth {
@@ -217,6 +273,7 @@ async fn sqlite_strategy_admission_preserves_tenant_quota_and_cross_worker_lease
     let database = Database::connect(&url).await.unwrap();
     let peer = Database::connect(&url).await.unwrap();
     invariants(&database, &peer).await;
+    transient_signal_invariants(&database).await;
 }
 
 #[tokio::test]
@@ -227,4 +284,5 @@ async fn postgres_strategy_admission_preserves_tenant_quota_and_cross_worker_lea
     let database = Database::connect(&url).await.unwrap();
     let peer = Database::connect(&url).await.unwrap();
     invariants(&database, &peer).await;
+    transient_signal_invariants(&database).await;
 }

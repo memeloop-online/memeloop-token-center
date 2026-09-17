@@ -210,6 +210,9 @@ fn policy(tenant: Uuid, route: Uuid, account: Uuid) -> CandidatePolicy {
             recheck_ms: 100,
             stickiness: false,
         },
+        transient_policy: None,
+        transient_signal_enabled: false,
+        transient_signal: None,
     }
 }
 
@@ -226,6 +229,7 @@ async fn native_fallback_has_no_implicit_controls_and_policy_identity_is_exact()
     let selected = snapshot.policy(route, account, 3).unwrap();
     assert!(!selected.allow_probe());
     assert_eq!(selected.cooldown_ms(), 42);
+    assert!(!snapshot.uses_transient_signal(route, account, 3));
     assert!(snapshot.policy(route, account, 4).is_none());
     assert!(snapshot.policy(Uuid::now_v7(), account, 3).is_none());
     assert!(snapshot.policy(route, Uuid::now_v7(), 3).is_none());
