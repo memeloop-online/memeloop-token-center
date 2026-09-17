@@ -560,6 +560,13 @@ impl ProviderCatalog {
                     "minimum": 0,
                     "maximum": 4,
                     "default": 1
+                },
+                "chat_controls": {
+                    "type": "string",
+                    "enum": ["provider_default", "strict"],
+                    "default": "strict",
+                    "title": "Chat controls",
+                    "description": "Choose how Chat Completions sampling and output-limit controls are adapted to the Codex Responses transport. Provider default validates and removes controls the upstream cannot represent; strict accepts neutral values only."
                 }
             }
         });

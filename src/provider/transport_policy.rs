@@ -2,6 +2,23 @@
 use serde::Deserialize;
 use serde_json::Value;
 
+/// How the native Codex adapter handles OpenAI Chat controls which the
+/// upstream Responses transport cannot represent exactly.
+///
+/// Keep this account-owned and versioned.  Client names and model slugs are
+/// deliberately not part of the decision, so operators can change upstream
+/// compatibility without another client-specific gateway patch.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CodexChatControlPolicy {
+    /// Validate the OpenAI value shape, then let the Codex upstream apply its
+    /// own sampling and output-length policy.
+    ProviderDefault,
+    /// Accept only controls whose value is neutral for the Codex transport.
+    #[default]
+    Strict,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct CodexTransportPolicy {
@@ -17,6 +34,7 @@ pub(crate) struct CodexTransportPolicy {
     pub request_timeout_millis: u64,
     /// Maximum local memory queue time; does not extend the request deadline.
     pub memory_admission_wait_millis: u64,
+    pub chat_controls: CodexChatControlPolicy,
 }
 
 impl Default for CodexTransportPolicy {
@@ -32,6 +50,7 @@ impl Default for CodexTransportPolicy {
             read_timeout_millis: 600_000,
             request_timeout_millis: 1_260_000,
             memory_admission_wait_millis: 30_000,
+            chat_controls: CodexChatControlPolicy::Strict,
         }
     }
 }
@@ -91,6 +110,15 @@ mod tests {
         assert_eq!(policy.read_timeout_millis, 600_000);
         assert_eq!(policy.request_timeout_millis, 1_260_000);
         assert_eq!(policy.memory_admission_wait_millis, 30_000);
+        assert_eq!(policy.chat_controls, CodexChatControlPolicy::Strict);
+        let provider_default = CodexTransportPolicy::parse(Some(&json!({
+            "chat_controls": "provider_default"
+        })))
+        .unwrap();
+        assert_eq!(
+            provider_default.chat_controls,
+            CodexChatControlPolicy::ProviderDefault
+        );
         let independent_phases = CodexTransportPolicy::parse(Some(&json!({
             "connect_timeout_millis": 5_000,
             "read_timeout_millis": 1_000,
@@ -116,6 +144,7 @@ mod tests {
             json!({"connect_retry_delay_millis": 2001}),
             json!({"shared_probe_attempts": 5}),
             json!({"shared_probe_attempts": null}),
+            json!({"chat_controls": "unknown"}),
             json!({"account_hint": "untrusted"}),
             json!({"retry_503": true}),
             json!({"plugin": "untrusted"}),

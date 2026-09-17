@@ -18,6 +18,7 @@ use super::{
     MAX_PROXY_LIFETIME, MAX_PROXY_RESPONSE_BODY, MAX_REPORTED_TOKENS,
     MAX_RESPONSES_SSE_EVENT_BYTES, Protocol, TokenUsage, upstream_response::UpstreamResponse,
 };
+use crate::provider::CodexChatControlPolicy;
 use crate::{
     error::AppError, oauth::managed::codex::account_header_value, provider::UpstreamCredential,
 };
@@ -109,11 +110,16 @@ const CHAT_ALLOWED_FIELDS: &[&str] = &[
     "top_p",
     "presence_penalty",
     "frequency_penalty",
+    "stop",
+    "user",
+    "seed",
+    "response_format",
 ];
 
 struct ChatRequestControls {
     output_limit: Option<i64>,
     output_limit_field: Option<&'static str>,
+    enforce_output_limit: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -289,8 +295,16 @@ pub(super) fn prepare_request_with_id(
     protocol: Protocol,
 ) -> Result<PreparedCodexRequest, AppError> {
     validate_route_config(config)?;
+    let chat_control_policy =
+        crate::provider::CodexTransportPolicy::parse(config.get("transport_policy"))
+            .map_err(|_| {
+                AppError::BadRequest(
+                    "OpenAI Codex account has invalid fixed transport configuration".into(),
+                )
+            })?
+            .chat_controls;
     let chat_controls = matches!(protocol, Protocol::OpenAiChat)
-        .then(|| translate_chat_request(request))
+        .then(|| translate_chat_request(request, chat_control_policy))
         .transpose()?;
     let object = request
         .as_object_mut()
@@ -311,6 +325,7 @@ pub(super) fn prepare_request_with_id(
     validate_service_tier(object.get("service_tier"), protocol)?;
     let output_token_ceiling = trusted_reservation_token_bound(config, upstream_model)?;
     if let Some(controls) = chat_controls.as_ref()
+        && controls.enforce_output_limit
         && controls
             .output_limit
             .is_some_and(|limit| limit < output_token_ceiling)
@@ -364,7 +379,10 @@ pub(super) fn prepare_request_with_id(
     })
 }
 
-fn translate_chat_request(request: &mut Value) -> Result<ChatRequestControls, AppError> {
+fn translate_chat_request(
+    request: &mut Value,
+    control_policy: CodexChatControlPolicy,
+) -> Result<ChatRequestControls, AppError> {
     let object = request
         .as_object_mut()
         .ok_or_else(|| AppError::BadRequest("request body must be a JSON object".into()))?;
@@ -412,10 +430,21 @@ fn translate_chat_request(request: &mut Value) -> Result<ChatRequestControls, Ap
             ));
         }
     }
-    validate_neutral_chat_number(object, "temperature", 0.0, 2.0, 1.0)?;
-    validate_neutral_chat_number(object, "top_p", 0.0, 1.0, 1.0)?;
-    validate_neutral_chat_number(object, "presence_penalty", -2.0, 2.0, 0.0)?;
-    validate_neutral_chat_number(object, "frequency_penalty", -2.0, 2.0, 0.0)?;
+    let strict = control_policy == CodexChatControlPolicy::Strict;
+    validate_chat_number(object, "temperature", 0.0, 2.0, strict.then_some(1.0))?;
+    validate_chat_number(object, "top_p", 0.0, 1.0, strict.then_some(1.0))?;
+    validate_chat_number(object, "presence_penalty", -2.0, 2.0, strict.then_some(0.0))?;
+    validate_chat_number(
+        object,
+        "frequency_penalty",
+        -2.0,
+        2.0,
+        strict.then_some(0.0),
+    )?;
+    validate_chat_user(object.get("user"))?;
+    validate_chat_seed(object.get("seed"), strict)?;
+    validate_chat_stop(object.get("stop"), strict)?;
+    validate_chat_response_format(object.get("response_format"))?;
     let legacy_limit = chat_output_limit(object.get("max_tokens"), "max_tokens")?;
     let completion_limit =
         chat_output_limit(object.get("max_completion_tokens"), "max_completion_tokens")?;
@@ -497,6 +526,10 @@ fn translate_chat_request(request: &mut Value) -> Result<ChatRequestControls, Ap
     object.remove("top_p");
     object.remove("presence_penalty");
     object.remove("frequency_penalty");
+    object.remove("stop");
+    object.remove("user");
+    object.remove("seed");
+    object.remove("response_format");
     object.insert("input".into(), Value::Array(input));
     object.insert(
         "instructions".into(),
@@ -505,6 +538,7 @@ fn translate_chat_request(request: &mut Value) -> Result<ChatRequestControls, Ap
     Ok(ChatRequestControls {
         output_limit,
         output_limit_field,
+        enforce_output_limit: strict,
     })
 }
 
@@ -512,12 +546,12 @@ pub(super) fn is_chat_candidate_incompatibility(message: &str) -> bool {
     message.starts_with("Codex text Chat ")
 }
 
-fn validate_neutral_chat_number(
+fn validate_chat_number(
     object: &Map<String, Value>,
     field: &str,
     minimum: f64,
     maximum: f64,
-    neutral: f64,
+    required_neutral: Option<f64>,
 ) -> Result<(), AppError> {
     let Some(value) = object.get(field) else {
         return Ok(());
@@ -536,12 +570,90 @@ fn validate_neutral_chat_number(
             "Codex text Chat {field} is outside the supported OpenAI range"
         )));
     }
-    if value != neutral {
+    if required_neutral.is_some_and(|neutral| value != neutral) {
         return Err(AppError::BadRequest(format!(
             "Codex text Chat does not support non-default {field} semantics"
         )));
     }
     Ok(())
+}
+
+fn validate_chat_user(value: Option<&Value>) -> Result<(), AppError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    if value.as_str().is_some_and(|value| {
+        !value.is_empty() && value.len() <= 1_024 && !value.chars().any(char::is_control)
+    }) {
+        return Ok(());
+    }
+    Err(AppError::BadRequest(
+        "Codex text Chat user must be a bounded non-empty string".into(),
+    ))
+}
+
+fn validate_chat_seed(value: Option<&Value>, strict: bool) -> Result<(), AppError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    if value.as_i64().is_none() {
+        return Err(AppError::BadRequest(
+            "Codex text Chat seed must be an integer".into(),
+        ));
+    }
+    if strict {
+        return Err(AppError::BadRequest(
+            "Codex text Chat does not support seed semantics".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_chat_stop(value: Option<&Value>, strict: bool) -> Result<(), AppError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let valid = match value {
+        Value::String(value) => bounded_chat_stop(value),
+        Value::Array(values) => {
+            !values.is_empty()
+                && values.len() <= 4
+                && values
+                    .iter()
+                    .all(|value| value.as_str().is_some_and(bounded_chat_stop))
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(AppError::BadRequest(
+            "Codex text Chat stop must contain one to four bounded strings".into(),
+        ));
+    }
+    if strict {
+        return Err(AppError::BadRequest(
+            "Codex text Chat does not support stop semantics".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn bounded_chat_stop(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 1_024 && !value.chars().any(char::is_control)
+}
+
+fn validate_chat_response_format(value: Option<&Value>) -> Result<(), AppError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    if value
+        .as_object()
+        .is_some_and(|format| format.len() == 1 && format.get("type") == Some(&json!("text")))
+    {
+        return Ok(());
+    }
+    Err(AppError::BadRequest(
+        "Codex text Chat supports only response_format.type=text".into(),
+    ))
 }
 
 fn chat_output_limit(value: Option<&Value>, field: &str) -> Result<Option<i64>, AppError> {
@@ -1999,6 +2111,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(existing_image_tool["tools"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn missing_chat_control_policy_remains_strict() {
+        let route = config("gpt-codex", 10);
+        let mut sampling = json!({
+            "model": "public",
+            "messages": [{"role": "user", "content": "translate"}],
+            "temperature": 0.0
+        });
+        assert!(matches!(
+            prepare_request_with_id(
+                &mut sampling,
+                "gpt-codex",
+                &route,
+                Uuid::nil(),
+                Protocol::OpenAiChat,
+            ),
+            Err(AppError::BadRequest(message))
+                if message.contains("non-default temperature semantics")
+        ));
+
+        let mut output_limit = json!({
+            "model": "public",
+            "messages": [{"role": "user", "content": "translate"}],
+            "max_tokens": 1
+        });
+        assert!(matches!(
+            prepare_request_with_id(
+                &mut output_limit,
+                "gpt-codex",
+                &route,
+                Uuid::nil(),
+                Protocol::OpenAiChat,
+            ),
+            Err(AppError::BadRequest(message)) if message.contains("cannot guarantee max_tokens")
+        ));
     }
 
     #[test]
