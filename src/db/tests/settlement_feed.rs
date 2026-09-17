@@ -412,6 +412,19 @@ async fn terminal_cost_policy_flows_into_request_aggregates_without_rewriting_se
                 .unwrap();
         let expected = if keeps_cost { stored_cost } else { 0 };
         assert_eq!(projected_cost, expected, "{label}");
+        let projected_status: String = sqlx::query_scalar(
+            "SELECT status_class FROM request_stats_facts WHERE request_id = $1",
+        )
+        .bind(request_id.to_string())
+        .fetch_one(&fixture.database.pool)
+        .await
+        .unwrap();
+        let expected_status = if status_code >= 200 && status_code < 400 && error_code.is_none() {
+            "success"
+        } else {
+            "failure"
+        };
+        assert_eq!(projected_status, expected_status, "{label}");
         expected_aggregate_cost += expected;
     }
 
