@@ -25,6 +25,20 @@ fn transient_sample_for_outcome(
     }
 }
 
+fn active_transient_keeps_breaker_closed(
+    policy: crate::plugin::routing::GroupRoutingTransientPolicy,
+    signal: crate::plugin::routing::GroupRoutingTransientSignal,
+) -> bool {
+    !signal.should_open(policy.min_samples, policy.open_micros)
+}
+
+fn active_transient_defers_probe_recovery(
+    policy: crate::plugin::routing::GroupRoutingTransientPolicy,
+    signal: crate::plugin::routing::GroupRoutingTransientSignal,
+) -> bool {
+    !signal.should_recover(policy.recover_micros, policy.min_probe_successes)
+}
+
 struct SharedProbeLimiter {
     active: AtomicU32,
 }
@@ -128,6 +142,198 @@ mod limiter_tests {
             transient_sample_for_outcome(GroupRoutingOutcome::Authentication),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod v2_lifecycle_tests {
+    use super::*;
+    use crate::{
+        config::UpstreamHealthConfig,
+        db::{Database, UpstreamFailureKind, unix_millis},
+        plugin::routing::{
+            GroupRoutingOutcome, GroupRoutingTransientPolicy, GroupRoutingTransientPolicyMode,
+            GroupRoutingTransientSignal,
+        },
+    };
+
+    #[tokio::test]
+    async fn active_v2_opens_and_recovers_only_at_threshold_without_replaying_or_sampling_cancelled()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("v2-lifecycle.db").display()
+        );
+        let database = Database::connect(&url).await.unwrap();
+        database.migrate().await.unwrap();
+        let tenant = Uuid::now_v7();
+        let account = Uuid::now_v7();
+        sqlx::query("INSERT INTO tenants (id,external_id,created_at) VALUES ($1,$1,0)")
+            .bind(tenant.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO upstream_accounts (id,tenant_id,name,driver,auth_kind,config_json,status,credential_generation,created_at,updated_at) VALUES ($1,$2,'v2 lifecycle','http-json','none','{}','active',1,0,0)")
+            .bind(account.to_string())
+            .bind(tenant.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        let policy = GroupRoutingTransientPolicy {
+            mode: GroupRoutingTransientPolicyMode::Active,
+            min_samples: 2,
+            open_micros: 900_000,
+            recover_micros: 600_000,
+            min_probe_successes: 2,
+        };
+        macro_rules! plugin_signal {
+            ($value:expr) => {{
+                let signal = $value;
+                GroupRoutingTransientSignal {
+                    sample_count: signal.sample_count as u64,
+                    ewma_micros: signal.ewma_micros as u32,
+                    last_observed_at: signal.last_observed_at,
+                    recovery_successes: signal.recovery_successes as u64,
+                    revision: signal.revision as u64,
+                }
+            }};
+        }
+
+        let first = plugin_signal!(
+            database
+                .record_transient_health_sample(account, 1, true)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert!(active_transient_keeps_breaker_closed(policy, first));
+        assert!(
+            database
+                .claim_upstream_account_attempt_with_health_config(
+                    account,
+                    1,
+                    UpstreamHealthConfig::DEFAULT,
+                )
+                .await
+                .unwrap()
+                .is_healthy(),
+            "the first failed request is not replayed and does not open before min_samples"
+        );
+
+        let second = plugin_signal!(
+            database
+                .record_transient_health_sample(account, 1, true)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert!(!active_transient_keeps_breaker_closed(policy, second));
+        database
+            .record_upstream_account_failure(account, 1, UpstreamFailureKind::Connection)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE upstream_account_health SET cooldown_until = 0 WHERE upstream_account_id = $1",
+        )
+        .bind(account.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        let first_probe = database
+            .claim_upstream_account_attempt_with_health_config(
+                account,
+                1,
+                UpstreamHealthConfig::DEFAULT,
+            )
+            .await
+            .unwrap();
+        let UpstreamAttemptAdmission::Probe {
+            lease_token: first_lease,
+        } = first_probe
+        else {
+            panic!("threshold crossing must admit exactly one probe")
+        };
+        let first_success = plugin_signal!(
+            database
+                .record_transient_health_sample(account, 1, false)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert!(active_transient_defers_probe_recovery(
+            policy,
+            first_success
+        ));
+        assert!(
+            database
+                .defer_upstream_account_probe_recovery(account, 1, first_lease, 0)
+                .await
+                .unwrap()
+        );
+        let second_probe = database
+            .claim_upstream_account_attempt_with_health_config(
+                account,
+                1,
+                UpstreamHealthConfig::DEFAULT,
+            )
+            .await
+            .unwrap();
+        let UpstreamAttemptAdmission::Probe {
+            lease_token: second_lease,
+        } = second_probe
+        else {
+            panic!("deferred recovery must retain half-open state")
+        };
+        let second_success = plugin_signal!(
+            database
+                .record_transient_health_sample(account, 1, false)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert!(!active_transient_defers_probe_recovery(
+            policy,
+            second_success
+        ));
+        assert!(
+            database
+                .record_upstream_account_probe_success(account, 1, second_lease)
+                .await
+                .unwrap()
+        );
+
+        let before_cancel: i64 = sqlx::query_scalar(
+            "SELECT revision FROM upstream_account_transient_health_signals WHERE upstream_account_id = $1",
+        )
+        .bind(account.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            transient_sample_for_outcome(GroupRoutingOutcome::Cancelled),
+            None
+        );
+        let after_cancel: i64 = sqlx::query_scalar(
+            "SELECT revision FROM upstream_account_transient_health_signals WHERE upstream_account_id = $1",
+        )
+        .bind(account.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(after_cancel, before_cancel);
+        assert!(
+            database
+                .claim_upstream_account_attempt_with_health_config(
+                    account,
+                    1,
+                    UpstreamHealthConfig::DEFAULT,
+                )
+                .await
+                .unwrap()
+                .is_healthy()
+        );
+        assert!(unix_millis() >= second_success.last_observed_at);
     }
 }
 
@@ -570,7 +776,7 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                     }),
                 signal,
                 lease_token,
-            ) && !signal.should_recover(policy.recover_micros, policy.min_probe_successes)
+            ) && active_transient_defers_probe_recovery(policy, signal)
             {
                 if owns_probe_lease && !recovered_on_delivery {
                     let cooldown = directive.as_ref().map_or(
@@ -685,7 +891,7 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                         .filter(|policy| policy.is_active()),
                     signal,
                 )
-                && !signal.should_open(policy.min_samples, policy.open_micros)
+                && active_transient_keeps_breaker_closed(policy, signal)
             {
                 // The conclusive sample is durable, but an explicitly active
                 // v2 policy has not accumulated enough evidence to open. This

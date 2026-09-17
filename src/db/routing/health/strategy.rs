@@ -83,23 +83,34 @@ impl Database {
                FROM upstream_accounts account
               WHERE account.id = $1 AND account.status = 'active'
                 AND account.credential_generation = $2
-             ON CONFLICT (upstream_account_id, credential_generation) DO UPDATE SET
+             ON CONFLICT (upstream_account_id) DO UPDATE SET
+                 credential_generation = excluded.credential_generation,
                  sample_count = CASE
+                     WHEN upstream_account_transient_health_signals.credential_generation <> excluded.credential_generation
+                         THEN 1
                      WHEN upstream_account_transient_health_signals.sample_count < 9223372036854775807
                          THEN upstream_account_transient_health_signals.sample_count + 1
                      ELSE upstream_account_transient_health_signals.sample_count
                  END,
-                 ewma_micros = (
-                     upstream_account_transient_health_signals.ewma_micros * 3 + $3 + 2
-                 ) / 4,
+                 ewma_micros = CASE
+                     WHEN upstream_account_transient_health_signals.credential_generation <> excluded.credential_generation
+                         THEN $3
+                     ELSE (
+                         upstream_account_transient_health_signals.ewma_micros * 3 + $3 + 2
+                     ) / 4
+                 END,
                  last_observed_at = $4,
                  recovery_successes = CASE
+                     WHEN upstream_account_transient_health_signals.credential_generation <> excluded.credential_generation
+                         THEN $5
                      WHEN $3 > 0 THEN 0
                      WHEN upstream_account_transient_health_signals.recovery_successes < 9223372036854775807
                          THEN upstream_account_transient_health_signals.recovery_successes + 1
                      ELSE upstream_account_transient_health_signals.recovery_successes
                  END,
                  revision = CASE
+                     WHEN upstream_account_transient_health_signals.credential_generation <> excluded.credential_generation
+                         THEN 1
                      WHEN upstream_account_transient_health_signals.revision < 9223372036854775807
                          THEN upstream_account_transient_health_signals.revision + 1
                      ELSE upstream_account_transient_health_signals.revision

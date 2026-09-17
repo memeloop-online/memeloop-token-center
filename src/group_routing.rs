@@ -407,12 +407,23 @@ async fn prepare_inner(
         let transient_signals = plugin_is_v2.then(|| {
             members
                 .iter()
-                .map(|member| GroupRoutingTransientSignal {
-                    sample_count: member.2.transient_signal.sample_count.max(0) as u64,
-                    ewma_micros: member.2.transient_signal.ewma_micros.clamp(0, 1_000_000) as u32,
-                    last_observed_at: member.2.transient_signal.last_observed_at.max(0),
-                    recovery_successes: member.2.transient_signal.recovery_successes.max(0) as u64,
-                    revision: member.2.transient_signal.revision.max(0) as u64,
+                .map(|member| {
+                    let candidate = &member.1;
+                    let signal = bindings
+                        .get(&(
+                            candidate.route_id,
+                            candidate.account_id,
+                            candidate.credential_generation,
+                        ))
+                        .expect("bucket members originate from the frozen binding snapshot")
+                        .transient_signal;
+                    GroupRoutingTransientSignal {
+                        sample_count: signal.sample_count.max(0) as u64,
+                        ewma_micros: signal.ewma_micros.clamp(0, 1_000_000) as u32,
+                        last_observed_at: signal.last_observed_at.max(0),
+                        recovery_successes: signal.recovery_successes.max(0) as u64,
+                        revision: signal.revision.max(0) as u64,
+                    }
                 })
                 .collect::<Vec<_>>()
         });

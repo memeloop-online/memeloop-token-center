@@ -245,6 +245,31 @@ async fn transient_signal_invariants(database: &Database) {
             .is_none(),
         "a stale credential generation cannot publish a signal"
     );
+    sqlx::query("UPDATE upstream_accounts SET credential_generation = 4 WHERE id = $1")
+        .bind(account.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let rotated = database
+        .record_transient_health_sample(account, 4, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rotated.sample_count, 1);
+    assert_eq!(rotated.ewma_micros, 0);
+    assert_eq!(rotated.recovery_successes, 1);
+    assert_eq!(rotated.revision, 1);
+    let retained_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_account_transient_health_signals WHERE upstream_account_id = $1",
+    )
+    .bind(account.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        retained_rows, 1,
+        "credential rotation replaces the bounded signal row"
+    );
 }
 
 #[test]
