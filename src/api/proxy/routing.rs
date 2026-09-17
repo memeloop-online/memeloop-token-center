@@ -84,6 +84,7 @@ pub(super) fn plan_proxy_route(
     if is_codex {
         codex::validate_route(&route, protocol)?;
     }
+    let responses_via_chat_dialect = state.providers.responses_via_chat_dialect(&route.driver);
     let (mut forwarded_json, responses_chat) = kimi::prepare_forwarded_request(
         &route,
         protocol,
@@ -94,10 +95,7 @@ pub(super) fn plan_proxy_route(
         matches!(protocol, Protocol::OpenAiResponses)
             && codex_multi_agent_v2_client
             && state.providers.supports_codex_multi_agent_v2(&route.driver),
-        matches!(protocol, Protocol::OpenAiResponses)
-            && state
-                .providers
-                .supports_responses_via_chat_v1(&route.driver),
+        responses_via_chat_dialect,
     )?;
     let codex_plan = if is_codex {
         Some(codex_transport::prepare_request_with_id(

@@ -1,4 +1,5 @@
 use super::AppError;
+use crate::provider::ResponsesViaChatDialect;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -223,7 +224,15 @@ fn agent_message(item: &Value) -> Result<Value, AppError> {
 /// Convert the source's Responses message/tool forms without a service bridge.
 /// Tool outputs remain adjacent to their calls even when interleaved user
 /// messages occur in the input timeline.
+#[cfg(test)]
 pub(in crate::api) fn convert(request: &Value) -> Result<Value, AppError> {
+    convert_with_dialect(request, ResponsesViaChatDialect::OpenAiChatV1)
+}
+
+pub(in crate::api) fn convert_with_dialect(
+    request: &Value,
+    dialect: ResponsesViaChatDialect,
+) -> Result<Value, AppError> {
     validate_bridge_features(request)?;
     if request
         .get("previous_response_id")
@@ -261,6 +270,7 @@ pub(in crate::api) fn convert(request: &Value) -> Result<Value, AppError> {
     let mut awaiting = BTreeSet::<String>::new();
     let mut deferred = Vec::new();
     let mut reasoning = String::new();
+    let preserve_reasoning = dialect == ResponsesViaChatDialect::KimiV1;
     for item in &input {
         let normalized;
         let item = if item["type"] == "agent_message" {
@@ -271,6 +281,9 @@ pub(in crate::api) fn convert(request: &Value) -> Result<Value, AppError> {
         };
         match item["type"].as_str().unwrap_or("message") {
             "reasoning" => {
+                if !preserve_reasoning {
+                    continue;
+                }
                 let summary = item["summary"]
                     .as_array()
                     .map(|parts| {
@@ -291,10 +304,12 @@ pub(in crate::api) fn convert(request: &Value) -> Result<Value, AppError> {
                 );
             }
             "function_call" | "custom_tool_call" => {
-                combine(
-                    &mut reasoning,
-                    item["reasoning_content"].as_str().unwrap_or(""),
-                );
+                if preserve_reasoning {
+                    combine(
+                        &mut reasoning,
+                        item["reasoning_content"].as_str().unwrap_or(""),
+                    );
+                }
                 let id = item["call_id"].as_str().unwrap_or("");
                 let arguments = if item["type"] == "custom_tool_call" {
                     serde_json::to_string(&json!({"input":item["input"]}))
@@ -319,7 +334,7 @@ pub(in crate::api) fn convert(request: &Value) -> Result<Value, AppError> {
                     .as_array_mut()
                     .ok_or(AppError::Internal)?
                     .push(call);
-                if !reasoning.is_empty() {
+                if preserve_reasoning && !reasoning.is_empty() {
                     message["reasoning_content"] = Value::String(std::mem::take(&mut reasoning));
                 }
                 if output_ids.contains(id) {
@@ -347,15 +362,17 @@ pub(in crate::api) fn convert(request: &Value) -> Result<Value, AppError> {
                 let mut message = json!({"role":if role == "developer" {"user"} else {role},
                     "content":content(&item["content"])});
                 if role == "assistant" {
-                    combine(
-                        &mut reasoning,
-                        item["reasoning_content"].as_str().unwrap_or(""),
-                    );
-                    if !reasoning.is_empty() {
+                    if preserve_reasoning {
+                        combine(
+                            &mut reasoning,
+                            item["reasoning_content"].as_str().unwrap_or(""),
+                        );
+                    }
+                    if preserve_reasoning && !reasoning.is_empty() {
                         message["reasoning_content"] =
                             Value::String(std::mem::take(&mut reasoning));
                     }
-                } else if !reasoning.is_empty() {
+                } else if preserve_reasoning && !reasoning.is_empty() {
                     messages.push(json!({"role":"assistant","content":"",
                         "reasoning_content":std::mem::take(&mut reasoning)}));
                 }
@@ -373,7 +390,7 @@ pub(in crate::api) fn convert(request: &Value) -> Result<Value, AppError> {
         }
     }
     messages.append(&mut deferred);
-    if !reasoning.is_empty() {
+    if preserve_reasoning && !reasoning.is_empty() {
         messages.push(json!({"role":"assistant","content":"","reasoning_content":reasoning}));
     }
     output["messages"] = Value::Array(messages);
@@ -390,8 +407,10 @@ pub(in crate::api) fn convert(request: &Value) -> Result<Value, AppError> {
             output[name] = value.clone();
         }
     }
-    if let Some(effort) = request.pointer("/reasoning/effort") {
-        output["reasoning_effort"] = effort.clone();
+    if preserve_reasoning {
+        if let Some(effort) = request.pointer("/reasoning/effort") {
+            output["reasoning_effort"] = effort.clone();
+        }
     }
     if let Some(format) = request.pointer("/text/format") {
         output["response_format"] = if format["type"] == "json_schema" {
@@ -603,7 +622,7 @@ mod tests {
                 {"type":"additional_tools","tools":[{"type":"function","name":"other","parameters":{"type":"object"}}]}
             ],"max_output_tokens":400,"reasoning":{"effort":"high"},
             "text":{"format":{"type":"json_schema","name":"result","schema":{"type":"object"},"strict":true}}});
-        let converted = convert(&request).unwrap();
+        let converted = convert_with_dialect(&request, ResponsesViaChatDialect::KimiV1).unwrap();
         assert_eq!(converted["messages"][0]["role"], "system");
         assert_eq!(
             converted["messages"][1]["tool_calls"][0]["function"]["name"],
@@ -616,6 +635,25 @@ mod tests {
         assert_eq!(converted["max_tokens"], 400);
         assert_eq!(converted["reasoning_effort"], "high");
         assert_eq!(converted["response_format"]["json_schema"]["strict"], true);
+    }
+
+    #[test]
+    fn strict_openai_chat_dialect_omits_kimi_reasoning_fields() {
+        let request = json!({
+            "input":[
+                {"type":"reasoning","summary":[{"type":"summary_text","text":"private trace"}]},
+                {"role":"assistant","content":"answer","reasoning_content":"private trace"}
+            ],
+            "reasoning":{"effort":"high"}
+        });
+        let converted =
+            convert_with_dialect(&request, ResponsesViaChatDialect::OpenAiChatV1).unwrap();
+        assert!(converted.to_string().contains("answer"));
+        assert!(!converted.to_string().contains("reasoning_content"));
+        assert!(!converted.to_string().contains("reasoning_effort"));
+        let kimi = convert_with_dialect(&request, ResponsesViaChatDialect::KimiV1).unwrap();
+        assert_eq!(kimi["reasoning_effort"], "high");
+        assert!(kimi.to_string().contains("reasoning_content"));
     }
 
     #[test]

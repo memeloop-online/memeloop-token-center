@@ -293,6 +293,14 @@ fn multi_agent_compatibility_is_explicit_and_provider_scoped() {
             .request_compatibility
             .responses_via_chat_v1
     );
+    assert_eq!(
+        catalog
+            .get("kimi-oauth")
+            .expect("Kimi provider")
+            .request_compatibility
+            .responses_via_chat_dialect,
+        Some(crate::provider::ResponsesViaChatDialect::KimiV1)
+    );
     let kimi_capabilities = catalog
         .get("kimi-oauth")
         .expect("Kimi provider")

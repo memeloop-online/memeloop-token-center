@@ -157,6 +157,14 @@ fn default_codex_agent_instructions_template() -> String {
 /// catalog.  A capability is never inferred from a model name or URL: a
 /// third-party upstream must opt in before the gateway rewrites Codex
 /// collaboration payloads for it.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum ResponsesViaChatDialect {
+    #[serde(rename = "openai_chat_v1")]
+    OpenAiChatV1,
+    #[serde(rename = "kimi_v1")]
+    KimiV1,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RequestCompatibility {
@@ -167,20 +175,30 @@ pub struct RequestCompatibility {
     /// adapters; it is not inferred from a URL or model name.
     #[serde(default)]
     pub responses_via_chat_v1: bool,
+    /// Closed, versioned dialect implemented by the Responses-via-Chat bridge.
+    /// This is required whenever `responses_via_chat_v1` is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_via_chat_dialect: Option<ResponsesViaChatDialect>,
     #[serde(default)]
     pub codex_multi_agent_v2: bool,
 }
 
 impl RequestCompatibility {
     pub(crate) fn is_default(&self) -> bool {
-        !self.third_party && !self.responses_via_chat_v1 && !self.codex_multi_agent_v2
+        !self.third_party
+            && !self.responses_via_chat_v1
+            && self.responses_via_chat_dialect.is_none()
+            && !self.codex_multi_agent_v2
     }
 
     pub fn supports_codex_multi_agent_v2(&self) -> bool {
         // Third-party MultiAgentV2 is executable only through an explicitly
         // declared Responses-via-Chat transport. Native Codex has its own
         // upstream Responses transport and does not use this predicate.
-        self.third_party && self.codex_multi_agent_v2 && self.responses_via_chat_v1
+        self.third_party
+            && self.codex_multi_agent_v2
+            && self.responses_via_chat_v1
+            && self.responses_via_chat_dialect.is_some()
     }
 }
 
@@ -606,6 +624,7 @@ impl ProviderCatalog {
         kimi.request_compatibility = RequestCompatibility {
             third_party: true,
             responses_via_chat_v1: true,
+            responses_via_chat_dialect: Some(ResponsesViaChatDialect::KimiV1),
             codex_multi_agent_v2: true,
         };
         kimi.codex_model_capabilities = Some(CodexModelCapabilities {
@@ -735,6 +754,24 @@ impl ProviderCatalog {
         self.get(driver).is_some_and(|provider| {
             provider.request_compatibility.third_party
                 && provider.request_compatibility.responses_via_chat_v1
+                && provider
+                    .request_compatibility
+                    .responses_via_chat_dialect
+                    .is_some()
+        })
+    }
+
+    pub fn responses_via_chat_dialect(&self, driver: &str) -> Option<ResponsesViaChatDialect> {
+        self.get(driver).and_then(|provider| {
+            let compatibility = &provider.request_compatibility;
+            if compatibility.third_party
+                && compatibility.responses_via_chat_v1
+                && compatibility.responses_via_chat_dialect.is_some()
+            {
+                compatibility.responses_via_chat_dialect
+            } else {
+                None
+            }
         })
     }
 

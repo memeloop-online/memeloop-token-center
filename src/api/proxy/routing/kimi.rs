@@ -13,7 +13,7 @@ pub(super) fn prepare_forwarded_request(
     request: &Value,
     prepare_multi_agent_tools: bool,
     normalize_multi_agent: bool,
-    responses_via_chat: bool,
+    responses_via_chat_dialect: Option<crate::provider::ResponsesViaChatDialect>,
 ) -> Result<(Value, Option<responses_via_chat::Context>), AppError> {
     let mut forwarded = request.clone();
     if normalize_multi_agent {
@@ -24,35 +24,34 @@ pub(super) fn prepare_forwarded_request(
             prepare_multi_agent_tools,
         )?;
     }
-    let is_kimi = route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER;
-    if is_kimi {
+    let is_kimi_route = route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER;
+    if is_kimi_route {
         if route.base_url != crate::oauth::managed::kimi::BASE_URL {
             return Err(AppError::BadRequest(
                 "Kimi OAuth requires its fixed base URL".into(),
             ));
         }
         crate::oauth::managed::kimi::validate_credential(&route.credential)?;
-        if matches!(protocol, Protocol::OpenAiResponses) {
-            let context = crate::api::kimi_transport::prepare_kimi_responses(
-                &route.upstream_model,
-                &mut forwarded,
-            )?;
-            return Ok((forwarded, Some(context)));
-        }
+    }
+    if matches!(protocol, Protocol::OpenAiResponses)
+        && let Some(dialect) = responses_via_chat_dialect
+    {
+        let context = crate::api::responses_via_chat::prepare_with_dialect(
+            &route.upstream_model,
+            &mut forwarded,
+            dialect,
+        )?;
+        crate::api::kimi_transport::repair_responses_messages(dialect, &mut forwarded);
+        return Ok((forwarded, Some(context)));
+    }
+    if is_kimi_route {
         crate::api::kimi_transport::prepare(protocol, &route.upstream_model, &mut forwarded)?;
         return Ok((forwarded, None));
     }
-    if responses_via_chat && matches!(protocol, Protocol::OpenAiResponses) {
-        let context =
-            crate::api::responses_via_chat::prepare(&route.upstream_model, &mut forwarded)?;
-        return Ok((forwarded, Some(context)));
+    if let Some(model) = forwarded.get_mut("model") {
+        *model = Value::String(route.upstream_model.clone());
     }
-    {
-        if let Some(model) = forwarded.get_mut("model") {
-            *model = Value::String(route.upstream_model.clone());
-        }
-        return Ok((forwarded, None));
-    }
+    Ok((forwarded, None))
 }
 
 struct StreamState {
@@ -209,7 +208,6 @@ pub(in crate::api::proxy) fn translate(
     response: reqwest::Response,
     context: responses_via_chat::Context,
     streaming: bool,
-    kimi_dialect: bool,
 ) -> Result<UpstreamResponse, ProxySendError> {
     if !response.status().is_success() {
         return Ok(response.into());
@@ -270,6 +268,7 @@ pub(in crate::api::proxy) fn translate(
     parts.headers.remove(header::CONTENT_LENGTH);
     parts.headers.remove(header::CONTENT_ENCODING);
     parts.content_length = None;
+    let kimi_dialect = context.uses_kimi_dialect();
     let translated = if streaming {
         let state = StreamState {
             upstream: parts.stream,
@@ -455,7 +454,6 @@ mod tests {
             response,
             responses_via_chat::Context::for_kimi(&json!({"model":"kimi-k3"})),
             true,
-            true,
         )
         .unwrap();
         let chunks = translated.bytes_stream().collect::<Vec<_>>().await;
@@ -486,7 +484,6 @@ mod tests {
             let translated = translate(
                 response,
                 responses_via_chat::Context::for_kimi(&json!({"model":"kimi-k3"})),
-                true,
                 true,
             )
             .unwrap();
@@ -523,7 +520,7 @@ mod tests {
             &request,
             true,
             false,
-            false,
+            None,
         )
         .unwrap();
 
@@ -555,7 +552,7 @@ mod tests {
             &request,
             false,
             true,
-            false,
+            Some(crate::provider::ResponsesViaChatDialect::KimiV1),
         )
         .unwrap();
 
@@ -582,7 +579,7 @@ mod tests {
             &request,
             false,
             true,
-            false,
+            Some(crate::provider::ResponsesViaChatDialect::KimiV1),
         ) {
             Ok(_) => panic!("opaque delegated content must fail closed before dispatch"),
             Err(error) => error,

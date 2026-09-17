@@ -19,7 +19,7 @@ pub(super) fn is_official_codex_user_agent(headers: &HeaderMap) -> bool {
     let Ok(user_agent) = value.to_str() else {
         return false;
     };
-    crate::api::codex_transport::is_first_party_codex_user_agent(user_agent)
+    crate::api::proxy::codex_transport::is_first_party_codex_user_agent(user_agent)
 }
 
 /// Normalize the subset of Codex MultiAgentV2 request shapes that a declared

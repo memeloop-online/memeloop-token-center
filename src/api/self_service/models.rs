@@ -1,4 +1,5 @@
 use super::super::*;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Deserialize, Default)]
 pub(in crate::api) struct ModelsQuery {
@@ -257,20 +258,22 @@ fn merge_codex_model_capabilities(
         .into_iter()
         .filter(|modality| right.input_modalities.iter().any(|value| value == modality))
         .collect();
+    let left_reasoning = reasoning_levels_by_effort(left.supported_reasoning_levels)?;
+    let right_reasoning = reasoning_levels_by_effort(right.supported_reasoning_levels)?;
     let mut supported_reasoning_levels = Vec::new();
-    for left_level in left.supported_reasoning_levels {
-        let right_level = right
-            .supported_reasoning_levels
-            .iter()
-            .find(|right_level| right_level.effort == left_level.effort)?;
-        if left_level.description != right_level.description
-            || left_level.description.trim().is_empty()
+    for (effort, left_description) in left_reasoning {
+        let Some(right_description) = right_reasoning.get(&effort) else {
+            continue;
+        };
+        if left_description.as_str() != right_description.as_str()
+            || left_description.trim().is_empty()
+            || right_description.trim().is_empty()
         {
             return None;
         }
         supported_reasoning_levels.push(crate::provider::CodexReasoningLevel {
-            effort: left_level.effort,
-            description: left_level.description,
+            effort,
+            description: left_description,
         });
     }
     let default_reasoning_level = if left.default_reasoning_level == right.default_reasoning_level
@@ -304,6 +307,21 @@ fn merge_codex_model_capabilities(
         supported_reasoning_levels,
         default_reasoning_level,
     })
+}
+
+fn reasoning_levels_by_effort(
+    levels: Vec<crate::provider::CodexReasoningLevel>,
+) -> Option<BTreeMap<String, String>> {
+    let mut by_effort = BTreeMap::new();
+    for level in levels {
+        if let Some(existing) = by_effort.get(&level.effort)
+            && existing != &level.description
+        {
+            return None;
+        }
+        by_effort.insert(level.effort, level.description);
+    }
+    Some(by_effort)
 }
 
 fn codex_model_info(
@@ -515,6 +533,26 @@ mod tests {
             merge_codex_model_capabilities(kimi_capabilities.clone(), mismatched_description)
                 .is_none()
         );
+
+        let mut reversed = kimi_capabilities.clone();
+        reversed.supported_reasoning_levels.reverse();
+        let merged_forward =
+            merge_codex_model_capabilities(kimi_capabilities.clone(), reversed.clone())
+                .expect("same reasoning levels merge");
+        let merged_reverse = merge_codex_model_capabilities(reversed, kimi_capabilities.clone())
+            .expect("same reasoning levels merge in reverse order");
+        assert_eq!(
+            serde_json::to_value(&merged_forward).unwrap(),
+            serde_json::to_value(&merged_reverse).unwrap()
+        );
+
+        let mut subset = kimi_capabilities.clone();
+        subset
+            .supported_reasoning_levels
+            .retain(|level| level.effort != "max");
+        let merged_subset = merge_codex_model_capabilities(kimi_capabilities.clone(), subset)
+            .expect("reasoning levels use the deterministic common intersection");
+        assert_eq!(merged_subset.supported_reasoning_levels.len(), 4);
 
         let ordinary = codex_model_info("ordinary", false, Some(kimi_capabilities));
         assert_eq!(ordinary["multi_agent_version"], "disabled");

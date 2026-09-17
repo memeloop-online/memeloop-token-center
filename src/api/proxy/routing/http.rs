@@ -93,12 +93,7 @@ pub(super) async fn send_reqwest_proxy_route(
     match upstream_result {
         Ok(response) => Ok(ProxyRouteResponse {
             response: if let Some(context) = route.responses_chat.clone() {
-                super::kimi::translate(
-                    response,
-                    context,
-                    route.upstream_stream,
-                    route.route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER,
-                )?
+                super::kimi::translate(response, context, route.upstream_stream)?
             } else {
                 UpstreamResponse::Reqwest(response)
             },

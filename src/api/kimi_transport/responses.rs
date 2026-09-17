@@ -7,29 +7,28 @@ use uuid::Uuid;
 const MAX_ACCUMULATED_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ITEMS: usize = 512;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::api) enum UsageDialect {
-    Kimi,
-    OpenAiChat,
-}
+pub(in crate::api) use crate::provider::ResponsesViaChatDialect;
 
 #[derive(Clone)]
 pub(in crate::api) struct Context {
     model: String,
     tools: BTreeMap<String, ToolIdentity>,
-    usage_dialect: UsageDialect,
+    usage_dialect: ResponsesViaChatDialect,
 }
 
 impl Context {
     pub(in crate::api) fn new(request: &Value) -> Self {
-        Self::with_dialect(request, UsageDialect::OpenAiChat)
+        Self::with_dialect(request, ResponsesViaChatDialect::OpenAiChatV1)
     }
 
     pub(in crate::api) fn for_kimi(request: &Value) -> Self {
-        Self::with_dialect(request, UsageDialect::Kimi)
+        Self::with_dialect(request, ResponsesViaChatDialect::KimiV1)
     }
 
-    pub(in crate::api) fn with_dialect(request: &Value, usage_dialect: UsageDialect) -> Self {
+    pub(in crate::api) fn with_dialect(
+        request: &Value,
+        usage_dialect: ResponsesViaChatDialect,
+    ) -> Self {
         Self {
             model: request["model"].as_str().unwrap_or("").into(),
             tools: tools(request)
@@ -38,6 +37,10 @@ impl Context {
                 .collect(),
             usage_dialect,
         }
+    }
+
+    pub(in crate::api) fn uses_kimi_dialect(&self) -> bool {
+        self.usage_dialect == ResponsesViaChatDialect::KimiV1
     }
 
     fn tool_item(&self, call: &Value, id: &str) -> Value {
@@ -186,10 +189,10 @@ fn normalize_openai_chat_usage(value: &Value) -> Result<Value, &'static str> {
     Ok(value.clone())
 }
 
-fn usage(value: &Value, dialect: UsageDialect) -> Result<Value, &'static str> {
+fn usage(value: &Value, dialect: ResponsesViaChatDialect) -> Result<Value, &'static str> {
     let value = match dialect {
-        UsageDialect::Kimi => super::usage::normalize(value)?,
-        UsageDialect::OpenAiChat => normalize_openai_chat_usage(value)?,
+        ResponsesViaChatDialect::KimiV1 => super::usage::normalize(value)?,
+        ResponsesViaChatDialect::OpenAiChatV1 => normalize_openai_chat_usage(value)?,
     };
     let input = value["prompt_tokens"]
         .as_u64()

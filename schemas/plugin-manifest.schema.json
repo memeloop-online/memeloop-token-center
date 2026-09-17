@@ -194,12 +194,40 @@
                     "default": false,
                     "description": "Explicitly identifies a provider adapter that translates OpenAI Responses through Chat Completions."
                   },
+                  "responses_via_chat_dialect": {
+                    "type": "string",
+                    "enum": ["openai_chat_v1", "kimi_v1"],
+                    "description": "Closed, versioned Responses-via-Chat wire dialect. Required when responses_via_chat_v1 is true."
+                  },
                   "codex_multi_agent_v2": {
                     "type": "boolean",
                     "default": false,
                     "description": "Opt in to the host's Codex MultiAgentV2 request normalization for this provider."
                   }
-                }
+                },
+                "allOf": [
+                  {
+                    "if": {
+                      "required": ["responses_via_chat_v1"],
+                      "properties": {
+                        "responses_via_chat_v1": {"const": true}
+                      }
+                    },
+                    "then": {
+                      "required": ["responses_via_chat_dialect"]
+                    }
+                  },
+                  {
+                    "if": {
+                      "required": ["responses_via_chat_dialect"]
+                    },
+                    "then": {
+                      "properties": {
+                        "responses_via_chat_v1": {"const": true}
+                      }
+                    }
+                  }
+                ]
               },
               "codex_model_capabilities": {
                 "type": "object",

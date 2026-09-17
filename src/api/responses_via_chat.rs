@@ -7,20 +7,20 @@ use super::AppError;
 use serde_json::{Value, json};
 
 pub(in crate::api) use super::kimi_transport::responses::{
-    Context, Stream, UsageDialect, buffered,
+    Context, ResponsesViaChatDialect, Stream, buffered,
 };
 
 pub(in crate::api) fn prepare(model: &str, request: &mut Value) -> Result<Context, AppError> {
-    prepare_with_dialect(model, request, UsageDialect::OpenAiChat)
+    prepare_with_dialect(model, request, ResponsesViaChatDialect::OpenAiChatV1)
 }
 
 pub(in crate::api) fn prepare_with_dialect(
     model: &str,
     request: &mut Value,
-    dialect: UsageDialect,
+    dialect: ResponsesViaChatDialect,
 ) -> Result<Context, AppError> {
     let context = Context::with_dialect(request, dialect);
-    *request = super::kimi_transport::responses_request::convert(request)?;
+    *request = super::kimi_transport::responses_request::convert_with_dialect(request, dialect)?;
     let object = request
         .as_object_mut()
         .ok_or_else(|| AppError::BadRequest("request body must be an object".into()))?;

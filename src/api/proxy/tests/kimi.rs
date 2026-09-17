@@ -45,7 +45,6 @@ async fn translated_kimi_clean_eof_and_done_settle_and_archive_once() {
             raw,
             crate::api::responses_via_chat::Context::for_kimi(&json!({"model":fixture.model})),
             true,
-            true,
         )
         .unwrap();
         let chunks = translated.bytes_stream().collect::<Vec<_>>().await;
@@ -150,7 +149,7 @@ async fn kimi_translation_clears_length_and_uses_complete_unknown_length_memory_
         .unwrap();
     assert!(response.content_length().is_some());
     let context = crate::api::responses_via_chat::Context::for_kimi(&json!({"model":"kimi"}));
-    let translated = routing::kimi::translate(response, context, false, true).unwrap();
+    let translated = routing::kimi::translate(response, context, false).unwrap();
     assert!(translated.content_length().is_none());
     let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(
         crate::config::DEFAULT_PROXY_MEMORY_BUDGET_BYTES,
@@ -195,14 +194,14 @@ async fn send_official_codex_responses_request(
 }
 
 #[tokio::test]
-async fn generic_via_chat_provider_uses_chat_endpoint_credentials_and_reverse_maps_tools() {
+async fn fake_glm_via_chat_provider_uses_strict_chat_contract_and_reverse_maps_tools() {
     let upstream = MockServer::start().await;
     let mut fixture = response_usage_fixture_with_uri_contract_and_driver_model(
-        "generic-via-chat-bridge",
+        "fake-glm-via-chat-bridge",
         upstream.uri(),
         0,
         Some("openai-chat-usage-only"),
-        "fake-via-chat",
+        "fake-glm-via-chat",
         "generic-agent-model",
     )
     .await;
@@ -219,14 +218,15 @@ async fn generic_via_chat_provider_uses_chat_endpoint_credentials_and_reverse_ma
         .get("http-json")
         .expect("HTTP JSON supplies generic credential and config schemas")
         .clone();
-    fake_provider.id = "fake-via-chat".into();
-    fake_provider.display_name = "Fake Responses-via-Chat provider".into();
+    fake_provider.id = "fake-glm-via-chat".into();
+    fake_provider.display_name = "Fake GLM Responses-via-Chat provider".into();
     fake_provider.oauth_adapter = None;
     fake_provider.component_adapter = None;
     fake_provider.generation_adapter = None;
     fake_provider.request_compatibility = crate::provider::RequestCompatibility {
         third_party: true,
         responses_via_chat_v1: true,
+        responses_via_chat_dialect: Some(crate::provider::ResponsesViaChatDialect::OpenAiChatV1),
         codex_multi_agent_v2: true,
     };
     fake_provider.codex_model_capabilities = Some(kimi_capabilities);

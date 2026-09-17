@@ -692,6 +692,7 @@ export interface ProviderType {
   request_compatibility?: {
     third_party: boolean;
     responses_via_chat_v1: boolean;
+    responses_via_chat_dialect?: 'openai_chat_v1' | 'kimi_v1';
     codex_multi_agent_v2: boolean;
   };
   codex_model_capabilities?: {

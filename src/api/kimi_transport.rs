@@ -78,10 +78,19 @@ pub(super) fn prepare_kimi_responses(
     let context = super::responses_via_chat::prepare_with_dialect(
         &normalize_model(model),
         request,
-        super::responses_via_chat::UsageDialect::Kimi,
+        super::responses_via_chat::ResponsesViaChatDialect::KimiV1,
     )?;
     messages::repair(request);
     Ok(context)
+}
+
+pub(super) fn repair_responses_messages(
+    dialect: crate::provider::ResponsesViaChatDialect,
+    request: &mut Value,
+) {
+    if dialect == crate::provider::ResponsesViaChatDialect::KimiV1 {
+        messages::repair(request);
+    }
 }
 
 pub(super) fn catalog() -> Vec<crate::db::DiscoveredUpstreamModel> {
