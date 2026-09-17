@@ -2532,6 +2532,7 @@ async fn finish_buffered_request_with_upstream_attribution(
         error_code: error_code.as_deref(),
         response_object: &stored_response,
         routing_session_id: routing_session_id.as_deref(),
+        routing_terminal_observed_at: None,
         conversation: conversation
             .as_ref()
             .map(|projection| projection.input(response_id.as_deref())),

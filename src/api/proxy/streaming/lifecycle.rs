@@ -28,6 +28,8 @@ pub(super) struct StreamingFinalizationInput<'a> {
     pub(super) response_archive_attempt: Option<crate::proxy_lifecycle::ProxyArchiveAttempt>,
     pub(super) stored_response: String,
     pub(super) gap_response: String,
+    pub(super) routing_terminal_observed_at: Option<i64>,
+    pub(super) routing_terminal_pre_published: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,6 +161,8 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
         response_archive_attempt,
         stored_response,
         gap_response,
+        routing_terminal_observed_at,
+        routing_terminal_pre_published,
     } = input;
     let classification = classify_streaming_terminal(
         status_code,
@@ -325,7 +329,12 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
             usage,
             error_code,
             response_object: &stored_response,
-            routing_session_id: routing_session_id.as_deref(),
+            routing_session_id: if routing_terminal_pre_published {
+                None
+            } else {
+                routing_session_id.as_deref()
+            },
+            routing_terminal_observed_at,
             conversation: conversation
                 .as_ref()
                 .map(|projection| projection.input(response_id.as_deref())),

@@ -95,6 +95,10 @@ pub struct FinishProxyRequest<'a> {
     /// semantic conversation projection. Terminal routing evidence must be
     /// durable even when projection is deferred or skipped.
     pub routing_session_id: Option<&'a str>,
+    /// Stable time at which the terminal became observable. Streaming callers
+    /// capture this before closing the response body so delayed settlement
+    /// cannot reorder concurrent requests in the same session.
+    pub routing_terminal_observed_at: Option<i64>,
     pub conversation: Option<ProxyConversationInput<'a>>,
 }
 
@@ -702,6 +706,7 @@ impl Database {
             error_code: Some("request_lifecycle_timeout"),
             response_object: &response_object,
             routing_session_id: None,
+            routing_terminal_observed_at: None,
             conversation: None,
         })
         .await
@@ -1127,7 +1132,7 @@ impl Database {
                 explicit_session_id,
                 status_code,
                 error_code.as_deref(),
-                now,
+                input.routing_terminal_observed_at.unwrap_or(now),
             )
             .await?;
         }

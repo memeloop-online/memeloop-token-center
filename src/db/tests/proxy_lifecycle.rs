@@ -57,6 +57,7 @@ async fn insert_completed_session_request(database: &Database, input: CompletedS
             error_code,
             response_object: "gap://session-transport-avoid/response",
             routing_session_id: Some(session_id),
+            routing_terminal_observed_at: None,
             // This deliberately models deferred/skipped semantic projection.
             // Routing evidence must commit without conversation content.
             conversation: None,
@@ -206,6 +207,56 @@ async fn synchronous_session_terminal_evidence_is_immediate_and_route_scoped() {
         None
     );
 
+    // Settlement order is not terminal order. A delayed older failure must
+    // not replace a newer success that already became observable to the
+    // client, even when the old row is inserted last.
+    let interleaved_model = "session-transport-interleaved";
+    let newer_request = Uuid::now_v7();
+    let older_request = Uuid::now_v7();
+    let observed_at = unix_millis();
+    database
+        .record_session_routing_terminal(SessionRoutingTerminalInput {
+            key: &key,
+            request_id: newer_request,
+            explicit_session_id: session_id,
+            model: interleaved_model,
+            protocol: "openai-responses",
+            status_code: 200,
+            error_code: None,
+            model_route_id: Some(recovered_route),
+            upstream_account_id: Some(recovered_account),
+            observed_at: observed_at + 2,
+        })
+        .await
+        .unwrap();
+    database
+        .record_session_routing_terminal(SessionRoutingTerminalInput {
+            key: &key,
+            request_id: older_request,
+            explicit_session_id: session_id,
+            model: interleaved_model,
+            protocol: "openai-responses",
+            status_code: 502,
+            error_code: Some("upstream_stream_read_error"),
+            model_route_id: Some(failed_route),
+            upstream_account_id: Some(failed_account),
+            observed_at: observed_at + 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        database
+            .latest_session_transport_route_to_avoid(
+                &key,
+                session_id,
+                interleaved_model,
+                "openai-responses",
+            )
+            .await
+            .unwrap(),
+        None
+    );
+
     sqlx::query("UPDATE session_routing_terminals SET expires_at = 0")
         .execute(&database.pool)
         .await
@@ -215,7 +266,7 @@ async fn synchronous_session_terminal_evidence_is_immediate_and_route_scoped() {
             .delete_expired_session_routing_terminals(10)
             .await
             .unwrap(),
-        2
+        5
     );
 }
 
@@ -447,6 +498,7 @@ async fn postgres_late_streaming_parent_atomically_reconciles_committed_child_cl
             error_code: None,
             response_object: "objects/early-child-response",
             routing_session_id: None,
+            routing_terminal_observed_at: None,
             conversation: None,
         })
         .await
@@ -991,6 +1043,7 @@ async fn postgres_outbox_projection_reconciles_child_projected_before_parent() {
             error_code: None,
             response_object: "objects/outbox-parent-response",
             routing_session_id: None,
+            routing_terminal_observed_at: None,
             conversation: Some(ProxyConversationInput {
                 key: &key,
                 request_json: &parent_json,
@@ -1018,6 +1071,7 @@ async fn postgres_outbox_projection_reconciles_child_projected_before_parent() {
             error_code: None,
             response_object: "objects/outbox-child-response",
             routing_session_id: None,
+            routing_terminal_observed_at: None,
             conversation: Some(ProxyConversationInput {
                 key: &key,
                 request_json: &child_json,
@@ -1193,6 +1247,7 @@ async fn buffered_conversation_content_wait_does_not_hold_archive_budget() {
                     error_code: None,
                     response_object: "objects/blake3/buffered-conversation-response",
                     routing_session_id: None,
+                    routing_terminal_observed_at: None,
                     conversation: Some(ProxyConversationInput {
                         key: &key,
                         request_json: &request_json,
@@ -1673,6 +1728,7 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
         error_code: None,
         response_object: "objects/blake3/atomic-response",
         routing_session_id: None,
+        routing_terminal_observed_at: None,
         conversation: Some(ProxyConversationInput {
             key: &key,
             request_json: &request_json,
@@ -1839,6 +1895,7 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
                 error_code: None,
                 response_object: "objects/blake3/untrusted-invalid-usage-response",
                 routing_session_id: None,
+                routing_terminal_observed_at: None,
                 conversation: None,
             })
             .await
@@ -1915,6 +1972,7 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
             error_code: Some("upstream_incomplete_response"),
             response_object: "objects/blake3/delivered-failure-response",
             routing_session_id: None,
+            routing_terminal_observed_at: None,
             conversation: None,
         })
         .await
@@ -2010,6 +2068,7 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
                 error_code: Some("upstream_incomplete_response"),
                 response_object: "objects/blake3/flex-delivered-response",
                 routing_session_id: None,
+                routing_terminal_observed_at: None,
                 conversation: None,
             })
             .await
@@ -2109,6 +2168,7 @@ async fn concurrent_proxy_terminal_owners_settle_and_link_once() {
                     error_code: None,
                     response_object: "objects/blake3/race-response",
                     routing_session_id: None,
+                    routing_terminal_observed_at: None,
                     conversation: Some(ProxyConversationInput {
                         key: &key,
                         request_json: &request_json,
@@ -2220,6 +2280,7 @@ async fn terminal_upstream_attribution_uses_only_dispatched_candidates() {
                 error_code: Some("upstream_unavailable"),
                 response_object: "gap://proxy-attribution/no-dispatch-response",
                 routing_session_id: None,
+                routing_terminal_observed_at: None,
                 conversation: None,
             },
             None,
@@ -2276,6 +2337,7 @@ async fn terminal_upstream_attribution_uses_only_dispatched_candidates() {
                 error_code: Some("upstream_connection"),
                 response_object: "gap://proxy-attribution/failover-response",
                 routing_session_id: None,
+                routing_terminal_observed_at: None,
                 conversation: None,
             },
             None,

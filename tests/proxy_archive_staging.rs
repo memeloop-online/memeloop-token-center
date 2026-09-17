@@ -227,6 +227,7 @@ async fn sqlite_proxy_locators_and_staging_bindings_are_one_atomic_commit() {
         error_code: None,
         response_object: &response_locator,
         routing_session_id: None,
+        routing_terminal_observed_at: None,
         conversation: None,
     };
     // Test-only SQL safety boundary: `request_id` is a typed UUID, not external text, and SQLite

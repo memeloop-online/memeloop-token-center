@@ -17,6 +17,7 @@ pub(crate) struct SessionRoutingTerminalInput<'a> {
     pub error_code: Option<&'a str>,
     pub model_route_id: Option<Uuid>,
     pub upstream_account_id: Option<Uuid>,
+    pub observed_at: i64,
 }
 
 impl Database {
@@ -27,10 +28,8 @@ impl Database {
         &self,
         input: SessionRoutingTerminalInput<'_>,
     ) -> Result<(), AppError> {
-        let observed_at = unix_millis();
         let mut transaction = self.begin_write_transaction().await?;
-        upsert_session_routing_terminal_in_transaction(&mut transaction, input, observed_at)
-            .await?;
+        upsert_session_routing_terminal_in_transaction(&mut transaction, input).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -54,7 +53,9 @@ impl Database {
                AND explicit_session_id = $4
                AND model = $5
                AND protocol = $6
-               AND expires_at > $7",
+               AND expires_at > $7
+             ORDER BY observed_at DESC, request_id DESC
+             LIMIT 1",
         )
         .bind(key.tenant_id.to_string())
         .bind(key.principal_id.to_string())
@@ -95,11 +96,11 @@ impl Database {
     ) -> Result<u64, AppError> {
         let rows = sqlx::query(
             "DELETE FROM session_routing_terminals
-             WHERE (tenant_id, principal_id, key_id, explicit_session_id, model, protocol) IN (
-                 SELECT tenant_id, principal_id, key_id, explicit_session_id, model, protocol
+             WHERE request_id IN (
+                 SELECT request_id
                  FROM session_routing_terminals
                  WHERE expires_at <= $1
-                 ORDER BY expires_at, tenant_id, key_id, explicit_session_id, model, protocol
+                 ORDER BY expires_at, request_id
                  LIMIT $2
              )",
         )
@@ -133,19 +134,7 @@ pub(super) async fn upsert_session_routing_terminal_from_request_in_transaction(
          FROM request_records r
          JOIN key_records k ON k.id = r.key_id AND k.tenant_id = r.tenant_id
          WHERE r.id = $6 AND r.created_at = $7 AND r.completed_at IS NULL
-         ON CONFLICT (
-             tenant_id, principal_id, key_id, explicit_session_id, model, protocol
-         ) DO UPDATE SET
-             request_id = excluded.request_id,
-             observed_at = excluded.observed_at,
-             status_code = excluded.status_code,
-             error_code = excluded.error_code,
-             model_route_id = excluded.model_route_id,
-             upstream_account_id = excluded.upstream_account_id,
-             expires_at = excluded.expires_at
-         WHERE excluded.observed_at > session_routing_terminals.observed_at
-            OR (excluded.observed_at = session_routing_terminals.observed_at
-                AND excluded.request_id >= session_routing_terminals.request_id)",
+         ON CONFLICT (request_id) DO NOTHING",
     )
     .bind(explicit_session_id)
     .bind(observed_at)
@@ -162,28 +151,17 @@ pub(super) async fn upsert_session_routing_terminal_from_request_in_transaction(
 async fn upsert_session_routing_terminal_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     input: SessionRoutingTerminalInput<'_>,
-    observed_at: i64,
 ) -> Result<(), AppError> {
-    let expires_at = observed_at.saturating_add(SESSION_ROUTING_TERMINAL_TTL_MS);
+    let expires_at = input
+        .observed_at
+        .saturating_add(SESSION_ROUTING_TERMINAL_TTL_MS);
     sqlx::query(
         "INSERT INTO session_routing_terminals (
              tenant_id, principal_id, key_id, explicit_session_id, model, protocol,
              request_id, observed_at, status_code, error_code, model_route_id,
              upstream_account_id, expires_at
          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-         ON CONFLICT (
-             tenant_id, principal_id, key_id, explicit_session_id, model, protocol
-         ) DO UPDATE SET
-             request_id = excluded.request_id,
-             observed_at = excluded.observed_at,
-             status_code = excluded.status_code,
-             error_code = excluded.error_code,
-             model_route_id = excluded.model_route_id,
-             upstream_account_id = excluded.upstream_account_id,
-             expires_at = excluded.expires_at
-         WHERE excluded.observed_at > session_routing_terminals.observed_at
-            OR (excluded.observed_at = session_routing_terminals.observed_at
-                AND excluded.request_id >= session_routing_terminals.request_id)",
+         ON CONFLICT (request_id) DO NOTHING",
     )
     .bind(input.key.tenant_id.to_string())
     .bind(input.key.principal_id.to_string())
@@ -192,7 +170,7 @@ async fn upsert_session_routing_terminal_in_transaction(
     .bind(input.model)
     .bind(input.protocol)
     .bind(input.request_id.to_string())
-    .bind(observed_at)
+    .bind(input.observed_at)
     .bind(input.status_code)
     .bind(input.error_code)
     .bind(input.model_route_id.map(|id| id.to_string()))
@@ -201,6 +179,10 @@ async fn upsert_session_routing_terminal_in_transaction(
     .execute(&mut **transaction)
     .await?;
     Ok(())
+}
+
+pub(crate) fn is_session_avoid_terminal(status_code: i64, error_code: Option<&str>) -> bool {
+    status_code == 502 && error_code.is_some_and(is_session_avoid_transport_error_code)
 }
 
 fn is_session_avoid_transport_error_code(error_code: &str) -> bool {
@@ -217,7 +199,7 @@ fn is_session_avoid_transport_error_code(error_code: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_session_avoid_transport_error_code;
+    use super::{is_session_avoid_terminal, is_session_avoid_transport_error_code};
 
     #[test]
     fn only_transport_terminal_codes_are_session_avoid_evidence() {
@@ -243,5 +225,14 @@ mod tests {
         ] {
             assert!(!is_session_avoid_transport_error_code(error_code));
         }
+        assert!(is_session_avoid_terminal(
+            502,
+            Some("upstream_stream_read_error")
+        ));
+        assert!(!is_session_avoid_terminal(502, Some("http_502")));
+        assert!(!is_session_avoid_terminal(
+            503,
+            Some("upstream_stream_read_error")
+        ));
     }
 }

@@ -869,6 +869,7 @@ async fn finish_audio_request(
             error_code,
             response_object: &response_object,
             routing_session_id: None,
+            routing_terminal_observed_at: None,
             conversation: None,
         })
         .await?;
