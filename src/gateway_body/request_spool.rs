@@ -18,6 +18,8 @@ pub(crate) const REQUEST_SPOOL_CHUNK_BYTES: usize = 64 * 1024;
 pub(crate) struct RequestSpoolAdmission {
     directory: Arc<PathBuf>,
     budget: Arc<RequestSpoolBudget>,
+    #[cfg(test)]
+    read_count: Arc<AtomicUsize>,
 }
 
 impl RequestSpoolAdmission {
@@ -25,6 +27,8 @@ impl RequestSpoolAdmission {
         Self {
             directory: Arc::new(directory),
             budget: Arc::new(RequestSpoolBudget::new(limit_bytes)),
+            #[cfg(test)]
+            read_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -106,11 +110,18 @@ impl RequestSpoolAdmission {
                 &mut capture.lease,
                 RequestSpoolLease::new(self.budget.clone()),
             ),
+            #[cfg(test)]
+            read_count: self.read_count.clone(),
         })
     }
 
     pub(crate) fn snapshot(&self) -> RequestSpoolSnapshot {
         self.budget.snapshot()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_count_for_test(&self) -> usize {
+        self.read_count.load(Ordering::Acquire)
     }
 }
 
@@ -226,6 +237,8 @@ pub(crate) struct RequestSpool {
     length: usize,
     digest: [u8; 32],
     _lease: RequestSpoolLease,
+    #[cfg(test)]
+    read_count: Arc<AtomicUsize>,
 }
 
 impl RequestSpool {
@@ -239,6 +252,8 @@ impl RequestSpool {
     }
 
     pub(crate) async fn read_all(&self) -> Result<Bytes, RequestSpoolReadError> {
+        #[cfg(test)]
+        self.read_count.fetch_add(1, Ordering::AcqRel);
         let owner = self.owner.clone();
         let file = tokio::task::spawn_blocking(move || owner.try_clone())
             .await

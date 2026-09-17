@@ -359,6 +359,7 @@ impl ProxyMemoryReservation {
         &self,
         maximum: usize,
         projection_bytes: usize,
+        projection_weight: usize,
         deadline: tokio::time::Instant,
     ) -> Option<ConversationProjectionPermit> {
         if self.has_buffered_response() || maximum > MAX_BUFFERED_RESPONSE_BYTES {
@@ -368,8 +369,7 @@ impl ProxyMemoryReservation {
             .saturating_mul(CAPTURE_MEMORY_WEIGHT)
             .max(UNIT_BYTES);
         let response_units = u32::try_from(response_bytes.div_ceil(UNIT_BYTES)).ok()?;
-        let projection_bytes =
-            projection_bytes.checked_mul(REQUEST_MEMORY_WEIGHT.saturating_sub(1))?;
+        let projection_bytes = projection_bytes.checked_mul(projection_weight)?;
         let projection_units = u32::try_from(projection_bytes.div_ceil(UNIT_BYTES)).ok()?;
         let total_units = response_units.checked_add(projection_units)?;
         let mut permit = self
@@ -463,9 +463,10 @@ impl ProxyMemoryReservation {
     pub(crate) async fn reserve_conversation_projection(
         &self,
         bytes: usize,
+        weight: usize,
         deadline: tokio::time::Instant,
     ) -> Option<ConversationProjectionPermit> {
-        let weighted = bytes.checked_mul(REQUEST_MEMORY_WEIGHT.saturating_sub(1))?;
+        let weighted = bytes.checked_mul(weight)?;
         let units = u32::try_from(weighted.div_ceil(UNIT_BYTES)).ok()?;
         self.acquire(
             &self.permits,
@@ -809,6 +810,7 @@ mod tests {
                 .reserve_buffered_response_with_projection(
                     256 * 1024,
                     64 * 1024,
+                    REQUEST_MEMORY_WEIGHT.saturating_sub(1),
                     tokio::time::Instant::now() + std::time::Duration::from_secs(5),
                 )
                 .await
@@ -891,6 +893,7 @@ mod tests {
                 .reserve_buffered_response_with_projection(
                     MAX_BUFFERED_RESPONSE_BYTES,
                     REQUEST_BYTES,
+                    REQUEST_MEMORY_WEIGHT.saturating_sub(1),
                     tokio::time::Instant::now() + std::time::Duration::from_secs(5),
                 )
                 .await
@@ -948,6 +951,7 @@ mod tests {
             let permit = projection
                 .reserve_conversation_projection(
                     64 * 1024,
+                    REQUEST_MEMORY_WEIGHT.saturating_sub(1),
                     tokio::time::Instant::now() + std::time::Duration::from_secs(5),
                 )
                 .await
@@ -996,6 +1000,7 @@ mod tests {
             projection
                 .reserve_conversation_projection(
                     64 * 1024,
+                    REQUEST_MEMORY_WEIGHT.saturating_sub(1),
                     started + std::time::Duration::from_millis(50),
                 )
                 .await

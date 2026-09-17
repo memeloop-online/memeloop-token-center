@@ -1831,6 +1831,15 @@ impl ConversationBody {
         }
     }
 
+    fn projection_weight(&self) -> usize {
+        match self {
+            Self::InMemory(_) => {
+                crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT.saturating_sub(1)
+            }
+            Self::Spool(_) => crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT,
+        }
+    }
+
     async fn read(&self) -> Result<Bytes, AppError> {
         match self {
             Self::InMemory(body) => Ok(body.clone()),
@@ -1885,6 +1894,7 @@ impl ProxyConversation {
             .reserve_buffered_response_with_projection(
                 response_maximum,
                 self.request_body.len(),
+                self.request_body.projection_weight(),
                 deadline,
             )
             .await
@@ -1913,7 +1923,11 @@ impl ProxyConversation {
         };
         let projection_memory = match admission {
             ConversationProjectionAdmission::Deferred => memory
-                .reserve_conversation_projection(self.request_body.len(), deadline)
+                .reserve_conversation_projection(
+                    self.request_body.len(),
+                    self.request_body.projection_weight(),
+                    deadline,
+                )
                 .await
                 .ok_or(AppError::Overloaded)?,
             ConversationProjectionAdmission::Reserved(permit) => permit,
