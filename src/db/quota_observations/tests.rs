@@ -140,6 +140,7 @@ async fn verify(config: Config) {
         .unwrap();
     assert_eq!(renewed_recovery.len(), 1);
     assert_eq!(renewed_recovery[0].account_id, recovering.id);
+    assert_eq!(renewed_recovery[0].recovery_mark, prior_attempt + 2);
 
     // Fixture only: no credential is used and no supplier request is made.
     sqlx::query("UPDATE upstream_accounts SET driver='kimi-oauth' WHERE id=$1")
@@ -160,6 +161,53 @@ async fn verify(config: Config) {
     assert_eq!(non_opted_in.len(), 1);
     assert_eq!(non_opted_in[0].account_id, recovering.id);
     assert!(non_opted_in[0].recovering_quota);
+    let recovery_lease = Uuid::now_v7();
+    assert!(
+        db.claim_quota_observation(
+            &renewed_recovery[0],
+            recovery_lease,
+            prior_attempt + 1,
+            prior_attempt + 33,
+        )
+        .await
+        .unwrap(),
+        "a new hard-quota episode bypasses the prior observation backoff exactly once"
+    );
+    db.finish_quota_observation(
+        &renewed_recovery[0],
+        recovery_lease,
+        None,
+        prior_attempt + 100,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !db.claim_quota_observation(
+            &renewed_recovery[0],
+            Uuid::now_v7(),
+            prior_attempt + 3,
+            prior_attempt + 34,
+        )
+        .await
+        .unwrap(),
+        "the persisted episode mark prevents a faster gateway clock from bypassing twice"
+    );
+    sqlx::query("DELETE FROM upstream_account_health WHERE upstream_account_id=$1")
+        .bind(recovering.id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        !db.claim_quota_observation(
+            &renewed_recovery[0],
+            Uuid::now_v7(),
+            prior_attempt + 101,
+            prior_attempt + 131,
+        )
+        .await
+        .unwrap(),
+        "a stale recovery target cannot probe after the matching health episode is gone"
+    );
     let target = db
         .quota_observation_targets(&[plugin_id], 100, 4)
         .await

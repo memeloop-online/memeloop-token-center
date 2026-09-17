@@ -55,6 +55,7 @@ impl Database {
             FROM targets GROUP BY id,tenant_id
         ) SELECT a.id,a.tenant_id,t.external_id,a.credential_generation,a.updated_at,
                 CASE WHEN p.recovery_priority=0 THEN 1 ELSE 0 END AS recovering_quota,
+                p.recovery_mark,
                 COALESCE(q.last_attempt_at,0) AS previous_attempt_at,
                 COALESCE(q.next_refresh_at,0) AS previous_next_refresh_at
             FROM prioritized p JOIN upstream_accounts a ON a.id=p.id AND a.tenant_id=p.tenant_id
@@ -83,6 +84,7 @@ impl Database {
                     generation: row.try_get("credential_generation")?,
                     config_revision: row.try_get("updated_at")?,
                     recovering_quota: row.try_get::<i64, _>("recovering_quota")? == 1,
+                    recovery_mark: row.try_get("recovery_mark")?,
                     previous_attempt_at: row.try_get("previous_attempt_at")?,
                     previous_next_refresh_at: row.try_get("previous_next_refresh_at")?,
                 })
@@ -98,13 +100,24 @@ impl Database {
         lease_until: i64,
     ) -> Result<bool, AppError> {
         let changed = sqlx::query("INSERT INTO upstream_quota_observations (upstream_account_id,tenant_id,credential_generation,config_revision,last_attempt_at,lease_id,lease_until)
-            SELECT id,tenant_id,credential_generation,updated_at,$5,$6,$7 FROM upstream_accounts
+            SELECT id,tenant_id,credential_generation,updated_at,
+                CASE WHEN $8>$5 THEN $8 ELSE $5 END,$6,$7 FROM upstream_accounts
             WHERE id=$1 AND tenant_id=$2 AND credential_generation=$3 AND updated_at=$4 AND status='active'
+                AND ($8=0 OR EXISTS (SELECT 1 FROM upstream_account_health h
+                    WHERE h.upstream_account_id=$1 AND h.credential_generation=$3
+                        AND h.last_failure_kind='quota_exhausted' AND h.updated_at=$8
+                        AND h.probe_lease_until<=$5))
             ON CONFLICT(upstream_account_id) DO UPDATE SET tenant_id=excluded.tenant_id,credential_generation=excluded.credential_generation,
                 config_revision=excluded.config_revision,last_attempt_at=excluded.last_attempt_at,lease_id=excluded.lease_id,lease_until=excluded.lease_until
             WHERE upstream_quota_observations.lease_until<=$5 AND (upstream_quota_observations.next_refresh_at<=$5
-                OR upstream_quota_observations.credential_generation<>excluded.credential_generation OR upstream_quota_observations.config_revision<>excluded.config_revision)")
-            .bind(target.account_id.to_string()).bind(target.tenant_id.to_string()).bind(target.generation).bind(target.config_revision).bind(now).bind(lease.to_string()).bind(lease_until)
+                OR upstream_quota_observations.credential_generation<>excluded.credential_generation
+                OR upstream_quota_observations.config_revision<>excluded.config_revision
+                OR ($8>upstream_quota_observations.last_attempt_at
+                    AND EXISTS (SELECT 1 FROM upstream_account_health h
+                        WHERE h.upstream_account_id=$1 AND h.credential_generation=$3
+                            AND h.last_failure_kind='quota_exhausted' AND h.updated_at=$8
+                            AND h.probe_lease_until<=$5)))")
+            .bind(target.account_id.to_string()).bind(target.tenant_id.to_string()).bind(target.generation).bind(target.config_revision).bind(now).bind(lease.to_string()).bind(lease_until).bind(target.recovery_mark)
             .execute(&self.pool).await?.rows_affected();
         Ok(changed == 1)
     }

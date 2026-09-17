@@ -35,6 +35,7 @@ pub(crate) struct QuotaObservationTarget {
     pub generation: i64,
     pub config_revision: i64,
     pub recovering_quota: bool,
+    pub recovery_mark: i64,
     pub previous_attempt_at: i64,
     pub previous_next_refresh_at: i64,
 }
@@ -343,6 +344,7 @@ mod tests {
             generation: 1,
             config_revision: 10,
             recovering_quota: true,
+            recovery_mark: 1,
             previous_attempt_at: 0,
             previous_next_refresh_at: 0,
         };
@@ -364,6 +366,7 @@ mod tests {
             generation: 1,
             config_revision: 10,
             recovering_quota: true,
+            recovery_mark: 1,
             previous_attempt_at: 0,
             previous_next_refresh_at: 0,
         };
