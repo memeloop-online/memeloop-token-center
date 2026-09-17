@@ -1553,7 +1553,10 @@ async fn proxy_with_identity_and_conversation_spool(
         && let Some(conversation) = buffered_request.conversation.as_ref()
         && !buffered_request
             .memory
-            .reserve_unexpected_buffered_request(conversation.request_body.len())
+            .reserve_unexpected_buffered_request(
+                conversation.request_body.len(),
+                conversation.request_body.projection_weight(),
+            )
             .await
     {
         conversation.reject_projection();

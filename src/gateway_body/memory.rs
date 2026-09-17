@@ -274,13 +274,14 @@ impl ProxyMemoryReservation {
     pub(crate) async fn reserve_unexpected_buffered_request(
         &self,
         projection_bytes: usize,
+        projection_weight: usize,
     ) -> bool {
         let units = {
             let Ok(held) = self.held.lock() else {
                 return false;
             };
             let Some(bytes) = projection_bytes
-                .checked_mul(REQUEST_MEMORY_WEIGHT.saturating_sub(1))
+                .checked_mul(projection_weight)
                 .and_then(|projection| held.0.checked_add(projection))
             else {
                 return false;
@@ -870,13 +871,19 @@ mod tests {
         }
         assert!(
             streams[0]
-                .reserve_unexpected_buffered_request(REQUEST_BYTES)
+                .reserve_unexpected_buffered_request(
+                    REQUEST_BYTES,
+                    REQUEST_MEMORY_WEIGHT.saturating_sub(1),
+                )
                 .await
         );
         for stream in &streams[1..] {
             assert!(
                 !stream
-                    .reserve_unexpected_buffered_request(REQUEST_BYTES)
+                    .reserve_unexpected_buffered_request(
+                        REQUEST_BYTES,
+                        REQUEST_MEMORY_WEIGHT.saturating_sub(1),
+                    )
                     .await
             );
         }
