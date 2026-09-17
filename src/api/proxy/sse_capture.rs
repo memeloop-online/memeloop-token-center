@@ -44,6 +44,7 @@ pub(super) struct ResponsesSseCapture {
     response_id: Option<String>,
     invalid: bool,
     observed_protocol_invalid: bool,
+    independently_observed_protocol_invalid: bool,
     terminal_success: bool,
     terminal_failure: bool,
     terminal_incomplete: bool,
@@ -89,6 +90,7 @@ pub(super) struct ResponsesSseSummary {
     pub(super) usage: Option<TokenUsage>,
     pub(super) usage_invalid: bool,
     pub(super) observed_protocol_invalid: bool,
+    pub(super) independently_observed_protocol_invalid: bool,
     pub(super) protocol_invalid: bool,
 }
 
@@ -198,6 +200,7 @@ impl ResponsesSseCapture {
             self.finish_delivery_event(bytes, class);
         }
         self.observed_protocol_invalid |= self.invalid;
+        self.independently_observed_protocol_invalid |= self.invalid;
         Ok(())
     }
 
@@ -212,13 +215,29 @@ impl ResponsesSseCapture {
             .map_or_else(Vec::new, |delivery| std::mem::take(&mut delivery.frames)))
     }
 
-    pub(super) fn finish_summary(mut self) -> ResponsesSseSummary {
+    #[cfg(test)]
+    pub(super) fn finish_summary(self) -> ResponsesSseSummary {
+        self.finish_summary_after_local_boundary(false)
+    }
+
+    pub(super) fn finish_summary_after_local_boundary(
+        mut self,
+        local_boundary: bool,
+    ) -> ResponsesSseSummary {
         if let Some(chat_usage) = self.chat_usage.as_ref() {
             self.usage = chat_usage.usage();
             let usage_invalid = chat_usage.usage_invalid();
+            // A local framing limit can end an otherwise valid Chat prefix
+            // before DONE and terminal usage. Keep that derived incompleteness
+            // request-scoped; only an independently observed Chat schema or
+            // sequence violation may still poison account health.
+            let independently_usage_invalid = chat_usage.observed_semantic_invalidity()
+                || (!local_boundary && self.framing_rejection.is_none());
             self.usage_invalid |= usage_invalid;
             self.invalid |= usage_invalid;
             self.observed_protocol_invalid |= usage_invalid;
+            self.independently_observed_protocol_invalid |=
+                usage_invalid && independently_usage_invalid;
         }
         if !self.framer.is_complete() {
             self.invalid = true;
@@ -242,6 +261,7 @@ impl ResponsesSseCapture {
             usage: self.usage,
             usage_invalid: self.usage_invalid,
             observed_protocol_invalid: self.observed_protocol_invalid,
+            independently_observed_protocol_invalid: self.independently_observed_protocol_invalid,
             protocol_invalid,
         }
     }

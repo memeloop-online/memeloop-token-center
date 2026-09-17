@@ -176,6 +176,7 @@ fn batch_limit_without_prior_invalidity_has_no_observed_protocol_violation() {
     ));
     let summary = capture.finish_summary();
     assert!(!summary.observed_protocol_invalid);
+    assert!(!summary.independently_observed_protocol_invalid);
     assert!(summary.protocol_invalid);
 }
 
@@ -189,6 +190,7 @@ fn batch_limit_preserves_a_prior_semantic_protocol_violation() {
     ));
     let summary = capture.finish_summary();
     assert!(summary.observed_protocol_invalid);
+    assert!(summary.independently_observed_protocol_invalid);
     assert!(summary.protocol_invalid);
 }
 
@@ -202,6 +204,37 @@ fn event_limit_is_observed_protocol_invalidity() {
     ));
     let summary = capture.finish_summary();
     assert!(summary.observed_protocol_invalid);
+    assert!(!summary.independently_observed_protocol_invalid);
+    assert!(summary.protocol_invalid);
+}
+
+#[test]
+fn strict_chat_event_limit_does_not_turn_missing_terminal_usage_into_semantic_evidence() {
+    let mut capture = ResponsesSseCapture::for_openai_chat_usage();
+    let oversized = vec![b'x'; crate::api::limits::MAX_RESPONSES_SSE_EVENT_BYTES + 1];
+    assert!(matches!(
+        capture.push_delivery_frames(&oversized),
+        Err(crate::api::sse::SseFramerRejection::EventLimit)
+    ));
+    let summary = capture.finish_summary();
+    assert!(summary.usage_invalid);
+    assert!(summary.observed_protocol_invalid);
+    assert!(!summary.independently_observed_protocol_invalid);
+    assert!(summary.protocol_invalid);
+}
+
+#[test]
+fn strict_chat_total_size_boundary_does_not_turn_missing_terminal_usage_into_semantic_evidence() {
+    let mut capture = ResponsesSseCapture::for_openai_chat_usage();
+    capture
+        .push_delivery_frames(
+            b"data: {\"id\":\"chatcmpl-size\",\"object\":\"chat.completion.chunk\",\"model\":\"fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"valid output\"},\"finish_reason\":null}]}\n\n",
+        )
+        .unwrap();
+    let summary = capture.finish_summary_after_local_boundary(true);
+    assert!(summary.usage_invalid);
+    assert!(summary.observed_protocol_invalid);
+    assert!(!summary.independently_observed_protocol_invalid);
     assert!(summary.protocol_invalid);
 }
 

@@ -33,6 +33,34 @@ impl BoundedUpstreamError {
     }
 }
 
+pub(super) fn upstream_error_health_terminal(error_code: &str) -> UpstreamAttemptTerminal {
+    if is_local_response_boundary(error_code)
+        || matches!(
+            error_code,
+            "upstream_timeout"
+                | "upstream_read_timeout"
+                | "upstream_request_timeout"
+                | "upstream_stream"
+                | "upstream_stream_read_error"
+        )
+    {
+        UpstreamAttemptTerminal::Inconclusive
+    } else {
+        UpstreamAttemptTerminal::invalid_response()
+    }
+}
+
+pub(super) fn is_local_response_boundary(error_code: &str) -> bool {
+    matches!(
+        error_code,
+        "upstream_response_event_too_large"
+            | "upstream_response_event_batch_too_large"
+            | "upstream_response_terminal_too_large"
+            | "upstream_response_too_large"
+            | "upstream_response_memory_capacity"
+    )
+}
+
 pub(super) async fn read_bounded_upstream(
     response: UpstreamResponse,
     maximum: usize,
@@ -120,6 +148,26 @@ pub(super) async fn read_bounded_upstream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_response_boundaries_are_inconclusive_health_evidence() {
+        for error in [
+            "upstream_response_event_too_large",
+            "upstream_response_event_batch_too_large",
+            "upstream_response_terminal_too_large",
+            "upstream_response_too_large",
+            "upstream_response_memory_capacity",
+        ] {
+            assert!(matches!(
+                upstream_error_health_terminal(error),
+                UpstreamAttemptTerminal::Inconclusive
+            ));
+        }
+        assert!(matches!(
+            upstream_error_health_terminal("upstream_invalid_content_type"),
+            UpstreamAttemptTerminal::Failed { .. }
+        ));
+    }
 
     #[tokio::test]
     async fn unexpected_json_waits_for_memory_before_polling_any_body_bytes() {
