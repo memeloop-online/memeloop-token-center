@@ -201,7 +201,7 @@ fn is_matching_codex_user_agent(originator: &str, user_agent: &str) -> bool {
 /// client.  Keep this parser beside the native transport's originator allow
 /// list so request normalization and upstream identity forwarding cannot
 /// drift into separate client inventories.
-pub(super) fn is_first_party_codex_user_agent(user_agent: &str) -> bool {
+pub(in crate::api) fn is_first_party_codex_user_agent(user_agent: &str) -> bool {
     if !bounded_visible_ascii(user_agent, MAX_CODEX_USER_AGENT_BYTES) {
         return false;
     }
