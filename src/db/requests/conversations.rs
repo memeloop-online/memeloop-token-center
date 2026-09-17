@@ -397,17 +397,18 @@ impl Database {
         } else {
             None
         };
-        if matches!(self.backend, DatabaseBackend::PostgreSql)
-            && let Some(request_created_at) = request_created_at
-        {
-            sqlx::query(
-                "SELECT id FROM request_records WHERE id = $1 AND created_at = $2 FOR UPDATE",
-            )
-            .bind(&request_id)
-            .bind(request_created_at)
-            .fetch_optional(&mut **transaction)
-            .await?
-            .ok_or(AppError::NotFound)?;
+        if let Some(request_created_at) = request_created_at {
+            lock_request_records_projection_source_in_transaction(transaction).await?;
+            if matches!(self.backend, DatabaseBackend::PostgreSql) {
+                sqlx::query(
+                    "SELECT id FROM request_records WHERE id = $1 AND created_at = $2 FOR UPDATE",
+                )
+                .bind(&request_id)
+                .bind(request_created_at)
+                .fetch_optional(&mut **transaction)
+                .await?
+                .ok_or(AppError::NotFound)?;
+            }
         }
         // Conversation reconciliation may merge session projections later in this transaction.
         // The request row is locked first to match terminal writers and source-pruning maintenance;

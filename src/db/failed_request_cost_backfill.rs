@@ -1136,6 +1136,56 @@ mod tests {
                 .into_iter()
                 .all(|cost| cost == writer_cost)
         );
+
+        let stats_gate = Database::connect_with_max(database_url, 1).await.unwrap();
+        let mut stats_gate_tx = stats_gate.begin_write_transaction().await.unwrap();
+        let stats_gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *stats_gate_tx)
+            .await
+            .unwrap();
+        lock_request_stats_projection_in_transaction(&mut stats_gate_tx)
+            .await
+            .unwrap();
+
+        let source_writer = Database::connect_with_max(database_url, 1).await.unwrap();
+        let source_writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&source_writer.pool)
+            .await
+            .unwrap();
+        let source_writer_task = tokio::spawn(async move {
+            let mut transaction = source_writer.begin_write_transaction().await?;
+            lock_request_records_projection_source_in_transaction(&mut transaction).await?;
+            lock_generation_jobs_projection_source_in_transaction(&mut transaction).await?;
+            lock_request_stats_projection_in_transaction(&mut transaction).await?;
+            transaction.commit().await?;
+            Ok::<(), AppError>(())
+        });
+        wait_for_postgres_blocker(observer, source_writer_pid, stats_gate_pid).await;
+
+        let prune = Database::connect_with_max(database_url, 1).await.unwrap();
+        let prune_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&prune.pool)
+            .await
+            .unwrap();
+        let prune_task = tokio::spawn(async move {
+            let mut transaction = prune.begin_write_transaction().await?;
+            sqlx::query("LOCK TABLE request_records, generation_jobs IN SHARE MODE")
+                .execute(&mut *transaction)
+                .await?;
+            lock_request_stats_projection_in_transaction(&mut transaction).await?;
+            transaction.commit().await?;
+            Ok::<(), AppError>(())
+        });
+        wait_for_postgres_blocker(observer, prune_pid, source_writer_pid).await;
+        stats_gate_tx.commit().await.unwrap();
+        let (source_writer_result, prune_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(source_writer_task, prune_task)
+            })
+            .await
+            .expect("source writer and pruning lock order deadlocked");
+        source_writer_result.unwrap().unwrap();
+        prune_result.unwrap().unwrap();
     }
 
     #[tokio::test]
