@@ -90,7 +90,7 @@ export function OverviewTrends({ state, onDrilldown }: { state: ResourceState<Op
     {stats && <>
       <p className="usage-time-zone">{bucketTimeZoneNote(locale, stats.time_zone)}</p>
       <p className="analytics-settlement-note"><LocalSettlementNotice /></p>
-      <p className="analytics-p95-note">{locale === 'zh-CN' ? 'P95为直方图区间上界；超出最高档或旧版无法确定的值不绘制为精确延迟。' : 'P95 uses histogram upper bounds. Overflow and ambiguous legacy values leave gaps instead of exact latency points.'}</p>
+      <p className="analytics-p95-note">{locale === 'zh-CN' ? 'P95 按直方图区间上界展示；超出最高档及早期无法确定的值留空。' : 'P95 uses histogram upper bounds. Overflow and ambiguous earlier values leave gaps.'}</p>
       <div className="overview-trend-grid">
         {trendCards.map(({ id, title, option }) => <article className={`panel overview-trend-card${id === 'throughput' ? ' overview-trend-primary' : ''}`} key={id}>
           <ChartDataView title={title} metadata={<span>{displayTimeZone()}</span>} data={table}>

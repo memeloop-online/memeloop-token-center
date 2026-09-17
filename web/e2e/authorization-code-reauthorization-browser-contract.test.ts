@@ -69,7 +69,7 @@ test('Antigravity reauthorization preserves the account and consumes identity-mi
     await page.getByRole('dialog').getByRole('button', { name: '确认继续', exact: true }).click();
     await start.click(); await callback.fill('http://localhost/callback?code=fixture-code&state=fixture-state');
     await page.getByRole('button', { name: '完成授权', exact: true }).click();
-    await page.getByRole('alert').filter({ hasText: '尚未确认原账号' }).waitFor();
+    await page.getByRole('alert').filter({ hasText: '原账号的重新授权状态待确认' }).waitFor();
     await page.getByRole('button', { name: '继续完成重新授权', exact: true }).click();
     await page.getByRole('status').filter({ hasText: '原账号已重新授权' }).waitFor();
     assert.equal(starts, 2); assert.equal(completes, 3); assert.equal(reads, 1);

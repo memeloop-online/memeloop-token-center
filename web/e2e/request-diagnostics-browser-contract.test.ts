@@ -158,11 +158,11 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     assert.equal(await timedRow.locator('.request-outcome').getAttribute('data-outcome'), 'completed');
     await timedRow.locator('.request-outcome').focus();
     await page.getByRole('tooltip').filter({ hasText: 'not client acknowledgement' }).waitFor();
-    assert.match(await timedRow.locator('.request-tps-cell').innerText(), /Gateway output rate\s+32/);
+    assert.match(await timedRow.locator('.request-tps-cell').innerText(), /Generation TPS\s+32/);
     assert.match(await timedRow.locator('.request-tps-cell').innerText(), /Average TPS\s+25\.93/, 'average includes the first-output wait and remains alongside generation throughput');
-    assert.match(await recordedRow.locator('[data-rate="generation"]').innerText(), /Gateway output rate\s+—/, 'missing generation timing does not borrow the average');
+    assert.match(await recordedRow.locator('[data-rate="generation"]').innerText(), /Generation TPS\s+—/, 'missing generation timing does not borrow the average');
     assert.match(await historicalGapDiagnostics.locator('[data-rate="average"]').innerText(), /Average TPS\s+—/);
-    assert.match(await historicalGapDiagnostics.locator('[data-rate="generation"]').innerText(), /Gateway output rate\s+—/);
+    assert.match(await historicalGapDiagnostics.locator('[data-rate="generation"]').innerText(), /Generation TPS\s+—/);
     await timedRow.locator('[data-rate="generation"]').focus();
     await page.getByRole('tooltip').filter({ hasText: 'First output wait' }).waitFor();
     assert.match(await page.getByRole('tooltip').filter({ hasText: 'First output wait' }).innerText(), /234/);
@@ -269,7 +269,7 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     assert.match(await ceiling.innerText(), /Settlement ceiling/);
     assert.match(await ceiling.locator('.request-token-primary').innerText(), /Uncached input\s*—[\s\S]*Output\s*—/);
     assert.match(await ceiling.locator('[data-rate="average"]').innerText(), /Average TPS\s+—/);
-    assert.match(await ceiling.locator('[data-rate="generation"]').innerText(), /Gateway output rate\s+—/);
+    assert.match(await ceiling.locator('[data-rate="generation"]').innerText(), /Generation TPS\s+—/);
     assert.doesNotMatch(await ceiling.innerText(), /8,?560\.91/);
     const ceilingCost = ceiling.locator('.request-detail-primary > div').last().locator('span[tabindex="0"]');
     assert.equal(await ceilingCost.innerText(), '$0.00');

@@ -119,6 +119,8 @@ test('terminal imported history need not have completion timestamps; live starte
   assert.equal(requestOutcome({ ...request, status_code: 499, error_code: 'client_cancelled' }), 'cancelled');
   assert.equal(requestOutcome({ ...request, status_code: null, error_code: 'delivery_started' }), 'delivering');
   assert.match(requestStatusCopy({ ...request, completed_at: 3000 }, 'en').hint, /not client acknowledgement/);
+  assert.match(requestStatusCopy(request, 'en').hint, /Completion time is missing; complete delivery is not confirmed\./);
+  assert.match(requestStatusCopy(request, 'zh-CN').hint, /此历史记录缺少完成时间，无法确认完整交付。/);
 });
 
 test('Anthropic uses persisted normalized total input, not raw provider input', () => {

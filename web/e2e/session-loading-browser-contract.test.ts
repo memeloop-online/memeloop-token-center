@@ -48,6 +48,9 @@ test('session reads retry a transient failure inside one deadline and remain can
     await page.locator('.session-list-skeleton').waitFor();
     await page.evaluate(() => window.resolveSessionList(true));
     await page.getByText('Retained session', { exact: true }).first().waitFor();
+    await page.getByRole('button', { name: 'Agent and request timing', exact: true }).click();
+    assert.equal(await page.locator('.session-event footer > span[tabindex="0"]').innerText(), '5 tokens · 10 ms · —',
+      'unknown session cost renders as a dash instead of the recorded ledger amount');
     assert.equal(await page.getByRole('checkbox', { name: 'Auto-refresh', exact: true }).isChecked(), true);
     await page.getByRole('button', { name: 'Simulate session event', exact: true }).click();
     await page.waitForFunction(() => window.sessionListReads === 3);

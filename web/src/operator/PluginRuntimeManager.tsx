@@ -18,7 +18,7 @@ interface History { runtime_enabled?: boolean; installation_enabled: boolean; in
 const copy = {
   en: {
     title: 'Plugin installation and versions', global: 'Global administrator operations',
-    unavailable: 'Runtime management is not enabled, or this credential is not a global plugin administrator.',
+    unavailable: 'Runtime management must be enabled and this credential needs global plugin administrator permission.',
     loading: 'Loading runtime…', refresh: 'Refresh runtime', disabled: 'Installation is disabled. Configure host signing trust and shared inventory storage to enable it.',
     scope: 'Each inventory is a complete plugin set. Keep required policies and providers. Installation alone does not activate code.',
     inventory: 'New inventory ID', packages: 'Digest-pinned OCI references (one per line)', install: 'Install for review',
@@ -27,13 +27,13 @@ const copy = {
     retry: 'Retry installation', candidates: 'Available inventories', stage: 'Validate inventory', publish: 'Publish inventory',
     current: 'Current revision', baseline: 'Startup baseline (no published revision)', history: 'Version history', rollback: 'Roll back to this version',
     audit: 'Operation audit', older: 'Load older versions', olderAudit: 'Load older audit records', empty: 'No records yet.', done: 'Operation completed.',
-    failed: 'Operation failed. Refresh to check the durable result before retrying.', confirm: 'Confirm global activation',
+    failed: 'Operation failed. Refresh to view the latest result before retrying.', confirm: 'Confirm global activation',
     inventoryFlow: 'Inventory and installation', activity: 'Tasks and version records',
     pending: 'Working…', staged: 'Validated', unstaged: 'Not yet validated',
   },
   zh: {
     title: '插件安装与版本管理', global: '全局管理员操作',
-    unavailable: '运行时管理未启用，或当前凭据不是全局插件管理员。',
+    unavailable: '请启用运行时管理，并使用具有全局插件管理员权限的凭据。',
     loading: '正在读取运行时…', refresh: '刷新运行时', disabled: '安装功能未启用。请配置主机签名信任策略和共享库存存储。',
     scope: '每个库存必须包含完整插件集，请保留需要的策略和供应商。安装本身不会激活代码。',
     inventory: '新库存 ID', packages: '固定摘要的 OCI 引用（每行一个）', install: '安装并待审阅',
@@ -42,7 +42,7 @@ const copy = {
     retry: '重试安装', candidates: '可用库存', stage: '校验库存', publish: '发布库存',
     current: '当前版本', baseline: '启动基线（尚未发布版本）', history: '版本历史', rollback: '回退到此版本',
     audit: '操作审计', older: '读取更早版本', olderAudit: '读取更早审计记录', empty: '暂无记录。', done: '操作已完成。',
-    failed: '操作失败，请刷新确认持久化结果后重试。', confirm: '确认全局激活',
+    failed: '操作失败，请刷新查看最新结果后重试。', confirm: '确认全局激活',
     inventoryFlow: '库存与安装', activity: '任务与版本记录',
     pending: '处理中…', staged: '已校验', unstaged: '尚未校验',
   },

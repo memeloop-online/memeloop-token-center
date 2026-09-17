@@ -42,7 +42,7 @@ test('replay provides localized user-turn navigation, compact archive state, and
   assert.match(replayView, /sessionReplay\.archiveUnknown/);
   assert.match(replayView, /sessionReplay\.pairing\.\$\{item\.pairing\}/);
   assert.doesNotMatch(replayView, /ARCHIVE UNKNOWN|ARCHIVE INCOMPLETE|TOOL CALL|TOOL RESULT/);
-  for (const key of ['sessionReplay.title', 'sessionReplay.userTurns', 'sessionReplay.toolCall', 'sessionReplay.toolResult', 'sessionReplay.archiveUnavailableBoth', 'sessionReplay.expand', 'sessionReplay.pairing.paired'] as const) {
+  for (const key of ['sessionReplay.title', 'sessionReplay.userTurns', 'sessionReplay.toolCall', 'sessionReplay.toolResult', 'sessionReplay.archiveUnavailableBoth', 'sessionReplay.archiveFormatInvalid', 'sessionReplay.expand', 'sessionReplay.pairing.paired'] as const) {
     assert.match(i18n, new RegExp(`'${key.replaceAll('.', '\\.')}':`));
   }
   assert.match(replayView, /REPLAY_EXPAND_TEXT_LENGTH/);

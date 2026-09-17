@@ -40,7 +40,8 @@ const sessionRequests: Record<string, LogicalSessionDetail['requests']> = {
   [session.session_id]: [{
     request_id: 'archived-fixture-request', created_at: 1000, completed_at: 1010,
     protocol: 'openai', model: 'fixture-model', status_code: 200, duration_ms: 10,
-    input_tokens: 2, output_tokens: 3, cost: '0', currency: 'USD', error_code: null,
+    input_tokens: 2, output_tokens: 3, cost: '12.34', currency: 'USD', error_code: null,
+    usage_basis: 'not_observed',
     archive_state: 'pending', source: 'live', provenance: 'native', unlinked: false,
     session_context: {
       session_id: session.session_id, association: 'confirmed', session_name: session.session_name,
