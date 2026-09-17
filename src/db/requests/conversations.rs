@@ -397,7 +397,7 @@ impl Database {
         } else {
             None
         };
-        if let Some(request_created_at) = request_created_at {
+        let request_fact_exists = if let Some(request_created_at) = request_created_at {
             lock_request_records_projection_source_in_transaction(transaction).await?;
             if matches!(self.backend, DatabaseBackend::PostgreSql) {
                 sqlx::query(
@@ -409,11 +409,22 @@ impl Database {
                 .await?
                 .ok_or(AppError::NotFound)?;
             }
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM request_stats_facts WHERE request_id = $1",
+            )
+            .bind(&request_id)
+            .fetch_one(&mut **transaction)
+            .await?
+                != 0
+        } else {
+            false
+        };
+        // A completed request can reclassify its session projection, while a newly arrived turn id
+        // can reconcile already-completed descendants. Pending observations with neither condition
+        // must remain independently committable while another pending observation is uncommitted.
+        if request_fact_exists || hints.turn_id.is_some() {
+            lock_request_stats_projection_in_transaction(transaction).await?;
         }
-        // Conversation reconciliation may merge session projections later in this transaction.
-        // The request row is locked first to match terminal writers and source-pruning maintenance;
-        // take the statistics lock before any conversation advisory or row lock after that.
-        lock_request_stats_projection_in_transaction(transaction).await?;
 
         if matches!(self.backend, DatabaseBackend::PostgreSql)
             && let Some(session_id) = hints.session_id.as_deref()
@@ -756,8 +767,13 @@ impl Database {
             if attached.rows_affected() != 1 {
                 return Err(AppError::Internal);
             }
-            reclassify_request_session_in_transaction(transaction, parse_uuid(request_id.clone())?)
+            if request_fact_exists {
+                reclassify_request_session_in_transaction(
+                    transaction,
+                    parse_uuid(request_id.clone())?,
+                )
                 .await?;
+            }
         }
         if let Some(turn_id) = hints.turn_id.as_deref() {
             reconcile_unresolved_explicit_parents_in_transaction(
