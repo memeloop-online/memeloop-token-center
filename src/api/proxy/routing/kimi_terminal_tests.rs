@@ -1,4 +1,5 @@
 use super::*;
+use crate::api::responses_via_chat;
 
 fn wire(finish: Option<&str>, usage: Value, delta: Value) -> Bytes {
     Bytes::from(format!(
@@ -44,7 +45,9 @@ fn state(chunks: Vec<Result<Bytes, &'static str>>) -> StreamState {
         upstream: Box::pin(futures_util::stream::iter(chunks)),
         framer: BoundedSseFramer::default(),
         usage: ChatSseUsageState::for_kimi(),
-        translator: responses::Stream::new(responses::Context::new(&json!({"model":"kimi-k3"}))),
+        translator: responses_via_chat::Stream::new(responses_via_chat::Context::new(
+            &json!({"model":"kimi-k3"}),
+        )),
         pending: VecDeque::new(),
         terminal: false,
         failed: false,
@@ -196,9 +199,10 @@ async fn duplicate_call_ids_and_incomplete_custom_arguments_never_complete() {
     let custom = json!({"tool_calls":[{"index":0,"id":"custom-call","function":{"name":"patch","arguments":"{\"input\":"}}]});
     for delta in [duplicate, custom] {
         let mut state = state(vec![Ok(wire(Some("tool_calls"), usage(), delta))]);
-        state.translator =
-            responses::Stream::new(responses::Context::new(&json!({"model":"kimi-k3",
-            "tools":[{"type":"custom","name":"patch"}]})));
+        state.translator = responses_via_chat::Stream::new(responses_via_chat::Context::new(
+            &json!({"model":"kimi-k3",
+            "tools":[{"type":"custom","name":"patch"}]}),
+        ));
         let output = state.into_stream().collect::<Vec<_>>().await;
         assert!(output.iter().any(Result::is_err));
         let text = String::from_utf8(

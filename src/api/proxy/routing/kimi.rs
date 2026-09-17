@@ -576,15 +576,17 @@ mod tests {
                 {"type":"encrypted_content","encrypted_content":{"ciphertext":"opaque"}}
             ]}]
         });
-        let error = prepare_forwarded_request(
+        let error = match prepare_forwarded_request(
             &kimi_route(),
             Protocol::OpenAiResponses,
             &request,
             false,
             true,
             false,
-        )
-        .expect_err("opaque delegated content must fail closed before dispatch");
+        ) {
+            Ok(_) => panic!("opaque delegated content must fail closed before dispatch"),
+            Err(error) => error,
+        };
         assert!(
             matches!(error, AppError::BadRequest(message) if message.contains("agent_message"))
         );

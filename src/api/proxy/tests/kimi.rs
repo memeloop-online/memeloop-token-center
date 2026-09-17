@@ -175,15 +175,35 @@ async fn kimi_translation_clears_length_and_uses_complete_unknown_length_memory_
     upstream.verify().await;
 }
 
+async fn send_official_codex_responses_request(
+    fixture: &CodexRouteFixture,
+    body: &Value,
+    accept: &'static str,
+) -> Response {
+    router_for_role(fixture.state.clone(), RuntimeRole::Gateway)
+        .oneshot(
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, accept)
+                .header(header::USER_AGENT, "codex_vscode/0.154.0")
+                .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key))
+                .body(Body::from(serde_json::to_vec(body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 async fn generic_via_chat_provider_uses_chat_endpoint_credentials_and_reverse_maps_tools() {
     let upstream = MockServer::start().await;
-    let mut fixture = response_usage_fixture_with_uri_contract_and_driver(
+    let mut fixture = response_usage_fixture_with_uri_contract_and_driver_model(
         "generic-via-chat-bridge",
         upstream.uri(),
         0,
         Some("openai-chat-usage-only"),
         "fake-via-chat",
+        "generic-agent-model",
     )
     .await;
 
@@ -197,14 +217,17 @@ async fn generic_via_chat_provider_uses_chat_endpoint_credentials_and_reverse_ma
     fake_provider.display_name = "Fake Responses-via-Chat provider".into();
     fixture.state.providers.extend([fake_provider]).unwrap();
 
-    let auth = header_matcher("authorization", "Bearer compatibility-upstream-secret");
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .and(auth.clone())
+        .and(header_matcher(
+            "authorization",
+            "Bearer compatibility-upstream-secret",
+        ))
         .and(body_partial_json(json!({
             "model": fixture.model,
             "messages": [{"role":"user"}],
-            "stream": false
+            "stream": false,
+            "max_completion_tokens": 4096
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "fake-buffered",
@@ -222,7 +245,7 @@ async fn generic_via_chat_provider_uses_chat_endpoint_credentials_and_reverse_ma
         .expect(1)
         .mount(&upstream)
         .await;
-    let buffered = send_response_usage_request(
+    let buffered = send_official_codex_responses_request(
         &fixture,
         &json!({
             "model": fixture.model,
@@ -232,6 +255,7 @@ async fn generic_via_chat_provider_uses_chat_endpoint_credentials_and_reverse_ma
             ]}],
             "stream": false
         }),
+        "application/json",
     )
     .await;
     assert_eq!(buffered.status(), StatusCode::OK);
@@ -251,24 +275,33 @@ async fn generic_via_chat_provider_uses_chat_endpoint_credentials_and_reverse_ma
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .and(auth)
+        .and(header_matcher(
+            "authorization",
+            "Bearer compatibility-upstream-secret",
+        ))
+        .and(header_matcher("accept", "text/event-stream"))
         .and(body_partial_json(json!({
             "model": fixture.model,
-            "stream": true
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"readable delegated task"}
+            ]}],
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "max_completion_tokens": 4096
         })))
         .respond_with(ResponseTemplate::new(200).set_body_raw(
             [
                 format!(
                     "data: {}\n\n",
-                    json!({"id":"fake-stream","created":7,"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"spawn-call","function":{"name":"collaboration__spawn_agent","arguments":r#"{"message":"spawn task"}"#}}]},"finish_reason":null}],"usage":null})
+                    json!({"id":"fake-stream","object":"chat.completion.chunk","model":fixture.model,"created":7,"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"spawn-call","function":{"name":"collaboration__spawn_agent","arguments":r#"{"message":"spawn task"}"#}}]},"finish_reason":null}],"usage":null})
                 ),
                 format!(
                     "data: {}\n\n",
-                    json!({"id":"fake-stream","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":null})
+                    json!({"id":"fake-stream","object":"chat.completion.chunk","model":fixture.model,"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":null})
                 ),
                 format!(
                     "data: {}\n\n",
-                    json!({"id":"fake-stream","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}})
+                    json!({"id":"fake-stream","object":"chat.completion.chunk","model":fixture.model,"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}})
                 ),
                 "data: [DONE]\n\n".into(),
             ]
@@ -278,16 +311,18 @@ async fn generic_via_chat_provider_uses_chat_endpoint_credentials_and_reverse_ma
         .expect(1)
         .mount(&upstream)
         .await;
-    let streamed = send_response_usage_request(
+    let streamed = send_official_codex_responses_request(
         &fixture,
         &json!({
             "model": fixture.model,
-            "input": "stream delegated task",
+            "input": [{"type":"agent_message","author":"/root","recipient":"/worker",
+                "content":[{"type":"input_text","text":"readable delegated task"}]}],
             "tools": [{"type":"namespace","name":"collaboration","tools":[
                 {"type":"function","name":"spawn_agent","parameters":{"type":"object"}}
             ]}],
             "stream": true
         }),
+        "text/event-stream",
     )
     .await;
     assert_eq!(streamed.status(), StatusCode::OK);
