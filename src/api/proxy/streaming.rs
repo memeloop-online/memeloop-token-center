@@ -589,16 +589,26 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         for frame in &delivery_frames {
                             output_timing.observe(&frame.bytes, frame.terminal, observed_ms);
                         }
-                        if let Some(spool) = archive_sender.as_mut()
-                            && !spool.append(
-                                delivery_frames
-                                    .iter()
-                                    .map(|frame| super::archive_retention::sse_frame(&frame.bytes))
-                                    .collect(),
-                            )
-                        {
-                            tracing::warn!(%request_id, stage = "response_spool_ack", "proxy archive gap");
-                            drop(archive_sender.take());
+                        if let Some(spool) = archive_sender.as_mut() {
+                            let mut archive_failed = false;
+                            for frame in &delivery_frames {
+                                let Some(_retention_memory) =
+                                    request_memory.try_reserve_archive_json_transform(&frame.bytes)
+                                else {
+                                    archive_failed = true;
+                                    break;
+                                };
+                                if !spool
+                                    .append(vec![super::archive_retention::sse_frame(&frame.bytes)])
+                                {
+                                    archive_failed = true;
+                                    break;
+                                }
+                            }
+                            if archive_failed {
+                                tracing::warn!(%request_id, stage = "response_spool_ack", "proxy archive gap");
+                                drop(archive_sender.take());
+                            }
                         }
                         // A successful Responses terminal is held privately
                         // until EOF validates its tail. Once the receiver is

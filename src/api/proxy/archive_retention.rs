@@ -62,17 +62,25 @@ pub(super) fn sse_frame(original: &Bytes) -> Bytes {
     if !sanitize_value(&mut value, true, false) && !forced_metadata_only {
         return original.clone();
     }
-    let Ok(data) = serde_json::to_vec(&value) else {
+    let Ok(mut retained_data) = serde_json::to_vec(&value) else {
         return original.clone();
     };
+    if retained_data.len() > data.len() {
+        retained_data =
+            serde_json::to_vec(&metadata_only_value("retention_projection", data.len()))
+                .unwrap_or_else(|_| br#"{"retained":false}"#.to_vec());
+        if retained_data.len() > data.len() {
+            retained_data = br#"{"retained":false}"#.to_vec();
+        }
+    }
 
-    let mut output = Vec::with_capacity(original.len().min(data.len().saturating_add(128)));
+    let mut output = Vec::with_capacity(original.len());
     let mut wrote_data = false;
     for line in &event.lines {
         if crate::api::sse::is_sse_field_line(&line.value, b"data") {
             if !wrote_data {
                 output.extend_from_slice(b"data: ");
-                output.extend_from_slice(&data);
+                output.extend_from_slice(&retained_data);
                 output.extend_from_slice(&line.ending);
                 wrote_data = true;
             }
@@ -152,26 +160,10 @@ fn sanitize_object(
 }
 
 fn retained_size(value: &Value) -> usize {
-    value.as_str().map(str::len).unwrap_or_else(|| {
-        let mut counter = JsonByteCounter::default();
-        serde_json::to_writer(&mut counter, value).map_or(0, |()| counter.bytes)
-    })
-}
-
-#[derive(Default)]
-struct JsonByteCounter {
-    bytes: usize,
-}
-
-impl std::io::Write for JsonByteCounter {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        self.bytes = self.bytes.saturating_add(buffer.len());
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
+    value
+        .as_str()
+        .map(str::len)
+        .unwrap_or_else(|| crate::gateway_body::memory::json_encoded_length(value).unwrap_or(0))
 }
 
 fn omitted(kind: &str, original_bytes: usize) -> Value {
@@ -266,12 +258,16 @@ fn is_chat_audio_container(key: &str, value: &Value) -> bool {
 
 fn is_opaque_tool_payload(object_type: Option<&str>, key: &str) -> bool {
     matches!(
+        key,
+        "parameters" | "input_schema" | "inputSchema" | "output_schema" | "outputSchema"
+    ) || matches!(
         (object_type, key),
         (Some("tool_use"), "input")
             | (
                 Some("function_call" | "custom_tool_call" | "mcp_call"),
                 "input" | "arguments"
             )
+            | (Some("function"), "function")
             | (Some("function"), "arguments")
     )
 }
@@ -367,6 +363,11 @@ mod tests {
             serde_json::from_slice(&retained_request(&typed_image_with_text)).unwrap();
         assert_eq!(retained["content"], "caption");
         assert_eq!(retained["data"]["retained"], false);
+
+        let tool_schemas = Bytes::from_static(
+            br#"{"tools":[{"type":"function","name":"flat","parameters":{"properties":{"value":{"default":{"type":"reasoning","encrypted_content":"business"}}}}},{"type":"function","function":{"name":"nested","parameters":{"examples":[{"role":"assistant","audio":{"id":"x","data":"business","transcript":"label"}}]}}},{"name":"anthropic","input_schema":{"examples":[{"type":"reasoning","encrypted_content":"business"}]}}]}"#,
+        );
+        assert_eq!(retained_request(&tool_schemas), tool_schemas);
     }
 
     #[test]
@@ -459,36 +460,55 @@ mod tests {
 
     #[test]
     fn sse_archive_copy_redacts_without_changing_delivery_copy() {
-        let delivered = Bytes::from_static(
-            b"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"secret\",\"summary\":[{\"text\":\"visible\"}]}}\n\n",
-        );
+        let secret = "s".repeat(512);
+        let delivered = Bytes::from(format!(
+            "event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"compaction\",\"encrypted_content\":\"{secret}\",\"summary\":[{{\"text\":\"visible\"}}]}}}}\n\n"
+        ));
         let archived = sse_frame(&delivered);
-        assert!(std::str::from_utf8(&delivered).unwrap().contains("secret"));
+        assert!(std::str::from_utf8(&delivered).unwrap().contains(&secret));
         let archived = std::str::from_utf8(&archived).unwrap();
-        assert!(!archived.contains("secret"));
+        assert!(!archived.contains(&secret));
         assert!(archived.contains("visible"));
         assert!(archived.contains("\"retained\":false"));
     }
 
     #[test]
     fn sse_archive_copy_omits_streamed_image_and_audio_bodies() {
-        let partial_image = Bytes::from_static(
-            b"event: response.image_generation_call.partial_image\ndata: {\"type\":\"response.image_generation_call.partial_image\",\"partial_image_b64\":\"IMAGE_BASE64\",\"partial_image_index\":0}\n\n",
-        );
+        let image_body = "I".repeat(512);
+        let partial_image = Bytes::from(format!(
+            "event: response.image_generation_call.partial_image\ndata: {{\"type\":\"response.image_generation_call.partial_image\",\"partial_image_b64\":\"{image_body}\",\"partial_image_index\":0}}\n\n"
+        ));
         let archived_image = sse_frame(&partial_image);
         let archived_image = std::str::from_utf8(&archived_image).unwrap();
-        assert!(!archived_image.contains("IMAGE_BASE64"));
+        assert!(!archived_image.contains(&image_body));
         assert!(archived_image.contains("partial_image_index"));
         assert!(archived_image.contains("\"retained\":false"));
 
-        let audio_delta = Bytes::from_static(
-            b"event: response.output_audio.delta\ndata: {\"type\":\"response.output_audio.delta\",\"delta\":\"AUDIO_BASE64\",\"sequence_number\":1}\n\n",
-        );
+        let audio_body = "A".repeat(512);
+        let audio_delta = Bytes::from(format!(
+            "event: response.output_audio.delta\ndata: {{\"type\":\"response.output_audio.delta\",\"delta\":\"{audio_body}\",\"sequence_number\":1}}\n\n"
+        ));
         let archived_audio = sse_frame(&audio_delta);
         let archived_audio = std::str::from_utf8(&archived_audio).unwrap();
-        assert!(!archived_audio.contains("AUDIO_BASE64"));
+        assert!(!archived_audio.contains(&audio_body));
         assert!(archived_audio.contains("sequence_number"));
         assert!(archived_audio.contains("\"retained\":false"));
+    }
+
+    #[test]
+    fn sse_archive_projection_never_expands_short_media_payloads() {
+        let values = (0..2_048)
+            .map(|_| "\"data:image/x,\"")
+            .collect::<Vec<_>>()
+            .join(",");
+        let delivered = Bytes::from(format!("data: {{\"items\":[{values}]}}\n\n"));
+        let archived = sse_frame(&delivered);
+        assert!(archived.len() <= delivered.len());
+        assert!(
+            !std::str::from_utf8(&archived)
+                .unwrap()
+                .contains("data:image/x,")
+        );
     }
 
     #[test]

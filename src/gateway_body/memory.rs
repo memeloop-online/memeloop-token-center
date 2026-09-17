@@ -172,6 +172,18 @@ impl ProxyMemoryReservation {
         })
     }
 
+    pub(crate) fn try_reserve_archive_json_transform(
+        self: &Arc<Self>,
+        body: &[u8],
+    ) -> Option<ArchiveOutputMemory> {
+        let nodes = JsonMemoryScanner::default().observe(body);
+        let bytes = body
+            .len()
+            .checked_mul(3)?
+            .checked_add(nodes.checked_mul(256)?)?;
+        self.try_reserve_archive_output(bytes)
+    }
+
     /// Snapshot the selected account's policy for this request. Retries cannot
     /// replace its selected queue policy or metrics owner.
     pub(crate) fn configure_admission(
@@ -633,6 +645,27 @@ mod tests {
         assert!(!request.try_grow(64 * 1024 * 1024, REQUEST_MEMORY_WEIGHT));
         assert!(!request.try_grow(usize::MAX, REQUEST_MEMORY_WEIGHT));
         assert!(request.try_grow(1024, REQUEST_MEMORY_WEIGHT));
+    }
+
+    #[test]
+    fn archive_json_transform_is_hard_bounded_and_releases_its_permit() {
+        let budget = ProxyMemoryBudget::new(256 * 1024);
+        let blocker = budget.reservation();
+        assert!(blocker.try_grow(256 * 1024, 1));
+        let archive = budget.reservation();
+        assert!(
+            archive
+                .try_reserve_archive_json_transform(br#"{"data":"data:image/x,"}"#)
+                .is_none()
+        );
+        drop(blocker);
+        let permit = archive
+            .try_reserve_archive_json_transform(br#"{"data":"data:image/x,"}"#)
+            .expect("archive transform fits after capacity is released");
+        assert!(budget.snapshot().0 > 0);
+        drop(permit);
+        drop(archive);
+        assert_eq!(budget.snapshot().0, 0);
     }
 
     #[test]

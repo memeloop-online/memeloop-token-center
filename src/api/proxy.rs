@@ -2375,7 +2375,7 @@ async fn finish_buffered_request_with_upstream_attribution(
                     reservation_id: request.reservation.id,
                 },
                 crate::response_archive_spool::BufferedArchivePurpose::Response,
-                &archive_body,
+                archive_body,
                 request.state.config.key_pepper.as_bytes(),
                 request.state.config.archive_spool_compression_enabled,
             )
