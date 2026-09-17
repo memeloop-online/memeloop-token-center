@@ -26,6 +26,12 @@ pub(in crate::api::proxy) fn retain_pinned_text_candidates(
     Ok(())
 }
 
+fn candidate_allowed_for_model(model: &str, driver: &str, official_codex_responses: bool) -> bool {
+    !official_codex_responses
+        || !crate::provider::is_bundled_codex_model_slug(model)
+        || codex_transport::is_driver(driver)
+}
+
 pub(in crate::api::proxy) fn candidate_reservation_bounds(
     planned: &PlannedProxyRoute,
     original_body_length: usize,
@@ -88,6 +94,7 @@ pub(in crate::api::proxy) struct CandidatePreparationSummary {
     incompatible_usage: usize,
     reservation_metadata_unavailable: usize,
     codex_chat_incompatible: usize,
+    bundled_native_only_skipped: usize,
     codex_chat_rejection: Option<String>,
     skipped_incompatible_strict_route: bool,
     skipped_local_protocol_mismatch: bool,
@@ -102,6 +109,24 @@ pub(in crate::api::proxy) async fn next_planned_proxy_candidate(
 ) -> Result<Option<PlannedProxyRoute>, AppError> {
     for candidate in candidates.by_ref() {
         summary.examined += 1;
+        if !candidate_allowed_for_model(
+            request.model,
+            &candidate.driver,
+            request.codex_multi_agent_v2_client
+                && matches!(request.protocol, Protocol::OpenAiResponses),
+        ) {
+            summary.bundled_native_only_skipped += 1;
+            tracing::info!(
+                %request.request_id,
+                route_id = %candidate.route_id,
+                upstream_account_id = %candidate.account_id,
+                model = request.model,
+                driver = %candidate.driver,
+                stage = "candidate_bundled_native_only",
+                "proxy skipped a non-native candidate for a bundled Codex model slug"
+            );
+            continue;
+        }
         if !request.state.providers.is_public(&candidate.driver) {
             summary.retired_provider += 1;
             tracing::warn!(
@@ -229,6 +254,7 @@ pub(in crate::api::proxy) async fn next_planned_proxy_candidate(
         incompatible_usage = summary.incompatible_usage,
         reservation_metadata_unavailable = summary.reservation_metadata_unavailable,
         codex_chat_incompatible = summary.codex_chat_incompatible,
+        bundled_native_only_skipped = summary.bundled_native_only_skipped,
         "authorized candidate preparation exhausted without dispatch"
     );
     Ok(None)
@@ -264,6 +290,18 @@ pub(in crate::api::proxy) fn exhausted_candidate_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_codex_slugs_are_native_only_for_official_responses() {
+        assert!(!candidate_allowed_for_model("gpt-5.5", "kimi-oauth", true));
+        assert!(candidate_allowed_for_model("gpt-5.5", "kimi-oauth", false));
+        assert!(candidate_allowed_for_model("gpt-5.5", "openai-codex", true));
+        assert!(candidate_allowed_for_model(
+            "kimi-k3-256k",
+            "kimi-oauth",
+            true
+        ));
+    }
 
     #[test]
     fn prepared_component_body_expands_the_input_reservation_bound() {
@@ -304,7 +342,7 @@ mod tests {
                     config_json: "{}".into(),
                 },
             )),
-            kimi_response: None,
+            responses_chat: None,
         };
 
         let initial_bound = input_reservation_bound(&prepared.route, ORIGINAL_BODY_LENGTH).unwrap();

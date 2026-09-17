@@ -82,6 +82,126 @@ pub struct GenerationAdapterContribution {
     pub provider_asset_reads_repeatable: bool,
 }
 
+/// Fixed reasoning metadata accepted by the Codex model-directory contract.
+/// Codex 0.154 requires a non-empty description for every advertised effort.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CodexReasoningLevel {
+    pub effort: String,
+    pub description: String,
+}
+
+/// Versioned, non-secret model-directory capabilities contributed by a
+/// provider. A capability is never inferred from a model name or URL.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CodexModelCapabilities {
+    pub version: String,
+    /// A bounded strategy identifier. Providers select a gateway-owned
+    /// instruction template; they never inject arbitrary prompt text.
+    #[serde(default = "default_codex_agent_instructions_template")]
+    pub agent_instructions_template: String,
+    /// Codex's model-directory value for the shell tool.  Keep this an
+    /// explicit provider declaration rather than inferring it from a model
+    /// slug or upstream URL.
+    pub shell_type: String,
+    #[serde(default)]
+    pub apply_patch_tool_type: Option<String>,
+    #[serde(default)]
+    pub fallback_context_window: Option<u64>,
+    #[serde(default)]
+    pub input_modalities: Vec<String>,
+    #[serde(default)]
+    pub supports_image_detail_original: bool,
+    #[serde(default)]
+    pub include_skills_usage_instructions: bool,
+    #[serde(default)]
+    pub include_plugin_usage_instructions: bool,
+    #[serde(default)]
+    pub include_apps_usage_instructions: bool,
+    #[serde(default)]
+    pub supported_reasoning_levels: Vec<CodexReasoningLevel>,
+    #[serde(default)]
+    pub default_reasoning_level: Option<String>,
+}
+
+pub(crate) const CODEX_MODEL_CAPABILITIES_VERSION: &str = "codex-model-capabilities-v1";
+pub(crate) const CODEX_AGENT_INSTRUCTIONS_TEMPLATE_V1: &str = "codex-generic-agent-v1";
+// Codex 0.154 bundled slugs. The reserved gpt-/codex- namespaces below also
+// protect future bundled additions until this fixture is refreshed.
+const BUNDLED_CODEX_MODEL_SLUGS: &[&str] = &[
+    "codex-auto-review",
+    "gpt-6-astra",
+    "gpt-daybreak-blue-latest",
+    "gpt-daybreak-red-latest",
+    "gpt-5.2",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.5",
+    "gpt-5.6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+];
+
+pub(crate) fn is_bundled_codex_model_slug(model: &str) -> bool {
+    BUNDLED_CODEX_MODEL_SLUGS.contains(&model)
+        || model.starts_with("gpt-")
+        || model.starts_with("codex-")
+}
+
+fn default_codex_agent_instructions_template() -> String {
+    CODEX_AGENT_INSTRUCTIONS_TEMPLATE_V1.to_owned()
+}
+
+/// Explicit request-shape compatibility declarations owned by the provider
+/// catalog.  A capability is never inferred from a model name or URL: a
+/// third-party upstream must opt in before the gateway rewrites Codex
+/// collaboration payloads for it.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum ResponsesViaChatDialect {
+    #[serde(rename = "openai_chat_v1")]
+    OpenAiChatV1,
+    #[serde(rename = "kimi_v1")]
+    KimiV1,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RequestCompatibility {
+    #[serde(default)]
+    pub third_party: bool,
+    /// The provider translates OpenAI Responses requests through the host's
+    /// Chat transport. This is an explicit hook for future DeepSeek/GLM-style
+    /// adapters; it is not inferred from a URL or model name.
+    #[serde(default)]
+    pub responses_via_chat_v1: bool,
+    /// Closed, versioned dialect implemented by the Responses-via-Chat bridge.
+    /// This is required whenever `responses_via_chat_v1` is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_via_chat_dialect: Option<ResponsesViaChatDialect>,
+    #[serde(default)]
+    pub codex_multi_agent_v2: bool,
+}
+
+impl RequestCompatibility {
+    pub(crate) fn is_default(&self) -> bool {
+        !self.third_party
+            && !self.responses_via_chat_v1
+            && self.responses_via_chat_dialect.is_none()
+            && !self.codex_multi_agent_v2
+    }
+
+    pub fn supports_codex_multi_agent_v2(&self) -> bool {
+        // Third-party MultiAgentV2 is executable only through an explicitly
+        // declared Responses-via-Chat transport. Native Codex has its own
+        // upstream Responses transport and does not use this predicate.
+        self.third_party
+            && self.codex_multi_agent_v2
+            && self.responses_via_chat_v1
+            && self.responses_via_chat_dialect.is_some()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderType {
@@ -97,6 +217,10 @@ pub struct ProviderType {
     pub component_adapter: Option<ComponentAdapterContribution>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation_adapter: Option<GenerationAdapterContribution>,
+    #[serde(default, skip_serializing_if = "RequestCompatibility::is_default")]
+    pub request_compatibility: RequestCompatibility,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_model_capabilities: Option<CodexModelCapabilities>,
     #[serde(default)]
     pub source: String,
 }
@@ -281,6 +405,8 @@ impl ProviderCatalog {
                 provable_submit_idempotency: false,
                 provider_asset_reads_repeatable: false,
             }),
+            request_compatibility: Default::default(),
+            codex_model_capabilities: None,
             source: "builtin".to_owned(),
         }];
         types.push(crate::provider::cbcnx::provider_type(
@@ -321,6 +447,8 @@ impl ProviderCatalog {
                 provable_submit_idempotency: false,
                 provider_asset_reads_repeatable: true,
             }),
+            request_compatibility: Default::default(),
+            codex_model_capabilities: None,
             source: "builtin".to_owned(),
         });
         types.push(ProviderType {
@@ -362,6 +490,8 @@ impl ProviderCatalog {
                 provable_submit_idempotency: false,
                 provider_asset_reads_repeatable: true,
             }),
+            request_compatibility: Default::default(),
+            codex_model_capabilities: None,
             source: "builtin".to_owned(),
         });
         types.push(builtin_managed_oauth_provider(
@@ -496,6 +626,47 @@ impl ProviderCatalog {
             poll_url: crate::oauth::managed::kimi::TOKEN_ENDPOINT.to_owned(),
             refresh_url: crate::oauth::managed::kimi::TOKEN_ENDPOINT.to_owned(),
         });
+        kimi.request_compatibility = RequestCompatibility {
+            third_party: true,
+            responses_via_chat_v1: true,
+            responses_via_chat_dialect: Some(ResponsesViaChatDialect::KimiV1),
+            codex_multi_agent_v2: true,
+        };
+        kimi.codex_model_capabilities = Some(CodexModelCapabilities {
+            version: CODEX_MODEL_CAPABILITIES_VERSION.to_owned(),
+            agent_instructions_template: CODEX_AGENT_INSTRUCTIONS_TEMPLATE_V1.to_owned(),
+            shell_type: "unified_exec".to_owned(),
+            apply_patch_tool_type: Some("freeform".to_owned()),
+            fallback_context_window: Some(256 * 1024),
+            input_modalities: vec!["text".to_owned(), "image".to_owned()],
+            supports_image_detail_original: false,
+            include_skills_usage_instructions: true,
+            include_plugin_usage_instructions: true,
+            include_apps_usage_instructions: true,
+            supported_reasoning_levels: vec![
+                CodexReasoningLevel {
+                    effort: "low".to_owned(),
+                    description: "Fast responses with lighter reasoning".to_owned(),
+                },
+                CodexReasoningLevel {
+                    effort: "medium".to_owned(),
+                    description: "Balances speed and reasoning depth for everyday tasks".to_owned(),
+                },
+                CodexReasoningLevel {
+                    effort: "high".to_owned(),
+                    description: "Greater reasoning depth for complex problems".to_owned(),
+                },
+                CodexReasoningLevel {
+                    effort: "xhigh".to_owned(),
+                    description: "Extra high reasoning depth for complex problems".to_owned(),
+                },
+                CodexReasoningLevel {
+                    effort: "max".to_owned(),
+                    description: "Maximum reasoning depth for the hardest problems".to_owned(),
+                },
+            ],
+            default_reasoning_level: Some("medium".to_owned()),
+        });
         kimi.credential_schema["properties"]["expires_at"] = json!({"type": ["integer", "null"], "description": "Unix milliseconds, absent source expiry remains unknown"});
         types.push(kimi);
         Self {
@@ -574,6 +745,70 @@ impl ProviderCatalog {
 
     pub fn get(&self, driver: &str) -> Option<&ProviderType> {
         self.types.iter().find(|provider| provider.id == driver)
+    }
+
+    pub fn supports_codex_multi_agent_v2(&self, driver: &str) -> bool {
+        self.get(driver).is_some_and(|provider| {
+            provider
+                .request_compatibility
+                .supports_codex_multi_agent_v2()
+        })
+    }
+
+    pub fn supports_responses_via_chat_v1(&self, driver: &str) -> bool {
+        self.get(driver).is_some_and(|provider| {
+            provider.request_compatibility.third_party
+                && provider.request_compatibility.responses_via_chat_v1
+                && provider
+                    .request_compatibility
+                    .responses_via_chat_dialect
+                    .is_some()
+        })
+    }
+
+    pub fn responses_via_chat_dialect(&self, driver: &str) -> Option<ResponsesViaChatDialect> {
+        self.get(driver).and_then(|provider| {
+            let compatibility = &provider.request_compatibility;
+            if compatibility.third_party
+                && compatibility.responses_via_chat_v1
+                && compatibility.responses_via_chat_dialect.is_some()
+            {
+                compatibility.responses_via_chat_dialect
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Model catalogs also include native Codex routes, whose transport reads
+    /// MultiAgentV2 without the third-party normalization hook.
+    pub fn supports_codex_multi_agent_v2_model_catalog(&self, driver: &str) -> bool {
+        driver == crate::oauth::codex_device::PROVIDER_DRIVER
+            || self.supports_codex_multi_agent_v2(driver)
+    }
+
+    pub(crate) fn codex_model_capabilities_for_catalog(
+        &self,
+        driver: &str,
+    ) -> Option<CodexModelCapabilities> {
+        self.get(driver)
+            .filter(|provider| {
+                provider
+                    .request_compatibility
+                    .supports_codex_multi_agent_v2()
+            })
+            .filter(|provider| {
+                provider.request_compatibility.responses_via_chat_dialect
+                    != Some(ResponsesViaChatDialect::OpenAiChatV1)
+                    || provider
+                        .codex_model_capabilities
+                        .as_ref()
+                        .is_none_or(|capabilities| {
+                            capabilities.supported_reasoning_levels.is_empty()
+                                && capabilities.default_reasoning_level.is_none()
+                        })
+            })
+            .and_then(|provider| provider.codex_model_capabilities.clone())
     }
 
     pub(crate) fn managed_oauth_adapter_for_driver(
@@ -663,6 +898,8 @@ fn builtin_managed_oauth_provider(
         oauth_adapter: None,
         component_adapter: None,
         generation_adapter: None,
+        request_compatibility: Default::default(),
+        codex_model_capabilities: None,
         source: "builtin".to_owned(),
     }
 }
@@ -720,6 +957,8 @@ fn builtin_interactive_oauth_provider(
         }),
         component_adapter: None,
         generation_adapter: None,
+        request_compatibility: Default::default(),
+        codex_model_capabilities: None,
         source: "builtin".to_owned(),
     }
 }

@@ -19,7 +19,7 @@ pub(super) async fn send_reqwest_proxy_route(
     .map_err(|_| ProxySendError::CandidateUnavailable)?;
     let target_url = network::upstream_api_url(
         &outbound_base_url,
-        if route.kimi_response.is_some() {
+        if route.responses_chat.is_some() {
             Protocol::OpenAiChat.path()
         } else {
             protocol.path()
@@ -32,8 +32,7 @@ pub(super) async fn send_reqwest_proxy_route(
     // upstream representation to SSE instead of inheriting a downstream
     // `Accept: application/json` default. Keep generic compatible routes
     // transparent.
-    let accept = if (route.route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER
-        && route.upstream_stream)
+    let accept = if (route.responses_chat.is_some() && route.upstream_stream)
         || (route.route.driver == crate::provider::CBCNX_PROVIDER_DRIVER
             && matches!(protocol, Protocol::OpenAiResponses)
             && route.upstream_stream)
@@ -93,7 +92,7 @@ pub(super) async fn send_reqwest_proxy_route(
     );
     match upstream_result {
         Ok(response) => Ok(ProxyRouteResponse {
-            response: if let Some(context) = route.kimi_response.clone() {
+            response: if let Some(context) = route.responses_chat.clone() {
                 super::kimi::translate(response, context, route.upstream_stream)?
             } else {
                 UpstreamResponse::Reqwest(response)

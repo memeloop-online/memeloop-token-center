@@ -843,6 +843,8 @@ pub(in crate::api) async fn proxy_with_identity(
     pinned_route: Option<Uuid>,
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 ) -> Result<Response, AppError> {
+    let codex_multi_agent_v2_client =
+        crate::api::request_normalization::is_official_codex_user_agent(&headers);
     let diagnostic_context = proxy_diagnostics::Context::current();
     let request_id = diagnostic_context.request_id;
     let preparation = proxy_diagnostics::Phase::new(diagnostic_context, "request_preparation");
@@ -852,6 +854,11 @@ pub(in crate::api) async fn proxy_with_identity(
     let plugin_snapshot =
         proxy_diagnostics::Phase::new(diagnostic_context, "application_plugin_snapshot");
     let mut state = state.pin_application_plugins().await?;
+    // Tool preparation is a protocol/client concern, not a catalog lookup.  It
+    // must happen on the native parent request as well, so a later delegated
+    // child request cannot inherit the encrypted collaboration carrier.
+    let codex_multi_agent_v2_tools_prepared =
+        codex_multi_agent_v2_client && matches!(protocol, Protocol::OpenAiResponses);
     plugin_snapshot.finish("completed", None, None);
     let proxy_lifecycle_permit = state
         .proxy_lifecycle_permits
@@ -925,6 +932,8 @@ pub(in crate::api) async fn proxy_with_identity(
         protocol,
         request_id,
         request_json: &request_json,
+        codex_multi_agent_v2_client,
+        codex_multi_agent_v2_tools_prepared,
     };
     let mut route_plan = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
         request: request_context,
@@ -960,6 +969,8 @@ pub(in crate::api) async fn proxy_with_identity(
                     protocol,
                     request_id,
                     request_json: &request_json,
+                    codex_multi_agent_v2_client,
+                    codex_multi_agent_v2_tools_prepared,
                 },
                 original_body_length: body.len(),
                 candidates,
@@ -974,6 +985,8 @@ pub(in crate::api) async fn proxy_with_identity(
         protocol,
         request_id,
         request_json: &request_json,
+        codex_multi_agent_v2_client,
+        codex_multi_agent_v2_tools_prepared,
     };
     let primary = route_plan.primary_route();
     let upstream_account_id = Some(primary.account_id);

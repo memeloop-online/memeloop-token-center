@@ -185,7 +185,8 @@ pub use routing::{
     UpdateRoutedModelRouteInput,
 };
 pub(crate) use routing::{
-    UpstreamAttemptAdmission, UpstreamFailureKind, upstream_probe_heartbeat_interval,
+    GrantedModelCapabilitySource, UpstreamAttemptAdmission, UpstreamFailureKind,
+    upstream_probe_heartbeat_interval,
 };
 pub use upstream_account_availability::{
     UpstreamAccountAvailability, UpstreamAccountAvailabilityFilter,

@@ -1,4 +1,5 @@
 use super::responses_request::{ToolIdentity, tools};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
@@ -6,21 +7,42 @@ use uuid::Uuid;
 const MAX_ACCUMULATED_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ITEMS: usize = 512;
 
+pub(in crate::api) use crate::provider::ResponsesViaChatDialect;
+
 #[derive(Clone)]
 pub(in crate::api) struct Context {
     model: String,
     tools: BTreeMap<String, ToolIdentity>,
+    usage_dialect: ResponsesViaChatDialect,
 }
 
 impl Context {
+    #[cfg(test)]
     pub(in crate::api) fn new(request: &Value) -> Self {
+        Self::with_dialect(request, ResponsesViaChatDialect::OpenAiChatV1)
+    }
+
+    #[cfg(test)]
+    pub(in crate::api) fn for_kimi(request: &Value) -> Self {
+        Self::with_dialect(request, ResponsesViaChatDialect::KimiV1)
+    }
+
+    pub(in crate::api) fn with_dialect(
+        request: &Value,
+        usage_dialect: ResponsesViaChatDialect,
+    ) -> Self {
         Self {
             model: request["model"].as_str().unwrap_or("").into(),
             tools: tools(request)
                 .into_iter()
                 .map(|(name, (identity, _))| (name, identity))
                 .collect(),
+            usage_dialect,
         }
+    }
+
+    pub(in crate::api) fn uses_kimi_dialect(&self) -> bool {
+        self.usage_dialect == ResponsesViaChatDialect::KimiV1
     }
 
     fn tool_item(&self, call: &Value, id: &str) -> Value {
@@ -63,8 +85,117 @@ impl Context {
     }
 }
 
-fn usage(value: &Value) -> Result<Value, &'static str> {
-    let value = super::usage::normalize(value)?;
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenAiChatUsage {
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    total_tokens: i64,
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+    #[serde(default)]
+    completion_tokens_details: Option<OpenAiCompletionTokensDetails>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenAiPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<i64>,
+    #[serde(default)]
+    cache_write_tokens: Option<i64>,
+    #[serde(default)]
+    audio_tokens: Option<i64>,
+    #[serde(default)]
+    image_tokens: Option<i64>,
+    #[serde(default)]
+    text_tokens: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenAiCompletionTokensDetails {
+    #[serde(default)]
+    accepted_prediction_tokens: Option<i64>,
+    #[serde(default)]
+    audio_tokens: Option<i64>,
+    #[serde(default)]
+    reasoning_tokens: Option<i64>,
+    #[serde(default)]
+    rejected_prediction_tokens: Option<i64>,
+    #[serde(default)]
+    text_tokens: Option<i64>,
+}
+
+fn normalize_openai_chat_usage(value: &Value) -> Result<Value, &'static str> {
+    let usage = serde_json::from_value::<OpenAiChatUsage>(value.clone())
+        .map_err(|_| "responses_chat_usage_schema")?;
+    let cached = usage
+        .prompt_tokens_details
+        .as_ref()
+        .and_then(|details| details.cached_tokens)
+        .unwrap_or(0);
+    let cache_write = usage
+        .prompt_tokens_details
+        .as_ref()
+        .and_then(|details| details.cache_write_tokens)
+        .unwrap_or(0);
+    let prompt_details_valid = usage.prompt_tokens_details.as_ref().is_none_or(|details| {
+        [
+            details.cached_tokens,
+            details.cache_write_tokens,
+            details.audio_tokens,
+            details.image_tokens,
+            details.text_tokens,
+        ]
+        .into_iter()
+        .flatten()
+        .all(|tokens| (0..=usage.prompt_tokens).contains(&tokens))
+    });
+    let completion_details_valid = usage
+        .completion_tokens_details
+        .as_ref()
+        .is_none_or(|details| {
+            [
+                details.accepted_prediction_tokens,
+                details.audio_tokens,
+                details.reasoning_tokens,
+                details.rejected_prediction_tokens,
+                details.text_tokens,
+            ]
+            .into_iter()
+            .flatten()
+            .all(|tokens| (0..=usage.completion_tokens).contains(&tokens))
+        });
+    if usage.prompt_tokens < 0
+        || usage.completion_tokens < 0
+        || usage.total_tokens <= 0
+        || usage.total_tokens
+            != usage
+                .prompt_tokens
+                .checked_add(usage.completion_tokens)
+                .unwrap_or(-1)
+        || cached < 0
+        || cache_write < 0
+        || cached > usage.prompt_tokens
+        || cached
+            .checked_add(cache_write)
+            .is_none_or(|cached_and_written| cached_and_written > usage.prompt_tokens)
+        || !prompt_details_valid
+        || !completion_details_valid
+        || usage.prompt_tokens > crate::api::limits::MAX_REPORTED_TOKENS
+        || usage.completion_tokens > crate::api::limits::MAX_REPORTED_TOKENS
+    {
+        return Err("responses_chat_usage_invalid");
+    }
+    Ok(value.clone())
+}
+
+fn usage(value: &Value, dialect: ResponsesViaChatDialect) -> Result<Value, &'static str> {
+    let value = match dialect {
+        ResponsesViaChatDialect::KimiV1 => super::usage::normalize(value)?,
+        ResponsesViaChatDialect::OpenAiChatV1 => normalize_openai_chat_usage(value)?,
+    };
     let input = value["prompt_tokens"]
         .as_u64()
         .ok_or("usage_input_invalid")?;
@@ -73,7 +204,7 @@ fn usage(value: &Value) -> Result<Value, &'static str> {
         .ok_or("usage_output_invalid")?;
     let total = value["total_tokens"]
         .as_u64()
-        .ok_or("kimi_usage_field_type")?;
+        .ok_or("responses_chat_usage_field_type")?;
     let cached = value
         .pointer("/prompt_tokens_details/cached_tokens")
         .and_then(Value::as_u64)
@@ -218,7 +349,7 @@ pub(in crate::api) fn buffered(context: &Context, value: &Value) -> Result<Value
             &id,
             value["created"].as_i64().unwrap_or(0),
             outputs,
-            usage(&value["usage"])?,
+            usage(&value["usage"], context.usage_dialect)?,
         ),
         choice["finish_reason"].as_str(),
     ))
@@ -302,7 +433,7 @@ impl Stream {
             events.push(self.event("response.in_progress", json!({"response":response}))?);
         }
         if !chunk["usage"].is_null() {
-            self.usage = Some(usage(&chunk["usage"])?);
+            self.usage = Some(usage(&chunk["usage"], self.context.usage_dialect)?);
         }
         let choices = chunk["choices"].as_array().ok_or("choices_missing")?;
         if choices.len() > 1 {
@@ -531,7 +662,7 @@ mod tests {
 
     #[test]
     fn buffered_documented_cache_alias_is_preserved_and_conflicts_fail() {
-        let context = Context::new(&json!({"model":"kimi-k3"}));
+        let context = Context::for_kimi(&json!({"model":"kimi-k3"}));
         let mut value = json!({"choices":[{"finish_reason":"stop", "message":{"content":"Hello"}}],
             "usage":{"prompt_tokens":19,"completion_tokens":13,"total_tokens":32,"cached_tokens":12}});
         let response = buffered(&context, &value).unwrap();
@@ -548,8 +679,22 @@ mod tests {
     }
 
     #[test]
+    fn generic_usage_rejects_kimi_top_level_cache_alias() {
+        let context = Context::new(&json!({"model":"generic"}));
+        let value = json!({
+            "choices":[{"finish_reason":"stop", "message":{"content":"Hello"}}],
+            "usage":{"prompt_tokens":19,"completion_tokens":13,"total_tokens":32,
+                "cached_tokens":12}
+        });
+        assert_eq!(
+            buffered(&context, &value),
+            Err("responses_chat_usage_schema")
+        );
+    }
+
+    #[test]
     fn buffered_rejects_every_malformed_accounting_shape_before_completed() {
-        let context = Context::new(&json!({"model":"kimi-k3"}));
+        let context = Context::for_kimi(&json!({"model":"kimi-k3"}));
         for usage in super::super::usage::invalid_examples() {
             let value = json!({"choices":[{"finish_reason":"stop", "message":{"content":"Hello"}}],
                 "usage": usage});
@@ -559,7 +704,7 @@ mod tests {
 
     #[test]
     fn buffered_custom_output_and_cached_reasoning_usage_are_preserved() {
-        let context = Context::new(&json!({"model":"kimi-k3","tools":[
+        let context = Context::for_kimi(&json!({"model":"kimi-k3","tools":[
             {"type":"namespace","name":"editor","tools":[{"type":"custom","name":"patch"}]}]}));
         let response = buffered(&context, &json!({"created":12,"choices":[{
             "finish_reason":"tool_calls","message":{"reasoning_content":"thinking",
@@ -581,7 +726,7 @@ mod tests {
 
     #[test]
     fn stream_delivers_deltas_but_cannot_complete_without_usage() {
-        let mut stream = Stream::new(Context::new(&json!({"model":"kimi-k3"})));
+        let mut stream = Stream::new(Context::for_kimi(&json!({"model":"kimi-k3"})));
         let events = stream
             .observe(
                 &json!({"choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}),
@@ -603,5 +748,54 @@ mod tests {
         assert!(last.contains("response.completed"));
         assert!(last.contains("\"text\":\"hello\""));
         assert!(stream.finish().is_err());
+    }
+
+    #[test]
+    fn streamed_collaboration_calls_complete_and_reverse_map_namespaces() {
+        let request = json!({
+            "model": "kimi-k3-256k",
+            "tools": [{"type":"namespace","name":"collaboration","tools":[
+                {"type":"function","name":"spawn_agent","parameters":{"type":"object"}},
+                {"type":"function","name":"followup_task","parameters":{"type":"object"}}
+            ]}]
+        });
+        let mut stream = Stream::new(Context::for_kimi(&request));
+        stream
+            .observe(&json!({
+                "created": 7,
+                "choices": [{"index":0,"delta":{"tool_calls":[
+                    {"index":0,"id":"spawn-call","function":{"name":"collaboration__spawn_agent","arguments":r#"{"message":"spawn"#}}]},
+                "finish_reason":null}]
+            }))
+            .unwrap();
+        stream
+            .observe(&json!({
+                "choices": [{"index":0,"delta":{"tool_calls":[
+                    {"index":0,"function":{"arguments":r#" agent"}"#}},
+                    {"index":1,"id":"followup-call","function":{"name":"collaboration__followup_task","arguments":r#"{"message":"follow"}"#}}
+                ]},"finish_reason":null}]
+            }))
+            .unwrap();
+        stream
+            .observe(&json!({
+                "choices": [{"index":0,"delta":{},"finish_reason":"tool_calls"}]
+            }))
+            .unwrap();
+        stream
+            .observe(&json!({
+                "choices": [],
+                "usage": {"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}
+            }))
+            .unwrap();
+
+        let events = stream.finish().unwrap();
+        let wire = String::from_utf8(events.concat()).unwrap();
+        assert!(wire.contains("response.function_call_arguments.done"));
+        assert!(wire.contains("response.completed"));
+        assert!(wire.contains("\"name\":\"spawn_agent\""));
+        assert!(wire.contains("\"name\":\"followup_task\""));
+        assert!(wire.matches("\"namespace\":\"collaboration\"").count() >= 2);
+        assert!(wire.contains("spawn agent"));
+        assert!(wire.contains("follow"));
     }
 }

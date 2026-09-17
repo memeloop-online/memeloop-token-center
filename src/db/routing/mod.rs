@@ -12,8 +12,8 @@ mod types;
 
 pub use types::{
     CreateRoutedModelRouteInput, CreateRoutedModelRouteResult, CredentialRoutingView,
-    ReplaceCredentialRoutingInput, ReplaceRouteRoutingInput, RouteCreateDisposition,
-    RouteCreateIdempotencyKey, RouteRoutingView, RouteSelectionOptions,
+    GrantedModelCapabilitySource, ReplaceCredentialRoutingInput, ReplaceRouteRoutingInput,
+    RouteCreateDisposition, RouteCreateIdempotencyKey, RouteRoutingView, RouteSelectionOptions,
     UpdateRoutedModelRouteInput,
 };
 

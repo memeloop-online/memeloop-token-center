@@ -4,7 +4,7 @@ use super::{AppError, Protocol};
 use serde_json::{Value, json};
 mod messages;
 pub(in crate::api) mod responses;
-mod responses_request;
+pub(in crate::api) mod responses_request;
 pub(in crate::api) mod usage;
 
 pub(super) fn supports(protocol: Protocol) -> bool {
@@ -47,7 +47,8 @@ pub(super) fn prepare(
         ));
     }
     if matches!(protocol, Protocol::OpenAiResponses) {
-        *request = responses_request::convert(request)?;
+        let _ = prepare_kimi_responses(model, request)?;
+        return Ok(());
     }
     let object = request
         .as_object_mut()
@@ -68,6 +69,28 @@ pub(super) fn prepare(
         messages::repair(request);
     }
     Ok(())
+}
+
+pub(super) fn prepare_kimi_responses(
+    model: &str,
+    request: &mut Value,
+) -> Result<super::responses_via_chat::Context, AppError> {
+    let context = super::responses_via_chat::prepare_with_dialect(
+        &normalize_model(model),
+        request,
+        super::responses_via_chat::ResponsesViaChatDialect::KimiV1,
+    )?;
+    messages::repair(request);
+    Ok(context)
+}
+
+pub(super) fn repair_responses_messages(
+    dialect: crate::provider::ResponsesViaChatDialect,
+    request: &mut Value,
+) {
+    if dialect == crate::provider::ResponsesViaChatDialect::KimiV1 {
+        messages::repair(request);
+    }
 }
 
 pub(super) fn catalog() -> Vec<crate::db::DiscoveredUpstreamModel> {

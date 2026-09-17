@@ -1,4 +1,5 @@
 use super::*;
+use crate::api::responses_via_chat;
 use std::sync::{Arc, Mutex};
 use tracing::instrument::WithSubscriber;
 
@@ -7,7 +8,9 @@ fn state() -> StreamState {
         upstream: Box::pin(futures_util::stream::empty()),
         framer: BoundedSseFramer::default(),
         usage: ChatSseUsageState::for_kimi(),
-        translator: responses::Stream::new(responses::Context::new(&json!({"model":"kimi-k3"}))),
+        translator: responses_via_chat::Stream::new(responses_via_chat::Context::for_kimi(
+            &json!({"model":"kimi-k3"}),
+        )),
         pending: VecDeque::new(),
         terminal: false,
         failed: false,
@@ -54,8 +57,9 @@ fn translation_reasons_distinguish_usage_finish_and_limits_without_payload() {
     // Schema rejection now happens before any translator output is created.
     assert!(state.pending.is_empty());
     assert_eq!(state.translator.finish(), Err("empty_stream"));
-    let mut translator =
-        responses::Stream::new(responses::Context::new(&json!({"model":"kimi-k3"})));
+    let mut translator = responses_via_chat::Stream::new(responses_via_chat::Context::for_kimi(
+        &json!({"model":"kimi-k3"}),
+    ));
     translator
         .observe(&json!({"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}))
         .unwrap();
@@ -63,8 +67,9 @@ fn translation_reasons_distinguish_usage_finish_and_limits_without_payload() {
     let incomplete = String::from_utf8(translator.finish().unwrap().concat()).unwrap();
     assert!(incomplete.contains("response.incomplete"));
     assert!(!incomplete.contains("response.completed"));
-    let mut translator =
-        responses::Stream::new(responses::Context::new(&json!({"model":"kimi-k3"})));
+    let mut translator = responses_via_chat::Stream::new(responses_via_chat::Context::for_kimi(
+        &json!({"model":"kimi-k3"}),
+    ));
     translator
         .observe(&json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}))
         .unwrap();
@@ -181,6 +186,6 @@ async fn owned_failure_keeps_ingress_identity_clock_and_never_logs_payload() {
         "upstream_response_event_too_large"
     );
     assert_eq!(value["fields"]["event_class"], "sse");
-    assert_eq!(value["fields"]["phase"], "kimi_response_translation");
+    assert_eq!(value["fields"]["phase"], "responses_chat_translation");
     assert!(value["fields"]["request_elapsed_ms"].as_i64().unwrap() >= 60_000);
 }

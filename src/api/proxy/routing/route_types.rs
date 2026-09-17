@@ -8,7 +8,7 @@ pub(in crate::api::proxy) struct PreparedProxyRoute {
     pub(in crate::api::proxy) codex_store_disabled: bool,
     pub(super) codex_session_id: Option<String>,
     pub(in crate::api::proxy) component_request: Option<(PreparedProviderRequest, RequestContext)>,
-    pub(super) kimi_response: Option<crate::api::kimi_transport::responses::Context>,
+    pub(super) responses_chat: Option<crate::api::responses_via_chat::Context>,
 }
 
 pub(in crate::api::proxy) struct PlannedProxyRoute {
@@ -20,7 +20,7 @@ pub(in crate::api::proxy) struct PlannedProxyRoute {
     pub(super) codex_store_disabled: bool,
     pub(super) codex_session_id: Option<String>,
     pub(super) component_context: Option<RequestContext>,
-    pub(super) kimi_response: Option<crate::api::kimi_transport::responses::Context>,
+    pub(super) responses_chat: Option<crate::api::responses_via_chat::Context>,
 }
 
 impl PlannedProxyRoute {
@@ -41,7 +41,7 @@ impl PlannedProxyRoute {
 impl PreparedProxyRoute {
     pub(in crate::api::proxy) fn release_request_buffers(&mut self) {
         self.forwarded_body = Bytes::new();
-        self.kimi_response = None;
+        self.responses_chat = None;
     }
 
     pub(in crate::api::proxy) fn is_codex(&self) -> bool {
@@ -57,6 +57,8 @@ pub(in crate::api::proxy) struct ProxyRequestContext<'a> {
     pub(in crate::api::proxy) protocol: Protocol,
     pub(in crate::api::proxy) request_id: Uuid,
     pub(in crate::api::proxy) request_json: &'a Value,
+    pub(in crate::api::proxy) codex_multi_agent_v2_client: bool,
+    pub(in crate::api::proxy) codex_multi_agent_v2_tools_prepared: bool,
 }
 
 pub(in crate::api::proxy) struct ProxyRoutePlanInput<'a> {

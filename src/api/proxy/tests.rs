@@ -692,6 +692,25 @@ async fn response_usage_fixture_with_uri_contract_and_driver(
     stream_usage_contract: Option<&str>,
     driver: &str,
 ) -> CodexRouteFixture {
+    response_usage_fixture_with_uri_contract_and_driver_model(
+        label,
+        upstream_uri,
+        input_token_overhead_ceiling,
+        stream_usage_contract,
+        driver,
+        "gpt-5.6-sol",
+    )
+    .await
+}
+
+async fn response_usage_fixture_with_uri_contract_and_driver_model(
+    label: &str,
+    upstream_uri: String,
+    input_token_overhead_ceiling: i64,
+    stream_usage_contract: Option<&str>,
+    driver: &str,
+    public_model: &str,
+) -> CodexRouteFixture {
     let directory = tempfile::tempdir().unwrap();
     let archive_path = directory.path().join("archive");
     let database_url = format!(
@@ -706,7 +725,7 @@ async fn response_usage_fixture_with_uri_contract_and_driver(
     config.archive_path = Some(archive_path.display().to_string());
     let state = AppState::initialize(config).await.unwrap();
     let tenant = format!("compatibility-route-{label}");
-    let model = "gpt-5.6-sol".to_owned();
+    let model = public_model.to_owned();
     let mut upstream_config = json!({
         "base_url": upstream_uri,
         "network_scope": "public",

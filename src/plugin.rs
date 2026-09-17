@@ -2383,6 +2383,75 @@ fn validate_provider_contribution(
             "plugin {plugin_id} contributes an invalid provider"
         )));
     }
+    if provider.request_compatibility.codex_multi_agent_v2
+        && !provider.request_compatibility.third_party
+    {
+        return Err(AppError::BadRequest(format!(
+            "plugin {plugin_id} provider {} must declare third_party for Codex MultiAgentV2 compatibility",
+            provider.id
+        )));
+    }
+    if provider.request_compatibility.codex_multi_agent_v2
+        && !provider.request_compatibility.responses_via_chat_v1
+    {
+        return Err(AppError::BadRequest(format!(
+            "plugin {plugin_id} provider {} must declare responses_via_chat_v1 for Codex MultiAgentV2 compatibility",
+            provider.id
+        )));
+    }
+    if provider.codex_model_capabilities.is_some()
+        && !provider.request_compatibility.codex_multi_agent_v2
+    {
+        return Err(AppError::BadRequest(format!(
+            "plugin {plugin_id} provider {} must declare codex_multi_agent_v2 for Codex model capabilities",
+            provider.id
+        )));
+    }
+    if provider.request_compatibility.responses_via_chat_v1
+        && !provider.request_compatibility.third_party
+    {
+        return Err(AppError::BadRequest(format!(
+            "plugin {plugin_id} provider {} must declare third_party for Responses-via-Chat compatibility",
+            provider.id
+        )));
+    }
+    if provider.request_compatibility.responses_via_chat_v1
+        && provider
+            .request_compatibility
+            .responses_via_chat_dialect
+            .is_none()
+    {
+        return Err(AppError::BadRequest(format!(
+            "plugin {plugin_id} provider {} must declare a Responses-via-Chat dialect",
+            provider.id
+        )));
+    }
+    if provider
+        .request_compatibility
+        .responses_via_chat_dialect
+        .is_some()
+        && !provider.request_compatibility.responses_via_chat_v1
+    {
+        return Err(AppError::BadRequest(format!(
+            "plugin {plugin_id} provider {} declares a Responses-via-Chat dialect without responses_via_chat_v1",
+            provider.id
+        )));
+    }
+    if provider.request_compatibility.responses_via_chat_dialect
+        == Some(crate::provider::ResponsesViaChatDialect::OpenAiChatV1)
+        && provider
+            .codex_model_capabilities
+            .as_ref()
+            .is_some_and(|capabilities| {
+                !capabilities.supported_reasoning_levels.is_empty()
+                    || capabilities.default_reasoning_level.is_some()
+            })
+    {
+        return Err(AppError::BadRequest(format!(
+            "plugin {plugin_id} provider {} cannot advertise reasoning levels with the strict OpenAI Chat dialect",
+            provider.id
+        )));
+    }
     crate::schema::validate_definition(&provider.config_schema)?;
     crate::schema::validate_definition(&provider.credential_schema)?;
     let supported_credentials = [

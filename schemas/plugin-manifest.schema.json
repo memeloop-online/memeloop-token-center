@@ -180,6 +180,126 @@
                   }
                 }
               },
+              "request_compatibility": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "third_party": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Explicitly identifies a non-native upstream contract; this is never inferred from a URL or model name."
+                  },
+                  "responses_via_chat_v1": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Explicitly identifies a provider adapter that translates OpenAI Responses through Chat Completions."
+                  },
+                  "responses_via_chat_dialect": {
+                    "type": "string",
+                    "enum": ["openai_chat_v1", "kimi_v1"],
+                    "description": "Closed, versioned Responses-via-Chat wire dialect. Required when responses_via_chat_v1 is true."
+                  },
+                  "codex_multi_agent_v2": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Opt in to the host's Codex MultiAgentV2 request normalization for this provider."
+                  }
+                },
+                "allOf": [
+                  {
+                    "if": {
+                      "required": ["responses_via_chat_v1"],
+                      "properties": {
+                        "responses_via_chat_v1": {"const": true}
+                      }
+                    },
+                    "then": {
+                      "required": ["responses_via_chat_dialect"]
+                    }
+                  },
+                  {
+                    "if": {
+                      "required": ["responses_via_chat_dialect"]
+                    },
+                    "then": {
+                      "properties": {
+                        "responses_via_chat_v1": {"const": true}
+                      }
+                    }
+                  }
+                ]
+              },
+              "codex_model_capabilities": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["version", "agent_instructions_template", "shell_type", "input_modalities"],
+                "description": "Versioned, fixed, non-secret Codex model-directory capabilities for an explicitly compatible provider. Account, route, and upstream identity must never be included.",
+                "properties": {
+                  "version": {
+                    "const": "codex-model-capabilities-v1"
+                  },
+                  "agent_instructions_template": {
+                    "const": "codex-generic-agent-v1"
+                  },
+                  "shell_type": {
+                    "type": "string",
+                    "enum": ["disabled", "unified_exec"]
+                  },
+                  "apply_patch_tool_type": {
+                    "type": ["string", "null"],
+                    "enum": ["freeform", null]
+                  },
+                  "fallback_context_window": {
+                    "type": ["integer", "null"],
+                    "minimum": 1
+                  },
+                  "input_modalities": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "items": {
+                      "type": "string",
+                      "enum": ["text", "image"]
+                    }
+                  },
+                  "supports_image_detail_original": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "include_skills_usage_instructions": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "include_plugin_usage_instructions": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "include_apps_usage_instructions": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "supported_reasoning_levels": {
+                    "type": "array",
+                    "uniqueItems": true,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["effort", "description"],
+                      "properties": {
+                        "effort": {
+                          "type": "string",
+                          "enum": ["none", "low", "medium", "high", "xhigh", "max", "ultra"]
+                        },
+                        "description": {"type": "string", "minLength": 1}
+                      }
+                    }
+                  },
+                  "default_reasoning_level": {
+                    "type": ["string", "null"],
+                    "enum": ["none", "low", "medium", "high", "xhigh", "max", "ultra", null]
+                  }
+                }
+              },
               "source": { "type": "string", "readOnly": true }
             }
           }

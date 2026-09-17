@@ -1,4 +1,5 @@
 use super::AppError;
+use crate::provider::ResponsesViaChatDialect;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -101,6 +102,69 @@ fn content(value: &Value) -> Value {
     )
 }
 
+fn validate_tools(value: &Value) -> Result<(), AppError> {
+    let Some(tools) = value.as_array() else {
+        return Err(AppError::BadRequest(
+            "Responses-via-Chat tools must be an array".into(),
+        ));
+    };
+    for tool in tools {
+        let kind = tool["type"].as_str().unwrap_or("function");
+        match kind {
+            "function" | "custom" => {}
+            "namespace" => validate_tools(&tool["tools"])?,
+            _ => {
+                return Err(AppError::BadRequest(format!(
+                    "unsupported Responses tool type for Responses-via-Chat: {kind}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_image_details(value: &Value) -> Result<(), AppError> {
+    match value {
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("input_image")
+                && object.get("detail").and_then(Value::as_str) == Some("original")
+            {
+                return Err(AppError::BadRequest(
+                    "Responses-via-Chat does not support original image detail".into(),
+                ));
+            }
+            for child in object.values() {
+                validate_image_details(child)?;
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                validate_image_details(child)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Reject request features that this bridge cannot preserve exactly. The
+/// gateway must not advertise a tool/image capability and then silently drop
+/// or downgrade it while converting Responses to Chat.
+pub(super) fn validate_bridge_features(request: &Value) -> Result<(), AppError> {
+    validate_image_details(request)?;
+    if request.get("tools").is_some() {
+        validate_tools(&request["tools"])?;
+    }
+    if let Some(input) = request["input"].as_array() {
+        for item in input {
+            if item["type"] == "additional_tools" {
+                validate_tools(&item["tools"])?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn combine(existing: &mut String, incoming: &str) {
     if incoming.trim().is_empty() || existing == incoming {
         return;
@@ -114,11 +178,12 @@ fn combine(existing: &mut String, incoming: &str) {
 }
 
 /// Inter-agent messages are user-level input, never privileged instructions.
-/// Provider-encrypted payloads cannot be translated by this gateway: in real
-/// agent requests the readable part can be only an envelope, not the task.
+/// The common request normalizer converts readable string encrypted payloads
+/// before this function runs. Any opaque/non-string payload still fails closed
+/// rather than being guessed at.
 fn agent_message(item: &Value) -> Result<Value, AppError> {
     let parts = item["content"].as_array().ok_or_else(|| {
-        AppError::BadRequest("Kimi agent messages require readable content".into())
+        AppError::BadRequest("Responses-via-Chat agent messages require readable content".into())
     })?;
     let mut readable = Vec::with_capacity(parts.len() + 1);
     readable.push(json!({"type":"input_text", "text":format!(
@@ -127,23 +192,30 @@ fn agent_message(item: &Value) -> Result<Value, AppError> {
     )}));
     for part in parts {
         match part["type"].as_str() {
-            Some("encrypted_content") => return Err(AppError::BadRequest(
-                "Kimi cannot read encrypted agent message content; resend the complete agent task as plaintext input".into(),
-            )),
             Some("input_text" | "output_text" | "text") if part["text"].is_string() => {
-                readable.push(part.clone());
+                readable.push(json!({
+                    "type": "input_text",
+                    "text": part["text"]
+                }));
             }
             Some("input_image") if part["image_url"].is_string() => {
-                readable.push(part.clone());
+                let mut image = json!({
+                    "type": "input_image",
+                    "image_url": part["image_url"]
+                });
+                if let Some(detail) = part.get("detail") {
+                    image["detail"] = detail.clone();
+                }
+                readable.push(image);
             }
             _ => return Err(AppError::BadRequest(
-                "unsupported agent message content for Kimi; resend the complete agent task as readable input".into(),
+                "unsupported agent message content for Responses-via-Chat; resend the complete agent task as readable input".into(),
             )),
         }
     }
     if parts.is_empty() {
         return Err(AppError::BadRequest(
-            "Kimi agent messages require readable content".into(),
+            "Responses-via-Chat agent messages require readable content".into(),
         ));
     }
     Ok(json!({"type":"message", "role":"user", "content":readable}))
@@ -152,13 +224,22 @@ fn agent_message(item: &Value) -> Result<Value, AppError> {
 /// Convert the source's Responses message/tool forms without a service bridge.
 /// Tool outputs remain adjacent to their calls even when interleaved user
 /// messages occur in the input timeline.
-pub(super) fn convert(request: &Value) -> Result<Value, AppError> {
+#[cfg(test)]
+pub(in crate::api) fn convert(request: &Value) -> Result<Value, AppError> {
+    convert_with_dialect(request, ResponsesViaChatDialect::OpenAiChatV1)
+}
+
+pub(in crate::api) fn convert_with_dialect(
+    request: &Value,
+    dialect: ResponsesViaChatDialect,
+) -> Result<Value, AppError> {
+    validate_bridge_features(request)?;
     if request
         .get("previous_response_id")
         .is_some_and(|id| !id.is_null())
     {
         return Err(AppError::BadRequest(
-            "Kimi Responses continuation requires the complete input history".into(),
+            "Responses-via-Chat continuation requires the complete input history".into(),
         ));
     }
     let mut output =
@@ -189,6 +270,7 @@ pub(super) fn convert(request: &Value) -> Result<Value, AppError> {
     let mut awaiting = BTreeSet::<String>::new();
     let mut deferred = Vec::new();
     let mut reasoning = String::new();
+    let preserve_reasoning = dialect == ResponsesViaChatDialect::KimiV1;
     for item in &input {
         let normalized;
         let item = if item["type"] == "agent_message" {
@@ -199,6 +281,9 @@ pub(super) fn convert(request: &Value) -> Result<Value, AppError> {
         };
         match item["type"].as_str().unwrap_or("message") {
             "reasoning" => {
+                if !preserve_reasoning {
+                    continue;
+                }
                 let summary = item["summary"]
                     .as_array()
                     .map(|parts| {
@@ -219,10 +304,12 @@ pub(super) fn convert(request: &Value) -> Result<Value, AppError> {
                 );
             }
             "function_call" | "custom_tool_call" => {
-                combine(
-                    &mut reasoning,
-                    item["reasoning_content"].as_str().unwrap_or(""),
-                );
+                if preserve_reasoning {
+                    combine(
+                        &mut reasoning,
+                        item["reasoning_content"].as_str().unwrap_or(""),
+                    );
+                }
                 let id = item["call_id"].as_str().unwrap_or("");
                 let arguments = if item["type"] == "custom_tool_call" {
                     serde_json::to_string(&json!({"input":item["input"]}))
@@ -247,7 +334,7 @@ pub(super) fn convert(request: &Value) -> Result<Value, AppError> {
                     .as_array_mut()
                     .ok_or(AppError::Internal)?
                     .push(call);
-                if !reasoning.is_empty() {
+                if preserve_reasoning && !reasoning.is_empty() {
                     message["reasoning_content"] = Value::String(std::mem::take(&mut reasoning));
                 }
                 if output_ids.contains(id) {
@@ -275,15 +362,17 @@ pub(super) fn convert(request: &Value) -> Result<Value, AppError> {
                 let mut message = json!({"role":if role == "developer" {"user"} else {role},
                     "content":content(&item["content"])});
                 if role == "assistant" {
-                    combine(
-                        &mut reasoning,
-                        item["reasoning_content"].as_str().unwrap_or(""),
-                    );
-                    if !reasoning.is_empty() {
+                    if preserve_reasoning {
+                        combine(
+                            &mut reasoning,
+                            item["reasoning_content"].as_str().unwrap_or(""),
+                        );
+                    }
+                    if preserve_reasoning && !reasoning.is_empty() {
                         message["reasoning_content"] =
                             Value::String(std::mem::take(&mut reasoning));
                     }
-                } else if !reasoning.is_empty() {
+                } else if preserve_reasoning && !reasoning.is_empty() {
                     messages.push(json!({"role":"assistant","content":"",
                         "reasoning_content":std::mem::take(&mut reasoning)}));
                 }
@@ -295,13 +384,13 @@ pub(super) fn convert(request: &Value) -> Result<Value, AppError> {
             }
             _ => {
                 return Err(AppError::BadRequest(
-                    "unsupported Responses input item for Kimi".into(),
+                    "unsupported Responses input item for Responses-via-Chat".into(),
                 ));
             }
         }
     }
     messages.append(&mut deferred);
-    if !reasoning.is_empty() {
+    if preserve_reasoning && !reasoning.is_empty() {
         messages.push(json!({"role":"assistant","content":"","reasoning_content":reasoning}));
     }
     output["messages"] = Value::Array(messages);
@@ -318,7 +407,7 @@ pub(super) fn convert(request: &Value) -> Result<Value, AppError> {
             output[name] = value.clone();
         }
     }
-    if let Some(effort) = request.pointer("/reasoning/effort") {
+    if preserve_reasoning && let Some(effort) = request.pointer("/reasoning/effort") {
         output["reasoning_effort"] = effort.clone();
     }
     if let Some(format) = request.pointer("/text/format") {
@@ -385,20 +474,114 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_agent_payload_is_not_silently_replaced_with_its_envelope() {
+    fn normalized_encrypted_agent_payload_preserves_task_text_without_metadata() {
         for content in [
             json!([{"type":"input_text","text":"Message Type: NEW_TASK\nPayload:\n"},
                 {"type":"encrypted_content","encrypted_content":"secret-ciphertext-fixture"}]),
             json!([{"type":"encrypted_content","encrypted_content":"secret-ciphertext-fixture"}]),
         ] {
-            let error = convert(&json!({"input":[{"type":"agent_message","content":content}]}))
-                .unwrap_err();
-            let AppError::BadRequest(message) = error else {
-                panic!("expected input rejection")
-            };
-            assert!(message.contains("resend the complete agent task as plaintext input"));
-            assert!(!message.contains("secret-ciphertext-fixture"));
+            let mut request = json!({"input":[{"type":"agent_message",
+                "author":"/root", "recipient":"/root/worker",
+                "internal_chat_message_metadata_passthrough":{"instruction":"never forward this"},
+                "content":content}]});
+            crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut request, true)
+                .unwrap();
+            assert_eq!(request["input"][0]["content"][0]["type"], "input_text");
+            let output = convert(&request).unwrap();
+            assert_eq!(output["messages"][0]["role"], "user");
+            assert!(output.to_string().contains("secret-ciphertext-fixture"));
+            assert!(!output.to_string().contains("encrypted_content"));
+            assert!(!output.to_string().contains("never forward this"));
         }
+    }
+
+    #[test]
+    fn opaque_encrypted_agent_payload_still_fails_closed() {
+        let mut request = json!({"input":[{"type":"agent_message","content":[
+            {"type":"encrypted_content","encrypted_content":{"ciphertext":"opaque"}}
+        ]}]});
+        let error =
+            crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut request, true)
+                .unwrap_err();
+        let AppError::BadRequest(message) = error else {
+            panic!("expected input rejection")
+        };
+        assert!(message.contains("agent_message"));
+        assert_eq!(request["input"][0]["type"], "agent_message");
+    }
+
+    #[test]
+    fn codex_multi_agent_fixture_is_readable_for_kimi_without_internal_metadata() {
+        let mut request: Value =
+            serde_json::from_str(include_str!("fixtures/codex-multi-agent-v2.json"))
+                .expect("valid Codex MultiAgentV2 fixture");
+        crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut request, true)
+            .unwrap();
+
+        assert!(
+            request["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_none()
+        );
+        assert!(
+            request["tools"][0]["tools"][1]["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_none()
+        );
+        assert!(
+            request["tools"][0]["tools"][2]["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_some()
+        );
+        assert!(
+            request["input"][0]["tools"][0]["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_none()
+        );
+        assert_eq!(request["input"][1]["content"][1]["type"], "input_text");
+        assert_eq!(
+            request["input"][1]["content"][1]["text"],
+            "delegated task fixture"
+        );
+
+        let output = convert(&request).expect("fixture converts to Responses-via-Chat");
+        let spawn_agent = output["tools"]
+            .as_array()
+            .and_then(|tools| {
+                tools
+                    .iter()
+                    .find(|tool| tool["function"]["name"] == "collaboration__spawn_agent")
+            })
+            .expect("fixture keeps the collaboration spawn_agent tool");
+        assert!(
+            spawn_agent["function"]["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_none()
+        );
+        assert_eq!(output["messages"][0]["role"], "user");
+        assert!(output.to_string().contains("delegated task fixture"));
+        assert!(!output.to_string().contains("never forward this metadata"));
+        assert!(!output.to_string().contains("encrypted_content"));
+        let messages = output["messages"].as_array().expect("converted messages");
+        let calls = messages
+            .iter()
+            .filter(|message| message["role"] == "assistant")
+            .flat_map(|message| message["tool_calls"].as_array().into_iter().flatten())
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["function"]["name"], "collaboration__spawn_agent");
+        assert!(
+            calls[0]["function"]["arguments"]
+                .as_str()
+                .is_some_and(|arguments| arguments.contains("kimi-k3-256k"))
+        );
+        assert_eq!(calls[1]["function"]["name"], "collaboration__followup_task");
+        assert!(messages.iter().any(|message| {
+            message["role"] == "tool" && message["tool_call_id"] == "spawn-call"
+        }));
+        assert!(messages.iter().any(|message| {
+            message["role"] == "tool" && message["tool_call_id"] == "followup-call"
+        }));
     }
 
     #[test]
@@ -437,7 +620,7 @@ mod tests {
                 {"type":"additional_tools","tools":[{"type":"function","name":"other","parameters":{"type":"object"}}]}
             ],"max_output_tokens":400,"reasoning":{"effort":"high"},
             "text":{"format":{"type":"json_schema","name":"result","schema":{"type":"object"},"strict":true}}});
-        let converted = convert(&request).unwrap();
+        let converted = convert_with_dialect(&request, ResponsesViaChatDialect::KimiV1).unwrap();
         assert_eq!(converted["messages"][0]["role"], "system");
         assert_eq!(
             converted["messages"][1]["tool_calls"][0]["function"]["name"],
@@ -453,16 +636,40 @@ mod tests {
     }
 
     #[test]
-    fn first_tool_declaration_controls_reverse_mapping_and_image_detail() {
+    fn strict_openai_chat_dialect_omits_kimi_reasoning_fields() {
+        let request = json!({
+            "input":[
+                {"type":"reasoning","summary":[{"type":"summary_text","text":"private trace"}]},
+                {"role":"assistant","content":"answer","reasoning_content":"private trace"}
+            ],
+            "reasoning":{"effort":"high"}
+        });
+        let converted =
+            convert_with_dialect(&request, ResponsesViaChatDialect::OpenAiChatV1).unwrap();
+        assert!(converted.to_string().contains("answer"));
+        assert!(!converted.to_string().contains("reasoning_content"));
+        assert!(!converted.to_string().contains("reasoning_effort"));
+        let kimi = convert_with_dialect(&request, ResponsesViaChatDialect::KimiV1).unwrap();
+        assert_eq!(kimi["reasoning_effort"], "high");
+        assert!(kimi.to_string().contains("reasoning_content"));
+    }
+
+    #[test]
+    fn unsupported_original_image_detail_fails_closed() {
         let request = json!({"input":[{"role":"user","content":[
             {"type":"input_image","image_url":"data:image/png;base64,fixture","detail":"original"}]},
             {"type":"additional_tools","tools":[{"type":"custom","name":"same"}]}],
             "tools":[{"type":"function","name":"same","parameters":{}}]});
         assert!(!tools(&request)["same"].0.custom);
-        let output = convert(&request).unwrap();
-        assert_eq!(
-            output["messages"][0]["content"][0]["image_url"]["detail"],
-            "high"
-        );
+        assert!(convert(&request).is_err());
+    }
+
+    #[test]
+    fn unsupported_builtin_tool_fails_closed() {
+        let request = json!({
+            "input": "hello",
+            "tools": [{"type":"computer_use_preview","display_width":1024}]
+        });
+        assert!(convert(&request).is_err());
     }
 }

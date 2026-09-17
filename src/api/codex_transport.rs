@@ -197,6 +197,32 @@ fn is_matching_codex_user_agent(originator: &str, user_agent: &str) -> bool {
     user_agent.starts_with(expected_prefix)
 }
 
+/// Return whether a downstream User-Agent identifies a first-party Codex
+/// client.  Keep this parser beside the native transport's originator allow
+/// list so request normalization and upstream identity forwarding cannot
+/// drift into separate client inventories.
+pub(in crate::api) fn is_first_party_codex_user_agent(user_agent: &str) -> bool {
+    if !bounded_visible_ascii(user_agent, MAX_CODEX_USER_AGENT_BYTES) {
+        return false;
+    }
+    if user_agent == "codex_cli_rs" {
+        return true;
+    }
+    let Some((originator, version_and_details)) = user_agent.split_once('/') else {
+        return false;
+    };
+    let Some(version) = version_and_details.split_whitespace().next() else {
+        return false;
+    };
+    is_valid_codex_version(version)
+        && is_allowed_codex_originator(originator)
+        && is_matching_codex_user_agent(originator, user_agent)
+}
+
+fn is_valid_codex_version(version: &str) -> bool {
+    semver::Version::parse(version).is_ok()
+}
+
 fn bounded_visible_ascii(value: &str, max_bytes: usize) -> bool {
     !value.is_empty()
         && value.len() <= max_bytes

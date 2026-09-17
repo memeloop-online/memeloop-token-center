@@ -57,6 +57,8 @@ pub(super) fn plan_proxy_route(
                 protocol,
                 request_id,
                 request_json,
+                codex_multi_agent_v2_client,
+                codex_multi_agent_v2_tools_prepared,
             },
         route,
         preparation_now,
@@ -82,8 +84,19 @@ pub(super) fn plan_proxy_route(
     if is_codex {
         codex::validate_route(&route, protocol)?;
     }
-    let (mut forwarded_json, kimi_response) =
-        kimi::prepare_forwarded_request(&route, protocol, request_json)?;
+    let responses_via_chat_dialect = state.providers.responses_via_chat_dialect(&route.driver);
+    let (mut forwarded_json, responses_chat) = kimi::prepare_forwarded_request(
+        &route,
+        protocol,
+        request_json,
+        matches!(protocol, Protocol::OpenAiResponses)
+            && codex_multi_agent_v2_client
+            && codex_multi_agent_v2_tools_prepared,
+        matches!(protocol, Protocol::OpenAiResponses)
+            && codex_multi_agent_v2_client
+            && state.providers.supports_codex_multi_agent_v2(&route.driver),
+        responses_via_chat_dialect,
+    )?;
     let codex_plan = if is_codex {
         Some(codex_transport::prepare_request_with_id(
             &mut forwarded_json,
@@ -98,7 +111,7 @@ pub(super) fn plan_proxy_route(
     let output_token_ceiling = match codex_plan.as_ref() {
         Some(plan) => plan.output_token_ceiling,
         None => inject_controlled_output_ceiling(
-            if kimi_response.is_some() {
+            if responses_chat.is_some() {
                 Protocol::OpenAiChat
             } else {
                 protocol
@@ -149,7 +162,7 @@ pub(super) fn plan_proxy_route(
         codex_store_disabled,
         codex_session_id,
         component_context,
-        kimi_response,
+        responses_chat,
     })
 }
 
@@ -197,7 +210,7 @@ pub(super) async fn materialize_proxy_route(
         codex_store_disabled: planned.codex_store_disabled,
         codex_session_id: planned.codex_session_id,
         component_request,
-        kimi_response: planned.kimi_response,
+        responses_chat: planned.responses_chat,
     })
 }
 
