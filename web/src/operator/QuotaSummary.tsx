@@ -42,7 +42,7 @@ export function QuotaSummary({
     snapshot
     && showResetCreditExpiryInTooltip
     && resetCreditExpiry?.state === 'known'
-    && (quotaAvailableResetCredits(snapshot, now) ?? 0) > 1,
+    && (quotaAvailableResetCredits(snapshot, now) ?? 0) > 0,
   );
   const text = t(presentation.key, {
     name: highest && snapshot ? label(snapshot.provider, highest) : '',

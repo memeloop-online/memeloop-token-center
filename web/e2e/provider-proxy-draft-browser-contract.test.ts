@@ -14,6 +14,7 @@ test('independent proxy save updates concurrency metadata without dropping the p
   const browser = await chromium.launch({ headless: true });
   try {
     const page = await browser.newPage();
+    await page.clock.setFixedTime(new Date('2026-09-13T07:00:00Z'));
     const errors: string[] = [];
     page.on('pageerror', error => errors.push(error.message));
     await page.route('**/*', route => {
@@ -117,6 +118,7 @@ test('independent proxy save updates concurrency metadata without dropping the p
     // a reset. These reads and the proxy update are in-memory only; no reset
     // endpoint (not even preparation) is allowed by this fixture.
     await page.goto(`${origin}/e2e/fixtures/form-journey.html?workflows&proxy-workflow&quota-generation`);
+    // The fixture exposes one available reset credit with a known expiry.
     await row.getByRole('button', { name: '刷新额度', exact: true }).click();
     await page.waitForFunction(() => window.formJourneyReads.filter(path => path.endsWith('/quota')).length === 1);
     assert.match(await row.innerText(), /重置于/);
@@ -125,7 +127,10 @@ test('independent proxy save updates concurrency metadata without dropping the p
     await quotaSummary.focus();
     const quotaTooltip = page.getByRole('tooltip');
     await quotaTooltip.waitFor();
-    assert.match(await quotaTooltip.innerText(), /重置机会最近到期/);
+    const quotaTooltipText = await quotaTooltip.innerText();
+    const expectedExpiry = await page.evaluate(() => new Date(Date.now() + 3_600_000).toLocaleString('zh-CN'));
+    assert.match(quotaTooltipText, /重置机会最近到期/);
+    assert.ok(quotaTooltipText.includes(expectedExpiry), 'the single available reset opportunity expiry is shown in the list tooltip');
     await page.setViewportSize({ width: 1440, height: 1000 });
     await page.evaluate(() => { document.documentElement.dataset.theme = 'light'; });
     await page.screenshot({ path: `${artifacts}/quota-summary-tooltip-light-1440.png`, fullPage: true });
