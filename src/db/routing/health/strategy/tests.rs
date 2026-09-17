@@ -216,7 +216,7 @@ async fn transient_signal_invariants(database: &Database) {
     assert_eq!(failed.ewma_micros, TRANSIENT_EWMA_SCALE);
     assert_eq!(failed.recovery_successes, 0);
     assert_eq!(failed.revision, 1);
-    assert!(failed.should_open(1, 900_000));
+    assert!(failed.sample_count >= 1 && failed.ewma_micros >= 900_000);
 
     let first_success = database
         .record_transient_health_sample(account, 3, false)
@@ -227,7 +227,7 @@ async fn transient_signal_invariants(database: &Database) {
     assert_eq!(first_success.ewma_micros, 750_000);
     assert_eq!(first_success.recovery_successes, 1);
     assert_eq!(first_success.revision, 2);
-    assert!(!first_success.should_recover(600_000, 2));
+    assert!(first_success.ewma_micros > 600_000 || first_success.recovery_successes < 2);
 
     let second_success = database
         .record_transient_health_sample(account, 3, false)
@@ -236,7 +236,7 @@ async fn transient_signal_invariants(database: &Database) {
         .unwrap();
     assert_eq!(second_success.ewma_micros, 562_500);
     assert_eq!(second_success.recovery_successes, 2);
-    assert!(second_success.should_recover(600_000, 2));
+    assert!(second_success.ewma_micros <= 600_000 && second_success.recovery_successes >= 2);
     assert!(
         database
             .record_transient_health_sample(account, 2, true)

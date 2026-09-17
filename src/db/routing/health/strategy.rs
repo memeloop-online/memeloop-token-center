@@ -14,22 +14,6 @@ pub(crate) struct TransientHealthSignal {
     pub(crate) revision: i64,
 }
 
-impl TransientHealthSignal {
-    pub(crate) fn should_open(self, minimum_samples: u32, open_threshold_micros: u32) -> bool {
-        self.sample_count >= i64::from(minimum_samples)
-            && self.ewma_micros >= i64::from(open_threshold_micros)
-    }
-
-    pub(crate) fn should_recover(
-        self,
-        recover_threshold_micros: u32,
-        minimum_probe_successes: u32,
-    ) -> bool {
-        self.ewma_micros <= i64::from(recover_threshold_micros)
-            && self.recovery_successes >= i64::from(minimum_probe_successes)
-    }
-}
-
 /// A tenant-scoped, credential-free snapshot; no row means the candidate is
 /// inactive, absent, or stale, not that it is healthy.
 #[derive(Clone, Debug)]

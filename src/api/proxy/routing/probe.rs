@@ -166,18 +166,19 @@ mod v2_lifecycle_tests {
             directory.path().join("v2-lifecycle.db").display()
         );
         let database = Database::connect(&url).await.unwrap();
+        let pool = sqlx::AnyPool::connect(&url).await.unwrap();
         database.migrate().await.unwrap();
         let tenant = Uuid::now_v7();
         let account = Uuid::now_v7();
         sqlx::query("INSERT INTO tenants (id,external_id,created_at) VALUES ($1,$1,0)")
             .bind(tenant.to_string())
-            .execute(&database.pool)
+            .execute(&pool)
             .await
             .unwrap();
         sqlx::query("INSERT INTO upstream_accounts (id,tenant_id,name,driver,auth_kind,config_json,status,credential_generation,created_at,updated_at) VALUES ($1,$2,'v2 lifecycle','http-json','none','{}','active',1,0,0)")
             .bind(account.to_string())
             .bind(tenant.to_string())
-            .execute(&database.pool)
+            .execute(&pool)
             .await
             .unwrap();
         let policy = GroupRoutingTransientPolicy {
@@ -237,7 +238,7 @@ mod v2_lifecycle_tests {
             "UPDATE upstream_account_health SET cooldown_until = 0 WHERE upstream_account_id = $1",
         )
         .bind(account.to_string())
-        .execute(&database.pool)
+        .execute(&pool)
         .await
         .unwrap();
         let first_probe = database
@@ -307,7 +308,7 @@ mod v2_lifecycle_tests {
             "SELECT revision FROM upstream_account_transient_health_signals WHERE upstream_account_id = $1",
         )
         .bind(account.to_string())
-        .fetch_one(&database.pool)
+        .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(
@@ -318,7 +319,7 @@ mod v2_lifecycle_tests {
             "SELECT revision FROM upstream_account_transient_health_signals WHERE upstream_account_id = $1",
         )
         .bind(account.to_string())
-        .fetch_one(&database.pool)
+        .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(after_cancel, before_cancel);
@@ -334,6 +335,7 @@ mod v2_lifecycle_tests {
                 .is_healthy()
         );
         assert!(unix_millis() >= second_success.last_observed_at);
+        pool.close().await;
     }
 }
 

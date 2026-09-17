@@ -73,22 +73,6 @@ fn reserve_native_bucket_ranks(
     start
 }
 
-fn sort_plan_candidates(selection_seed: Uuid, directives: &mut [GroupRoutingDirective]) {
-    // Stable sort preserves plugin order among non-sticky candidates.
-    directives.sort_by_key(|directive| {
-        let rank = if directive.stickiness {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(selection_seed.as_bytes());
-            hasher.update(directive.route_id.as_bytes());
-            hasher.update(directive.account_id.as_bytes());
-            u64::from_le_bytes(hasher.finalize().as_bytes()[..8].try_into().unwrap())
-        } else {
-            0
-        };
-        (!directive.stickiness, rank)
-    });
-}
-
 fn sort_execution_candidates(
     selection_seed: Uuid,
     directives: &mut [crate::plugin::routing::GroupRoutingExecutionDirective],
@@ -568,7 +552,7 @@ pub(crate) async fn observe_with_signal(
     };
     let runtime = state.plugins.clone();
     let plugin_id = policy.plugin_id.clone();
-    let execution_signal = transient_signal.or_else(|| match outcome {
+    let execution_signal = transient_signal.or(match outcome {
         GroupRoutingOutcome::HardQuota
         | GroupRoutingOutcome::Authentication
         | GroupRoutingOutcome::Cancelled => policy.transient_signal,
