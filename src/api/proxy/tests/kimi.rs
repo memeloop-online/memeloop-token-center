@@ -270,7 +270,30 @@ async fn native_codex_responses_preserves_collaboration_schema_on_the_wire() {
     let requests = upstream.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     let forwarded: Value = requests[0].body_json().unwrap();
-    assert_eq!(forwarded["tools"], request["tools"]);
+    // The native transport may append its own image-generation tool. Compare
+    // the client-owned collaboration namespace instead of rejecting that
+    // reviewed transport addition.
+    let expected_collaboration = request["tools"]
+        .as_array()
+        .and_then(|tools| {
+            tools
+                .iter()
+                .find(|tool| tool["type"] == "namespace" && tool["name"] == "collaboration")
+        })
+        .expect("fixture contains collaboration namespace");
+    let forwarded_collaboration = forwarded["tools"]
+        .as_array()
+        .and_then(|tools| {
+            tools
+                .iter()
+                .find(|tool| tool["type"] == "namespace" && tool["name"] == "collaboration")
+        })
+        .expect("native wire preserves collaboration namespace");
+    assert_eq!(forwarded_collaboration, expected_collaboration);
+    assert_eq!(
+        forwarded_collaboration["tools"][0]["parameters"]["properties"]["message"]["encrypted"],
+        json!({"type": "boolean"})
+    );
     assert_eq!(forwarded["input"][0], request["input"][0]);
     upstream.verify().await;
 }
