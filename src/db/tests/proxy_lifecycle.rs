@@ -1,6 +1,866 @@
 use super::super::*;
 
 #[tokio::test]
+async fn postgres_late_streaming_parent_atomically_reconciles_committed_child_cluster() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let database = Database::connect_with_max(&database_url, 8).await.unwrap();
+    database.migrate().await.unwrap();
+    let unique = Uuid::now_v7();
+    let pepper = b"late streaming parent reconciliation pepper";
+    let model = format!("late-streaming-parent-{unique}");
+    let price = database
+        .upsert_model_price(&model, "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let tenant_external_id = format!("late-streaming-parent-{unique}");
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: tenant_external_id.clone(),
+                principal_external_id: "member".to_owned(),
+                alias: "late-streaming-parent".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy {
+                    max_concurrency: 8,
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let legacy_issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id,
+                principal_external_id: "member".to_owned(),
+                alias: "late-streaming-parent-legacy".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy {
+                    max_concurrency: 8,
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let legacy_key = database
+        .authenticate_key(&legacy_issued.key, pepper)
+        .await
+        .unwrap();
+    let foreign_issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: format!("late-streaming-parent-foreign-{unique}"),
+                principal_external_id: "member".to_owned(),
+                alias: "late-streaming-parent-foreign".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy {
+                    max_concurrency: 8,
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let foreign_key = database
+        .authenticate_key(&foreign_issued.key, pepper)
+        .await
+        .unwrap();
+    let parent_request_id = Uuid::now_v7();
+    let child_request_id = Uuid::now_v7();
+    let foreign_child_request_id = Uuid::now_v7();
+    let _parent_reservation = database
+        .start_proxy_request(StartProxyRequest {
+            request_id: parent_request_id,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 10,
+            output_token_ceiling: 10,
+            protocol: "openai-responses",
+            model: &model,
+            request_object: "objects/late-parent",
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+    let child_reservation = database
+        .start_proxy_request(StartProxyRequest {
+            request_id: child_request_id,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 10,
+            output_token_ceiling: 10,
+            protocol: "openai-responses",
+            model: &model,
+            request_object: "objects/early-child",
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+    let _foreign_child_reservation = database
+        .start_proxy_request(StartProxyRequest {
+            request_id: foreign_child_request_id,
+            key: &foreign_key,
+            price: &price,
+            input_token_ceiling: 10,
+            output_token_ceiling: 10,
+            protocol: "openai-responses",
+            model: &model,
+            request_object: "objects/foreign-early-child",
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+
+    let response_id = format!("resp-late-parent-{unique}");
+    let parent_json = serde_json::json!({
+        "input": [{"role": "user", "content": "parent request"}]
+    });
+    let parent_hints = ConversationHints::default();
+    let mut parent_transaction = database.begin_write_transaction().await.unwrap();
+    database
+        .record_conversation_observation_in_transaction(
+            &mut parent_transaction,
+            ConversationObservationInput {
+                key: &key,
+                request_id: parent_request_id,
+                request_json: &parent_json,
+                hints: &parent_hints,
+                client_name: Some("Codex"),
+                // Exercise the durable repair path for an already in-flight
+                // terminal writer that did not preclaim the response lock.
+                upstream_response_id: None,
+                // A delayed terminal writer may acquire its observation clock
+                // after the already-issued follow-up. Explicit response
+                // identity must remain authoritative over this inversion.
+                observed_at: unix_millis().saturating_add(60_000),
+                attach_request_record: true,
+                content_materialized: false,
+            },
+        )
+        .await
+        .unwrap();
+    let parent_cluster: String = sqlx::query_scalar(
+        "SELECT cluster_id FROM conversation_observations WHERE request_id = $1",
+    )
+    .bind(parent_request_id.to_string())
+    .fetch_one(&mut *parent_transaction)
+    .await
+    .unwrap();
+    let legacy_observation_id = Uuid::now_v7();
+    let legacy_request_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, atom_hashes_json, created_at, inference_version) VALUES ($1, $2, $3, $4, '[]', $5, 2)",
+    )
+    .bind(legacy_observation_id.to_string())
+    .bind(&parent_cluster)
+    .bind(legacy_request_id.to_string())
+    .bind(legacy_key.key_id.to_string())
+    .bind(unix_millis())
+    .execute(&mut *parent_transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO conversation_key_clusters (key_id, cluster_id, explicit_session_id, updated_at, request_count, candidate_edge_count) VALUES ($1, $2, NULL, $3, 1, 0)",
+    )
+    .bind(legacy_key.key_id.to_string())
+    .bind(&parent_cluster)
+    .bind(unix_millis())
+    .execute(&mut *parent_transaction)
+    .await
+    .unwrap();
+
+    // Model the production ordering directly: the parent stream has already
+    // yielded its response id, but its terminal observation is still hidden in
+    // this transaction while the follow-up request commits independently.
+    let child_hints = ConversationHints {
+        parent_turn_id: Some(response_id.clone()),
+        ..ConversationHints::default()
+    };
+    let child_cluster = database
+        .record_conversation_observation(
+            &key,
+            child_request_id,
+            &serde_json::json!({
+                "input": [{"role": "user", "content": "child request"}]
+            }),
+            &child_hints,
+            Some("Codex"),
+        )
+        .await
+        .unwrap();
+    database
+        .finish_proxy_request(FinishProxyRequest {
+            usage_basis: None,
+            first_output_ms: None,
+            generation_duration_ms: None,
+            request_id: child_request_id,
+            tenant_id: key.tenant_id,
+            reservation: &child_reservation,
+            input_token_ceiling: 10,
+            output_token_ceiling: 10,
+            requested_service_tier: None,
+            status_code: 200,
+            duration_ms: 17,
+            usage: TokenUsage {
+                input_tokens: 3,
+                output_tokens: 2,
+                ..TokenUsage::default()
+            },
+            error_code: None,
+            response_object: "objects/early-child-response",
+            conversation: None,
+        })
+        .await
+        .unwrap();
+    let archive_request_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO session_archive_unlinked_requests (tenant_id, source, external_request_id, archive_request_id, key_id, principal_id, conversation_cluster_id, source_started_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, imported_at) VALUES ($1, 'codex', $2, $3, $4, $5, $6, $7, 'openai-responses', $8, 200, 23, 5, 7, $9)",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(format!("archive-child-{unique}"))
+    .bind(archive_request_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(key.principal_id.to_string())
+    .bind(child_cluster.to_string())
+    .bind(unix_millis())
+    .bind(&model)
+    .bind(unix_millis())
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO session_archive_totals (tenant_id, key_id, session_id, last_activity_at, requests, errors, input_tokens, output_tokens, duration_count, duration_sum_ms) VALUES ($1, $2, $3, $4, 1, 0, 5, 7, 1, 23)",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(child_cluster.to_string())
+    .bind(unix_millis())
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let foreign_cluster = database
+        .record_conversation_observation(
+            &foreign_key,
+            foreign_child_request_id,
+            &serde_json::json!({
+                "input": [{"role": "user", "content": "foreign child request"}]
+            }),
+            &child_hints,
+            Some("Codex"),
+        )
+        .await
+        .unwrap();
+
+    let unresolved_before_parent_commit: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_unresolved_explicit_parents WHERE key_id = $1 AND parent_reference = $2",
+    )
+    .bind(key.key_id.to_string())
+    .bind(&response_id)
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(unresolved_before_parent_commit, 1);
+    let visible_parent_observations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1")
+            .bind(parent_request_id.to_string())
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(visible_parent_observations, 0);
+    let visible_child_cluster: String =
+        sqlx::query_scalar("SELECT conversation_cluster_id FROM request_records WHERE id = $1")
+            .bind(child_request_id.to_string())
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(visible_child_cluster, child_cluster.to_string());
+
+    attach_conversation_upstream_response_in_transaction(
+        &mut parent_transaction,
+        database.backend,
+        parent_request_id,
+        &response_id,
+    )
+    .await
+    .unwrap();
+    parent_transaction.commit().await.unwrap();
+
+    let memberships: Vec<String> = sqlx::query_scalar(
+        "SELECT conversation_cluster_id FROM request_records WHERE id = $1 OR id = $2 ORDER BY id",
+    )
+    .bind(parent_request_id.to_string())
+    .bind(child_request_id.to_string())
+    .fetch_all(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(memberships.len(), 2);
+    assert_eq!(memberships[0], memberships[1]);
+    assert_ne!(memberships[0], child_cluster.to_string());
+    let reconciled: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM conversation_unresolved_explicit_parents WHERE key_id = $1 AND parent_reference = $2), (SELECT COUNT(*) FROM conversation_edges edge JOIN conversation_observations parent ON parent.id = edge.from_observation_id JOIN conversation_observations child ON child.id = edge.to_observation_id WHERE parent.request_id = $3 AND child.request_id = $4 AND edge.relation_kind = 'continues' AND edge.cluster_id = parent.cluster_id AND edge.cluster_id = child.cluster_id), (SELECT COUNT(*) FROM conversation_clusters WHERE id = $5)",
+    )
+    .bind(key.key_id.to_string())
+    .bind(&response_id)
+    .bind(parent_request_id.to_string())
+    .bind(child_request_id.to_string())
+    .bind(child_cluster.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(reconciled, (0, 1, 0));
+    let canonical_cluster = &memberships[0];
+    let usage_projection: (String, i64, i64, i64) = sqlx::query_as(
+        "SELECT fact.session_id, (SELECT COUNT(*) FROM session_usage_totals WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3), (SELECT COUNT(*) FROM session_usage_totals WHERE tenant_id = $1 AND key_id = $2 AND session_id = $4), (SELECT requests FROM session_usage_totals WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3)
+         FROM request_stats_facts fact WHERE fact.request_id = $5",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(canonical_cluster)
+    .bind(child_cluster.to_string())
+    .bind(child_request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(usage_projection, (canonical_cluster.clone(), 1, 0, 1));
+    let archive_projection: (String, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT conversation_cluster_id, (SELECT COUNT(*) FROM session_archive_totals WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3), (SELECT COUNT(*) FROM session_archive_totals WHERE tenant_id = $1 AND key_id = $2 AND session_id = $4), (SELECT input_tokens FROM session_archive_totals WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3), (SELECT output_tokens FROM session_archive_totals WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3) FROM session_archive_unlinked_requests WHERE archive_request_id = $5",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(canonical_cluster)
+    .bind(child_cluster.to_string())
+    .bind(archive_request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(archive_projection, (canonical_cluster.clone(), 1, 0, 5, 7));
+    let legacy_projection: (String, i64) = sqlx::query_as(
+        "SELECT cluster_id, (SELECT COUNT(*) FROM conversation_key_clusters WHERE key_id = $1 AND cluster_id = $2) FROM conversation_observations WHERE id = $3",
+    )
+    .bind(legacy_key.key_id.to_string())
+    .bind(canonical_cluster)
+    .bind(legacy_observation_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(legacy_projection, (canonical_cluster.clone(), 1));
+
+    database
+        .attach_conversation_upstream_response(parent_request_id, &response_id)
+        .await
+        .unwrap();
+    let edge_count_after_replay: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_edges edge JOIN conversation_observations parent ON parent.id = edge.from_observation_id JOIN conversation_observations child ON child.id = edge.to_observation_id WHERE parent.request_id = $1 AND child.request_id = $2",
+    )
+    .bind(parent_request_id.to_string())
+    .bind(child_request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(edge_count_after_replay, 1);
+    let foreign_state: (i64, String) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM conversation_unresolved_explicit_parents WHERE key_id = $1 AND parent_reference = $2), conversation_cluster_id FROM request_records WHERE id = $3",
+    )
+    .bind(foreign_key.key_id.to_string())
+    .bind(&response_id)
+    .bind(foreign_child_request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(foreign_state, (1, foreign_cluster.to_string()));
+
+    // If the parent commits before the child acquires the reference lock, its
+    // exact identity remains authoritative even when the parent's observation
+    // clock is later than the child's.
+    let reverse_parent_request_id = Uuid::now_v7();
+    let reverse_child_request_id = Uuid::now_v7();
+    for (request_id, object) in [
+        (reverse_parent_request_id, "objects/reverse-parent"),
+        (reverse_child_request_id, "objects/reverse-child"),
+    ] {
+        database
+            .start_proxy_request(StartProxyRequest {
+                request_id,
+                key: &key,
+                price: &price,
+                input_token_ceiling: 10,
+                output_token_ceiling: 10,
+                protocol: "openai-responses",
+                model: &model,
+                request_object: object,
+                upstream_account_id: None,
+                model_route_id: None,
+            })
+            .await
+            .unwrap();
+    }
+    let reverse_response_id = format!("resp-reverse-parent-{unique}");
+    let mut reverse_parent_transaction = database.begin_write_transaction().await.unwrap();
+    let reverse_parent_cluster = database
+        .record_conversation_observation_in_transaction(
+            &mut reverse_parent_transaction,
+            ConversationObservationInput {
+                key: &key,
+                request_id: reverse_parent_request_id,
+                request_json: &serde_json::json!({"input": "reverse parent"}),
+                hints: &ConversationHints::default(),
+                client_name: Some("Codex"),
+                upstream_response_id: Some(&reverse_response_id),
+                observed_at: unix_millis().saturating_add(120_000),
+                attach_request_record: true,
+                content_materialized: false,
+            },
+        )
+        .await
+        .unwrap();
+    attach_conversation_upstream_response_in_transaction(
+        &mut reverse_parent_transaction,
+        database.backend,
+        reverse_parent_request_id,
+        &reverse_response_id,
+    )
+    .await
+    .unwrap();
+    reverse_parent_transaction.commit().await.unwrap();
+    let reverse_child_cluster = database
+        .record_conversation_observation(
+            &key,
+            reverse_child_request_id,
+            &serde_json::json!({"input": "reverse child"}),
+            &ConversationHints {
+                parent_turn_id: Some(reverse_response_id.clone()),
+                ..ConversationHints::default()
+            },
+            Some("Codex"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reverse_child_cluster, reverse_parent_cluster);
+    let reverse_state: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM conversation_unresolved_explicit_parents WHERE key_id = $1 AND parent_reference = $2), (SELECT COUNT(*) FROM conversation_edges edge JOIN conversation_observations parent ON parent.id = edge.from_observation_id JOIN conversation_observations child ON child.id = edge.to_observation_id WHERE parent.request_id = $3 AND child.request_id = $4 AND edge.cluster_id = parent.cluster_id AND edge.cluster_id = child.cluster_id)",
+    )
+    .bind(key.key_id.to_string())
+    .bind(&reverse_response_id)
+    .bind(reverse_parent_request_id.to_string())
+    .bind(reverse_child_request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(reverse_state, (0, 1));
+
+    // Generic parent_turn_id references can name a declared turn rather than
+    // a Responses response id. Publishing that turn must fire reconciliation.
+    let turn_child_request_id = Uuid::now_v7();
+    let turn_parent_request_id = Uuid::now_v7();
+    for (request_id, object) in [
+        (turn_child_request_id, "objects/turn-child"),
+        (turn_parent_request_id, "objects/turn-parent"),
+    ] {
+        database
+            .start_proxy_request(StartProxyRequest {
+                request_id,
+                key: &key,
+                price: &price,
+                input_token_ceiling: 10,
+                output_token_ceiling: 10,
+                protocol: "openai-responses",
+                model: &model,
+                request_object: object,
+                upstream_account_id: None,
+                model_route_id: None,
+            })
+            .await
+            .unwrap();
+    }
+    let declared_turn_id = format!("turn-late-parent-{unique}");
+    let turn_child_cluster = database
+        .record_conversation_observation(
+            &key,
+            turn_child_request_id,
+            &serde_json::json!({"input": "turn child"}),
+            &ConversationHints {
+                parent_turn_id: Some(declared_turn_id.clone()),
+                ..ConversationHints::default()
+            },
+            Some("Codex"),
+        )
+        .await
+        .unwrap();
+    let turn_parent_cluster = database
+        .record_conversation_observation(
+            &key,
+            turn_parent_request_id,
+            &serde_json::json!({"input": "turn parent"}),
+            &ConversationHints {
+                turn_id: Some(declared_turn_id.clone()),
+                ..ConversationHints::default()
+            },
+            Some("Codex"),
+        )
+        .await
+        .unwrap();
+    assert_ne!(turn_child_cluster, turn_parent_cluster);
+    let turn_state: (String, String, i64, i64) = sqlx::query_as(
+        "SELECT child.cluster_id, parent.cluster_id, (SELECT COUNT(*) FROM conversation_unresolved_explicit_parents WHERE key_id = $1 AND parent_reference = $2), (SELECT COUNT(*) FROM conversation_edges edge WHERE edge.from_observation_id = parent.id AND edge.to_observation_id = child.id AND edge.cluster_id = parent.cluster_id AND edge.cluster_id = child.cluster_id) FROM conversation_observations child JOIN conversation_observations parent ON parent.request_id = $3 WHERE child.request_id = $4",
+    )
+    .bind(key.key_id.to_string())
+    .bind(&declared_turn_id)
+    .bind(turn_parent_request_id.to_string())
+    .bind(turn_child_request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(turn_state.0, turn_state.1);
+    assert_eq!((turn_state.2, turn_state.3), (0, 1));
+
+    // All references known to one terminal transaction must be locked in one
+    // global order. Otherwise P(turn=Z,response=A) and C(parent=A,turn=Z)
+    // acquire opposite locks across record and attach and deadlock.
+    let ordered_parent_request_id = Uuid::now_v7();
+    let ordered_child_request_id = Uuid::now_v7();
+    for (request_id, object) in [
+        (ordered_parent_request_id, "objects/ordered-parent"),
+        (ordered_child_request_id, "objects/ordered-child"),
+    ] {
+        database
+            .start_proxy_request(StartProxyRequest {
+                request_id,
+                key: &key,
+                price: &price,
+                input_token_ceiling: 10,
+                output_token_ceiling: 10,
+                protocol: "openai-responses",
+                model: &model,
+                request_object: object,
+                upstream_account_id: None,
+                model_route_id: None,
+            })
+            .await
+            .unwrap();
+    }
+    let ordered_response_id = format!("a-ordered-response-{unique}");
+    let ordered_turn_id = format!("z-ordered-turn-{unique}");
+    let ordered_parent_json = serde_json::json!({"input": "ordered parent"});
+    let ordered_child_json = serde_json::json!({"input": "ordered child"});
+    let ordered_parent_hints = ConversationHints {
+        turn_id: Some(ordered_turn_id.clone()),
+        ..ConversationHints::default()
+    };
+    let ordered_child_hints = ConversationHints {
+        parent_turn_id: Some(ordered_response_id.clone()),
+        turn_id: Some(ordered_turn_id.clone()),
+        ..ConversationHints::default()
+    };
+    let mut ordered_parent_transaction = database.begin_write_transaction().await.unwrap();
+    let ordered_parent_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *ordered_parent_transaction)
+        .await
+        .unwrap();
+    let ordered_parent_cluster = database
+        .record_conversation_observation_in_transaction(
+            &mut ordered_parent_transaction,
+            ConversationObservationInput {
+                key: &key,
+                request_id: ordered_parent_request_id,
+                request_json: &ordered_parent_json,
+                hints: &ordered_parent_hints,
+                client_name: Some("Codex"),
+                upstream_response_id: Some(&ordered_response_id),
+                observed_at: unix_millis(),
+                attach_request_record: true,
+                content_materialized: false,
+            },
+        )
+        .await
+        .unwrap();
+    let ordered_child_database = database.clone();
+    let ordered_child_key = key.clone();
+    let (ordered_child_pid_sender, ordered_child_pid_receiver) = tokio::sync::oneshot::channel();
+    let ordered_child = tokio::spawn(async move {
+        let mut transaction = ordered_child_database
+            .begin_write_transaction()
+            .await
+            .unwrap();
+        let backend_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *transaction)
+            .await
+            .unwrap();
+        ordered_child_pid_sender.send(backend_pid).unwrap();
+        let cluster = ordered_child_database
+            .record_conversation_observation_in_transaction(
+                &mut transaction,
+                ConversationObservationInput {
+                    key: &ordered_child_key,
+                    request_id: ordered_child_request_id,
+                    request_json: &ordered_child_json,
+                    hints: &ordered_child_hints,
+                    client_name: Some("Codex"),
+                    upstream_response_id: None,
+                    observed_at: unix_millis(),
+                    attach_request_record: true,
+                    content_materialized: false,
+                },
+            )
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        cluster
+    });
+    let ordered_child_pid = ordered_child_pid_receiver.await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let blocked_by_parent: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity activity JOIN pg_locks advisory ON advisory.pid = activity.pid WHERE activity.pid = $1 AND activity.state = 'active' AND activity.wait_event_type = 'Lock' AND activity.wait_event = 'advisory' AND advisory.locktype = 'advisory' AND NOT advisory.granted AND $2 = ANY(pg_blocking_pids(activity.pid)))",
+            )
+            .bind(ordered_child_pid)
+            .bind(ordered_parent_pid)
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+            if blocked_by_parent {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("child did not wait on the parent's ordered conversation reference locks");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        attach_conversation_upstream_response_in_transaction(
+            &mut ordered_parent_transaction,
+            database.backend,
+            ordered_parent_request_id,
+            &ordered_response_id,
+        )
+        .await
+        .unwrap();
+        ordered_parent_transaction.commit().await.unwrap();
+    })
+    .await
+    .expect("parent attach deadlocked after record acquired conversation references");
+    let ordered_child_cluster =
+        tokio::time::timeout(std::time::Duration::from_secs(10), ordered_child)
+            .await
+            .expect("child did not resume after parent commit")
+            .unwrap();
+    assert_eq!(ordered_parent_cluster, ordered_child_cluster);
+    let ordered_state: (String, String, i64) = sqlx::query_as(
+        "SELECT parent.conversation_cluster_id, child.conversation_cluster_id, (SELECT COUNT(*) FROM conversation_unresolved_explicit_parents WHERE key_id = $1 AND parent_reference = $2) FROM request_records parent JOIN request_records child ON child.id = $3 WHERE parent.id = $4",
+    )
+    .bind(key.key_id.to_string())
+    .bind(&ordered_response_id)
+    .bind(ordered_child_request_id.to_string())
+    .bind(ordered_parent_request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(ordered_state.0, ordered_state.1);
+    assert_eq!(ordered_state.2, 0);
+}
+
+#[tokio::test]
+async fn postgres_outbox_projection_reconciles_child_projected_before_parent() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let database = Database::connect_with_max(&database_url, 8).await.unwrap();
+    database.migrate().await.unwrap();
+    let unique = Uuid::now_v7();
+    let pepper = b"outbox late parent reconciliation pepper";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: format!("outbox-late-parent-{unique}"),
+                principal_external_id: "member".to_owned(),
+                alias: "outbox-late-parent".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy {
+                    enforcement_mode: EnforcementMode::MeteredUnlimited,
+                    max_concurrency: 4,
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::ONE,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let model = format!("outbox-late-parent-{unique}");
+    let price = database
+        .upsert_model_price(&model, "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let parent_request_id = Uuid::now_v7();
+    let child_request_id = Uuid::now_v7();
+    let parent_reservation = database
+        .start_proxy_request(StartProxyRequest {
+            request_id: parent_request_id,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 2,
+            output_token_ceiling: 2,
+            protocol: "openai-responses",
+            model: &model,
+            request_object: "objects/outbox-parent",
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+    let child_reservation = database
+        .start_proxy_request(StartProxyRequest {
+            request_id: child_request_id,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 2,
+            output_token_ceiling: 2,
+            protocol: "openai-responses",
+            model: &model,
+            request_object: "objects/outbox-child",
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+    let response_id = format!("resp-outbox-parent-{unique}");
+    let parent_json = serde_json::json!({"input": "outbox parent"});
+    let child_json = serde_json::json!({"input": "outbox child"});
+    let parent_hints = ConversationHints::default();
+    let child_hints = ConversationHints {
+        parent_turn_id: Some(response_id.clone()),
+        ..ConversationHints::default()
+    };
+    database
+        .finish_proxy_request(FinishProxyRequest {
+            usage_basis: None,
+            first_output_ms: None,
+            generation_duration_ms: None,
+            request_id: parent_request_id,
+            tenant_id: key.tenant_id,
+            reservation: &parent_reservation,
+            input_token_ceiling: 2,
+            output_token_ceiling: 2,
+            requested_service_tier: None,
+            status_code: 200,
+            duration_ms: 5,
+            usage: TokenUsage::default(),
+            error_code: None,
+            response_object: "objects/outbox-parent-response",
+            conversation: Some(ProxyConversationInput {
+                key: &key,
+                request_json: &parent_json,
+                hints: &parent_hints,
+                client_name: Some("Codex"),
+                upstream_response_id: Some(&response_id),
+            }),
+        })
+        .await
+        .unwrap();
+    database
+        .finish_proxy_request(FinishProxyRequest {
+            usage_basis: None,
+            first_output_ms: None,
+            generation_duration_ms: None,
+            request_id: child_request_id,
+            tenant_id: key.tenant_id,
+            reservation: &child_reservation,
+            input_token_ceiling: 2,
+            output_token_ceiling: 2,
+            requested_service_tier: None,
+            status_code: 200,
+            duration_ms: 5,
+            usage: TokenUsage::default(),
+            error_code: None,
+            response_object: "objects/outbox-child-response",
+            conversation: Some(ProxyConversationInput {
+                key: &key,
+                request_json: &child_json,
+                hints: &child_hints,
+                client_name: Some("Codex"),
+                upstream_response_id: None,
+            }),
+        })
+        .await
+        .unwrap();
+
+    let projector = Uuid::now_v7();
+    let tasks = database
+        .claim_conversation_projection_tasks(projector, 32)
+        .await
+        .unwrap();
+    assert!(
+        tasks
+            .iter()
+            .any(|task| task.request_id == parent_request_id)
+    );
+    assert!(tasks.iter().any(|task| task.request_id == child_request_id));
+    assert!(
+        database
+            .project_claimed_conversation_projection_task(projector, child_request_id)
+            .await
+            .unwrap()
+    );
+    let child_cluster_before_parent: String =
+        sqlx::query_scalar("SELECT conversation_cluster_id FROM request_records WHERE id = $1")
+            .bind(child_request_id.to_string())
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    let unresolved_before_parent: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_unresolved_explicit_parents WHERE key_id = $1 AND parent_reference = $2",
+    )
+    .bind(key.key_id.to_string())
+    .bind(&response_id)
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(unresolved_before_parent, 1);
+    assert!(
+        database
+            .project_claimed_conversation_projection_task(projector, parent_request_id)
+            .await
+            .unwrap()
+    );
+    let projected_state: (String, String, i64, i64) = sqlx::query_as(
+        "SELECT parent.conversation_cluster_id, child.conversation_cluster_id, (SELECT COUNT(*) FROM conversation_unresolved_explicit_parents WHERE key_id = $1 AND parent_reference = $2), (SELECT COUNT(*) FROM conversation_clusters WHERE id = $3) FROM request_records parent JOIN request_records child ON child.id = $4 WHERE parent.id = $5",
+    )
+    .bind(key.key_id.to_string())
+    .bind(&response_id)
+    .bind(&child_cluster_before_parent)
+    .bind(child_request_id.to_string())
+    .bind(parent_request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(projected_state.0, projected_state.1);
+    assert_eq!((projected_state.2, projected_state.3), (0, 0));
+}
+
+#[tokio::test]
 async fn buffered_conversation_content_wait_does_not_hold_archive_budget() {
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         return;

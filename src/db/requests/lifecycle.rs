@@ -1151,6 +1151,7 @@ impl Database {
                         request_json: conversation.request_json,
                         hints: conversation.hints,
                         client_name: conversation.client_name,
+                        upstream_response_id: conversation.upstream_response_id,
                         observed_at: now,
                         attach_request_record: true,
                         content_materialized,
@@ -1160,6 +1161,7 @@ impl Database {
                 if let Some(response_id) = conversation.upstream_response_id {
                     attach_conversation_upstream_response_in_transaction(
                         &mut transaction,
+                        self.backend,
                         input.request_id,
                         response_id,
                     )

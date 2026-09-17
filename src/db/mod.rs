@@ -90,7 +90,7 @@ use rows::generation_asset_download;
 pub use session_analytics::LogicalSessionListFilter;
 pub(crate) use session_projection::{
     add_request_fact_to_session_projection_in_transaction,
-    reclassify_request_session_in_transaction,
+    merge_request_session_projection_in_transaction, reclassify_request_session_in_transaction,
 };
 pub use time::unix_millis;
 pub(crate) use upstream_quota_reset::{PrepareQuotaReset, QuotaResetClaim, QuotaResetOperation};
@@ -204,7 +204,7 @@ pub struct Database {
 }
 
 #[derive(Clone, Copy)]
-enum DatabaseBackend {
+pub(crate) enum DatabaseBackend {
     PostgreSql,
     Sqlite,
 }

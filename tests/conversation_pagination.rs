@@ -638,8 +638,9 @@ async fn assert_subagent_relation_contract(state: &AppState, database_url: &str,
     assert_ne!(foreign_cluster, root_cluster);
     assert_ne!(foreign_cluster, explicit_key_a_cluster);
 
-    // A parent timestamp later than its child is also unavailable.
-    let (future_parent_request, _) = observe_request(
+    // Exact declared parent identity remains authoritative when observation
+    // clocks are inverted by a delayed terminal writer.
+    let (future_parent_request, future_parent_cluster) = observe_request(
         state,
         &key_a,
         &json!({"input": "future parent"}),
@@ -662,7 +663,7 @@ async fn assert_subagent_relation_contract(state: &AppState, database_url: &str,
     let (_, future_child_cluster) = observe_request(
         state,
         &key_a,
-        &json!({"input": "temporally invalid child"}),
+        &json!({"input": "timestamp-inverted child"}),
         &ConversationHints {
             parent_turn_id: Some("future-parent".into()),
             subagent: true,
@@ -671,7 +672,7 @@ async fn assert_subagent_relation_contract(state: &AppState, database_url: &str,
         "FutureChild",
     )
     .await;
-    assert_ne!(future_child_cluster, root_cluster);
+    assert_eq!(future_child_cluster, future_parent_cluster);
 
     let subagent_edges_for_a: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM conversation_edges e JOIN conversation_observations target ON target.id = e.to_observation_id WHERE target.key_id = $1 AND e.relation_kind = 'subagent'",
@@ -687,7 +688,7 @@ async fn assert_subagent_relation_contract(state: &AppState, database_url: &str,
     .fetch_one(&pool)
     .await
     .expect("count key B subagent edges");
-    assert_eq!(subagent_edges_for_a, 3);
+    assert_eq!(subagent_edges_for_a, 4);
     assert_eq!(subagent_edges_for_b, 0);
     pool.close().await;
 }
