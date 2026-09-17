@@ -19,6 +19,13 @@ test('request detail follows terminal events and fences late responses after sel
     const page = await browser.newPage({ hasTouch: true });
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/request-lifecycle.html`);
+    const imageReviewEntry = page.locator('.request-page-surface').getByRole('button', { name: 'Image requests requiring review', exact: true });
+    await imageReviewEntry.click();
+    await page.getByRole('button', { name: 'Open image request review', exact: true }).waitFor();
+    assert.equal(await imageReviewEntry.getAttribute('aria-expanded'), 'true');
+    await imageReviewEntry.click();
+    assert.equal(await page.getByRole('button', { name: 'Open image request review', exact: true }).count(), 0,
+      'request reconciliation is available from Requests and remains closed until explicitly opened');
     const first = page.locator('tbody tr').filter({ has: page.getByText('model-a', { exact: true }) });
     await page.getByRole('tooltip').filter({ hasText: 'Background scope help' }).waitFor();
     await first.locator('.table-action').click();

@@ -8,7 +8,7 @@ import { messageOf, queryForTenant } from '../scope/operatorShared.js';
 import type { SessionStreamState } from '../SessionMonitor.js';
 import type { SessionEventChannel } from '../sessionEventChannel.js';
 
-export function SessionsPage({ token, tenant, focus, sessionEvents, streamState, streamError, onOpenRequests }: {
+export function SessionsPage({ token, tenant, focus, sessionEvents, streamState, streamError, onOpenRequests, requestRefresh }: {
   token: string;
   tenant: string;
   focus?: SessionFocus;
@@ -16,6 +16,7 @@ export function SessionsPage({ token, tenant, focus, sessionEvents, streamState,
   streamState: SessionStreamState;
   streamError: string;
   onOpenRequests: () => void;
+  requestRefresh?: { intervalMs: number; paused: boolean; onIntervalChange: (value: number) => void };
 }) {
   const revision = useSyncExternalStore(sessionEvents.subscribe, sessionEvents.snapshot);
   const { t } = useI18n();
@@ -79,8 +80,10 @@ export function SessionsPage({ token, tenant, focus, sessionEvents, streamState,
         tenant={tenant}
         revision={revision}
         eventKeyIds={sessionEvents.eventKeyIds}
+        eventOverflowed={sessionEvents.overflowed}
         focus={focus}
         streamState={streamState}
+        refreshCadence={requestRefresh}
         onSelectRequest={selectRequest}
       />
     </article>

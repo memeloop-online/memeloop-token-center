@@ -1,8 +1,12 @@
 import type { RequestArchiveState, RequestEventKind, RequestSessionContext } from '../types.js';
 
-// Session filters must converge promptly after a terminal lifecycle event,
-// independently of the traffic table's user-selected render cadence.
+// The realtime cadence still yields briefly so a burst of lifecycle events
+// becomes one authoritative list/detail read instead of one read per event.
 export const sessionEventRefreshDelayMs = 500;
+
+export function sessionRefreshDelayMs(intervalMs: number) {
+  return intervalMs <= 0 ? sessionEventRefreshDelayMs : Math.max(sessionEventRefreshDelayMs, intervalMs);
+}
 
 export interface SessionIdentity {
   key_id: string;

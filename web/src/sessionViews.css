@@ -31,6 +31,23 @@
   margin: 0;
 }
 
+.session-list-skeleton,
+.session-detail-skeleton { display: grid; gap: 12px; min-width: 0; }
+.session-list-skeleton { padding: 12px; }
+.session-list-skeleton > span { display: grid; gap: 8px; min-height: 76px; padding: 12px; border-bottom: 1px solid var(--colorNeutralStroke2, #263a40); }
+.session-list-skeleton i,
+.session-detail-skeleton i { display: block; min-height: 10px; border-radius: 999px; background: var(--colorNeutralBackground3, #183038); animation: session-loading-pulse 1.4s ease-in-out infinite alternate; }
+.session-list-skeleton i:first-child { width: 72%; min-height: 14px; }
+.session-list-skeleton i:nth-child(2) { width: 92%; }
+.session-list-skeleton i:last-child { width: 54%; }
+.session-detail-skeleton { padding: 18px 4px; }
+.session-detail-skeleton i:first-child { width: 44%; min-height: 24px; }
+.session-detail-skeleton i:nth-child(2) { width: 76%; }
+.session-detail-skeleton i:nth-child(3) { width: 100%; min-height: 120px; border-radius: var(--borderRadiusMedium, 8px); }
+.session-detail-skeleton i:last-child { width: 88%; min-height: 64px; border-radius: var(--borderRadiusMedium, 8px); }
+@keyframes session-loading-pulse { from { opacity: .42; } to { opacity: .82; } }
+@media (prefers-reduced-motion: reduce) { .session-list-skeleton i, .session-detail-skeleton i { animation: none; opacity: .65; } }
+
 .session-sidebar-item {
   display: grid;
   width: 100%;

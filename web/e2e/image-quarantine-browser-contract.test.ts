@@ -46,49 +46,49 @@ test('quarantine review requires facts, preserves conflict draft and retry ident
       await page.getByRole('button', { name: 'Details', exact: true }).click();
       // Busy and resolved forms are disabled. Do not edit the previous draft
       // while the selected detail request is still replacing its state.
-      await page.locator('[aria-label="Manual review details"] fieldset:not([disabled])').waitFor();
+      await page.locator('[aria-label="Request details"] fieldset:not([disabled])').waitFor();
     };
-    await page.getByText('Select an explicit tenant first;', { exact: false }).waitFor(); assert.equal(reads, 0);
+    await page.getByText('Select a tenant first.', { exact: true }).waitFor(); assert.equal(reads, 0);
     await page.getByLabel('Fixture tenant').selectOption('alpha');
-    const openReview = page.getByRole('button', { name: 'Open manual review (tenant service credential required)', exact: true });
+    const openReview = page.getByRole('button', { name: 'Open image request review', exact: true });
     await openReview.waitFor();
     assert.equal(reads, 0, 'selecting a tenant does not implicitly request privileged quarantine data');
     await openReview.click();
     await selectDetails();
-    await page.getByLabel('Verified resolution').selectOption('settle_confirmed');
-    await page.getByLabel('Confirmed amount').fill('-1');
-    await page.getByText('Enter a nonnegative decimal', { exact: false }).waitFor();
-    await page.getByLabel('Confirmed amount').fill('0.100001');
+    await page.getByLabel('Resolution').selectOption('settle_confirmed');
+    await page.getByLabel('Actual amount').fill('-1');
+    await page.getByText('Enter a nonnegative amount', { exact: false }).waitFor();
+    await page.getByLabel('Actual amount').fill('0.100001');
     await page.getByLabel('Evidence digest', { exact: true }).fill('c'.repeat(64));
-    const submit = page.getByRole('button', { name: 'Confirm manual resolution', exact: true });
+    const submit = page.getByRole('button', { name: 'Submit resolution', exact: true });
     assert.equal(await submit.isEnabled(), false);
     const verified = page.getByRole('checkbox');
     const send = async () => { await verified.check(); await submit.click(); await page.getByRole('dialog').getByRole('button', { name: 'Confirm and continue', exact: true }).click(); };
     await send(); await page.getByRole('alert').waitFor();
-    await send(); await page.getByText('The record changed.', { exact: false }).waitFor();
+    await send(); await page.getByText('The record changed', { exact: false }).waitFor();
     assert.equal(writes[0].key, writes[1].key); assert.deepEqual(writes[0].body, writes[1].body);
     assert.equal(writes[0].body.confirmed_cost_micros, 100001);
-    assert.equal(await page.getByLabel('Confirmed amount').inputValue(), '0.100001');
+    assert.equal(await page.getByLabel('Actual amount').inputValue(), '0.100001');
     assert.equal(await verified.isChecked(), false);
     await send(); await page.getByRole('status').waitFor();
-    await page.getByRole('heading', { name: 'Manual resolution audit receipt' }).waitFor();
+    await page.getByRole('heading', { name: 'Resolution receipt' }).waitFor();
     assert.equal(await submit.isEnabled(), false, 'resolved receipts cannot be submitted again');
-    await page.getByText('Acting service credential ID: service-alpha').waitFor();
+    await page.getByText('Credential ID: service-alpha').waitFor();
     assert.equal(writes[2].body.expected_revision, 'b'.repeat(64)); assert.notEqual(writes[1].key, writes[2].key);
     await page.getByRole('button', { name: 'Refresh', exact: true }).click();
     await selectDetails();
     // Details loads asynchronously. The previous resolved form also has a
     // zero amount, but still has the old action; wait for the new form state.
     await page.locator('input[inputmode="decimal"][readonly]').waitFor();
-    assert.equal(await page.getByLabel('Confirmed amount').inputValue(), '0');
-    assert.equal(await page.getByLabel('Confirmed amount').evaluate(node => (node as HTMLInputElement).readOnly), true);
+    assert.equal(await page.getByLabel('Actual amount').inputValue(), '0');
+    assert.equal(await page.getByLabel('Actual amount').evaluate(node => (node as HTMLInputElement).readOnly), true);
     await page.getByLabel('Evidence digest', { exact: true }).fill('d'.repeat(64));
     await send(); await page.getByRole('status').waitFor();
     assert.equal(writes[3].body.action, 'not_delivered'); assert.equal(writes[3].body.confirmed_cost_micros, 0);
     await page.getByRole('button', { name: 'Refresh', exact: true }).click();
     await selectDetails();
     await page.getByLabel('Evidence digest', { exact: true }).fill('e'.repeat(64));
-    await send(); await page.getByText('The record conflicted and refresh failed.', { exact: false }).waitFor();
+    await send(); await page.getByText('The record changed. Reopen the details before continuing.', { exact: true }).waitFor();
     await verified.check(); assert.equal(await submit.isEnabled(), false);
     assert.equal(await page.getByLabel('Evidence digest', { exact: true }).inputValue(), 'e'.repeat(64));
     await selectDetails();
@@ -105,7 +105,7 @@ test('quarantine review requires facts, preserves conflict draft and retry ident
     assert.equal(reads, beforeOpen + 1, 'changed scope requires a fresh explicit open before reading');
     assert.equal(await page.getByText('request-alpha', { exact: false }).count(), 0);
     assert.equal(await page.getByRole('dialog').count(), 0);
-    assert.equal(await page.getByLabel('Confirmed amount').count(), 0, 'old tenant form is unmounted, not merely empty');
+    assert.equal(await page.getByLabel('Actual amount').count(), 0, 'old tenant form is unmounted, not merely empty');
     assert.equal(await page.getByLabel('Evidence digest', { exact: true }).count(), 0, 'old tenant evidence input is absent');
     assert.equal(writes.length, 5);
   } finally { await browser.close(); await server.close(); }

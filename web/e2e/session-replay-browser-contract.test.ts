@@ -51,7 +51,7 @@ test('large archive content is explicit, paged to its real end, and cleared on v
     await open.waitFor();
     assert.equal(await page.evaluate(() => window.archiveRangeReads), 0);
     assert.deepEqual(await page.locator('.session-replay-turn-heading b').allTextContents(), ['—', '—'], 'snapshot-only data cannot claim zero user or agent activity');
-    assert.equal(await page.getByText('Archive unavailable', { exact: true }).count(), 0, 'a readable large archive is not labelled unavailable');
+    assert.equal(await page.getByText('This history has not loaded yet. Try again later.', { exact: true }).count(), 0, 'a readable large archive is not labelled unavailable');
     await open.click();
     const reader = page.locator('.archive-content-reader:not(.collapsed)');
     await reader.locator('.session-replay-entry.message').nth(29).waitFor();
@@ -100,14 +100,14 @@ test('large archive content is explicit, paged to its real end, and cleared on v
     await open.click();
     await reader.getByText(/^Archived step 1:/).first().waitFor();
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-replay.html?full=1&gap=1`);
-    await page.getByText('Archive unavailable', { exact: true }).waitFor();
+    await page.getByText('This history has not loaded yet. Try again later.', { exact: true }).waitFor();
     assert.equal(await open.count(), 0, 'a confirmed archive gap is not offered as a readable bound object');
     assert.equal(await page.evaluate(() => window.archiveRangeReads), 0);
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-replay.html?full=1&missing=1`);
     await open.waitFor();
     assert.equal(await page.evaluate(() => window.archiveRangeReads), 0);
     await open.click();
-    await reader.getByRole('alert').getByText('Archive unavailable', { exact: true }).waitFor();
+    await reader.getByRole('alert').getByText('This history has not loaded yet. Try again later.', { exact: true }).waitFor();
     assert.equal(await reader.locator('.session-replay-entry.message').count(), 0, 'a truly missing bound object remains an error, never an empty successful archive');
   } finally { await browser.close(); await server.close(); }
 });

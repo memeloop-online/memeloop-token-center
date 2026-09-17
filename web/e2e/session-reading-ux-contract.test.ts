@@ -15,12 +15,15 @@ test('conversation content precedes optional operational timelines', () => {
   assert.match(view, /requestDisplayedCost/);
   assert.match(view, /const micros = decimalMicros\(requestDisplayedCost\(request\)\)/);
   assert.match(view, /formatDurationDisplay/);
+  assert.match(view, /session-list-skeleton/);
   assert.doesNotMatch(view, /className="session-detail" role=\{onClose/);
 });
 
 test('request inspection retains the selected conversation', () => {
   assert.match(monitor, /onSelect=\{\(request\) => \{ void onSelectRequest\(request\); \}\}/);
   assert.match(monitor, /SessionCredentialFilter value=\{draft.keyId\}/);
+  assert.match(monitor, /RequestRefreshControl/);
+  assert.match(monitor, /sessionRefreshDelayMs\(refreshIntervalRef\.current\)/);
   assert.match(credential, /optionValue/);
   assert.match(credential, /session.key_alias \|\| session.key_id/);
   assert.match(credential, /setCustomValidity\(''\);\s*\}, \[value, selected\?\.label, scope, id\]\)/);
