@@ -55,19 +55,25 @@ test('analytics background exposes actual indexed buckets through pointer, keybo
     const settlement = page.getByRole('slider', { name: 'Local settlement' });
     const notice = settlement.locator('.metric-label span[tabindex]');
     for (const action of ['pointer', 'keyboard', 'touch']) {
+      checkpoint(`settlement/${action}:prepare`);
       await page.mouse.move(1, 1);
       await settlement.focus();
       await page.keyboard.press('Escape');
+      checkpoint(`settlement/${action}:trigger`);
       if (action === 'pointer') await notice.hover();
       if (action === 'keyboard') await page.keyboard.press('Tab');
       if (action === 'touch') await notice.tap();
       const tooltip = visibleTooltips().filter({ hasText: /供应商实际用量或发票请以供应商记录为准|use provider records for actual usage or invoice details/ });
+      checkpoint(`settlement/${action}:wait-visible`);
       await tooltip.waitFor({ state: 'visible' });
+      checkpoint(`settlement/${action}:visible`);
       assert.equal(await visibleTooltips().count(), 1, `${action}: detail must not also expose a trend tooltip`);
       assert.match(await tooltip.textContent() ?? '', /保守上限|conservative ceiling/);
       assert.equal(await settlement.locator('.metric-value').textContent(), '$0.123456');
+      checkpoint(`settlement/${action}:hide`);
       await page.keyboard.press('Escape');
       await tooltip.waitFor({ state: 'hidden' });
+      checkpoint(`settlement/${action}:hidden`);
     }
   }finally{await browser.close();await server.close();}
 });
