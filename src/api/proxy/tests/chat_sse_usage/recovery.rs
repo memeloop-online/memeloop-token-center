@@ -430,7 +430,7 @@ async fn oversized_chat_event_errors_downstream_and_cannot_recover_into_done() {
 
 #[tokio::test]
 async fn total_chat_response_limit_does_not_poison_upstream_health() {
-    let first = chat_content("chatcmpl-total-limit").into_bytes();
+    let first = b": keepalive\n\n".to_vec();
     let second = chat_chunk(
         "chatcmpl-total-limit",
         json!([{
