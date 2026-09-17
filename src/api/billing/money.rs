@@ -15,10 +15,25 @@ pub(in crate::api) fn parse_money_micros(value: &str, field: &str) -> Result<i64
     decimal
         .checked_mul(Decimal::from(crate::model::MONEY_SCALE))
         .filter(|scaled| scaled.fract().is_zero())
-        .and_then(|scaled| scaled.to_string().parse::<i64>().ok())
+        // Multiplication preserves the input scale in `rust_decimal`, so an
+        // exact six-place amount can stringify as `5529585.000000` even
+        // though it is an integer number of micros. Normalize before parsing
+        // or valid settlement corrections at the maximum supported precision
+        // are rejected.
+        .and_then(|scaled| scaled.normalize().to_string().parse::<i64>().ok())
         .ok_or_else(|| {
             AppError::BadRequest(format!(
                 "{field} must have at most 6 decimal places and fit monetary range"
             ))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_money_micros;
+
+    #[test]
+    fn accepts_exact_maximum_money_precision() {
+        assert_eq!(parse_money_micros("5.529585", "amount").unwrap(), 5_529_585);
+    }
 }
