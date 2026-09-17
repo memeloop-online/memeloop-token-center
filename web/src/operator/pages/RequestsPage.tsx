@@ -36,7 +36,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   onRequestDrilldownHandled?: (revision: number) => void;
   requestRefresh?: { intervalMs: number; paused: boolean; onIntervalChange: (value: number) => void };
   streamOverflowRevision?: number;
-  onProtectRequests?: (ids: string[]) => void;
+  onProtectRequests?: (ids: string[], consumerPaused?: boolean) => void;
 }) {
   const { t } = useI18n();
   const diagnosticLabels = { requestId: t('request.correlationId'), streamInterrupted: t('request.streamInterrupted') };
@@ -48,19 +48,22 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   const [detailResult, setDetail] = useState<{ value: RequestDetail; token: string; tenant: string; requestId: string }>();
   const [error, setError] = useState('');
   const [upstreamError, setUpstreamError] = useState('');
-  const [olderFilteredResultsStale, setOlderFilteredResultsStale] = useState(false);
+  const [filteredResultsStale, setFilteredResultsStale] = useState(false);
   const [imageReviewOpen, setImageReviewOpen] = useState(false);
   const sequence = useRef(0);
   const errorSource = useRef<'detail' | 'load' | 'refresh' | undefined>(undefined);
-  const olderFilteredResultsVisible = useRef(false);
   const loadedHistoryIds = useRef(new Set<string>());
   const requestsRef = useRef(requests);
   const loadingRef = useRef(false);
   const paused = useRef(false);
-  paused.current = requestRefresh?.paused ?? false;
+  // The pause tier is page-local: SSE and the bounded hook buffer keep running
+  // while the visible list, metrics and drawer stay frozen until resume.
+  const [userPaused, setUserPaused] = useState(false);
+  const streamPaused = userPaused || (requestRefresh?.paused ?? false);
+  paused.current = streamPaused;
   const reconcileOverflow = useRef(false);
   const previousOverflowRevision = useRef(streamOverflowRevision);
-  const filteredRefresh = useRef<{
+  const overflowRefresh = useRef<{
     controller?: AbortController;
     firstPendingAt?: number;
     inFlight: boolean;
@@ -74,6 +77,9 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   const detailSequence = useRef(0);
   const detailAbort = useRef<AbortController | null>(null);
   const selectedRequestId = useRef<string | undefined>(undefined);
+  // State mirror of the open detail so the protection effect reruns on
+  // selection changes; a ref alone would not trigger React.
+  const [selectedRequest, setSelectedRequest] = useState<string | undefined>(undefined);
   const refreshedTerminalEvent = useRef<string | undefined>(undefined);
   // Gate during render: effects must not expose a previous credential/tenant's
   // detail for even the first commit after a scope change.
@@ -91,8 +97,8 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   requestsRef.current = requests;
   scope.current = { token, tenant, filters };
 
-  function cancelFilteredRefresh() {
-    const state = filteredRefresh.current;
+  function cancelOverflowRefresh() {
+    const state = overflowRefresh.current;
     state.scopeSequence += 1;
     state.requestSequence += 1;
     if (state.timer !== undefined) window.clearTimeout(state.timer);
@@ -104,10 +110,12 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     state.pending = false;
   }
 
-  function scheduleFilteredRefresh() {
-    const state = filteredRefresh.current;
+  // Overflow reconciliation serves only the unfiltered live first page.
+  // Filtered and history views stay stable until an explicit manual refresh.
+  function scheduleOverflowRefresh() {
+    const state = overflowRefresh.current;
     const currentScope = scope.current;
-    if (!currentScope.token || !currentScope.tenant || (!typedFiltersActive(currentScope.filters) && !reconcileOverflow.current)) return;
+    if (!currentScope.token || !currentScope.tenant || typedFiltersActive(currentScope.filters) || !reconcileOverflow.current) return;
     state.pending = true;
     if (state.inFlight || loadingRef.current || paused.current) return;
 
@@ -117,15 +125,15 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     const scopeSequence = state.scopeSequence;
     state.timer = window.setTimeout(() => {
       state.timer = undefined;
-      if (filteredRefresh.current.scopeSequence === scopeSequence) void refreshFilteredRequests();
+      if (overflowRefresh.current.scopeSequence === scopeSequence) void refreshOverflowFirstPage();
     }, filteredRequestRefreshDelay(now, state.firstPendingAt));
   }
 
-  async function refreshFilteredRequests() {
-    const state = filteredRefresh.current;
+  async function refreshOverflowFirstPage() {
+    const state = overflowRefresh.current;
     if (state.inFlight || loadingRef.current || !state.pending || paused.current) return;
     const currentScope = scope.current;
-    if (!currentScope.token || !currentScope.tenant || (!typedFiltersActive(currentScope.filters) && !reconcileOverflow.current)) return;
+    if (!currentScope.token || !currentScope.tenant || typedFiltersActive(currentScope.filters) || !reconcileOverflow.current) return;
     state.inFlight = true;
     state.pending = false;
     state.firstPendingAt = undefined;
@@ -141,25 +149,12 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
       const latest = scope.current;
       if (controller.signal.aborted || state.requestSequence !== requestSequence || state.scopeSequence !== scopeSequence
         || latest.token !== currentScope.token || latest.tenant !== currentScope.tenant || latest.filters !== currentScope.filters) return;
-      // Keep the current drawer and scroll position intact. This replacement is
-      // the exact server-filtered first page, not a guessed local merge.
-      if (typedFiltersActive(currentScope.filters)) {
-        setRequests((current) => mergeRefreshedRequestPage(current, next, olderFilteredResultsVisible.current));
-      } else {
-        const current = requestsRef.current;
-        const page = mergeBatchedRequestPage(mergeRefreshedRequestPage(current, next, current.length > 100), new Map(liveEventsRef.current), next.next_cursor !== null, loadedHistoryIds.current);
-        setRequests(page.requests); setHasOlder(page.hasOlder);
-      }
+      // Replace the live window with the authoritative server first page, then
+      // re-apply the bounded live buffer. Never runs for filtered views.
+      const current = requestsRef.current;
+      const page = mergeBatchedRequestPage(mergeRefreshedRequestPage(current, next, current.length > 100), new Map(liveEventsRef.current), next.next_cursor !== null, loadedHistoryIds.current);
+      setRequests(page.requests); setHasOlder(page.hasOlder);
       if (previousOverflowRevision.current === overflowAtStart) reconcileOverflow.current = false;
-      // A retained history tail owns its pagination state. A first-page
-      // cursor must not reopen an already exhausted tail.
-      if (typedFiltersActive(currentScope.filters) && (!olderFilteredResultsVisible.current || next.next_cursor === null)) {
-        setHasOlder(next.next_cursor !== null);
-      }
-      if (next.next_cursor === null) {
-        olderFilteredResultsVisible.current = false;
-        setOlderFilteredResultsStale(false);
-      }
       if (errorSource.current === 'refresh') {
         errorSource.current = undefined;
         setError('');
@@ -173,7 +168,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
       if (state.requestSequence !== requestSequence || state.scopeSequence !== scopeSequence) return;
       state.controller = undefined;
       state.inFlight = false;
-      if (state.pending) scheduleFilteredRefresh();
+      if (state.pending) scheduleOverflowRefresh();
     }
   }
 
@@ -185,10 +180,10 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     // Freeze insertion before the page fetch, not after it resolves: otherwise
     // a live batch could move the visible tail while this cursor is in flight.
     if (older) for (const request of requestsRef.current) loadedHistoryIds.current.add(request.request_id);
-    const refreshWasActive = older && (filteredRefresh.current.pending || filteredRefresh.current.inFlight);
+    const refreshWasActive = older && (overflowRefresh.current.pending || overflowRefresh.current.inFlight);
     // A foreground page request owns the request list until it settles. Abort
     // any background first-page refresh rather than running two query POSTs.
-    cancelFilteredRefresh();
+    cancelOverflowRefresh();
     loadAbort.current?.abort();
     const controller = new AbortController();
     loadAbort.current = controller;
@@ -196,8 +191,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     const currentScope = { token, tenant, filters: nextFilters };
     if (!older) {
       loadedHistoryIds.current.clear();
-      olderFilteredResultsVisible.current = false;
-      setOlderFilteredResultsStale(false);
+      setFilteredResultsStale(false);
       setRequests([]); setHasOlder(false); closeRequestDetail();
     }
     loadingRef.current = true;
@@ -219,7 +213,6 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
           : next.requests);
         setHasOlder(next.next_cursor !== null);
       }
-      if (older && typedFiltersActive(nextFilters) && next.requests.length > 0) olderFilteredResultsVisible.current = true;
     } catch (reason) {
       if (request === sequence.current && !controller.signal.aborted) {
         if (!older) { setRequests([]); setHasOlder(false); }
@@ -231,78 +224,95 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
         loadAbort.current = null;
         loadingRef.current = false;
         setLoading(false);
-        if (refreshWasActive) filteredRefresh.current.pending = true;
-        if (filteredRefresh.current.pending) scheduleFilteredRefresh();
+        if (refreshWasActive) overflowRefresh.current.pending = true;
+        if (overflowRefresh.current.pending) scheduleOverflowRefresh();
       }
     }
   }
 
   useEffect(() => {
-    cancelFilteredRefresh();
+    // Reset every scope-bound cursor/buffer ref before any reload. Syncing the
+    // overflow baseline to the current prop cannot swallow a new-scope
+    // overflow: the stream's overflowRevision only ever increments, and the
+    // new scope's batch is recreated empty after this commit, so any future
+    // overflow still arrives as a strictly larger revision.
+    loadedHistoryIds.current.clear();
+    reconcileOverflow.current = false;
+    previousOverflowRevision.current = streamOverflowRevision;
+    onProtectRequests?.([]);
+    cancelOverflowRefresh();
     loadAbort.current?.abort(); loadAbort.current = null;
-    olderFilteredResultsVisible.current = false;
     errorSource.current = undefined;
     loadingRef.current = false;
-    sequence.current += 1; setFilters(emptyTypedFilterAst); setRequests([]); setDetail(undefined); setHasOlder(false); setLoading(false); setOlderFilteredResultsStale(false); setImageReviewOpen(false); setError(''); setUpstreamError('');
-    if (!token || !tenant) { setUpstreams([]); return () => { cancelFilteredRefresh(); loadAbort.current?.abort(); }; }
+    sequence.current += 1; setFilters(emptyTypedFilterAst); setRequests([]); setDetail(undefined); setHasOlder(false); setLoading(false); setFilteredResultsStale(false); setImageReviewOpen(false); setError(''); setUpstreamError('');
+    if (!token || !tenant) { setUpstreams([]); return () => { cancelOverflowRefresh(); loadAbort.current?.abort(); }; }
     const upstreamRequest = ++upstreamSequence.current;
     void api<UpstreamAccount[]>(`/internal/v1/upstreams${queryForTenant(tenant)}`, token)
       .then((values) => { if (upstreamRequest === upstreamSequence.current) { setUpstreams(values); setUpstreamError(''); } })
       .catch((reason) => { if (upstreamRequest === upstreamSequence.current) { setUpstreams([]); setUpstreamError(apiDiagnosticMessage(reason, t('common.requestFailed'), diagnosticLabels)); } });
     void load(emptyTypedFilterAst);
-    return () => { cancelFilteredRefresh(); loadAbort.current?.abort(); };
+    return () => { cancelOverflowRefresh(); loadAbort.current?.abort(); };
   }, [tenant, token, writeTenant]);
 
   useEffect(() => {
     selectedRequestId.current = undefined; refreshedTerminalEvent.current = undefined;
+    setSelectedRequest(undefined);
     detailSequence.current += 1; detailAbort.current?.abort(); detailAbort.current = null; setDetail(undefined);
     return () => { detailSequence.current += 1; detailAbort.current?.abort(); };
   }, [tenant, token]);
 
   useEffect(() => {
-    onProtectRequests?.(requests.map(request => request.request_id));
-  }, [requests, onProtectRequests]);
+    // Report the pause tier together with the protected ids: while paused the
+    // hook batch stops publishing revisions entirely but keeps buffering SSE.
+    // The open detail stays protected even after live traffic pushes it out
+    // of the rendered window.
+    const visibleIds = requests.map(request => request.request_id);
+    onProtectRequests?.(selectedRequest && !visibleIds.includes(selectedRequest) ? [...visibleIds, selectedRequest] : visibleIds, userPaused);
+  }, [requests, selectedRequest, userPaused, onProtectRequests]);
   useEffect(() => () => onProtectRequests?.([]), [onProtectRequests]);
 
   useEffect(() => {
-    if (requestRefresh?.paused) {
-      const state = filteredRefresh.current;
+    if (streamPaused) {
+      const state = overflowRefresh.current;
       const pending = state.pending || state.inFlight;
-      cancelFilteredRefresh();
+      cancelOverflowRefresh();
       state.pending = pending;
-    } else if (filteredRefresh.current.pending) scheduleFilteredRefresh();
-  }, [requestRefresh?.paused]);
+    } else if (overflowRefresh.current.pending) scheduleOverflowRefresh();
+  }, [streamPaused]);
 
   useEffect(() => {
     if (streamOverflowRevision !== previousOverflowRevision.current) {
       previousOverflowRevision.current = streamOverflowRevision;
-      if (loadedHistoryIds.current.size && !typedFiltersActive(filters)) return;
+      // Overflow reconciliation serves only the unfiltered live first page.
+      // Filtered and history views stay stable until an explicit refresh.
+      if (typedFiltersActive(filters) || loadedHistoryIds.current.size) return;
       reconcileOverflow.current = true;
-      scheduleFilteredRefresh();
+      scheduleOverflowRefresh();
     }
   }, [streamOverflowRevision]);
 
   useEffect(() => {
-    if (liveEvents.size === 0) return;
+    // SSE batches never auto-refresh a filtered view. They only surface the
+    // stale hint so the user can explicitly reload filtered history.
+    if (streamPaused || liveEvents.size === 0) return;
     if (typedFiltersActive(filters)) {
-      const terminalizedVisiblePending = olderFilteredResultsVisible.current
-        && [...liveEventsRef.current.values()].some((event) => (event.event_kind === 'finished' || event.completed_at != null)
-          && requestsRef.current.some((request) => request.request_id === event.request_id && request.status_code === null));
-      if (terminalizedVisiblePending) setOlderFilteredResultsStale(true);
-      scheduleFilteredRefresh();
+      // Any published batch marks filtered results stale: the list itself
+      // stays frozen until the user explicitly refreshes it.
+      setFilteredResultsStale(true);
       return;
     }
     const page = mergeBatchedRequestPage(requestsRef.current, new Map(liveEventsRef.current), hasOlderRef.current, loadedHistoryIds.current);
     setRequests(page.requests); setHasOlder(page.hasOlder);
-  }, [streamRevision]);
+  }, [streamRevision, streamPaused]);
 
   useEffect(() => {
-    if (!loading && filteredRefresh.current.pending) scheduleFilteredRefresh();
+    if (!loading && overflowRefresh.current.pending) scheduleOverflowRefresh();
   }, [loading]);
 
   async function openRequestDetail(requestId: string) {
     if (selectedRequestId.current !== requestId) setDetail(undefined);
     selectedRequestId.current = requestId;
+    setSelectedRequest(requestId);
     const requestSequence = ++detailSequence.current;
     detailAbort.current?.abort(); const controller = new AbortController(); detailAbort.current = controller;
     try {
@@ -325,19 +335,21 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
 
   function closeRequestDetail() {
     selectedRequestId.current = undefined;
+    setSelectedRequest(undefined);
     detailSequence.current += 1;
     detailAbort.current?.abort(); detailAbort.current = null;
     setDetail(undefined);
   }
 
   useEffect(() => {
+    if (streamPaused) return;
     const requestId = selectedRequestId.current;
     if (!requestId) return;
     const event = liveEvents.get(requestId);
     if (!event || (event.event_kind !== 'finished' && event.completed_at == null) || event.event_id === refreshedTerminalEvent.current) return;
     refreshedTerminalEvent.current = event.event_id;
     void openRequestDetail(requestId);
-  }, [streamRevision]);
+  }, [streamRevision, streamPaused]);
 
   useEffect(() => {
     if (!requestFocus) return;
@@ -347,7 +359,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
 
   useEffect(() => {
     if (!requestDrilldown) return;
-    cancelFilteredRefresh();
+    cancelOverflowRefresh();
     setFilters(requestDrilldown.ast);
     scope.current = { token, tenant, filters: requestDrilldown.ast };
     void load(requestDrilldown.ast);
@@ -358,7 +370,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     {error && <div className="notice error" role="alert">{t(errorSource.current === 'detail' ? 'request.detail' : 'request.listSource')}: {error}</div>}
     {upstreamError && <div className="notice error" role="alert">{t('request.upstreamSource')}: {upstreamError}</div>}
     {streamError && <div className="notice error" role="alert">{t('request.streamSource')}: {streamError}</div>}
-    <RequestsPanel requests={requests} upstreams={upstreams} filters={filters} loading={loading} hasOlder={hasOlder} streamState={streamState} token={token} tenant={tenant} olderFilteredResultsStale={olderFilteredResultsStale} requestRefresh={requestRefresh} historyLoaded={loadedHistoryIds.current.size > 0} imageReviewOpen={imageReviewOpen} onToggleImageReview={() => setImageReviewOpen((open) => !open)}
+    <RequestsPanel requests={requests} upstreams={upstreams} filters={filters} loading={loading} hasOlder={hasOlder} streamState={streamState} token={token} tenant={tenant} filteredResultsStale={filteredResultsStale} requestRefresh={requestRefresh} refreshPaused={userPaused} onToggleRefreshPaused={() => setUserPaused((value) => !value)} historyLoaded={loadedHistoryIds.current.size > 0} imageReviewOpen={imageReviewOpen} onToggleImageReview={() => setImageReviewOpen((open) => !open)}
       onApply={(next) => { setFilters(next); scope.current = { token, tenant, filters: next }; void load(next); }}
       onClear={() => { setFilters(emptyTypedFilterAst); scope.current = { token, tenant, filters: emptyTypedFilterAst }; void load(emptyTypedFilterAst); }}
       onLoadOlder={() => void load(filters, true)} onRefreshFilteredResults={() => void load(filters)} onSelect={selectRequest} onOpenSessions={onOpenSessions} onOpenSession={onOpenSession} />
@@ -369,7 +381,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   </>;
 }
 
-function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, streamState, token, tenant, olderFilteredResultsStale, onApply, onClear, onLoadOlder, onRefreshFilteredResults, onSelect, onOpenSessions, onOpenSession, requestRefresh, historyLoaded, imageReviewOpen, onToggleImageReview }: {
+function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, streamState, token, tenant, filteredResultsStale, onApply, onClear, onLoadOlder, onRefreshFilteredResults, onSelect, onOpenSessions, onOpenSession, requestRefresh, refreshPaused = false, onToggleRefreshPaused, historyLoaded, imageReviewOpen, onToggleImageReview }: {
   requests: RequestView[];
   upstreams: UpstreamAccount[];
   filters: TypedFilterAst;
@@ -378,7 +390,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   streamState: SessionStreamState;
   token: string;
   tenant: string;
-  olderFilteredResultsStale: boolean;
+  filteredResultsStale: boolean;
   historyLoaded: boolean;
   imageReviewOpen: boolean;
   onToggleImageReview: () => void;
@@ -390,6 +402,8 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   onOpenSessions: () => void;
   onOpenSession: (sessionId: string) => void;
   requestRefresh?: { intervalMs: number; paused: boolean; onIntervalChange: (value: number) => void };
+  refreshPaused?: boolean;
+  onToggleRefreshPaused?: () => void;
 }) {
   const { locale, t } = useI18n();
   const summary = summarizeVisibleRequests(requests);
@@ -399,10 +413,18 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   const count = (value: number) => formatMetricDisplay(value, locale);
   const settlementCurrency = summary.localCosts.length === 1 ? summary.localCosts[0].currency : undefined;
   return <article className="panel request-page-surface"><div className="panel-title traffic-heading"><div><h2>{typedFiltersActive(filters) ? t('traffic.filtered') : t('traffic.live')}</h2><span>{typedFiltersActive(filters) ? t('traffic.filteredHint') : t('traffic.liveHint')}</span></div><div className="traffic-heading-actions"><Button appearance="secondary" aria-expanded={imageReviewOpen} onClick={onToggleImageReview}>{t('quarantine.menuItem')}</Button><div className={`request-live-state session-live-state ${streamState}`} role="status">{t(`sessions.live.${streamState}`)}</div><div className="segmented" role="group" aria-label={t('sessions.monitorMode')}><ToggleButton appearance="subtle" checked>{t('sessions.requestsMode')}</ToggleButton><ToggleButton appearance="subtle" checked={false} onClick={onOpenSessions}>{t('sessions.sessionsMode')}</ToggleButton></div></div></div>
-    {requestRefresh && <RequestRefreshControl {...requestRefresh} />}
+    {requestRefresh && <div className="request-refresh-row">
+      <RequestRefreshControl intervalMs={requestRefresh.intervalMs} onIntervalChange={requestRefresh.onIntervalChange}
+        paused={requestRefresh.paused || refreshPaused}
+        pausedHint={refreshPaused && !requestRefresh.paused
+          ? t('traffic.updatesPausedHint') : undefined} />
+      {onToggleRefreshPaused && <span className="request-refresh-pause">
+        <ToggleButton appearance="secondary" checked={refreshPaused} onClick={onToggleRefreshPaused}>{refreshPaused ? t('traffic.resumeUpdates') : t('traffic.pauseUpdates')}</ToggleButton>
+      </span>}
+    </div>}
     {historyLoaded && !typedFiltersActive(filters) && <div className="request-refresh-control"><span>{locale === 'zh-CN' ? '正在浏览历史：已显示请求继续更新，新请求暂不插入。' : 'Browsing history: visible requests keep updating; new requests are not inserted.'}</span><Button appearance="subtle" disabled={loading} onClick={onRefreshFilteredResults}>{locale === 'zh-CN' ? '返回最新请求' : 'Return to latest requests'}</Button></div>}
     <TypedFilterBuilder ast={filters} disabled={loading} onApply={onApply} onClear={onClear} scope="requests" token={token} tenant={tenant} upstreams={upstreams} />
-    {olderFilteredResultsStale && <div className="notice warning" role="status">{t('traffic.olderFilteredResultsStale')}<Button appearance="secondary" disabled={loading} onClick={onRefreshFilteredResults}>{t('traffic.refreshFilteredResults')}</Button></div>}
+    {filteredResultsStale && typedFiltersActive(filters) && <div className="notice warning" role="status">{t('traffic.filteredResultsStale')}<Button appearance="secondary" disabled={loading} onClick={onRefreshFilteredResults}>{t('traffic.refreshFilteredResults')}</Button></div>}
     {requests.length > 0 && <section className="metrics request-traffic-metrics" aria-label={t('monitoring.summary')}>
       <AnalyticsMetric {...sampling} label={t('usage.totalTokens')} value={count(summary.totalTokens).text} title={count(summary.totalTokens).title} trend={points.map(point => point.totalTokens)} />
       <AnalyticsMetric {...sampling} label={t('traffic.success')} value={count(summary.successful).text} title={count(summary.successful).title} tone="positive" trend={points.map(point => point.successful)} ratio={summary.successful / summary.requests} />
