@@ -5606,10 +5606,12 @@ paths:
       description: |
         Phase one accepts one uncompressed PCM16 WAV `file` and a required `model`.
         `prompt` and `hotwords` (a JSON string array encoded as a multipart text field)
-        are optional. `temperature` is accepted for client compatibility and ignored.
+        are optional. `temperature`, when present, must be between 0 and 1 and is
+        forwarded to the selected upstream.
         `response_format` is `json` by default or `verbose_json`.
 
-        Authentication, explicit `audio` model-route grants, upstream health admission,
+        Authentication, explicit `openai-audio` model-route grants backed by the `audio`
+        provider modality, upstream health admission,
         key RPM/concurrency limits, balance/budget reservation, and per-second generation
         pricing all apply. Actual duration is measured from the trusted WAV format/data
         chunks before dispatch; millisecond-resolution duration is retained in audit history and the
@@ -5627,6 +5629,9 @@ paths:
       responses:
         '200':
           description: Normalized transcription response.
+          headers:
+            X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+            X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
           content:
             application/json:
               schema:
@@ -6894,7 +6899,7 @@ components:
         display_name: { type: string }
         protocols:
           type: array
-          items: { type: string, enum: [openai, anthropic, audio, generation] }
+          items: { type: string, enum: [openai, anthropic, openai-audio, generation] }
         modalities:
           type: array
           items: { type: string, enum: [text, embedding, image, video, audio] }
@@ -7833,7 +7838,7 @@ components:
           items: { type: string, format: uuid }
           default: []
         upstream_model: { type: string, minLength: 1, maxLength: 500 }
-        protocol: { type: string, enum: [openai, anthropic, audio, generation] }
+        protocol: { type: string, enum: [openai, anthropic, openai-audio, generation] }
         priority: { type: integer, format: int64, minimum: -1000000, maximum: 1000000, default: 0 }
         enabled:
           type: boolean
@@ -7904,7 +7909,7 @@ components:
           uniqueItems: true
           items: { type: string, format: uuid }
         upstream_model: { type: string, minLength: 1, maxLength: 500 }
-        protocol: { type: string, enum: [openai, anthropic, audio, generation] }
+        protocol: { type: string, enum: [openai, anthropic, openai-audio, generation] }
         priority: { type: integer, format: int64, minimum: -1000000, maximum: 1000000 }
         included_provider_group_ids:
           type: array
@@ -8111,7 +8116,7 @@ components:
           uniqueItems: true
           items: { type: string, format: uuid }
         upstream_model: { type: string }
-        protocol: { type: string, enum: [openai, anthropic, audio, generation] }
+        protocol: { type: string, enum: [openai, anthropic, openai-audio, generation] }
         priority: { type: integer, format: int64, minimum: -1000000, maximum: 1000000 }
         enabled: { type: boolean }
         included_provider_group_ids:
@@ -9881,7 +9886,7 @@ components:
         prompt: { type: string, maxLength: 32000 }
         hotwords: { type: string, description: JSON-encoded array of at most 256 non-empty strings. }
         response_format: { type: string, enum: [json, verbose_json], default: json }
-        temperature: { type: number, description: Accepted and ignored for compatibility. }
+        temperature: { type: number, minimum: 0, maximum: 1, description: Forwarded to the selected upstream. }
     OpenAIAudioTranscriptionJson:
       type: object
       additionalProperties: false

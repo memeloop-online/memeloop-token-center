@@ -3,7 +3,7 @@ use reqwest::multipart::{Form, Part};
 
 use super::*;
 
-const AUDIO_PROTOCOL: &str = "audio";
+const AUDIO_PROTOCOL: &str = "openai-audio";
 const AUDIO_AUDIT_PROTOCOL: &str = "audio-transcription";
 const AUDIO_CLIENT_PROTOCOL: &str = "openai-audio-transcription";
 const MAX_HOTWORDS: usize = 256;
@@ -38,6 +38,7 @@ struct AudioTranscriptionForm {
     prompt: Option<String>,
     hotwords: Option<Vec<String>>,
     response_format: AudioResponseFormat,
+    temperature: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,6 +51,8 @@ struct RewrittenAudioMetadata {
     hotwords: Option<Vec<String>>,
     #[serde(default)]
     response_format: AudioResponseFormat,
+    #[serde(default)]
+    temperature: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -95,6 +98,7 @@ pub(super) async fn create_audio_transcription(
             "prompt": form.prompt,
             "hotwords": form.hotwords,
             "response_format": form.response_format.as_str(),
+            "temperature": form.temperature,
         }),
     )
     .await?;
@@ -137,9 +141,6 @@ pub(super) async fn create_audio_transcription(
             "audio transcription price must use second billing".into(),
         ));
     }
-    let reservation_price = generation_price
-        .reservation_price()
-        .ok_or_else(|| AppError::BadRequest("generation price is too large".into()))?;
     let request_object = metadata_only_locator(json!({
         "kind": "audio_transcription",
         "media_archived": false,
@@ -165,12 +166,11 @@ pub(super) async fn create_audio_transcription(
     )?;
     let reservation = state
         .db
-        .start_proxy_request(StartProxyRequest {
+        .start_metered_synchronous_request(StartMeteredSynchronousRequest {
             request_id,
             key: &key,
-            price: &reservation_price,
-            input_token_ceiling: 0,
-            output_token_ceiling: audio.billed_seconds,
+            price: &generation_price,
+            unit_ceiling: audio.billed_seconds,
             protocol: AUDIO_AUDIT_PROTOCOL,
             model: &metadata.model,
             request_object: &request_object,
@@ -425,6 +425,7 @@ async fn parse_audio_transcription_form(
     let mut prompt = None;
     let mut hotwords = None;
     let mut response_format = None;
+    let mut temperature = None;
     while let Some(field) = multipart
         .next_field()
         .await
@@ -463,10 +464,16 @@ async fn parse_audio_transcription_form(
                 set_once_text(&mut response_format, field, "response_format").await?
             }
             "temperature" => {
-                let _ = field
+                if temperature.is_some() {
+                    return Err(AppError::BadRequest(
+                        "temperature must be supplied once".into(),
+                    ));
+                }
+                let raw = field
                     .text()
                     .await
                     .map_err(|_| AppError::BadRequest("invalid temperature field".into()))?;
+                temperature = Some(parse_temperature(&raw)?);
             }
             _ => {
                 return Err(AppError::BadRequest(format!(
@@ -493,6 +500,7 @@ async fn parse_audio_transcription_form(
         prompt,
         hotwords,
         response_format,
+        temperature,
     };
     validate_optional_prompt(form.prompt.as_deref())?;
     validate_hotwords(form.hotwords.as_deref())?;
@@ -530,7 +538,26 @@ fn validate_audio_metadata(metadata: &RewrittenAudioMetadata) -> Result<(), AppE
         return Err(AppError::BadRequest("model is required".into()));
     }
     validate_optional_prompt(metadata.prompt.as_deref())?;
-    validate_hotwords(metadata.hotwords.as_deref())
+    validate_hotwords(metadata.hotwords.as_deref())?;
+    validate_temperature(metadata.temperature)
+}
+
+fn parse_temperature(value: &str) -> Result<f64, AppError> {
+    let temperature = value
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| AppError::BadRequest("temperature must be a number from 0 to 1".into()))?;
+    validate_temperature(Some(temperature))?;
+    Ok(temperature)
+}
+
+fn validate_temperature(temperature: Option<f64>) -> Result<(), AppError> {
+    if temperature.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+        return Err(AppError::BadRequest(
+            "temperature must be a number from 0 to 1".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_optional_prompt(prompt: Option<&str>) -> Result<(), AppError> {
@@ -673,6 +700,9 @@ fn upstream_form(
             "hotwords",
             serde_json::to_string(hotwords).map_err(|_| AppError::Internal)?,
         );
+    }
+    if let Some(temperature) = metadata.temperature {
+        form = form.text("temperature", temperature.to_string());
     }
     Ok(form)
 }
@@ -850,27 +880,17 @@ async fn finish_audio_request(
     let response_object = metadata_only_locator(response_metadata)?;
     state
         .db
-        .finish_proxy_request(FinishProxyRequest {
-            usage_basis: None,
-            first_output_ms: None,
+        .finish_metered_synchronous_request(FinishMeteredSynchronousRequest {
             generation_duration_ms: Some(audio.duration_ms),
             request_id,
             tenant_id,
             reservation,
-            input_token_ceiling: 0,
-            output_token_ceiling: audio.billed_seconds,
-            requested_service_tier: None,
+            unit_ceiling: audio.billed_seconds,
+            billed_units: billed_seconds,
             status_code: i64::from(status.as_u16()),
             duration_ms: started.elapsed().as_millis().min(i64::MAX as u128) as i64,
-            usage: TokenUsage {
-                output_tokens: billed_seconds,
-                ..TokenUsage::default()
-            },
             error_code,
             response_object: &response_object,
-            routing_session_id: None,
-            routing_terminal_observed_at: None,
-            conversation: None,
         })
         .await?;
     Ok(())
@@ -960,6 +980,14 @@ mod tests {
             .unwrap(),
             json!({"text":"hello","duration":1.5,"segments":[{"start":0.0,"end":1.4,"text":"hello"}]})
         );
+    }
+
+    #[test]
+    fn temperature_is_strictly_bounded_before_upstream_dispatch() {
+        assert_eq!(parse_temperature("0.3").unwrap(), 0.3);
+        for invalid in ["-0.1", "1.1", "NaN", "inf", "not-a-number"] {
+            assert!(parse_temperature(invalid).is_err(), "accepted {invalid}");
+        }
     }
 
     #[tokio::test]
@@ -1092,6 +1120,18 @@ mod tests {
                 .body
                 .windows(b"asr-upstream".len())
                 .any(|window| window == b"asr-upstream")
+        );
+        assert!(
+            requests[0]
+                .body
+                .windows(b"name=\"temperature\"".len())
+                .any(|window| window == b"name=\"temperature\"")
+        );
+        assert!(
+            requests[0]
+                .body
+                .windows(b"0.3".len())
+                .any(|window| window == b"0.3")
         );
 
         let refs = state

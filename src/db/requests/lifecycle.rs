@@ -54,6 +54,25 @@ pub struct StartProxyRequest<'a> {
     pub model_route_id: Option<Uuid>,
 }
 
+/// Admission contract for a synchronous request billed in provider-defined
+/// generation units rather than tokens.
+///
+/// The current request ledger predates generation-unit accounting and stores
+/// the reserved scalar in its legacy output quantity column. Keeping that
+/// compatibility translation inside this database boundary prevents protocol
+/// handlers from treating seconds, images, or other units as tokens.
+pub struct StartMeteredSynchronousRequest<'a> {
+    pub request_id: Uuid,
+    pub key: &'a AuthenticatedKey,
+    pub price: &'a GenerationPrice,
+    pub unit_ceiling: i64,
+    pub protocol: &'a str,
+    pub model: &'a str,
+    pub request_object: &'a str,
+    pub upstream_account_id: Option<Uuid>,
+    pub model_route_id: Option<Uuid>,
+}
+
 pub(crate) struct SwitchProxyCandidateInput<'a> {
     pub request_id: Uuid,
     pub tenant_id: Uuid,
@@ -102,6 +121,20 @@ pub struct FinishProxyRequest<'a> {
     pub conversation: Option<ProxyConversationInput<'a>>,
 }
 
+/// Terminal contract paired with [`StartMeteredSynchronousRequest`].
+pub struct FinishMeteredSynchronousRequest<'a> {
+    pub request_id: Uuid,
+    pub tenant_id: Uuid,
+    pub reservation: &'a UsageReservation,
+    pub unit_ceiling: i64,
+    pub billed_units: i64,
+    pub generation_duration_ms: Option<i64>,
+    pub status_code: i64,
+    pub duration_ms: i64,
+    pub error_code: Option<&'a str>,
+    pub response_object: &'a str,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ProxyRequestUpstreamAttribution {
     KeepSelected,
@@ -139,6 +172,34 @@ impl Database {
         input: StartProxyRequest<'_>,
     ) -> Result<UsageReservation, AppError> {
         self.start_proxy_request_inner(input, None).await
+    }
+
+    pub async fn start_metered_synchronous_request(
+        &self,
+        input: StartMeteredSynchronousRequest<'_>,
+    ) -> Result<UsageReservation, AppError> {
+        if input.unit_ceiling <= 0 || input.price.billing_unit.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "metered request requires a positive unit ceiling and billing unit".into(),
+            ));
+        }
+        let reservation_price = input
+            .price
+            .reservation_price()
+            .ok_or_else(|| AppError::BadRequest("generation price is too large".into()))?;
+        self.start_proxy_request(StartProxyRequest {
+            request_id: input.request_id,
+            key: input.key,
+            price: &reservation_price,
+            input_token_ceiling: 0,
+            output_token_ceiling: input.unit_ceiling,
+            protocol: input.protocol,
+            model: input.model,
+            request_object: input.request_object,
+            upstream_account_id: input.upstream_account_id,
+            model_route_id: input.model_route_id,
+        })
+        .await
     }
 
     #[cfg(test)]
@@ -718,6 +779,43 @@ impl Database {
     ) -> Result<FinishProxyRequestResult, AppError> {
         self.finish_proxy_request_with_archive_staging(input, None)
             .await
+    }
+
+    pub async fn finish_metered_synchronous_request(
+        &self,
+        input: FinishMeteredSynchronousRequest<'_>,
+    ) -> Result<FinishProxyRequestResult, AppError> {
+        if input.unit_ceiling <= 0
+            || input.billed_units < 0
+            || input.billed_units > input.unit_ceiling
+        {
+            return Err(AppError::BadRequest(
+                "metered request usage exceeds its admitted unit ceiling".into(),
+            ));
+        }
+        self.finish_proxy_request(FinishProxyRequest {
+            usage_basis: None,
+            first_output_ms: None,
+            generation_duration_ms: input.generation_duration_ms,
+            request_id: input.request_id,
+            tenant_id: input.tenant_id,
+            reservation: input.reservation,
+            input_token_ceiling: 0,
+            output_token_ceiling: input.unit_ceiling,
+            requested_service_tier: None,
+            status_code: input.status_code,
+            duration_ms: input.duration_ms,
+            usage: TokenUsage {
+                output_tokens: input.billed_units,
+                ..TokenUsage::default()
+            },
+            error_code: input.error_code,
+            response_object: input.response_object,
+            routing_session_id: None,
+            routing_terminal_observed_at: None,
+            conversation: None,
+        })
+        .await
     }
 
     /// Commits a terminal proxy response and its durable staging binding as a

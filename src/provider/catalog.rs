@@ -386,7 +386,7 @@ impl ProviderCatalog {
             protocols: vec![
                 "openai".to_owned(),
                 "anthropic".to_owned(),
-                "audio".to_owned(),
+                "openai-audio".to_owned(),
                 "generation".to_owned(),
             ],
             modalities: vec![

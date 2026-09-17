@@ -110,9 +110,12 @@ pub(super) fn validate_route_fields(
             "model names must not contain control characters".into(),
         ));
     }
-    if !matches!(protocol, "openai" | "anthropic" | "audio" | "generation") {
+    if !matches!(
+        protocol,
+        "openai" | "anthropic" | "openai-audio" | "generation"
+    ) {
         return Err(AppError::BadRequest(
-            "route protocol must be openai, anthropic, audio, or generation".into(),
+            "route protocol must be openai, anthropic, openai-audio, or generation".into(),
         ));
     }
     if !(-1_000_000..=1_000_000).contains(&priority) {
