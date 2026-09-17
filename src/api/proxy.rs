@@ -78,6 +78,7 @@ mod sse_delivery_tests;
 
 const PROXY_BODY_CHANNEL_CAPACITY: usize = 1;
 const MAX_INPUT_TOKEN_OVERHEAD_CEILING: i64 = 1_000_000;
+const SESSION_ACCOUNT_AVOID_LOOKUP_TIMEOUT: Duration = Duration::from_millis(50);
 
 fn validate_openai_chat_choice_count(request: &Value) -> Result<(), AppError> {
     if openai_chat_choice_count(request)? == 1 {
@@ -961,6 +962,16 @@ async fn proxy_with_identity_and_conversation_spool(
     preparation.finish("completed", None, Some(body.len()));
     let route_preparation = proxy_diagnostics::Phase::new(diagnostic_context, "route_preparation");
     let selection_seed = routing_selection_seed(&key, request_id, &conversation_hints);
+    let avoid_route_account = session_route_account_to_avoid(
+        &state,
+        &key,
+        request_id,
+        &conversation_hints,
+        &model,
+        protocol.name(),
+        applied.upstream_account_hint,
+    )
+    .await;
     let candidate_query =
         proxy_diagnostics::Phase::new(diagnostic_context, "authorized_candidate_query");
     let mut candidates = state
@@ -972,6 +983,7 @@ async fn proxy_with_identity_and_conversation_spool(
             protocol.name(),
             RouteSelectionOptions {
                 upstream_account_hint: applied.upstream_account_hint,
+                avoid_route_account,
                 selection_seed,
             },
         )
@@ -1759,6 +1771,7 @@ async fn proxy_with_identity_and_conversation_spool(
         upstream_attempt,
         upstream_activity,
         request_id,
+        public_model: model.clone(),
         upstream_account_id: active_route.route.account_id,
         credential_generation: active_route.route.credential_generation,
         buffered_request,
@@ -2500,6 +2513,10 @@ async fn finish_buffered_request_with_upstream_attribution(
         },
     );
     let stored_response = format!("gap://{request_id}/response");
+    let routing_session_id = request
+        .conversation
+        .as_ref()
+        .and_then(|conversation| conversation.hints.session_id.clone());
     let projection_deadline =
         tokio::time::Instant::now() + MAX_PROXY_LIFETIME.saturating_sub(request.started.elapsed());
     let conversation = if let Some(conversation) = request.conversation.as_ref() {
@@ -2531,6 +2548,8 @@ async fn finish_buffered_request_with_upstream_attribution(
         usage_basis: Some(usage_basis),
         error_code: error_code.as_deref(),
         response_object: &stored_response,
+        routing_session_id: routing_session_id.as_deref(),
+        routing_terminal_observed_at: None,
         conversation: conversation
             .as_ref()
             .map(|projection| projection.input(response_id.as_deref())),
@@ -2601,4 +2620,49 @@ fn routing_selection_seed(
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
     Uuid::from_bytes(bytes)
+}
+
+async fn session_route_account_to_avoid(
+    state: &AppState,
+    key: &AuthenticatedKey,
+    request_id: Uuid,
+    hints: &crate::conversation::ConversationHints,
+    model: &str,
+    protocol: &str,
+    upstream_account_hint: Option<Uuid>,
+) -> Option<(Uuid, Uuid)> {
+    // An explicit application-policy hint is authoritative for this request.
+    // Group-routing hooks still receive the complete ordered candidate set and
+    // may override the native ordering in their later bounded stage.
+    if upstream_account_hint.is_some() {
+        return None;
+    }
+    let session_id = hints.session_id.as_deref()?;
+    match tokio::time::timeout(
+        SESSION_ACCOUNT_AVOID_LOOKUP_TIMEOUT,
+        state
+            .db
+            .latest_session_transport_route_to_avoid(key, session_id, model, protocol),
+    )
+    .await
+    {
+        Ok(Ok(account_id)) => account_id,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                %request_id,
+                error_category = error.diagnostic_category(),
+                stage = "session_route_account_avoid_lookup",
+                "session transport evidence lookup failed open"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                %request_id,
+                stage = "session_route_account_avoid_lookup",
+                "session transport evidence lookup timed out and failed open"
+            );
+            None
+        }
+    }
 }

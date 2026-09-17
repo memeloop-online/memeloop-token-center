@@ -244,6 +244,10 @@ impl UpstreamAttemptGuard {
         }
     }
 
+    pub(crate) const fn route_assignment(&self) -> (Uuid, Uuid) {
+        (self.route_id, self.upstream_account_id)
+    }
+
     /// Call only after a protocol-validated billable frame is durably recorded
     /// and enqueued downstream. Headers, comments and usage-only frames do not
     /// establish recovery. This is not request completion or usage settlement.

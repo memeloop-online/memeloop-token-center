@@ -173,6 +173,32 @@ pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>
                     tracing::error!(%error, "worker failed to delete expired budget rollup detail");
                 }
             }
+            let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let mut deleted_total = 0_u64;
+            loop {
+                match state
+                    .db
+                    .delete_expired_session_routing_terminals(10_000)
+                    .await
+                {
+                    Ok(deleted) => {
+                        deleted_total = deleted_total.saturating_add(deleted);
+                        if deleted < 10_000 || tokio::time::Instant::now() >= cleanup_deadline {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "worker failed to delete expired session routing terminals");
+                        break;
+                    }
+                }
+            }
+            if deleted_total > 0 {
+                tracing::info!(
+                    deleted = deleted_total,
+                    "worker deleted expired session routing terminals"
+                );
+            }
             #[cfg(feature = "experimental-plugin-revisions")]
             if let Some(plugins) = &state.application_plugins {
                 match plugins.reclaim_unreferenced_installation_attempts().await {
@@ -547,6 +573,8 @@ mod tests {
                 },
                 error_code: None,
                 response_object: "gap://worker-metered-projection/response",
+                routing_session_id: None,
+                routing_terminal_observed_at: None,
                 conversation: None,
             })
             .await

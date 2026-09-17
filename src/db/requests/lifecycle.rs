@@ -91,6 +91,14 @@ pub struct FinishProxyRequest<'a> {
     pub usage: TokenUsage,
     pub error_code: Option<&'a str>,
     pub response_object: &'a str,
+    /// Explicit downstream session identity captured independently from
+    /// semantic conversation projection. Terminal routing evidence must be
+    /// durable even when projection is deferred or skipped.
+    pub routing_session_id: Option<&'a str>,
+    /// Stable time at which the terminal became observable. Streaming callers
+    /// capture this before closing the response body so delayed settlement
+    /// cannot reorder concurrent requests in the same session.
+    pub routing_terminal_observed_at: Option<i64>,
     pub conversation: Option<ProxyConversationInput<'a>>,
 }
 
@@ -697,6 +705,8 @@ impl Database {
             usage: TokenUsage::default(),
             error_code: Some("request_lifecycle_timeout"),
             response_object: &response_object,
+            routing_session_id: None,
+            routing_terminal_observed_at: None,
             conversation: None,
         })
         .await
@@ -1113,6 +1123,19 @@ impl Database {
                 ),
                 Err(error) => return Err(error),
             };
+
+        if let Some(explicit_session_id) = input.routing_session_id {
+            super::session_routing::upsert_session_routing_terminal_from_request_in_transaction(
+                &mut transaction,
+                &request_id,
+                created_at,
+                explicit_session_id,
+                status_code,
+                error_code.as_deref(),
+                input.routing_terminal_observed_at.unwrap_or(now),
+            )
+            .await?;
+        }
 
         // Metered-unlimited terminal traffic can complete in large bursts for
         // one session. Its terminal transaction must remain insert-only with

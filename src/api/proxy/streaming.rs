@@ -8,7 +8,9 @@ mod tests;
 mod timing;
 
 use delivery::{CapturedSseDelivery, capture_sse_delivery, downstream_stream_failure};
-use lifecycle::{StreamingFinalizationInput, finalize_streaming_lifecycle};
+use lifecycle::{
+    StreamingFinalizationInput, classify_streaming_terminal, finalize_streaming_lifecycle,
+};
 use terminal_delivery::{ResponsesTerminalDelivery, TerminalEof};
 
 enum DownstreamAwarePoll<T> {
@@ -26,6 +28,7 @@ enum StreamPoll<T> {
 // five minutes as stalled. Keep a generous margin below that client limit
 // while avoiding a material per-request event rate.
 const CODEX_RESPONSES_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const SESSION_ROUTING_TERMINAL_PUBLISH_TIMEOUT: Duration = Duration::from_millis(250);
 
 async fn poll_upstream_or_downstream_closed<T>(
     body_sender: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
@@ -124,6 +127,7 @@ pub(super) struct StreamingResponse<'a> {
     pub(super) strict_openai_chat_usage: bool,
     pub(super) upstream_activity: crate::metrics::ActivityGuard,
     pub(super) request_id: Uuid,
+    pub(super) public_model: String,
     /// Stable operator-only correlation metadata. This is intentionally an
     /// account UUID rather than any provider response field so protocol
     /// rejections can be diagnosed without retaining or logging upstream
@@ -153,6 +157,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         strict_openai_chat_usage,
         upstream_activity,
         request_id,
+        public_model,
         upstream_account_id,
         credential_generation,
         buffered_request,
@@ -832,6 +837,56 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             }
             drop(terminal_frames);
             terminal_memory.set_bytes(0);
+            let classification = classify_streaming_terminal(
+                status_code,
+                protocol,
+                is_codex_route,
+                transport_error,
+                sse_summary.as_ref(),
+            );
+            let routing_terminal_observed_at = conversation
+                .as_ref()
+                .and_then(|conversation| conversation.hints.session_id.as_ref())
+                .map(|_| crate::db::unix_millis());
+            let mut routing_terminal_pre_published = false;
+            if crate::db::is_session_avoid_terminal(
+                classification.status_code,
+                classification.error_code,
+            ) && let Some(observed_at) = routing_terminal_observed_at
+                && let Some(conversation) = conversation.as_ref()
+                && let Some(session_id) = conversation.hints.session_id.as_deref()
+            {
+                let (model_route_id, upstream_account_id) = upstream_attempt.route_assignment();
+                let evidence = background_state.db.record_session_routing_terminal(
+                    crate::db::SessionRoutingTerminalInput {
+                        key: &conversation.key,
+                        request_id,
+                        explicit_session_id: session_id,
+                        model: &public_model,
+                        protocol: protocol.name(),
+                        status_code: classification.status_code,
+                        error_code: classification.error_code,
+                        model_route_id: Some(model_route_id),
+                        upstream_account_id: Some(upstream_account_id),
+                        observed_at,
+                    },
+                );
+                match tokio::time::timeout(SESSION_ROUTING_TERMINAL_PUBLISH_TIMEOUT, evidence).await
+                {
+                    Ok(Ok(())) => routing_terminal_pre_published = true,
+                    Ok(Err(error)) => tracing::error!(
+                        %request_id,
+                        error_category = error.diagnostic_category(),
+                        stage = "stream_routing_terminal",
+                        "failed to persist streaming routing terminal before downstream close"
+                    ),
+                    Err(_) => tracing::error!(
+                        %request_id,
+                        stage = "stream_routing_terminal",
+                        "streaming routing terminal persistence exceeded its short publish budget"
+                    ),
+                }
+            }
             drop(body_sender);
             terminal_delivery_phase.finish(
                 transport_error.unwrap_or("returned"),
@@ -868,6 +923,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 response_archive_attempt,
                 stored_response,
                 gap_response,
+                routing_terminal_observed_at,
+                routing_terminal_pre_published,
             })
             .await;
             // This function handles its own database failures; returned means

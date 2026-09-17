@@ -123,6 +123,8 @@ async fn durable_send_blocks_duplicate_owner_takeover_and_generic_refund() {
                 usage: TokenUsage::default(),
                 error_code: Some("request_expired"),
                 response_object: "gap://expired/response",
+                routing_session_id: None,
+                routing_terminal_observed_at: None,
                 conversation: None,
             })
             .await;

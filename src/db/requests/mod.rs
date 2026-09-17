@@ -3,6 +3,7 @@ mod lifecycle;
 mod metered_projection;
 mod pricing_stats;
 mod queries;
+mod session_routing;
 mod settlement;
 mod stats;
 
@@ -28,6 +29,7 @@ pub use queries::RequestListFilter;
 pub(crate) use queries::{
     request_detail_accounting_projection, request_usage_basis_from_row, search_prefix,
 };
+pub(crate) use session_routing::{SessionRoutingTerminalInput, is_session_avoid_terminal};
 pub use settlement::normalize_proxy_usage;
 pub(crate) use settlement::{
     price_token_usage, reserve_usage_in_transaction, settle_confirmed_image_charge_in_transaction,

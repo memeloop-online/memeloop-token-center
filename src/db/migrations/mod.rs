@@ -538,6 +538,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
             "../../../migrations/common/0101_conversation_unresolved_explicit_parents.sql"
         ),
     },
+    Migration {
+        version: 102,
+        name: "request session routing terminals",
+        sql: include_str!("../../../migrations/common/0102_request_session_routing_terminal.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1061,6 +1066,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         sql: include_str!(
             "../../../migrations/common/0101_conversation_unresolved_explicit_parents.sql"
         ),
+    },
+    Migration {
+        version: 102,
+        name: "request session routing terminals",
+        sql: include_str!("../../../migrations/common/0102_request_session_routing_terminal.sql"),
     },
 ];
 

@@ -103,6 +103,8 @@ pub(super) async fn create_text_settlement_with_id(
             },
             error_code: None,
             response_object,
+            routing_session_id: None,
+            routing_terminal_observed_at: None,
             conversation: None,
         })
         .await

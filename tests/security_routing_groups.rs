@@ -589,6 +589,7 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
             "openai",
             RouteSelectionOptions {
                 upstream_account_hint: None,
+                avoid_route_account: None,
                 selection_seed: seed,
             },
             pepper,
@@ -606,6 +607,7 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
             "generation",
             RouteSelectionOptions {
                 upstream_account_hint: None,
+                avoid_route_account: None,
                 selection_seed: seed,
             },
             pepper,
@@ -623,6 +625,7 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
             "openai",
             RouteSelectionOptions {
                 upstream_account_hint: None,
+                avoid_route_account: None,
                 selection_seed: seed,
             },
             pepper,
@@ -670,6 +673,7 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
                 "openai",
                 RouteSelectionOptions {
                     upstream_account_hint: None,
+                    avoid_route_account: None,
                     selection_seed: seed
                 },
                 pepper,
@@ -774,6 +778,7 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
             "openai",
             RouteSelectionOptions {
                 upstream_account_hint: None,
+                avoid_route_account: None,
                 selection_seed: seed,
             },
             pepper,
@@ -792,6 +797,7 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
             "generation",
             RouteSelectionOptions {
                 upstream_account_hint: None,
+                avoid_route_account: None,
                 selection_seed: seed,
             },
             pepper,
@@ -810,6 +816,7 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
             "openai",
             RouteSelectionOptions {
                 upstream_account_hint: None,
+                avoid_route_account: None,
                 selection_seed: seed,
             },
             pepper,
@@ -832,6 +839,7 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
                 "openai",
                 RouteSelectionOptions {
                     upstream_account_hint: None,
+                    avoid_route_account: None,
                     selection_seed: seed
                 },
                 pepper,
@@ -851,6 +859,7 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
                 "generation",
                 RouteSelectionOptions {
                     upstream_account_hint: None,
+                    avoid_route_account: None,
                     selection_seed: seed
                 },
                 pepper,
@@ -941,6 +950,7 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
             "openai",
             RouteSelectionOptions {
                 upstream_account_hint: None,
+                avoid_route_account: None,
                 selection_seed: seed,
             },
             pepper,
@@ -959,6 +969,7 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
             "generation",
             RouteSelectionOptions {
                 upstream_account_hint: None,
+                avoid_route_account: None,
                 selection_seed: seed,
             },
             pepper,
@@ -983,6 +994,7 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
             "openai",
             RouteSelectionOptions {
                 upstream_account_hint: None,
+                avoid_route_account: None,
                 selection_seed: seed,
             },
             pepper,
@@ -1067,6 +1079,7 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
                 "openai",
                 RouteSelectionOptions {
                     upstream_account_hint: None,
+                    avoid_route_account: None,
                     selection_seed: seed
                 },
                 pepper,
@@ -1084,6 +1097,7 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
             "openai",
             RouteSelectionOptions {
                 upstream_account_hint: None,
+                avoid_route_account: None,
                 selection_seed: seed,
             },
             pepper,
@@ -1102,6 +1116,7 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
             "generation",
             RouteSelectionOptions {
                 upstream_account_hint: None,
+                avoid_route_account: None,
                 selection_seed: seed,
             },
             pepper,
@@ -1126,6 +1141,7 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
             "openai",
             RouteSelectionOptions {
                 upstream_account_hint: None,
+                avoid_route_account: None,
                 selection_seed: seed,
             },
             pepper,

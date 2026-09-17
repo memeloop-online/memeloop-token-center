@@ -171,6 +171,8 @@ impl Database {
                         usage: TokenUsage::default(),
                         error_code: Some("request_expired"),
                         response_object: &response_object,
+                        routing_session_id: None,
+                        routing_terminal_observed_at: None,
                         conversation: None,
                     })
                     .await;
