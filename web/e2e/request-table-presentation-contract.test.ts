@@ -33,35 +33,32 @@ test('generation TPS requires observed output interval and does not relabel tota
   assert.equal(generationRequestOutputTps({ ...timed, generation_duration_ms: 1 }), 32000, 'no arbitrary high-rate threshold masks an otherwise recorded gateway interval');
 });
 
-test('failed requests use policy zero only for unobserved usage and preserve reported settlements', () => {
-  for (const status_code of [499, 502, 503] as const) {
-    const failed = { ...request, status_code, usage_basis: 'not_observed' as const, cost: '35' };
-    assert.equal(requestUsageIsActual(failed), false);
-    assert.equal(requestCostCopy(failed, 'en').unknown, false);
-    assert.equal(requestDisplayedCost(failed), '0');
+test('failed requests use policy zero unless provider-reported usage supports the settlement', () => {
+  const failures = [
+    { status_code: 499, error_code: null },
+    { status_code: 502, error_code: null },
+    { status_code: 503, error_code: null },
+    { status_code: 200, error_code: 'upstream_incomplete_response' },
+  ] as const;
+  for (const usage_basis of [undefined, null, 'provider_estimated', 'contract_ceiling', 'not_observed'] as const) {
+    for (const failure of failures) {
+      const failed = { ...request, ...failure, usage_basis, cost: '35' };
+      assert.equal(requestUsageIsActual(failed), false);
+      assert.equal(requestCostCopy(failed, 'en').unknown, false);
+      assert.equal(requestCostCopy(failed, 'en').label, 'Cost set to 0');
+      assert.equal(requestDisplayedCost(failed), '0');
+      assert.equal(failed.cost, '35', 'presentation policy leaves the stored ledger amount unchanged');
+    }
   }
-  const cancelled = { ...request, status_code: 200, error_code: 'client_cancelled', usage_basis: 'not_observed' as const, cost: '35' };
-  assert.equal(requestUsageIsActual(cancelled), false);
-  assert.equal(requestDisplayedCost(cancelled), '0');
-  for (const usage_basis of [undefined, null, 'provider_estimated', 'contract_ceiling'] as const) {
-    const failed = { ...request, status_code: 499, usage_basis, cost: '35' };
-    assert.equal(requestUsageIsActual(failed), false);
-    assert.equal(requestCostCopy(failed, 'en').unknown, true);
-    assert.equal(requestCostCopy(failed, 'en').label, 'Review required');
-    assert.equal(requestDisplayedCost(failed), '35');
-    assert.equal(failed.cost, '35');
-  }
-  const unobserved = { ...request, status_code: 499, usage_basis: 'not_observed' as const, cost: '35' };
-  assert.equal(requestUsageIsActual(unobserved), false);
-  assert.equal(requestCostCopy(unobserved, 'en').unknown, false);
-  assert.equal(requestDisplayedCost(unobserved), '0');
-  assert.equal(requestDisplayedCost({ ...unobserved, status_code: 200 }), '35');
-  assert.equal(requestDisplayedCost({ ...unobserved, status_code: null }), '35');
-  assert.equal(requestCostCopy({ ...unobserved, status_code: null }, 'en').label, 'Awaiting settlement');
+  const successfulUnobserved = { ...request, usage_basis: 'not_observed' as const, cost: '35' };
+  assert.equal(requestDisplayedCost(successfulUnobserved), '35');
+  assert.equal(requestDisplayedCost({ ...successfulUnobserved, status_code: null, error_code: 'delivery_started' }), '35');
+  assert.equal(requestCostCopy({ ...successfulUnobserved, status_code: null }, 'en').label, 'Awaiting settlement');
   const reported = { ...request, status_code: 499, cost: '0.2' };
   assert.equal(requestUsageIsActual(reported), true);
   assert.equal(requestCostCopy(reported, 'en').unknown, false);
   assert.equal(requestDisplayedCost(reported), '0.2');
+  assert.equal(requestDisplayedCost({ ...reported, status_code: 200, error_code: 'upstream_incomplete_response' }), '0.2');
   assert.equal(requestUsageIsActual({ ...request, usage_basis: 'not_observed' }), false);
 });
 
@@ -93,11 +90,11 @@ test('average output TPS uses recorded total seconds, distinguishes valid zero f
   assert.equal(averageRequestOutputTps({ ...request, output_tokens: -1 }), null);
 });
 
-test('failed unobserved cost is presented as policy zero while success remains unchanged', () => {
-  const unobserved = requestCostCopy({ ...request, status_code: 502, usage_basis: 'not_observed', cost: '35' }, 'en');
-  assert.equal(unobserved.unknown, false);
-  assert.equal(unobserved.label, 'Usage not observed');
-  assert.match(unobserved.hint, /defaults to 0/);
+test('failed cost copy states the zero policy while success remains unchanged', () => {
+  const failed = requestCostCopy({ ...request, status_code: 502, usage_basis: 'contract_ceiling', cost: '35' }, 'en');
+  assert.equal(failed.unknown, false);
+  assert.equal(failed.label, 'Cost set to 0');
+  assert.match(failed.hint, /cost is 0/);
   assert.equal(requestCostCopy({ ...request, status_code: 200, usage_basis: 'not_observed', cost: '35' }, 'en').unknown, true);
 });
 

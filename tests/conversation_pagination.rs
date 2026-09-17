@@ -906,8 +906,17 @@ async fn many_completed_facts_move_into_one_session_without_projection_drift() {
     );
     assert_eq!(
         totals.try_get::<i64, _>("cost_micros").unwrap(),
-        REQUESTS * 5
+        (REQUESTS - 8) * 5
     );
+    let failed_cost: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(cost_micros), 0) FROM request_stats_facts WHERE key_id = $1 AND session_id = $2 AND error_code <> ''",
+    )
+    .bind(fixture.key.key_id.to_string())
+    .bind(&cluster)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(failed_cost, 0);
     for table in ["session_usage_hourly", "session_usage_daily"] {
         let sql = format!(
             "SELECT COALESCE(SUM(requests), 0) AS requests, MIN(input_tokens) AS min_input, MIN(output_tokens) AS min_output, MIN(duration_sum_ms) AS min_duration, MIN(cost_micros) AS min_cost FROM {table} WHERE key_id = $1 AND session_id = $2"

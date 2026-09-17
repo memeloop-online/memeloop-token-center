@@ -1392,7 +1392,7 @@ async fn sqlite_usage_analysis_keeps_currency_cache_scope_and_prefix_filters_exa
         "{body}"
     );
     assert_eq!(body["summary"]["costs"][0]["currency"], "CNY");
-    assert_eq!(body["summary"]["costs"][0]["cost"], "2");
+    assert_eq!(body["summary"]["costs"][0]["cost"], "0");
     assert_eq!(body["summary"]["costs"][1]["currency"], "USD");
     assert_eq!(body["summary"]["costs"][1]["cost"], "1");
     assert_eq!(body["by_key"].as_array().unwrap().len(), 2);

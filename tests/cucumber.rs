@@ -233,6 +233,13 @@ fn spawn_test_worker(state: AppState) -> (watch::Sender<bool>, JoinHandle<()>) {
     (shutdown, task)
 }
 
+fn restart_test_worker(world: &mut TokenCenterWorld) {
+    let state = world.state.clone().expect("test state");
+    let (worker_shutdown, worker_task) = spawn_test_worker(state);
+    world.worker_shutdown = Some(worker_shutdown);
+    world.worker_task = Some(worker_task);
+}
+
 async fn stop_test_worker(world: &mut TokenCenterWorld) {
     let shutdown_error = world
         .worker_shutdown
@@ -666,6 +673,10 @@ async fn create_siliconflow_video_route_and_key(world: &mut TokenCenterWorld) {
 
 #[when("the client creates and replays a SiliconFlow text to video generation")]
 async fn create_and_replay_siliconflow_video(world: &mut TokenCenterWorld) {
+    // Keep the admission/replay pair in the durable queued state. The worker is
+    // restarted only after the replay has observed the exact admitted payload;
+    // the following step then drives and verifies the real upstream work.
+    stop_test_worker(world).await;
     let body = json!({
         "model": "siliconflow-video-public",
         "input": {"parameters": {
@@ -701,6 +712,7 @@ async fn create_and_replay_siliconflow_video(world: &mut TokenCenterWorld) {
     assert_eq!(replay.status(), StatusCode::OK);
     let replay: Value = replay.json().await.expect("SiliconFlow replay JSON");
     assert_eq!(replay, world.response);
+    restart_test_worker(world);
 }
 
 #[then("the SiliconFlow video is proxied with safe metadata and job billing")]

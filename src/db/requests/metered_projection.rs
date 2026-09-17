@@ -137,14 +137,26 @@ impl Database {
         }
         if let Some(row) = request_ids.into_iter().next() {
             let request_id: String = row.try_get("id")?;
-            let fact_cost: Option<i64> =
-                sqlx::query("SELECT cost_micros FROM request_stats_facts WHERE request_id = $1")
-                    .bind(&request_id)
-                    .fetch_optional(&mut *transaction)
-                    .await?
-                    .map(|row| row.try_get("cost_micros"))
-                    .transpose()?;
-            if fact_cost != Some(actual_micros) {
+            let fact = sqlx::query(
+                "SELECT fact.cost_micros, record.status_code, record.error_code, record.usage_basis FROM request_stats_facts fact JOIN request_records record ON record.id = fact.request_id AND record.created_at = fact.created_at WHERE fact.request_id = $1",
+            )
+            .bind(&request_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            let Some(fact) = fact else {
+                return Err(AppError::Conflict(
+                    "metered request fact is missing or does not match its settlement".into(),
+                ));
+            };
+            let error_code: Option<String> = fact.try_get("error_code")?;
+            let usage_basis: Option<String> = fact.try_get("usage_basis")?;
+            let expected_fact_cost = super::super::effective_cost::effective_displayed_cost_micros(
+                actual_micros,
+                fact.try_get("status_code")?,
+                error_code.as_deref(),
+                usage_basis.as_deref(),
+            );
+            if fact.try_get::<i64, _>("cost_micros")? != expected_fact_cost {
                 return Err(AppError::Conflict(
                     "metered request fact is missing or does not match its settlement".into(),
                 ));

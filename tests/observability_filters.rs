@@ -818,6 +818,22 @@ async fn operator_and_self_observability_filters_are_bounded_scoped_and_keyset_p
         },
     )
     .await;
+    for cost_micros in [1_250_000, 1_500_000] {
+        record(
+            &state,
+            &beta,
+            RecordedRequest {
+                model: "cost-filter-model",
+                route_id: beta_route,
+                upstream_id: upstream,
+                duration_ms: 25,
+                cost_micros,
+                status_code: 200,
+                error_code: None,
+            },
+        )
+        .await;
+    }
     let other_tenant_request = record(
         &state,
         &other,
@@ -847,8 +863,30 @@ async fn operator_and_self_observability_filters_are_bounded_scoped_and_keyset_p
         .unwrap();
     let now = memeloop_token_center::db::unix_millis();
     let query = format!(
-        "from_created_at=0&to_created_at={now}&model=diagnostic-model&protocol=openai-chat&status=error&error_code=upstream_boom&upstream_account_id={upstream}&route_id={alpha_route}&min_duration_ms=100&max_duration_ms=200&min_cost=1&max_cost=2&key_alias=alpha&principal=alice"
+        "from_created_at=0&to_created_at={now}&model=diagnostic-model&protocol=openai-chat&status=error&error_code=upstream_boom&upstream_account_id={upstream}&route_id={alpha_route}&min_duration_ms=100&max_duration_ms=200&key_alias=alpha&principal=alice"
     );
+    let (status, cost_filtered) = get_json(
+        &state,
+        &format!(
+            "/internal/v1/requests?from_created_at=0&to_created_at={now}&model=cost-filter-model&status=success&min_cost=1&max_cost=2&key_alias=beta&principal=bob"
+        ),
+        &service.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cost_filtered.as_array().unwrap().len(), 2);
+    let (status, cost_filtered_stats) = get_json(
+        &state,
+        &format!(
+            "/internal/v1/stats?from_created_at={}&to_created_at={now}&model=cost-filter-model&status=success&min_cost=1&max_cost=2&key_alias=beta&principal=bob",
+            now.saturating_sub(86_400_000)
+        ),
+        &service.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cost_filtered_stats["summary"]["total_requests"], 2);
+    assert_eq!(cost_filtered_stats["summary"]["successful_requests"], 2);
     let bounded_query = query.replace(
         "from_created_at=0",
         &format!("from_created_at={}", now.saturating_sub(86_400_000)),
@@ -898,6 +936,7 @@ async fn operator_and_self_observability_filters_are_bounded_scoped_and_keyset_p
     assert_eq!(projected_request["route_id"], alpha_route.to_string());
     assert!(projected_request["completed_at"].is_i64());
     assert_eq!(projected_request["currency"], "USD");
+    assert_eq!(projected_request["cost"], "0");
 
     let (status, detail) = get_json(
         &state,
