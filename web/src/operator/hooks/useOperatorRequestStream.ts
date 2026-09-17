@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { RequestEvent } from '../../types';
 import { SessionEventChannel } from '../sessionEventChannel';
 import { useRequestEventStream } from './useRequestEventStream';
-import { coalesceRequestEvent, RequestRefreshBatch } from '../traffic/requestRefresh.js';
+import { coalesceRequestEvent, RequestRefreshBatch, requestEventCacheCapacity, trimRequestEventCache } from '../traffic/requestRefresh.js';
 
 export function useOperatorRequestStream({ token, tenant, enabled, disconnectedMessage, intervalMs = 5000, paused = false }: {
   token: string;
@@ -38,11 +38,9 @@ export function useOperatorRequestStream({ token, tenant, enabled, disconnectedM
         const next = coalesceRequestEvent(published.get(id), event);
         published.delete(id); published.set(id, next);
       }
-      const protectedSet = new Set(protectedIds.current);
-      for (const id of published.keys()) {
-        if (published.size <= 2_000 + protectedSet.size) break;
-        if (!protectedSet.has(id)) published.delete(id);
-      }
+      // Publish-side trimming stays silent: pending-side loss already travels
+      // with the batch via its overflow flag.
+      trimRequestEventCache(published, new Set(protectedIds.current), requestEventCacheCapacity);
       events.current = published;
       if (overflow) setOverflowRevision(value => value + 1);
       setRevision(value => value + 1);
@@ -61,6 +59,9 @@ export function useOperatorRequestStream({ token, tenant, enabled, disconnectedM
   const protectRequests = useCallback((ids: string[], consumerPaused?: boolean) => {
     protectedIds.current = ids;
     batch.current?.protect(ids);
+    // A shrinking protected set tightens the published cache bound right away.
+    // Dropped entries request an authoritative first-page reconciliation.
+    if (trimRequestEventCache(events.current, new Set(ids), requestEventCacheCapacity)) setOverflowRevision(value => value + 1);
     // Omitted (e.g. scope cleanup) means "keep the current pause tier".
     if (consumerPaused !== undefined) {
       consumerPause.current = consumerPaused;

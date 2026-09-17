@@ -48,11 +48,10 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   const [detailResult, setDetail] = useState<{ value: RequestDetail; token: string; tenant: string; requestId: string }>();
   const [error, setError] = useState('');
   const [upstreamError, setUpstreamError] = useState('');
-  const [olderFilteredResultsStale, setOlderFilteredResultsStale] = useState(false);
+  const [filteredResultsStale, setFilteredResultsStale] = useState(false);
   const [imageReviewOpen, setImageReviewOpen] = useState(false);
   const sequence = useRef(0);
   const errorSource = useRef<'detail' | 'load' | 'refresh' | undefined>(undefined);
-  const olderFilteredResultsVisible = useRef(false);
   const loadedHistoryIds = useRef(new Set<string>());
   const requestsRef = useRef(requests);
   const loadingRef = useRef(false);
@@ -78,6 +77,9 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   const detailSequence = useRef(0);
   const detailAbort = useRef<AbortController | null>(null);
   const selectedRequestId = useRef<string | undefined>(undefined);
+  // State mirror of the open detail so the protection effect reruns on
+  // selection changes; a ref alone would not trigger React.
+  const [selectedRequest, setSelectedRequest] = useState<string | undefined>(undefined);
   const refreshedTerminalEvent = useRef<string | undefined>(undefined);
   // Gate during render: effects must not expose a previous credential/tenant's
   // detail for even the first commit after a scope change.
@@ -189,8 +191,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     const currentScope = { token, tenant, filters: nextFilters };
     if (!older) {
       loadedHistoryIds.current.clear();
-      olderFilteredResultsVisible.current = false;
-      setOlderFilteredResultsStale(false);
+      setFilteredResultsStale(false);
       setRequests([]); setHasOlder(false); closeRequestDetail();
     }
     loadingRef.current = true;
@@ -212,7 +213,6 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
           : next.requests);
         setHasOlder(next.next_cursor !== null);
       }
-      if (older && typedFiltersActive(nextFilters) && next.requests.length > 0) olderFilteredResultsVisible.current = true;
     } catch (reason) {
       if (request === sequence.current && !controller.signal.aborted) {
         if (!older) { setRequests([]); setHasOlder(false); }
@@ -242,10 +242,9 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     onProtectRequests?.([]);
     cancelOverflowRefresh();
     loadAbort.current?.abort(); loadAbort.current = null;
-    olderFilteredResultsVisible.current = false;
     errorSource.current = undefined;
     loadingRef.current = false;
-    sequence.current += 1; setFilters(emptyTypedFilterAst); setRequests([]); setDetail(undefined); setHasOlder(false); setLoading(false); setOlderFilteredResultsStale(false); setImageReviewOpen(false); setError(''); setUpstreamError('');
+    sequence.current += 1; setFilters(emptyTypedFilterAst); setRequests([]); setDetail(undefined); setHasOlder(false); setLoading(false); setFilteredResultsStale(false); setImageReviewOpen(false); setError(''); setUpstreamError('');
     if (!token || !tenant) { setUpstreams([]); return () => { cancelOverflowRefresh(); loadAbort.current?.abort(); }; }
     const upstreamRequest = ++upstreamSequence.current;
     void api<UpstreamAccount[]>(`/internal/v1/upstreams${queryForTenant(tenant)}`, token)
@@ -257,15 +256,19 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
 
   useEffect(() => {
     selectedRequestId.current = undefined; refreshedTerminalEvent.current = undefined;
+    setSelectedRequest(undefined);
     detailSequence.current += 1; detailAbort.current?.abort(); detailAbort.current = null; setDetail(undefined);
     return () => { detailSequence.current += 1; detailAbort.current?.abort(); };
   }, [tenant, token]);
 
   useEffect(() => {
-    // Report the pause tier together with the visible ids: while paused the
+    // Report the pause tier together with the protected ids: while paused the
     // hook batch stops publishing revisions entirely but keeps buffering SSE.
-    onProtectRequests?.(requests.map(request => request.request_id), userPaused);
-  }, [requests, userPaused, onProtectRequests]);
+    // The open detail stays protected even after live traffic pushes it out
+    // of the rendered window.
+    const visibleIds = requests.map(request => request.request_id);
+    onProtectRequests?.(selectedRequest && !visibleIds.includes(selectedRequest) ? [...visibleIds, selectedRequest] : visibleIds, userPaused);
+  }, [requests, selectedRequest, userPaused, onProtectRequests]);
   useEffect(() => () => onProtectRequests?.([]), [onProtectRequests]);
 
   useEffect(() => {
@@ -293,10 +296,9 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     // stale hint so the user can explicitly reload filtered history.
     if (streamPaused || liveEvents.size === 0) return;
     if (typedFiltersActive(filters)) {
-      const terminalizedVisiblePending = olderFilteredResultsVisible.current
-        && [...liveEventsRef.current.values()].some((event) => (event.event_kind === 'finished' || event.completed_at != null)
-          && requestsRef.current.some((request) => request.request_id === event.request_id && request.status_code === null));
-      if (terminalizedVisiblePending) setOlderFilteredResultsStale(true);
+      // Any published batch marks filtered results stale: the list itself
+      // stays frozen until the user explicitly refreshes it.
+      setFilteredResultsStale(true);
       return;
     }
     const page = mergeBatchedRequestPage(requestsRef.current, new Map(liveEventsRef.current), hasOlderRef.current, loadedHistoryIds.current);
@@ -310,6 +312,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   async function openRequestDetail(requestId: string) {
     if (selectedRequestId.current !== requestId) setDetail(undefined);
     selectedRequestId.current = requestId;
+    setSelectedRequest(requestId);
     const requestSequence = ++detailSequence.current;
     detailAbort.current?.abort(); const controller = new AbortController(); detailAbort.current = controller;
     try {
@@ -332,6 +335,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
 
   function closeRequestDetail() {
     selectedRequestId.current = undefined;
+    setSelectedRequest(undefined);
     detailSequence.current += 1;
     detailAbort.current?.abort(); detailAbort.current = null;
     setDetail(undefined);
@@ -366,7 +370,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     {error && <div className="notice error" role="alert">{t(errorSource.current === 'detail' ? 'request.detail' : 'request.listSource')}: {error}</div>}
     {upstreamError && <div className="notice error" role="alert">{t('request.upstreamSource')}: {upstreamError}</div>}
     {streamError && <div className="notice error" role="alert">{t('request.streamSource')}: {streamError}</div>}
-    <RequestsPanel requests={requests} upstreams={upstreams} filters={filters} loading={loading} hasOlder={hasOlder} streamState={streamState} token={token} tenant={tenant} olderFilteredResultsStale={olderFilteredResultsStale} requestRefresh={requestRefresh} refreshPaused={userPaused} onToggleRefreshPaused={() => setUserPaused((value) => !value)} historyLoaded={loadedHistoryIds.current.size > 0} imageReviewOpen={imageReviewOpen} onToggleImageReview={() => setImageReviewOpen((open) => !open)}
+    <RequestsPanel requests={requests} upstreams={upstreams} filters={filters} loading={loading} hasOlder={hasOlder} streamState={streamState} token={token} tenant={tenant} filteredResultsStale={filteredResultsStale} requestRefresh={requestRefresh} refreshPaused={userPaused} onToggleRefreshPaused={() => setUserPaused((value) => !value)} historyLoaded={loadedHistoryIds.current.size > 0} imageReviewOpen={imageReviewOpen} onToggleImageReview={() => setImageReviewOpen((open) => !open)}
       onApply={(next) => { setFilters(next); scope.current = { token, tenant, filters: next }; void load(next); }}
       onClear={() => { setFilters(emptyTypedFilterAst); scope.current = { token, tenant, filters: emptyTypedFilterAst }; void load(emptyTypedFilterAst); }}
       onLoadOlder={() => void load(filters, true)} onRefreshFilteredResults={() => void load(filters)} onSelect={selectRequest} onOpenSessions={onOpenSessions} onOpenSession={onOpenSession} />
@@ -377,7 +381,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   </>;
 }
 
-function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, streamState, token, tenant, olderFilteredResultsStale, onApply, onClear, onLoadOlder, onRefreshFilteredResults, onSelect, onOpenSessions, onOpenSession, requestRefresh, refreshPaused = false, onToggleRefreshPaused, historyLoaded, imageReviewOpen, onToggleImageReview }: {
+function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, streamState, token, tenant, filteredResultsStale, onApply, onClear, onLoadOlder, onRefreshFilteredResults, onSelect, onOpenSessions, onOpenSession, requestRefresh, refreshPaused = false, onToggleRefreshPaused, historyLoaded, imageReviewOpen, onToggleImageReview }: {
   requests: RequestView[];
   upstreams: UpstreamAccount[];
   filters: TypedFilterAst;
@@ -386,7 +390,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   streamState: SessionStreamState;
   token: string;
   tenant: string;
-  olderFilteredResultsStale: boolean;
+  filteredResultsStale: boolean;
   historyLoaded: boolean;
   imageReviewOpen: boolean;
   onToggleImageReview: () => void;
@@ -413,15 +417,14 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
       <RequestRefreshControl intervalMs={requestRefresh.intervalMs} onIntervalChange={requestRefresh.onIntervalChange}
         paused={requestRefresh.paused || refreshPaused}
         pausedHint={refreshPaused && !requestRefresh.paused
-          ? (locale === 'zh-CN' ? '已暂停更新：事件接收继续，恢复后合并。' : 'Updates paused: events keep streaming and merge on resume.')
-          : undefined} />
+          ? t('traffic.updatesPausedHint') : undefined} />
       {onToggleRefreshPaused && <span className="request-refresh-pause">
-        <ToggleButton appearance="secondary" checked={refreshPaused} onClick={onToggleRefreshPaused}>{refreshPaused ? (locale === 'zh-CN' ? '恢复更新' : 'Resume updates') : (locale === 'zh-CN' ? '暂停更新' : 'Pause updates')}</ToggleButton>
+        <ToggleButton appearance="secondary" checked={refreshPaused} onClick={onToggleRefreshPaused}>{refreshPaused ? t('traffic.resumeUpdates') : t('traffic.pauseUpdates')}</ToggleButton>
       </span>}
     </div>}
     {historyLoaded && !typedFiltersActive(filters) && <div className="request-refresh-control"><span>{locale === 'zh-CN' ? '正在浏览历史：已显示请求继续更新，新请求暂不插入。' : 'Browsing history: visible requests keep updating; new requests are not inserted.'}</span><Button appearance="subtle" disabled={loading} onClick={onRefreshFilteredResults}>{locale === 'zh-CN' ? '返回最新请求' : 'Return to latest requests'}</Button></div>}
     <TypedFilterBuilder ast={filters} disabled={loading} onApply={onApply} onClear={onClear} scope="requests" token={token} tenant={tenant} upstreams={upstreams} />
-    {olderFilteredResultsStale && <div className="notice warning" role="status">{t('traffic.olderFilteredResultsStale')}<Button appearance="secondary" disabled={loading} onClick={onRefreshFilteredResults}>{t('traffic.refreshFilteredResults')}</Button></div>}
+    {filteredResultsStale && typedFiltersActive(filters) && <div className="notice warning" role="status">{t('traffic.filteredResultsStale')}<Button appearance="secondary" disabled={loading} onClick={onRefreshFilteredResults}>{t('traffic.refreshFilteredResults')}</Button></div>}
     {requests.length > 0 && <section className="metrics request-traffic-metrics" aria-label={t('monitoring.summary')}>
       <AnalyticsMetric {...sampling} label={t('usage.totalTokens')} value={count(summary.totalTokens).text} title={count(summary.totalTokens).title} trend={points.map(point => point.totalTokens)} />
       <AnalyticsMetric {...sampling} label={t('traffic.success')} value={count(summary.successful).text} title={count(summary.successful).title} tone="positive" trend={points.map(point => point.successful)} ratio={summary.successful / summary.requests} />

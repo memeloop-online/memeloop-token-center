@@ -4,6 +4,7 @@ import { mergeLiveRequestEvents, requestViewFromEvent } from './requestTraffic.j
 export const requestRefreshIntervals = [0, 5_000, 30_000, 60_000, 300_000] as const;
 export const defaultRequestRefreshInterval = 5_000;
 export const requestRefreshPreferenceKey = 'mtc.operator.request-refresh-ms.v1';
+export const requestEventCacheCapacity = 2_000;
 export function requestRefreshPreference(value: string | null): number {
   const number = value === null || !value.trim() ? NaN : Number(value);
   return requestRefreshIntervals.some(interval => interval === number) ? number : defaultRequestRefreshInterval;
@@ -38,6 +39,18 @@ export interface RefreshClock {
   cancel: (timer: number) => void;
 }
 
+/** Evict oldest unprotected entries until the cache fits its bound. Returns whether anything was dropped. */
+export function trimRequestEventCache<V>(cache: Map<string, V>, protectedIds: ReadonlySet<string>, capacity = requestEventCacheCapacity): boolean {
+  let evicted = false;
+  for (const id of cache.keys()) {
+    if (cache.size <= capacity + protectedIds.size) break;
+    if (protectedIds.has(id)) continue;
+    cache.delete(id);
+    evicted = true;
+  }
+  return evicted;
+}
+
 /** One timer per batch, never a sliding debounce. Real time still yields between batches. */
 export class RequestRefreshBatch {
   private timer?: number;
@@ -48,16 +61,17 @@ export class RequestRefreshBatch {
   private disposed = false;
   constructor(private interval: number, private clock: RefreshClock,
     private publish: (events: Map<string, RequestEvent>, overflow: boolean) => void,
-    private capacity = 2_000) {}
-  protect(ids: Iterable<string>) { this.protectedIds = new Set(ids); }
+    private capacity = requestEventCacheCapacity) {}
+  protect(ids: Iterable<string>) {
+    this.protectedIds = new Set(ids);
+    // A shrinking protected set tightens the bound immediately; dropped
+    // pending events must surface as overflow on the next publish.
+    if (trimRequestEventCache(this.pending, this.protectedIds, this.capacity)) this.overflow = true;
+  }
   enqueue(event: RequestEvent) {
     if (this.disposed) return;
     this.pending.set(event.request_id, coalesceRequestEvent(this.pending.get(event.request_id), event));
-    if (this.pending.size > this.capacity + this.protectedIds.size) {
-      for (const id of this.pending.keys()) {
-        if (!this.protectedIds.has(id)) { this.pending.delete(id); this.overflow = true; break; }
-      }
-    }
+    if (trimRequestEventCache(this.pending, this.protectedIds, this.capacity)) this.overflow = true;
     this.schedule();
   }
   setInterval(interval: number) { this.interval = interval; this.cancel(); this.schedule(); }

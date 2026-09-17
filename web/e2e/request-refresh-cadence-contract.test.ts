@@ -97,7 +97,7 @@ test('React wiring batches SSE revisions and publishes list and metrics from the
   assert.match(operator, /next\.dispose\(\)/);
   assert.match(page, /summarizeVisibleRequests\(requests\)/);
   assert.match(page, /RequestTable requests=\{requests\}/);
-  assert.match(page, /onProtectRequests\?\.\(requests\.map/);
+  assert.match(page, /requests\.map\(request => request\.request_id\)/);
   assert.match(preference, /visibilitychange/); assert.match(preference, /removeEventListener/);
   assert.match(preference, /localStorage\.setItem/);
 });
