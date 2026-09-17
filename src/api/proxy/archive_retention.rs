@@ -10,7 +10,7 @@ const ENCRYPTED_FIELD: &str = "encrypted_content";
 /// encrypted protocol fields never enter the durable archive.
 pub(super) fn json_body(original: &Bytes, parsed: &Value) -> Result<Bytes, AppError> {
     let mut retained = parsed.clone();
-    if !sanitize_value(&mut retained) {
+    if !sanitize_value(&mut retained, false) {
         return Ok(original.clone());
     }
     serde_json::to_vec(&retained)
@@ -42,7 +42,7 @@ pub(super) fn sse_frame(original: &Bytes) -> Bytes {
     let Ok(mut value) = serde_json::from_slice::<Value>(&data) else {
         return original.clone();
     };
-    if !sanitize_value(&mut value) {
+    if !sanitize_value(&mut value, false) {
         return original.clone();
     }
     let Ok(data) = serde_json::to_vec(&value) else {
@@ -71,21 +71,26 @@ pub(super) fn sse_frame(original: &Bytes) -> Bytes {
     Bytes::from(output)
 }
 
-fn sanitize_value(value: &mut Value) -> bool {
+fn sanitize_value(value: &mut Value, media_context: bool) -> bool {
     match value {
-        Value::Array(values) => values
-            .iter_mut()
-            .fold(false, |changed, value| sanitize_value(value) || changed),
-        Value::Object(object) => sanitize_object(object),
+        Value::Array(values) => {
+            let mut changed = false;
+            for value in values {
+                changed |= sanitize_value(value, media_context);
+            }
+            changed
+        }
+        Value::Object(object) => sanitize_object(object, media_context),
         _ => false,
     }
 }
 
-fn sanitize_object(object: &mut Map<String, Value>) -> bool {
-    let media = object
-        .get("type")
-        .and_then(Value::as_str)
-        .is_some_and(is_media_part);
+fn sanitize_object(object: &mut Map<String, Value>, media_context: bool) -> bool {
+    let media = media_context
+        || object
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(is_media_part);
     let mut changed = false;
     let keys = object.keys().cloned().collect::<Vec<_>>();
     for key in keys {
@@ -115,7 +120,7 @@ fn sanitize_object(object: &mut Map<String, Value>) -> bool {
             changed = true;
             continue;
         }
-        changed |= sanitize_value(value);
+        changed |= sanitize_value(value, media);
     }
     changed
 }
@@ -179,15 +184,20 @@ mod tests {
     #[test]
     fn typed_media_and_encrypted_fields_become_metadata_only() {
         let body = Bytes::from_static(
-            br#"{"input":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"},{"type":"input_audio","data":"BBBB","format":"wav"},{"type":"reasoning","encrypted_content":"opaque"}],"output":[{"type":"image_generation_call","result":"CCCC"}],"tool":{"data":"ordinary"}}"#,
+            br#"{"input":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"},{"type":"input_audio","input_audio":{"data":"BBBB","format":"wav"}},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"DDDD"}},{"type":"reasoning","encrypted_content":"opaque"}],"output":[{"type":"image_generation_call","result":"CCCC"}],"tool":{"data":"ordinary"}}"#,
         );
         let parsed = serde_json::from_slice(&body).unwrap();
         let retained: Value = serde_json::from_slice(&json_body(&body, &parsed).unwrap()).unwrap();
         assert_eq!(retained["input"][0]["image_url"]["retained"], false);
-        assert_eq!(retained["input"][1]["data"]["retained"], false);
-        assert_eq!(retained["input"][1]["format"], "wav");
         assert_eq!(
-            retained["input"][2]["encrypted_content"]["kind"],
+            retained["input"][1]["input_audio"]["data"]["retained"],
+            false
+        );
+        assert_eq!(retained["input"][1]["input_audio"]["format"], "wav");
+        assert_eq!(retained["input"][2]["source"]["data"]["retained"], false);
+        assert_eq!(retained["input"][2]["source"]["media_type"], "image/png");
+        assert_eq!(
+            retained["input"][3]["encrypted_content"]["kind"],
             "encrypted_content"
         );
         assert_eq!(retained["tool"]["data"], "ordinary");
@@ -196,6 +206,7 @@ mod tests {
         assert!(!serde_json::to_string(&retained).unwrap().contains("BBBB"));
         assert!(!serde_json::to_string(&retained).unwrap().contains("opaque"));
         assert!(!serde_json::to_string(&retained).unwrap().contains("CCCC"));
+        assert!(!serde_json::to_string(&retained).unwrap().contains("DDDD"));
     }
 
     #[test]
