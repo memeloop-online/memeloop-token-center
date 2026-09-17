@@ -100,7 +100,8 @@ test('Overview keeps current sections visible through independent endpoint failu
     const metricCards = page.locator('.operator-monitoring-metrics .analytics-metric');
     const tokenMetric = metricCards.first();
     assert.equal(await tokenMetric.locator('.metric-label').textContent(), 'Total tokens');
-    assert.equal(await tokenMetric.locator('.metric-value').textContent(), '12,345', 'total tokens use exact local-number formatting of the backend value');
+    assert.equal(await tokenMetric.locator('.metric-value').textContent(), '12.35K', 'English overview metrics use locale-native compact notation');
+    assert.equal(await tokenMetric.locator('.metric-value').getAttribute('title'), '12,345', 'the compact token metric retains the exact localized backend value');
     assert.equal(await tokenMetric.locator('svg').count(), 0, 'no Monitoring time series exists, so total tokens must not synthesize a trend');
     assert.equal(await tokenMetric.evaluate((element) => getComputedStyle(element).borderTopWidth), '0px', 'statistics use flat surfaces rather than nested card borders');
     const successMetric = metricCards.nth(1);
