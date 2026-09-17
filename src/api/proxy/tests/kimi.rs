@@ -307,7 +307,7 @@ async fn fake_glm_via_chat_provider_uses_strict_chat_contract_and_reverse_maps_t
         0,
         Some("openai-chat-usage-only"),
         "fake-glm-via-chat",
-        "generic-agent-model",
+        "gpt-5.5",
     )
     .await;
 

@@ -26,10 +26,12 @@ pub(in crate::api::proxy) fn retain_pinned_text_candidates(
     Ok(())
 }
 
-fn candidate_allowed_for_model(model: &str, driver: &str, official_codex_responses: bool) -> bool {
-    !official_codex_responses
-        || !crate::provider::is_bundled_codex_model_slug(model)
-        || codex_transport::is_driver(driver)
+fn candidate_allowed_for_multi_agent_request(
+    driver: &str,
+    multi_agent_request: bool,
+    supports_multi_agent: bool,
+) -> bool {
+    !multi_agent_request || codex_transport::is_driver(driver) || supports_multi_agent
 }
 
 pub(in crate::api::proxy) fn candidate_reservation_bounds(
@@ -94,7 +96,7 @@ pub(in crate::api::proxy) struct CandidatePreparationSummary {
     incompatible_usage: usize,
     reservation_metadata_unavailable: usize,
     codex_chat_incompatible: usize,
-    bundled_native_only_skipped: usize,
+    multi_agent_incompatible: usize,
     codex_chat_rejection: Option<String>,
     skipped_incompatible_strict_route: bool,
     skipped_local_protocol_mismatch: bool,
@@ -109,21 +111,22 @@ pub(in crate::api::proxy) async fn next_planned_proxy_candidate(
 ) -> Result<Option<PlannedProxyRoute>, AppError> {
     for candidate in candidates.by_ref() {
         summary.examined += 1;
-        if !candidate_allowed_for_model(
-            request.model,
+        if !candidate_allowed_for_multi_agent_request(
             &candidate.driver,
-            request.codex_multi_agent_v2_client
-                && matches!(request.protocol, Protocol::OpenAiResponses),
+            request.codex_multi_agent_v2_request,
+            request
+                .state
+                .providers
+                .supports_codex_multi_agent_v2(&candidate.driver),
         ) {
-            summary.bundled_native_only_skipped += 1;
+            summary.multi_agent_incompatible += 1;
             tracing::info!(
                 %request.request_id,
                 route_id = %candidate.route_id,
                 upstream_account_id = %candidate.account_id,
-                model = request.model,
                 driver = %candidate.driver,
-                stage = "candidate_bundled_native_only",
-                "proxy skipped a non-native candidate for a bundled Codex model slug"
+                stage = "candidate_multi_agent_incompatible",
+                "proxy skipped a candidate without MultiAgentV2 compatibility"
             );
             continue;
         }
@@ -254,7 +257,7 @@ pub(in crate::api::proxy) async fn next_planned_proxy_candidate(
         incompatible_usage = summary.incompatible_usage,
         reservation_metadata_unavailable = summary.reservation_metadata_unavailable,
         codex_chat_incompatible = summary.codex_chat_incompatible,
-        bundled_native_only_skipped = summary.bundled_native_only_skipped,
+        multi_agent_incompatible = summary.multi_agent_incompatible,
         "authorized candidate preparation exhausted without dispatch"
     );
     Ok(None)
@@ -292,14 +295,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bundled_codex_slugs_are_native_only_for_official_responses() {
-        assert!(!candidate_allowed_for_model("gpt-5.5", "kimi-oauth", true));
-        assert!(candidate_allowed_for_model("gpt-5.5", "kimi-oauth", false));
-        assert!(candidate_allowed_for_model("gpt-5.5", "openai-codex", true));
-        assert!(candidate_allowed_for_model(
-            "kimi-k3-256k",
+    fn multi_agent_requests_require_native_or_declared_compatibility() {
+        assert!(candidate_allowed_for_multi_agent_request(
+            "http-json",
+            false,
+            false
+        ));
+        assert!(candidate_allowed_for_multi_agent_request(
+            "openai-codex",
+            true,
+            false
+        ));
+        assert!(candidate_allowed_for_multi_agent_request(
             "kimi-oauth",
+            true,
             true
+        ));
+        assert!(!candidate_allowed_for_multi_agent_request(
+            "http-json",
+            true,
+            false
         ));
     }
 
