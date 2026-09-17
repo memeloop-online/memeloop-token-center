@@ -114,6 +114,14 @@ fn sanitize_value(value: &mut Value, infer_protocol: bool, media_context: bool) 
             changed
         }
         Value::Object(object) => sanitize_object(object, infer_protocol, media_context),
+        Value::String(text) => {
+            let Some(kind) = inline_media_kind(text) else {
+                return false;
+            };
+            let original_bytes = text.len();
+            *value = omitted(kind, original_bytes);
+            true
+        }
         _ => false,
     }
 }
@@ -427,6 +435,20 @@ mod tests {
         let retained: Value = serde_json::from_slice(&retained).unwrap();
         assert_eq!(retained["image"]["kind"], "image");
         assert_eq!(retained["audio"]["kind"], "audio");
+    }
+
+    #[test]
+    fn inline_media_in_arrays_is_removed_even_inside_opaque_tool_payloads() {
+        let body = Bytes::from_static(
+            br#"{"items":["data:image/png,SECRET"],"tool":{"type":"tool_use","input":["data:audio/wav,OPAQUE"]}}"#,
+        );
+        let retained = retained_request(&body);
+        let retained_text = std::str::from_utf8(&retained).unwrap();
+        assert!(!retained_text.contains("SECRET"));
+        assert!(!retained_text.contains("OPAQUE"));
+        let retained: Value = serde_json::from_slice(&retained).unwrap();
+        assert_eq!(retained["items"][0]["kind"], "image");
+        assert_eq!(retained["tool"]["input"][0]["kind"], "audio");
     }
 
     #[test]
