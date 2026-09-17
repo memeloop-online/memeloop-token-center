@@ -84,7 +84,9 @@ impl Database {
                 COALESCE(signal.ewma_micros,0) AS transient_ewma_micros,
                 COALESCE(signal.last_observed_at,0) AS transient_last_observed_at,
                 COALESCE(signal.recovery_successes,0) AS transient_recovery_successes,
-                COALESCE(signal.revision,0) AS transient_signal_revision
+                COALESCE(signal.revision,0) AS transient_signal_revision,
+                COALESCE(signal.transient_window_ms,0) AS transient_window_ms,
+                COALESCE(signal.window_started_at,0) AS transient_window_started_at
             FROM input
             JOIN model_routes r ON r.id = input.route_id AND r.tenant_id = $1
             JOIN upstream_accounts a ON a.id = input.account_id AND a.tenant_id = $1
@@ -93,7 +95,8 @@ impl Database {
         ), bindings AS (
             SELECT c.route_id, c.account_id, g.id, g.routing_priority, g.strategy_version, g.routing_strategy, 'provider' AS kind, c.health, c.generation,
                    c.transient_sample_count, c.transient_ewma_micros, c.transient_last_observed_at,
-                   c.transient_recovery_successes, c.transient_signal_revision
+                   c.transient_recovery_successes, c.transient_signal_revision,
+                   c.transient_window_ms, c.transient_window_started_at
             FROM candidate_scope c
             JOIN model_route_included_provider_groups inclusion ON inclusion.model_route_id = c.route_id AND inclusion.tenant_id = $1
             JOIN provider_groups g ON g.id = inclusion.provider_group_id AND g.tenant_id = $1
@@ -102,7 +105,8 @@ impl Database {
             UNION ALL
             SELECT c.route_id, c.account_id, g.id, g.routing_priority, g.strategy_version, g.routing_strategy, 'route' AS kind, c.health, c.generation,
                    c.transient_sample_count, c.transient_ewma_micros, c.transient_last_observed_at,
-                   c.transient_recovery_successes, c.transient_signal_revision
+                   c.transient_recovery_successes, c.transient_signal_revision,
+                   c.transient_window_ms, c.transient_window_started_at
             FROM candidate_scope c
             JOIN model_route_group_memberships m ON m.model_route_id = c.route_id AND m.tenant_id = $1
             JOIN route_groups g ON g.id = m.route_group_id AND g.tenant_id = $1
@@ -111,7 +115,8 @@ impl Database {
             SELECT bindings.*, ROW_NUMBER() OVER (PARTITION BY route_id, account_id, generation ORDER BY routing_priority DESC, id ASC, kind ASC) AS position FROM bindings
         ) SELECT route_id, account_id, id, routing_priority, strategy_version, routing_strategy, kind, health, generation,
                  transient_sample_count, transient_ewma_micros, transient_last_observed_at,
-                 transient_recovery_successes, transient_signal_revision
+                 transient_recovery_successes, transient_signal_revision,
+                 transient_window_ms, transient_window_started_at
             FROM ranked WHERE position = 1");
         // Interpolation contains only host-generated placeholder positions;
         // every identifier value remains a bound parameter.
@@ -148,6 +153,8 @@ impl Database {
                             last_observed_at: row.try_get("transient_last_observed_at")?,
                             recovery_successes: row.try_get("transient_recovery_successes")?,
                             revision: row.try_get("transient_signal_revision")?,
+                            transient_window_ms: row.try_get("transient_window_ms")?,
+                            window_started_at: row.try_get("transient_window_started_at")?,
                         },
                         strategy: serde_json::from_str(
                             &row.try_get::<String, _>("routing_strategy")?,

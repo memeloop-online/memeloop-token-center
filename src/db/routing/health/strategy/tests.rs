@@ -208,7 +208,13 @@ async fn transient_signal_invariants(database: &Database) {
         .unwrap();
 
     let failed = database
-        .record_transient_health_sample(account, 3, true)
+        .record_transient_health_sample_at(
+            account,
+            3,
+            true,
+            10_000,
+            crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -216,10 +222,21 @@ async fn transient_signal_invariants(database: &Database) {
     assert_eq!(failed.ewma_micros, TRANSIENT_EWMA_SCALE);
     assert_eq!(failed.recovery_successes, 0);
     assert_eq!(failed.revision, 1);
+    assert_eq!(
+        failed.transient_window_ms,
+        crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS as i64
+    );
+    assert_eq!(failed.window_started_at, 0);
     assert!(failed.sample_count >= 1 && failed.ewma_micros >= 900_000);
 
     let first_success = database
-        .record_transient_health_sample(account, 3, false)
+        .record_transient_health_sample_at(
+            account,
+            3,
+            false,
+            10_001,
+            crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -230,7 +247,13 @@ async fn transient_signal_invariants(database: &Database) {
     assert!(first_success.ewma_micros > 600_000 || first_success.recovery_successes < 2);
 
     let second_success = database
-        .record_transient_health_sample(account, 3, false)
+        .record_transient_health_sample_at(
+            account,
+            3,
+            false,
+            10_002,
+            crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -239,7 +262,13 @@ async fn transient_signal_invariants(database: &Database) {
     assert!(second_success.ewma_micros <= 600_000 && second_success.recovery_successes >= 2);
     assert!(
         database
-            .record_transient_health_sample(account, 2, true)
+            .record_transient_health_sample_at(
+                account,
+                2,
+                true,
+                10_003,
+                crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
+            )
             .await
             .unwrap()
             .is_none(),
@@ -251,7 +280,13 @@ async fn transient_signal_invariants(database: &Database) {
         .await
         .unwrap();
     let rotated = database
-        .record_transient_health_sample(account, 4, false)
+        .record_transient_health_sample_at(
+            account,
+            4,
+            false,
+            10_004,
+            crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -265,6 +300,8 @@ async fn transient_signal_invariants(database: &Database) {
         .bind(0_i64)
         .bind(rotated.last_observed_at.saturating_sub(1))
         .bind(1_i64)
+        .bind(crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS as i64)
+        .bind(0_i64)
         .fetch_one(&database.pool)
         .await
         .unwrap();
@@ -288,6 +325,90 @@ async fn transient_signal_invariants(database: &Database) {
     );
 }
 
+async fn transient_signal_window_invariants(database: &Database, peer: &Database) {
+    database.migrate().await.unwrap();
+    let tenant = Uuid::now_v7();
+    let account = Uuid::now_v7();
+    sqlx::query("INSERT INTO tenants (id, external_id, created_at) VALUES ($1,$1,0)")
+        .bind(tenant.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO upstream_accounts (id,tenant_id,name,driver,auth_kind,config_json,status,credential_generation,created_at,updated_at) VALUES ($1,$2,'window fixture','http-json','none','{}','active',1,0,0)")
+        .bind(account.to_string())
+        .bind(tenant.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+    let first = database
+        .record_transient_health_sample_at(account, 1, true, 10_100, 1_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.sample_count, 1);
+    let same_window = database
+        .record_transient_health_sample_at(account, 1, false, 10_999, 1_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(same_window.sample_count, 2);
+    assert_eq!(same_window.ewma_micros, 750_000);
+
+    let next_window = database
+        .record_transient_health_sample_at(account, 1, false, 11_000, 1_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(next_window.sample_count, 1);
+    assert_eq!(next_window.ewma_micros, 0);
+    assert_eq!(next_window.recovery_successes, 1);
+    assert_eq!(next_window.revision, 3);
+    assert_eq!(next_window.transient_window_ms, 1_000);
+    assert_eq!(next_window.window_started_at, 11_000);
+    assert!(
+        database
+            .record_transient_health_sample_at(account, 1, true, 10_999, 1_000)
+            .await
+            .unwrap()
+            .is_none(),
+        "a late sample from an expired window cannot pollute the current window"
+    );
+    let (wide, narrow) = tokio::join!(
+        database.record_transient_health_sample_at(account, 1, false, 12_000, 2_000),
+        peer.record_transient_health_sample_at(account, 1, true, 12_000, 1_000),
+    );
+    wide.unwrap();
+    narrow.unwrap();
+    let retained = sqlx::query(
+        "SELECT sample_count, ewma_micros, last_observed_at, recovery_successes, revision,
+                transient_window_ms, window_started_at
+           FROM upstream_account_transient_health_signals
+          WHERE upstream_account_id = $1",
+    )
+    .bind(account.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(retained.try_get::<i64, _>("sample_count").unwrap(), 1);
+    assert_eq!(
+        retained.try_get::<i64, _>("ewma_micros").unwrap(),
+        1_000_000
+    );
+    assert_eq!(
+        retained.try_get::<i64, _>("last_observed_at").unwrap(),
+        12_000
+    );
+    assert_eq!(
+        retained.try_get::<i64, _>("transient_window_ms").unwrap(),
+        1_000
+    );
+    assert_eq!(
+        retained.try_get::<i64, _>("window_started_at").unwrap(),
+        12_000
+    );
+}
+
 async fn postgres_blocked_old_generation_cannot_overwrite_rotated_signal(database: &Database) {
     database.migrate().await.unwrap();
     let tenant = Uuid::now_v7();
@@ -304,7 +425,12 @@ async fn postgres_blocked_old_generation_cannot_overwrite_rotated_signal(databas
         .await
         .unwrap();
     database
-        .record_transient_health_sample(account, 3, true)
+        .record_transient_health_sample(
+            account,
+            3,
+            true,
+            crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -332,6 +458,8 @@ async fn postgres_blocked_old_generation_cannot_overwrite_rotated_signal(databas
             .bind(3_i64)
             .bind(TRANSIENT_EWMA_SCALE)
             .bind(300_i64)
+            .bind(0_i64)
+            .bind(crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS as i64)
             .bind(0_i64)
             .fetch_optional(&mut *old_connection)
             .await
@@ -364,7 +492,8 @@ async fn postgres_blocked_old_generation_cannot_overwrite_rotated_signal(databas
     sqlx::query(
         "UPDATE upstream_account_transient_health_signals
             SET credential_generation = 4, sample_count = 1, ewma_micros = 0,
-                last_observed_at = 400, recovery_successes = 1, revision = 1
+                last_observed_at = 400, recovery_successes = 1, revision = 1,
+                transient_window_ms = 60000, window_started_at = 0
           WHERE upstream_account_id = $1",
     )
     .bind(account.to_string())
@@ -425,6 +554,7 @@ async fn sqlite_strategy_admission_preserves_tenant_quota_and_cross_worker_lease
     let peer = Database::connect(&url).await.unwrap();
     invariants(&database, &peer).await;
     transient_signal_invariants(&database).await;
+    transient_signal_window_invariants(&database, &peer).await;
 }
 
 #[tokio::test]
@@ -436,5 +566,6 @@ async fn postgres_strategy_admission_preserves_tenant_quota_and_cross_worker_lea
     let peer = Database::connect(&url).await.unwrap();
     invariants(&database, &peer).await;
     transient_signal_invariants(&database).await;
+    transient_signal_window_invariants(&database, &peer).await;
     postgres_blocked_old_generation_cannot_overwrite_rotated_signal(&database).await;
 }

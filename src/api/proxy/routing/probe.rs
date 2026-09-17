@@ -203,7 +203,13 @@ mod v2_lifecycle_tests {
 
         let first = plugin_signal!(
             database
-                .record_transient_health_sample(account, 1, true)
+                .record_transient_health_sample_at(
+                    account,
+                    1,
+                    true,
+                    1_000,
+                    crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
+                )
                 .await
                 .unwrap()
                 .unwrap()
@@ -224,7 +230,13 @@ mod v2_lifecycle_tests {
 
         let second = plugin_signal!(
             database
-                .record_transient_health_sample(account, 1, true)
+                .record_transient_health_sample_at(
+                    account,
+                    1,
+                    true,
+                    1_001,
+                    crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
+                )
                 .await
                 .unwrap()
                 .unwrap()
@@ -257,7 +269,13 @@ mod v2_lifecycle_tests {
         };
         let first_success = plugin_signal!(
             database
-                .record_transient_health_sample(account, 1, false)
+                .record_transient_health_sample_at(
+                    account,
+                    1,
+                    false,
+                    1_002,
+                    crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
+                )
                 .await
                 .unwrap()
                 .unwrap()
@@ -288,7 +306,13 @@ mod v2_lifecycle_tests {
         };
         let second_success = plugin_signal!(
             database
-                .record_transient_health_sample(account, 1, false)
+                .record_transient_health_sample_at(
+                    account,
+                    1,
+                    false,
+                    1_003,
+                    crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
+                )
                 .await
                 .unwrap()
                 .unwrap()
@@ -697,11 +721,11 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
         } => GroupRoutingOutcome::Authentication,
         UpstreamAttemptTerminal::Failed { .. } => GroupRoutingOutcome::TransientFailure,
     };
-    let signal_enabled = state.group_routing.as_ref().is_some_and(|snapshot| {
-        snapshot.uses_transient_signal(route_id, upstream_account_id, credential_generation)
+    let transient_health_window_ms = state.group_routing.as_ref().and_then(|snapshot| {
+        snapshot.transient_health_window_ms(route_id, upstream_account_id, credential_generation)
     });
     let signal = if let Some(transient_failure) = transient_sample_for_outcome(outcome)
-        && signal_enabled
+        && let Some(window_ms) = transient_health_window_ms
     {
         match state
             .db
@@ -709,20 +733,12 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                 upstream_account_id,
                 credential_generation,
                 transient_failure,
+                window_ms,
             )
             .await
         {
-            Ok(signal) => {
-                signal.map(
-                    |signal| crate::plugin::routing::GroupRoutingTransientSignal {
-                        sample_count: signal.sample_count.max(0) as u64,
-                        ewma_micros: signal.ewma_micros.clamp(0, 1_000_000) as u32,
-                        last_observed_at: signal.last_observed_at.max(0),
-                        recovery_successes: signal.recovery_successes.max(0) as u64,
-                        revision: signal.revision.max(0) as u64,
-                    },
-                )
-            }
+            Ok(signal) => signal
+                .map(|signal| signal.for_group_routing_window(crate::db::unix_millis(), window_ms)),
             Err(error) => {
                 tracing::warn!(%request_id, %upstream_account_id, error_category=error.diagnostic_category(), stage="transient_health_sample", "transient health signal unavailable; native health policy retained");
                 None

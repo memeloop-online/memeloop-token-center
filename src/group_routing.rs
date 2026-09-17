@@ -7,9 +7,10 @@ use crate::{
     AppState,
     error::AppError,
     plugin::routing::{
-        GROUP_ROUTING_V2_VERSION, GroupRoutingCandidate, GroupRoutingDirective, GroupRoutingHealth,
-        GroupRoutingInput, GroupRoutingObserveInput, GroupRoutingOutcome,
-        GroupRoutingTransientPolicy, GroupRoutingTransientSignal,
+        DEFAULT_TRANSIENT_HEALTH_WINDOW_MS, GROUP_ROUTING_V2_VERSION, GroupRoutingCandidate,
+        GroupRoutingDirective, GroupRoutingHealth, GroupRoutingInput, GroupRoutingObserveInput,
+        GroupRoutingOutcome, GroupRoutingTransientPolicy, GroupRoutingTransientSignal,
+        transient_health_window_ms,
     },
     provider::AuthorizedUpstreamCandidate,
 };
@@ -27,6 +28,10 @@ type CandidateKey = (Uuid, Uuid, i64);
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_default_transient_health_window_ms(value: &u64) -> bool {
+    *value == DEFAULT_TRANSIENT_HEALTH_WINDOW_MS
 }
 
 /// The native/no-hook entrance is synchronous: do not add an unbounded
@@ -124,6 +129,15 @@ pub(crate) struct CandidatePolicy {
     transient_signal_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transient_signal: Option<GroupRoutingTransientSignal>,
+    #[serde(
+        default = "default_transient_health_window_ms",
+        skip_serializing_if = "is_default_transient_health_window_ms"
+    )]
+    transient_health_window_ms: u64,
+}
+
+fn default_transient_health_window_ms() -> u64 {
+    DEFAULT_TRANSIENT_HEALTH_WINDOW_MS
 }
 
 pub(crate) struct RequestGroupRouting {
@@ -154,6 +168,17 @@ impl RequestGroupRouting {
             .is_some_and(|policy| policy.transient_signal_enabled)
     }
 
+    pub(crate) fn transient_health_window_ms(
+        &self,
+        route: Uuid,
+        account: Uuid,
+        generation: i64,
+    ) -> Option<u64> {
+        self.policy(route, account, generation)
+            .filter(|policy| policy.transient_signal_enabled)
+            .map(|policy| policy.transient_health_window_ms)
+    }
+
     pub(crate) fn active_transient_policy(
         &self,
         route: Uuid,
@@ -166,14 +191,24 @@ impl RequestGroupRouting {
 }
 
 impl CandidatePolicy {
+    fn current_transient_signal(&self) -> Option<GroupRoutingTransientSignal> {
+        self.transient_signal.map(|signal| {
+            signal.in_current_window(crate::db::unix_millis(), self.transient_health_window_ms)
+        })
+    }
+
     fn has_valid_transient_snapshot(&self) -> bool {
         if self.transient_signal_enabled {
             return self.transient_signal.is_some()
                 && self
                     .transient_policy
-                    .is_some_and(|policy| policy.is_valid());
+                    .is_some_and(|policy| policy.is_valid())
+                && (1_000..=crate::plugin::routing::MAX_TRANSIENT_HEALTH_WINDOW_MS)
+                    .contains(&self.transient_health_window_ms);
         }
-        self.transient_signal.is_none() && self.transient_policy.is_none()
+        self.transient_signal.is_none()
+            && self.transient_policy.is_none()
+            && self.transient_health_window_ms == DEFAULT_TRANSIENT_HEALTH_WINDOW_MS
     }
 
     pub(crate) fn allow_probe(&self) -> bool {
@@ -196,7 +231,12 @@ impl CandidatePolicy {
         if self.candidate.health != GroupRoutingHealth::Transient {
             return None;
         }
-        self.transient_policy.filter(|policy| policy.is_active())
+        self.transient_policy.filter(|policy| {
+            policy.is_active()
+                && self
+                    .current_transient_signal()
+                    .is_some_and(GroupRoutingTransientSignal::has_samples)
+        })
     }
 }
 
@@ -359,6 +399,17 @@ async fn prepare_inner(
         let plugin_id = members[0].2.plugin_id.clone();
         let plugin_is_v2 =
             state.plugins.group_routing_version(&plugin_id) == Some(GROUP_ROUTING_V2_VERSION);
+        let transient_health_window_ms = if plugin_is_v2 {
+            match transient_health_window_ms(&config) {
+                Ok(window_ms) => window_ms,
+                Err(error) => {
+                    tracing::warn!(%request_id, %group_id, %plugin_id, error_category=error.diagnostic_category(), stage="group_routing_native_fallback", reason="invalid_transient_health_window", "group strategy has an invalid transient health window; native policy retained");
+                    continue;
+                }
+            }
+        } else {
+            DEFAULT_TRANSIENT_HEALTH_WINDOW_MS
+        };
         let native_health = state.plugins.group_routing_uses_native_health(&plugin_id);
         let quota_context = if state.plugins.group_routing_uses_quota_context(&plugin_id) {
             match quota::context_for_bucket(&members, &quota_observations, quota_now_ms) {
@@ -405,6 +456,7 @@ async fn prepare_inner(
             candidates: inputs,
             quota_context,
         };
+        let signal_now_ms = crate::db::unix_millis();
         let transient_signals = plugin_is_v2.then(|| {
             members
                 .iter()
@@ -418,13 +470,7 @@ async fn prepare_inner(
                         ))
                         .expect("bucket members originate from the frozen binding snapshot")
                         .transient_signal;
-                    GroupRoutingTransientSignal {
-                        sample_count: signal.sample_count.max(0) as u64,
-                        ewma_micros: signal.ewma_micros.clamp(0, 1_000_000) as u32,
-                        last_observed_at: signal.last_observed_at.max(0),
-                        recovery_successes: signal.recovery_successes.max(0) as u64,
-                        revision: signal.revision.max(0) as u64,
-                    }
+                    signal.for_group_routing_window(signal_now_ms, transient_health_window_ms)
                 })
                 .collect::<Vec<_>>()
         });
@@ -470,25 +516,10 @@ async fn prepare_inner(
                     if !native_health {
                         let frozen_signal =
                             bindings.get(&key).filter(|_| plugin_is_v2).map(|binding| {
-                                GroupRoutingTransientSignal {
-                                    sample_count: binding.transient_signal.sample_count.max(0)
-                                        as u64,
-                                    ewma_micros: binding
-                                        .transient_signal
-                                        .ewma_micros
-                                        .clamp(0, 1_000_000)
-                                        as u32,
-                                    last_observed_at: binding
-                                        .transient_signal
-                                        .last_observed_at
-                                        .max(0),
-                                    recovery_successes: binding
-                                        .transient_signal
-                                        .recovery_successes
-                                        .max(0)
-                                        as u64,
-                                    revision: binding.transient_signal.revision.max(0) as u64,
-                                }
+                                binding.transient_signal.for_group_routing_window(
+                                    signal_now_ms,
+                                    transient_health_window_ms,
+                                )
                             });
                         policies.insert(
                             key,
@@ -502,6 +533,7 @@ async fn prepare_inner(
                                 transient_policy,
                                 transient_signal_enabled: plugin_is_v2,
                                 transient_signal: frozen_signal,
+                                transient_health_window_ms,
                             },
                         );
                     }
@@ -572,7 +604,7 @@ pub(crate) async fn observe_with_signal(
     let execution_signal = transient_signal.or(match outcome {
         GroupRoutingOutcome::HardQuota
         | GroupRoutingOutcome::Authentication
-        | GroupRoutingOutcome::Cancelled => policy.transient_signal,
+        | GroupRoutingOutcome::Cancelled => policy.current_transient_signal(),
         GroupRoutingOutcome::Success | GroupRoutingOutcome::TransientFailure => None,
     });
     match crate::api::plugin_execution::run_group(

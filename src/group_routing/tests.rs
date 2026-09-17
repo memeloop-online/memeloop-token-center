@@ -213,6 +213,7 @@ fn policy(tenant: Uuid, route: Uuid, account: Uuid) -> CandidatePolicy {
         transient_policy: None,
         transient_signal_enabled: false,
         transient_signal: None,
+        transient_health_window_ms: DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
     }
 }
 
@@ -244,6 +245,20 @@ async fn native_fallback_has_no_implicit_controls_and_policy_identity_is_exact()
     assert!(
         hard.active_transient_policy().is_none(),
         "hard quota recovery remains core-owned"
+    );
+    let mut expired = policy(snapshot.tenant_id, Uuid::now_v7(), Uuid::now_v7());
+    expired.transient_policy = hard.transient_policy;
+    expired.transient_signal_enabled = true;
+    expired.transient_signal = Some(GroupRoutingTransientSignal {
+        sample_count: 1,
+        ewma_micros: 1,
+        last_observed_at: 1,
+        recovery_successes: 0,
+        revision: 1,
+    });
+    assert!(
+        expired.active_transient_policy().is_none(),
+        "expired history cannot keep an active breaker half-open"
     );
     assert!(snapshot.policy(Uuid::now_v7(), account, 3).is_none());
     assert!(snapshot.policy(route, Uuid::now_v7(), 3).is_none());
