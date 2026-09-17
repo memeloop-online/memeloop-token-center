@@ -177,9 +177,14 @@ impl ProxyMemoryReservation {
         body: &[u8],
     ) -> Option<ArchiveOutputMemory> {
         let nodes = JsonMemoryScanner::default().observe(body);
+        // SSE retention simultaneously owns bounded framing bytes/lines,
+        // joined data, a parsed Value, serialized retained data, and the
+        // reconstructed event. Charge all six byte-sized copies plus tree
+        // nodes before parsing; the producer queue acquires its own permit
+        // when the final Bytes is handed off.
         let bytes = body
             .len()
-            .checked_mul(3)?
+            .checked_mul(6)?
             .checked_add(nodes.checked_mul(256)?)?;
         self.try_reserve_archive_output(bytes)
     }
@@ -666,6 +671,22 @@ mod tests {
         drop(permit);
         drop(archive);
         assert_eq!(budget.snapshot().0, 0);
+
+        let large_frame = vec![b'x'; 64 * 1024];
+        let insufficient = ProxyMemoryBudget::new(6 * 64 * 1024);
+        assert!(
+            insufficient
+                .reservation()
+                .try_reserve_archive_json_transform(&large_frame)
+                .is_none()
+        );
+        let sufficient = ProxyMemoryBudget::new(8 * 64 * 1024);
+        assert!(
+            sufficient
+                .reservation()
+                .try_reserve_archive_json_transform(&large_frame)
+                .is_some()
+        );
     }
 
     #[test]

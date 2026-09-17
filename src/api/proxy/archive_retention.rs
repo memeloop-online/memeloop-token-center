@@ -70,7 +70,7 @@ pub(super) fn sse_frame(original: &Bytes) -> Bytes {
             serde_json::to_vec(&metadata_only_value("retention_projection", data.len()))
                 .unwrap_or_else(|_| br#"{"retained":false}"#.to_vec());
         if retained_data.len() > data.len() {
-            retained_data = br#"{"retained":false}"#.to_vec();
+            retained_data = b"null".to_vec();
         }
     }
 
@@ -79,7 +79,12 @@ pub(super) fn sse_frame(original: &Bytes) -> Bytes {
     for line in &event.lines {
         if crate::api::sse::is_sse_field_line(&line.value, b"data") {
             if !wrote_data {
-                output.extend_from_slice(b"data: ");
+                let prefix = if line.value.starts_with(b"data: ") {
+                    b"data: ".as_slice()
+                } else {
+                    b"data:".as_slice()
+                };
+                output.extend_from_slice(prefix);
                 output.extend_from_slice(&retained_data);
                 output.extend_from_slice(&line.ending);
                 wrote_data = true;
@@ -93,6 +98,9 @@ pub(super) fn sse_frame(original: &Bytes) -> Bytes {
         return original.clone();
     }
     output.extend_from_slice(&event.terminator);
+    if output.len() > original.len() {
+        return Bytes::from_static(b"data:null\n\n");
+    }
     Bytes::from(output)
 }
 
@@ -512,6 +520,21 @@ mod tests {
     }
 
     #[test]
+    fn sse_archive_large_visible_text_and_short_secret_stays_bounded() {
+        let visible = "v".repeat(192 * 1024);
+        let delivered = Bytes::from(format!(
+            "data: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"compaction\",\"encrypted_content\":\"s\",\"summary\":[{{\"text\":\"{visible}\"}}]}}}}\n\n"
+        ));
+        let archived = sse_frame(&delivered);
+        assert!(archived.len() <= delivered.len());
+        assert!(
+            !std::str::from_utf8(&archived)
+                .unwrap()
+                .contains("encrypted_content\":\"s")
+        );
+    }
+
+    #[test]
     fn duplicate_sse_payload_fails_closed() {
         let delivered = Bytes::from_static(
             b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"SECRET\",\"encrypted_content\":null}}\n\n",
@@ -520,5 +543,13 @@ mod tests {
         let archived = std::str::from_utf8(&archived).unwrap();
         assert!(!archived.contains("SECRET"));
         assert!(archived.contains("ambiguous_json"));
+    }
+
+    #[test]
+    fn short_duplicate_sse_without_space_never_expands() {
+        let delivered = Bytes::from_static(b"data:{\"a\":0,\"a\":0}\n\n");
+        let archived = sse_frame(&delivered);
+        assert_eq!(archived, Bytes::from_static(b"data:null\n\n"));
+        assert!(archived.len() <= delivered.len());
     }
 }
