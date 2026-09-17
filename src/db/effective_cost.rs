@@ -16,9 +16,7 @@ pub(crate) fn effective_displayed_cost_micros(
     let terminal_failure = status_code.is_some_and(|code| {
         !(200..400).contains(&code) || error_code.is_some_and(|value| !value.is_empty())
     });
-    if terminal_failure
-        && usage_basis == Some("not_observed")
-    {
+    if terminal_failure && usage_basis == Some("not_observed") {
         0
     } else {
         cost_micros
@@ -55,7 +53,10 @@ mod tests {
             effective_displayed_cost_micros(594, Some(503), None, Some("provider_reported")),
             594
         );
-        assert_eq!(effective_displayed_cost_micros(594, Some(503), None, None), 594);
+        assert_eq!(
+            effective_displayed_cost_micros(594, Some(503), None, None),
+            594
+        );
         assert_eq!(
             effective_displayed_cost_micros(
                 594,

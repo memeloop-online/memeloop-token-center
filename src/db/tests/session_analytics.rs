@@ -463,7 +463,10 @@ async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_histor
         .find(|request| request.request.request_id == cancelled_request)
         .expect("2xx error-code session request");
     assert_eq!(request.request.status_code, Some(200));
-    assert_eq!(request.request.error_code.as_deref(), Some("client_cancelled"));
+    assert_eq!(
+        request.request.error_code.as_deref(),
+        Some("client_cancelled")
+    );
     assert_eq!(request.request.cost, "0");
     assert_eq!(request.request.billing.cost.as_deref(), Some("0"));
 }
