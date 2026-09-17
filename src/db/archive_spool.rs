@@ -407,6 +407,7 @@ impl Database {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) async fn append_response_archive_spool(
         &self,
         identity: ArchiveSpoolIdentity,
@@ -414,12 +415,52 @@ impl Database {
         byte_count: i64,
         ciphertext: &str,
     ) -> Result<bool, AppError> {
+        self.append_response_archive_spool_batch(
+            identity,
+            &[ArchiveSpoolChunk {
+                seq,
+                byte_count,
+                ciphertext: ciphertext.to_owned(),
+            }],
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn append_response_archive_spool_batch(
+        &self,
+        identity: ArchiveSpoolIdentity,
+        chunks: &[ArchiveSpoolChunk],
+    ) -> Result<bool, AppError> {
+        let Some(first) = chunks.first() else {
+            return Ok(spool_write_rejected(identity, "append", "invalid_chunk"));
+        };
+        self.append_response_archive_spool_batch_with(identity, first.seq, chunks.len(), |seq| {
+            let offset = usize::try_from(seq - first.seq).map_err(|_| AppError::Internal)?;
+            let chunk = chunks.get(offset).ok_or(AppError::Internal)?;
+            Ok(ArchiveSpoolChunk {
+                seq: chunk.seq,
+                byte_count: chunk.byte_count,
+                ciphertext: chunk.ciphertext.clone(),
+            })
+        })
+        .await
+    }
+
+    pub(crate) async fn append_response_archive_spool_batch_with<F>(
+        &self,
+        identity: ArchiveSpoolIdentity,
+        first_seq: i64,
+        chunk_count: usize,
+        mut next_chunk: F,
+    ) -> Result<bool, AppError>
+    where
+        F: FnMut(i64) -> Result<ArchiveSpoolChunk, AppError> + Send,
+    {
         let purpose = BufferedArchivePurpose::Response;
-        if seq < 0
-            || byte_count <= 0
-            || byte_count > PLAIN_LIMIT
-            || ciphertext.is_empty()
-            || ciphertext.len() > CIPHER_CHUNK_LIMIT
+        if first_seq < 0
+            || chunk_count == 0
+            || chunk_count > crate::response_archive_spool::CAPTURE_DATABASE_BATCH_CHUNKS
         {
             return Ok(spool_write_rejected(identity, "append", "invalid_chunk"));
         }
@@ -447,34 +488,87 @@ impl Database {
             ));
         }
         let count: i64 = row.try_get("chunk_count")?;
-        if seq < count {
-            let replay = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT ciphertext, byte_count FROM response_archive_spool_chunks WHERE request_id = $1 AND seq = $2")))
-                .bind(identity.request_id.to_string()).bind(seq).fetch_optional(&mut *tx).await?;
-            let accepted = replay.is_some_and(|r| {
-                r.get::<String, _>("ciphertext") == ciphertext
-                    && r.get::<i64, _>("byte_count") == byte_count
-            });
+        let batch_count = i64::try_from(chunk_count).map_err(|_| AppError::Internal)?;
+        let validate = |chunk: &ArchiveSpoolChunk, expected_seq: i64| {
+            chunk.seq == expected_seq
+                && chunk.byte_count > 0
+                && chunk.byte_count <= PLAIN_LIMIT
+                && !chunk.ciphertext.is_empty()
+                && chunk.ciphertext.len() <= CIPHER_CHUNK_LIMIT
+        };
+        if first_seq < count {
+            let end = first_seq
+                .checked_add(batch_count)
+                .ok_or(AppError::Internal)?;
+            let mut accepted = end <= count;
+            if accepted {
+                for offset in 0..batch_count {
+                    let expected_seq = first_seq.checked_add(offset).ok_or(AppError::Internal)?;
+                    let chunk = next_chunk(expected_seq)?;
+                    if !validate(&chunk, expected_seq) {
+                        accepted = false;
+                        break;
+                    }
+                    let replay = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT ciphertext, byte_count FROM response_archive_spool_chunks WHERE request_id = $1 AND seq = $2")))
+                        .bind(identity.request_id.to_string()).bind(chunk.seq).fetch_optional(&mut *tx).await?;
+                    accepted &= replay.is_some_and(|row| {
+                        row.get::<String, _>("ciphertext") == chunk.ciphertext.as_str()
+                            && row.get::<i64, _>("byte_count") == chunk.byte_count
+                    });
+                    if !accepted {
+                        break;
+                    }
+                }
+            }
             if !accepted {
                 spool_write_rejected(identity, "append", "replay_mismatch");
             }
             return Ok(accepted);
         }
-        if seq != count
-            || count >= CHUNK_LIMIT
-            || row.try_get::<i64, _>("byte_count")? > PLAIN_LIMIT - byte_count
-        {
+        if first_seq != count || count > CHUNK_LIMIT - batch_count {
             return Ok(spool_write_rejected(
                 identity,
                 "append",
                 "sequence_or_plain_capacity",
             ));
         }
-        // Accounting includes a fixed row/index overhead, not just ciphertext.
-        let cipher_bytes = ciphertext.len() as i64 + CHUNK_OVERHEAD;
-        sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "INSERT INTO response_archive_spool_chunks (request_id, seq, ciphertext, byte_count) VALUES ($1, $2, $3, $4)")))
-            .bind(identity.request_id.to_string()).bind(seq).bind(ciphertext).bind(byte_count).execute(&mut *tx).await?;
-        sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET chunk_count = chunk_count + 1, byte_count = byte_count + $1, cipher_bytes = cipher_bytes + $2, updated_at = $3, expires_at = $4 WHERE request_id = $5")))
-            .bind(byte_count).bind(cipher_bytes).bind(now).bind(now + CAPTURE_TTL).bind(identity.request_id.to_string()).execute(&mut *tx).await?;
+        let existing_bytes = row.try_get::<i64, _>("byte_count")?;
+        let mut byte_count = 0_i64;
+        let mut cipher_bytes = 0_i64;
+        for offset in 0..batch_count {
+            let expected_seq = first_seq.checked_add(offset).ok_or(AppError::Internal)?;
+            let chunk = next_chunk(expected_seq)?;
+            if !validate(&chunk, expected_seq) {
+                return Ok(spool_write_rejected(identity, "append", "invalid_chunk"));
+            }
+            byte_count = byte_count
+                .checked_add(chunk.byte_count)
+                .ok_or(AppError::Internal)?;
+            if existing_bytes > PLAIN_LIMIT - byte_count {
+                return Ok(spool_write_rejected(
+                    identity,
+                    "append",
+                    "sequence_or_plain_capacity",
+                ));
+            }
+            cipher_bytes = cipher_bytes
+                .checked_add(
+                    i64::try_from(chunk.ciphertext.len()).map_err(|_| AppError::Internal)?
+                        + CHUNK_OVERHEAD,
+                )
+                .ok_or(AppError::Internal)?;
+            // Insert each prepared chunk immediately. The transaction remains
+            // atomic, while the caller can release its plaintext before the
+            // next ciphertext is prepared instead of retaining both batches.
+            sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "INSERT INTO response_archive_spool_chunks (request_id, seq, ciphertext, byte_count) VALUES ($1, $2, $3, $4)")))
+                .bind(identity.request_id.to_string())
+                .bind(chunk.seq)
+                .bind(chunk.ciphertext)
+                .bind(chunk.byte_count)
+                .execute(&mut *tx).await?;
+        }
+        sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET chunk_count = chunk_count + $1, byte_count = byte_count + $2, cipher_bytes = cipher_bytes + $3, updated_at = $4, expires_at = $5 WHERE request_id = $6")))
+            .bind(batch_count).bind(byte_count).bind(cipher_bytes).bind(now).bind(now + CAPTURE_TTL).bind(identity.request_id.to_string()).execute(&mut *tx).await?;
         hold.phase("budget_update");
         let budget = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1 WHERE singleton = 1 AND cipher_bytes <= $2")))
             .bind(cipher_bytes).bind(CIPHER_LIMIT - cipher_bytes).execute(&mut *tx).await?;

@@ -350,12 +350,18 @@ pub(crate) struct ResponseArchiveProducer {
     identity: ArchiveSpoolIdentity,
     #[cfg(test)]
     state: AppState,
-    sender: Option<tokio::sync::mpsc::Sender<Bytes>>,
+    sender: Option<tokio::sync::mpsc::Sender<QueuedArchiveChunk>>,
+    chunk_memory: Arc<tokio::sync::Semaphore>,
     terminal: Option<tokio::sync::oneshot::Sender<Bytes>>,
     pending: Vec<u8>,
     writer: super::OwnedTask<()>,
     active: Arc<AtomicBool>,
     _queue_memory: Arc<CaptureQueueMemory>,
+}
+
+struct QueuedArchiveChunk {
+    bytes: Bytes,
+    _memory: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 pub(crate) struct ResponseArchiveSettlement {
@@ -463,6 +469,9 @@ impl ResponseArchiveProducer {
         let queue_memory = Arc::new(CaptureQueueMemory {
             reservation: memory,
         });
+        let chunk_memory = Arc::new(tokio::sync::Semaphore::new(
+            super::CAPTURE_DATABASE_BATCH_CHUNKS,
+        ));
         let (sender, receiver) = tokio::sync::mpsc::channel(super::CAPTURE_QUEUE_CHUNKS);
         let (terminal, terminal_receiver) = tokio::sync::oneshot::channel();
         let active = Arc::new(AtomicBool::new(true));
@@ -508,6 +517,7 @@ impl ResponseArchiveProducer {
             #[cfg(test)]
             state: state.clone(),
             sender: Some(sender),
+            chunk_memory,
             terminal: Some(terminal),
             pending: Vec::with_capacity(super::CHUNK_BYTES),
             writer,
@@ -554,8 +564,18 @@ impl ResponseArchiveProducer {
                             return false;
                         }
                     };
+                    let memory = match self.chunk_memory.clone().try_acquire_owned() {
+                        Ok(memory) => memory,
+                        Err(_) => {
+                            self.abandon("queue_capacity");
+                            return false;
+                        }
+                    };
                     let full = Bytes::from(std::mem::take(&mut self.pending));
-                    permit.send(full);
+                    permit.send(QueuedArchiveChunk {
+                        bytes: full,
+                        _memory: Some(memory),
+                    });
                     self.pending = Vec::with_capacity(super::CHUNK_BYTES);
                 }
             }
@@ -634,46 +654,98 @@ impl ResponseArchiveWriter {
         })
     }
 
-    async fn append_chunk(&mut self, bytes: &[u8]) -> Result<(), AppError> {
-        let ciphertext = super::cipher::seal_for_purpose_with_compression(
-            self.identity,
-            self.seq,
-            bytes,
-            self.state.config.key_pepper.as_bytes(),
-            super::BufferedArchivePurpose::Response,
-            self.compression_enabled,
-        ).inspect_err(|error| {
-            tracing::warn!(request_id = %self.identity.request_id, phase = "response_spool_encrypt", error_category = error.diagnostic_category(), "response archive chunk encryption failed");
+    async fn append_chunks(&mut self, chunks: Vec<QueuedArchiveChunk>) -> Result<(), AppError> {
+        if chunks.is_empty() || chunks.len() > super::CAPTURE_DATABASE_BATCH_CHUNKS {
+            return Err(AppError::Internal);
+        }
+        let chunk_count = chunks.len();
+        let batch_bytes = chunks.iter().try_fold(0_i64, |total, chunk| {
+            total
+                .checked_add(i64::try_from(chunk.bytes.len()).map_err(|_| AppError::Internal)?)
+                .ok_or(AppError::Internal)
         })?;
-        let byte_count = i64::try_from(bytes.len()).map_err(|_| AppError::Internal)?;
-        let append_started = std::time::Instant::now();
-        let appended = observe_writer_database(
-            self.identity,
-            "response_spool_append",
-            byte_count,
-            self.state.db.append_response_archive_spool(
-                self.identity,
-                self.seq,
-                byte_count,
-                &ciphertext,
-            ),
-        )
-        .await;
-        let elapsed = append_started.elapsed();
+        let mut chunks = chunks.into_iter();
+        let identity = self.identity;
+        let compression_enabled = self.compression_enabled;
+        let pepper = self.state.config.key_pepper.clone();
+        let appended = {
+            let append_started = std::time::Instant::now();
+            // The database requests one chunk at a time and inserts it before
+            // requesting the next. Sealing therefore replaces one permitted
+            // plaintext with one transient ciphertext; it never retains four
+            // plaintexts and four ciphertexts together. Once the plaintext
+            // permit is released, a producer refill remains inside the same
+            // four-complete-chunk envelope.
+            let result = observe_writer_database(
+                identity,
+                "response_spool_append",
+                batch_bytes,
+                self.state.db.append_response_archive_spool_batch_with(
+                    identity,
+                    self.seq,
+                    chunk_count,
+                    move |seq| {
+                        let QueuedArchiveChunk {
+                            bytes,
+                            _memory: memory,
+                        } =
+                            chunks.next().ok_or(AppError::Internal)?;
+                        let byte_count =
+                            i64::try_from(bytes.len()).map_err(|_| AppError::Internal)?;
+                        let ciphertext = super::cipher::seal_for_purpose_with_compression(
+                            identity,
+                            seq,
+                            &bytes,
+                            pepper.as_bytes(),
+                            super::BufferedArchivePurpose::Response,
+                            compression_enabled,
+                        )
+                        .inspect_err(|error| {
+                            tracing::warn!(request_id = %identity.request_id, phase = "response_spool_encrypt", error_category = error.diagnostic_category(), "response archive chunk encryption failed");
+                        })?;
+                        drop(bytes);
+                        drop(memory);
+                        Ok(crate::db::ArchiveSpoolChunk {
+                            seq,
+                            byte_count,
+                            ciphertext,
+                        })
+                    },
+                ),
+            )
+            .await;
+            let elapsed = append_started.elapsed();
+            self.append_wait += elapsed;
+            self.max_append_wait = self.max_append_wait.max(elapsed);
+            result
+        };
         self.append_attempts += 1;
-        self.append_wait += elapsed;
-        self.max_append_wait = self.max_append_wait.max(elapsed);
         if !appended? {
             return Err(AppError::Internal);
         }
-        self.seq += 1;
-        self.bytes += byte_count;
+        self.seq = self
+            .seq
+            .checked_add(i64::try_from(chunk_count).map_err(|_| AppError::Internal)?)
+            .ok_or(AppError::Internal)?;
+        self.bytes = self
+            .bytes
+            .checked_add(batch_bytes)
+            .ok_or(AppError::Internal)?;
         Ok(())
+    }
+
+    async fn append_chunk(&mut self, bytes: Bytes) -> Result<(), AppError> {
+        self.append_chunks(vec![QueuedArchiveChunk {
+            bytes,
+            _memory: None,
+        }])
+        .await
     }
 
     #[cfg(test)]
     pub(super) async fn append_for_test(&mut self, chunks: Vec<Bytes>) -> Result<(), AppError> {
         let mut buffered = Vec::with_capacity(super::CHUNK_BYTES);
+        let mut batch = Vec::with_capacity(super::CAPTURE_DATABASE_BATCH_CHUNKS);
         for chunk in chunks {
             let mut remaining = chunk.as_ref();
             while !remaining.is_empty() {
@@ -681,15 +753,32 @@ impl ResponseArchiveWriter {
                 buffered.extend_from_slice(&remaining[..take]);
                 remaining = &remaining[take..];
                 if buffered.len() == super::CHUNK_BYTES {
-                    self.append_chunk(&buffered).await?;
-                    buffered.clear();
+                    batch.push(QueuedArchiveChunk {
+                        bytes: Bytes::from(std::mem::take(&mut buffered)),
+                        _memory: None,
+                    });
+                    if batch.len() == super::CAPTURE_DATABASE_BATCH_CHUNKS {
+                        self.append_chunks(std::mem::take(&mut batch)).await?;
+                        batch = Vec::with_capacity(super::CAPTURE_DATABASE_BATCH_CHUNKS);
+                    }
                 }
             }
         }
         if !buffered.is_empty() {
-            self.append_chunk(&buffered).await?;
+            batch.push(QueuedArchiveChunk {
+                bytes: Bytes::from(buffered),
+                _memory: None,
+            });
+        }
+        if !batch.is_empty() {
+            self.append_chunks(batch).await?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn append_state_for_test(&self) -> (u64, i64, i64) {
+        (self.append_attempts, self.seq, self.bytes)
     }
 
     async fn seal_inner(self) -> Result<(), AppError> {
@@ -723,7 +812,7 @@ enum WriterOutcome {
 async fn run_response_archive_writer(
     state: AppState,
     identity: ArchiveSpoolIdentity,
-    mut receiver: tokio::sync::mpsc::Receiver<Bytes>,
+    mut receiver: tokio::sync::mpsc::Receiver<QueuedArchiveChunk>,
     terminal: tokio::sync::oneshot::Receiver<Bytes>,
     active: Arc<AtomicBool>,
 ) -> Result<WriterOutcome, AppError> {
@@ -732,11 +821,20 @@ async fn run_response_archive_writer(
     let mut writer = ResponseArchiveWriter::begin_inner(state.clone(), identity).await?;
     #[cfg(test)]
     pause_begin_ack_for_test(&state).await;
-    while let Some(bytes) = receiver.recv().await {
+    while let Some(first) = receiver.recv().await {
         if !active.load(Ordering::Acquire) {
             return Ok(writer_interrupted(identity, "abandoned_before_append"));
         }
-        writer.append_chunk(&bytes).await?;
+        let mut batch = Vec::with_capacity(super::CAPTURE_DATABASE_BATCH_CHUNKS);
+        batch.push(first);
+        while batch.len() < super::CAPTURE_DATABASE_BATCH_CHUNKS {
+            match receiver.try_recv() {
+                Ok(chunk) => batch.push(chunk),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        writer.append_chunks(batch).await?;
     }
     let Ok(tail) = terminal.await else {
         return Ok(writer_interrupted(identity, "terminal_sender_dropped"));
@@ -745,7 +843,7 @@ async fn run_response_archive_writer(
         return Ok(writer_interrupted(identity, "abandoned_before_tail"));
     }
     if !tail.is_empty() {
-        writer.append_chunk(&tail).await?;
+        writer.append_chunk(tail).await?;
     }
     if !active.load(Ordering::Acquire) {
         return Ok(writer_interrupted(identity, "abandoned_before_seal"));

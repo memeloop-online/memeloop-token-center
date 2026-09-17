@@ -797,6 +797,139 @@ async fn identity_sequence_replay_and_exact_quota() {
 }
 
 #[tokio::test]
+async fn streaming_batch_updates_budget_once_preserves_sequence_and_replays_exactly() {
+    let (_dir, db, id) = fixture().await;
+    terminal(&db, id).await;
+    assert!(db.begin_response_archive_spool(id).await.unwrap());
+    sqlx::raw_sql(
+        "CREATE TABLE budget_update_audit (marker INTEGER NOT NULL); \
+         CREATE TRIGGER audit_streaming_batch_budget AFTER UPDATE ON response_archive_spool_budget \
+         BEGIN INSERT INTO budget_update_audit (marker) VALUES (1); END;",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let chunks = [
+        ArchiveSpoolChunk {
+            seq: 0,
+            byte_count: 1,
+            ciphertext: "a".into(),
+        },
+        ArchiveSpoolChunk {
+            seq: 1,
+            byte_count: 2,
+            ciphertext: "bb".into(),
+        },
+        ArchiveSpoolChunk {
+            seq: 2,
+            byte_count: 3,
+            ciphertext: "ccc".into(),
+        },
+        ArchiveSpoolChunk {
+            seq: 3,
+            byte_count: 4,
+            ciphertext: "dddd".into(),
+        },
+    ];
+    assert!(
+        db.append_response_archive_spool_batch(id, &chunks)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM budget_update_audit")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        1,
+        "one batch must acquire and update the singleton budget once"
+    );
+    let rows = sqlx::query(
+        "SELECT seq, byte_count, ciphertext FROM response_archive_spool_chunks ORDER BY seq",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 4);
+    for (expected, row) in chunks.iter().zip(rows) {
+        assert_eq!(row.get::<i64, _>("seq"), expected.seq);
+        assert_eq!(row.get::<i64, _>("byte_count"), expected.byte_count);
+        assert_eq!(row.get::<String, _>("ciphertext"), expected.ciphertext);
+    }
+    let accounted = SPOOL_OVERHEAD
+        + chunks
+            .iter()
+            .map(|chunk| chunk.ciphertext.len() as i64 + CHUNK_OVERHEAD)
+            .sum::<i64>();
+    assert_eq!(budget(&db).await, accounted);
+
+    assert!(
+        db.append_response_archive_spool_batch(id, &chunks)
+            .await
+            .unwrap()
+    );
+    assert_eq!(budget(&db).await, accounted);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM budget_update_audit")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        1,
+        "an exact replay must not charge or update the singleton budget again"
+    );
+}
+
+#[tokio::test]
+async fn streaming_batch_budget_failure_rolls_back_every_chunk_and_spool_counter() {
+    let (_dir, db, id) = fixture().await;
+    terminal(&db, id).await;
+    assert!(db.begin_response_archive_spool(id).await.unwrap());
+    let before = budget(&db).await;
+    sqlx::raw_sql(
+        "CREATE TRIGGER fail_streaming_batch_budget BEFORE UPDATE ON response_archive_spool_budget \
+         BEGIN SELECT RAISE(ABORT, 'injected_batch_budget_failure'); END;",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let chunks = [
+        ArchiveSpoolChunk {
+            seq: 0,
+            byte_count: 8,
+            ciphertext: "first".into(),
+        },
+        ArchiveSpoolChunk {
+            seq: 1,
+            byte_count: 9,
+            ciphertext: "second".into(),
+        },
+    ];
+    assert!(
+        db.append_response_archive_spool_batch(id, &chunks)
+            .await
+            .is_err()
+    );
+    assert_eq!(budget(&db).await, before);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM response_archive_spool_chunks")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        0
+    );
+    let spool = sqlx::query(
+        "SELECT chunk_count, byte_count, cipher_bytes FROM response_archive_spools WHERE request_id = $1",
+    )
+    .bind(id.request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(spool.get::<i64, _>("chunk_count"), 0);
+    assert_eq!(spool.get::<i64, _>("byte_count"), 0);
+    assert_eq!(spool.get::<i64, _>("cipher_bytes"), SPOOL_OVERHEAD);
+}
+
+#[tokio::test]
 async fn gap_cleanup_immediately_releases_exact_cipher_bytes_and_preserves_audit() {
     let (_dir, db, id) = fixture().await;
     assert!(db.begin_response_archive_spool(id).await.unwrap());

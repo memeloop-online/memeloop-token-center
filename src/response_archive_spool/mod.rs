@@ -57,11 +57,13 @@ impl BufferedArchivePurpose {
 
 pub(crate) const CHUNK_BYTES: usize = 64 * 1024;
 pub(crate) const CAPTURE_INSERT_BATCH_CHUNKS: usize = 16;
-// One partial chunk remains in the proxy task, at most three complete chunks
-// wait in the channel, and the writer owns at most one database-bound chunk.
-// The full five-chunk envelope is charged to the request's existing memory
-// reservation before the writer starts.
+// One partial chunk remains in the proxy task. Four permits bound complete
+// plaintext chunks across the channel and writer together. Batch sealing
+// releases each plaintext together with its permit; any producer refill then
+// replaces that freed slot. The five-chunk plaintext envelope stays charged,
+// with only the legacy writer's one-chunk ciphertext transient above it.
 const CAPTURE_QUEUE_CHUNKS: usize = 3;
+pub(crate) const CAPTURE_DATABASE_BATCH_CHUNKS: usize = CAPTURE_QUEUE_CHUNKS + 1;
 const CAPTURE_MEMORY_BYTES: usize = CHUNK_BYTES * 5;
 
 struct OwnedTask<T: Send + 'static> {
