@@ -652,6 +652,14 @@ async fn streaming_writer_batches_four_chunks_without_growing_its_memory_reserva
         (super::CAPTURE_DATABASE_BATCH_CHUNKS + 1) * super::CHUNK_BYTES,
         "the batch uses four complete-chunk permits plus the producer's partial chunk"
     );
+    let maximum_ciphertext = super::cipher::sealed_len(super::CHUNK_BYTES).unwrap();
+    let legacy_peak_bound = super::CAPTURE_MEMORY_BYTES + 2 * maximum_ciphertext;
+    let batched_peak_bound =
+        (super::CAPTURE_DATABASE_BATCH_CHUNKS + 1) * super::CHUNK_BYTES + 2 * maximum_ciphertext;
+    assert_eq!(
+        batched_peak_bound, legacy_peak_bound,
+        "one-at-a-time sealing keeps the plaintext, base64 envelope, and ciphertext bound unchanged"
+    );
     let (_dir, state, pool, identity) = fixture().await;
     let mut writer = ResponseArchiveProducer::begin_for_test(&state, identity)
         .await
