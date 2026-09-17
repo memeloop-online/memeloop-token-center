@@ -18,6 +18,10 @@ export function useOperatorRequestStream({ token, tenant, enabled, disconnectedM
   const [overflowRevision, setOverflowRevision] = useState(0);
   const batch = useRef<RequestRefreshBatch | undefined>(undefined);
   const protectedIds = useRef<string[]>([]);
+  // Page-local pause tier reported by the Requests consumer. While set, the
+  // batch stops publishing (no revision bumps, no rerenders) but keeps
+  // coalescing SSE events into its strictly bounded pending map.
+  const consumerPause = useRef(false);
 
   useEffect(() => {
     // Drop the previous scope's protected ids before the new batch adopts
@@ -44,15 +48,25 @@ export function useOperatorRequestStream({ token, tenant, enabled, disconnectedM
       setRevision(value => value + 1);
     });
     next.protect(protectedIds.current);
-    next.setPaused(paused || !enabled);
+    next.setPaused(paused || !enabled || consumerPause.current);
     batch.current = next;
     return () => { next.dispose(); if (batch.current === next) batch.current = undefined; };
   }, [tenant, token]);
 
   useEffect(() => { batch.current?.setInterval(intervalMs); }, [intervalMs]);
-  useEffect(() => { batch.current?.setPaused(paused || !enabled); }, [paused, enabled]);
+  useEffect(() => { batch.current?.setPaused(paused || !enabled || consumerPause.current); }, [paused, enabled]);
+  // The Sessions surface keeps its own cadence: the request page's pause tier
+  // must not hold back session event identities.
   useEffect(() => { sessionEvents.current.setCadence(intervalMs, paused || !enabled); }, [intervalMs, paused, enabled]);
-  const protectRequests = useCallback((ids: string[]) => { protectedIds.current = ids; batch.current?.protect(ids); }, []);
+  const protectRequests = useCallback((ids: string[], consumerPaused?: boolean) => {
+    protectedIds.current = ids;
+    batch.current?.protect(ids);
+    // Omitted (e.g. scope cleanup) means "keep the current pause tier".
+    if (consumerPaused !== undefined) {
+      consumerPause.current = consumerPaused;
+      batch.current?.setPaused(paused || !enabled || consumerPause.current);
+    }
+  }, [paused, enabled]);
 
   const stream = useRequestEventStream({
     token,

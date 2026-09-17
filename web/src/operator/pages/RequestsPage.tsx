@@ -36,7 +36,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   onRequestDrilldownHandled?: (revision: number) => void;
   requestRefresh?: { intervalMs: number; paused: boolean; onIntervalChange: (value: number) => void };
   streamOverflowRevision?: number;
-  onProtectRequests?: (ids: string[]) => void;
+  onProtectRequests?: (ids: string[], consumerPaused?: boolean) => void;
 }) {
   const { t } = useI18n();
   const diagnosticLabels = { requestId: t('request.correlationId'), streamInterrupted: t('request.streamInterrupted') };
@@ -262,8 +262,10 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   }, [tenant, token]);
 
   useEffect(() => {
-    onProtectRequests?.(requests.map(request => request.request_id));
-  }, [requests, onProtectRequests]);
+    // Report the pause tier together with the visible ids: while paused the
+    // hook batch stops publishing revisions entirely but keeps buffering SSE.
+    onProtectRequests?.(requests.map(request => request.request_id), userPaused);
+  }, [requests, userPaused, onProtectRequests]);
   useEffect(() => () => onProtectRequests?.([]), [onProtectRequests]);
 
   useEffect(() => {
