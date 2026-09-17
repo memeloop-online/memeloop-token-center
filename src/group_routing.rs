@@ -7,10 +7,9 @@ use crate::{
     AppState,
     error::AppError,
     plugin::routing::{
-        DEFAULT_TRANSIENT_HEALTH_WINDOW_MS, GROUP_ROUTING_V2_VERSION, GroupRoutingCandidate,
-        GroupRoutingDirective, GroupRoutingHealth, GroupRoutingInput, GroupRoutingObserveInput,
-        GroupRoutingOutcome, GroupRoutingTransientPolicy, GroupRoutingTransientSignal,
-        transient_health_window_ms,
+        GROUP_ROUTING_V2_VERSION, GroupRoutingCandidate, GroupRoutingDirective, GroupRoutingHealth,
+        GroupRoutingInput, GroupRoutingObserveInput, GroupRoutingOutcome,
+        GroupRoutingTransientPolicy, GroupRoutingTransientSignal, transient_health_window_ms,
     },
     provider::AuthorizedUpstreamCandidate,
 };
@@ -30,8 +29,41 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-fn is_default_transient_health_window_ms(value: &u64) -> bool {
-    *value == DEFAULT_TRANSIENT_HEALTH_WINDOW_MS
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TransientHealthScope {
+    pub(crate) id: String,
+    pub(crate) window_ms: u64,
+}
+
+fn hash_scope_field(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn transient_health_scope(
+    tenant_id: Uuid,
+    route_id: Uuid,
+    group_id: &str,
+    plugin_id: &str,
+    plugin_fingerprint: &str,
+    strategy_version: i64,
+    config: &serde_json::Value,
+) -> Result<TransientHealthScope, AppError> {
+    let window_ms = transient_health_window_ms(config)?;
+    let config = serde_json::to_vec(config).map_err(|_| AppError::Internal)?;
+    let mut hasher = blake3::Hasher::new();
+    hash_scope_field(&mut hasher, b"group-routing-v2-transient-health-scope-v1");
+    hash_scope_field(&mut hasher, tenant_id.as_bytes());
+    hash_scope_field(&mut hasher, route_id.as_bytes());
+    hash_scope_field(&mut hasher, group_id.as_bytes());
+    hash_scope_field(&mut hasher, plugin_id.as_bytes());
+    hash_scope_field(&mut hasher, plugin_fingerprint.as_bytes());
+    hash_scope_field(&mut hasher, &strategy_version.to_le_bytes());
+    hash_scope_field(&mut hasher, &config);
+    Ok(TransientHealthScope {
+        id: hasher.finalize().to_hex().to_string(),
+        window_ms,
+    })
 }
 
 /// The native/no-hook entrance is synchronous: do not add an unbounded
@@ -129,15 +161,11 @@ pub(crate) struct CandidatePolicy {
     transient_signal_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transient_signal: Option<GroupRoutingTransientSignal>,
-    #[serde(
-        default = "default_transient_health_window_ms",
-        skip_serializing_if = "is_default_transient_health_window_ms"
-    )]
-    transient_health_window_ms: u64,
-}
-
-fn default_transient_health_window_ms() -> u64 {
-    DEFAULT_TRANSIENT_HEALTH_WINDOW_MS
+    /// Runtime-only identity. Durable plan v1 must remain readable by older
+    /// workers, so v2 policies are excluded from capture rather than adding a
+    /// field to its deny-unknown CandidatePolicy payload.
+    #[serde(skip)]
+    transient_health_scope: Option<TransientHealthScope>,
 }
 
 pub(crate) struct RequestGroupRouting {
@@ -158,15 +186,15 @@ impl RequestGroupRouting {
         self.policies.get(&(route, account, generation))
     }
 
-    pub(crate) fn transient_health_window_ms(
+    pub(crate) fn transient_health_scope(
         &self,
         route: Uuid,
         account: Uuid,
         generation: i64,
-    ) -> Option<u64> {
+    ) -> Option<&TransientHealthScope> {
         self.policy(route, account, generation)
             .filter(|policy| policy.transient_signal_enabled)
-            .map(|policy| policy.transient_health_window_ms)
+            .and_then(|policy| policy.transient_health_scope.as_ref())
     }
 
     pub(crate) fn active_transient_policy(
@@ -187,9 +215,9 @@ impl CandidatePolicy {
     }
 
     fn current_transient_signal(&self) -> Option<GroupRoutingTransientSignal> {
-        self.transient_signal.map(|signal| {
-            signal.in_current_window(crate::db::unix_millis(), self.transient_health_window_ms)
-        })
+        let scope = self.transient_health_scope.as_ref()?;
+        self.transient_signal
+            .map(|signal| signal.in_current_window(crate::db::unix_millis(), scope.window_ms))
     }
 
     fn has_valid_transient_snapshot(&self) -> bool {
@@ -198,12 +226,19 @@ impl CandidatePolicy {
                 && self
                     .transient_policy
                     .is_some_and(|policy| policy.is_valid())
-                && (1_000..=crate::plugin::routing::MAX_TRANSIENT_HEALTH_WINDOW_MS)
-                    .contains(&self.transient_health_window_ms);
+                && self.transient_health_scope.as_ref().is_some_and(|scope| {
+                    scope.id.len() == 64
+                        && (1_000..=crate::plugin::routing::MAX_TRANSIENT_HEALTH_WINDOW_MS)
+                            .contains(&scope.window_ms)
+                });
         }
         self.transient_signal.is_none()
             && self.transient_policy.is_none()
-            && self.transient_health_window_ms == DEFAULT_TRANSIENT_HEALTH_WINDOW_MS
+            && self.transient_health_scope.is_none()
+    }
+
+    fn durable_v1_compatible(&self) -> bool {
+        !self.transient_signal_enabled
     }
 
     pub(crate) fn transient_probe_controls(&self) -> Option<(bool, u64)> {
@@ -316,6 +351,44 @@ async fn prepare_inner(
     if bindings.is_empty() {
         return Ok(());
     }
+    let plugin_fingerprints = state.plugins.group_routing_fingerprints();
+    let transient_scopes = bindings
+        .iter()
+        .filter_map(|(key, binding)| {
+            let plugin_id = &binding.strategy.plugin_id;
+            if state.plugins.group_routing_version(plugin_id) != Some(GROUP_ROUTING_V2_VERSION) {
+                return None;
+            }
+            let fingerprint = plugin_fingerprints.get(plugin_id)?;
+            transient_health_scope(
+                tenant_id,
+                key.0,
+                &binding.id,
+                plugin_id,
+                fingerprint,
+                binding.version,
+                &binding.strategy.config,
+            )
+            .ok()
+            .map(|scope| (*key, scope))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let scoped_signal_keys = transient_scopes
+        .iter()
+        .map(|(key, scope)| (key.1, key.2, scope.id.clone()))
+        .collect::<Vec<_>>();
+    let scoped_signals = state
+        .db
+        .group_routing_v2_transient_signals(&scoped_signal_keys)
+        .await?
+        .into_iter()
+        .map(|entry| {
+            (
+                (entry.account_id, entry.generation, entry.policy_scope),
+                entry.signal,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     for (index, candidate) in candidates.iter().enumerate() {
         if let Some(binding) = bindings.get(&(
             candidate.route_id,
@@ -399,17 +472,18 @@ async fn prepare_inner(
         let plugin_id = members[0].2.plugin_id.clone();
         let plugin_is_v2 =
             state.plugins.group_routing_version(&plugin_id) == Some(GROUP_ROUTING_V2_VERSION);
-        let transient_health_window_ms = if plugin_is_v2 {
-            match transient_health_window_ms(&config) {
-                Ok(window_ms) => window_ms,
-                Err(error) => {
-                    tracing::warn!(%request_id, %group_id, %plugin_id, error_category=error.diagnostic_category(), stage="group_routing_native_fallback", reason="invalid_transient_health_window", "group strategy has an invalid transient health window; native policy retained");
-                    continue;
-                }
-            }
-        } else {
-            DEFAULT_TRANSIENT_HEALTH_WINDOW_MS
-        };
+        if plugin_is_v2
+            && members.iter().any(|member| {
+                !transient_scopes.contains_key(&(
+                    member.1.route_id,
+                    member.1.account_id,
+                    member.1.credential_generation,
+                ))
+            })
+        {
+            tracing::warn!(%request_id, %group_id, %plugin_id, stage="group_routing_native_fallback", reason="invalid_transient_health_scope", "group strategy has no valid scoped transient health identity; native policy retained");
+            continue;
+        }
         let native_health = state.plugins.group_routing_uses_native_health(&plugin_id);
         let quota_context = if state.plugins.group_routing_uses_quota_context(&plugin_id) {
             match quota::context_for_bucket(&members, &quota_observations, quota_now_ms) {
@@ -462,15 +536,19 @@ async fn prepare_inner(
                 .iter()
                 .map(|member| {
                     let candidate = &member.1;
-                    let signal = bindings
-                        .get(&(
-                            candidate.route_id,
-                            candidate.account_id,
-                            candidate.credential_generation,
-                        ))
-                        .expect("bucket members originate from the frozen binding snapshot")
-                        .transient_signal;
-                    signal.for_group_routing_window(signal_now_ms, transient_health_window_ms)
+                    let key = (
+                        candidate.route_id,
+                        candidate.account_id,
+                        candidate.credential_generation,
+                    );
+                    let scope = transient_scopes
+                        .get(&(key.0, key.1, key.2))
+                        .expect("validated v2 bucket members have frozen health scopes");
+                    scoped_signals
+                        .get(&(key.1, key.2, scope.id.clone()))
+                        .copied()
+                        .unwrap_or_default()
+                        .for_group_routing_window(signal_now_ms, scope.window_ms)
                 })
                 .collect::<Vec<_>>()
         });
@@ -514,13 +592,14 @@ async fn prepare_inner(
                     );
                     ranks.insert(key, bucket_rank + position);
                     if !native_health {
-                        let frozen_signal =
-                            bindings.get(&key).filter(|_| plugin_is_v2).map(|binding| {
-                                binding.transient_signal.for_group_routing_window(
-                                    signal_now_ms,
-                                    transient_health_window_ms,
-                                )
-                            });
+                        let candidate_scope = transient_scopes.get(&key).filter(|_| plugin_is_v2);
+                        let frozen_signal = candidate_scope.map(|scope| {
+                            scoped_signals
+                                .get(&(key.1, key.2, scope.id.clone()))
+                                .copied()
+                                .unwrap_or_default()
+                                .for_group_routing_window(signal_now_ms, scope.window_ms)
+                        });
                         policies.insert(
                             key,
                             CandidatePolicy {
@@ -533,7 +612,7 @@ async fn prepare_inner(
                                 transient_policy,
                                 transient_signal_enabled: plugin_is_v2,
                                 transient_signal: frozen_signal,
-                                transient_health_window_ms,
+                                transient_health_scope: candidate_scope.cloned(),
                             },
                         );
                     }

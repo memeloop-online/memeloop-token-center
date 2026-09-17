@@ -213,8 +213,120 @@ fn policy(tenant: Uuid, route: Uuid, account: Uuid) -> CandidatePolicy {
         transient_policy: None,
         transient_signal_enabled: false,
         transient_signal: None,
-        transient_health_window_ms: DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
+        transient_health_scope: None,
     }
+}
+
+#[test]
+fn v2_health_scope_is_stable_and_isolates_route_group_plugin_revision_and_config() {
+    let tenant = Uuid::from_u128(1);
+    let route = Uuid::from_u128(2);
+    let config = serde_json::json!({
+        "transient_health_mode": "active",
+        "transient_health_window_ms": 60_000,
+    });
+    let scope = transient_health_scope(
+        tenant,
+        route,
+        "group:route",
+        "plugin",
+        "revision-a",
+        7,
+        &config,
+    )
+    .unwrap();
+    assert_eq!(
+        scope,
+        transient_health_scope(
+            tenant,
+            route,
+            "group:route",
+            "plugin",
+            "revision-a",
+            7,
+            &config,
+        )
+        .unwrap()
+    );
+    for changed in [
+        transient_health_scope(
+            tenant,
+            Uuid::from_u128(3),
+            "group:route",
+            "plugin",
+            "revision-a",
+            7,
+            &config,
+        )
+        .unwrap(),
+        transient_health_scope(
+            tenant,
+            route,
+            "other:route",
+            "plugin",
+            "revision-a",
+            7,
+            &config,
+        )
+        .unwrap(),
+        transient_health_scope(
+            tenant,
+            route,
+            "group:route",
+            "other-plugin",
+            "revision-a",
+            7,
+            &config,
+        )
+        .unwrap(),
+        transient_health_scope(
+            tenant,
+            route,
+            "group:route",
+            "plugin",
+            "revision-b",
+            7,
+            &config,
+        )
+        .unwrap(),
+        transient_health_scope(
+            tenant,
+            route,
+            "group:route",
+            "plugin",
+            "revision-a",
+            8,
+            &config,
+        )
+        .unwrap(),
+        transient_health_scope(
+            tenant,
+            route,
+            "group:route",
+            "plugin",
+            "revision-a",
+            7,
+            &serde_json::json!({"transient_health_window_ms": 1_000}),
+        )
+        .unwrap(),
+    ] {
+        assert_ne!(scope.id, changed.id);
+    }
+}
+
+#[test]
+fn durable_v1_never_serializes_runtime_scope_or_captures_v2_health_policy() {
+    let mut v2 = policy(Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+    v2.transient_signal_enabled = true;
+    v2.transient_health_scope = Some(TransientHealthScope {
+        id: "a".repeat(64),
+        window_ms: 1_000,
+    });
+    assert!(!v2.durable_v1_compatible());
+    let encoded = serde_json::to_value(&v2).unwrap();
+    assert!(encoded.get("transient_health_scope").is_none());
+    assert!(encoded.get("transient_health_window_ms").is_none());
+    assert!(policy(Uuid::nil(), Uuid::nil(), Uuid::nil()).durable_v1_compatible());
 }
 
 #[tokio::test]
@@ -229,7 +341,7 @@ async fn native_fallback_has_no_implicit_controls_and_policy_identity_is_exact()
     );
     let selected = snapshot.policy(route, account, 3).unwrap();
     assert_eq!(selected.transient_probe_controls(), Some((false, 42)));
-    assert_eq!(snapshot.transient_health_window_ms(route, account, 3), None);
+    assert_eq!(snapshot.transient_health_scope(route, account, 3), None);
     assert!(snapshot.policy(route, account, 4).is_none());
 
     let mut hard = policy(snapshot.tenant_id, Uuid::now_v7(), Uuid::now_v7());
@@ -248,6 +360,10 @@ async fn native_fallback_has_no_implicit_controls_and_policy_identity_is_exact()
     let mut expired = policy(snapshot.tenant_id, Uuid::now_v7(), Uuid::now_v7());
     expired.transient_policy = hard.transient_policy;
     expired.transient_signal_enabled = true;
+    expired.transient_health_scope = Some(TransientHealthScope {
+        id: "a".repeat(64),
+        window_ms: crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
+    });
     expired.transient_signal = Some(GroupRoutingTransientSignal {
         sample_count: 1,
         ewma_micros: 1,

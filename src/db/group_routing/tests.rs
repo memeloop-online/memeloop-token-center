@@ -118,10 +118,11 @@ async fn verify_group_selection(config: Config) {
     assert_eq!(selected.id, format!("{}:route", Uuid::from_u128(20)));
     assert_eq!((selected.priority, selected.version), (10, 7));
     assert_eq!(selected.strategy.plugin_id, "fixture");
-    assert_eq!(selected.transient_signal, TransientHealthSignal::default());
+    let signal_scope = "a".repeat(64);
     db.record_transient_health_sample(
         account,
         1,
+        &signal_scope,
         true,
         crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
     )
@@ -139,10 +140,15 @@ async fn verify_group_selection(config: Config) {
         .unwrap();
     assert_eq!(selected.id, format!("{}:provider", Uuid::from_u128(30)));
     assert_eq!(selected.priority, 11);
-    assert_eq!(selected.transient_signal.sample_count, 1);
-    assert_eq!(selected.transient_signal.ewma_micros, 1_000_000);
+    let scoped = db
+        .group_routing_v2_transient_signals(&[(account, 1, signal_scope.clone())])
+        .await
+        .unwrap();
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped[0].signal.sample_count, 1);
+    assert_eq!(scoped[0].signal.ewma_micros, 1_000_000);
     assert_eq!(
-        selected.transient_signal.transient_window_ms,
+        scoped[0].signal.transient_window_ms,
         crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS as i64
     );
     // The host consumes one statement for the full candidate set, not one

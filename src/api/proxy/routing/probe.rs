@@ -272,6 +272,7 @@ mod v2_lifecycle_tests {
             recover_micros: 600_000,
             min_probe_successes: 2,
         };
+        let policy_scope = "a".repeat(64);
         macro_rules! plugin_signal {
             ($value:expr) => {{
                 let signal = $value;
@@ -290,6 +291,7 @@ mod v2_lifecycle_tests {
                 .record_transient_health_sample_at(
                     account,
                     1,
+                    &policy_scope,
                     true,
                     1_000,
                     crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
@@ -317,6 +319,7 @@ mod v2_lifecycle_tests {
                 .record_transient_health_sample_at(
                     account,
                     1,
+                    &policy_scope,
                     true,
                     1_001,
                     crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
@@ -356,6 +359,7 @@ mod v2_lifecycle_tests {
                 .record_transient_health_sample_at(
                     account,
                     1,
+                    &policy_scope,
                     false,
                     1_002,
                     crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
@@ -393,6 +397,7 @@ mod v2_lifecycle_tests {
                 .record_transient_health_sample_at(
                     account,
                     1,
+                    &policy_scope,
                     false,
                     1_003,
                     crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
@@ -413,9 +418,10 @@ mod v2_lifecycle_tests {
         );
 
         let before_cancel: i64 = sqlx::query_scalar(
-            "SELECT revision FROM upstream_account_transient_health_signals WHERE upstream_account_id = $1",
+            "SELECT revision FROM group_routing_v2_transient_health_signals WHERE upstream_account_id = $1 AND policy_scope = $2",
         )
         .bind(account.to_string())
+        .bind(&policy_scope)
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -424,9 +430,10 @@ mod v2_lifecycle_tests {
             None
         );
         let after_cancel: i64 = sqlx::query_scalar(
-            "SELECT revision FROM upstream_account_transient_health_signals WHERE upstream_account_id = $1",
+            "SELECT revision FROM group_routing_v2_transient_health_signals WHERE upstream_account_id = $1 AND policy_scope = $2",
         )
         .bind(account.to_string())
+        .bind(&policy_scope)
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -805,24 +812,28 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
         } => GroupRoutingOutcome::Authentication,
         UpstreamAttemptTerminal::Failed { .. } => GroupRoutingOutcome::TransientFailure,
     };
-    let transient_health_window_ms = state.group_routing.as_ref().and_then(|snapshot| {
-        snapshot.transient_health_window_ms(route_id, upstream_account_id, credential_generation)
+    let transient_health_scope = state.group_routing.as_ref().and_then(|snapshot| {
+        snapshot
+            .transient_health_scope(route_id, upstream_account_id, credential_generation)
+            .cloned()
     });
     let signal = if let Some(transient_failure) = transient_sample_for_outcome(outcome)
-        && let Some(window_ms) = transient_health_window_ms
+        && let Some(scope) = transient_health_scope
     {
         match state
             .db
             .record_transient_health_sample(
                 upstream_account_id,
                 credential_generation,
+                &scope.id,
                 transient_failure,
-                window_ms,
+                scope.window_ms,
             )
             .await
         {
-            Ok(signal) => signal
-                .map(|signal| signal.for_group_routing_window(crate::db::unix_millis(), window_ms)),
+            Ok(signal) => signal.map(|signal| {
+                signal.for_group_routing_window(crate::db::unix_millis(), scope.window_ms)
+            }),
             Err(error) => {
                 tracing::warn!(%request_id, %upstream_account_id, error_category=error.diagnostic_category(), stage="transient_health_sample", "transient health signal unavailable; native health policy retained");
                 None

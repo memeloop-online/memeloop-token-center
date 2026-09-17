@@ -206,11 +206,13 @@ async fn transient_signal_invariants(database: &Database) {
         .execute(&database.pool)
         .await
         .unwrap();
+    let scope = "a".repeat(64);
 
     let failed = database
         .record_transient_health_sample_at(
             account,
             3,
+            &scope,
             true,
             10_000,
             crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
@@ -233,6 +235,7 @@ async fn transient_signal_invariants(database: &Database) {
         .record_transient_health_sample_at(
             account,
             3,
+            &scope,
             false,
             10_001,
             crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
@@ -250,6 +253,7 @@ async fn transient_signal_invariants(database: &Database) {
         .record_transient_health_sample_at(
             account,
             3,
+            &scope,
             false,
             10_002,
             crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
@@ -265,6 +269,7 @@ async fn transient_signal_invariants(database: &Database) {
             .record_transient_health_sample_at(
                 account,
                 2,
+                &scope,
                 true,
                 10_003,
                 crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
@@ -283,6 +288,7 @@ async fn transient_signal_invariants(database: &Database) {
         .record_transient_health_sample_at(
             account,
             4,
+            &scope,
             false,
             10_004,
             crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
@@ -297,6 +303,7 @@ async fn transient_signal_invariants(database: &Database) {
     let older_completion = sqlx::query(RECORD_TRANSIENT_HEALTH_SAMPLE_SQL)
         .bind(account.to_string())
         .bind(4_i64)
+        .bind(&scope)
         .bind(0_i64)
         .bind(rotated.last_observed_at.saturating_sub(1))
         .bind(1_i64)
@@ -313,15 +320,16 @@ async fn transient_signal_invariants(database: &Database) {
         "same-generation completion order cannot move last_observed_at backwards"
     );
     let retained_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM upstream_account_transient_health_signals WHERE upstream_account_id = $1",
+        "SELECT COUNT(*) FROM group_routing_v2_transient_health_signals WHERE upstream_account_id = $1 AND credential_generation = 4 AND policy_scope = $2",
     )
     .bind(account.to_string())
+    .bind(&scope)
     .fetch_one(&database.pool)
     .await
     .unwrap();
     assert_eq!(
         retained_rows, 1,
-        "credential rotation replaces the bounded signal row"
+        "credential rotation creates one fenced row for the current generation"
     );
 }
 
@@ -340,15 +348,18 @@ async fn transient_signal_window_invariants(database: &Database, peer: &Database
         .execute(&database.pool)
         .await
         .unwrap();
+    let original_scope = "a".repeat(64);
+    let replacement_scope = "b".repeat(64);
+    let wide_scope = "c".repeat(64);
 
     let first = database
-        .record_transient_health_sample_at(account, 1, true, 10_100, 1_000)
+        .record_transient_health_sample_at(account, 1, &original_scope, true, 10_100, 1_000)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(first.sample_count, 1);
     let same_window = database
-        .record_transient_health_sample_at(account, 1, false, 10_999, 1_000)
+        .record_transient_health_sample_at(account, 1, &original_scope, false, 10_999, 1_000)
         .await
         .unwrap()
         .unwrap();
@@ -356,7 +367,7 @@ async fn transient_signal_window_invariants(database: &Database, peer: &Database
     assert_eq!(same_window.ewma_micros, 750_000);
 
     let next_window = database
-        .record_transient_health_sample_at(account, 1, false, 11_000, 1_000)
+        .record_transient_health_sample_at(account, 1, &original_scope, false, 11_000, 1_000)
         .await
         .unwrap()
         .unwrap();
@@ -368,44 +379,60 @@ async fn transient_signal_window_invariants(database: &Database, peer: &Database
     assert_eq!(next_window.window_started_at, 11_000);
     assert!(
         database
-            .record_transient_health_sample_at(account, 1, true, 10_999, 1_000)
+            .record_transient_health_sample_at(account, 1, &original_scope, true, 10_999, 1_000)
             .await
             .unwrap()
             .is_none(),
         "a late sample from an expired window cannot pollute the current window"
     );
-    let (wide, narrow) = tokio::join!(
-        database.record_transient_health_sample_at(account, 1, false, 12_000, 2_000),
-        peer.record_transient_health_sample_at(account, 1, true, 12_000, 1_000),
+    let (replacement, wide) = tokio::join!(
+        database.record_transient_health_sample_at(
+            account,
+            1,
+            &replacement_scope,
+            false,
+            12_000,
+            1_000,
+        ),
+        peer.record_transient_health_sample_at(account, 1, &wide_scope, true, 12_000, 2_000,),
     );
-    wide.unwrap();
-    narrow.unwrap();
-    let retained = sqlx::query(
-        "SELECT sample_count, ewma_micros, last_observed_at, recovery_successes, revision,
-                transient_window_ms, window_started_at
-           FROM upstream_account_transient_health_signals
-          WHERE upstream_account_id = $1",
-    )
-    .bind(account.to_string())
-    .fetch_one(&database.pool)
-    .await
-    .unwrap();
-    assert_eq!(retained.try_get::<i64, _>("sample_count").unwrap(), 1);
+    replacement.unwrap().unwrap();
+    wide.unwrap().unwrap();
+    database
+        .record_transient_health_sample_at(account, 1, &original_scope, true, 12_001, 1_000)
+        .await
+        .unwrap()
+        .unwrap();
+    let retained = database
+        .group_routing_v2_transient_signals(&[
+            (account, 1, replacement_scope.clone()),
+            (account, 1, wide_scope.clone()),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(retained.len(), 2);
+    let replacement = retained
+        .iter()
+        .find(|entry| entry.policy_scope == replacement_scope)
+        .unwrap()
+        .signal;
+    assert_eq!((replacement.sample_count, replacement.ewma_micros), (1, 0));
     assert_eq!(
-        retained.try_get::<i64, _>("ewma_micros").unwrap(),
-        1_000_000
+        (
+            replacement.transient_window_ms,
+            replacement.window_started_at
+        ),
+        (1_000, 12_000)
     );
+    let wide = retained
+        .iter()
+        .find(|entry| entry.policy_scope == wide_scope)
+        .unwrap()
+        .signal;
+    assert_eq!((wide.sample_count, wide.ewma_micros), (1, 1_000_000));
     assert_eq!(
-        retained.try_get::<i64, _>("last_observed_at").unwrap(),
-        12_000
-    );
-    assert_eq!(
-        retained.try_get::<i64, _>("transient_window_ms").unwrap(),
-        1_000
-    );
-    assert_eq!(
-        retained.try_get::<i64, _>("window_started_at").unwrap(),
-        12_000
+        (wide.transient_window_ms, wide.window_started_at),
+        (2_000, 12_000)
     );
 }
 
@@ -424,10 +451,12 @@ async fn postgres_blocked_old_generation_cannot_overwrite_rotated_signal(databas
         .execute(&database.pool)
         .await
         .unwrap();
+    let scope = "d".repeat(64);
     database
         .record_transient_health_sample(
             account,
             3,
+            &scope,
             true,
             crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
         )
@@ -437,11 +466,12 @@ async fn postgres_blocked_old_generation_cannot_overwrite_rotated_signal(databas
 
     let mut rotation = database.pool.begin().await.unwrap();
     sqlx::query(
-        "UPDATE upstream_account_transient_health_signals
+        "UPDATE group_routing_v2_transient_health_signals
             SET revision = revision
-          WHERE upstream_account_id = $1",
+          WHERE upstream_account_id = $1 AND credential_generation = 3 AND policy_scope = $2",
     )
     .bind(account.to_string())
+    .bind(&scope)
     .execute(&mut *rotation)
     .await
     .unwrap();
@@ -452,10 +482,12 @@ async fn postgres_blocked_old_generation_cannot_overwrite_rotated_signal(databas
         .await
         .unwrap();
     let account_id = account.to_string();
+    let old_scope = scope.clone();
     let old_sample = tokio::spawn(async move {
         sqlx::query(RECORD_TRANSIENT_HEALTH_SAMPLE_SQL)
             .bind(account_id)
             .bind(3_i64)
+            .bind(old_scope)
             .bind(TRANSIENT_EWMA_SCALE)
             .bind(300_i64)
             .bind(0_i64)
@@ -466,19 +498,16 @@ async fn postgres_blocked_old_generation_cannot_overwrite_rotated_signal(databas
     });
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let blocked: bool = sqlx::query_scalar(
-                "SELECT COALESCE(wait_event_type = 'Lock', FALSE)
-                   FROM pg_stat_activity
-                  WHERE pid = CAST($1 AS INTEGER)",
-            )
-            .bind(old_pid)
-            .fetch_one(&database.pool)
-            .await
-            .unwrap();
+            let blocked: bool =
+                sqlx::query_scalar("SELECT CARDINALITY(pg_blocking_pids(CAST($1 AS INTEGER))) > 0")
+                    .bind(old_pid)
+                    .fetch_one(&database.pool)
+                    .await
+                    .unwrap();
             if blocked {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
         }
     })
     .await
@@ -490,13 +519,14 @@ async fn postgres_blocked_old_generation_cannot_overwrite_rotated_signal(databas
         .await
         .unwrap();
     sqlx::query(
-        "UPDATE upstream_account_transient_health_signals
-            SET credential_generation = 4, sample_count = 1, ewma_micros = 0,
-                last_observed_at = 400, recovery_successes = 1, revision = 1,
-                transient_window_ms = 60000, window_started_at = 0
-          WHERE upstream_account_id = $1",
+        "INSERT INTO group_routing_v2_transient_health_signals (
+             upstream_account_id, credential_generation, policy_scope,
+             transient_window_ms, window_started_at, sample_count,
+             ewma_micros, last_observed_at, recovery_successes, revision
+         ) VALUES ($1,4,$2,60000,0,1,0,400,1,1)",
     )
     .bind(account.to_string())
+    .bind(&scope)
     .execute(&mut *rotation)
     .await
     .unwrap();
@@ -514,10 +544,11 @@ async fn postgres_blocked_old_generation_cannot_overwrite_rotated_signal(databas
     let row = sqlx::query(
         "SELECT credential_generation, sample_count, ewma_micros,
                 last_observed_at, recovery_successes, revision
-           FROM upstream_account_transient_health_signals
-          WHERE upstream_account_id = $1",
+           FROM group_routing_v2_transient_health_signals
+          WHERE upstream_account_id = $1 AND credential_generation = 4 AND policy_scope = $2",
     )
     .bind(account.to_string())
+    .bind(&scope)
     .fetch_one(&database.pool)
     .await
     .unwrap();
