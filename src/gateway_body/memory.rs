@@ -266,6 +266,51 @@ impl ProxyMemoryReservation {
         }
     }
 
+    /// A requested native stream stays outside the retained partition until
+    /// response headers prove that it must buffer after all. Claim its raw
+    /// body plus terminal projection footprint without queuing; losers must
+    /// fail and release their raw bytes so the admitted transition can make
+    /// progress in the process-wide FIFO queue.
+    pub(crate) async fn reserve_unexpected_buffered_request(
+        &self,
+        projection_bytes: usize,
+    ) -> bool {
+        let units = {
+            let Ok(held) = self.held.lock() else {
+                return false;
+            };
+            let Some(bytes) = projection_bytes
+                .checked_mul(REQUEST_MEMORY_WEIGHT.saturating_sub(1))
+                .and_then(|projection| held.0.checked_add(projection))
+            else {
+                return false;
+            };
+            let Ok(units) = u32::try_from(bytes.div_ceil(UNIT_BYTES)) else {
+                return false;
+            };
+            units
+        };
+        let mut acquire = Box::pin(self.retained_requests.clone().acquire_many_owned(units));
+        let Some(Ok(permit)) = std::future::poll_fn(|context| {
+            Poll::Ready(match acquire.as_mut().poll(context) {
+                Poll::Ready(result) => Some(result),
+                Poll::Pending => None,
+            })
+        })
+        .await
+        else {
+            return false;
+        };
+        let Ok(mut retained) = self.retained.lock() else {
+            return false;
+        };
+        if retained.is_some() {
+            return true;
+        }
+        *retained = Some(permit);
+        true
+    }
+
     pub(crate) async fn reserve_buffered_response(
         &self,
         maximum: usize,
@@ -764,6 +809,84 @@ mod tests {
                 .contains("proxy_memory_waits_total{stage=\"response\",outcome=\"admitted\"} 1")
         );
         assert!(rendered.contains("proxy_memory_waiting{stage=\"response\"} 0"));
+    }
+
+    #[test]
+    fn configured_budget_guarantees_one_buffered_conversation_transition() {
+        for budget in [
+            crate::config::DEFAULT_PROXY_MEMORY_BUDGET_BYTES as usize,
+            512 * 1024 * 1024,
+            2_usize * 1024 * 1024 * 1024,
+        ] {
+            let request = (budget - 1024 * 1024) / 12;
+            let rounded = |bytes: usize| bytes.div_ceil(UNIT_BYTES) * UNIT_BYTES;
+            let retained_limit = budget / 4 / UNIT_BYTES * UNIT_BYTES;
+            assert!(rounded(request.saturating_mul(3)) <= retained_limit);
+            assert!(
+                rounded(request)
+                    + rounded(request.saturating_mul(2))
+                    + rounded(MAX_BUFFERED_RESPONSE_BYTES.saturating_mul(CAPTURE_MEMORY_WEIGHT))
+                    <= budget / UNIT_BYTES * UNIT_BYTES
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unexpected_buffered_transition_rejects_extra_native_streams_to_make_progress() {
+        const REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
+        let budget = ProxyMemoryBudget::new(crate::config::DEFAULT_PROXY_MEMORY_BUDGET_BYTES);
+        let mut streams = Vec::new();
+        for _ in 0..4 {
+            let stream = budget.reservation();
+            assert!(stream.try_grow(REQUEST_BYTES, 1));
+            streams.push(stream);
+        }
+        assert!(
+            streams[0]
+                .reserve_unexpected_buffered_request(REQUEST_BYTES)
+                .await
+        );
+        for stream in &streams[1..] {
+            assert!(
+                !stream
+                    .reserve_unexpected_buffered_request(REQUEST_BYTES)
+                    .await
+            );
+        }
+        assert_eq!(budget.snapshot().2, 3 * REQUEST_BYTES);
+
+        let admitted = streams[0].clone();
+        admitted.configure_admission(
+            std::time::Duration::from_secs(5),
+            crate::metrics::Metrics::default(),
+        );
+        let waiting = admitted.clone();
+        let task = tokio::spawn(async move {
+            let projection = waiting
+                .reserve_buffered_response_with_projection(
+                    MAX_BUFFERED_RESPONSE_BYTES,
+                    REQUEST_BYTES,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                )
+                .await
+                .expect("one unexpected buffered response must make progress");
+            (waiting, projection)
+        });
+        budget.wait_for_response_reservation_for_test().await;
+        assert!(!task.is_finished());
+
+        streams.drain(1..).for_each(drop);
+        let (waiting, projection) = task.await.unwrap();
+        assert_eq!(budget.snapshot().0, 240 * 1024 * 1024);
+        drop(projection);
+        assert_eq!(budget.snapshot().0, 208 * 1024 * 1024);
+        waiting.release_retained_request_for_stream();
+        assert_eq!(budget.snapshot().2, 0);
+        drop(waiting);
+        drop(admitted);
+        drop(streams);
+        assert_eq!(budget.snapshot().0, 0);
     }
 
     #[tokio::test]

@@ -1472,6 +1472,31 @@ pub(in crate::api) async fn proxy_with_identity(
         return result;
     }
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
+    let is_sse = content_type
+        .as_ref()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
+    let will_buffer_response =
+        (is_codex_route && !codex_downstream_stream) || (!is_sse && !strict_openai_chat_usage);
+    if requested_native_stream
+        && will_buffer_response
+        && let Some(conversation) = buffered_request.conversation.as_ref()
+        && !buffered_request
+            .memory
+            .reserve_unexpected_buffered_request(conversation.request_body.len())
+            .await
+    {
+        conversation.reject_projection();
+        drop(upstream);
+        let result =
+            finish_proxy_failure(&buffered_request, "upstream_response_memory_capacity").await;
+        upstream_attempt
+            .complete(UpstreamAttemptTerminal::Inconclusive)
+            .await;
+        codex_retry.complete(CodexRetryTerminal::Failed);
+        return result;
+    }
     if is_codex_route && !codex_downstream_stream {
         let buffer_phase = proxy_diagnostics::Phase::account(
             diagnostic_context,
@@ -1580,11 +1605,6 @@ pub(in crate::api) async fn proxy_with_identity(
         });
         return result;
     }
-    let is_sse = content_type
-        .as_ref()
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
     // An opted-in Chat usage stream has a terminal SSE usage contract. A
     // successful JSON envelope cannot prove that contract and must never be
     // forwarded or settled as a compatible buffered response.
@@ -1740,6 +1760,12 @@ struct ProxyConversationProjection<'a> {
 }
 
 impl ProxyConversation {
+    fn reject_projection(&self) {
+        if let Ok(mut admission) = self.projection_admission.lock() {
+            *admission = ConversationProjectionAdmission::Rejected;
+        }
+    }
+
     async fn reserve_for_buffered_response(
         &self,
         memory: &crate::gateway_body::memory::ProxyMemoryReservation,
