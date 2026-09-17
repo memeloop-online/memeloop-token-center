@@ -69,7 +69,7 @@ async fn gated_sse_upstream(
 }
 
 #[tokio::test]
-async fn large_conversation_stream_retains_raw_bytes_until_terminal_projection() {
+async fn large_source_backed_conversation_stream_releases_raw_bytes_before_terminal_projection() {
     const RETAINED_BYTES: usize = 8 * 1024 * 1024;
 
     let fixture = codex_route_fixture("large-conversation-stream").await;
@@ -114,12 +114,8 @@ async fn large_conversation_stream_retains_raw_bytes_until_terminal_projection()
 
     let (held, _, _, _) = fixture.state.proxy_memory_budget.snapshot();
     assert!(
-        held >= RETAINED_BYTES,
-        "raw conversation bytes stay reserved"
-    );
-    assert!(
-        held < RETAINED_BYTES * 2,
-        "the parsed JSON tree must not remain live through an open SSE"
+        held < RETAINED_BYTES,
+        "source-backed raw conversation bytes are released while the SSE remains open"
     );
 
     release_body.send(()).unwrap();
