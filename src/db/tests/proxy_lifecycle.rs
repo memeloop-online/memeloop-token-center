@@ -4,11 +4,12 @@ struct CompletedSessionRequest<'a> {
     key: &'a AuthenticatedKey,
     price: &'a ModelPrice,
     model: &'a str,
+    protocol: &'a str,
     session_id: &'a str,
+    model_route_id: Uuid,
     upstream_account_id: Uuid,
     status_code: i64,
     error_code: Option<&'a str>,
-    observed_at: i64,
 }
 
 async fn insert_completed_session_request(database: &Database, input: CompletedSessionRequest<'_>) {
@@ -16,61 +17,56 @@ async fn insert_completed_session_request(database: &Database, input: CompletedS
         key,
         price,
         model,
+        protocol,
         session_id,
+        model_route_id,
         upstream_account_id,
         status_code,
         error_code,
-        observed_at,
     } = input;
     let request_id = Uuid::now_v7();
-    database
+    let reservation = database
         .start_proxy_request(StartProxyRequest {
             request_id,
             key,
             price,
             input_token_ceiling: 10,
             output_token_ceiling: 10,
-            protocol: "openai-responses",
+            protocol,
             model,
             request_object: "gap://session-transport-avoid/request",
             upstream_account_id: Some(upstream_account_id),
-            model_route_id: None,
+            model_route_id: Some(model_route_id),
         })
         .await
         .unwrap();
     database
-        .record_conversation_observation(
-            key,
+        .finish_proxy_request(FinishProxyRequest {
+            usage_basis: Some(crate::model::RequestUsageBasis::NotObserved),
+            first_output_ms: None,
+            generation_duration_ms: None,
             request_id,
-            &serde_json::json!({"input":[{"role":"user","content":"next turn"}]}),
-            &ConversationHints {
-                session_id: Some(session_id.to_owned()),
-                ..ConversationHints::default()
-            },
-            Some("Codex"),
-        )
-        .await
-        .unwrap();
-    sqlx::query(
-        "UPDATE request_records SET completed_at = $1, status_code = $2, error_code = $3 WHERE id = $4",
-    )
-    .bind(observed_at)
-    .bind(status_code)
-    .bind(error_code)
-    .bind(request_id.to_string())
-    .execute(&database.pool)
-    .await
-    .unwrap();
-    sqlx::query("UPDATE conversation_observations SET created_at = $1 WHERE request_id = $2")
-        .bind(observed_at)
-        .bind(request_id.to_string())
-        .execute(&database.pool)
+            tenant_id: key.tenant_id,
+            reservation: &reservation,
+            input_token_ceiling: 10,
+            output_token_ceiling: 10,
+            requested_service_tier: None,
+            status_code,
+            duration_ms: 1,
+            usage: TokenUsage::default(),
+            error_code,
+            response_object: "gap://session-transport-avoid/response",
+            routing_session_id: Some(session_id),
+            // This deliberately models deferred/skipped semantic projection.
+            // Routing evidence must commit without conversation content.
+            conversation: None,
+        })
         .await
         .unwrap();
 }
 
 #[tokio::test]
-async fn latest_explicit_session_transport_502_deprioritizes_only_that_account() {
+async fn synchronous_session_terminal_evidence_is_immediate_and_route_scoped() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(
         "sqlite://{}?mode=rwc",
@@ -89,7 +85,10 @@ async fn latest_explicit_session_transport_502_deprioritizes_only_that_account()
                 principal_external_id: "member".to_owned(),
                 alias: "session-transport-avoid".to_owned(),
                 currency: "USD".to_owned(),
-                policy: KeyPolicy::default(),
+                policy: KeyPolicy {
+                    enforcement_mode: EnforcementMode::MeteredUnlimited,
+                    ..KeyPolicy::default()
+                },
                 initial_balance: Decimal::ONE,
                 idempotency_key: None,
             },
@@ -101,103 +100,107 @@ async fn latest_explicit_session_transport_502_deprioritizes_only_that_account()
         .authenticate_key(&issued.key, pepper)
         .await
         .unwrap();
-    let price = database
-        .upsert_model_price("session-transport-avoid", "USD", Decimal::ONE, Decimal::ONE)
+    let model_a = "session-transport-model-a";
+    let model_b = "session-transport-model-b";
+    let price_a = database
+        .upsert_model_price(model_a, "USD", Decimal::ONE, Decimal::ONE)
         .await
         .unwrap();
-    let model = "session-transport-avoid";
+    let price_b = database
+        .upsert_model_price(model_b, "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
     let failed_account = Uuid::now_v7();
     let recovered_account = Uuid::now_v7();
+    let failed_route = Uuid::now_v7();
+    let recovered_route = Uuid::now_v7();
     let session_id = "explicit-session-transport-avoid";
-    let observed_at = unix_millis();
 
     insert_completed_session_request(
         &database,
         CompletedSessionRequest {
             key: &key,
-            price: &price,
-            model,
+            price: &price_a,
+            model: model_a,
+            protocol: "openai-responses",
             session_id,
+            model_route_id: failed_route,
             upstream_account_id: failed_account,
             status_code: 502,
             error_code: Some("upstream_transport_connection_reset"),
-            observed_at,
         },
     )
     .await;
     assert_eq!(
         database
-            .latest_session_transport_account_to_avoid(&key, session_id)
+            .latest_session_transport_route_to_avoid(&key, session_id, model_a, "openai-responses",)
             .await
             .unwrap(),
-        Some(failed_account)
+        Some((failed_route, failed_account))
     );
 
-    // A success in another session may heal global account health. The failed
-    // session still retains its own latest terminal ordering evidence.
-    insert_completed_session_request(
-        &database,
-        CompletedSessionRequest {
-            key: &key,
-            price: &price,
-            model,
-            session_id: "unrelated-successful-session",
-            upstream_account_id: recovered_account,
-            status_code: 200,
-            error_code: None,
-            observed_at: observed_at + 1,
-        },
-    )
-    .await;
+    // A terminal for another model or protocol cannot change this model's
+    // next-request ordering.
     assert_eq!(
         database
-            .latest_session_transport_account_to_avoid(&key, session_id)
+            .latest_session_transport_route_to_avoid(&key, session_id, model_b, "openai-responses",)
             .await
             .unwrap(),
-        Some(failed_account)
+        None
     );
-
-    // A newer successful terminal in the same session clears the preference
-    // rather than retaining stale failure evidence.
-    insert_completed_session_request(
-        &database,
-        CompletedSessionRequest {
-            key: &key,
-            price: &price,
-            model,
-            session_id,
-            upstream_account_id: recovered_account,
-            status_code: 200,
-            error_code: None,
-            observed_at: observed_at + 2,
-        },
-    )
-    .await;
     assert_eq!(
         database
-            .latest_session_transport_account_to_avoid(&key, session_id)
+            .latest_session_transport_route_to_avoid(&key, session_id, model_a, "openai-chat",)
             .await
             .unwrap(),
         None
     );
 
+    // A success in another session may heal global account health, but cannot
+    // erase this session's terminal evidence.
     insert_completed_session_request(
         &database,
         CompletedSessionRequest {
             key: &key,
-            price: &price,
-            model,
-            session_id,
-            upstream_account_id: failed_account,
-            status_code: 502,
-            error_code: Some("upstream_invalid_response"),
-            observed_at: observed_at + 3,
+            price: &price_b,
+            model: model_b,
+            protocol: "openai-responses",
+            session_id: "unrelated-successful-session",
+            model_route_id: recovered_route,
+            upstream_account_id: recovered_account,
+            status_code: 200,
+            error_code: None,
         },
     )
     .await;
     assert_eq!(
         database
-            .latest_session_transport_account_to_avoid(&key, session_id)
+            .latest_session_transport_route_to_avoid(&key, session_id, model_a, "openai-responses",)
+            .await
+            .unwrap(),
+        Some((failed_route, failed_account))
+    );
+
+    // A newer terminal for the same session/model/protocol supersedes the
+    // failed route. A non-transport 502 is intentionally not avoidance proof.
+    insert_completed_session_request(
+        &database,
+        CompletedSessionRequest {
+            key: &key,
+            price: &price_a,
+            model: model_a,
+            protocol: "openai-responses",
+            session_id,
+            model_route_id: recovered_route,
+            upstream_account_id: failed_account,
+            status_code: 502,
+            error_code: Some("upstream_invalid_response"),
+        },
+    )
+    .await;
+    assert_eq!(
+        database
+            .latest_session_transport_route_to_avoid(&key, session_id, model_a, "openai-responses",)
             .await
             .unwrap(),
         None
@@ -431,6 +434,7 @@ async fn postgres_late_streaming_parent_atomically_reconciles_committed_child_cl
             },
             error_code: None,
             response_object: "objects/early-child-response",
+            routing_session_id: None,
             conversation: None,
         })
         .await
@@ -974,6 +978,7 @@ async fn postgres_outbox_projection_reconciles_child_projected_before_parent() {
             usage: TokenUsage::default(),
             error_code: None,
             response_object: "objects/outbox-parent-response",
+            routing_session_id: None,
             conversation: Some(ProxyConversationInput {
                 key: &key,
                 request_json: &parent_json,
@@ -1000,6 +1005,7 @@ async fn postgres_outbox_projection_reconciles_child_projected_before_parent() {
             usage: TokenUsage::default(),
             error_code: None,
             response_object: "objects/outbox-child-response",
+            routing_session_id: None,
             conversation: Some(ProxyConversationInput {
                 key: &key,
                 request_json: &child_json,
@@ -1174,6 +1180,7 @@ async fn buffered_conversation_content_wait_does_not_hold_archive_budget() {
                     usage: TokenUsage::default(),
                     error_code: None,
                     response_object: "objects/blake3/buffered-conversation-response",
+                    routing_session_id: None,
                     conversation: Some(ProxyConversationInput {
                         key: &key,
                         request_json: &request_json,
@@ -1653,6 +1660,7 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
         usage: usage.clone(),
         error_code: None,
         response_object: "objects/blake3/atomic-response",
+        routing_session_id: None,
         conversation: Some(ProxyConversationInput {
             key: &key,
             request_json: &request_json,
@@ -1818,6 +1826,7 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
                 },
                 error_code: None,
                 response_object: "objects/blake3/untrusted-invalid-usage-response",
+                routing_session_id: None,
                 conversation: None,
             })
             .await
@@ -1893,6 +1902,7 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
             usage: TokenUsage::default(),
             error_code: Some("upstream_incomplete_response"),
             response_object: "objects/blake3/delivered-failure-response",
+            routing_session_id: None,
             conversation: None,
         })
         .await
@@ -1987,6 +1997,7 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
                 usage: TokenUsage::default(),
                 error_code: Some("upstream_incomplete_response"),
                 response_object: "objects/blake3/flex-delivered-response",
+                routing_session_id: None,
                 conversation: None,
             })
             .await
@@ -2085,6 +2096,7 @@ async fn concurrent_proxy_terminal_owners_settle_and_link_once() {
                     },
                     error_code: None,
                     response_object: "objects/blake3/race-response",
+                    routing_session_id: None,
                     conversation: Some(ProxyConversationInput {
                         key: &key,
                         request_json: &request_json,
@@ -2195,6 +2207,7 @@ async fn terminal_upstream_attribution_uses_only_dispatched_candidates() {
                 usage: TokenUsage::default(),
                 error_code: Some("upstream_unavailable"),
                 response_object: "gap://proxy-attribution/no-dispatch-response",
+                routing_session_id: None,
                 conversation: None,
             },
             None,
@@ -2250,6 +2263,7 @@ async fn terminal_upstream_attribution_uses_only_dispatched_candidates() {
                 usage: TokenUsage::default(),
                 error_code: Some("upstream_connection"),
                 response_object: "gap://proxy-attribution/failover-response",
+                routing_session_id: None,
                 conversation: None,
             },
             None,

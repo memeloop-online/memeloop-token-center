@@ -49,7 +49,7 @@ pub(crate) async fn prepare_route_for_protocol(
             protocol,
             RouteSelectionOptions {
                 upstream_account_hint: hint,
-                avoid_upstream_account_id: None,
+                avoid_route_account: None,
                 selection_seed: seed,
             },
         )

@@ -3,6 +3,7 @@ mod lifecycle;
 mod metered_projection;
 mod pricing_stats;
 mod queries;
+mod session_routing;
 mod settlement;
 mod stats;
 

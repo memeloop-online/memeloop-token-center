@@ -88,7 +88,7 @@ async fn credential_expiring_after_resolution_skips_to_prepared_standby() {
             Protocol::OpenAiResponses.name(),
             RouteSelectionOptions {
                 upstream_account_hint: None,
-                avoid_upstream_account_id: None,
+                avoid_route_account: None,
                 selection_seed: request_id,
             },
         )
@@ -182,7 +182,7 @@ async fn local_codex_chat_protocol_keeps_priority_over_native_candidate() {
             Protocol::OpenAiChat.name(),
             RouteSelectionOptions {
                 upstream_account_hint: None,
-                avoid_upstream_account_id: None,
+                avoid_route_account: None,
                 selection_seed: request_id,
             },
         )
@@ -235,7 +235,7 @@ async fn changed_transport_revision_invalidates_the_prepared_snapshot() {
             Protocol::OpenAiResponses.name(),
             RouteSelectionOptions {
                 upstream_account_hint: None,
-                avoid_upstream_account_id: None,
+                avoid_route_account: None,
                 selection_seed: request_id,
             },
             fixture.state.config.key_pepper.as_bytes(),

@@ -165,6 +165,7 @@ async fn finish_with_terminal_evidence(
             },
             error_code,
             response_object: &response_object,
+            routing_session_id: None,
             conversation: None,
         })
         .await

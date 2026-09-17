@@ -547,6 +547,7 @@ mod tests {
                 },
                 error_code: None,
                 response_object: "gap://worker-metered-projection/response",
+                routing_session_id: None,
                 conversation: None,
             })
             .await

@@ -117,7 +117,7 @@ async fn soonest_reset_real_gateway_uses_shared_evidence_and_preserves_native_he
             "openai",
             crate::db::RouteSelectionOptions {
                 upstream_account_hint: None,
-                avoid_upstream_account_id: None,
+                avoid_route_account: None,
                 selection_seed: Uuid::from_u128(7),
             },
         )

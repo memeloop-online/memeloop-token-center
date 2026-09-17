@@ -553,7 +553,7 @@ async fn assistant_execution_context(
             &protocol,
             crate::db::RouteSelectionOptions {
                 upstream_account_hint: None,
-                avoid_upstream_account_id: None,
+                avoid_route_account: None,
                 selection_seed: Uuid::now_v7(),
             },
         )

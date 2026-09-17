@@ -405,6 +405,7 @@ async fn metered_usage_projection_is_exactly_once_and_skips_prepaid_hot_rows() {
             },
             error_code: None,
             response_object: "gap://metered-projection/response",
+            routing_session_id: None,
             conversation: Some(ProxyConversationInput {
                 key: &key,
                 request_json: &request_json,

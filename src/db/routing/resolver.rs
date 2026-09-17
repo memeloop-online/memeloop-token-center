@@ -195,7 +195,7 @@ impl Database {
     ) -> Result<Vec<AuthorizedUpstreamCandidate>, AppError> {
         let RouteSelectionOptions {
             upstream_account_hint,
-            avoid_upstream_account_id,
+            avoid_route_account,
             selection_seed,
         } = selection;
         let rows = sqlx::query(
@@ -250,7 +250,7 @@ impl Database {
             key_id,
             selection_seed,
             upstream_account_hint,
-            avoid_upstream_account_id,
+            avoid_route_account,
         );
         tracing::debug!(
             event = "authorized_candidate_order",
@@ -533,7 +533,7 @@ fn order_authorized_candidates(
     key_id: Uuid,
     selection_seed: Uuid,
     hint: Option<Uuid>,
-    avoid: Option<Uuid>,
+    avoid: Option<(Uuid, Uuid)>,
 ) -> HintDisposition {
     let disposition = match hint {
         None => HintDisposition::Absent,
@@ -561,8 +561,10 @@ fn order_authorized_candidates(
     disposition
 }
 
-fn avoid_rank(avoid: Option<Uuid>, candidate: &RoutingCandidate) -> u8 {
-    u8::from(avoid.is_some_and(|avoid| avoid == candidate.account_id))
+fn avoid_rank(avoid: Option<(Uuid, Uuid)>, candidate: &RoutingCandidate) -> u8 {
+    u8::from(avoid.is_some_and(|(route_id, account_id)| {
+        route_id == candidate.route_id && account_id == candidate.account_id
+    }))
 }
 
 fn hint_rank(hint: Option<Uuid>, candidate: &RoutingCandidate) -> u8 {
@@ -705,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_session_transport_account_is_only_deprioritized() {
+    fn latest_session_transport_route_account_is_only_deprioritized() {
         let avoided = Uuid::from_u128(101);
         let alternative = Uuid::from_u128(102);
         let mut candidates = vec![candidate(avoided), candidate(alternative)];
@@ -717,7 +719,7 @@ mod tests {
             Uuid::from_u128(10),
             Uuid::from_u128(20),
             None,
-            Some(avoided),
+            Some((Uuid::from_u128(1), avoided)),
         );
 
         assert_eq!(disposition, HintDisposition::Absent);
@@ -742,7 +744,7 @@ mod tests {
             Uuid::from_u128(10),
             Uuid::from_u128(20),
             Some(hinted_and_avoided),
-            Some(hinted_and_avoided),
+            Some((Uuid::from_u128(1), hinted_and_avoided)),
         );
 
         assert_eq!(disposition, HintDisposition::Preferred);
@@ -758,9 +760,28 @@ mod tests {
             Uuid::from_u128(10),
             Uuid::from_u128(20),
             None,
-            Some(account),
+            Some((Uuid::from_u128(1), account)),
         );
         assert_eq!(candidates[0].account_id, account);
+    }
+
+    #[test]
+    fn avoid_evidence_does_not_deprioritize_same_account_on_another_route() {
+        let account = Uuid::from_u128(101);
+        let mut candidates = vec![candidate(account), candidate(account)];
+        candidates[1].route_id = Uuid::from_u128(2);
+        candidates[1].priority = 50;
+
+        order_authorized_candidates(
+            &mut candidates,
+            Uuid::from_u128(10),
+            Uuid::from_u128(20),
+            None,
+            Some((Uuid::from_u128(1), account)),
+        );
+
+        assert_eq!(candidates[0].route_id, Uuid::from_u128(2));
+        assert_eq!(candidates[1].route_id, Uuid::from_u128(1));
     }
 
     #[test]

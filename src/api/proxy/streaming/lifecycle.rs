@@ -264,6 +264,9 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
     } else {
         CodexRetryTerminal::Failed
     };
+    let routing_session_id = conversation
+        .as_ref()
+        .and_then(|conversation| conversation.hints.session_id.clone());
     let conversation = if let Some(conversation) = conversation.as_ref() {
         match conversation.project(&memory, lifecycle_deadline).await {
             Ok(projection) => Some(projection),
@@ -299,6 +302,7 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
             usage,
             error_code,
             response_object: &stored_response,
+            routing_session_id: routing_session_id.as_deref(),
             conversation: conversation
                 .as_ref()
                 .map(|projection| projection.input(response_id.as_deref())),

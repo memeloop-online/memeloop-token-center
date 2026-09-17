@@ -91,6 +91,10 @@ pub struct FinishProxyRequest<'a> {
     pub usage: TokenUsage,
     pub error_code: Option<&'a str>,
     pub response_object: &'a str,
+    /// Explicit downstream session identity captured independently from
+    /// semantic conversation projection. Terminal routing evidence must be
+    /// durable even when projection is deferred or skipped.
+    pub routing_session_id: Option<&'a str>,
     pub conversation: Option<ProxyConversationInput<'a>>,
 }
 
@@ -697,6 +701,7 @@ impl Database {
             usage: TokenUsage::default(),
             error_code: Some("request_lifecycle_timeout"),
             response_object: &response_object,
+            routing_session_id: None,
             conversation: None,
         })
         .await
@@ -1050,6 +1055,25 @@ impl Database {
             if attributed.rows_affected() != 1 {
                 return Err(AppError::Conflict(
                     "request terminal upstream attribution changed".into(),
+                ));
+            }
+        }
+
+        if let Some(explicit_session_id) = input.routing_session_id {
+            let attached = sqlx::query(
+                "UPDATE request_records SET explicit_session_id = $1 WHERE id = $2 AND created_at = $3 AND tenant_id = $4 AND key_id = $5 AND reservation_id = $6 AND completed_at IS NULL",
+            )
+            .bind(explicit_session_id)
+            .bind(&request_id)
+            .bind(created_at)
+            .bind(&tenant_id)
+            .bind(&key_id)
+            .bind(&reservation_id)
+            .execute(&mut *transaction)
+            .await?;
+            if attached.rows_affected() != 1 {
+                return Err(AppError::Conflict(
+                    "request terminal session identity changed".into(),
                 ));
             }
         }

@@ -819,7 +819,7 @@ async fn unauthorized_traffic_hint_cannot_expand_the_granted_candidate_set() {
             "openai",
             RouteSelectionOptions {
                 upstream_account_hint: Some(fixture.unauthorized_account_id),
-                avoid_upstream_account_id: None,
+                avoid_route_account: None,
                 selection_seed: uuid::Uuid::now_v7(),
             },
             fixture.state.config.key_pepper.as_bytes(),
