@@ -99,6 +99,17 @@ test('large archive content is explicit, paged to its real end, and cleared on v
     assert.equal(await page.evaluate(() => window.archiveRangeReads), 0, 'invalid snapshots also require explicit reading');
     await open.click();
     await reader.getByText(/^Archived step 1:/).first().waitFor();
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-replay.html?full=1&invalid-payload=1`);
+    await open.waitFor();
+    await open.click();
+    await reader.getByRole('alert').getByText('The archive format could not be read.', { exact: true }).waitFor();
+    await page.evaluate(() => localStorage.setItem('mtc-locale', 'zh-CN'));
+    await page.reload();
+    const openZh = page.getByRole('button', { name: '读取完整响应内容', exact: true });
+    await openZh.waitFor();
+    await openZh.click();
+    await page.getByRole('alert').getByText('归档格式无法读取。', { exact: true }).waitFor();
+    await page.evaluate(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-replay.html?full=1&gap=1`);
     await page.getByText('This history has not loaded yet. Try again later.', { exact: true }).waitFor();
     assert.equal(await open.count(), 0, 'a confirmed archive gap is not offered as a readable bound object');
