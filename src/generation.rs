@@ -12,7 +12,9 @@ pub use comfyui_schema::{
     effective_parameter_schema as comfyui_parameter_schema,
     validate_config as validate_comfyui_config, validate_parameters as validate_comfyui_parameters,
 };
-pub(crate) use protocol::{GenerationProtocolAdapter, normalize_seedance_duration};
+pub(crate) use protocol::GenerationProtocolAdapter;
+#[cfg(test)]
+pub(crate) use protocol::normalize_seedance_duration;
 use sha2::{Digest, Sha256};
 pub(crate) use siliconflow_video_schema::{
     parameter_schema as siliconflow_video_parameter_schema,
