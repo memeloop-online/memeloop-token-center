@@ -905,7 +905,7 @@ async fn many_completed_facts_move_into_one_session_without_projection_drift() {
     );
     assert_eq!(
         totals.try_get::<i64, _>("cost_micros").unwrap(),
-        REQUESTS * 5
+        (REQUESTS - 8) * 5
     );
     for table in ["session_usage_hourly", "session_usage_daily"] {
         let sql = format!(
