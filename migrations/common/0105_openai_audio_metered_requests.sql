@@ -74,9 +74,26 @@ UPDATE request_records
        output_tokens = 0
  WHERE protocol = 'audio-transcription';
 
+-- Schema 103 already projected audio seconds into generation_units while
+-- keeping request-record seconds in the compatibility output column. Only an
+-- older fact that still carries the same positive quantity in output_tokens,
+-- and has no generation quantity of its own, is safe to backfill.
 UPDATE request_stats_facts
-   SET generation_units = output_tokens,
-       billing_unit = 'second',
+   SET generation_units = output_tokens
+ WHERE protocol = 'audio-transcription'
+   AND generation_units = 0
+   AND output_tokens > 0
+   AND EXISTS (
+       SELECT 1
+         FROM request_records r
+        WHERE r.id = request_stats_facts.request_id
+          AND r.protocol = 'audio-transcription'
+          AND r.billing_unit = 'second'
+          AND r.billed_units = request_stats_facts.output_tokens
+   );
+
+UPDATE request_stats_facts
+   SET billing_unit = 'second',
        input_tokens = 0,
        cached_input_tokens = 0,
        cache_write_tokens = 0,
