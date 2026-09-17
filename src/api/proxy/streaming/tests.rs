@@ -209,6 +209,21 @@ fn event_limit_is_observed_protocol_invalidity() {
 }
 
 #[test]
+fn strict_chat_event_limit_does_not_turn_missing_terminal_usage_into_semantic_evidence() {
+    let mut capture = ResponsesSseCapture::for_openai_chat_usage();
+    let oversized = vec![b'x'; crate::api::limits::MAX_RESPONSES_SSE_EVENT_BYTES + 1];
+    assert!(matches!(
+        capture.push_delivery_frames(&oversized),
+        Err(crate::api::sse::SseFramerRejection::EventLimit)
+    ));
+    let summary = capture.finish_summary();
+    assert!(summary.usage_invalid);
+    assert!(summary.observed_protocol_invalid);
+    assert!(!summary.independently_observed_protocol_invalid);
+    assert!(summary.protocol_invalid);
+}
+
+#[test]
 fn strict_chat_valid_prefix_is_not_confused_with_missing_final_usage() {
     let mut capture = ResponsesSseCapture::for_openai_chat_usage();
     let frames = capture.push_delivery_frames(

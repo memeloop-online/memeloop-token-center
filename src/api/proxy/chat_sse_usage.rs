@@ -155,6 +155,10 @@ impl ChatSseUsageState {
         self.invalid || !self.done || self.usage.is_none()
     }
 
+    pub(super) fn observed_semantic_invalidity(&self) -> bool {
+        self.invalid
+    }
+
     /// Prefix validity is distinct from final usage completeness: a healthy
     /// live stream normally has neither DONE nor terminal usage yet.
     pub(super) fn valid_so_far(&self) -> bool {
