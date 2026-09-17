@@ -18,8 +18,7 @@ test('analytics background exposes actual indexed buckets through pointer, keybo
     // React commits the selected bucket asynchronously and Fluent keeps hidden tooltip portals mounted.
     // Wait for the committed value and scope tooltip checks to visible content before sending the next input.
     const waitForMetricValue = async (suffix: string) => {
-      const element = await metric.elementHandle(); assert.ok(element);
-      await page.waitForFunction((node, expected) => (node.getAttribute('aria-valuetext') ?? '').endsWith(expected), element, suffix);
+      await page.waitForFunction((expected: string) => document.querySelector<HTMLElement>('[role="slider"][aria-label="Requests"]')?.getAttribute('aria-valuetext')?.endsWith(expected) ?? false, suffix);
     };
     const visibleTooltips = () => page.locator('[role="tooltip"]:visible');
     for(const theme of ['light','dark'])for(const width of [390,1440,2560]){
