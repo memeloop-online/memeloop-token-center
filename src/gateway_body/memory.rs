@@ -149,7 +149,43 @@ pub(crate) struct ConversationProjectionPermit {
     _permit: OwnedSemaphorePermit,
 }
 
+pub(crate) struct ArchiveJsonMemory {
+    reservation: Arc<ProxyMemoryReservation>,
+    bytes: usize,
+    nodes: usize,
+}
+
+impl Drop for ArchiveJsonMemory {
+    fn drop(&mut self) {
+        self.reservation.release(self.nodes, 256);
+        self.reservation.release(self.bytes, 1);
+    }
+}
+
 impl ProxyMemoryReservation {
+    /// Reserve the additional parsed tree and serialized output used only to
+    /// derive an archive-safe JSON copy. The normal request envelope already
+    /// accounts for routing/provider copies, not this transient retention
+    /// transform.
+    pub(crate) fn try_reserve_archive_json(
+        self: &Arc<Self>,
+        body: &[u8],
+    ) -> Option<ArchiveJsonMemory> {
+        let nodes = JsonMemoryScanner::default().observe(body);
+        if !self.try_grow(body.len(), 1) {
+            return None;
+        }
+        if !self.try_grow(nodes, 256) {
+            self.release(body.len(), 1);
+            return None;
+        }
+        Some(ArchiveJsonMemory {
+            reservation: self.clone(),
+            bytes: body.len(),
+            nodes,
+        })
+    }
+
     /// Snapshot the selected account's policy for this request. Retries cannot
     /// replace its selected queue policy or metrics owner.
     pub(crate) fn configure_admission(

@@ -48,11 +48,15 @@ version/ETag where the backend provides them.
    normalized and cannot reconstruct exact JSON whitespace, SSE framing, or
    opaque fields. They must not replace the raw byte contract implicitly.
 2. Text proxy archives apply a typed retention policy before encryption:
-   `encrypted_content`, inline image/audio/video data URLs, typed media body
-   fields and `b64_json` become bounded metadata markers. Delivery, billing,
-   conversation projection and upstream request bytes remain unchanged.
-   Unknown fields and non-JSON bodies retain their original bytes; the policy
-   does not guess from entropy or redact ordinary tool fields named `data`.
+   encrypted fields inside explicit reasoning/encrypted protocol envelopes,
+   inline image/audio/video data URLs, and typed media body fields become
+   bounded metadata markers. Delivery, billing, conversation projection and
+   upstream request bytes remain unchanged. Unknown fields and non-JSON bodies
+   retain their original bytes; the policy does not guess from entropy or
+   redact ordinary tool fields named `data`, `b64_json` or
+   `encrypted_content`. Ambiguous duplicate-key JSON is retained only as
+   metadata because its exact bytes can contain a value hidden by normal JSON
+   object projection.
 3. Historical recompression must write a new object, verify original
    length/digest, CAS-bind the new locator, and reclaim the old object only
    through lease/reference-safe GC. It is not part of enabling new writes.

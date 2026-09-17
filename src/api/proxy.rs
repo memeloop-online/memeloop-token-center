@@ -1020,10 +1020,22 @@ pub(in crate::api) async fn proxy_with_identity(
         Some(primary.credential_generation),
     );
     let admitted_request_object = format!("gap://{request_id}/request");
-    let archive_request_body = archive_retention::json_body(&body, &original_request_json)?;
+    let archive_json_memory = if archive_retention::may_require_retention(&body) {
+        let Some(reservation) = memory.try_reserve_archive_json(&body) else {
+            state
+                .metrics
+                .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Json);
+            return Err(AppError::Overloaded);
+        };
+        Some(reservation)
+    } else {
+        None
+    };
+    drop(original_request_json);
+    let archive_request_body = archive_retention::request_json_body(&body);
     let request_capture_memory = state.metrics.memory_usage(
         crate::metrics::MemoryComponent::StreamCapture,
-        archive_request_body.len().saturating_mul(3),
+        body.len().saturating_mul(3),
     );
     let reservation = match state
         .db
@@ -1059,6 +1071,7 @@ pub(in crate::api) async fn proxy_with_identity(
     };
     admission.finish("completed", None, Some(archive_request_body.len()));
     drop(archive_request_body);
+    drop(archive_json_memory);
     let client_name = client_name(&headers);
     let conversation = matches!(
         protocol,
@@ -1071,7 +1084,6 @@ pub(in crate::api) async fn proxy_with_identity(
         client_name,
         projection_admission: std::sync::Mutex::new(ConversationProjectionAdmission::Deferred),
     });
-    drop(original_request_json);
     drop(request_capture_memory);
     memory.release(
         body.len(),
@@ -2320,7 +2332,7 @@ async fn finish_buffered_request_with_upstream_attribution(
     let archive_body = archive_retention::json_body_if_valid(&body);
     let response_capture_memory = request.state.metrics.memory_usage(
         crate::metrics::MemoryComponent::StreamCapture,
-        archive_body.len().saturating_mul(3),
+        body.len().saturating_mul(3),
     );
     let response_capture_permit = request.state.proxy_memory_budget.reservation();
     let response_archive = if request.memory.has_buffered_response()
