@@ -43,7 +43,7 @@ test('analytics background exposes actual indexed buckets through pointer, keybo
       if (action === 'pointer') await notice.hover();
       if (action === 'keyboard') await page.keyboard.press('Tab');
       if (action === 'touch') await notice.tap();
-      const tooltip = page.getByRole('tooltip').filter({ hasText: /不是供应商实际消耗或发票|not supplier consumption or an invoice/ });
+      const tooltip = page.getByRole('tooltip').filter({ hasText: /供应商实际用量或发票请以供应商记录为准|use provider records for actual usage or invoice details/ });
       await tooltip.waitFor();
       assert.equal(await page.getByRole('tooltip').count(), 1, `${action}: detail must not also expose a trend tooltip`);
       assert.match(await tooltip.textContent() ?? '', /保守上限|conservative ceiling/);

@@ -56,7 +56,7 @@ export function requestUsageCopy(request: RequestView, locale: string) {
   switch (request.usage_basis) {
     case 'provider_reported': return { label: zh ? '上游报告用量' : 'Provider-reported usage', hint: zh ? '词元数量由上游报告；速率使用网关记录的时间。' : 'Token counts reported by the provider; throughput uses gateway-recorded timing.' };
     case 'provider_estimated': return { label: zh ? '估算用量' : 'Estimated usage', hint: zh ? '词元数量为估算值，实际输出速率未知。' : 'Token counts are estimated; actual output throughput is unknown.' };
-    case 'contract_ceiling': return { label: zh ? '结算上限' : 'Settlement ceiling', hint: zh ? '词元数量为保守结算上限，不是实际生成量；实际用量与速率未知。' : 'Token counts are conservative settlement ceilings, not actual generated output; actual usage and throughput are unknown.' };
+    case 'contract_ceiling': return { label: zh ? '结算上限' : 'Settlement ceiling', hint: zh ? '词元数量为保守结算上限；实际用量与速率请以供应商记录为准。' : 'Token counts are conservative settlement ceilings; use provider records for actual usage and throughput.' };
     case 'not_observed': return { label: zh ? '未观测用量' : 'Usage not observed', hint: zh ? '未观测到实际词元用量；记录计数不能作为实际输出或速率。' : 'Actual token usage was not observed; recorded counts cannot represent actual output or throughput.' };
     default: return { label: zh ? '用量来源未记录' : 'Usage source not recorded', hint: zh ? '历史词元计数来源未记录，不能确认实际输出速率。' : 'The source of historical token counts was not recorded; actual output throughput cannot be confirmed.' };
   }
@@ -66,35 +66,46 @@ export function requestCostCopy(request: RequestView, locale: string) {
   const zh = locale === 'zh-CN';
   /** Recorded local ledger amounts stay visible in details, explicitly labelled as local settlement rather than supplier usage. */
   const ledgerLabel = zh ? '本地账本金额' : 'Local ledger amount';
-  if (request.usage_basis === 'not_observed') return {
+  if (requestIsPending(request)) return {
     unknown: true,
     ledgerLabel,
-    label: zh ? '费用未知' : 'Cost unknown',
+    label: zh ? '待结算' : 'Awaiting settlement',
+    hint: zh ? '请求仍在进行中，费用尚未结算。' : 'The request is still in progress; cost has not been settled.',
+  };
+  if (requestFailed(request) && request.usage_basis === 'not_observed') return {
+    unknown: false,
+    ledgerLabel,
+    label: zh ? '未观测用量' : 'Usage not observed',
     hint: zh
-      ? '本地账本以 0 结算并释放了预留，但未观测到供应商实际用量；0 不是供应商免费或实际费用为零的证明。'
-      : 'The local ledger settled zero and released the reservation, but supplier usage was not observed; zero does not prove the supplier charged nothing.',
+      ? '这是失败请求，未观测到供应商实际用量；本地计费默认按 0 显示。'
+      : 'This request failed without observed supplier usage; local billing defaults to 0.',
   };
   if (!requestUsageIsActual(request)) return {
     unknown: true, ledgerLabel,
-    label: zh ? '费用未知' : 'Cost unknown',
-    hint: zh ? '实际用量未确认。已记账金额仅供核对。' : 'Actual usage is unconfirmed. The recorded ledger amount is available for review.',
+    label: zh ? '需核对' : 'Review required',
+    hint: zh ? '实际用量尚未确认；已记账金额可用于核对。' : 'Actual usage is pending confirmation; the recorded ledger amount is available for review.',
   };
   if (request.usage_basis === 'contract_ceiling') return {
     unknown: false,
     ledgerLabel,
     label: '',
     hint: zh
-      ? '历史本地结算采用保守合同上限；这是已记账的本地金额，不是供应商实际用量或发票证明。'
-      : 'Historical local settlement used a conservative contract ceiling; this is the locally recorded amount, not proof of supplier usage or invoice cost.',
+      ? '历史本地结算采用保守合同上限；供应商实际用量与发票请以供应商记录为准。'
+      : 'Historical local settlement used a conservative contract ceiling; use provider records for actual usage and invoice details.',
   };
   return {
     unknown: false,
     ledgerLabel,
     label: '',
     hint: zh
-      ? '本地已结算金额；不是供应商实际消耗账单。'
-      : 'Locally settled amount; not the supplier’s actual usage invoice.',
+      ? '本地已结算金额；供应商实际用量请以供应商记录为准。'
+      : 'Locally settled amount; consult provider records for actual usage.',
   };
+}
+
+/** Failed requests without supplier evidence display the policy amount (zero) even before a historical rebate is posted. */
+export function requestDisplayedCost(request: RequestView): string {
+  return requestFailed(request) && request.usage_basis === 'not_observed' ? '0' : request.cost;
 }
 
 export function requestCredentialLabel(request: RequestView, fallback: string | undefined): { label: string } | { key: 'request.unnamedCredential' | 'request.missingCredential' } {

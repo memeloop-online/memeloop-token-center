@@ -12,8 +12,9 @@ test('summary monetary surfaces label local settlement without changing their am
   assert.match(notice,/DetailTooltip content=\{detail\}/);
   assert.match(notice,/<span tabIndex=\{0\}/);
   assert.match(notice,/可能包含保守上限结算/);
-  assert.match(notice,/不是供应商实际消耗或发票/);
+  assert.match(notice,/供应商实际用量或发票请以供应商记录为准/);
   assert.match(notice,/历史用量来源未记录/);
+  assert.doesNotMatch(notice,/历史汇总可能仍包含尚未完成调整的脏账/);
   assert.doesNotMatch(notice,/fetch\(|api\(|reduce\(/);
 });
 

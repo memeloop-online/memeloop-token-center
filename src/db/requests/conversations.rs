@@ -1047,7 +1047,16 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
             let raw_cached_input_tokens: i64 = row.try_get("cached_input_tokens")?;
             let raw_cache_write_tokens: i64 = row.try_get("cache_write_tokens")?;
             let raw_output_tokens: i64 = row.try_get("output_tokens")?;
-            let cost_micros: i64 = row.try_get("cost_micros")?;
+            let raw_cost_micros: i64 = row.try_get("cost_micros")?;
+            let status_code: Option<i64> = row.try_get("status_code")?;
+            let error_code: Option<String> = row.try_get("error_code")?;
+            let usage_basis = super::queries::request_usage_basis_from_row(&row)?;
+            let cost_micros = super::super::effective_cost::effective_displayed_cost_micros(
+                raw_cost_micros,
+                status_code,
+                error_code.as_deref(),
+                usage_basis.as_ref().map(|value| value.as_str()),
+            );
             let completed_at = row.try_get("completed_at")?;
             let (usage, billing, currency) = super::request_detail_accounting_projection(
                 billable,
@@ -1063,7 +1072,7 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
             );
             Ok(ConversationRequestView {
                 request: RequestView {
-                    usage_basis: super::queries::request_usage_basis_from_row(&row)?,
+                    usage_basis,
                     compaction: row
                         .try_get::<Option<i64>, _>("compaction")?
                         .filter(|value| *value == 1)
@@ -1074,7 +1083,7 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
                     created_at: row.try_get("created_at")?,
                     completed_at,
                     source_completed_at: row.try_get("source_completed_at")?,
-                    lifecycle_state: match row.try_get::<Option<i64>, _>("status_code")? {
+                    lifecycle_state: match status_code {
                         None => crate::model::RequestLifecycleState::Pending,
                         Some(499) => crate::model::RequestLifecycleState::Cancelled,
                         Some(code) if (200..400).contains(&code) => {
@@ -1086,7 +1095,7 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
                     model: row.try_get("model")?,
                     upstream_account_id: None,
                     route_id: None,
-                    status_code: row.try_get("status_code")?,
+                    status_code,
                     duration_ms: row.try_get("duration_ms")?,
                     input_tokens: raw_input_tokens,
                     cached_input_tokens: raw_cached_input_tokens,
@@ -1096,7 +1105,7 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
                     currency: currency.clone(),
                     usage,
                     billing,
-                    error_code: row.try_get("error_code")?,
+                    error_code,
                     archive_state: crate::model::RequestArchiveState::from_storage(
                         row.try_get::<String, _>("archive_state")?.as_str(),
                     )

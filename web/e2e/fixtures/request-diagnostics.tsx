@@ -41,6 +41,9 @@ const request: RequestView = {
 if (new URLSearchParams(location.search).get('usage-basis') === 'contract_ceiling') {
   Object.assign(request, { usage_basis: 'contract_ceiling', status_code: 499, output_tokens: 100000, duration_ms: 11681, first_output_ms: 1000, generation_duration_ms: 10681 });
 }
+if (new URLSearchParams(location.search).get('usage-basis') === 'not_observed') {
+  Object.assign(request, { usage_basis: 'not_observed', status_code: 502, error_code: 'upstream_stream', cost: '35' });
+}
 
 const historicalGap: RequestView = {
   request_id: '3d9f7abc-b767-4668-a8d1-baa042ea1df2',

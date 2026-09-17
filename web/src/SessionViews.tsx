@@ -4,7 +4,7 @@ import type { CSSProperties } from 'react';
 import { formatCurrencyDisplay, formatMetricDisplay, formatDurationDisplay, formatPercent } from './format.js';
 import type { Locale } from './i18n.js';
 import { useI18n } from './i18n.js';
-import { requestCostCopy } from './requestTablePresentation.js';
+import { requestCostCopy, requestDisplayedCost } from './requestTablePresentation.js';
 import { deriveSemanticExecution } from './sessionSemantics.js';
 import { latestDeclaredSessionName, sessionFallback, unnamedSessionName } from './sessionTitles.js';
 import { SessionReplayPanel, type SessionReplayArchiveLoader } from './sessionReplayViews.js';
@@ -74,7 +74,7 @@ function SemanticExecutionPanel({ detail }: { detail: LogicalSessionDetail }) {
   const agentCosts = new Map<string, bigint>();
   const taskCosts = new Map<string, bigint>();
   for (const request of observations) {
-    const micros = decimalMicros(request.cost);
+    const micros = decimalMicros(requestDisplayedCost(request));
     if (!micros || !request.currency) continue;
     const agent = request.execution?.agent_id || t('sessions.agentUnknown');
     const agentKey = `${request.currency}\0${agent}`;
@@ -240,7 +240,7 @@ function SessionActivity({ detail, summary, currency, loading, onSelect }: {
   const eventMetrics = (request: ConversationRequest) => [
     `${formatMetricNumber(request.input_tokens + request.output_tokens, locale).text} ${t('request.tokenUnit')}`,
     request.duration_ms === null ? '—' : formatMilliseconds(request.duration_ms, locale),
-    requestCostCopy(request, locale).unknown ? requestCostCopy(request, locale).label : request.currency || currency || summaryCurrency ? formatCurrency(request.cost, request.currency ?? currency ?? summaryCurrency ?? '', locale) : '—',
+    requestCostCopy(request, locale).unknown ? requestCostCopy(request, locale).label : request.currency || currency || summaryCurrency ? formatCurrency(requestDisplayedCost(request), request.currency ?? currency ?? summaryCurrency ?? '', locale) : '—',
   ];
   const parentLabel = (request: ConversationRequest) => {
     const node = nodes.get(request.request_id);
@@ -270,7 +270,7 @@ function SessionActivity({ detail, summary, currency, loading, onSelect }: {
             <header><div><DetailTooltip content={`${t('sessions.client')}: ${request.structure?.client_name || actor}\n${t('sessions.diagnostics')}: ${request.request_id}\n${request.protocol}`}><b className="session-event-model" tabIndex={0}>{request.model}</b></DetailTooltip><span className={`status ${status}`}>{request.status_code ?? t('common.running')}</span>{task && <span className="pill">{task}</span>}{relations.map((relation) => <span className="session-relation" key={`${relation.from_request_id ?? 'root'}-${relation.relation}`}>{t(`conversationRelation.${relation.relation}`)}</span>)}</div><time dateTime={new Date(request.created_at).toISOString()}>{new Date(request.created_at).toLocaleString(locale)}</time></header>
             <div className="session-event-request"><span>{actor}</span></div>
             {parent && <p className="session-event-parent">← {parent}</p>}
-            <footer><DetailTooltip content={`${t('sessions.tokens')}: ${request.input_tokens + request.output_tokens}\n${t('sessions.averageLatency')}: ${request.duration_ms == null ? '—' : `${request.duration_ms} ms`}\n${t('sessions.cost')}: ${requestCostCopy(request, locale).unknown ? requestCostCopy(request, locale).hint : `${request.cost} ${request.currency ?? currency ?? summaryCurrency ?? ''}`}`.trim()}><span tabIndex={0}>{eventMetrics(request).join(' · ')}</span></DetailTooltip>{request.error_code && <code className="error-code">{request.error_code}</code>}<button type="button" className="secondary session-event-open" disabled={loading} onClick={() => onSelect(request)}>{t('request.inspect')}</button></footer>
+            <footer><DetailTooltip content={`${t('sessions.tokens')}: ${request.input_tokens + request.output_tokens}\n${t('sessions.averageLatency')}: ${request.duration_ms == null ? '—' : `${request.duration_ms} ms`}\n${t('sessions.cost')}: ${requestCostCopy(request, locale).unknown ? requestCostCopy(request, locale).hint : `${requestDisplayedCost(request)} ${request.currency ?? currency ?? summaryCurrency ?? ''}`}`.trim()}><span tabIndex={0}>{eventMetrics(request).join(' · ')}</span></DetailTooltip>{request.error_code && <code className="error-code">{request.error_code}</code>}<button type="button" className="secondary session-event-open" disabled={loading} onClick={() => onSelect(request)}>{t('request.inspect')}</button></footer>
           </article>
         </li>;
       })}</ol>

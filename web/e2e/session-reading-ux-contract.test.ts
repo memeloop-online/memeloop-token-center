@@ -12,6 +12,8 @@ test('conversation content precedes optional operational timelines', () => {
   assert.match(view, /className="session-event-model" tabIndex=\{0\}>\{request.model\}/);
   assert.match(view, /formatMetricDisplay/);
   assert.match(view, /formatCurrencyDisplay/);
+  assert.match(view, /requestDisplayedCost/);
+  assert.match(view, /const micros = decimalMicros\(requestDisplayedCost\(request\)\)/);
   assert.match(view, /formatDurationDisplay/);
   assert.doesNotMatch(view, /className="session-detail" role=\{onClose/);
 });
