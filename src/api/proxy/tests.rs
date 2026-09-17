@@ -277,6 +277,26 @@ async fn codex_route_fixture(label: &str) -> CodexRouteFixture {
     codex_route_fixture_with_archive_directory(label, "archive").await
 }
 
+async fn set_codex_chat_control_policy(fixture: &CodexRouteFixture, policy: &str) {
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let mut config: Value = serde_json::from_str(
+        &sqlx::query_scalar::<_, String>("SELECT config_json FROM upstream_accounts WHERE id = $1")
+            .bind(fixture.upstream_account_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    config["transport_policy"] = json!({"chat_controls": policy});
+    sqlx::query("UPDATE upstream_accounts SET config_json = $1 WHERE id = $2")
+        .bind(config.to_string())
+        .bind(fixture.upstream_account_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
 async fn add_codex_standby_route(
     fixture: &CodexRouteFixture,
     tenant: &str,
@@ -2726,6 +2746,10 @@ fn assert_codex_chat_wire(request: &wiremock::Request, upstream_model: &str) {
         "top_p",
         "presence_penalty",
         "frequency_penalty",
+        "stop",
+        "user",
+        "seed",
+        "response_format",
     ] {
         assert!(body.get(field).is_none(), "{field}");
     }
@@ -2860,8 +2884,75 @@ async fn unsupported_codex_protocol_and_chat_shapes_fail_before_side_effects() {
 }
 
 #[tokio::test]
+async fn codex_provider_default_chat_controls_are_validated_then_removed() {
+    let fixture = codex_route_fixture("provider-default-chat-controls").await;
+    set_codex_chat_control_policy(&fixture, "provider_default").await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .and(body_partial_json(json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "translate"}]
+            }]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            completed_codex_sse("translated").into_bytes(),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/chat/completions",
+        json!({
+            "model": fixture.model,
+            "messages": [{"role": "user", "content": "translate"}],
+            "stream": false,
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "top_p": 0.5,
+            "presence_penalty": 0.5,
+            "frequency_penalty": -0.5,
+            "stop": ["END"],
+            "user": "translation-client",
+            "seed": 7,
+            "response_format": {"type": "text"}
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+
+    let requests = upstream.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    for field in [
+        "max_tokens",
+        "temperature",
+        "top_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "stop",
+        "user",
+        "seed",
+        "response_format",
+    ] {
+        assert!(body.get(field).is_none(), "{field}");
+    }
+    upstream.verify().await;
+}
+
+#[tokio::test]
 async fn codex_specific_chat_limits_skip_to_a_compatible_native_candidate() {
     let fixture = codex_route_fixture("chat-fallback").await;
+    set_codex_chat_control_policy(&fixture, "strict").await;
     fixture
         .state
         .db

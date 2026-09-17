@@ -489,6 +489,12 @@ fn builtin_codex_routes_openai_with_required_trusted_limits_only() {
             .pointer("/properties/transport_policy/properties/shared_probe_attempts/minimum"),
         Some(&json!(0))
     );
+    assert_eq!(
+        codex
+            .config_schema
+            .pointer("/properties/transport_policy/properties/chat_controls/default"),
+        Some(&json!("strict"))
+    );
     for (field, bound, expected) in [
         ("version", "enum", json!([1])),
         ("candidate_attempts", "minimum", json!(1)),
