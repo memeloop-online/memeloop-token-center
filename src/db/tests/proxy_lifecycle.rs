@@ -205,6 +205,18 @@ async fn synchronous_session_terminal_evidence_is_immediate_and_route_scoped() {
             .unwrap(),
         None
     );
+
+    sqlx::query("UPDATE session_routing_terminals SET expires_at = 0")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        database
+            .delete_expired_session_routing_terminals(10)
+            .await
+            .unwrap(),
+        2
+    );
 }
 
 #[tokio::test]

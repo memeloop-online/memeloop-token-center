@@ -173,6 +173,19 @@ pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>
                     tracing::error!(%error, "worker failed to delete expired budget rollup detail");
                 }
             }
+            match state
+                .db
+                .delete_expired_session_routing_terminals(100_000)
+                .await
+            {
+                Ok(deleted) if deleted > 0 => {
+                    tracing::info!(deleted, "worker deleted expired session routing terminals");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(%error, "worker failed to delete expired session routing terminals");
+                }
+            }
             #[cfg(feature = "experimental-plugin-revisions")]
             if let Some(plugins) = &state.application_plugins {
                 match plugins.reclaim_unreferenced_installation_attempts().await {

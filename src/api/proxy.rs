@@ -1754,6 +1754,7 @@ async fn proxy_with_identity_and_conversation_spool(
         upstream_attempt,
         upstream_activity,
         request_id,
+        public_model: model.clone(),
         upstream_account_id: active_route.route.account_id,
         credential_generation: active_route.route.credential_generation,
         buffered_request,

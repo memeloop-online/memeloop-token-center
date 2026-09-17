@@ -8,7 +8,9 @@ mod tests;
 mod timing;
 
 use delivery::{CapturedSseDelivery, capture_sse_delivery, downstream_stream_failure};
-use lifecycle::{StreamingFinalizationInput, finalize_streaming_lifecycle};
+use lifecycle::{
+    StreamingFinalizationInput, classify_streaming_terminal, finalize_streaming_lifecycle,
+};
 use terminal_delivery::{ResponsesTerminalDelivery, TerminalEof};
 
 enum DownstreamAwarePoll<T> {
@@ -124,6 +126,7 @@ pub(super) struct StreamingResponse<'a> {
     pub(super) strict_openai_chat_usage: bool,
     pub(super) upstream_activity: crate::metrics::ActivityGuard,
     pub(super) request_id: Uuid,
+    pub(super) public_model: String,
     /// Stable operator-only correlation metadata. This is intentionally an
     /// account UUID rather than any provider response field so protocol
     /// rejections can be diagnosed without retaining or logging upstream
@@ -153,6 +156,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         strict_openai_chat_usage,
         upstream_activity,
         request_id,
+        public_model,
         upstream_account_id,
         credential_generation,
         buffered_request,
@@ -832,6 +836,45 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             }
             drop(terminal_frames);
             terminal_memory.set_bytes(0);
+            if let Some(conversation) = conversation.as_ref()
+                && let Some(session_id) = conversation.hints.session_id.as_deref()
+            {
+                let classification = classify_streaming_terminal(
+                    status_code,
+                    protocol,
+                    is_codex_route,
+                    transport_error,
+                    sse_summary.as_ref(),
+                );
+                let (model_route_id, upstream_account_id) = upstream_attempt.route_assignment();
+                let evidence = background_state.db.record_session_routing_terminal(
+                    crate::db::SessionRoutingTerminalInput {
+                        key: &conversation.key,
+                        request_id,
+                        explicit_session_id: session_id,
+                        model: &public_model,
+                        protocol: protocol.name(),
+                        status_code: classification.status_code,
+                        error_code: classification.error_code,
+                        model_route_id: Some(model_route_id),
+                        upstream_account_id: Some(upstream_account_id),
+                    },
+                );
+                match tokio::time::timeout_at(lifecycle_deadline, evidence).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => tracing::error!(
+                        %request_id,
+                        error_category = error.diagnostic_category(),
+                        stage = "stream_routing_terminal",
+                        "failed to persist streaming routing terminal before downstream close"
+                    ),
+                    Err(_) => tracing::error!(
+                        %request_id,
+                        stage = "stream_routing_terminal",
+                        "streaming routing terminal persistence exceeded lifecycle deadline"
+                    ),
+                }
+            }
             drop(body_sender);
             terminal_delivery_phase.finish(
                 transport_error.unwrap_or("returned"),

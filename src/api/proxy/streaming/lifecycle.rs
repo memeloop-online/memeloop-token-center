@@ -37,6 +37,52 @@ enum StreamingUpstreamEvidence {
     InvalidResponse,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct StreamingTerminalClassification {
+    pub(super) status_code: i64,
+    pub(super) error_code: Option<&'static str>,
+    mapped_chat_incomplete: bool,
+}
+
+pub(super) fn classify_streaming_terminal(
+    status_code: i64,
+    protocol: Protocol,
+    is_codex_route: bool,
+    transport_error: Option<&'static str>,
+    sse_summary: Option<&ResponsesSseSummary>,
+) -> StreamingTerminalClassification {
+    let mapped_chat_incomplete = is_codex_route
+        && matches!(protocol, Protocol::OpenAiChat)
+        && matches!(
+            sse_summary.map(|summary| &summary.outcome),
+            Some(ResponsesSseOutcome::TerminatedIncomplete)
+        );
+    let protocol_error = match sse_summary.map(|summary| &summary.outcome) {
+        Some(ResponsesSseOutcome::Failed) => Some("upstream_failed_response"),
+        Some(ResponsesSseOutcome::Incomplete) => Some("upstream_incomplete_response"),
+        Some(ResponsesSseOutcome::TerminatedIncomplete) if !mapped_chat_incomplete => {
+            Some("upstream_incomplete_response")
+        }
+        Some(ResponsesSseOutcome::TerminatedIncomplete) => None,
+        Some(ResponsesSseOutcome::Completed { .. }) | None => None,
+    };
+    let (status_code, error_code) = match transport_error {
+        Some("downstream_disconnected") => (499, Some("client_cancelled")),
+        Some("downstream_backpressure") => (504, Some("downstream_backpressure")),
+        Some("delivery_state") => (500, Some("delivery_state")),
+        Some(error) => (502, Some(error)),
+        None => match protocol_error {
+            Some(error) => (502, Some(error)),
+            None => (status_code, None),
+        },
+    };
+    StreamingTerminalClassification {
+        status_code,
+        error_code,
+        mapped_chat_incomplete,
+    }
+}
+
 fn streaming_upstream_evidence(
     terminal_result_failed: bool,
     transport_error: Option<&str>,
@@ -114,39 +160,16 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
         stored_response,
         gap_response,
     } = input;
-    let mapped_chat_incomplete = is_codex_route
-        && matches!(protocol, Protocol::OpenAiChat)
-        && matches!(
-            sse_summary.as_ref().map(|summary| &summary.outcome),
-            Some(ResponsesSseOutcome::TerminatedIncomplete)
-        );
-    let protocol_error = match sse_summary.as_ref().map(|summary| &summary.outcome) {
-        Some(ResponsesSseOutcome::Failed) => Some("upstream_failed_response"),
-        Some(ResponsesSseOutcome::Incomplete) => Some("upstream_incomplete_response"),
-        Some(ResponsesSseOutcome::TerminatedIncomplete) if !mapped_chat_incomplete => {
-            Some("upstream_incomplete_response")
-        }
-        Some(ResponsesSseOutcome::TerminatedIncomplete) => None,
-        Some(ResponsesSseOutcome::Completed { .. }) | None => None,
-    };
-    let (mut terminal_status, mut error_code) = match transport_error {
-        // 499 is an operator receipt for a downstream that closed its body.
-        // It is never sent on the wire because the HTTP response was already
-        // admitted, but it keeps client cancellation out of upstream 5xx
-        // availability metrics and request history.
-        Some("downstream_disconnected") => (499, Some("client_cancelled")),
-        // A live but persistently unread downstream is also local evidence,
-        // not an upstream failure.
-        Some("downstream_backpressure") => (504, Some("downstream_backpressure")),
-        // Delivery state is owned by this service's database. Classify its
-        // failure as internal while retaining the stable diagnostic code.
-        Some("delivery_state") => (500, Some("delivery_state")),
-        Some(error) => (502, Some(error)),
-        None => match protocol_error {
-            Some(error) => (502, Some(error)),
-            None => (status_code, None),
-        },
-    };
+    let classification = classify_streaming_terminal(
+        status_code,
+        protocol,
+        is_codex_route,
+        transport_error,
+        sse_summary.as_ref(),
+    );
+    let mapped_chat_incomplete = classification.mapped_chat_incomplete;
+    let mut terminal_status = classification.status_code;
+    let mut error_code = classification.error_code;
     let mut usage_basis = crate::model::RequestUsageBasis::NotObserved;
     // A downstream loss after the complete terminal was captured must not
     // erase trustworthy provider usage. A validated provider-declared incomplete

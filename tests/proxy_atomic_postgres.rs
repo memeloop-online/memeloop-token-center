@@ -271,6 +271,7 @@ async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_wi
                     },
                     error_code: None,
                     response_object: "objects/blake3/metered-unlimited-response",
+                    routing_session_id: None,
                     conversation: None,
                 })
                 .await
@@ -519,6 +520,7 @@ async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_
             },
             error_code: None,
             response_object: "objects/blake3/metered-conversation-root-response",
+            routing_session_id: None,
             conversation: Some(ProxyConversationInput {
                 key: &key,
                 request_json: &root_request_json,
@@ -618,6 +620,7 @@ async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_
                     },
                     error_code: None,
                     response_object: "objects/blake3/metered-conversation-child-response",
+                    routing_session_id: None,
                     conversation: Some(ProxyConversationInput {
                         key: &key,
                         request_json: &request_json,
@@ -813,6 +816,7 @@ async fn postgres_metered_unlimited_terminal_replay_is_exactly_once() {
                     },
                     error_code: None,
                     response_object: "objects/blake3/metered-unlimited-replay-response",
+                    routing_session_id: None,
                     conversation: None,
                 })
                 .await
@@ -955,6 +959,7 @@ async fn postgres_prepaid_boundary_remains_fail_closed_under_parallel_admission(
                     },
                     error_code: None,
                     response_object: "objects/blake3/prepaid-boundary-response",
+                    routing_session_id: None,
                     conversation: None,
                 })
                 .await
@@ -1069,6 +1074,7 @@ async fn postgres_conversation_projection_prematerializes_before_the_session_loc
             },
             error_code: None,
             response_object: "objects/blake3/projection-prematerialize-response",
+            routing_session_id: None,
             conversation: Some(ProxyConversationInput {
                 key: &key,
                 request_json: &request_json,
@@ -1348,6 +1354,7 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
                 },
                 error_code: None,
                 response_object: "objects/blake3/postgres-admission-lock-response-a",
+                routing_session_id: None,
                 conversation: Some(ProxyConversationInput {
                     key: &finish_a_key,
                     request_json: &finish_a_request_json,
@@ -1445,6 +1452,7 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
                     },
                     error_code: None,
                     response_object: "objects/blake3/postgres-admission-lock-response-b",
+                    routing_session_id: None,
                     conversation: Some(ProxyConversationInput {
                         key: &key,
                         request_json: &request_b_json,
@@ -1527,6 +1535,7 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
             },
             error_code: None,
             response_object: "objects/blake3/postgres-admission-lock-response-b",
+            routing_session_id: None,
             conversation: Some(ProxyConversationInput {
                 key: &key,
                 request_json: &replay_json,
@@ -1726,6 +1735,7 @@ async fn postgres_proxy_terminal_owner_is_exactly_once() {
                     },
                     error_code: None,
                     response_object: &fault_locator,
+                    routing_session_id: None,
                     conversation: None,
                 },
                 Some(&fault_lease),
@@ -1815,6 +1825,7 @@ async fn postgres_proxy_terminal_owner_is_exactly_once() {
                         },
                         error_code: None,
                         response_object: &response_object,
+                        routing_session_id: None,
                         conversation: None,
                     },
                     Some(&lease),

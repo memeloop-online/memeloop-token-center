@@ -1059,25 +1059,6 @@ impl Database {
             }
         }
 
-        if let Some(explicit_session_id) = input.routing_session_id {
-            let attached = sqlx::query(
-                "UPDATE request_records SET explicit_session_id = $1 WHERE id = $2 AND created_at = $3 AND tenant_id = $4 AND key_id = $5 AND reservation_id = $6 AND completed_at IS NULL",
-            )
-            .bind(explicit_session_id)
-            .bind(&request_id)
-            .bind(created_at)
-            .bind(&tenant_id)
-            .bind(&key_id)
-            .bind(&reservation_id)
-            .execute(&mut *transaction)
-            .await?;
-            if attached.rows_affected() != 1 {
-                return Err(AppError::Conflict(
-                    "request terminal session identity changed".into(),
-                ));
-            }
-        }
-
         if let Some(archive) = buffered_archive {
             BudgetHold::set_phase(&mut hold, "archive_capture");
             let capture_started = std::time::Instant::now();
@@ -1137,6 +1118,19 @@ impl Database {
                 ),
                 Err(error) => return Err(error),
             };
+
+        if let Some(explicit_session_id) = input.routing_session_id {
+            super::session_routing::upsert_session_routing_terminal_from_request_in_transaction(
+                &mut transaction,
+                &request_id,
+                created_at,
+                explicit_session_id,
+                status_code,
+                error_code.as_deref(),
+                now,
+            )
+            .await?;
+        }
 
         // Metered-unlimited terminal traffic can complete in large bursts for
         // one session. Its terminal transaction must remain insert-only with

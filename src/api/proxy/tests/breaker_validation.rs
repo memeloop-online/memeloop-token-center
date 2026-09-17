@@ -218,6 +218,50 @@ async fn ambiguous_codex_response_does_not_open_the_shared_account_breaker() {
 }
 
 #[tokio::test]
+async fn streaming_transport_terminal_is_visible_before_immediate_same_session_retry() {
+    let (failed_endpoint, failed_upstream) = truncated_sse_upstream_endpoint(
+        b"data: {\"id\":\"partial\",\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+    )
+    .await;
+    let healthy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(successful_chat_response())
+        .expect(1)
+        .mount(&healthy)
+        .await;
+    let fixture = resilient_route_fixture(
+        "stream-terminal-before-retry",
+        &[(failed_endpoint, 0), (healthy.uri(), 10)],
+    )
+    .await;
+    let session_id = "stream-terminal-before-retry";
+
+    let first = send_resilient_chat(&fixture, Some(session_id), true).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let mut first_body = first.into_body().into_data_stream();
+    let mut observed_disconnect = false;
+    while let Some(chunk) = futures_util::StreamExt::next(&mut first_body).await {
+        if chunk.is_err() {
+            observed_disconnect = true;
+        }
+    }
+    assert!(observed_disconnect);
+
+    // No settlement wait is allowed here: downstream EOF itself is the client
+    // boundary. The next independent request must already see the shared,
+    // durable terminal and choose the healthy route.
+    let second = send_resilient_chat(&fixture, Some(session_id), false).await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let _ = to_bytes(second.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+
+    failed_upstream.await.unwrap();
+    healthy.verify().await;
+}
+
+#[tokio::test]
 async fn failed_codex_protocol_mismatch_opens_the_invalid_response_breaker() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
