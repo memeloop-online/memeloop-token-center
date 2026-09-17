@@ -184,6 +184,32 @@ pub(crate) async fn reclassify_request_session_in_transaction(
     Ok(true)
 }
 
+pub(crate) async fn merge_request_session_projection_in_transaction(
+    tx: &mut Transaction<'_, Any>,
+    tenant_id: &str,
+    key_id: &str,
+    source_session_id: &str,
+    target_session_id: &str,
+) -> Result<(), AppError> {
+    if source_session_id == target_session_id {
+        return Ok(());
+    }
+    sqlx::query(
+        "UPDATE request_stats_facts SET session_id = $1 WHERE tenant_id = $2 AND key_id = $3 AND session_id = $4",
+    )
+    .bind(target_session_id)
+    .bind(tenant_id)
+    .bind(key_id)
+    .bind(source_session_id)
+    .execute(&mut **tx)
+    .await?;
+    rebuild_request_session_projection_in_transaction(tx, tenant_id, key_id, source_session_id)
+        .await?;
+    rebuild_request_session_projection_in_transaction(tx, tenant_id, key_id, target_session_id)
+        .await?;
+    Ok(())
+}
+
 async fn remove_request_fact_from_session_projection_in_transaction(
     tx: &mut Transaction<'_, Any>,
     delta: &RequestSessionDelta,

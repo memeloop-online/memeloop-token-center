@@ -16,6 +16,7 @@ const CONVERSATION_INSERT_BATCH_BIND_LIMIT: usize = 900;
 const SEMANTIC_ATOM_INSERT_BIND_COUNT: usize = 7;
 const CONTEXT_NODE_INSERT_BIND_COUNT: usize = 6;
 const EXPLICIT_SESSION_LOCK_SEED: i64 = 734_627_102_948_338;
+const CONVERSATION_REFERENCE_LOCK_SEED: i64 = 734_627_102_948_339;
 
 #[derive(Clone, Debug)]
 pub struct ConversationListFilter {
@@ -33,7 +34,6 @@ pub struct ConversationDetailFilter {
 
 struct ConversationSelection {
     observation_id: String,
-    cluster_id: String,
     relation: RelationKind,
     confidence: i64,
     direct_parent: bool,
@@ -50,6 +50,9 @@ pub(crate) struct ConversationObservationInput<'a> {
     pub(crate) request_json: &'a serde_json::Value,
     pub(crate) hints: &'a ConversationHints,
     pub(crate) client_name: Option<&'a str>,
+    /// If the terminal transaction already knows the upstream response id,
+    /// include it in the record-phase reference lock ordering.
+    pub(crate) upstream_response_id: Option<&'a str>,
     pub(crate) observed_at: i64,
     /// Archive-only observations intentionally have no request_records row.
     pub(crate) attach_request_record: bool,
@@ -283,6 +286,7 @@ impl Database {
                 request_json: &request_json,
                 hints: &hints,
                 client_name: client_name.as_deref(),
+                upstream_response_id: upstream_response_id.as_deref(),
                 observed_at,
                 attach_request_record: true,
                 content_materialized: true,
@@ -292,6 +296,7 @@ impl Database {
         if let Some(upstream_response_id) = upstream_response_id.as_deref() {
             attach_conversation_upstream_response_in_transaction(
                 &mut transaction,
+                self.backend,
                 request_id,
                 upstream_response_id,
             )
@@ -339,6 +344,7 @@ impl Database {
                     request_json,
                     hints,
                     client_name,
+                    upstream_response_id: None,
                     observed_at: unix_millis(),
                     attach_request_record: true,
                     content_materialized: false,
@@ -360,6 +366,7 @@ impl Database {
             request_json,
             hints,
             client_name,
+            upstream_response_id,
             observed_at,
             attach_request_record,
             content_materialized,
@@ -423,6 +430,19 @@ impl Database {
 
         let principal_id = key.principal_id.to_string();
         let key_id = key.key_id.to_string();
+        lock_conversation_references_in_transaction(
+            transaction,
+            self.backend,
+            &tenant_id,
+            &principal_id,
+            &key_id,
+            &[
+                hints.parent_turn_id.as_deref(),
+                hints.turn_id.as_deref(),
+                upstream_response_id,
+            ],
+        )
+        .await?;
         // Every structured match below is decisive: the selection loop stops on
         // a direct parent, same turn, or explicit session. Fetch only that one
         // indexed row instead of reading and sorting up to 50 wide fingerprints
@@ -438,6 +458,11 @@ impl Database {
         .await?;
         let candidates = if let Some(candidate) = structured_candidate {
             vec![candidate]
+        } else if hints.parent_turn_id.is_some() {
+            // A declared parent is authoritative. If it is not committed yet,
+            // keep this observation isolated and durable for reconciliation
+            // instead of attaching it to an unrelated semantic candidate.
+            Vec::new()
         } else {
             sqlx::query(
                 "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.created_at <= $4 ORDER BY o.created_at DESC LIMIT 50",
@@ -539,7 +564,6 @@ impl Database {
                 };
                 selected = Some(ConversationSelection {
                     observation_id: row.try_get("id")?,
-                    cluster_id: row.try_get("cluster_id")?,
                     relation,
                     confidence,
                     direct_parent,
@@ -552,8 +576,8 @@ impl Database {
                     // continuation. Persist a directed edge only when the protocol names
                     // the parent/turn, the payload establishes a Merkle-prefix relation,
                     // or the client explicitly marks a compaction.
-                    write_edge: causally_prior
-                        && (direct_parent || same_turn || exact_prefix || hints.compaction),
+                    write_edge: direct_parent
+                        || (causally_prior && (same_turn || exact_prefix || hints.compaction)),
                 });
                 if direct_parent || same_turn || explicit_match || exact_prefix {
                     break;
@@ -567,7 +591,6 @@ impl Database {
             {
                 candidate_selection = Some(ConversationSelection {
                     observation_id: row.try_get("id")?,
-                    cluster_id: row.try_get("cluster_id")?,
                     relation: RelationKind::Candidate,
                     confidence: confidence.clamp(1, 699),
                     direct_parent: false,
@@ -580,8 +603,18 @@ impl Database {
             }
         }
 
+        let unresolved_parent_reference = hints.parent_turn_id.as_deref().filter(|_| {
+            !selected
+                .as_ref()
+                .is_some_and(|selection| selection.direct_parent)
+        });
         let cluster_id = if let Some(selection) = &selected {
-            parse_uuid(selection.cluster_id.clone())?
+            lock_selected_conversation_cluster_in_transaction(
+                transaction,
+                self.backend,
+                &selection.observation_id,
+            )
+            .await?
         } else {
             let id = Uuid::now_v7();
             sqlx::query(
@@ -628,6 +661,21 @@ impl Database {
         .bind(execution_metadata.as_ref().map(|metadata| metadata.source.as_str()))
         .execute(&mut **transaction)
         .await?;
+
+        if let Some(parent_reference) = unresolved_parent_reference {
+            sqlx::query(
+                "INSERT INTO conversation_unresolved_explicit_parents (child_observation_id, tenant_id, principal_id, key_id, parent_reference, subagent, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT(child_observation_id) DO NOTHING",
+            )
+            .bind(observation_id.to_string())
+            .bind(&tenant_id)
+            .bind(&principal_id)
+            .bind(&key_id)
+            .bind(parent_reference)
+            .bind(i64::from(hints.subagent))
+            .bind(now)
+            .execute(&mut **transaction)
+            .await?;
+        }
 
         let edge_selection = selected
             .filter(|selection| selection.write_edge)
@@ -694,6 +742,15 @@ impl Database {
             reclassify_request_session_in_transaction(transaction, parse_uuid(request_id.clone())?)
                 .await?;
         }
+        if let Some(turn_id) = hints.turn_id.as_deref() {
+            reconcile_unresolved_explicit_parents_in_transaction(
+                transaction,
+                self.backend,
+                &observation_id.to_string(),
+                turn_id,
+            )
+            .await?;
+        }
         Ok(cluster_id)
     }
 
@@ -702,9 +759,10 @@ impl Database {
         request_id: Uuid,
         upstream_response_id: &str,
     ) -> Result<(), AppError> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         attach_conversation_upstream_response_in_transaction(
             &mut transaction,
+            self.backend,
             request_id,
             upstream_response_id,
         )
@@ -884,28 +942,24 @@ async fn fetch_structured_conversation_candidate(
 ) -> Result<Option<AnyRow>, AppError> {
     if let Some(parent_turn_id) = hints.parent_turn_id.as_deref() {
         let by_turn = sqlx::query(
-            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.turn_id = $4 AND o.created_at <= $5 ORDER BY o.created_at DESC LIMIT 1",
+            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.turn_id = $4 ORDER BY o.created_at DESC LIMIT 1",
         )
         .bind(tenant_id)
         .bind(principal_id)
         .bind(key_id)
         .bind(parent_turn_id)
-        .bind(observed_at)
         .fetch_optional(&mut **transaction)
         .await?;
         let by_response = sqlx::query(
-            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.upstream_response_id = $4 AND o.created_at <= $5 ORDER BY o.created_at DESC LIMIT 1",
+            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.upstream_response_id = $4 ORDER BY o.created_at DESC LIMIT 1",
         )
         .bind(tenant_id)
         .bind(principal_id)
         .bind(key_id)
         .bind(parent_turn_id)
-        .bind(observed_at)
         .fetch_optional(&mut **transaction)
         .await?;
-        if let Some(candidate) = newest_conversation_candidate(by_turn, by_response)? {
-            return Ok(Some(candidate));
-        }
+        return newest_conversation_candidate(by_turn, by_response);
     }
 
     if let Some(turn_id) = hints.turn_id.as_deref() {
@@ -1010,8 +1064,345 @@ async fn emit_conversation_projected_event_in_transaction(
     Ok(())
 }
 
+async fn lock_conversation_references_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    backend: DatabaseBackend,
+    tenant_id: &str,
+    principal_id: &str,
+    key_id: &str,
+    references: &[Option<&str>],
+) -> Result<(), AppError> {
+    if matches!(backend, DatabaseBackend::PostgreSql) {
+        let mut references = references
+            .iter()
+            .filter_map(|value| *value)
+            .collect::<Vec<_>>();
+        references.sort_unstable();
+        references.dedup();
+        for reference in references {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, $2))")
+                .bind(format!("{tenant_id}:{principal_id}:{key_id}:{reference}"))
+                .bind(CONVERSATION_REFERENCE_LOCK_SEED)
+                .execute(&mut **transaction)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn lock_selected_conversation_cluster_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    backend: DatabaseBackend,
+    observation_id: &str,
+) -> Result<Uuid, AppError> {
+    let statement = if matches!(backend, DatabaseBackend::PostgreSql) {
+        "SELECT c.id FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE o.id = $1 FOR UPDATE OF o, c"
+    } else {
+        "SELECT c.id FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE o.id = $1"
+    };
+    let cluster_id: String = sqlx::query_scalar(statement)
+        .bind(observation_id)
+        .fetch_one(&mut **transaction)
+        .await?;
+    parse_uuid(cluster_id)
+}
+
+async fn lock_reconciliation_clusters_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    backend: DatabaseBackend,
+    parent_observation_id: &str,
+    child_observation_id: &str,
+) -> Result<(String, String), AppError> {
+    let target = lock_selected_conversation_cluster_in_transaction(
+        transaction,
+        backend,
+        parent_observation_id,
+    )
+    .await?
+    .to_string();
+    let source = lock_selected_conversation_cluster_in_transaction(
+        transaction,
+        backend,
+        child_observation_id,
+    )
+    .await?
+    .to_string();
+    Ok((target, source))
+}
+
+async fn merge_conversation_clusters_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    backend: DatabaseBackend,
+    tenant_id: &str,
+    principal_id: &str,
+    key_id: &str,
+    parent_observation_id: &str,
+    child_observation_id: &str,
+) -> Result<String, AppError> {
+    // An unresolved explicit-parent observation is born in a fresh cluster,
+    // so no other reconciliation can use its source in the opposite direction.
+    // Normal descendants lock that source row before insertion; locking target
+    // then source therefore either moves them too or waits for their commit.
+    let (target_cluster_id, source_cluster_id) = lock_reconciliation_clusters_in_transaction(
+        transaction,
+        backend,
+        parent_observation_id,
+        child_observation_id,
+    )
+    .await?;
+    let owned_clusters: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_clusters WHERE (id = $1 OR id = $2) AND tenant_id = $3 AND principal_id = $4",
+    )
+    .bind(&target_cluster_id)
+    .bind(&source_cluster_id)
+    .bind(tenant_id)
+    .bind(principal_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    let expected = if target_cluster_id == source_cluster_id {
+        1
+    } else {
+        2
+    };
+    if owned_clusters != expected {
+        return Err(AppError::NotFound);
+    }
+    if target_cluster_id == source_cluster_id {
+        return Ok(target_cluster_id);
+    }
+
+    let source_projection = sqlx::query(
+        "SELECT explicit_session_id, updated_at, request_count, candidate_edge_count FROM conversation_key_clusters WHERE key_id = $1 AND cluster_id = $2",
+    )
+    .bind(key_id)
+    .bind(&source_cluster_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    let source_explicit_session_id: Option<String> =
+        source_projection.try_get("explicit_session_id")?;
+    let source_updated_at: i64 = source_projection.try_get("updated_at")?;
+    let source_request_count: i64 = source_projection.try_get("request_count")?;
+    let source_candidate_edge_count: i64 = source_projection.try_get("candidate_edge_count")?;
+    let target_projection = sqlx::query(
+        "UPDATE conversation_key_clusters SET explicit_session_id = COALESCE(explicit_session_id, $1), updated_at = CASE WHEN updated_at < $2 THEN $2 ELSE updated_at END, request_count = request_count + $3, candidate_edge_count = candidate_edge_count + $4 WHERE key_id = $5 AND cluster_id = $6",
+    )
+    .bind(source_explicit_session_id.as_deref())
+    .bind(source_updated_at)
+    .bind(source_request_count)
+    .bind(source_candidate_edge_count)
+    .bind(key_id)
+    .bind(&target_cluster_id)
+    .execute(&mut **transaction)
+    .await?;
+    if target_projection.rows_affected() != 1 {
+        return Err(AppError::Internal);
+    }
+
+    // Migration 0031 intentionally retained inert historical cross-key edges.
+    // Move only edges whose endpoints both belong to this stable key; foreign
+    // evidence remains attached to the legacy source cluster.
+    sqlx::query(
+        "UPDATE conversation_edges SET cluster_id = $1 WHERE cluster_id = $2 AND to_observation_id IN (SELECT id FROM conversation_observations WHERE cluster_id = $2 AND key_id = $3) AND (from_observation_id IS NULL OR from_observation_id IN (SELECT id FROM conversation_observations WHERE cluster_id = $2 AND key_id = $3))",
+    )
+    .bind(&target_cluster_id)
+    .bind(&source_cluster_id)
+    .bind(key_id)
+    .execute(&mut **transaction)
+    .await?;
+    let moved_observations = sqlx::query(
+        "UPDATE conversation_observations SET cluster_id = $1 WHERE cluster_id = $2 AND key_id = $3",
+    )
+    .bind(&target_cluster_id)
+    .bind(&source_cluster_id)
+    .bind(key_id)
+    .execute(&mut **transaction)
+    .await?;
+    if moved_observations.rows_affected() == 0 {
+        return Err(AppError::Internal);
+    }
+    sqlx::query(
+        "UPDATE request_records SET conversation_cluster_id = $1 WHERE tenant_id = $2 AND key_id = $3 AND conversation_cluster_id = $4",
+    )
+    .bind(&target_cluster_id)
+    .bind(tenant_id)
+    .bind(key_id)
+    .bind(&source_cluster_id)
+    .execute(&mut **transaction)
+    .await?;
+    let moved_archive_requests = sqlx::query(
+        "UPDATE session_archive_unlinked_requests SET conversation_cluster_id = $1 WHERE tenant_id = $2 AND key_id = $3 AND conversation_cluster_id = $4",
+    )
+    .bind(&target_cluster_id)
+    .bind(tenant_id)
+    .bind(key_id)
+    .bind(&source_cluster_id)
+    .execute(&mut **transaction)
+    .await?;
+    if moved_archive_requests.rows_affected() != 0 {
+        sqlx::query(
+            "DELETE FROM session_archive_totals WHERE tenant_id = $1 AND key_id = $2 AND (session_id = $3 OR session_id = $4)",
+        )
+        .bind(tenant_id)
+        .bind(key_id)
+        .bind(&source_cluster_id)
+        .bind(&target_cluster_id)
+        .execute(&mut **transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO session_archive_totals (tenant_id, key_id, session_id, last_activity_at, requests, errors, input_tokens, output_tokens, duration_count, duration_sum_ms) SELECT tenant_id, key_id, conversation_cluster_id, MAX(source_started_at), COUNT(*), SUM(CASE WHEN status_code IS NOT NULL AND (status_code < 200 OR status_code >= 400) THEN 1 ELSE 0 END), SUM(input_tokens), SUM(output_tokens), SUM(CASE WHEN duration_ms IS NULL THEN 0 ELSE 1 END), SUM(COALESCE(duration_ms, 0)) FROM session_archive_unlinked_requests WHERE tenant_id = $1 AND key_id = $2 AND conversation_cluster_id = $3 GROUP BY tenant_id, key_id, conversation_cluster_id",
+        )
+        .bind(tenant_id)
+        .bind(key_id)
+        .bind(&target_cluster_id)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    merge_request_session_projection_in_transaction(
+        transaction,
+        tenant_id,
+        key_id,
+        &source_cluster_id,
+        &target_cluster_id,
+    )
+    .await?;
+    let target_cluster = sqlx::query(
+        "UPDATE conversation_clusters SET created_at = (SELECT MIN(created_at) FROM conversation_observations WHERE cluster_id = $1), updated_at = (SELECT MAX(created_at) FROM conversation_observations WHERE cluster_id = $1), explicit_session_id = COALESCE(explicit_session_id, $2) WHERE id = $1",
+    )
+    .bind(&target_cluster_id)
+    .bind(source_explicit_session_id.as_deref())
+    .execute(&mut **transaction)
+    .await?;
+    if target_cluster.rows_affected() != 1 {
+        return Err(AppError::Internal);
+    }
+    sqlx::query("DELETE FROM conversation_key_clusters WHERE key_id = $1 AND cluster_id = $2")
+        .bind(key_id)
+        .bind(&source_cluster_id)
+        .execute(&mut **transaction)
+        .await?;
+    let deleted_cluster = sqlx::query(
+        "DELETE FROM conversation_clusters WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM conversation_observations WHERE cluster_id = $1)",
+    )
+        .bind(&source_cluster_id)
+        .execute(&mut **transaction)
+        .await?;
+    if deleted_cluster.rows_affected() == 0 {
+        let retained_source = sqlx::query(
+            "UPDATE conversation_clusters SET created_at = (SELECT MIN(created_at) FROM conversation_observations WHERE cluster_id = $1), updated_at = (SELECT MAX(created_at) FROM conversation_observations WHERE cluster_id = $1), explicit_session_id = (SELECT MIN(explicit_session_id) FROM conversation_observations WHERE cluster_id = $1) WHERE id = $1",
+        )
+        .bind(&source_cluster_id)
+        .execute(&mut **transaction)
+        .await?;
+        if retained_source.rows_affected() != 1 {
+            return Err(AppError::Internal);
+        }
+    }
+    Ok(target_cluster_id)
+}
+
+async fn reconcile_unresolved_explicit_parents_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    backend: DatabaseBackend,
+    parent_observation_id: &str,
+    parent_reference: &str,
+) -> Result<(), AppError> {
+    let parent = sqlx::query(
+        "SELECT o.key_id, o.branch_id, c.tenant_id, c.principal_id FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE o.id = $1",
+    )
+    .bind(parent_observation_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    let tenant_id: String = parent.try_get("tenant_id")?;
+    let principal_id: String = parent.try_get("principal_id")?;
+    let key_id: String = parent.try_get("key_id")?;
+    let parent_branch_id: Option<String> = parent.try_get("branch_id")?;
+    let unresolved = sqlx::query(
+        "SELECT u.child_observation_id, u.subagent, child.explicit_session_id, child.branch_id, child.compaction FROM conversation_unresolved_explicit_parents u JOIN conversation_observations child ON child.id = u.child_observation_id AND child.key_id = u.key_id WHERE u.tenant_id = $1 AND u.principal_id = $2 AND u.key_id = $3 AND u.parent_reference = $4 ORDER BY u.created_at ASC, u.child_observation_id ASC",
+    )
+    .bind(&tenant_id)
+    .bind(&principal_id)
+    .bind(&key_id)
+    .bind(parent_reference)
+    .fetch_all(&mut **transaction)
+    .await?;
+    for child in unresolved {
+        let child_observation_id: String = child.try_get("child_observation_id")?;
+        if child_observation_id == parent_observation_id {
+            sqlx::query(
+                "DELETE FROM conversation_unresolved_explicit_parents WHERE child_observation_id = $1",
+            )
+            .bind(&child_observation_id)
+            .execute(&mut **transaction)
+            .await?;
+            continue;
+        }
+        let child_branch_id: Option<String> = child.try_get("branch_id")?;
+        let child_explicit_session_id: Option<String> = child.try_get("explicit_session_id")?;
+        let subagent = child.try_get::<i64, _>("subagent")? != 0;
+        let compaction = child.try_get::<i64, _>("compaction")? != 0;
+        let cluster_id = merge_conversation_clusters_in_transaction(
+            transaction,
+            backend,
+            &tenant_id,
+            &principal_id,
+            &key_id,
+            parent_observation_id,
+            &child_observation_id,
+        )
+        .await?;
+        let relation = if subagent {
+            RelationKind::Subagent
+        } else if compaction {
+            RelationKind::Compacts
+        } else if child_branch_id.is_some()
+            && parent_branch_id.is_some()
+            && child_branch_id != parent_branch_id
+        {
+            RelationKind::Branch
+        } else {
+            RelationKind::Continues
+        };
+        sqlx::query(
+            "INSERT INTO conversation_edges (id, cluster_id, from_observation_id, to_observation_id, relation_kind, confidence_millis, evidence_json, pinned, inference_version, created_at) VALUES ($1, $2, $3, $4, $5, 995, $6, 0, 2, $7)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(cluster_id)
+        .bind(parent_observation_id)
+        .bind(&child_observation_id)
+        .bind(relation_name(relation))
+        .bind(serde_json::json!({
+            "explicit_session": child_explicit_session_id.is_some(),
+            "explicit_parent": true,
+            "same_turn": false,
+            "branch": child_branch_id.is_some(),
+            "compaction": compaction,
+            "subagent": subagent,
+            "semantic_prefix": false,
+            "compaction_overlap": false,
+            "client_match": false,
+            "reconciled": true,
+            "inference_version": 2
+        }).to_string())
+        .bind(unix_millis())
+        .execute(&mut **transaction)
+        .await?;
+        sqlx::query(
+            "DELETE FROM conversation_unresolved_explicit_parents WHERE child_observation_id = $1 AND tenant_id = $2 AND principal_id = $3 AND key_id = $4 AND parent_reference = $5",
+        )
+        .bind(&child_observation_id)
+        .bind(&tenant_id)
+        .bind(&principal_id)
+        .bind(&key_id)
+        .bind(parent_reference)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn attach_conversation_upstream_response_in_transaction(
     transaction: &mut Transaction<'_, Any>,
+    backend: DatabaseBackend,
     request_id: Uuid,
     upstream_response_id: &str,
 ) -> Result<(), AppError> {
@@ -1024,6 +1415,26 @@ pub(crate) async fn attach_conversation_upstream_response_in_transaction(
             "upstream response id must contain at most 256 non-control characters".into(),
         ));
     }
+    let parent = sqlx::query(
+        "SELECT o.id, o.key_id, c.tenant_id, c.principal_id FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE o.request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(AppError::Internal)?;
+    let parent_observation_id: String = parent.try_get("id")?;
+    let key_id: String = parent.try_get("key_id")?;
+    let tenant_id: String = parent.try_get("tenant_id")?;
+    let principal_id: String = parent.try_get("principal_id")?;
+    lock_conversation_references_in_transaction(
+        transaction,
+        backend,
+        &tenant_id,
+        &principal_id,
+        &key_id,
+        &[Some(upstream_response_id)],
+    )
+    .await?;
     let updated = sqlx::query(
         "UPDATE conversation_observations SET upstream_response_id = $1 WHERE request_id = $2",
     )
@@ -1034,6 +1445,13 @@ pub(crate) async fn attach_conversation_upstream_response_in_transaction(
     if updated.rows_affected() != 1 {
         return Err(AppError::Internal);
     }
+    reconcile_unresolved_explicit_parents_in_transaction(
+        transaction,
+        backend,
+        &parent_observation_id,
+        upstream_response_id,
+    )
+    .await?;
     Ok(())
 }
 

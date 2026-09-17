@@ -531,6 +531,13 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "quota reset accepted settlement",
         sql: include_str!("../../../migrations/common/0100_quota_reset_settlement.sql"),
     },
+    Migration {
+        version: 101,
+        name: "unresolved explicit conversation parents",
+        sql: include_str!(
+            "../../../migrations/common/0101_conversation_unresolved_explicit_parents.sql"
+        ),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1047,6 +1054,13 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 100,
         name: "quota reset accepted settlement",
         sql: include_str!("../../../migrations/common/0100_quota_reset_settlement.sql"),
+    },
+    Migration {
+        version: 101,
+        name: "unresolved explicit conversation parents",
+        sql: include_str!(
+            "../../../migrations/common/0101_conversation_unresolved_explicit_parents.sql"
+        ),
     },
 ];
 
