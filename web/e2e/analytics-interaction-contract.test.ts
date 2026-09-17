@@ -15,29 +15,37 @@ test('analytics background exposes actual indexed buckets through pointer, keybo
     const page=await browser.newPage({hasTouch:true});
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/analytics-interaction.html`);
     const metric=page.getByRole('slider',{name:'Requests'});await metric.waitFor();
+    const checkpoint = (label: string) => console.log(`[analytics-interaction] ${label}`);
     // React commits the selected bucket asynchronously and Fluent keeps hidden tooltip portals mounted.
     // Wait for the committed value and scope tooltip checks to visible content before sending the next input.
     const waitForMetricValue = async (suffix: string) => {
+      checkpoint(`wait-value:${suffix}`);
       await page.waitForFunction((expected: string) => document.querySelector<HTMLElement>('[role="slider"][aria-label="Requests"]')?.getAttribute('aria-valuetext')?.endsWith(expected) ?? false, suffix);
+      checkpoint(`value-ready:${suffix}`);
     };
     const visibleTooltips = () => page.locator('[role="tooltip"]:visible');
     for(const theme of ['light','dark'])for(const width of [390,1440,2560]){
       await page.setViewportSize({width,height:1000});
       await page.evaluate(theme=>{document.documentElement.dataset.theme=theme;},theme);
+      checkpoint(`${theme}/${width}:focus-home`);
       await metric.focus();await page.keyboard.press('Home');
       await waitForMetricValue('Requests: 2');
       assert.match(await metric.getAttribute('aria-valuetext')??'',/UTC · Requests: 2$/);
       await page.keyboard.press('ArrowRight');await waitForMetricValue('Requests: —');assert.match(await metric.getAttribute('aria-valuetext')??'',/Requests: —$/);
       const box=await metric.boundingBox();assert.ok(box);
+      checkpoint(`${theme}/${width}:pointer-move`);
       await page.mouse.move(box.x+box.width*.7,box.y+box.height*.7);
       await waitForMetricValue('Requests: 10');
       assert.match(await metric.getAttribute('aria-valuetext')??'',/Requests: 10$/);
+      checkpoint(`${theme}/${width}:touch-tap`);
       await page.touchscreen.tap(box.x+box.width-4,box.y+box.height*.7);
       await waitForMetricValue('Requests: 5');
       assert.match(await metric.getAttribute('aria-valuetext')??'',/Requests: 5$/);
       const trendTooltip = visibleTooltips().filter({ hasText: 'Requests: 5' });
+      checkpoint(`${theme}/${width}:trend-tooltip`);
       await trendTooltip.waitFor({ state: 'visible' });
       await page.keyboard.press('Escape');await trendTooltip.waitFor({state:'hidden'});
+      checkpoint(`${theme}/${width}:done`);
       assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
       if(width===2560)assert.ok(await page.locator('.app-main-content').evaluate(el=>el.getBoundingClientRect().width)>2500,'analytics must not retain 2048px shell cap');
       if(width===2560)assert.ok(await page.locator('.usage-page').evaluate(el=>el.getBoundingClientRect().width)>2400,'late operator CSS must not restore the 1360px inner page cap');
