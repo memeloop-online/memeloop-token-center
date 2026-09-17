@@ -74,7 +74,7 @@ function SemanticExecutionPanel({ detail }: { detail: LogicalSessionDetail }) {
   const agentCosts = new Map<string, bigint>();
   const taskCosts = new Map<string, bigint>();
   for (const request of observations) {
-    const micros = decimalMicros(request.cost);
+    const micros = decimalMicros(requestDisplayedCost(request));
     if (!micros || !request.currency) continue;
     const agent = request.execution?.agent_id || t('sessions.agentUnknown');
     const agentKey = `${request.currency}\0${agent}`;

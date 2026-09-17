@@ -415,6 +415,57 @@ async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_histor
         AppError::BadRequest(message)
             if message == "legacy session cursor requires key_id; refresh and use the returned three-field cursor"
     ));
+
+    // A terminal 2xx response can still carry client-side failure evidence. The
+    // session detail projection must apply the same displayed-cost rule as the
+    // request list instead of exposing the stored not-observed amount.
+    let cancelled_session = Uuid::now_v7();
+    let cancelled_request = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO conversation_key_clusters (key_id, cluster_id, explicit_session_id, updated_at, request_count, candidate_edge_count) VALUES ($1, $2, 'postgres-cancelled-session', $3, 1, 0)",
+    )
+    .bind(key.key_id.to_string())
+    .bind(cancelled_session.to_string())
+    .bind(base + 400)
+    .execute(&pool)
+    .await
+    .expect("2xx error-code session projection");
+    sqlx::query(
+        "INSERT INTO request_records (id, tenant_id, key_id, created_at, completed_at, protocol, model, status_code, duration_ms, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, cost_micros, currency, usage_basis, error_code, request_object, response_object, reservation_id, conversation_cluster_id) VALUES ($1, $2, $3, $4, $5, 'openai-responses', 'gpt-cancelled', 200, 12, 7, 0, 0, 3, 35000000, 'USD', 'not_observed', 'client_cancelled', 'memory://request', 'memory://response', $6, $7)",
+    )
+    .bind(cancelled_request.to_string())
+    .bind(key.tenant_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(base + 400)
+    .bind(base + 412)
+    .bind(Uuid::now_v7().to_string())
+    .bind(cancelled_session.to_string())
+    .execute(&pool)
+    .await
+    .expect("2xx error-code request record");
+    let detail = state
+        .db
+        .logical_session_detail(
+            key.tenant_id,
+            key.key_id,
+            &cancelled_session.to_string(),
+            ConversationDetailFilter {
+                limit: 10,
+                before_created_at: None,
+                before_request_id: None,
+            },
+        )
+        .await
+        .expect("2xx error-code session detail");
+    let request = detail
+        .requests
+        .iter()
+        .find(|request| request.request.request_id == cancelled_request)
+        .expect("2xx error-code session request");
+    assert_eq!(request.request.status_code, Some(200));
+    assert_eq!(request.request.error_code.as_deref(), Some("client_cancelled"));
+    assert_eq!(request.request.cost, "0");
+    assert_eq!(request.request.billing.cost.as_deref(), Some("0"));
 }
 
 #[tokio::test]

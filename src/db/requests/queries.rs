@@ -1164,10 +1164,16 @@ fn request_view_from_row(row: &AnyRow) -> Result<RequestView, AppError> {
     let billed_units: Option<i64> = row.try_get("billed_units")?;
     let billing_unit: Option<String> = row.try_get("billing_unit")?;
     let cost_micros: Option<i64> = row.try_get("cost_micros")?;
+    let error_code: Option<String> = row.try_get("error_code")?;
     let usage_basis: Option<String> = row.try_get("usage_basis")?;
     let cost = cost_micros
         .map(|value| {
-            effective_displayed_cost_micros(value, persisted_status_code, usage_basis.as_deref())
+            effective_displayed_cost_micros(
+                value,
+                persisted_status_code,
+                error_code.as_deref(),
+                usage_basis.as_deref(),
+            )
         })
         .map(micros_to_decimal_string);
     let currency: Option<String> = row.try_get("currency")?;
@@ -1243,7 +1249,7 @@ fn request_view_from_row(row: &AnyRow) -> Result<RequestView, AppError> {
             cost,
             currency,
         },
-        error_code: row.try_get("error_code")?,
+        error_code,
         archive_state: request_archive_state(row.try_get("archive_state")?)?,
         credential_identity: request_credential_identity_from_row(row)?,
         session_context: request_session_context_from_row(row)?,
@@ -1420,12 +1426,14 @@ fn request_event_views(rows: Vec<AnyRow>) -> Result<Vec<RequestEventView>, AppEr
             let billed_units: Option<i64> = row.try_get("billed_units")?;
             let billing_unit: Option<String> = row.try_get("billing_unit")?;
             let cost_micros: Option<i64> = row.try_get("current_cost_micros")?;
+            let error_code: Option<String> = row.try_get("current_error_code")?;
             let usage_basis = request_usage_basis_from_row(&row)?;
             let cost = cost_micros
                 .map(|value| {
                     effective_displayed_cost_micros(
                         value,
                         persisted_status_code,
+                        error_code.as_deref(),
                         usage_basis.as_ref().map(|value| value.as_str()),
                     )
                 })
@@ -1507,7 +1515,7 @@ fn request_event_views(rows: Vec<AnyRow>) -> Result<Vec<RequestEventView>, AppEr
                     cost,
                     currency,
                 },
-                error_code: row.try_get("current_error_code")?,
+                error_code,
                 archive_state: request_archive_state(row.try_get("archive_state")?)?,
                 credential_identity: request_credential_identity_from_row(&row)?,
             })

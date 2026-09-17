@@ -1049,10 +1049,12 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
             let raw_output_tokens: i64 = row.try_get("output_tokens")?;
             let raw_cost_micros: i64 = row.try_get("cost_micros")?;
             let status_code: Option<i64> = row.try_get("status_code")?;
+            let error_code: Option<String> = row.try_get("error_code")?;
             let usage_basis = super::queries::request_usage_basis_from_row(&row)?;
             let cost_micros = super::super::effective_cost::effective_displayed_cost_micros(
                 raw_cost_micros,
                 status_code,
+                error_code.as_deref(),
                 usage_basis.as_ref().map(|value| value.as_str()),
             );
             let completed_at = row.try_get("completed_at")?;
@@ -1103,7 +1105,7 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
                     currency: currency.clone(),
                     usage,
                     billing,
-                    error_code: row.try_get("error_code")?,
+                    error_code,
                     archive_state: crate::model::RequestArchiveState::from_storage(
                         row.try_get::<String, _>("archive_state")?.as_str(),
                     )

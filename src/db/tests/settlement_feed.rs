@@ -98,6 +98,27 @@ async fn finish_with_usage_basis(
     input_tokens: i64,
     output_tokens: i64,
 ) -> Result<FinishProxyRequestResult, AppError> {
+    finish_with_usage_basis_and_error(
+        fixture,
+        request_id,
+        reservation,
+        usage_basis,
+        input_tokens,
+        output_tokens,
+        None,
+    )
+    .await
+}
+
+async fn finish_with_usage_basis_and_error(
+    fixture: &SettlementFixture,
+    request_id: Uuid,
+    reservation: &UsageReservation,
+    usage_basis: RequestUsageBasis,
+    input_tokens: i64,
+    output_tokens: i64,
+    error_code: Option<&str>,
+) -> Result<FinishProxyRequestResult, AppError> {
     let response_object = format!("gap://settlement-feed/{request_id}/response");
     fixture
         .database
@@ -118,7 +139,7 @@ async fn finish_with_usage_basis(
                 output_tokens,
                 ..TokenUsage::default()
             },
-            error_code: None,
+            error_code,
             response_object: &response_object,
             conversation: None,
         })
@@ -242,6 +263,52 @@ async fn settlement_feed_insert_failure_rolls_back_and_replay_is_idempotent() {
             .unwrap(),
         1
     );
+}
+
+#[tokio::test]
+async fn two_xx_error_code_uses_zero_in_request_and_event_projections() {
+    let fixture = fixture(EnforcementMode::Prepaid).await;
+    let request_id = Uuid::now_v7();
+    let reservation = start(&fixture, request_id).await;
+    finish_with_usage_basis_and_error(
+        &fixture,
+        request_id,
+        &reservation,
+        RequestUsageBasis::NotObserved,
+        7,
+        3,
+        Some("client_cancelled"),
+    )
+    .await
+    .expect("finish 2xx client-cancelled request");
+
+    let requests = fixture
+        .database
+        .list_requests(fixture.key.key_id, 10)
+        .await
+        .expect("request projection");
+    let request = requests
+        .iter()
+        .find(|request| request.request_id == request_id)
+        .expect("request row");
+    assert_eq!(request.status_code, Some(200));
+    assert_eq!(request.error_code.as_deref(), Some("client_cancelled"));
+    assert_eq!(request.cost, "0");
+    assert_eq!(request.billing.cost.as_deref(), Some("0"));
+
+    let events = fixture
+        .database
+        .request_events_after("settlement-feed", 0, None, 10)
+        .await
+        .expect("event projection");
+    let event = events
+        .iter()
+        .find(|event| event.request_id == request_id)
+        .expect("finished event");
+    assert_eq!(event.status_code, Some(200));
+    assert_eq!(event.error_code.as_deref(), Some("client_cancelled"));
+    assert_eq!(event.cost, "0");
+    assert_eq!(event.billing.cost.as_deref(), Some("0"));
 }
 
 #[tokio::test]
