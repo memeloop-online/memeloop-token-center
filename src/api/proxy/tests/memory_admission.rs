@@ -46,7 +46,7 @@ async fn source_backed_conversation_releases_all_raw_request_permits() {
                     tokio::time::Instant::now() + Duration::from_secs(5),
                 )
                 .await?;
-            Ok::<_, AppError>(projection.request_json["model"].clone())
+            Ok::<_, crate::error::AppError>(projection.request_json["model"].clone())
         })
     };
     budget.wait_for_projection_reservation_for_test().await;
