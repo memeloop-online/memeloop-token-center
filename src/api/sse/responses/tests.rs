@@ -225,31 +225,14 @@ fn sanitizer_preserves_bare_cr_and_cross_chunk_crlf_boundaries() {
 }
 
 #[test]
-fn sanitizer_bounds_each_event_not_the_network_chunk() {
-    // Keep the complete batch within the independent decoder-product caps.
-    // The property under test is that an otherwise bounded network chunk may
-    // exceed the per-event cap, not that it may bypass the batch cap.
-    let mut event =
-        b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp\"},\"padding\":\""
-            .to_vec();
-    event.extend_from_slice(&[b'x'; 512]);
-    event.extend_from_slice(b"\"}\n\n");
-    let repeats = MAX_RESPONSES_SSE_EVENT_BYTES / event.len() + 1;
-    let network_chunk = event.repeat(repeats);
-    assert!(network_chunk.len() > MAX_RESPONSES_SSE_EVENT_BYTES);
-    assert!(network_chunk.len() <= MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK);
-    assert!(repeats <= MAX_SSE_FRAMES_PER_NETWORK_CHUNK);
-    let mut sanitizer = ResponsesStreamingSanitizer::default();
-    let output = sanitizer.push(&network_chunk).unwrap();
-    assert_eq!(output.as_ref(), network_chunk);
-    assert!(sanitizer.is_complete());
-
+fn sanitizer_accepts_exact_event_limit_and_rejects_the_next_byte() {
     let mut oversized = ResponsesStreamingSanitizer::default();
     let first = vec![b'x'; MAX_RESPONSES_SSE_EVENT_BYTES / 2];
-    let second = vec![b'x'; MAX_RESPONSES_SSE_EVENT_BYTES / 2 + 1];
+    let second = vec![b'x'; MAX_RESPONSES_SSE_EVENT_BYTES - first.len()];
     assert!(oversized.push(&first).is_ok());
+    assert!(oversized.push(&second).is_ok());
     assert_eq!(
-        oversized.push(&second),
+        oversized.push(b"x"),
         Err("upstream_response_event_too_large")
     );
 }

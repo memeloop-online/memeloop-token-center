@@ -43,6 +43,21 @@ fn streaming_upstream_evidence(
     sse_summary: Option<&ResponsesSseSummary>,
     error_code: Option<&str>,
 ) -> StreamingUpstreamEvidence {
+    // These are local resource-policy boundaries, not evidence that the
+    // account or its network path is unhealthy. In particular, tripping an
+    // event ceiling must not cool down the only otherwise healthy account and
+    // turn subsequent independent requests into `upstream_unavailable`.
+    if matches!(
+        transport_error,
+        Some(
+            "upstream_response_event_too_large"
+                | "upstream_response_event_batch_too_large"
+                | "upstream_response_too_large"
+                | "upstream_response_memory_capacity"
+        )
+    ) {
+        return StreamingUpstreamEvidence::Inconclusive;
+    }
     if sse_summary.is_some_and(|summary| summary.observed_protocol_invalid) {
         return StreamingUpstreamEvidence::InvalidResponse;
     }
@@ -54,7 +69,6 @@ fn streaming_upstream_evidence(
                 | "upstream_timeout"
                 | "upstream_read_timeout"
                 | "upstream_request_timeout"
-                | "upstream_response_event_batch_too_large"
                 | "downstream_disconnected"
                 | "downstream_backpressure"
                 | "delivery_state"
@@ -379,16 +393,24 @@ mod tests {
     }
 
     #[test]
-    fn local_event_batch_boundary_is_inconclusive_evidence() {
-        assert_eq!(
-            streaming_upstream_evidence(
-                false,
-                Some("upstream_response_event_batch_too_large"),
-                None,
-                Some("upstream_response_event_batch_too_large")
-            ),
-            StreamingUpstreamEvidence::Inconclusive
-        );
+    fn local_resource_boundaries_are_inconclusive_evidence() {
+        let protocol_incomplete = summary(ResponsesSseOutcome::Incomplete, true, true);
+        for error in [
+            "upstream_response_event_too_large",
+            "upstream_response_event_batch_too_large",
+            "upstream_response_too_large",
+            "upstream_response_memory_capacity",
+        ] {
+            assert_eq!(
+                streaming_upstream_evidence(
+                    false,
+                    Some(error),
+                    Some(&protocol_incomplete),
+                    Some(error)
+                ),
+                StreamingUpstreamEvidence::Inconclusive
+            );
+        }
     }
 
     #[test]
