@@ -1038,6 +1038,7 @@ pub(in crate::api) async fn proxy_with_identity(
         || body.clone(),
         |retained| archive_retention::encode_json_body(&body, retained),
     );
+    drop(retained_request_json);
     let request_capture_memory = state.metrics.memory_usage(
         crate::metrics::MemoryComponent::StreamCapture,
         body.len().saturating_mul(3),
@@ -2347,19 +2348,26 @@ async fn finish_buffered_request_with_upstream_attribution(
             base_capture_bytes.saturating_mul(3),
         )
     });
-    let response_archive = if response_capture_admitted {
+    let archive_body = if response_capture_admitted {
         let retained_response_json = archive_retention::prepare_json_body_if_valid(&body);
         let encoded_len = retained_response_json
             .as_ref()
             .map_or(body.len(), archive_retention::encoded_json_len);
         let extra_output_bytes = encoded_len.saturating_sub(base_capture_bytes);
         if extra_output_bytes > 0 && !response_capture_permit.try_grow(extra_output_bytes, 1) {
-            Err(AppError::Overloaded)
+            None
         } else {
-            let archive_body = retained_response_json.as_ref().map_or_else(
+            Some(retained_response_json.as_ref().map_or_else(
                 || body.clone(),
                 |retained| archive_retention::encode_json_body(&body, retained),
-            );
+            ))
+        }
+    } else {
+        None
+    };
+    let response_archive = archive_body.as_ref().map_or_else(
+        || Err(AppError::Overloaded),
+        |archive_body| {
             BufferedArchive::new(
                 crate::db::ArchiveSpoolIdentity {
                     request_id,
@@ -2371,10 +2379,8 @@ async fn finish_buffered_request_with_upstream_attribution(
                 request.state.config.key_pepper.as_bytes(),
                 request.state.config.archive_spool_compression_enabled,
             )
-        }
-    } else {
-        Err(AppError::Overloaded)
-    };
+        },
+    );
     let stored_response = format!("gap://{request_id}/response");
     let projection_deadline =
         tokio::time::Instant::now() + MAX_PROXY_LIFETIME.saturating_sub(request.started.elapsed());
