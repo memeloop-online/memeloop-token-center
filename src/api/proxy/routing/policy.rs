@@ -3,11 +3,20 @@ use super::*;
 
 pub(crate) struct RequestAttemptBudget {
     max_attempts: usize,
+    deadline_window: Option<std::time::Duration>,
     deadline: Option<tokio::time::Instant>,
     pub(in crate::api::proxy) version: u32,
 }
 
 impl RequestAttemptBudget {
+    pub(crate) fn arm(&mut self) {
+        if self.deadline.is_none() {
+            self.deadline = self
+                .deadline_window
+                .map(|window| tokio::time::Instant::now() + window);
+        }
+    }
+
     pub(crate) fn recovery_wait_deadline(
         &self,
         health: crate::config::UpstreamHealthConfig,
@@ -28,6 +37,7 @@ impl RequestAttemptBudget {
         if !codex_transport::is_driver(&route.driver) {
             let budget = Self {
                 max_attempts: PROXY_ROUTING_POLICY.max_attempts(),
+                deadline_window: None,
                 deadline: None,
                 version: 1,
             };
@@ -39,10 +49,10 @@ impl RequestAttemptBudget {
                 .map_err(|_| AppError::BadRequest("invalid Codex transport policy".into()))?;
         let budget = Self {
             max_attempts: policy.candidate_attempts,
-            deadline: Some(
-                tokio::time::Instant::now()
-                    + std::time::Duration::from_millis(policy.failover_deadline_millis),
-            ),
+            deadline_window: Some(std::time::Duration::from_millis(
+                policy.failover_deadline_millis,
+            )),
+            deadline: None,
             version: policy.version,
         };
         budget.record_snapshot(
@@ -180,7 +190,8 @@ mod tests {
                     RequestAttemptBudget::from_primary(&route(driver, policy), Uuid::from_u128(3))
                         .unwrap();
                 assert_eq!(budget.max_attempts, attempts);
-                assert_eq!(budget.deadline.is_some(), deadline != 0);
+                assert_eq!(budget.deadline_window.is_some(), deadline != 0);
+                assert!(budget.deadline.is_none());
             });
             let bytes = log.0.lock().unwrap();
             let event: Value = serde_json::from_slice(&bytes).unwrap();
@@ -210,7 +221,8 @@ mod tests {
             codex_transport::DRIVER,
             Some(json!({"candidate_attempts": 1, "failover_deadline_millis": 1000})),
         );
-        let budget = RequestAttemptBudget::from_primary(&primary, Uuid::from_u128(3)).unwrap();
+        let mut budget = RequestAttemptBudget::from_primary(&primary, Uuid::from_u128(3)).unwrap();
+        budget.arm();
         primary.config["transport_policy"] =
             json!({"candidate_attempts": 8, "failover_deadline_millis": 300000});
         assert_eq!(
@@ -235,6 +247,7 @@ mod tests {
         health.probe_lease_millis = 200;
         let budget = RequestAttemptBudget {
             max_attempts: 2,
+            deadline_window: Some(std::time::Duration::from_millis(250)),
             deadline: Some(now + std::time::Duration::from_millis(250)),
             version: 1,
         };
@@ -243,6 +256,7 @@ mod tests {
             now + std::time::Duration::from_millis(250)
         );
         let unbounded = RequestAttemptBudget {
+            deadline_window: None,
             deadline: None,
             ..budget
         };
@@ -254,11 +268,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn absolute_deadline_and_attempt_limit_cannot_be_reset_by_failover() {
-        let budget = RequestAttemptBudget {
+        let mut budget = RequestAttemptBudget {
             max_attempts: 2,
-            deadline: Some(tokio::time::Instant::now() + std::time::Duration::from_secs(1)),
+            deadline_window: Some(std::time::Duration::from_secs(1)),
+            deadline: None,
             version: 1,
         };
+        assert_eq!(budget.terminal_reason(1), None);
+        budget.arm();
         assert_eq!(budget.terminal_reason(1), None);
         assert_eq!(
             budget.terminal_reason(2),
@@ -272,6 +289,32 @@ mod tests {
         assert!(matches!(result, Err(ProxySendError::OuterDeadline)));
         assert_eq!(
             budget.terminal_reason(1),
+            Some("upstream_failover_deadline")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_is_frozen_early_but_starts_only_when_armed() {
+        let mut budget = RequestAttemptBudget::from_primary(
+            &route(
+                codex_transport::DRIVER,
+                Some(json!({"failover_deadline_millis": 1000})),
+            ),
+            Uuid::from_u128(5),
+        )
+        .unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        assert_eq!(budget.terminal_reason(0), None);
+
+        budget.arm();
+        let armed = budget.deadline.unwrap();
+        tokio::time::advance(std::time::Duration::from_millis(500)).await;
+        budget.arm();
+        assert_eq!(budget.deadline, Some(armed), "arming is one-shot");
+        assert_eq!(budget.terminal_reason(0), None);
+        tokio::time::advance(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            budget.terminal_reason(0),
             Some("upstream_failover_deadline")
         );
     }
