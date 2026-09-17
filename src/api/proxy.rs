@@ -873,7 +873,7 @@ pub(in crate::api) async fn proxy_with_identity(
         return Err(AppError::Overloaded);
     }
     let json_parse = proxy_diagnostics::Phase::new(diagnostic_context, "request_json_parse");
-    let original_request_json: Value = serde_json::from_slice(&body)
+    let original_request_json: Value = crate::api::sse::parse_unique_json(&body)
         .map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))?;
     json_parse.finish("completed", None, Some(body.len()));
     let conversation_hints = conversation_hints(&headers, &original_request_json);
@@ -1020,19 +1020,7 @@ pub(in crate::api) async fn proxy_with_identity(
         Some(primary.credential_generation),
     );
     let admitted_request_object = format!("gap://{request_id}/request");
-    let archive_json_memory = if archive_retention::may_require_retention(&body) {
-        let Some(reservation) = memory.try_reserve_archive_json(&body) else {
-            state
-                .metrics
-                .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Json);
-            return Err(AppError::Overloaded);
-        };
-        Some(reservation)
-    } else {
-        None
-    };
-    drop(original_request_json);
-    let archive_request_body = archive_retention::request_json_body(&body);
+    let archive_request_body = archive_retention::request_json_body(&body, original_request_json);
     let request_capture_memory = state.metrics.memory_usage(
         crate::metrics::MemoryComponent::StreamCapture,
         body.len().saturating_mul(3),
@@ -1071,7 +1059,6 @@ pub(in crate::api) async fn proxy_with_identity(
     };
     admission.finish("completed", None, Some(archive_request_body.len()));
     drop(archive_request_body);
-    drop(archive_json_memory);
     let client_name = client_name(&headers);
     let conversation = matches!(
         protocol,

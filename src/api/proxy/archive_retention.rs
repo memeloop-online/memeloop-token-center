@@ -6,13 +6,7 @@ const ENCRYPTED_FIELD: &str = "encrypted_content";
 /// Preserve the exact body when no retention rule applies. This keeps legacy
 /// request byte archives stable while ensuring inline media and explicitly
 /// encrypted protocol fields never enter the durable archive.
-pub(super) fn request_json_body(original: &Bytes) -> Bytes {
-    if !may_require_retention(original) {
-        return original.clone();
-    }
-    let Ok(mut retained) = crate::api::sse::parse_unique_json(original) else {
-        return metadata_only_body("ambiguous_json", original.len());
-    };
+pub(super) fn request_json_body(original: &Bytes, mut retained: Value) -> Bytes {
     if !sanitize_value(&mut retained, false) {
         return original.clone();
     }
@@ -22,13 +16,19 @@ pub(super) fn request_json_body(original: &Bytes) -> Bytes {
 }
 
 pub(super) fn json_body_if_valid(original: &Bytes) -> Bytes {
-    if !may_require_retention(original) {
+    let mut retained = match crate::api::sse::parse_unique_json(original) {
+        Ok(value) => value,
+        Err(_) if serde_json::from_slice::<Value>(original).is_ok() => {
+            return metadata_only_body("ambiguous_json", original.len());
+        }
+        Err(_) => return original.clone(),
+    };
+    if !sanitize_value(&mut retained, false) {
         return original.clone();
     }
-    if serde_json::from_slice::<Value>(original).is_err() {
-        return original.clone();
-    }
-    request_json_body(original)
+    serde_json::to_vec(&retained)
+        .map(Bytes::from)
+        .unwrap_or_else(|_| metadata_only_body("serialization_failure", original.len()))
 }
 
 pub(super) fn sse_frame(original: &Bytes) -> Bytes {
@@ -98,6 +98,7 @@ fn sanitize_object(object: &mut Map<String, Value>, media_context: bool) -> bool
         .map(str::to_owned);
     let media = media_context || is_media_part(object, object_type.as_deref());
     let encrypted = object_type.as_deref().is_some_and(is_encrypted_part);
+    let assistant_message = object.get("role").and_then(Value::as_str) == Some("assistant");
     let mut changed = false;
     let keys = object.keys().cloned().collect::<Vec<_>>();
     for key in keys {
@@ -125,7 +126,8 @@ fn sanitize_object(object: &mut Map<String, Value>, media_context: bool) -> bool
             changed = true;
             continue;
         }
-        let nested_media = media && is_media_container_key(object_type.as_deref(), &key);
+        let nested_media = (media && is_media_container_key(object_type.as_deref(), &key))
+            || (assistant_message && is_chat_audio_container(&key, value));
         changed |= sanitize_value(value, nested_media);
     }
     changed
@@ -172,29 +174,6 @@ fn metadata_only_body(kind: &str, original_bytes: usize) -> Bytes {
     serde_json::to_vec(&metadata_only_value(kind, original_bytes))
         .map(Bytes::from)
         .unwrap_or_else(|_| Bytes::from_static(br#"{"archive_retention":{"retained":false}}"#))
-}
-
-pub(super) fn may_require_retention(body: &[u8]) -> bool {
-    const PROTOCOL_MARKERS: [&[u8]; 12] = [
-        b"encrypted_content",
-        b"b64_json",
-        b"partial_image_b64",
-        b"image_generation_call",
-        b"input_image",
-        b"output_image",
-        b"input_audio",
-        b"output_audio",
-        b"input_video",
-        b"output_video",
-        b"media_type",
-        b"computer_screenshot",
-    ];
-    PROTOCOL_MARKERS
-        .iter()
-        .any(|marker| body.windows(marker.len()).any(|window| window == *marker))
-        || body
-            .windows(5)
-            .any(|window| window.eq_ignore_ascii_case(b"data:"))
 }
 
 fn inline_media_kind(value: &str) -> Option<&'static str> {
@@ -254,8 +233,21 @@ fn is_media_container_key(object_type: Option<&str>, key: &str) -> bool {
     )
 }
 
+fn is_chat_audio_container(key: &str, value: &Value) -> bool {
+    if key != "audio" {
+        return false;
+    }
+    let Some(audio) = value.as_object() else {
+        return false;
+    };
+    audio.get("data").is_some_and(Value::is_string)
+        && (audio.get("id").is_some_and(Value::is_string)
+            || audio.get("transcript").is_some_and(Value::is_string)
+            || audio.get("expires_at").is_some_and(Value::is_number))
+}
+
 fn is_encrypted_part(kind: &str) -> bool {
-    matches!(kind, "reasoning" | "encrypted_content")
+    matches!(kind, "reasoning" | "compaction" | "encrypted_content")
 }
 
 fn is_media_body_key(object_type: Option<&str>, key: &str, inherited_media: bool) -> bool {
@@ -281,10 +273,14 @@ fn is_media_body_key(object_type: Option<&str>, key: &str, inherited_media: bool
 mod tests {
     use super::*;
 
+    fn retained_request(body: &Bytes) -> Bytes {
+        request_json_body(body, crate::api::sse::parse_unique_json(body).unwrap())
+    }
+
     #[test]
     fn unchanged_json_preserves_exact_bytes() {
         let body = Bytes::from_static(br#"{ "model": "gpt", "input": "hello" }"#);
-        assert_eq!(request_json_body(&body), body);
+        assert_eq!(retained_request(&body), body);
     }
 
     #[test]
@@ -292,7 +288,7 @@ mod tests {
         let body = Bytes::from_static(
             br#"{"input":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"},{"type":"input_audio","input_audio":{"data":"BBBB","format":"wav"}},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"DDDD"}},{"type":"reasoning","encrypted_content":"opaque"}],"output":[{"type":"image_generation_call","result":"CCCC"}],"tool":{"data":"ordinary"}}"#,
         );
-        let retained: Value = serde_json::from_slice(&request_json_body(&body)).unwrap();
+        let retained: Value = serde_json::from_slice(&retained_request(&body)).unwrap();
         assert_eq!(retained["input"][0]["image_url"]["retained"], false);
         assert_eq!(
             retained["input"][1]["input_audio"]["data"]["retained"],
@@ -319,18 +315,23 @@ mod tests {
         let body = Bytes::from_static(
             br#"{"type":"tool_use","input":{"encrypted_content":"application value","b64_json":"application value","data":"application value"}}"#,
         );
-        assert_eq!(request_json_body(&body), body);
+        assert_eq!(retained_request(&body), body);
 
         let domain_object = Bytes::from_static(
             br#"{"type":"image","media_type":"application/json","content":"thumbnail label","data":"business value"}"#,
         );
-        assert_eq!(request_json_body(&domain_object), domain_object);
+        assert_eq!(retained_request(&domain_object), domain_object);
+
+        let tool_audio = Bytes::from_static(
+            br#"{"type":"tool_use","input":{"audio":{"id":"record-1","data":"business value","transcript":"label"}}}"#,
+        );
+        assert_eq!(retained_request(&tool_audio), tool_audio);
 
         let typed_image_with_text = Bytes::from_static(
             br#"{"type":"output_image","content":"caption","data":"IMAGE_BASE64"}"#,
         );
         let retained: Value =
-            serde_json::from_slice(&request_json_body(&typed_image_with_text)).unwrap();
+            serde_json::from_slice(&retained_request(&typed_image_with_text)).unwrap();
         assert_eq!(retained["content"], "caption");
         assert_eq!(retained["data"]["retained"], false);
     }
@@ -344,7 +345,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(",")
         ));
-        let retained = request_json_body(&body);
+        let retained = retained_request(&body);
         assert!(retained.len() < 160);
         let retained: Value = serde_json::from_slice(&retained).unwrap();
         assert_eq!(retained["encrypted_content"]["original_bytes"], 36_875);
@@ -355,7 +356,7 @@ mod tests {
         let body = Bytes::from_static(
             br#"{"type":"reasoning","encrypted_content":"SECRET","encrypted_content":null}"#,
         );
-        let retained = request_json_body(&body);
+        let retained = json_body_if_valid(&body);
         assert!(!std::str::from_utf8(&retained).unwrap().contains("SECRET"));
         let retained: Value = serde_json::from_slice(&retained).unwrap();
         assert_eq!(retained["archive_retention"]["kind"], "ambiguous_json");
@@ -366,7 +367,7 @@ mod tests {
         let body = Bytes::from_static(
             br#"{"input":[{"type":"input_image","image_url":"DATA:IMAGE/png;base64,SECRET"}]}"#,
         );
-        let retained = request_json_body(&body);
+        let retained = retained_request(&body);
         assert!(!std::str::from_utf8(&retained).unwrap().contains("SECRET"));
     }
 
@@ -376,7 +377,7 @@ mod tests {
         let body = Bytes::from(format!(
             "{{\"image\":\"data:image/svg+xml,<svg>SECRET</svg>\",\"audio\":\"data:AUDIO/{long_subtype},SECRET\"}}"
         ));
-        let retained = request_json_body(&body);
+        let retained = retained_request(&body);
         let retained_text = std::str::from_utf8(&retained).unwrap();
         assert!(!retained_text.contains("SECRET"));
         assert!(!retained_text.contains(&long_subtype));
@@ -387,9 +388,46 @@ mod tests {
     }
 
     #[test]
+    fn json_escapes_cannot_bypass_retention() {
+        let encrypted =
+            Bytes::from_static(br#"{"type":"reasoning","encrypted_\u0063ontent":"SECRET"}"#);
+        let retained = retained_request(&encrypted);
+        assert!(!std::str::from_utf8(&retained).unwrap().contains("SECRET"));
+
+        let image = Bytes::from_static(
+            br#"{"type":"input_image","image_url":"d\u0061ta:image/png;base64,SECRET"}"#,
+        );
+        let retained = retained_request(&image);
+        assert!(!std::str::from_utf8(&retained).unwrap().contains("SECRET"));
+    }
+
+    #[test]
+    fn chat_audio_and_compaction_payloads_become_metadata_only() {
+        let body = Bytes::from_static(
+            br#"{"choices":[{"message":{"role":"assistant","audio":{"id":"audio-1","expires_at":1,"data":"AUDIO_BASE64","transcript":"hello"}}}],"output":[{"type":"compaction","encrypted_content":"COMPACT_SECRET"}]}"#,
+        );
+        let retained: Value = serde_json::from_slice(&retained_request(&body)).unwrap();
+        assert_eq!(
+            retained["choices"][0]["message"]["audio"]["data"]["retained"],
+            false
+        );
+        assert_eq!(
+            retained["choices"][0]["message"]["audio"]["transcript"],
+            "hello"
+        );
+        assert_eq!(
+            retained["output"][0]["encrypted_content"]["retained"],
+            false
+        );
+        let retained = serde_json::to_string(&retained).unwrap();
+        assert!(!retained.contains("AUDIO_BASE64"));
+        assert!(!retained.contains("COMPACT_SECRET"));
+    }
+
+    #[test]
     fn sse_archive_copy_redacts_without_changing_delivery_copy() {
         let delivered = Bytes::from_static(
-            b"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"secret\",\"summary\":[{\"text\":\"visible\"}]}}\n\n",
+            b"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"secret\",\"summary\":[{\"text\":\"visible\"}]}}\n\n",
         );
         let archived = sse_frame(&delivered);
         assert!(std::str::from_utf8(&delivered).unwrap().contains("secret"));
