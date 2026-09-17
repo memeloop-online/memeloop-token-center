@@ -56,7 +56,7 @@ export function MonitoringSnapshot({ snapshot, points = [], quotaSummary }: { sn
   const successRate = summary.requests > 0 ? summary.successful_requests / summary.requests : null;
   const range = `${new Date(snapshot.from_created_at).toLocaleString(locale)} – ${new Date(snapshot.to_created_at).toLocaleString(locale)}`;
   const count = (value: number) => formatMetricDisplay(value, locale);
-  const totalTokens: { text: string; title?: string } = summary.total_tokens === undefined ? { text: '—' } : { text: formatNumber(summary.total_tokens, locale), title: formatNumber(summary.total_tokens, locale) };
+  const totalTokens: { text: string; title?: string } = summary.total_tokens === undefined ? { text: '—' } : formatMetricDisplay(summary.total_tokens, locale);
   const cacheRate = summary.cache_rate ?? null;
   const average = analyticsDuration(summary.avg_duration_ms, locale);
   const averageTpsTrend = averageBucketTpsSeries(points);

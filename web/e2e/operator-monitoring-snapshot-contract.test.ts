@@ -32,7 +32,7 @@ test('monitoring types preserve explicit window, currency arrays, and zero-traff
 
 test('monitoring summary surfaces additive token and cache facts without synthetic trends', () => {
   assert.match(componentSource, /summary\.total_tokens === undefined/);
-  assert.match(componentSource, /formatNumber\(summary\.total_tokens, locale\)/, 'total tokens use exact local-number formatting');
+  assert.match(componentSource, /formatMetricDisplay\(summary\.total_tokens, locale\)/, 'total tokens use compact metric text with the exact value as title');
   assert.match(componentSource, /summary\.cache_rate \?\? null/);
   assert.match(componentSource, /formatPercent\(cacheRate, locale\)/, 'an absent or null cache rate formats as —');
   assert.match(componentSource, /label=\{t\('usage\.totalTokens'\)\} value=\{totalTokens\.text\} title=\{totalTokens\.title\} \/>/, 'the token card carries no trend prop');
