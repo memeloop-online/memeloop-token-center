@@ -50,6 +50,16 @@ test('analytics background exposes actual indexed buckets through pointer, keybo
       await notice.focus();
       await page.waitForFunction(() => document.activeElement?.matches('.analytics-metric[aria-label="Local settlement"] .metric-label span[tabindex]') ?? false);
     };
+    const tooltipForNotice = async () => {
+      await page.waitForFunction(() => {
+        const trigger = document.querySelector<HTMLElement>('.analytics-metric[aria-label="Local settlement"] .metric-label span[tabindex]');
+        const describedBy = trigger?.getAttribute('aria-describedby');
+        return Boolean(describedBy && document.getElementById(describedBy)?.getAttribute('role') === 'tooltip');
+      });
+      const describedBy = await notice.getAttribute('aria-describedby');
+      assert.ok(describedBy);
+      return page.locator(`[role="tooltip"][id=${JSON.stringify(describedBy)}]`);
+    };
     for (const action of ['pointer', 'keyboard', 'touch']) {
       await page.mouse.move(1, 1);
       await settlement.focus();
@@ -57,10 +67,12 @@ test('analytics background exposes actual indexed buckets through pointer, keybo
       if (action === 'pointer') { await focusNotice(); await notice.hover(); }
       if (action === 'keyboard') await focusNotice();
       if (action === 'touch') await notice.tap();
-      const tooltip = visibleTooltips().filter({ hasText: /供应商实际用量或发票请以供应商记录为准|use provider records for actual usage or invoice details/ });
+      const tooltip = await tooltipForNotice();
       await tooltip.waitFor({ state: 'visible' });
       assert.equal(await visibleTooltips().count(), 1, `${action}: detail must not also expose a trend tooltip`);
-      assert.match(await tooltip.textContent() ?? '', /保守上限|conservative ceiling/);
+      const tooltipText = await tooltip.textContent() ?? '';
+      assert.match(tooltipText, /保守上限|settlement ceiling/i);
+      assert.match(tooltipText, /供应商记录|provider records/i);
       assert.equal(await settlement.locator('.metric-value').textContent(), '$0.123456');
       await page.keyboard.press('Escape');
       await tooltip.waitFor({ state: 'hidden' });
