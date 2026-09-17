@@ -119,11 +119,35 @@ async fn finish_with_usage_basis_and_error(
     output_tokens: i64,
     error_code: Option<&str>,
 ) -> Result<FinishProxyRequestResult, AppError> {
+    finish_with_terminal_evidence(
+        fixture,
+        request_id,
+        reservation,
+        Some(usage_basis),
+        200,
+        input_tokens,
+        output_tokens,
+        error_code,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_with_terminal_evidence(
+    fixture: &SettlementFixture,
+    request_id: Uuid,
+    reservation: &UsageReservation,
+    usage_basis: Option<RequestUsageBasis>,
+    status_code: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    error_code: Option<&str>,
+) -> Result<FinishProxyRequestResult, AppError> {
     let response_object = format!("gap://settlement-feed/{request_id}/response");
     fixture
         .database
         .finish_proxy_request(FinishProxyRequest {
-            usage_basis: Some(usage_basis),
+            usage_basis,
             first_output_ms: None,
             generation_duration_ms: None,
             request_id,
@@ -132,7 +156,7 @@ async fn finish_with_usage_basis_and_error(
             input_token_ceiling: 10,
             output_token_ceiling: 10,
             requested_service_tier: None,
-            status_code: 200,
+            status_code,
             duration_ms: 1,
             usage: TokenUsage {
                 input_tokens,
@@ -309,6 +333,106 @@ async fn two_xx_error_code_uses_zero_in_request_and_event_projections() {
     assert_eq!(event.error_code.as_deref(), Some("client_cancelled"));
     assert_eq!(event.cost, "0");
     assert_eq!(event.billing.cost.as_deref(), Some("0"));
+}
+
+#[tokio::test]
+async fn terminal_cost_policy_flows_into_request_aggregates_without_rewriting_settlement() {
+    let fixture = fixture(EnforcementMode::Prepaid).await;
+    let cases = [
+        ("success unknown", None, 200, None, true),
+        (
+            "failed provider reported",
+            Some(RequestUsageBasis::ProviderReported),
+            503,
+            None,
+            true,
+        ),
+        (
+            "failed provider estimated",
+            Some(RequestUsageBasis::ProviderEstimated),
+            502,
+            None,
+            false,
+        ),
+        (
+            "failed contract ceiling",
+            Some(RequestUsageBasis::ContractCeiling),
+            503,
+            None,
+            false,
+        ),
+        (
+            "failed not observed",
+            Some(RequestUsageBasis::NotObserved),
+            499,
+            None,
+            false,
+        ),
+        (
+            "2xx terminal error without provenance",
+            None,
+            200,
+            Some("upstream_incomplete_response"),
+            false,
+        ),
+    ];
+    let mut expected_aggregate_cost = 0_i64;
+
+    for (label, usage_basis, status_code, error_code, keeps_cost) in cases {
+        let request_id = Uuid::now_v7();
+        let reservation = start(&fixture, request_id).await;
+        finish_with_terminal_evidence(
+            &fixture,
+            request_id,
+            &reservation,
+            usage_basis,
+            status_code,
+            7,
+            3,
+            error_code,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{label}: {error}"));
+
+        let stored_cost: i64 =
+            sqlx::query_scalar("SELECT cost_micros FROM request_records WHERE id = $1")
+                .bind(request_id.to_string())
+                .fetch_one(&fixture.database.pool)
+                .await
+                .unwrap();
+        assert!(
+            stored_cost > 0,
+            "{label}: settlement amount remains auditable"
+        );
+        let projected_cost: i64 =
+            sqlx::query_scalar("SELECT cost_micros FROM request_stats_facts WHERE request_id = $1")
+                .bind(request_id.to_string())
+                .fetch_one(&fixture.database.pool)
+                .await
+                .unwrap();
+        let expected = if keeps_cost { stored_cost } else { 0 };
+        assert_eq!(projected_cost, expected, "{label}");
+        expected_aggregate_cost += expected;
+    }
+
+    for table in [
+        "usage_daily_aggregates",
+        "request_daily_aggregates",
+        "usage_analysis_hourly",
+        "usage_analysis_daily",
+        "session_usage_totals",
+        "session_usage_hourly",
+        "session_usage_daily",
+    ] {
+        let aggregate_cost: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COALESCE(SUM(cost_micros), 0) FROM {table} WHERE key_id = $1"
+        )))
+        .bind(fixture.key.key_id.to_string())
+        .fetch_one(&fixture.database.pool)
+        .await
+        .unwrap();
+        assert_eq!(aggregate_cost, expected_aggregate_cost, "{table}");
+    }
 }
 
 #[tokio::test]
