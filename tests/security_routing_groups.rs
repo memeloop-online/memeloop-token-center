@@ -59,6 +59,233 @@ async fn public_models(state: &AppState, key: &str) -> Value {
     serde_json::from_slice(&body).expect("public models JSON")
 }
 
+async fn codex_models(state: &AppState, key: &str) -> Value {
+    let response = api::router(state.clone())
+        .oneshot(
+            Request::get("/v1/models?client_version=0.154.0")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("Codex models response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("bounded Codex models body");
+    serde_json::from_slice(&body).expect("Codex models JSON")
+}
+
+fn model_ids(
+    response: &Value,
+    collection: &str,
+    id_field: &str,
+) -> std::collections::BTreeSet<String> {
+    response[collection]
+        .as_array()
+        .expect("model collection")
+        .iter()
+        .filter_map(|model| model[id_field].as_str().map(str::to_owned))
+        .collect()
+}
+
+async fn catalog_account(state: &AppState, tenant: &str, name: &str, driver: &str) -> Uuid {
+    state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant.to_owned(),
+                name: name.to_owned(),
+                driver: driver.to_owned(),
+                config: json!({
+                    "base_url": "https://example.com",
+                    "network_scope": "public",
+                    "reservation_token_bounds": {}
+                }),
+                credential: UpstreamCredential::None,
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .expect("catalog upstream account")
+        .id
+}
+
+async fn catalog_route(
+    state: &AppState,
+    tenant: &str,
+    public_model: &str,
+    upstream_model: &str,
+    account_id: Uuid,
+    granted_credential_ids: Vec<Uuid>,
+) {
+    state
+        .db
+        .create_routed_model_route(CreateRoutedModelRouteInput {
+            tenant_external_id: tenant.to_owned(),
+            public_model: public_model.to_owned(),
+            upstream_model: upstream_model.to_owned(),
+            protocol: "openai".to_owned(),
+            priority: 0,
+            enabled: true,
+            upstream_account_ids: vec![account_id],
+            included_provider_group_ids: Vec::new(),
+            excluded_provider_group_ids: Vec::new(),
+            route_group_ids: Vec::new(),
+            route_group_names: Vec::new(),
+            granted_credential_ids,
+            custom_model_confirmed: true,
+        })
+        .await
+        .expect("catalog model route");
+}
+
+#[tokio::test]
+async fn codex_models_endpoint_isolated_by_key_and_tenant() {
+    let directory = tempfile::tempdir().expect("Codex catalog directory");
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("codex-catalog.db").display()
+    );
+    let state = AppState::initialize(Config::for_test(database_url))
+        .await
+        .expect("initialize Codex catalog state");
+    let pepper = state.config.key_pepper.as_bytes();
+    let key_a = state
+        .db
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "catalog-tenant-a".to_owned(),
+                principal_external_id: "catalog-principal-a".to_owned(),
+                alias: "catalog-key-a".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .expect("catalog tenant A key");
+    let key_b = state
+        .db
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "catalog-tenant-b".to_owned(),
+                principal_external_id: "catalog-principal-b".to_owned(),
+                alias: "catalog-key-b".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .expect("catalog tenant B key");
+    let key_a_secret = key_a.key.as_deref().expect("catalog tenant A key secret");
+    let key_b_secret = key_b.key.as_deref().expect("catalog tenant B key secret");
+
+    let kimi_a = catalog_account(&state, "catalog-tenant-a", "catalog-a-kimi", "kimi-oauth").await;
+    let native_a = catalog_account(
+        &state,
+        "catalog-tenant-a",
+        "catalog-a-native",
+        "openai-codex",
+    )
+    .await;
+    let kimi_b = catalog_account(&state, "catalog-tenant-b", "catalog-b-kimi", "kimi-oauth").await;
+
+    catalog_route(
+        &state,
+        "catalog-tenant-a",
+        "kimi-a-owned",
+        "kimi-upstream-a",
+        kimi_a,
+        vec![key_a.key_id],
+    )
+    .await;
+    catalog_route(
+        &state,
+        "catalog-tenant-a",
+        "native-a-only",
+        "native-upstream-a",
+        native_a,
+        vec![key_a.key_id],
+    )
+    .await;
+    catalog_route(
+        &state,
+        "catalog-tenant-a",
+        "mixed-a-model",
+        "mixed-kimi-upstream-a",
+        kimi_a,
+        vec![key_a.key_id],
+    )
+    .await;
+    catalog_route(
+        &state,
+        "catalog-tenant-a",
+        "mixed-a-model",
+        "mixed-native-upstream-a",
+        native_a,
+        vec![key_a.key_id],
+    )
+    .await;
+    catalog_route(
+        &state,
+        "catalog-tenant-a",
+        "gpt-5.5",
+        "bundled-alias-upstream-a",
+        kimi_a,
+        vec![key_a.key_id],
+    )
+    .await;
+    catalog_route(
+        &state,
+        "catalog-tenant-a",
+        "unauthorized-a-model",
+        "unauthorized-upstream-a",
+        kimi_a,
+        Vec::new(),
+    )
+    .await;
+    catalog_route(
+        &state,
+        "catalog-tenant-b",
+        "kimi-b-owned",
+        "kimi-upstream-b",
+        kimi_b,
+        vec![key_b.key_id],
+    )
+    .await;
+
+    let remote_a = codex_models(&state, key_a_secret).await;
+    assert_eq!(
+        model_ids(&remote_a, "models", "slug"),
+        ["kimi-a-owned".to_owned()].into_iter().collect()
+    );
+    let remote_b = codex_models(&state, key_b_secret).await;
+    assert_eq!(
+        model_ids(&remote_b, "models", "slug"),
+        ["kimi-b-owned".to_owned()].into_iter().collect()
+    );
+
+    let ordinary_a = public_models(&state, key_a_secret).await;
+    assert_eq!(ordinary_a["object"], "list");
+    assert!(ordinary_a.get("models").is_none());
+    assert_eq!(
+        model_ids(&ordinary_a, "data", "id"),
+        ["gpt-5.5", "kimi-a-owned", "mixed-a-model", "native-a-only",]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    );
+}
+
 fn key_input(tenant: &str, principal: &str) -> CreateKeyInput {
     CreateKeyInput {
         tenant_external_id: tenant.to_owned(),
