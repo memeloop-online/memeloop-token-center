@@ -402,7 +402,7 @@ fn canonical_session_protocol(protocol: &str) -> &str {
     }
 }
 
-async fn rebuild_request_session_projection_in_transaction(
+pub(crate) async fn rebuild_request_session_projection_in_transaction(
     tx: &mut Transaction<'_, Any>,
     tenant_id: &str,
     key_id: &str,
