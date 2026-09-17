@@ -381,6 +381,25 @@ async fn oversized_chat_event_errors_downstream_and_cannot_recover_into_done() {
         refs.response_object.as_deref(),
         Some(format!("gap://{}/response", rows[0].request_id).as_str())
     );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let probe_lease_until: i64 = sqlx::query_scalar(
+                "SELECT probe_lease_until FROM upstream_account_health
+                 WHERE upstream_account_id = $1 AND credential_generation = $2",
+            )
+            .bind(fixture.upstream_account_id.to_string())
+            .bind(credential_generation)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if probe_lease_until == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("record_terminal must release the probe lease");
     let health_after = sqlx::query(
         "SELECT consecutive_failures, cooldown_until, last_failure_kind
          FROM upstream_account_health
