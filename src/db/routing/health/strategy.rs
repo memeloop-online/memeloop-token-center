@@ -2,6 +2,61 @@ use super::*;
 
 pub(crate) const TRANSIENT_EWMA_SCALE: i64 = 1_000_000;
 
+const RECORD_TRANSIENT_HEALTH_SAMPLE_SQL: &str =
+    "INSERT INTO upstream_account_transient_health_signals (
+         upstream_account_id, credential_generation, sample_count,
+         ewma_micros, last_observed_at, recovery_successes, revision
+     ) SELECT $1, $2, 1, $3, $4, $5, 1
+       FROM upstream_accounts account
+      WHERE account.id = $1 AND account.status = 'active'
+        AND account.credential_generation = $2
+     ON CONFLICT (upstream_account_id) DO UPDATE SET
+         credential_generation = excluded.credential_generation,
+         sample_count = CASE
+             WHEN upstream_account_transient_health_signals.credential_generation <> excluded.credential_generation
+                 THEN 1
+             WHEN upstream_account_transient_health_signals.sample_count < 9223372036854775807
+                 THEN upstream_account_transient_health_signals.sample_count + 1
+             ELSE upstream_account_transient_health_signals.sample_count
+         END,
+         ewma_micros = CASE
+             WHEN upstream_account_transient_health_signals.credential_generation <> excluded.credential_generation
+                 THEN excluded.ewma_micros
+             ELSE (
+                 upstream_account_transient_health_signals.ewma_micros * 3 + excluded.ewma_micros + 2
+             ) / 4
+         END,
+         last_observed_at = CASE
+             WHEN upstream_account_transient_health_signals.credential_generation < excluded.credential_generation
+                  OR upstream_account_transient_health_signals.last_observed_at < excluded.last_observed_at
+                 THEN excluded.last_observed_at
+             ELSE upstream_account_transient_health_signals.last_observed_at
+         END,
+         recovery_successes = CASE
+             WHEN upstream_account_transient_health_signals.credential_generation <> excluded.credential_generation
+                 THEN excluded.recovery_successes
+             WHEN excluded.ewma_micros > 0 THEN 0
+             WHEN upstream_account_transient_health_signals.recovery_successes < 9223372036854775807
+                 THEN upstream_account_transient_health_signals.recovery_successes + 1
+             ELSE upstream_account_transient_health_signals.recovery_successes
+         END,
+         revision = CASE
+             WHEN upstream_account_transient_health_signals.credential_generation <> excluded.credential_generation
+                 THEN 1
+             WHEN upstream_account_transient_health_signals.revision < 9223372036854775807
+                 THEN upstream_account_transient_health_signals.revision + 1
+             ELSE upstream_account_transient_health_signals.revision
+         END
+     WHERE upstream_account_transient_health_signals.credential_generation <= excluded.credential_generation
+       AND EXISTS (
+         SELECT 1 FROM upstream_accounts account
+          WHERE account.id = upstream_account_transient_health_signals.upstream_account_id
+            AND account.status = 'active'
+            AND account.credential_generation = excluded.credential_generation
+     )
+     RETURNING sample_count, ewma_micros, last_observed_at,
+               recovery_successes, revision";
+
 /// Credential-free, generation-fenced transient observations. The integer
 /// EWMA uses a fixed alpha of 1/4 so both database backends produce identical
 /// values without floating-point drift.
@@ -59,62 +114,14 @@ impl Database {
         } else {
             0
         };
-        let row = sqlx::query(
-            "INSERT INTO upstream_account_transient_health_signals (
-                 upstream_account_id, credential_generation, sample_count,
-                 ewma_micros, last_observed_at, recovery_successes, revision
-             ) SELECT $1, $2, 1, $3, $4, $5, 1
-               FROM upstream_accounts account
-              WHERE account.id = $1 AND account.status = 'active'
-                AND account.credential_generation = $2
-             ON CONFLICT (upstream_account_id) DO UPDATE SET
-                 credential_generation = excluded.credential_generation,
-                 sample_count = CASE
-                     WHEN upstream_account_transient_health_signals.credential_generation <> excluded.credential_generation
-                         THEN 1
-                     WHEN upstream_account_transient_health_signals.sample_count < 9223372036854775807
-                         THEN upstream_account_transient_health_signals.sample_count + 1
-                     ELSE upstream_account_transient_health_signals.sample_count
-                 END,
-                 ewma_micros = CASE
-                     WHEN upstream_account_transient_health_signals.credential_generation <> excluded.credential_generation
-                         THEN $3
-                     ELSE (
-                         upstream_account_transient_health_signals.ewma_micros * 3 + $3 + 2
-                     ) / 4
-                 END,
-                 last_observed_at = $4,
-                 recovery_successes = CASE
-                     WHEN upstream_account_transient_health_signals.credential_generation <> excluded.credential_generation
-                         THEN $5
-                     WHEN $3 > 0 THEN 0
-                     WHEN upstream_account_transient_health_signals.recovery_successes < 9223372036854775807
-                         THEN upstream_account_transient_health_signals.recovery_successes + 1
-                     ELSE upstream_account_transient_health_signals.recovery_successes
-                 END,
-                 revision = CASE
-                     WHEN upstream_account_transient_health_signals.credential_generation <> excluded.credential_generation
-                         THEN 1
-                     WHEN upstream_account_transient_health_signals.revision < 9223372036854775807
-                         THEN upstream_account_transient_health_signals.revision + 1
-                     ELSE upstream_account_transient_health_signals.revision
-                 END
-             WHERE EXISTS (
-                 SELECT 1 FROM upstream_accounts account
-                  WHERE account.id = upstream_account_transient_health_signals.upstream_account_id
-                    AND account.status = 'active'
-                    AND account.credential_generation = excluded.credential_generation
-             )
-             RETURNING sample_count, ewma_micros, last_observed_at,
-                       recovery_successes, revision",
-        )
-        .bind(upstream_account_id.to_string())
-        .bind(credential_generation)
-        .bind(sample)
-        .bind(now)
-        .bind(i64::from(!transient_failure))
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query(RECORD_TRANSIENT_HEALTH_SAMPLE_SQL)
+            .bind(upstream_account_id.to_string())
+            .bind(credential_generation)
+            .bind(sample)
+            .bind(now)
+            .bind(i64::from(!transient_failure))
+            .fetch_optional(&self.pool)
+            .await?;
         row.map(|row| {
             Ok(TransientHealthSignal {
                 sample_count: row.try_get("sample_count")?,

@@ -259,6 +259,22 @@ async fn transient_signal_invariants(database: &Database) {
     assert_eq!(rotated.ewma_micros, 0);
     assert_eq!(rotated.recovery_successes, 1);
     assert_eq!(rotated.revision, 1);
+    let older_completion = sqlx::query(RECORD_TRANSIENT_HEALTH_SAMPLE_SQL)
+        .bind(account.to_string())
+        .bind(4_i64)
+        .bind(0_i64)
+        .bind(rotated.last_observed_at.saturating_sub(1))
+        .bind(1_i64)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        older_completion
+            .try_get::<i64, _>("last_observed_at")
+            .unwrap(),
+        rotated.last_observed_at,
+        "same-generation completion order cannot move last_observed_at backwards"
+    );
     let retained_rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM upstream_account_transient_health_signals WHERE upstream_account_id = $1",
     )
@@ -270,6 +286,116 @@ async fn transient_signal_invariants(database: &Database) {
         retained_rows, 1,
         "credential rotation replaces the bounded signal row"
     );
+}
+
+async fn postgres_blocked_old_generation_cannot_overwrite_rotated_signal(database: &Database) {
+    database.migrate().await.unwrap();
+    let tenant = Uuid::now_v7();
+    let account = Uuid::now_v7();
+    sqlx::query("INSERT INTO tenants (id, external_id, created_at) VALUES ($1,$1,0)")
+        .bind(tenant.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO upstream_accounts (id,tenant_id,name,driver,auth_kind,config_json,status,credential_generation,created_at,updated_at) VALUES ($1,$2,'signal race fixture','http-json','none','{}','active',3,0,0)")
+        .bind(account.to_string())
+        .bind(tenant.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    database
+        .record_transient_health_sample(account, 3, true)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut rotation = database.pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE upstream_account_transient_health_signals
+            SET revision = revision
+          WHERE upstream_account_id = $1",
+    )
+    .bind(account.to_string())
+    .execute(&mut *rotation)
+    .await
+    .unwrap();
+
+    let mut old_connection = database.pool.acquire().await.unwrap();
+    let old_pid: i64 = sqlx::query_scalar("SELECT CAST(pg_backend_pid() AS BIGINT)")
+        .fetch_one(&mut *old_connection)
+        .await
+        .unwrap();
+    let account_id = account.to_string();
+    let old_sample = tokio::spawn(async move {
+        sqlx::query(RECORD_TRANSIENT_HEALTH_SAMPLE_SQL)
+            .bind(account_id)
+            .bind(3_i64)
+            .bind(TRANSIENT_EWMA_SCALE)
+            .bind(300_i64)
+            .bind(0_i64)
+            .fetch_optional(&mut *old_connection)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let blocked: bool = sqlx::query_scalar(
+                "SELECT COALESCE(wait_event_type = 'Lock', FALSE)
+                   FROM pg_stat_activity
+                  WHERE pid = CAST($1 AS INTEGER)",
+            )
+            .bind(old_pid)
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+            if blocked {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("old generation sample must reach the row-lock barrier");
+
+    sqlx::query("UPDATE upstream_accounts SET credential_generation = 4 WHERE id = $1")
+        .bind(account.to_string())
+        .execute(&mut *rotation)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE upstream_account_transient_health_signals
+            SET credential_generation = 4, sample_count = 1, ewma_micros = 0,
+                last_observed_at = 400, recovery_successes = 1, revision = 1
+          WHERE upstream_account_id = $1",
+    )
+    .bind(account.to_string())
+    .execute(&mut *rotation)
+    .await
+    .unwrap();
+    rotation.commit().await.unwrap();
+
+    let stale_result = tokio::time::timeout(std::time::Duration::from_secs(5), old_sample)
+        .await
+        .expect("blocked old generation sample must finish")
+        .unwrap()
+        .unwrap();
+    assert!(
+        stale_result.is_none(),
+        "a statement that observed generation 3 before blocking cannot overwrite generation 4"
+    );
+    let row = sqlx::query(
+        "SELECT credential_generation, sample_count, ewma_micros,
+                last_observed_at, recovery_successes, revision
+           FROM upstream_account_transient_health_signals
+          WHERE upstream_account_id = $1",
+    )
+    .bind(account.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.try_get::<i64, _>("credential_generation").unwrap(), 4);
+    assert_eq!(row.try_get::<i64, _>("sample_count").unwrap(), 1);
+    assert_eq!(row.try_get::<i64, _>("last_observed_at").unwrap(), 400);
+    assert_eq!(row.try_get::<i64, _>("revision").unwrap(), 1);
 }
 
 #[test]
@@ -310,4 +436,5 @@ async fn postgres_strategy_admission_preserves_tenant_quota_and_cross_worker_lea
     let peer = Database::connect(&url).await.unwrap();
     invariants(&database, &peer).await;
     transient_signal_invariants(&database).await;
+    postgres_blocked_old_generation_cannot_overwrite_rotated_signal(&database).await;
 }
