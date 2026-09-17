@@ -892,7 +892,7 @@ async fn proxy_with_identity_and_conversation_spool(
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     conversation_spool: Option<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
 ) -> Result<Response, AppError> {
-    let codex_multi_agent_v2_client =
+    let official_codex_client =
         crate::api::request_normalization::is_official_codex_user_agent(&headers);
     let diagnostic_context = proxy_diagnostics::Context::current();
     let request_id = diagnostic_context.request_id;
@@ -947,6 +947,9 @@ async fn proxy_with_identity_and_conversation_spool(
     }
     let request_json = applied.request_json;
     let model = applied.model;
+    let codex_multi_agent_v2_request = matches!(protocol, Protocol::OpenAiResponses)
+        && official_codex_client
+        && crate::api::request_normalization::has_codex_multi_agent_v2_shape(&request_json);
     preparation.finish("completed", None, Some(body.len()));
     let route_preparation = proxy_diagnostics::Phase::new(diagnostic_context, "route_preparation");
     let selection_seed = routing_selection_seed(&key, request_id, &conversation_hints);
@@ -976,7 +979,7 @@ async fn proxy_with_identity_and_conversation_spool(
         protocol,
         request_id,
         request_json: &request_json,
-        codex_multi_agent_v2_client,
+        codex_multi_agent_v2_request,
     };
     let mut route_plan = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
         request: request_context,
@@ -1012,7 +1015,7 @@ async fn proxy_with_identity_and_conversation_spool(
                     protocol,
                     request_id,
                     request_json: &request_json,
-                    codex_multi_agent_v2_client,
+                    codex_multi_agent_v2_request,
                 },
                 original_body_length: body.len(),
                 candidates,
@@ -1027,7 +1030,7 @@ async fn proxy_with_identity_and_conversation_spool(
         protocol,
         request_id,
         request_json: &request_json,
-        codex_multi_agent_v2_client,
+        codex_multi_agent_v2_request,
     };
     let primary = route_plan.primary_route();
     let upstream_account_id = Some(primary.account_id);

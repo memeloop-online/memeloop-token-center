@@ -22,6 +22,44 @@ pub(super) fn is_official_codex_user_agent(headers: &HeaderMap) -> bool {
     crate::api::proxy::codex_transport::is_first_party_codex_user_agent(user_agent)
 }
 
+/// Only collaboration-bearing request shapes need the declared third-party
+/// MultiAgentV2 conversion. An official Codex user agent alone must not alter
+/// routing or payload handling for an otherwise ordinary Responses request.
+pub(super) fn has_codex_multi_agent_v2_shape(request: &Value) -> bool {
+    request
+        .get("tools")
+        .is_some_and(contains_collaboration_tool)
+        || request
+            .get("input")
+            .and_then(Value::as_array)
+            .is_some_and(|input| {
+                input.iter().any(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("agent_message")
+                        || (item.get("type").and_then(Value::as_str) == Some("additional_tools")
+                            && item.get("tools").is_some_and(contains_collaboration_tool))
+                })
+            })
+}
+
+fn contains_collaboration_tool(value: &Value) -> bool {
+    value.as_array().is_some_and(|tools| {
+        tools.iter().any(|tool| {
+            (tool.get("type").and_then(Value::as_str) == Some("namespace")
+                && tool.get("name").and_then(Value::as_str) == Some("collaboration"))
+                || tool
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| COLLABORATION_TOOL_NAMES.contains(&name))
+                || tool
+                    .get("function")
+                    .and_then(|definition| definition.get("name"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| COLLABORATION_TOOL_NAMES.contains(&name))
+                || tool.get("tools").is_some_and(contains_collaboration_tool)
+        })
+    })
+}
+
 /// Normalize the subset of Codex MultiAgentV2 request shapes that a declared
 /// third-party upstream can read.  The native Codex route deliberately does
 /// not call this function. Readable agent messages are lowered to an ordinary
@@ -239,6 +277,25 @@ mod tests {
             HeaderValue::from_static("Codex Desktop/4.5.6"),
         );
         assert!(!is_official_codex_user_agent(&duplicate));
+    }
+
+    #[test]
+    fn multi_agent_shape_requires_agent_message_or_collaboration_tool() {
+        for request in [
+            json!({"input":"ordinary request"}),
+            json!({"tools":[{"type":"function","name":"ordinary"}]}),
+            json!({"input":[{"type":"additional_tools","tools":[{"type":"function","name":"ordinary"}]}]}),
+        ] {
+            assert!(!has_codex_multi_agent_v2_shape(&request));
+        }
+        for request in [
+            json!({"input":[{"type":"agent_message","content":[]}]}),
+            json!({"tools":[{"type":"function","name":"spawn_agent"}]}),
+            json!({"tools":[{"type":"namespace","name":"collaboration","tools":[]}]}),
+            json!({"input":[{"type":"additional_tools","tools":[{"type":"namespace","name":"collaboration","tools":[]}]}]}),
+        ] {
+            assert!(has_codex_multi_agent_v2_shape(&request));
+        }
     }
 
     #[test]

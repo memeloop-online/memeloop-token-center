@@ -57,7 +57,7 @@ pub(super) fn plan_proxy_route(
                 protocol,
                 request_id,
                 request_json,
-                codex_multi_agent_v2_client,
+                codex_multi_agent_v2_request,
             },
         route,
         preparation_now,
@@ -89,7 +89,7 @@ pub(super) fn plan_proxy_route(
         protocol,
         request_json,
         matches!(protocol, Protocol::OpenAiResponses)
-            && codex_multi_agent_v2_client
+            && codex_multi_agent_v2_request
             && state.providers.supports_codex_multi_agent_v2(&route.driver),
         responses_via_chat_dialect,
     )?;
