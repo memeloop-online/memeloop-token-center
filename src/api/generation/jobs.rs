@@ -53,39 +53,20 @@ pub(in crate::api) async fn create_generation_for_modality(
         job_id,
     )
     .await?;
-    let siliconflow_video = route.driver == "http-json"
-        && crate::generation::is_siliconflow_video_profile(&route.config, &route.upstream_model);
-    if !matches!(route.driver.as_str(), "volcengine-seedance" | "comfyui") && !siliconflow_video {
-        return Err(AppError::Upstream(format!(
-            "generation driver {} cannot execute asynchronous jobs",
-            route.driver
-        )));
-    }
+    let adapter = crate::generation::GenerationProtocolAdapter::for_route(&route)?;
     if let Some(modality) = requested_modality {
-        let driver_supports_modality = match modality {
-            "image" => route.driver == "comfyui",
-            "video" => {
-                matches!(route.driver.as_str(), "volcengine-seedance" | "comfyui")
-                    || siliconflow_video
-            }
-            _ => false,
-        };
         let provider_supports_modality = state
             .providers
             .get(&route.driver)
             .is_some_and(|provider| provider.modalities.iter().any(|value| value == modality));
-        if !driver_supports_modality || !provider_supports_modality {
+        if !adapter.supports_modality(modality) || !provider_supports_modality {
             return Err(AppError::Upstream(format!(
                 "generation route for {} does not support {} generation",
                 body.model, modality
             )));
         }
     }
-    if route.driver == "volcengine-seedance" {
-        normalize_seedance_duration(&mut body.input)?;
-    } else if siliconflow_video {
-        crate::generation::validate_siliconflow_video_parameters(&body.input)?;
-    }
+    adapter.normalize_input(&mut body.input)?;
     // Hash and archive exactly the normalized request that the worker will
     // submit. This prevents alternate `duration`/`--dur` spellings from
     // reserving one amount while asking a permissive provider for another.
@@ -117,8 +98,7 @@ pub(in crate::api) async fn create_generation_for_modality(
         .db
         .generation_price(&body.model, &key.currency)
         .await?;
-    let estimated_units =
-        estimated_generation_units(&route.driver, &generation_price.billing_unit, &body.input)?;
+    let estimated_units = adapter.estimated_units(&generation_price.billing_unit, &body.input)?;
     let mut reservation_price = generation_price
         .reservation_price()
         .ok_or_else(|| AppError::BadRequest("generation price is too large".into()))?;
@@ -245,124 +225,7 @@ pub(in crate::api) async fn create_generation_for_modality(
     }
 }
 
-fn estimated_generation_units(
-    driver: &str,
-    billing_unit: &str,
-    input: &Value,
-) -> Result<i64, AppError> {
-    match (driver, billing_unit) {
-        ("volcengine-seedance", "second") => {
-            let units = input
-                .get("duration")
-                .and_then(Value::as_i64)
-                .ok_or(AppError::Internal)?;
-            if !(1..=60).contains(&units) {
-                return Err(AppError::Internal);
-            }
-            Ok(units)
-        }
-        ("comfyui", "job") => Ok(1),
-        ("http-json", "job") => Ok(1),
-        ("comfyui", "megapixel") => crate::generation::comfyui_requested_pixels(input),
-        ("volcengine-seedance", _) => Err(AppError::BadRequest(
-            "Seedance generation price must use second billing".into(),
-        )),
-        ("comfyui", _) => Err(AppError::BadRequest(
-            "ComfyUI generation price must use job or megapixel billing".into(),
-        )),
-        ("http-json", _) => Err(AppError::BadRequest(
-            "SiliconFlow video generation price must use job billing".into(),
-        )),
-        _ => Err(AppError::BadRequest("unsupported generation driver".into())),
-    }
-}
-
+#[cfg(test)]
 pub(in crate::api) fn normalize_seedance_duration(input: &mut Value) -> Result<i64, AppError> {
-    let object = input
-        .as_object_mut()
-        .ok_or_else(|| AppError::BadRequest("generation input must be a JSON object".into()))?;
-    let explicit = match object.get("duration") {
-        None => None,
-        Some(Value::Number(value)) => Some(value.as_i64().ok_or_else(|| {
-            AppError::BadRequest("Seedance duration must be a JSON integer".into())
-        })?),
-        Some(_) => {
-            return Err(AppError::BadRequest(
-                "Seedance duration must be a JSON integer".into(),
-            ));
-        }
-    };
-    if explicit.is_some_and(|duration| !(1..=60).contains(&duration)) {
-        return Err(AppError::BadRequest(
-            "Seedance duration must be between 1 and 60 seconds".into(),
-        ));
-    }
-
-    let mut content_duration = None;
-    if let Some(content) = object.get_mut("content").and_then(Value::as_array_mut) {
-        for item in content {
-            let Some(text) = item.get_mut("text") else {
-                continue;
-            };
-            let Some(original) = text.as_str() else {
-                continue;
-            };
-            let tokens = original.split_whitespace().collect::<Vec<_>>();
-            let mut normalized = Vec::with_capacity(tokens.len());
-            let mut index = 0;
-            let mut removed_duration = false;
-            while index < tokens.len() {
-                let token = tokens[index];
-                if token == "--dur" {
-                    if content_duration.is_some() {
-                        return Err(AppError::BadRequest(
-                            "Seedance content must contain at most one --dur option".into(),
-                        ));
-                    }
-                    let raw = tokens.get(index + 1).ok_or_else(|| {
-                        AppError::BadRequest(
-                            "Seedance content --dur must be followed by an integer".into(),
-                        )
-                    })?;
-                    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
-                        return Err(AppError::BadRequest(
-                            "Seedance content --dur must be followed by an integer".into(),
-                        ));
-                    }
-                    let duration = raw.parse::<i64>().map_err(|_| {
-                        AppError::BadRequest(
-                            "Seedance content --dur must be followed by an integer".into(),
-                        )
-                    })?;
-                    if !(1..=60).contains(&duration) {
-                        return Err(AppError::BadRequest(
-                            "Seedance duration must be between 1 and 60 seconds".into(),
-                        ));
-                    }
-                    content_duration = Some(duration);
-                    removed_duration = true;
-                    index += 2;
-                    continue;
-                }
-                if token.starts_with("--dur") {
-                    return Err(AppError::BadRequest(
-                        "Seedance content contains a malformed --dur option".into(),
-                    ));
-                }
-                normalized.push(token);
-                index += 1;
-            }
-            if removed_duration {
-                *text = Value::String(normalized.join(" "));
-            }
-        }
-    }
-    if explicit.is_some() && content_duration.is_some() && explicit != content_duration {
-        return Err(AppError::BadRequest(
-            "Seedance duration conflicts with content --dur".into(),
-        ));
-    }
-    let duration = explicit.or(content_duration).unwrap_or(5);
-    object.insert("duration".to_owned(), Value::from(duration));
-    Ok(duration)
+    crate::generation::normalize_seedance_duration(input)
 }
