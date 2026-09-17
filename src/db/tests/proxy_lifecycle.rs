@@ -1,5 +1,190 @@
 use super::super::*;
 
+async fn insert_completed_session_request(
+    database: &Database,
+    key: &AuthenticatedKey,
+    price: &ModelPrice,
+    model: &str,
+    session_id: &str,
+    upstream_account_id: Uuid,
+    status_code: i64,
+    error_code: Option<&str>,
+    observed_at: i64,
+) {
+    let request_id = Uuid::now_v7();
+    database
+        .start_proxy_request(StartProxyRequest {
+            request_id,
+            key,
+            price,
+            input_token_ceiling: 10,
+            output_token_ceiling: 10,
+            protocol: "openai-responses",
+            model,
+            request_object: "gap://session-transport-avoid/request",
+            upstream_account_id: Some(upstream_account_id),
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+    database
+        .record_conversation_observation(
+            key,
+            request_id,
+            &serde_json::json!({"input":[{"role":"user","content":"next turn"}]}),
+            &ConversationHints {
+                session_id: Some(session_id.to_owned()),
+                ..ConversationHints::default()
+            },
+            Some("Codex"),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE request_records SET completed_at = $1, status_code = $2, error_code = $3 WHERE id = $4",
+    )
+    .bind(observed_at)
+    .bind(status_code)
+    .bind(error_code)
+    .bind(request_id.to_string())
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE conversation_observations SET created_at = $1 WHERE request_id = $2")
+        .bind(observed_at)
+        .bind(request_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn latest_explicit_session_transport_502_deprioritizes_only_that_account() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory
+            .path()
+            .join("session-transport-avoid.db")
+            .display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    database.migrate().await.unwrap();
+    let pepper = b"session transport avoid test pepper";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "session-transport-avoid".to_owned(),
+                principal_external_id: "member".to_owned(),
+                alias: "session-transport-avoid".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::ONE,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let price = database
+        .upsert_model_price("session-transport-avoid", "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let model = "session-transport-avoid";
+    let failed_account = Uuid::now_v7();
+    let recovered_account = Uuid::now_v7();
+    let session_id = "explicit-session-transport-avoid";
+    let observed_at = unix_millis();
+
+    insert_completed_session_request(
+        &database,
+        &key,
+        &price,
+        model,
+        session_id,
+        failed_account,
+        502,
+        Some("upstream_transport_connection_reset"),
+        observed_at,
+    )
+    .await;
+    assert_eq!(
+        database
+            .latest_session_transport_account_to_avoid(&key, session_id)
+            .await
+            .unwrap(),
+        Some(failed_account)
+    );
+
+    // A success in another session may heal global account health. The failed
+    // session still retains its own latest terminal ordering evidence.
+    insert_completed_session_request(
+        &database,
+        &key,
+        &price,
+        model,
+        "unrelated-successful-session",
+        recovered_account,
+        200,
+        None,
+        observed_at + 1,
+    )
+    .await;
+    assert_eq!(
+        database
+            .latest_session_transport_account_to_avoid(&key, session_id)
+            .await
+            .unwrap(),
+        Some(failed_account)
+    );
+
+    // A newer successful terminal in the same session clears the preference
+    // rather than retaining stale failure evidence.
+    insert_completed_session_request(
+        &database,
+        &key,
+        &price,
+        model,
+        session_id,
+        recovered_account,
+        200,
+        None,
+        observed_at + 2,
+    )
+    .await;
+    assert_eq!(
+        database
+            .latest_session_transport_account_to_avoid(&key, session_id)
+            .await
+            .unwrap(),
+        None
+    );
+
+    insert_completed_session_request(
+        &database,
+        &key,
+        &price,
+        model,
+        session_id,
+        failed_account,
+        502,
+        Some("upstream_invalid_response"),
+        observed_at + 3,
+    )
+    .await;
+    assert_eq!(
+        database
+            .latest_session_transport_account_to_avoid(&key, session_id)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
 #[tokio::test]
 async fn postgres_late_streaming_parent_atomically_reconciles_committed_child_cluster() {
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {

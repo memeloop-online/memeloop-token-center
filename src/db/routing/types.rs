@@ -16,6 +16,11 @@ pub struct GrantedModelCapabilitySource {
 #[derive(Clone, Copy, Debug)]
 pub struct RouteSelectionOptions {
     pub upstream_account_hint: Option<Uuid>,
+    /// Account used by the latest completed request in the same explicit
+    /// session when that request ended in an ambiguous transport 502. This is
+    /// only a next-request ordering preference: the account remains an
+    /// authorized fallback when no other candidate is usable.
+    pub avoid_upstream_account_id: Option<Uuid>,
     pub selection_seed: Uuid,
 }
 

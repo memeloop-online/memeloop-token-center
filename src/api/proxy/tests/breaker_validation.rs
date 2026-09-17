@@ -300,7 +300,8 @@ async fn server_error_is_preserved_then_cools_the_account_for_the_next_request()
     )
     .await;
 
-    let response = send_resilient_chat(&fixture, Some("server-error-first"), false).await;
+    let session_id = "server-error-same-session";
+    let response = send_resilient_chat(&fixture, Some(session_id), false).await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
@@ -310,7 +311,7 @@ async fn server_error_is_preserved_then_cools_the_account_for_the_next_request()
     // therefore this request must not be replayed to another account. The
     // recorded cooldown still makes the standby eligible for a later,
     // independent request.
-    let response = send_resilient_chat(&fixture, Some("server-error-next"), false).await;
+    let response = send_resilient_chat(&fixture, Some(session_id), false).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await

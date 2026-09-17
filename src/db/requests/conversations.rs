@@ -355,6 +355,63 @@ impl Database {
         Ok(cluster_id)
     }
 
+    /// Returns the account used by the latest completed request in one
+    /// explicit session only when that terminal is a transport-class 502.
+    ///
+    /// This is routing evidence for a later independent request, not replay
+    /// permission for the ambiguous request itself. The selector is scoped by
+    /// tenant, principal, stable key, and the client-declared session id.
+    pub(crate) async fn latest_session_transport_account_to_avoid(
+        &self,
+        key: &AuthenticatedKey,
+        explicit_session_id: &str,
+    ) -> Result<Option<Uuid>, AppError> {
+        let row = sqlx::query(
+            "SELECT r.status_code, r.error_code, r.upstream_account_id
+             FROM conversation_observations o
+             JOIN conversation_clusters c
+               ON c.id = o.cluster_id
+              AND c.tenant_id = $1
+              AND c.principal_id = $2
+             JOIN request_record_locators locator
+               ON locator.id = o.request_id
+              AND locator.tenant_id = c.tenant_id
+              AND locator.key_id = o.key_id
+             JOIN request_records r
+               ON r.id = locator.id
+              AND r.created_at = locator.created_at
+              AND r.tenant_id = c.tenant_id
+              AND r.key_id = o.key_id
+             WHERE o.key_id = $3
+               AND o.explicit_session_id = $4
+               AND r.completed_at IS NOT NULL
+             ORDER BY o.created_at DESC, o.id DESC
+             LIMIT 1",
+        )
+        .bind(key.tenant_id.to_string())
+        .bind(key.principal_id.to_string())
+        .bind(key.key_id.to_string())
+        .bind(explicit_session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        if row.try_get::<Option<i64>, _>("status_code")? != Some(502) {
+            return Ok(None);
+        }
+        let error_code: Option<String> = row.try_get("error_code")?;
+        if !error_code
+            .as_deref()
+            .is_some_and(is_session_avoid_transport_error_code)
+        {
+            return Ok(None);
+        }
+        row.try_get::<Option<String>, _>("upstream_account_id")?
+            .map(parse_uuid)
+            .transpose()
+    }
+
     pub(crate) async fn record_conversation_observation_in_transaction(
         &self,
         transaction: &mut Transaction<'_, Any>,
@@ -930,6 +987,18 @@ impl Database {
             edges_truncated,
         })
     }
+}
+
+fn is_session_avoid_transport_error_code(error_code: &str) -> bool {
+    error_code.starts_with("upstream_transport_")
+        || matches!(
+            error_code,
+            "upstream_timeout"
+                | "upstream_read_timeout"
+                | "upstream_request_timeout"
+                | "upstream_stream"
+                | "upstream_stream_read_error"
+        )
 }
 
 async fn fetch_structured_conversation_candidate(
@@ -1749,6 +1818,31 @@ fn relation_name(relation: RelationKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_avoid_accepts_only_transport_terminal_codes() {
+        for error_code in [
+            "upstream_transport_timeout",
+            "upstream_transport_connection_reset",
+            "upstream_transport_outer_deadline",
+            "upstream_timeout",
+            "upstream_read_timeout",
+            "upstream_request_timeout",
+            "upstream_stream",
+            "upstream_stream_read_error",
+        ] {
+            assert!(is_session_avoid_transport_error_code(error_code));
+        }
+        for error_code in [
+            "upstream_error",
+            "upstream_incomplete_response",
+            "upstream_invalid_response",
+            "upstream_connection",
+            "http_502",
+        ] {
+            assert!(!is_session_avoid_transport_error_code(error_code));
+        }
+    }
 
     #[test]
     fn candidate_fingerprint_has_a_fixed_serialized_memory_bound() {

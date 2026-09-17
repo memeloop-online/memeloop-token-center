@@ -89,6 +89,7 @@ async fn assert_rotation_preserves_route(
             "openai",
             RouteSelectionOptions {
                 upstream_account_hint: None,
+                avoid_upstream_account_id: None,
                 selection_seed: Uuid::from_u128(0x9876),
             },
             pepper,
@@ -281,6 +282,7 @@ async fn exercise_final_group_semantics(database_url: String, backend: &str) {
                 "openai",
                 RouteSelectionOptions {
                     upstream_account_hint: None,
+                    avoid_upstream_account_id: None,
                     selection_seed: Uuid::from_u128(0x9876),
                 },
                 pepper,

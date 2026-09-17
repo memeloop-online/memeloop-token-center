@@ -195,6 +195,7 @@ impl Database {
     ) -> Result<Vec<AuthorizedUpstreamCandidate>, AppError> {
         let RouteSelectionOptions {
             upstream_account_hint,
+            avoid_upstream_account_id,
             selection_seed,
         } = selection;
         let rows = sqlx::query(
@@ -249,6 +250,7 @@ impl Database {
             key_id,
             selection_seed,
             upstream_account_hint,
+            avoid_upstream_account_id,
         );
         tracing::debug!(
             event = "authorized_candidate_order",
@@ -531,6 +533,7 @@ fn order_authorized_candidates(
     key_id: Uuid,
     selection_seed: Uuid,
     hint: Option<Uuid>,
+    avoid: Option<Uuid>,
 ) -> HintDisposition {
     let disposition = match hint {
         None => HintDisposition::Absent,
@@ -546,6 +549,7 @@ fn order_authorized_candidates(
     candidates.sort_by(|left, right| {
         hint_rank(hint, left)
             .cmp(&hint_rank(hint, right))
+            .then_with(|| avoid_rank(avoid, left).cmp(&avoid_rank(avoid, right)))
             .then_with(|| left.priority.cmp(&right.priority))
             .then_with(|| {
                 weighted_rendezvous_score(key_id, selection_seed, left)
@@ -555,6 +559,10 @@ fn order_authorized_candidates(
             .then_with(|| left.account_id.cmp(&right.account_id))
     });
     disposition
+}
+
+fn avoid_rank(avoid: Option<Uuid>, candidate: &RoutingCandidate) -> u8 {
+    u8::from(avoid.is_some_and(|avoid| avoid == candidate.account_id))
 }
 
 fn hint_rank(hint: Option<Uuid>, candidate: &RoutingCandidate) -> u8 {
@@ -625,6 +633,7 @@ mod tests {
             Uuid::from_u128(10),
             Uuid::from_u128(20),
             Some(Uuid::from_u128(102)),
+            None,
         );
         assert_eq!(disposition, HintDisposition::Preferred);
         assert_eq!(candidates[0].account_id, Uuid::from_u128(102));
@@ -643,13 +652,19 @@ mod tests {
         let key = Uuid::from_u128(10);
         let seed = Uuid::from_u128(20);
         assert_eq!(
-            order_authorized_candidates(&mut candidates, key, seed, None),
+            order_authorized_candidates(&mut candidates, key, seed, None, None),
             HintDisposition::Absent
         );
         let before = identities(&candidates);
         candidates.reverse();
         assert_eq!(
-            order_authorized_candidates(&mut candidates, key, seed, Some(Uuid::from_u128(999))),
+            order_authorized_candidates(
+                &mut candidates,
+                key,
+                seed,
+                Some(Uuid::from_u128(999)),
+                None,
+            ),
             HintDisposition::OutsideAuthorizedSet
         );
         assert_eq!(before, identities(&candidates));
@@ -663,7 +678,8 @@ mod tests {
                 &mut candidates,
                 Uuid::nil(),
                 Uuid::nil(),
-                Some(Uuid::from_u128(999))
+                Some(Uuid::from_u128(999)),
+                None
             ),
             HintDisposition::OutsideAuthorizedSet
         );
@@ -676,10 +692,75 @@ mod tests {
         let mut candidates = vec![candidate(account), candidate(account)];
         candidates[1].route_id = Uuid::from_u128(2);
         candidates[1].priority = -1;
-        order_authorized_candidates(&mut candidates, Uuid::nil(), Uuid::nil(), Some(account));
+        order_authorized_candidates(
+            &mut candidates,
+            Uuid::nil(),
+            Uuid::nil(),
+            Some(account),
+            None,
+        );
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].route_id, Uuid::from_u128(2));
         assert_eq!(candidates[1].route_id, Uuid::from_u128(1));
+    }
+
+    #[test]
+    fn latest_session_transport_account_is_only_deprioritized() {
+        let avoided = Uuid::from_u128(101);
+        let alternative = Uuid::from_u128(102);
+        let mut candidates = vec![candidate(avoided), candidate(alternative)];
+        candidates[1].priority = 50;
+        let mut before = identities(&candidates);
+
+        let disposition = order_authorized_candidates(
+            &mut candidates,
+            Uuid::from_u128(10),
+            Uuid::from_u128(20),
+            None,
+            Some(avoided),
+        );
+
+        assert_eq!(disposition, HintDisposition::Absent);
+        assert_eq!(candidates[0].account_id, alternative);
+        assert_eq!(candidates[1].account_id, avoided);
+        let mut after = identities(&candidates);
+        before.sort();
+        after.sort();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn explicit_hint_overrides_session_avoid_ordering() {
+        let hinted_and_avoided = Uuid::from_u128(101);
+        let mut candidates = vec![
+            candidate(hinted_and_avoided),
+            candidate(Uuid::from_u128(102)),
+        ];
+
+        let disposition = order_authorized_candidates(
+            &mut candidates,
+            Uuid::from_u128(10),
+            Uuid::from_u128(20),
+            Some(hinted_and_avoided),
+            Some(hinted_and_avoided),
+        );
+
+        assert_eq!(disposition, HintDisposition::Preferred);
+        assert_eq!(candidates[0].account_id, hinted_and_avoided);
+    }
+
+    #[test]
+    fn sole_avoided_candidate_remains_available() {
+        let account = Uuid::from_u128(101);
+        let mut candidates = vec![candidate(account)];
+        order_authorized_candidates(
+            &mut candidates,
+            Uuid::from_u128(10),
+            Uuid::from_u128(20),
+            None,
+            Some(account),
+        );
+        assert_eq!(candidates[0].account_id, account);
     }
 
     #[test]
