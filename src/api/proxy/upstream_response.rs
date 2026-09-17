@@ -149,11 +149,26 @@ impl UpstreamResponse {
                 };
                 match next {
                     Ok(Some(chunk)) => {
+                        if chunk.is_err() {
+                            // The caller reports this error before any
+                            // settlement/archival await. Replace the state
+                            // with an empty stream now so the reqwest body is
+                            // not retained by the wrapper after failure.
+                            drop(upstream);
+                            let empty: UpstreamByteStream = Box::pin(stream::empty());
+                            return Some((chunk, (empty, read_deadline, true)));
+                        }
                         read_deadline = tokio::time::Instant::now() + read_timeout;
                         Some((chunk, (upstream, read_deadline, false)))
                     }
                     Ok(None) => None,
-                    Err(error_code) => Some((Err(error_code), (upstream, read_deadline, true))),
+                    Err(error_code) => {
+                        // Do not keep the underlying response alive while the
+                        // caller sends a terminal error or settles storage.
+                        drop(upstream);
+                        let empty: UpstreamByteStream = Box::pin(stream::empty());
+                        Some((Err(error_code), (empty, read_deadline, true)))
+                    }
                 }
             },
         );
@@ -193,6 +208,34 @@ impl From<reqwest::Response> for UpstreamResponse {
 mod tests {
     use super::*;
     use futures_util::StreamExt;
+    use std::{
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        task::{Context, Poll},
+    };
+
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct PendingBody {
+        _probe: DropProbe,
+    }
+
+    impl Stream for PendingBody {
+        type Item = Result<Bytes, &'static str>;
+
+        fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
 
     fn delayed_body(delays: Vec<std::time::Duration>) -> UpstreamResponse {
         let stream = stream::iter(delays).then(|delay| async move {
@@ -285,6 +328,34 @@ mod tests {
 
         assert_eq!(body.next().await.unwrap(), Err(UPSTREAM_REQUEST_TIMEOUT));
         assert!(body.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_timeout_drops_the_underlying_body_before_returning_error() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let response = UpstreamResponse::Prefetched {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            version: Version::HTTP_11,
+            content_length: None,
+            stream: Box::pin(PendingBody {
+                _probe: DropProbe(dropped.clone()),
+            }),
+        }
+        .with_body_timeouts(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(10),
+        );
+        let mut body = response.bytes_stream();
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+
+        assert_eq!(body.next().await.unwrap(), Err(UPSTREAM_REQUEST_TIMEOUT));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "timeout must release the underlying upstream body before the caller settles"
+        );
+        drop(body);
     }
 
     #[tokio::test(start_paused = true)]

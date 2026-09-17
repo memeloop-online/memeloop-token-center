@@ -32,7 +32,7 @@ pub(super) async fn send_reqwest_proxy_route(
     let outbound_base_url = route.route.base_url.clone();
     let outbound_http = match tokio::time::timeout_at(
         request_deadline,
-        network::client_for_config_url(
+        network::client_for_config_url_no_retry(
             &state.http,
             &outbound_base_url,
             &route.route.config,
