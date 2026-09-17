@@ -194,6 +194,87 @@ async fn send_official_codex_responses_request(
         .unwrap()
 }
 
+async fn send_official_codex_responses_to_endpoint(
+    fixture: &CodexRouteFixture,
+    endpoint: String,
+    body: &Value,
+    accept: &'static str,
+) -> Response {
+    let request = Request::post("/v1/responses")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, accept)
+        .header(header::USER_AGENT, "codex_vscode/0.154.0")
+        .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key))
+        .body(Body::from(serde_json::to_vec(body).unwrap()))
+        .unwrap();
+    codex_transport::with_test_endpoint(
+        endpoint,
+        router_for_role(fixture.state.clone(), RuntimeRole::Gateway).oneshot(request),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn native_codex_responses_preserves_collaboration_schema_on_the_wire() {
+    let upstream = MockServer::start().await;
+    let fixture = codex_route_fixture("native-collaboration-wire").await;
+    let collaboration_tools = json!([{
+        "type": "namespace",
+        "name": "collaboration",
+        "tools": [{
+            "type": "function",
+            "name": "followup_task",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "encrypted": {"type": "boolean"}
+                    }
+                }
+            }
+        }]
+    }]);
+    let request = json!({
+        "model": fixture.model,
+        "input": [{
+            "type": "additional_tools",
+            "tools": collaboration_tools
+        }],
+        "tools": collaboration_tools,
+        "stream": true
+    });
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            completed_codex_sse("native collaboration accepted").into_bytes(),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let response = send_official_codex_responses_to_endpoint(
+        &fixture,
+        upstream.uri(),
+        &request,
+        "text/event-stream",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+
+    let requests = upstream.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let forwarded: Value = requests[0].body_json().unwrap();
+    assert_eq!(forwarded["tools"], request["tools"]);
+    assert_eq!(forwarded["input"][0], request["input"][0]);
+    upstream.verify().await;
+}
+
 #[tokio::test]
 async fn fake_glm_via_chat_provider_uses_strict_chat_contract_and_reverse_maps_tools() {
     let upstream = MockServer::start().await;
