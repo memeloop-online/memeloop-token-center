@@ -20,6 +20,9 @@ export function useOperatorRequestStream({ token, tenant, enabled, disconnectedM
   const protectedIds = useRef<string[]>([]);
 
   useEffect(() => {
+    // Drop the previous scope's protected ids before the new batch adopts
+    // them: stale ids would otherwise shield old-scope rows from eviction.
+    protectedIds.current = [];
     events.current.clear();
     sessionEvents.current.clear();
     setRevision((value) => value + 1);

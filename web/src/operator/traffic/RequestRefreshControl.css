@@ -5,4 +5,7 @@
 .request-refresh-slider > :first-child { width: 100%; min-width: 0; }
 .request-refresh-ticks { display: flex; justify-content: space-between; padding: 0 8px; font-size: 11px; }
 .request-refresh-hint { font-size: 12px; }
+.request-refresh-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0 20px; }
+.request-refresh-row .request-refresh-control { flex: 1 1 auto; }
+.request-refresh-pause { display: flex; align-items: center; gap: 10px; margin: 8px 0 18px; color: var(--muted); font-size: 12px; }
 @media (max-width: 480px) { .request-refresh-control { gap: 8px 14px; } .request-refresh-slider { flex: 1 1 180px; } }
