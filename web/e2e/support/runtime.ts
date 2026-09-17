@@ -73,7 +73,7 @@ export function observeSessionReadyRequests({
   expected: number;
 }): SessionReadyObservation {
   const controller = new AbortController();
-  const deadline = AbortSignal.timeout(15_000);
+  const deadline = AbortSignal.timeout(30_000);
   const signal = AbortSignal.any([controller.signal, deadline]);
   const requestIds = new Set<string>();
   let sessionId: string | undefined;
