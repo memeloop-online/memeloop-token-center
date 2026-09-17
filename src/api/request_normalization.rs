@@ -46,11 +46,9 @@ pub(super) fn normalize_codex_multi_agent_v2(
     Ok(())
 }
 
-/// Strip the internal collaboration message carrier from an official Codex
-/// parent request before it can spawn a third-party child. This stage is
-/// target-independent: a native Codex parent must also receive it so later
-/// child turns contain readable task text. No agent-message downgrade occurs
-/// here; that remains target-specific in `normalize_codex_multi_agent_v2`.
+/// Remove the encrypted collaboration message marker that third-party
+/// compatibility adapters cannot read. Native Codex requests must bypass this
+/// conversion entirely and retain their original collaboration schema.
 pub(super) fn prepare_codex_multi_agent_v2_tools(
     request: &mut Value,
     enabled: bool,

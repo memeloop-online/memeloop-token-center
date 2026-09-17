@@ -11,18 +11,12 @@ pub(super) fn prepare_forwarded_request(
     route: &ResolvedUpstream,
     protocol: Protocol,
     request: &Value,
-    prepare_multi_agent_tools: bool,
     normalize_multi_agent: bool,
     responses_via_chat_dialect: Option<crate::provider::ResponsesViaChatDialect>,
 ) -> Result<(Value, Option<responses_via_chat::Context>), AppError> {
     let mut forwarded = request.clone();
     if normalize_multi_agent {
         crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut forwarded, true)?;
-    } else {
-        crate::api::request_normalization::prepare_codex_multi_agent_v2_tools(
-            &mut forwarded,
-            prepare_multi_agent_tools,
-        )?;
     }
     let is_kimi_route = route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER;
     if is_kimi_route {
@@ -503,38 +497,31 @@ mod tests {
     }
 
     #[test]
-    fn native_parent_route_prepares_carrier_without_agent_downgrade() {
+    fn native_parent_route_preserves_collaboration_schema() {
         let request = json!({
             "model": "public-model",
-            "tools": [{"type":"function","name":"spawn_agent","parameters":{
-                "type":"object","properties":{"message":{"type":"string","encrypted":{"type":"boolean"}}}
-            }}],
-            "input": [{"type":"agent_message","role":"system",
-                "internal_chat_message_metadata_passthrough":{"turn_id":"native"},
-                "content":[{"type":"encrypted_content","encrypted_content":"delegated task"}]
-            }]
+            "tools": [{"type":"namespace","name":"collaboration","tools":[{
+                "type":"function","name":"spawn_agent","parameters":{
+                    "type":"object","properties":{"message":{"type":"string","encrypted":{"type":"boolean"}}}
+                }
+            }]}],
+            "input": [{"type":"additional_tools","tools":[{"type":"namespace","name":"collaboration","tools":[{
+                "type":"function","name":"followup_task","parameters":{
+                    "type":"object","properties":{"message":{"type":"string","encrypted":{"type":"boolean"}}}
+                }
+            }]}]}]
         });
         let (forwarded, _) = prepare_forwarded_request(
             &route("openai-codex"),
             Protocol::OpenAiResponses,
             &request,
-            true,
             false,
             None,
         )
         .unwrap();
 
-        assert!(
-            forwarded["tools"][0]["parameters"]["properties"]["message"]
-                .get("encrypted")
-                .is_none()
-        );
-        assert_eq!(forwarded["input"][0]["type"], "agent_message");
-        assert_eq!(forwarded["input"][0]["role"], "system");
-        assert_eq!(
-            forwarded["input"][0]["internal_chat_message_metadata_passthrough"]["turn_id"],
-            "native"
-        );
+        assert_eq!(forwarded["tools"], request["tools"]);
+        assert_eq!(forwarded["input"][0], request["input"][0]);
     }
 
     #[test]
@@ -550,7 +537,6 @@ mod tests {
             &kimi_route(),
             Protocol::OpenAiResponses,
             &request,
-            false,
             true,
             Some(crate::provider::ResponsesViaChatDialect::KimiV1),
         )
@@ -577,7 +563,6 @@ mod tests {
             &kimi_route(),
             Protocol::OpenAiResponses,
             &request,
-            false,
             true,
             Some(crate::provider::ResponsesViaChatDialect::KimiV1),
         ) {
