@@ -6,29 +6,40 @@ const ENCRYPTED_FIELD: &str = "encrypted_content";
 /// Preserve the exact body when no retention rule applies. This keeps legacy
 /// request byte archives stable while ensuring inline media and explicitly
 /// encrypted protocol fields never enter the durable archive.
-pub(super) fn request_json_body(original: &Bytes, mut retained: Value) -> Bytes {
-    if !sanitize_value(&mut retained, false) {
-        return original.clone();
-    }
+pub(super) fn prepare_request_json(mut retained: Value) -> Option<Value> {
+    sanitize_value(&mut retained, true, false).then_some(retained)
+}
+
+pub(super) fn encode_json_body(original: &Bytes, retained: &Value) -> Bytes {
     serde_json::to_vec(&retained)
         .map(Bytes::from)
         .unwrap_or_else(|_| metadata_only_body("serialization_failure", original.len()))
 }
 
-pub(super) fn json_body_if_valid(original: &Bytes) -> Bytes {
+pub(super) fn prepare_json_body_if_valid(original: &Bytes) -> Option<Value> {
     let mut retained = match crate::api::sse::parse_unique_json(original) {
         Ok(value) => value,
         Err(_) if serde_json::from_slice::<Value>(original).is_ok() => {
-            return metadata_only_body("ambiguous_json", original.len());
+            return Some(metadata_only_value("ambiguous_json", original.len()));
         }
-        Err(_) => return original.clone(),
+        Err(_) => return None,
     };
-    if !sanitize_value(&mut retained, false) {
-        return original.clone();
+    if !sanitize_value(&mut retained, true, false) {
+        return None;
     }
-    serde_json::to_vec(&retained)
-        .map(Bytes::from)
-        .unwrap_or_else(|_| metadata_only_body("serialization_failure", original.len()))
+    Some(retained)
+}
+
+pub(super) fn encoded_json_len(retained: &Value) -> usize {
+    retained_size(retained)
+}
+
+#[cfg(test)]
+fn json_body_if_valid(original: &Bytes) -> Bytes {
+    prepare_json_body_if_valid(original).as_ref().map_or_else(
+        || original.clone(),
+        |retained| encode_json_body(original, retained),
+    )
 }
 
 pub(super) fn sse_frame(original: &Bytes) -> Bytes {
@@ -48,7 +59,7 @@ pub(super) fn sse_frame(original: &Bytes) -> Bytes {
         Ok(value) => (value, false),
         Err(_) => (metadata_only_value("ambiguous_json", data.len()), true),
     };
-    if !sanitize_value(&mut value, false) && !forced_metadata_only {
+    if !sanitize_value(&mut value, true, false) && !forced_metadata_only {
         return original.clone();
     }
     let Ok(data) = serde_json::to_vec(&value) else {
@@ -77,28 +88,33 @@ pub(super) fn sse_frame(original: &Bytes) -> Bytes {
     Bytes::from(output)
 }
 
-fn sanitize_value(value: &mut Value, media_context: bool) -> bool {
+fn sanitize_value(value: &mut Value, infer_protocol: bool, media_context: bool) -> bool {
     match value {
         Value::Array(values) => {
             let mut changed = false;
             for value in values {
-                changed |= sanitize_value(value, media_context);
+                changed |= sanitize_value(value, infer_protocol, media_context);
             }
             changed
         }
-        Value::Object(object) => sanitize_object(object, media_context),
+        Value::Object(object) => sanitize_object(object, infer_protocol, media_context),
         _ => false,
     }
 }
 
-fn sanitize_object(object: &mut Map<String, Value>, media_context: bool) -> bool {
+fn sanitize_object(
+    object: &mut Map<String, Value>,
+    infer_protocol: bool,
+    media_context: bool,
+) -> bool {
     let object_type = object
         .get("type")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let media = media_context || is_media_part(object, object_type.as_deref());
-    let encrypted = object_type.as_deref().is_some_and(is_encrypted_part);
-    let assistant_message = object.get("role").and_then(Value::as_str) == Some("assistant");
+    let media = media_context || (infer_protocol && is_media_part(object, object_type.as_deref()));
+    let encrypted = infer_protocol && object_type.as_deref().is_some_and(is_encrypted_part);
+    let assistant_message =
+        infer_protocol && object.get("role").and_then(Value::as_str) == Some("assistant");
     let mut changed = false;
     let keys = object.keys().cloned().collect::<Vec<_>>();
     for key in keys {
@@ -128,7 +144,9 @@ fn sanitize_object(object: &mut Map<String, Value>, media_context: bool) -> bool
         }
         let nested_media = (media && is_media_container_key(object_type.as_deref(), &key))
             || (assistant_message && is_chat_audio_container(&key, value));
-        changed |= sanitize_value(value, nested_media);
+        let nested_infer_protocol =
+            infer_protocol && !is_opaque_tool_payload(object_type.as_deref(), &key);
+        changed |= sanitize_value(value, nested_infer_protocol, nested_media);
     }
     changed
 }
@@ -246,6 +264,18 @@ fn is_chat_audio_container(key: &str, value: &Value) -> bool {
             || audio.get("expires_at").is_some_and(Value::is_number))
 }
 
+fn is_opaque_tool_payload(object_type: Option<&str>, key: &str) -> bool {
+    matches!(
+        (object_type, key),
+        (Some("tool_use"), "input")
+            | (
+                Some("function_call" | "custom_tool_call" | "mcp_call"),
+                "input" | "arguments"
+            )
+            | (Some("function"), "arguments")
+    )
+}
+
 fn is_encrypted_part(kind: &str) -> bool {
     matches!(kind, "reasoning" | "compaction" | "encrypted_content")
 }
@@ -274,7 +304,10 @@ mod tests {
     use super::*;
 
     fn retained_request(body: &Bytes) -> Bytes {
-        request_json_body(body, crate::api::sse::parse_unique_json(body).unwrap())
+        let parsed = crate::api::sse::parse_unique_json(body).unwrap();
+        prepare_request_json(parsed)
+            .as_ref()
+            .map_or_else(|| body.clone(), |retained| encode_json_body(body, retained))
     }
 
     #[test]
@@ -323,7 +356,7 @@ mod tests {
         assert_eq!(retained_request(&domain_object), domain_object);
 
         let tool_audio = Bytes::from_static(
-            br#"{"type":"tool_use","input":{"audio":{"id":"record-1","data":"business value","transcript":"label"}}}"#,
+            br#"{"type":"tool_use","input":{"nested":{"type":"reasoning","encrypted_content":"business value"},"message":{"role":"assistant","audio":{"id":"record-1","data":"business value","transcript":"label"}}}}"#,
         );
         assert_eq!(retained_request(&tool_audio), tool_audio);
 

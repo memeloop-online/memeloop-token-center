@@ -1020,7 +1020,24 @@ pub(in crate::api) async fn proxy_with_identity(
         Some(primary.credential_generation),
     );
     let admitted_request_object = format!("gap://{request_id}/request");
-    let archive_request_body = archive_retention::request_json_body(&body, original_request_json);
+    let retained_request_json = archive_retention::prepare_request_json(original_request_json);
+    let archive_output_memory = if let Some(retained) = retained_request_json.as_ref() {
+        let Some(reservation) =
+            memory.try_reserve_archive_output(archive_retention::encoded_json_len(retained))
+        else {
+            state
+                .metrics
+                .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Json);
+            return Err(AppError::Overloaded);
+        };
+        Some(reservation)
+    } else {
+        None
+    };
+    let archive_request_body = retained_request_json.as_ref().map_or_else(
+        || body.clone(),
+        |retained| archive_retention::encode_json_body(&body, retained),
+    );
     let request_capture_memory = state.metrics.memory_usage(
         crate::metrics::MemoryComponent::StreamCapture,
         body.len().saturating_mul(3),
@@ -1059,6 +1076,7 @@ pub(in crate::api) async fn proxy_with_identity(
     };
     admission.finish("completed", None, Some(archive_request_body.len()));
     drop(archive_request_body);
+    drop(archive_output_memory);
     let client_name = client_name(&headers);
     let conversation = matches!(
         protocol,
@@ -2316,28 +2334,44 @@ async fn finish_buffered_request_with_upstream_attribution(
     // Seal the independent response spool in the terminal transaction. Only
     // its durable ACK gates delivery, never an object-store upload.
     let capture_started = Instant::now();
-    let archive_body = archive_retention::json_body_if_valid(&body);
-    let response_capture_memory = request.state.metrics.memory_usage(
-        crate::metrics::MemoryComponent::StreamCapture,
-        body.len().saturating_mul(3),
-    );
     let response_capture_permit = request.state.proxy_memory_budget.reservation();
-    let response_archive = if request.memory.has_buffered_response()
+    let base_capture_bytes = body.len().max(256);
+    let response_capture_admitted = request.memory.has_buffered_response()
         || response_capture_permit.try_grow(
-            archive_body.len(),
+            base_capture_bytes,
             crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
-        ) {
-        BufferedArchive::new(
-            crate::db::ArchiveSpoolIdentity {
-                request_id,
-                tenant_id: request.tenant_id,
-                reservation_id: request.reservation.id,
-            },
-            crate::response_archive_spool::BufferedArchivePurpose::Response,
-            &archive_body,
-            request.state.config.key_pepper.as_bytes(),
-            request.state.config.archive_spool_compression_enabled,
+        );
+    let response_capture_memory = response_capture_admitted.then(|| {
+        request.state.metrics.memory_usage(
+            crate::metrics::MemoryComponent::StreamCapture,
+            base_capture_bytes.saturating_mul(3),
         )
+    });
+    let response_archive = if response_capture_admitted {
+        let retained_response_json = archive_retention::prepare_json_body_if_valid(&body);
+        let encoded_len = retained_response_json
+            .as_ref()
+            .map_or(body.len(), archive_retention::encoded_json_len);
+        let extra_output_bytes = encoded_len.saturating_sub(base_capture_bytes);
+        if extra_output_bytes > 0 && !response_capture_permit.try_grow(extra_output_bytes, 1) {
+            Err(AppError::Overloaded)
+        } else {
+            let archive_body = retained_response_json.as_ref().map_or_else(
+                || body.clone(),
+                |retained| archive_retention::encode_json_body(&body, retained),
+            );
+            BufferedArchive::new(
+                crate::db::ArchiveSpoolIdentity {
+                    request_id,
+                    tenant_id: request.tenant_id,
+                    reservation_id: request.reservation.id,
+                },
+                crate::response_archive_spool::BufferedArchivePurpose::Response,
+                &archive_body,
+                request.state.config.key_pepper.as_bytes(),
+                request.state.config.archive_spool_compression_enabled,
+            )
+        }
     } else {
         Err(AppError::Overloaded)
     };

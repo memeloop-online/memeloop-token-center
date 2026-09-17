@@ -149,7 +149,29 @@ pub(crate) struct ConversationProjectionPermit {
     _permit: OwnedSemaphorePermit,
 }
 
+pub(crate) struct ArchiveOutputMemory {
+    reservation: Arc<ProxyMemoryReservation>,
+    bytes: usize,
+}
+
+impl Drop for ArchiveOutputMemory {
+    fn drop(&mut self) {
+        self.reservation.release(self.bytes, 1);
+    }
+}
+
 impl ProxyMemoryReservation {
+    pub(crate) fn try_reserve_archive_output(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Option<ArchiveOutputMemory> {
+        let bytes = bytes.max(256);
+        self.try_grow(bytes, 1).then(|| ArchiveOutputMemory {
+            reservation: self.clone(),
+            bytes,
+        })
+    }
+
     /// Snapshot the selected account's policy for this request. Retries cannot
     /// replace its selected queue policy or metrics owner.
     pub(crate) fn configure_admission(
