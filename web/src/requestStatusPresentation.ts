@@ -37,13 +37,13 @@ export function requestOutcome(request: RequestView): RequestOutcome {
 export function requestStatusCopy(request: RequestView, locale: 'zh-CN' | 'en') {
   const outcome = requestOutcome(request);
   const copy = locale === 'zh-CN' ? {
-    running: ['运行中', '尚未记录终态，用量和费用仍待结算。'],
-    delivering: ['交付中', '已开始发送响应，尚未记录交付终态。'],
+    running: ['运行中', '尚未记录完成状态，用量和费用仍待结算。'],
+    delivering: ['交付中', '已开始发送响应，交付完成状态待记录。'],
     completed: ['已完成', '服务端已记录正常结束；不代表客户端已确认接收全部内容。'],
     cancelled: ['客户端断开', '客户端连接已断开，响应未正常交付完成。'],
     interrupted: ['响应中断', '响应未正常结束；已记录用量不代表响应完整交付。'],
     failed: ['失败', '服务端记录了请求失败，请查看错误详情。'],
-    unknown: ['终态未知', '历史记录仅保留状态码，缺少完成时间；无法确认完整交付。'],
+    unknown: ['记录待补充', '此历史记录包含状态码，完成时间待补充。'],
   } : {
     running: ['Running', 'No terminal outcome is recorded yet. Usage and cost await settlement.'],
     delivering: ['Delivering', 'Response delivery has started, but its terminal outcome is not recorded yet.'],
@@ -51,7 +51,7 @@ export function requestStatusCopy(request: RequestView, locale: 'zh-CN' | 'en') 
     cancelled: ['Client disconnected', 'The client connection closed before normal response delivery completed.'],
     interrupted: ['Interrupted', 'The response did not finish normally. Recorded usage does not establish complete delivery.'],
     failed: ['Failed', 'The server recorded a request failure. See the error details.'],
-    unknown: ['Outcome unknown', 'This historical record retains a status code but no completion time; complete delivery cannot be confirmed.'],
+    unknown: ['Record incomplete', 'This historical record has a status code and is awaiting completion timing.'],
   };
   const [label, explanation] = copy[outcome];
   const code = request.status_code === null ? '' : `${locale === 'zh-CN' ? '记录状态码' : 'Recorded status'}: ${request.status_code}`;

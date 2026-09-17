@@ -44,7 +44,7 @@ test('plugin OAuth uses default client, full callback once, safe errors and isol
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/authorization-code.html`);
     const start = page.getByRole('button', { name: '开始登录', exact: true });
     await start.click(); await page.getByRole('alert').waitFor();
-    assert.match(await page.getByRole('alert').innerText(), /MTC_PROVIDER_OAUTH_CLIENT_DEFAULTS_JSON/);
+    assert.equal(await page.getByRole('alert').innerText(), '此提供商的默认 OAuth 客户端尚未配置。请联系管理员。');
     await start.click(); await page.getByLabel('完整回调地址', { exact: true }).waitFor();
     await page.getByLabel('完整回调地址', { exact: true }).fill('http://localhost:8080/callback?code=fixture-code&state=fixture-state');
     await page.getByRole('button', { name: '完成授权', exact: true }).click();

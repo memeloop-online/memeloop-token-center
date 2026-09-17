@@ -30,7 +30,7 @@ test('service credential copying uses original values and explains unavailable o
       } else {
         await copy.click();
         if (mode === 'forbidden') {
-          await page.getByRole('alert').getByText('Copying a service credential requires a global management credential with service-token write permission.', { exact: true }).waitFor();
+          await page.getByRole('alert').getByText('Copying a service credential requires a global management credential with service credential write permission.', { exact: true }).waitFor();
           assert.equal(await page.locator('.one-time').count(), 0);
         } else if (mode === 'clipboard-failure') {
           await page.getByText('mts_service_original', { exact: true }).waitFor();

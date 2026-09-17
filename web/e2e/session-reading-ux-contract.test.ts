@@ -13,6 +13,7 @@ test('conversation content precedes optional operational timelines', () => {
   assert.match(view, /formatMetricDisplay/);
   assert.match(view, /formatCurrencyDisplay/);
   assert.match(view, /requestDisplayedCost/);
+  assert.match(view, /requestCostCopy\(request, locale\)\.unknown \? '—'/);
   assert.match(view, /const micros = decimalMicros\(requestDisplayedCost\(request\)\)/);
   assert.match(view, /formatDurationDisplay/);
   assert.match(view, /session-list-skeleton/);

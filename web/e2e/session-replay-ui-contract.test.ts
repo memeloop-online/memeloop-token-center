@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-const [surface, replayView, replayStyles, operatorSessions, selfSessions, i18n] = await Promise.all([
+const [surface, replayView, archiveReader, replayStyles, operatorSessions, selfSessions, i18n] = await Promise.all([
   readFile(new URL('../src/SessionViews.tsx', import.meta.url), 'utf8'),
   readFile(new URL('../src/sessionReplayViews.tsx', import.meta.url), 'utf8'),
+  readFile(new URL('../src/ArchiveContentReader.tsx', import.meta.url), 'utf8'),
   readFile(new URL('../src/sessionReplay.css', import.meta.url), 'utf8'),
   readFile(new URL('../src/operator/SessionMonitor.tsx', import.meta.url), 'utf8'),
   readFile(new URL('../src/self/SessionsPage.tsx', import.meta.url), 'utf8'),
@@ -40,9 +41,10 @@ test('replay provides localized user-turn navigation, compact archive state, and
   assert.match(replayView, /sessionReplay\.toolCall/);
   assert.match(replayView, /sessionReplay\.toolResult/);
   assert.match(replayView, /sessionReplay\.archiveUnknown/);
+  assert.match(archiveReader, /reason\.reason === 'archive_payload_invalid' \? 'sessionReplay\.archiveFormatInvalid'/);
   assert.match(replayView, /sessionReplay\.pairing\.\$\{item\.pairing\}/);
   assert.doesNotMatch(replayView, /ARCHIVE UNKNOWN|ARCHIVE INCOMPLETE|TOOL CALL|TOOL RESULT/);
-  for (const key of ['sessionReplay.title', 'sessionReplay.userTurns', 'sessionReplay.toolCall', 'sessionReplay.toolResult', 'sessionReplay.archiveUnavailableBoth', 'sessionReplay.expand', 'sessionReplay.pairing.paired'] as const) {
+  for (const key of ['sessionReplay.title', 'sessionReplay.userTurns', 'sessionReplay.toolCall', 'sessionReplay.toolResult', 'sessionReplay.archiveUnavailableBoth', 'sessionReplay.archiveFormatInvalid', 'sessionReplay.expand', 'sessionReplay.pairing.paired'] as const) {
     assert.match(i18n, new RegExp(`'${key.replaceAll('.', '\\.')}':`));
   }
   assert.match(replayView, /REPLAY_EXPAND_TEXT_LENGTH/);

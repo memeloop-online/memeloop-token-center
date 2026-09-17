@@ -243,7 +243,7 @@ function SessionActivity({ detail, summary, currency, loading, onSelect }: {
   const eventMetrics = (request: ConversationRequest) => [
     `${formatMetricNumber(request.input_tokens + request.output_tokens, locale).text} ${t('request.tokenUnit')}`,
     request.duration_ms === null ? '—' : formatMilliseconds(request.duration_ms, locale),
-    requestCostCopy(request, locale).unknown ? requestCostCopy(request, locale).label : request.currency || currency || summaryCurrency ? formatCurrency(requestDisplayedCost(request), request.currency ?? currency ?? summaryCurrency ?? '', locale) : '—',
+    requestCostCopy(request, locale).unknown ? '—' : request.currency || currency || summaryCurrency ? formatCurrency(requestDisplayedCost(request), request.currency ?? currency ?? summaryCurrency ?? '', locale) : '—',
   ];
   const parentLabel = (request: ConversationRequest) => {
     const node = nodes.get(request.request_id);

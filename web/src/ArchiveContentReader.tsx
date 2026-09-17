@@ -124,7 +124,7 @@ export function ArchiveContentReader({ request, sessionId, side, loadRange, rend
       } else {
         if (items.length) setPage({ key, loader: loadRange, offset, items, done: false });
         setError(reason instanceof ArchiveUnavailableError
-          ? t(reason.reason === 'archive_pending' ? 'sessionReplay.archivePending' : reason.reason === 'media_body_not_archived_by_policy' ? 'sessionReplay.archiveNotRetained' : 'sessionReplay.archiveUnavailable')
+          ? t(reason.reason === 'archive_pending' ? 'sessionReplay.archivePending' : reason.reason === 'media_body_not_archived_by_policy' ? 'sessionReplay.archiveNotRetained' : reason.reason === 'archive_payload_invalid' ? 'sessionReplay.archiveFormatInvalid' : 'sessionReplay.archiveUnavailable')
           : reason instanceof Error && reason.message.startsWith('Unsupported archive') ? t('sessionReplay.unsupportedBody')
             : reason instanceof Error && reason.message.startsWith('Archive stream') ? t('sessionReplay.archiveInterrupted')
               : t('sessionReplay.archiveReadFailed'));

@@ -85,9 +85,9 @@ export function analyticsAge(value: number | null | undefined, locale: Locale): 
 export function histogramP95(value: number | null | undefined, capped: boolean | undefined, locale: Locale): FormattedValue {
   if (value == null || !Number.isFinite(value) || value < 0) return { text: '—' };
   const duration = analyticsDuration(value, locale);
-  if (capped === true) return { text: locale === 'zh-CN' ? '>1分钟' : '>1 min', title: locale === 'zh-CN' ? 'P95超过60秒；精确值未知，超过当前统计范围。' : 'P95 exceeds 60 seconds. Its exact value is unknown and outside the measured range.' };
-  if (value >= 60_000 && capped === undefined) return { text: locale === 'zh-CN' ? '最高统计档' : 'Top histogram bucket', title: locale === 'zh-CN' ? '旧版数据将30–60秒和超过60秒的区间都记为60,000ms，无法区分是否截顶；不是实际P95。' : 'Legacy data maps both 30–60 seconds and >60 seconds to 60,000ms. The exact P95 and overflow state are unknown.' };
-  return { text: `≤${duration.text}`, title: locale === 'zh-CN' ? `固定直方图P95所在区间的上界（${formatMilliseconds(value, locale)}），不是精确分位数。` : `Upper bound of the fixed-histogram P95 bucket (${formatMilliseconds(value, locale)}), not an exact percentile.` };
+  if (capped === true) return { text: locale === 'zh-CN' ? '>1分钟' : '>1 min', title: locale === 'zh-CN' ? 'P95 超过 60 秒，位于当前统计范围之外。' : 'P95 exceeds 60 seconds and is outside the measured range.' };
+  if (value >= 60_000 && capped === undefined) return { text: locale === 'zh-CN' ? '最高统计档' : 'Top histogram bucket', title: locale === 'zh-CN' ? '旧版数据将 30–60 秒及以上记录合并在 60,000 ms 统计档。' : 'Legacy data combines 30–60 seconds and above in the 60,000 ms bucket.' };
+  return { text: `≤${duration.text}`, title: locale === 'zh-CN' ? `固定直方图 P95 区间上界：${formatMilliseconds(value, locale)}。` : `Fixed-histogram P95 bucket upper bound: ${formatMilliseconds(value, locale)}.` };
 }
 
 /** Unknown/capped tails must leave a gap, never a fabricated 60-second plateau. */
