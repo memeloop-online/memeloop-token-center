@@ -16,8 +16,33 @@ async fn gated_sse_upstream(
     let (release_body, body_released) = tokio::sync::oneshot::channel();
     let accepted = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request_prefix = [0_u8; 4096];
-        assert!(stream.read(&mut request_prefix).await.unwrap() > 0);
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0_u8; 4096];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&chunk[..read]);
+            if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let declared_body_bytes = std::str::from_utf8(&request[..header_end])
+            .unwrap()
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then_some(value.trim())
+            })
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        while request.len() < header_end + declared_body_bytes {
+            let mut chunk = [0_u8; 64 * 1024];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&chunk[..read]);
+        }
         stream
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
@@ -41,6 +66,89 @@ async fn gated_sse_upstream(
         );
     });
     (endpoint, release_body, accepted)
+}
+
+#[tokio::test]
+async fn large_conversation_stream_retains_raw_bytes_until_terminal_projection() {
+    const RETAINED_BYTES: usize = 8 * 1024 * 1024;
+
+    let fixture = codex_route_fixture("large-conversation-stream").await;
+    fixture
+        .state
+        .db
+        .update_key_policy(
+            fixture.key_id,
+            KeyPolicy {
+                tokens_per_minute: 32 * 1024 * 1024,
+                ..KeyPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    fixture
+        .state
+        .db
+        .grant(
+            fixture.credit_account_id,
+            Decimal::from(32),
+            "large conversation projection fixture",
+            "large-conversation-projection-balance",
+        )
+        .await
+        .unwrap();
+    let (endpoint, release_body, upstream) =
+        gated_sse_upstream(completed_codex_sse("projected after EOF").into_bytes()).await;
+    let response = send_codex_route_to_endpoint(
+        &fixture,
+        endpoint,
+        "/v1/responses",
+        json!({
+            "model": fixture.model,
+            "input": "small semantic input",
+            "metadata": {"padding": "x".repeat(RETAINED_BYTES)},
+            "stream": true
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (held, _, _, _) = fixture.state.proxy_memory_budget.snapshot();
+    assert!(
+        held >= RETAINED_BYTES,
+        "raw conversation bytes stay reserved"
+    );
+    assert!(
+        held < RETAINED_BYTES * 2,
+        "the parsed JSON tree must not remain live through an open SSE"
+    );
+
+    release_body.send(()).unwrap();
+    let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&delivered).contains("projected after EOF"));
+    upstream.await.unwrap();
+    wait_for_request_settlement(&fixture, 1).await;
+
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(200));
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let cluster: Option<String> =
+        sqlx::query_scalar("SELECT conversation_cluster_id FROM request_records WHERE id = $1")
+            .bind(rows[0].request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    pool.close().await;
+    assert!(
+        cluster.is_some(),
+        "terminal projection reparsed the raw request"
+    );
 }
 
 #[tokio::test]

@@ -556,6 +556,7 @@ async fn finish_non_sse_proxy_response(
         &buffered_request.memory,
         buffered_request.started,
         false,
+        buffered_request.conversation.as_ref(),
     )
     .await
     {
@@ -1038,13 +1039,6 @@ pub(in crate::api) async fn proxy_with_identity(
         }
     };
     admission.finish("completed", None, Some(body.len()));
-    drop(request_capture_memory);
-    memory.release(
-        body.len(),
-        crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
-    );
-    let request_body_length = body.len();
-    drop(body);
     let client_name = client_name(&headers);
     let conversation = matches!(
         protocol,
@@ -1052,10 +1046,19 @@ pub(in crate::api) async fn proxy_with_identity(
     )
     .then(|| ProxyConversation {
         key: key.clone(),
-        request_json: original_request_json,
+        request_body: body.clone(),
         hints: conversation_hints,
         client_name,
+        projection_admission: std::sync::Mutex::new(ConversationProjectionAdmission::Deferred),
     });
+    drop(original_request_json);
+    drop(request_capture_memory);
+    memory.release(
+        body.len(),
+        crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+    );
+    let request_body_length = body.len();
+    drop(body);
     let mut buffered_request = BufferedRequest {
         state: &state,
         reservation,
@@ -1123,6 +1126,7 @@ pub(in crate::api) async fn proxy_with_identity(
         output_choice_count,
     } = route_plan;
     if primary.is_component() {
+        drop(request_json);
         return execute_component_primary(
             buffered_request,
             &key,
@@ -1421,6 +1425,11 @@ pub(in crate::api) async fn proxy_with_identity(
             == Some(true);
     drop(request_json);
     active_route.release_request_buffers();
+    if let Some(conversation) = buffered_request.conversation.as_ref() {
+        buffered_request
+            .memory
+            .release_conversation_working_copies(conversation.request_body.len());
+    }
     let is_codex_route = active_route.is_codex();
     let codex_downstream_stream = active_route.codex_downstream_stream;
     let upstream_account_id = Some(active_route.route.account_id);
@@ -1463,6 +1472,33 @@ pub(in crate::api) async fn proxy_with_identity(
         return result;
     }
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
+    let is_sse = content_type
+        .as_ref()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
+    let will_buffer_response =
+        (is_codex_route && !codex_downstream_stream) || (!is_sse && !strict_openai_chat_usage);
+    if requested_native_stream
+        && will_buffer_response
+        && let Some(conversation) = buffered_request.conversation.as_ref()
+        && !buffered_request
+            .memory
+            .reserve_unexpected_buffered_request(conversation.request_body.len())
+            .await
+    {
+        conversation.reject_projection();
+        drop(buffered_request.conversation.take());
+        buffered_request.memory.release_rejected_request();
+        drop(upstream);
+        let result =
+            finish_proxy_failure(&buffered_request, "upstream_response_memory_capacity").await;
+        upstream_attempt
+            .complete(UpstreamAttemptTerminal::Inconclusive)
+            .await;
+        codex_retry.complete(CodexRetryTerminal::Failed);
+        return result;
+    }
     if is_codex_route && !codex_downstream_stream {
         let buffer_phase = proxy_diagnostics::Phase::account(
             diagnostic_context,
@@ -1474,6 +1510,7 @@ pub(in crate::api) async fn proxy_with_identity(
             upstream,
             &buffered_request.memory,
             buffered_request.started,
+            buffered_request.conversation.as_ref(),
         )
         .await
         {
@@ -1570,11 +1607,6 @@ pub(in crate::api) async fn proxy_with_identity(
         });
         return result;
     }
-    let is_sse = content_type
-        .as_ref()
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
     // An opted-in Chat usage stream has a terminal SSE usage contract. A
     // successful JSON envelope cannot prove that contract and must never be
     // forwarded or settled as a compatible buffered response.
@@ -1709,12 +1741,106 @@ fn validate_buffered_chat_success(body: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
-#[derive(Clone)]
 struct ProxyConversation {
     key: AuthenticatedKey,
-    request_json: Value,
+    request_body: Bytes,
     hints: crate::conversation::ConversationHints,
     client_name: Option<String>,
+    projection_admission: std::sync::Mutex<ConversationProjectionAdmission>,
+}
+
+enum ConversationProjectionAdmission {
+    Deferred,
+    Reserved(crate::gateway_body::memory::ConversationProjectionPermit),
+    Rejected,
+}
+
+struct ProxyConversationProjection<'a> {
+    conversation: &'a ProxyConversation,
+    request_json: Value,
+    _memory: crate::gateway_body::memory::ConversationProjectionPermit,
+}
+
+impl ProxyConversation {
+    fn reject_projection(&self) {
+        if let Ok(mut admission) = self.projection_admission.lock() {
+            *admission = ConversationProjectionAdmission::Rejected;
+        }
+    }
+
+    async fn reserve_for_buffered_response(
+        &self,
+        memory: &crate::gateway_body::memory::ProxyMemoryReservation,
+        response_maximum: usize,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        let admission = memory
+            .reserve_buffered_response_with_projection(
+                response_maximum,
+                self.request_body.len(),
+                deadline,
+            )
+            .await
+            .map_or(
+                ConversationProjectionAdmission::Rejected,
+                ConversationProjectionAdmission::Reserved,
+            );
+        let reserved = matches!(&admission, ConversationProjectionAdmission::Reserved(_));
+        if let Ok(mut current) = self.projection_admission.lock() {
+            *current = admission;
+        }
+        reserved
+    }
+
+    async fn project<'a>(
+        &'a self,
+        memory: &crate::gateway_body::memory::ProxyMemoryReservation,
+        deadline: tokio::time::Instant,
+    ) -> Result<ProxyConversationProjection<'a>, AppError> {
+        let admission = {
+            let mut current = self
+                .projection_admission
+                .lock()
+                .map_err(|_| AppError::Internal)?;
+            std::mem::replace(&mut *current, ConversationProjectionAdmission::Rejected)
+        };
+        let projection_memory = match admission {
+            ConversationProjectionAdmission::Deferred => memory
+                .reserve_conversation_projection(self.request_body.len(), deadline)
+                .await
+                .ok_or(AppError::Overloaded)?,
+            ConversationProjectionAdmission::Reserved(permit) => permit,
+            ConversationProjectionAdmission::Rejected => return Err(AppError::Overloaded),
+        };
+        let request_json =
+            serde_json::from_slice(&self.request_body).map_err(|_| AppError::Internal)?;
+        Ok(ProxyConversationProjection {
+            conversation: self,
+            request_json,
+            _memory: projection_memory,
+        })
+    }
+
+    fn log_projection_error(request_id: Uuid, error: &AppError) {
+        tracing::warn!(
+            %request_id,
+            stage = "conversation_projection",
+            error_category = error.diagnostic_category(),
+            "proxy conversation projection skipped"
+        );
+    }
+}
+
+impl<'a> ProxyConversationProjection<'a> {
+    fn input<'b>(&'b self, upstream_response_id: Option<&'b str>) -> ProxyConversationInput<'b> {
+        ProxyConversationInput {
+            key: &self.conversation.key,
+            request_json: &self.request_json,
+            hints: &self.conversation.hints,
+            client_name: self.conversation.client_name.as_deref(),
+            upstream_response_id,
+        }
+    }
 }
 
 struct BufferedRequest<'a> {
@@ -1798,6 +1924,11 @@ async fn execute_component_provider(
         .active_upstream(driver, "component_provider");
     let upstream_started = Instant::now();
     let upstream_result = upstream_request.send().await;
+    if let Some(conversation) = request.conversation.as_ref() {
+        request
+            .memory
+            .release_conversation_working_copies(conversation.request_body.len());
+    }
     request.state.metrics.observe_upstream(
         driver,
         "component_provider",
@@ -1903,6 +2034,7 @@ async fn execute_component_provider(
         &request.memory,
         request.started,
         true,
+        request.conversation.as_ref(),
     )
     .await
     {
@@ -2190,16 +2322,22 @@ async fn finish_buffered_request_with_upstream_attribution(
         Err(AppError::Overloaded)
     };
     let stored_response = format!("gap://{request_id}/response");
-    let conversation = request
-        .conversation
-        .as_ref()
-        .map(|conversation| ProxyConversationInput {
-            key: &conversation.key,
-            request_json: &conversation.request_json,
-            hints: &conversation.hints,
-            client_name: conversation.client_name.as_deref(),
-            upstream_response_id: response_id.as_deref(),
-        });
+    let projection_deadline =
+        tokio::time::Instant::now() + MAX_PROXY_LIFETIME.saturating_sub(request.started.elapsed());
+    let conversation = if let Some(conversation) = request.conversation.as_ref() {
+        match conversation
+            .project(&request.memory, projection_deadline)
+            .await
+        {
+            Ok(projection) => Some(projection),
+            Err(error) => {
+                ProxyConversation::log_projection_error(request_id, &error);
+                None
+            }
+        }
+    } else {
+        None
+    };
     let terminal = FinishProxyRequest {
         first_output_ms: None,
         generation_duration_ms: None,
@@ -2215,7 +2353,9 @@ async fn finish_buffered_request_with_upstream_attribution(
         usage_basis: Some(usage_basis),
         error_code: error_code.as_deref(),
         response_object: &stored_response,
-        conversation,
+        conversation: conversation
+            .as_ref()
+            .map(|projection| projection.input(response_id.as_deref())),
     };
     let terminal_phase = proxy_diagnostics::Phase::new(
         proxy_diagnostics::Context::for_request(request_id),

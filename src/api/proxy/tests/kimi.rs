@@ -161,6 +161,7 @@ async fn kimi_translation_clears_length_and_uses_complete_unknown_length_memory_
         &memory,
         Instant::now(),
         false,
+        None,
     )
     .await
     .unwrap();

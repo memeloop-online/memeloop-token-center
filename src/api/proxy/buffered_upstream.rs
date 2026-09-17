@@ -39,6 +39,7 @@ pub(super) async fn read_bounded_upstream(
     memory: &crate::gateway_body::memory::ProxyMemoryReservation,
     started: Instant,
     reserve_adapter_maximum: bool,
+    conversation: Option<&ProxyConversation>,
 ) -> Result<Vec<u8>, BoundedUpstreamError> {
     if response
         .headers()
@@ -68,10 +69,16 @@ pub(super) async fn read_bounded_upstream(
     };
     let diagnostic_context = proxy_diagnostics::Context::current();
     let capacity = proxy_diagnostics::Phase::new(diagnostic_context, "buffered_response_memory");
-    if !memory
-        .reserve_buffered_response(reservation_maximum, deadline)
-        .await
-    {
+    let reserved = if let Some(conversation) = conversation {
+        conversation
+            .reserve_for_buffered_response(memory, reservation_maximum, deadline)
+            .await
+    } else {
+        memory
+            .reserve_buffered_response(reservation_maximum, deadline)
+            .await
+    };
+    if !reserved {
         capacity.finish("rejected", None, None);
         return Err(BoundedUpstreamError::MemoryCapacity);
     }
@@ -139,7 +146,7 @@ mod tests {
         };
         let memory = budget.reservation();
         let read = tokio::spawn(async move {
-            read_bounded_upstream(response, 1024, &memory, Instant::now(), false).await
+            read_bounded_upstream(response, 1024, &memory, Instant::now(), false, None).await
         });
         budget.wait_for_response_reservation_for_test().await;
         assert!(!polled.load(Ordering::SeqCst));
@@ -176,7 +183,7 @@ mod tests {
             );
             let memory = budget.reservation();
             let result =
-                read_bounded_upstream(response, 1024, &memory, Instant::now(), false).await;
+                read_bounded_upstream(response, 1024, &memory, Instant::now(), false, None).await;
             assert_eq!(result.unwrap_err().code(), expected);
         }
     }
