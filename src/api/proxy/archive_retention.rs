@@ -542,6 +542,31 @@ mod tests {
     }
 
     #[test]
+    fn short_non_base64_media_split_across_network_chunks_is_removed() {
+        let delivered = Bytes::from_static(
+            b"data: {\"items\":[\"data:image/x,SECRET\"],\"label\":\"visible\"}\n\n",
+        );
+        let split = delivered
+            .windows(b"image".len())
+            .position(|window| window == b"image")
+            .unwrap()
+            + 2;
+        let mut framer = crate::api::sse::BoundedSseFramer::default();
+        let first = framer.push(&delivered[..split]);
+        assert!(first.rejection.is_none());
+        assert!(first.events.is_empty());
+        let second = framer.push(&delivered[split..]);
+        assert!(second.rejection.is_none());
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].bytes, delivered);
+
+        let archived = sse_frame(&second.events[0].bytes);
+        assert!(archived.len() <= delivered.len());
+        let archived = std::str::from_utf8(&archived).unwrap();
+        assert!(!archived.contains("SECRET"));
+    }
+
+    #[test]
     fn sse_archive_large_visible_text_and_short_secret_stays_bounded() {
         let visible = "v".repeat(192 * 1024);
         let delivered = Bytes::from(format!(
