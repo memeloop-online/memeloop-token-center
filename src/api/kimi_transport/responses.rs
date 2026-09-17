@@ -674,7 +674,7 @@ mod tests {
         value["usage"]["prompt_tokens_details"] = json!({"cached_tokens":11});
         assert_eq!(
             buffered(&context, &value),
-            Err("responses_chat_cached_tokens_conflict")
+            Err("kimi_cached_tokens_conflict")
         );
     }
 
