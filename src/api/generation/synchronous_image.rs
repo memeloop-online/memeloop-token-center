@@ -562,6 +562,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub(in crate::api) async fn read_image_response_bounded(
     response: reqwest::Response,
 ) -> Result<Bytes, ImageResponseReadError> {

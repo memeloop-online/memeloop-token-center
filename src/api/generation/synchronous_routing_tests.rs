@@ -1287,7 +1287,7 @@ async fn non_connect_image_send_timeout_keeps_health_unchanged_and_reservation_u
         Bytes::from(serde_json::to_vec(&request_json()).unwrap()),
         &placeholder,
         &route,
-        request,
+        SynchronousImageUpstreamRequest::Reqwest(request),
         ImageResponseFormat::OpenAi,
     )
     .await
