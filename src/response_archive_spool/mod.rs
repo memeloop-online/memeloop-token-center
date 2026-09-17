@@ -57,10 +57,10 @@ impl BufferedArchivePurpose {
 
 pub(crate) const CHUNK_BYTES: usize = 64 * 1024;
 pub(crate) const CAPTURE_INSERT_BATCH_CHUNKS: usize = 16;
-// One partial chunk remains in the proxy task, at most three complete chunks
-// wait in the channel, and the writer owns at most one database-bound chunk.
-// The full five-chunk envelope is charged to the request's existing memory
-// reservation before the writer starts.
+// One partial chunk remains in the proxy task. Four permits bound complete
+// chunks across the channel and writer together, so draining the channel into
+// a database batch cannot let the producer refill behind that batch. The full
+// five-chunk envelope is charged before the writer starts.
 const CAPTURE_QUEUE_CHUNKS: usize = 3;
 pub(crate) const CAPTURE_DATABASE_BATCH_CHUNKS: usize = CAPTURE_QUEUE_CHUNKS + 1;
 const CAPTURE_MEMORY_BYTES: usize = CHUNK_BYTES * 5;
