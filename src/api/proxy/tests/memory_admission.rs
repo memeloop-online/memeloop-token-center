@@ -1,6 +1,162 @@
 use super::*;
 
 #[tokio::test]
+async fn source_backed_conversation_releases_all_raw_request_permits() {
+    use axum::body::Body;
+
+    let directory = tempfile::tempdir().unwrap();
+    let admission = crate::gateway_body::request_spool::RequestSpoolAdmission::new(
+        directory.path().to_owned(),
+        1024 * 1024,
+    );
+    let source = Bytes::from_static(br#"{"model":"gpt-5.6-sol","input":"source-backed"}"#);
+    let spool = std::sync::Arc::new(
+        admission
+            .capture(Body::from(source.clone()), source.len(), Some(source.len()))
+            .await
+            .unwrap(),
+    );
+    let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(1024 * 1024);
+    let conversation = std::sync::Arc::new(ProxyConversation {
+        key: crate::model::AuthenticatedKey {
+            key_id: Uuid::nil(),
+            tenant_id: Uuid::nil(),
+            principal_id: Uuid::nil(),
+            account_id: Uuid::nil(),
+            alias: "test".to_owned(),
+            currency: "USD".to_owned(),
+            credential_generation: 0,
+            policy: KeyPolicy::default(),
+        },
+        request_body: ConversationBody::Spool(spool),
+        hints: crate::conversation::ConversationHints::default(),
+        client_name: None,
+        projection_admission: std::sync::Mutex::new(ConversationProjectionAdmission::Deferred),
+    });
+    let released = budget.reservation();
+    assert!(released.try_grow(
+        source.len(),
+        crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT,
+    ));
+    conversation.release_working_copies(&released);
+    assert_eq!(budget.snapshot().0, 0);
+    let blocker = budget.reservation();
+    assert!(blocker.try_grow(1024 * 1024, 1));
+    let memory = budget.reservation();
+    let projected = {
+        let conversation = conversation.clone();
+        let memory = memory.clone();
+        tokio::spawn(async move {
+            let projection = conversation
+                .project(
+                    &memory,
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                )
+                .await?;
+            Ok::<_, crate::error::AppError>(projection.request_json["model"].clone())
+        })
+    };
+    budget.wait_for_projection_reservation_for_test().await;
+    assert_eq!(admission.read_count_for_test(), 0);
+    drop(blocker);
+    assert_eq!(projected.await.unwrap().unwrap(), json!("gpt-5.6-sol"));
+    assert_eq!(admission.read_count_for_test(), 1);
+    assert_eq!(budget.snapshot().0, 0);
+
+    // With 64 KiB units, a 64 KiB source plus a 64 KiB response fits exactly
+    // at 2x projection weight (5 units), but not at source-backed 3x (6).
+    let large_source = Bytes::from(vec![b'x'; 64 * 1024]);
+    let combined_spool = std::sync::Arc::new(
+        admission
+            .capture(
+                Body::from(large_source.clone()),
+                large_source.len(),
+                Some(large_source.len()),
+            )
+            .await
+            .unwrap(),
+    );
+    let combined_conversation = ProxyConversation {
+        key: conversation.key.clone(),
+        request_body: ConversationBody::Spool(combined_spool),
+        hints: crate::conversation::ConversationHints::default(),
+        client_name: None,
+        projection_admission: std::sync::Mutex::new(ConversationProjectionAdmission::Deferred),
+    };
+    let combined_budget = crate::gateway_body::memory::ProxyMemoryBudget::new(320 * 1024);
+    let combined_memory = combined_budget.reservation();
+    assert!(
+        !combined_conversation
+            .reserve_for_buffered_response(
+                &combined_memory,
+                64 * 1024,
+                tokio::time::Instant::now(),
+            )
+            .await
+    );
+    assert_eq!(combined_budget.snapshot().0, 0);
+
+    // Source-backed native streams have released all raw working copies before
+    // unexpected buffered response admission. The retained partition is four
+    // 64 KiB units: 96 KiB would fit with an incorrect 2x projection but not
+    // with the real source replay+parse 3x reservation.
+    let transition_source = Bytes::from(vec![b'y'; 96 * 1024]);
+    let transition_spool = std::sync::Arc::new(
+        admission
+            .capture(
+                Body::from(transition_source.clone()),
+                transition_source.len(),
+                Some(transition_source.len()),
+            )
+            .await
+            .unwrap(),
+    );
+    let transition_conversation = ProxyConversation {
+        key: conversation.key.clone(),
+        request_body: ConversationBody::Spool(transition_spool),
+        hints: crate::conversation::ConversationHints::default(),
+        client_name: None,
+        projection_admission: std::sync::Mutex::new(ConversationProjectionAdmission::Deferred),
+    };
+    let transition_budget = crate::gateway_body::memory::ProxyMemoryBudget::new(1024 * 1024);
+    assert!(
+        !transition_budget
+            .reservation()
+            .reserve_unexpected_buffered_request(
+                transition_conversation.request_body.len(),
+                transition_conversation.request_body.projection_weight(),
+            )
+            .await
+    );
+    assert_eq!(transition_budget.snapshot().2, 0);
+
+    let invalid = std::sync::Arc::new(
+        admission
+            .capture(Body::from(Bytes::from_static(b"{")), 1, Some(1))
+            .await
+            .unwrap(),
+    );
+    let invalid_conversation = ProxyConversation {
+        key: conversation.key.clone(),
+        request_body: ConversationBody::Spool(invalid),
+        hints: crate::conversation::ConversationHints::default(),
+        client_name: None,
+        projection_admission: std::sync::Mutex::new(ConversationProjectionAdmission::Deferred),
+    };
+    assert!(
+        invalid_conversation
+            .project(
+                &memory,
+                tokio::time::Instant::now() + Duration::from_secs(5)
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(admission.read_count_for_test(), 2);
+    assert_eq!(budget.snapshot().0, 0);
+}
+
+#[tokio::test]
 async fn concurrent_large_streams_dispatch_while_buffered_partition_is_busy() {
     let fixture = std::sync::Arc::new(codex_route_fixture("large-stream-admission").await);
     // The gateway conservatively reserves input bytes as tokens. Admit both

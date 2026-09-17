@@ -829,7 +829,31 @@ pub(super) async fn proxy(
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 ) -> Result<Response, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
-    proxy_with_identity(state, headers, body, protocol, key, None, memory).await
+    proxy_with_identity_and_conversation_spool(
+        state, headers, body, protocol, key, None, memory, None,
+    )
+    .await
+}
+
+pub(super) async fn proxy_spooled_responses(
+    state: AppState,
+    headers: HeaderMap,
+    body: Bytes,
+    memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    spool: std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
+) -> Result<Response, AppError> {
+    let key = authenticate_downstream(&headers, &state).await?;
+    proxy_with_identity_and_conversation_spool(
+        state,
+        headers,
+        body,
+        Protocol::OpenAiResponses,
+        key,
+        None,
+        memory,
+        Some(spool),
+    )
+    .await
 }
 
 /// Internal callers must establish an explicit billing identity. A pinned route
@@ -842,6 +866,30 @@ pub(in crate::api) async fn proxy_with_identity(
     key: AuthenticatedKey,
     pinned_route: Option<Uuid>,
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+) -> Result<Response, AppError> {
+    proxy_with_identity_and_conversation_spool(
+        state,
+        headers,
+        body,
+        protocol,
+        key,
+        pinned_route,
+        memory,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn proxy_with_identity_and_conversation_spool(
+    state: AppState,
+    headers: HeaderMap,
+    body: Bytes,
+    protocol: Protocol,
+    key: AuthenticatedKey,
+    pinned_route: Option<Uuid>,
+    memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    conversation_spool: Option<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
 ) -> Result<Response, AppError> {
     let codex_multi_agent_v2_client =
         crate::api::request_normalization::is_official_codex_user_agent(&headers);
@@ -1059,7 +1107,9 @@ pub(in crate::api) async fn proxy_with_identity(
     )
     .then(|| ProxyConversation {
         key: key.clone(),
-        request_body: body.clone(),
+        request_body: conversation_spool
+            .map(ConversationBody::Spool)
+            .unwrap_or_else(|| ConversationBody::InMemory(body.clone())),
         hints: conversation_hints,
         client_name,
         projection_admission: std::sync::Mutex::new(ConversationProjectionAdmission::Deferred),
@@ -1087,13 +1137,19 @@ pub(in crate::api) async fn proxy_with_identity(
     };
     // Admission ACK includes reservation, request record, and encrypted sealed
     // request spool in one transaction. No upstream work starts before it.
-    // Native streams retain their charged request under the process-wide
-    // budget, without occupying buffered-response headroom while waiting for
-    // headers. An unexpected JSON response must reserve capacity before its
-    // first body read. Non-stream and component paths keep their partition.
+    // Native streams and source-backed Responses retain their charged request
+    // under the process-wide budget without occupying buffered-response
+    // headroom while waiting for headers. An unexpected JSON response must
+    // reserve capacity before its first body read. Other non-stream and
+    // component paths keep their retained partition.
     let retained_admission =
         proxy_diagnostics::Phase::new(diagnostic_context, "retained_memory_admission");
+    let source_backed_conversation = buffered_request
+        .conversation
+        .as_ref()
+        .is_some_and(ProxyConversation::is_source_backed);
     if !requested_native_stream
+        && !source_backed_conversation
         && !buffered_request
             .memory
             .finalize_request(recovery_wait_deadline)
@@ -1125,6 +1181,8 @@ pub(in crate::api) async fn proxy_with_identity(
     retained_admission.finish(
         if requested_native_stream {
             "stream_deferred"
+        } else if source_backed_conversation {
+            "source_backed_deferred"
         } else {
             "completed"
         },
@@ -1439,9 +1497,7 @@ pub(in crate::api) async fn proxy_with_identity(
     drop(request_json);
     active_route.release_request_buffers();
     if let Some(conversation) = buffered_request.conversation.as_ref() {
-        buffered_request
-            .memory
-            .release_conversation_working_copies(conversation.request_body.len());
+        conversation.release_working_copies(&buffered_request.memory);
     }
     let is_codex_route = active_route.is_codex();
     let codex_downstream_stream = active_route.codex_downstream_stream;
@@ -1497,7 +1553,10 @@ pub(in crate::api) async fn proxy_with_identity(
         && let Some(conversation) = buffered_request.conversation.as_ref()
         && !buffered_request
             .memory
-            .reserve_unexpected_buffered_request(conversation.request_body.len())
+            .reserve_unexpected_buffered_request(
+                conversation.request_body.len(),
+                conversation.request_body.projection_weight(),
+            )
             .await
     {
         conversation.reject_projection();
@@ -1756,10 +1815,49 @@ fn validate_buffered_chat_success(body: &[u8]) -> Result<(), &'static str> {
 
 struct ProxyConversation {
     key: AuthenticatedKey,
-    request_body: Bytes,
+    request_body: ConversationBody,
     hints: crate::conversation::ConversationHints,
     client_name: Option<String>,
     projection_admission: std::sync::Mutex<ConversationProjectionAdmission>,
+}
+
+enum ConversationBody {
+    InMemory(Bytes),
+    Spool(std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>),
+}
+
+impl ConversationBody {
+    fn len(&self) -> usize {
+        match self {
+            Self::InMemory(body) => body.len(),
+            Self::Spool(spool) => spool.len(),
+        }
+    }
+
+    fn projection_weight(&self) -> usize {
+        match self {
+            Self::InMemory(_) => {
+                crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT.saturating_sub(1)
+            }
+            Self::Spool(_) => crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT,
+        }
+    }
+
+    async fn read(&self) -> Result<Bytes, AppError> {
+        match self {
+            Self::InMemory(body) => Ok(body.clone()),
+            Self::Spool(spool) => spool.read_all().await.map_err(|_| AppError::Overloaded),
+        }
+    }
+
+    fn release_working_copies(&self, memory: &crate::gateway_body::memory::ProxyMemoryReservation) {
+        match self {
+            Self::InMemory(body) => memory.release_conversation_working_copies(body.len()),
+            Self::Spool(spool) => {
+                memory.release_source_backed_conversation_working_copies(spool.len())
+            }
+        }
+    }
 }
 
 enum ConversationProjectionAdmission {
@@ -1775,6 +1873,14 @@ struct ProxyConversationProjection<'a> {
 }
 
 impl ProxyConversation {
+    fn is_source_backed(&self) -> bool {
+        matches!(&self.request_body, ConversationBody::Spool(_))
+    }
+
+    fn release_working_copies(&self, memory: &crate::gateway_body::memory::ProxyMemoryReservation) {
+        self.request_body.release_working_copies(memory);
+    }
+
     fn reject_projection(&self) {
         if let Ok(mut admission) = self.projection_admission.lock() {
             *admission = ConversationProjectionAdmission::Rejected;
@@ -1791,6 +1897,7 @@ impl ProxyConversation {
             .reserve_buffered_response_with_projection(
                 response_maximum,
                 self.request_body.len(),
+                self.request_body.projection_weight(),
                 deadline,
             )
             .await
@@ -1819,14 +1926,18 @@ impl ProxyConversation {
         };
         let projection_memory = match admission {
             ConversationProjectionAdmission::Deferred => memory
-                .reserve_conversation_projection(self.request_body.len(), deadline)
+                .reserve_conversation_projection(
+                    self.request_body.len(),
+                    self.request_body.projection_weight(),
+                    deadline,
+                )
                 .await
                 .ok_or(AppError::Overloaded)?,
             ConversationProjectionAdmission::Reserved(permit) => permit,
             ConversationProjectionAdmission::Rejected => return Err(AppError::Overloaded),
         };
-        let request_json =
-            serde_json::from_slice(&self.request_body).map_err(|_| AppError::Internal)?;
+        let request_body = self.request_body.read().await?;
+        let request_json = serde_json::from_slice(&request_body).map_err(|_| AppError::Internal)?;
         Ok(ProxyConversationProjection {
             conversation: self,
             request_json,
@@ -1938,9 +2049,7 @@ async fn execute_component_provider(
     let upstream_started = Instant::now();
     let upstream_result = upstream_request.send().await;
     if let Some(conversation) = request.conversation.as_ref() {
-        request
-            .memory
-            .release_conversation_working_copies(conversation.request_body.len());
+        conversation.release_working_copies(&request.memory);
     }
     request.state.metrics.observe_upstream(
         driver,
