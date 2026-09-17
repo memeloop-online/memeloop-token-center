@@ -189,13 +189,14 @@ async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_wi
 
     const REQUESTS: usize = 1024;
     // Exercise substantially more work than the connection pool can hold, but
-    // keep active transactions below the 64-connection pool. Releasing all
+    // keep active transactions below the effective 32-connection pool (the
+    // database constructor clamps larger requests). Releasing all
     // 1024 tasks directly into pool acquisition makes the assertion depend on
     // runner I/O completing the global event-cursor queue before SQLx's pool
     // timeout; a pool timeout is not evidence about metered-unlimited budget
     // isolation. The test remains strict: every request is admitted exactly
-    // once, with 48 admissions or settlements running concurrently.
-    const MAX_IN_FLIGHT: usize = 48;
+    // once, with 24 admissions or settlements running concurrently.
+    const MAX_IN_FLIGHT: usize = 24;
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(REQUESTS));
     let admission_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
     let mut admissions = Vec::with_capacity(REQUESTS);
