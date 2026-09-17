@@ -1237,12 +1237,12 @@ mod tests {
         isolated
             .query_pairs_mut()
             .append_pair("options", &format!("-c search_path={schema}"));
-        let fixture = fixture(isolated.as_str(), None).await;
-        exercise_backfill(&fixture).await;
+        let contract_fixture = fixture(isolated.as_str(), None).await;
+        exercise_backfill(&contract_fixture).await;
         let concurrency_fixture = fixture(isolated.as_str(), None).await;
         exercise_postgres_projection_serialization(&concurrency_fixture, isolated.as_str(), &admin)
             .await;
-        fixture.database.close().await;
+        contract_fixture.database.close().await;
         concurrency_fixture.database.close().await;
         sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(&admin)
