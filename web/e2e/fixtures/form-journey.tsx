@@ -80,14 +80,9 @@ window.fetch = async (input, init) => {
       status: 'ready', observed_at: now, stale_after: null, stale: false, freshness: 'fresh', plan_type: null, workspace: null, error_code: null,
       capabilities: { read: true, plan: true, workspace: false, window_amounts: false, window_amount_unit: false, window_percent: true, reset_credit_expiry: true, subscription_expiry: false, supplier_read_only: true, refreshes_credentials: false, consumes_reset_credit: false },
       subscription_active_until: null, credits: { balance: null, unlimited: null, has_credits: null, source: null },
-      reset_credits: generation === 1
-        ? [
-          { status: 'available', granted_at: now - 60_000, expires_at: now + 3_600_000, source: 'codex_reset_credits' },
-          { status: 'available', granted_at: now - 120_000, expires_at: now + 7_200_000, source: 'codex_reset_credits' },
-        ]
-        : [{ status: 'available', granted_at: now - 60_000, expires_at: now + 3_600_000, source: 'codex_reset_credits' }],
+      reset_credits: [{ status: 'available', granted_at: now - 60_000, expires_at: now + 3_600_000, source: 'codex_reset_credits' }],
       windows: [{ id: 'primary', label: `代次 ${generation} 额度`, used_percent: generation === 1 ? 75 : 25, used: null, remaining: null, limit: null, unit: null, reset_at: now + 3_600_000, period_seconds: null, source: 'provider_usage', reset_is_estimated: false, allowed: true, limit_reached: false }],
-      reset_capability: { provider_supported: generation === 1, implementation_available: generation === 1, prepare_available: generation === 1, confirmation_required: true, retryable: false, available_credits: generation === 1 ? 2 : 1, applicable_credits: generation === 1 ? 2 : 1, reason: generation === 1 ? 'explicit_confirmation_required' : 'quota_reset_not_supported', credit_error_code: null, evidence: 'server_driver_contract' },
+      reset_capability: { provider_supported: generation === 1, implementation_available: generation === 1, prepare_available: generation === 1, confirmation_required: true, retryable: false, available_credits: 1, applicable_credits: 1, reason: generation === 1 ? 'explicit_confirmation_required' : 'quota_reset_not_supported', credit_error_code: null, evidence: 'server_driver_contract' },
     };
     if (window.deferNextFormQuotaRead) {
       window.deferNextFormQuotaRead = false;
