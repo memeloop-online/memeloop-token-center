@@ -186,8 +186,8 @@ async fn codex_models_endpoint_isolated_by_key_and_tenant() {
         )
         .await
         .expect("catalog tenant B key");
-    let key_a_secret = key_a.key.as_deref().expect("catalog tenant A key secret");
-    let key_b_secret = key_b.key.as_deref().expect("catalog tenant B key secret");
+    let key_a_secret = key_a.key.as_str();
+    let key_b_secret = key_b.key.as_str();
 
     let kimi_a = catalog_account(&state, "catalog-tenant-a", "catalog-a-kimi", "kimi-oauth").await;
     let native_a = catalog_account(
