@@ -792,6 +792,17 @@ impl ProviderCatalog {
                     .request_compatibility
                     .supports_codex_multi_agent_v2()
             })
+            .filter(|provider| {
+                provider.request_compatibility.responses_via_chat_dialect
+                    != Some(ResponsesViaChatDialect::OpenAiChatV1)
+                    || provider
+                        .codex_model_capabilities
+                        .as_ref()
+                        .is_none_or(|capabilities| {
+                            capabilities.supported_reasoning_levels.is_empty()
+                                && capabilities.default_reasoning_level.is_none()
+                        })
+            })
             .and_then(|provider| provider.codex_model_capabilities.clone())
     }
 

@@ -407,10 +407,8 @@ pub(in crate::api) fn convert_with_dialect(
             output[name] = value.clone();
         }
     }
-    if preserve_reasoning {
-        if let Some(effort) = request.pointer("/reasoning/effort") {
-            output["reasoning_effort"] = effort.clone();
-        }
+    if preserve_reasoning && let Some(effort) = request.pointer("/reasoning/effort") {
+        output["reasoning_effort"] = effort.clone();
     }
     if let Some(format) = request.pointer("/text/format") {
         output["response_format"] = if format["type"] == "json_schema" {

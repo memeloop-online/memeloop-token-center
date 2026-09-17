@@ -147,20 +147,23 @@ fn usable_codex_model_capabilities(capabilities: &crate::provider::CodexModelCap
         // Never advertise that capability until a versioned bridge implements
         // it without silent degradation.
         && !capabilities.supports_image_detail_original
-        && !capabilities.supported_reasoning_levels.is_empty()
-        && capabilities
-            .supported_reasoning_levels
-            .iter()
-            .all(|level| !level.effort.trim().is_empty() && !level.description.trim().is_empty())
-        && capabilities
-            .default_reasoning_level
-            .as_ref()
-            .is_some_and(|default| {
-                capabilities
-                    .supported_reasoning_levels
-                    .iter()
-                    .any(|level| &level.effort == default)
-            })
+        && if capabilities.supported_reasoning_levels.is_empty() {
+            capabilities.default_reasoning_level.is_none()
+        } else {
+            capabilities
+                .supported_reasoning_levels
+                .iter()
+                .all(|level| !level.effort.trim().is_empty() && !level.description.trim().is_empty())
+                && capabilities
+                    .default_reasoning_level
+                    .as_ref()
+                    .is_some_and(|default| {
+                        capabilities
+                            .supported_reasoning_levels
+                            .iter()
+                            .any(|level| &level.effort == default)
+                    })
+        }
         && capabilities.include_skills_usage_instructions
         && capabilities.include_plugin_usage_instructions
         && capabilities.include_apps_usage_instructions
@@ -553,6 +556,19 @@ mod tests {
         let merged_subset = merge_codex_model_capabilities(kimi_capabilities.clone(), subset)
             .expect("reasoning levels use the deterministic common intersection");
         assert_eq!(merged_subset.supported_reasoning_levels.len(), 4);
+
+        let mut no_reasoning = kimi_capabilities.clone();
+        no_reasoning.supported_reasoning_levels.clear();
+        no_reasoning.default_reasoning_level = None;
+        let strict_chat = codex_model_info("strict-chat", true, Some(&no_reasoning));
+        assert_eq!(strict_chat["multi_agent_version"], "v2");
+        assert_eq!(strict_chat["supported_reasoning_levels"], json!([]));
+        assert!(strict_chat["default_reasoning_level"].is_null());
+
+        let mut invalid_no_reasoning = no_reasoning;
+        invalid_no_reasoning.default_reasoning_level = Some("medium".to_owned());
+        let rejected = codex_model_info("invalid-strict-chat", true, Some(&invalid_no_reasoning));
+        assert_eq!(rejected["multi_agent_version"], "disabled");
 
         let ordinary = codex_model_info("ordinary", false, Some(kimi_capabilities));
         assert_eq!(ordinary["multi_agent_version"], "disabled");

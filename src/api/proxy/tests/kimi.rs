@@ -229,7 +229,10 @@ async fn fake_glm_via_chat_provider_uses_strict_chat_contract_and_reverse_maps_t
         responses_via_chat_dialect: Some(crate::provider::ResponsesViaChatDialect::OpenAiChatV1),
         codex_multi_agent_v2: true,
     };
-    fake_provider.codex_model_capabilities = Some(kimi_capabilities);
+    let mut strict_chat_capabilities = kimi_capabilities;
+    strict_chat_capabilities.supported_reasoning_levels.clear();
+    strict_chat_capabilities.default_reasoning_level = None;
+    fake_provider.codex_model_capabilities = Some(strict_chat_capabilities);
     fixture.state.providers.extend([fake_provider]).unwrap();
 
     Mock::given(method("POST"))

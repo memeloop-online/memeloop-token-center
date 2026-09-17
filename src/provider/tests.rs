@@ -283,7 +283,7 @@ fn plugin_provider_generation_capabilities_are_versioned_and_extensible() {
 
 #[test]
 fn multi_agent_compatibility_is_explicit_and_provider_scoped() {
-    let catalog = ProviderCatalog::builtins();
+    let mut catalog = ProviderCatalog::builtins();
     assert!(catalog.supports_codex_multi_agent_v2("kimi-oauth"));
     assert!(catalog.supports_responses_via_chat_v1("kimi-oauth"));
     assert!(
@@ -339,6 +339,32 @@ fn multi_agent_compatibility_is_explicit_and_provider_scoped() {
     assert!(!catalog.supports_codex_multi_agent_v2("openai-codex"));
     assert!(!catalog.supports_responses_via_chat_v1("openai-codex"));
     assert!(!catalog.supports_codex_multi_agent_v2("http-json"));
+
+    let mut strict_chat = catalog.get("kimi-oauth").unwrap().clone();
+    strict_chat.id = "strict-chat-agent".to_owned();
+    strict_chat.request_compatibility.responses_via_chat_dialect =
+        Some(ResponsesViaChatDialect::OpenAiChatV1);
+    let strict_capabilities = strict_chat.codex_model_capabilities.as_mut().unwrap();
+    strict_capabilities.supported_reasoning_levels.clear();
+    strict_capabilities.default_reasoning_level = None;
+    catalog.extend([strict_chat]).unwrap();
+    assert!(
+        catalog
+            .codex_model_capabilities_for_catalog("strict-chat-agent")
+            .is_some()
+    );
+
+    let mut invalid_strict_chat = catalog.get("kimi-oauth").unwrap().clone();
+    invalid_strict_chat.id = "invalid-strict-chat-agent".to_owned();
+    invalid_strict_chat
+        .request_compatibility
+        .responses_via_chat_dialect = Some(ResponsesViaChatDialect::OpenAiChatV1);
+    catalog.extend([invalid_strict_chat]).unwrap();
+    assert!(
+        catalog
+            .codex_model_capabilities_for_catalog("invalid-strict-chat-agent")
+            .is_none()
+    );
 }
 
 #[test]

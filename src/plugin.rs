@@ -2437,6 +2437,21 @@ fn validate_provider_contribution(
             provider.id
         )));
     }
+    if provider.request_compatibility.responses_via_chat_dialect
+        == Some(crate::provider::ResponsesViaChatDialect::OpenAiChatV1)
+        && provider
+            .codex_model_capabilities
+            .as_ref()
+            .is_some_and(|capabilities| {
+                !capabilities.supported_reasoning_levels.is_empty()
+                    || capabilities.default_reasoning_level.is_some()
+            })
+    {
+        return Err(AppError::BadRequest(format!(
+            "plugin {plugin_id} provider {} cannot advertise reasoning levels with the strict OpenAI Chat dialect",
+            provider.id
+        )));
+    }
     crate::schema::validate_definition(&provider.config_schema)?;
     crate::schema::validate_definition(&provider.credential_schema)?;
     let supported_credentials = [

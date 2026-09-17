@@ -10,10 +10,6 @@ pub(in crate::api) use super::kimi_transport::responses::{
     Context, ResponsesViaChatDialect, Stream, buffered,
 };
 
-pub(in crate::api) fn prepare(model: &str, request: &mut Value) -> Result<Context, AppError> {
-    prepare_with_dialect(model, request, ResponsesViaChatDialect::OpenAiChatV1)
-}
-
 pub(in crate::api) fn prepare_with_dialect(
     model: &str,
     request: &mut Value,

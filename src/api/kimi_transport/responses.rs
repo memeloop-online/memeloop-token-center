@@ -17,10 +17,12 @@ pub(in crate::api) struct Context {
 }
 
 impl Context {
+    #[cfg(test)]
     pub(in crate::api) fn new(request: &Value) -> Self {
         Self::with_dialect(request, ResponsesViaChatDialect::OpenAiChatV1)
     }
 
+    #[cfg(test)]
     pub(in crate::api) fn for_kimi(request: &Value) -> Self {
         Self::with_dialect(request, ResponsesViaChatDialect::KimiV1)
     }
