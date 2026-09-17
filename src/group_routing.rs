@@ -158,16 +158,6 @@ impl RequestGroupRouting {
         self.policies.get(&(route, account, generation))
     }
 
-    pub(crate) fn uses_transient_signal(
-        &self,
-        route: Uuid,
-        account: Uuid,
-        generation: i64,
-    ) -> bool {
-        self.policy(route, account, generation)
-            .is_some_and(|policy| policy.transient_signal_enabled)
-    }
-
     pub(crate) fn transient_health_window_ms(
         &self,
         route: Uuid,

@@ -230,7 +230,7 @@ async fn native_fallback_has_no_implicit_controls_and_policy_identity_is_exact()
     let selected = snapshot.policy(route, account, 3).unwrap();
     assert!(!selected.allow_probe());
     assert_eq!(selected.cooldown_ms(), 42);
-    assert!(!snapshot.uses_transient_signal(route, account, 3));
+    assert_eq!(snapshot.transient_health_window_ms(route, account, 3), None);
     assert!(snapshot.policy(route, account, 4).is_none());
 
     let mut hard = policy(snapshot.tenant_id, Uuid::now_v7(), Uuid::now_v7());
