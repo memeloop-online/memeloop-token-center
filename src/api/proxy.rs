@@ -556,6 +556,7 @@ async fn finish_non_sse_proxy_response(
         &buffered_request.memory,
         buffered_request.started,
         false,
+        buffered_request.conversation.as_ref(),
     )
     .await
     {
@@ -1048,6 +1049,7 @@ pub(in crate::api) async fn proxy_with_identity(
         request_body: body.clone(),
         hints: conversation_hints,
         client_name,
+        projection_admission: std::sync::Mutex::new(ConversationProjectionAdmission::Deferred),
     });
     drop(original_request_json);
     drop(request_capture_memory);
@@ -1481,6 +1483,7 @@ pub(in crate::api) async fn proxy_with_identity(
             upstream,
             &buffered_request.memory,
             buffered_request.started,
+            buffered_request.conversation.as_ref(),
         )
         .await
         {
@@ -1716,12 +1719,18 @@ fn validate_buffered_chat_success(body: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
-#[derive(Clone)]
 struct ProxyConversation {
     key: AuthenticatedKey,
     request_body: Bytes,
     hints: crate::conversation::ConversationHints,
     client_name: Option<String>,
+    projection_admission: std::sync::Mutex<ConversationProjectionAdmission>,
+}
+
+enum ConversationProjectionAdmission {
+    Deferred,
+    Reserved(crate::gateway_body::memory::ConversationProjectionPermit),
+    Rejected,
 }
 
 struct ProxyConversationProjection<'a> {
@@ -1731,15 +1740,50 @@ struct ProxyConversationProjection<'a> {
 }
 
 impl ProxyConversation {
+    async fn reserve_for_buffered_response(
+        &self,
+        memory: &crate::gateway_body::memory::ProxyMemoryReservation,
+        response_maximum: usize,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        let admission = memory
+            .reserve_buffered_response_with_projection(
+                response_maximum,
+                self.request_body.len(),
+                deadline,
+            )
+            .await
+            .map_or(
+                ConversationProjectionAdmission::Rejected,
+                ConversationProjectionAdmission::Reserved,
+            );
+        let reserved = matches!(&admission, ConversationProjectionAdmission::Reserved(_));
+        if let Ok(mut current) = self.projection_admission.lock() {
+            *current = admission;
+        }
+        reserved
+    }
+
     async fn project<'a>(
         &'a self,
         memory: &crate::gateway_body::memory::ProxyMemoryReservation,
         deadline: tokio::time::Instant,
     ) -> Result<ProxyConversationProjection<'a>, AppError> {
-        let projection_memory = memory
-            .reserve_conversation_projection(self.request_body.len(), deadline)
-            .await
-            .ok_or(AppError::Overloaded)?;
+        let admission = {
+            let mut current = self
+                .projection_admission
+                .lock()
+                .map_err(|_| AppError::Internal)?;
+            std::mem::replace(&mut *current, ConversationProjectionAdmission::Rejected)
+        };
+        let projection_memory = match admission {
+            ConversationProjectionAdmission::Deferred => memory
+                .reserve_conversation_projection(self.request_body.len(), deadline)
+                .await
+                .ok_or(AppError::Overloaded)?,
+            ConversationProjectionAdmission::Reserved(permit) => permit,
+            ConversationProjectionAdmission::Rejected => return Err(AppError::Overloaded),
+        };
         let request_json =
             serde_json::from_slice(&self.request_body).map_err(|_| AppError::Internal)?;
         Ok(ProxyConversationProjection {
@@ -1962,6 +2006,7 @@ async fn execute_component_provider(
         &request.memory,
         request.started,
         true,
+        request.conversation.as_ref(),
     )
     .await
     {

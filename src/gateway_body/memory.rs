@@ -306,6 +306,52 @@ impl ProxyMemoryReservation {
         true
     }
 
+    /// Admit a buffered response envelope and its terminal conversation
+    /// projection as one fair allocation. Acquiring them separately can
+    /// deadlock when an earlier response owner blocks the next response while
+    /// its own projection waits behind that response in the FIFO queue.
+    pub(crate) async fn reserve_buffered_response_with_projection(
+        &self,
+        maximum: usize,
+        projection_bytes: usize,
+        deadline: tokio::time::Instant,
+    ) -> Option<ConversationProjectionPermit> {
+        if self.has_buffered_response() || maximum > MAX_BUFFERED_RESPONSE_BYTES {
+            return None;
+        }
+        let response_bytes = maximum
+            .saturating_mul(CAPTURE_MEMORY_WEIGHT)
+            .max(UNIT_BYTES);
+        let response_units = u32::try_from(response_bytes.div_ceil(UNIT_BYTES)).ok()?;
+        let projection_bytes =
+            projection_bytes.checked_mul(REQUEST_MEMORY_WEIGHT.saturating_sub(1))?;
+        let projection_units = u32::try_from(projection_bytes.div_ceil(UNIT_BYTES)).ok()?;
+        let total_units = response_units.checked_add(projection_units)?;
+        let mut permit = self
+            .acquire(
+                &self.permits,
+                total_units,
+                deadline,
+                crate::metrics::memory_admission::Stage::Response,
+            )
+            .await?;
+        let projection = permit.split(projection_units as usize)?;
+        let Ok(mut held) = self.held.lock() else {
+            return None;
+        };
+        held.0 = held.0.checked_add(response_units as usize * UNIT_BYTES)?;
+        match held.1.as_mut() {
+            Some(existing) => existing.merge(permit),
+            None => held.1 = Some(permit),
+        }
+        self.response_reserved.store(true, Ordering::Release);
+        self.response_bytes
+            .store(response_units as usize * UNIT_BYTES, Ordering::Release);
+        Some(ConversationProjectionPermit {
+            _permit: projection,
+        })
+    }
+
     pub(crate) fn response_json_fits(&self, bytes: &[u8]) -> bool {
         bounded_json_fits(bytes, self.response_bytes.load(Ordering::Acquire))
     }
@@ -673,6 +719,46 @@ mod tests {
             rendered
                 .contains("proxy_memory_waits_total{stage=\"response\",outcome=\"cancelled\"} 1")
         );
+        assert!(
+            rendered
+                .contains("proxy_memory_waits_total{stage=\"response\",outcome=\"admitted\"} 1")
+        );
+        assert!(rendered.contains("proxy_memory_waiting{stage=\"response\"} 0"));
+    }
+
+    #[tokio::test]
+    async fn buffered_response_and_projection_share_one_fair_admission() {
+        let budget = ProxyMemoryBudget::new(1024 * 1024);
+        let held = budget.reservation();
+        assert!(held.try_grow(1024 * 1024, 1));
+        let metrics = crate::metrics::Metrics::default();
+        let request = budget.reservation();
+        request.configure_admission(std::time::Duration::from_secs(5), metrics.clone());
+        let waiting = request.clone();
+        let task = tokio::spawn(async move {
+            let projection = waiting
+                .reserve_buffered_response_with_projection(
+                    256 * 1024,
+                    64 * 1024,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                )
+                .await
+                .expect("combined response and projection admission");
+            (waiting, projection)
+        });
+        budget.wait_for_response_reservation_for_test().await;
+        assert!(!task.is_finished());
+
+        drop(held);
+        let (waiting, projection) = task.await.unwrap();
+        assert_eq!(budget.snapshot().0, 14 * 64 * 1024);
+        drop(projection);
+        assert_eq!(budget.snapshot().0, 12 * 64 * 1024);
+        drop(waiting);
+        drop(request);
+        assert_eq!(budget.snapshot().0, 0);
+
+        let rendered = metrics.render(&crate::metrics::RuntimeMetrics::default());
         assert!(
             rendered
                 .contains("proxy_memory_waits_total{stage=\"response\",outcome=\"admitted\"} 1")

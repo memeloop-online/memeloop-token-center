@@ -1474,6 +1474,7 @@ pub(super) async fn buffer_response(
     response: UpstreamResponse,
     memory: &crate::gateway_body::memory::ProxyMemoryReservation,
     started: std::time::Instant,
+    conversation: Option<&super::ProxyConversation>,
 ) -> Result<BufferedCodexResponse, &'static str> {
     if response
         .headers()
@@ -1501,7 +1502,14 @@ pub(super) async fn buffer_response(
         tokio::time::Instant::now() + MAX_PROXY_LIFETIME.saturating_sub(started.elapsed());
     let diagnostic_context = proxy_diagnostics::Context::current();
     let capacity = proxy_diagnostics::Phase::new(diagnostic_context, "buffered_response_memory");
-    if !memory.reserve_buffered_response(maximum, deadline).await {
+    let reserved = if let Some(conversation) = conversation {
+        conversation
+            .reserve_for_buffered_response(memory, maximum, deadline)
+            .await
+    } else {
+        memory.reserve_buffered_response(maximum, deadline).await
+    };
+    if !reserved {
         capacity.finish("rejected", None, None);
         return Err("upstream_response_memory_capacity");
     }

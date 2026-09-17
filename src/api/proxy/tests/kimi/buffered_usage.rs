@@ -70,6 +70,9 @@ async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_origina
             ),
             hints: crate::conversation::ConversationHints::default(),
             client_name: None,
+            projection_admission: std::sync::Mutex::new(
+                ConversationProjectionAdmission::Deferred,
+            ),
         }),
         protocol: Protocol::OpenAiChat,
         tenant_id: key.tenant_id,
