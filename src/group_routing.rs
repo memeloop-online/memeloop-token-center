@@ -165,6 +165,16 @@ impl RequestGroupRouting {
 }
 
 impl CandidatePolicy {
+    fn has_valid_transient_snapshot(&self) -> bool {
+        if self.transient_signal_enabled {
+            return self.transient_signal.is_some()
+                && self
+                    .transient_policy
+                    .is_some_and(|policy| policy.is_valid());
+        }
+        self.transient_signal.is_none() && self.transient_policy.is_none()
+    }
+
     pub(crate) fn allow_probe(&self) -> bool {
         self.directive.allow_transient_probe
     }

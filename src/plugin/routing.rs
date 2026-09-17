@@ -242,7 +242,7 @@ impl GroupRoutingTransientPolicy {
         self.mode == GroupRoutingTransientPolicyMode::Active
     }
 
-    fn is_valid(self) -> bool {
+    pub(crate) fn is_valid(self) -> bool {
         (1..=10_000).contains(&self.min_samples)
             && self.open_micros <= 1_000_000
             && self.recover_micros <= self.open_micros
